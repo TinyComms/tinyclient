@@ -23,7 +23,7 @@ pub(in crate::gui) const GROUPS: [(&str, &[(u64, &str, &str)]); 5] = [
     (
         "General",
         &[
-            (TINY_VIEW_CHANNEL, "View channels", "See the voice channels and who is sitting in them."),
+            (TINY_VIEW_CHANNEL, "View channels", "See channels, read their messages, and see who is in a call."),
             (TINY_MANAGE_CHANNELS, "Manage channels", "Create, rename, reorder and delete channels and categories."),
             (TINY_VIEW_AUDIT_LOG, "View audit log", "Read who changed what on the server, and why."),
         ],
@@ -35,14 +35,14 @@ pub(in crate::gui) const GROUPS: [(&str, &[(u64, &str, &str)]); 5] = [
             (TINY_MANAGE_INVITES, "Manage invites", "See and revoke everyone's invites."),
             (TINY_KICK_MEMBERS, "Kick members", "Remove people from the server. They can come back with a new invite."),
             (TINY_BAN_MEMBERS, "Ban members", "Remove people and keep them out, for a while or for good."),
-            (TINY_TIMEOUT_MEMBERS, "Time out members", "Keep someone out of calls for a while."),
+            (TINY_TIMEOUT_MEMBERS, "Time out members", "Stop someone talking and posting for a while."),
         ],
     ),
     (
         "Voice",
         &[
             (TINY_CONNECT, "Connect", "Join voice channels."),
-            (TINY_SPEAK, "Speak", "Be heard in a call. Without it they can only listen."),
+            (TINY_SPEAK, "Speak", "Be heard in a call, and post and react in text channels. Without it they can only listen and read."),
             (TINY_VOICE_ACTIVITY, "Use voice activity", "Talk without holding a key. Without it, push to talk only."),
             (TINY_VIDEO, "Video", "Turn their camera on in a call."),
             (TINY_SHARE_SCREEN, "Share screen", "Show their screen in a call."),
@@ -56,6 +56,7 @@ pub(in crate::gui) const GROUPS: [(&str, &[(u64, &str, &str)]); 5] = [
             (TINY_DEAFEN_MEMBERS, "Deafen members", "Stop someone hearing a call."),
             (TINY_MOVE_MEMBERS, "Move members", "Move people from one channel to another."),
             (TINY_DISCONNECT_MEMBERS, "Disconnect members", "Take someone out of a call."),
+            (TINY_MANAGE_REPORTS, "Manage reports", "Read reports, including who reported whom, and act on them."),
         ],
     ),
     (
@@ -137,6 +138,12 @@ pub(in crate::gui) fn editable(community: &TinyCommunity, role: &TinyRole) -> bo
 /// Whether this account may give `bit`: only what it holds itself, unless it is an owner.
 pub(in crate::gui) fn grantable(community: &TinyCommunity, bit: u64) -> bool {
     community.access.as_ref().is_some_and(|access| access.owner || access.has(bit))
+}
+
+/// Whether this account may give `bit` to `role`: only what it holds itself (unless it is an
+/// owner), and `@everyone` can never hold `manage_reports`.
+pub(in crate::gui) fn grantable_for(community: &TinyCommunity, role: &TinyRole, bit: u64) -> bool {
+    grantable(community, bit) && !(role.default && bit == TINY_MANAGE_REPORTS)
 }
 
 impl Shell {
@@ -418,7 +425,7 @@ fn editor(shell: &Shell, facts: &Facts, role: &TinyRole, window: &mut Window, cx
         for (ix, (bit, name, help)) in rows.iter().enumerate() {
             let bit = *bit;
             let on = bits & bit != 0;
-            let can = mine && grantable(community, bit);
+            let can = mine && grantable_for(community, role, bit);
             box_ = box_.child(
                 switch_row(SharedString::from(format!("tiny-role-perm-{group}-{ix}")), name, help, on, can)
                     .when(ix + 1 == rows.len(), |row| row.border_b_0())
@@ -502,6 +509,8 @@ mod tests {
         assert!(grantable(&community, TINY_SPEAK) && !grantable(&community, TINY_BAN_MEMBERS));
         community.access = Some(TinyAccess { owner: true, ..TinyAccess::default() });
         assert!(editable(&community, &community.roles[0].clone()) && grantable(&community, TINY_BAN_MEMBERS));
+        assert!(grantable_for(&community, &community.roles[1], TINY_MANAGE_REPORTS));
+        assert!(!grantable_for(&community, &community.roles[2], TINY_MANAGE_REPORTS), "@everyone can never hold manage_reports");
         community.access = Some(TinyAccess { owner: false, roles: vec![], permissions: TINY_SPEAK, rank: 2 });
         assert!(!editable(&community, &community.roles[1].clone()), "without manage_roles nothing is editable");
         assert_eq!(ordered(&community).iter().map(|role| role.id.as_str()).collect::<Vec<_>>(), ["Owner-ish", "Mod", "everyone"]);

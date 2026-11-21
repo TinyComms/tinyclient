@@ -23,8 +23,17 @@ use serde_json::Value;
 pub(in crate::gui) const PAGE: u32 = 50;
 
 /// The kinds the filter offers, with the action prefix each asks for.
-pub(in crate::gui) const KINDS: [(&str, &str); 8] =
-    [("Everything", ""), ("Members", "member."), ("Roles", "role."), ("Invites", "invite."), ("Channels", "room."), ("Categories", "category."), ("Voice moderation", "call."), ("Server", "server.")];
+pub(in crate::gui) const KINDS: [(&str, &str); 9] = [
+    ("Everything", ""),
+    ("Members", "member."),
+    ("Roles", "role."),
+    ("Invites", "invite."),
+    ("Voice channels", "room."),
+    ("Text channels", "channel."),
+    ("Categories", "category."),
+    ("Voice moderation", "call."),
+    ("Server", "server."),
+];
 
 /// Which filter list is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +157,10 @@ pub(in crate::gui) fn sentence(community: &TinyCommunity, row: &TinyAudit, count
         "room.update" | "room.rename" => format!("{who} changed {}.", named("channel")),
         "room.delete" => format!("{who} deleted {}.", named("channel")),
         "room.override" => format!("{who} changed who may do what in {}.", named("channel")),
+        "channel.create" => format!("{who} created {}.", text("name").map_or_else(|| "a text channel".to_owned(), |name| format!("#{name}"))),
+        "channel.update" => format!("{who} changed {}.", text("name").map_or_else(|| "a text channel".to_owned(), |name| format!("#{name}"))),
+        "channel.delete" => format!("{who} deleted {}.", text("name").map_or_else(|| "a text channel".to_owned(), |name| format!("#{name}"))),
+        "channel.override" => format!("{who} changed who may do what in {}.", text("name").map_or_else(|| "a text channel".to_owned(), |name| format!("#{name}"))),
         "call.server_mute" => match flag("server_muted") {
             Some(false) => format!("{who} let {whom} speak again."),
             _ => format!("{who} server-muted {whom}."),
@@ -176,6 +189,7 @@ pub(in crate::gui) fn icon(action: &str) -> (&'static str, gpui::Rgba) {
         _ if action.starts_with("member.") => ("icons/users.svg", theme::text_soft()),
         _ if action.starts_with("role.") => ("icons/shield.svg", theme::accent_text()),
         _ if action.starts_with("invite.") => ("icons/user-plus.svg", theme::positive()),
+        _ if action.starts_with("channel.") => ("icons/hash.svg", theme::text_soft()),
         _ if action.starts_with("room.") || action.starts_with("category.") || action.starts_with("layout.") => ("icons/volume-2.svg", theme::text_soft()),
         _ if action.starts_with("server.") => ("icons/server.svg", theme::text_soft()),
         _ => ("icons/list.svg", theme::text_faint()),
@@ -431,6 +445,23 @@ mod tests {
         assert_eq!(sentence(&community, &with("weird.thing", ""), 1), "Mara did weird thing.");
         assert_eq!(icon("member.ban").0, "icons/ban.svg");
         assert_eq!(icon("role.order").0, "icons/shield.svg");
+    }
+
+    #[test]
+    fn text_channel_audit_entries_have_sentences_hash_icon_and_filter() {
+        let community = community();
+        let with = |action: &str, detail: &str| TinyAudit { actor_id: Some("m".into()), action: action.into(), detail: detail.into(), ..TinyAudit::default() };
+        assert_eq!(sentence(&community, &with("channel.create", r#"{"id":"c1","name":"general","e2ee":true}"#), 1), "Mara created #general.");
+        assert_eq!(sentence(&community, &with("channel.update", r#"{"id":"c1","name":"general"}"#), 1), "Mara changed #general.");
+        assert_eq!(sentence(&community, &with("channel.update", r#"{"id":"c1"}"#), 1), "Mara changed a text channel.");
+        assert_eq!(sentence(&community, &with("channel.delete", r#"{"id":"c1"}"#), 1), "Mara deleted a text channel.");
+        assert_eq!(sentence(&community, &with("channel.override", r#"{"id":"c1","name":"general"}"#), 1), "Mara changed who may do what in #general.");
+        assert_eq!(sentence(&community, &with("channel.override", r#"{"id":"c1"}"#), 1), "Mara changed who may do what in a text channel.");
+        assert_eq!(icon("channel.create").0, "icons/hash.svg");
+        assert_eq!(icon("channel.delete").0, "icons/hash.svg");
+        assert!(KINDS.contains(&("Voice channels", "room.")));
+        assert!(KINDS.contains(&("Text channels", "channel.")));
+        assert!(!KINDS.iter().any(|(label, _)| *label == "Channels"));
     }
 
     #[test]

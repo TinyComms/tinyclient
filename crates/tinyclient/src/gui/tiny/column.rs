@@ -180,7 +180,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(div().type_ui().text_color(theme::text()).child("No voice channels yet"))
+                    .child(div().type_ui().text_color(theme::text()).child("No channels yet"))
                     .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(if page.may.make_room {
                         "Make one from the server menu above."
                     } else {

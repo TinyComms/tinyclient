@@ -205,23 +205,26 @@ fn caption(words: String, small: bool) -> Div {
 
 impl Shell {
     /// What the top bar says of a channel after its name.
-    pub(super) fn tiny_channel_facts(&self, room: &TinyRoom) -> Div {
+    pub(super) fn tiny_channel_facts(&self, page: &Page, room: &TinyRoom) -> Div {
+        let seated_here = self.tiny_call_here(room).is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
+        let seated = seated_here.then(|| with_me(room, page.me)).flatten();
+        let shown = seated.as_ref().unwrap_or(room);
         let mut facts = div().flex().items_center().gap(px(6.)).min_w_0();
-        if !room.topic.trim().is_empty() {
+        if !shown.topic.trim().is_empty() {
             facts = facts.child(div().flex_none().w(px(1.)).h(px(16.)).bg(theme::hairline())).child(
-                div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(room.topic.clone()),
+                div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(shown.topic.clone()),
             );
         }
         facts = facts.child(chip(
-            if room.user_limit > 0 { format!("{} of {}", room.participants.len(), room.user_limit) } else { format!("{} in call", room.participants.len()) },
-            if model::full(room) { theme::warning() } else { theme::text_soft() },
-            if model::full(room) { theme::warning_soft() } else { theme::hover() },
+            model::channel_occupancy(shown),
+            if model::full(shown) { theme::warning() } else { theme::text_soft() },
+            if model::full(shown) { theme::warning_soft() } else { theme::hover() },
         ));
-        if room.ptt_only {
+        if shown.ptt_only {
             facts = facts.child(chip("Push to talk", theme::accent_text(), theme::accent_soft()));
         }
-        if room.bitrate_kbps > 0 {
-            facts = facts.child(chip(format!("{} kb/s", room.bitrate()), theme::text_soft(), theme::hover()));
+        if shown.bitrate_kbps > 0 {
+            facts = facts.child(chip(format!("{} kb/s", shown.bitrate()), theme::text_soft(), theme::hover()));
         }
         facts
     }

@@ -67,10 +67,11 @@ pub fn launch_action(args: &[String]) -> Option<QuickAction> {
     QuickAction::from_index(value("--dock-action")?.parse().ok()?)
 }
 
-/// What the single-instance handoff accepts: an invite link, or a quick action's.
+/// What the single-instance handoff accepts: an invite link, a room link, or a quick action's.
 pub fn handoff(payload: &str) -> bool {
     parse_link(payload).is_some()
         || (payload.starts_with("tinyclient://join#") && protocol::parse_invite_link(payload).is_some())
+        || protocol::parse_room_link(payload).is_some()
 }
 
 #[cfg(test)]
@@ -115,8 +116,10 @@ mod tests {
         let url = protocol::invite_url("https://example.org", "token").unwrap();
         let invite = url.replacen("https://tinyclient.io/invite#", "tinyclient://join#", 1);
         assert!(handoff(&invite));
+        assert!(handoff(&protocol::room_link("https://example.org", "lounge").unwrap()));
         assert!(handoff(&QuickAction::NewMessage.link()));
         assert!(!handoff("tinyclient://join#broken"));
+        assert!(!handoff("tinyclient://room?server=example.org&id=.."));
         assert!(!handoff("tinyclient://action/nope"));
         assert!(!handoff("hello"));
     }

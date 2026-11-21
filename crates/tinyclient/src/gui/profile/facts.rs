@@ -1220,4 +1220,20 @@ mod tests {
         assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Slack)), Network::Slack, true), "Huddle");
         assert_eq!(call_label(&Call::Native, Network::Discord, false), "Call");
     }
+
+    #[test]
+    fn tiny_person_menu_omits_refused_actions() {
+        let mut p = person(Network::Tiny, Relation::None);
+        p.handle = "@bea".into();
+        let seen = Seen {
+            direct: Some((CallSupport::None, false)),
+            in_their_dm: true,
+            ..Seen::default()
+        };
+        let items = person_menu(&p, &seen, false, false);
+        assert!(!items.contains(&Item::CloseDirect), "Tiny cannot close a DM");
+        assert!(!items.iter().any(|item| matches!(item, Item::Mute { .. })), "Tiny has no mute");
+        assert!(!items.contains(&Item::RemoveFriend));
+        assert!(!items.contains(&Item::Block));
+    }
 }

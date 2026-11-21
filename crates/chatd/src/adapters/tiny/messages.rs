@@ -7,7 +7,7 @@
 use super::e2ee::{self, Read};
 use super::live::{Ask, Live};
 use super::Saved;
-use crate::adapters::{CatalogPage, Command, Context, Download, Refusal};
+use crate::adapters::{About, CatalogPage, Command, Context, ConversationAbout, Download, Members, Refusal};
 use crate::blobs::upload::{self, Target};
 use crate::store::{ConversationRow, PersonRow, PreviewLine, SpaceRow};
 use ::e2ee as e2ee_core;
@@ -48,16 +48,6 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     let Some(directs) = optional_list::<WireDirect>(saved, "/v1/directs", "directs") else {
         return;
     };
-    // A 200 with an empty channels or directs list still runs replace_tree: every conversation
-    // that list left out is deleted with its messages. A brief empty answer during a server
-    // update is not an empty community. A first connect with nothing of that kind still replaces.
-    let (had_channels, had_directs, had_voice) = kept_list_kinds(ctx);
-    if channels.is_empty() || directs.is_empty() {
-        if (channels.is_empty() && had_channels) || (directs.is_empty() && had_directs) {
-            tracing::warn!("chatd: Tiny server: empty channel or direct list; keeping the stored tree");
-            return;
-        }
-    }
     let rooms = match super::rooms_of(saved) {
         super::Listed::Rows(rows) => rows,
         super::Listed::Empty => Vec::new(),
@@ -66,12 +56,40 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             return;
         }
     };
-    // Same for voice rooms: an empty rooms answer (or a 404 on an old server that never had
-    // rooms) must not delete rooms already stored.
-    if rooms.is_empty() && had_voice {
-        tracing::warn!("chatd: Tiny server: empty rooms list; keeping the stored tree");
-        return;
-    }
+    // An empty list is checked, not trusted blindly and not allowed to freeze the rest of the
+    // tree. Stored channels/directs confirmed gone by 404 are removed; survivors (200, other
+    // status, or transport error) are carried into `rows` so `replace_tree` keeps them and their
+    // messages. Voice rooms have no per-room read endpoint, so stored voice rows are carried
+    // forward when `/v1/rooms` is empty.
+    let space = ctx.key(SPACE);
+    let surviving_channels = if channels.is_empty() {
+        let stored = ctx
+            .hub
+            .store()
+            .space_rows_of_kinds(&space, &[ConversationKind::Channel, ConversationKind::Announcement])
+            .unwrap_or_default();
+        probe_survivors(ctx, saved, stored)
+    } else {
+        Vec::new()
+    };
+    let surviving_directs = if directs.is_empty() {
+        let stored = ctx
+            .hub
+            .store()
+            .space_rows_of_kinds(&space, &[ConversationKind::Direct])
+            .unwrap_or_default();
+        probe_survivors(ctx, saved, stored)
+    } else {
+        Vec::new()
+    };
+    let surviving_rooms = if rooms.is_empty() {
+        ctx.hub
+            .store()
+            .space_rows_of_kinds(&space, &[ConversationKind::Voice])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let callable = directs_callable(saved);
     let mut people: Vec<PersonRow> = names
         .iter()
@@ -135,7 +153,8 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         );
         rows.push(row);
     }
-    if !directs.is_empty() {
+    rows.extend(surviving_channels);
+    if !directs.is_empty() || !surviving_directs.is_empty() {
         let mut group = Group::new("directs", "Direct messages", DIRECTS_AT);
         group.kind = GroupKind::Directs;
         groups.push(group);
@@ -180,7 +199,8 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         );
         rows.push(row);
     }
-    if !rooms.is_empty() {
+    rows.extend(surviving_directs);
+    if !rooms.is_empty() || !surviving_rooms.is_empty() {
         groups.push(Group::new("rooms", "Rooms", ROOMS_AT));
     }
     for (index, room) in rooms.iter().enumerate() {
@@ -198,6 +218,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.call = CallSupport::Native;
         rows.push(row);
     }
+    rows.extend(surviving_rooms);
     if !people.is_empty() {
         let _ = ctx.people(&people);
     }
@@ -447,6 +468,15 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
                     "That file is on another server.".to_owned(),
                 )));
             }
+        }
+        Command::Members { conversation_id, offset, limit, reply } => {
+            channel_members(ctx, saved, &conversation_id, offset, limit, reply);
+        }
+        Command::Profile { person_id, reply } | Command::ProfileIn { person_id, reply, .. } => {
+            profile(saved, &person_id, reply);
+        }
+        Command::ConversationInfo { conversation_id, reply } => {
+            conversation_info(ctx, saved, &conversation_id, reply);
         }
         other => other.unsupported(ctx),
     }
@@ -2189,6 +2219,186 @@ fn member_names(saved: &Saved) -> HashMap<String, String> {
     super::members_of(saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default()
 }
 
+fn roles_of(saved: &Saved) -> Vec<protocol::TinyRole> {
+    optional_list::<protocol::TinyRole>(saved, "/v1/roles", "roles").unwrap_or_default()
+}
+
+#[derive(Clone)]
+struct CachedDirectory {
+    fetched: std::time::Instant,
+    members: Vec<protocol::TinyMember>,
+    roles: Vec<protocol::TinyRole>,
+    overrides: HashMap<String, Vec<protocol::TinyOverride>>,
+}
+
+const DIRECTORY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn directory_cache() -> &'static std::sync::Mutex<HashMap<String, CachedDirectory>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, CachedDirectory>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn directory(saved: &Saved) -> CachedDirectory {
+    let key = format!("{}|{}", saved.base_url, saved.user_id);
+    if let Ok(cache) = directory_cache().lock() {
+        if let Some(entry) = cache.get(&key) {
+            if entry.fetched.elapsed() < DIRECTORY_TTL {
+                return entry.clone();
+            }
+        }
+    }
+    let members = super::members_of(saved).unwrap_or_default();
+    let roles = roles_of(saved);
+    let overrides = optional_list::<WireChannel>(saved, "/v1/channels", "channels")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|ch| (ch.id, ch.overrides))
+        .collect();
+    let entry = CachedDirectory {
+        fetched: std::time::Instant::now(),
+        members,
+        roles,
+        overrides,
+    };
+    if let Ok(mut cache) = directory_cache().lock() {
+        cache.insert(key, entry.clone());
+    }
+    entry
+}
+
+fn member_display_name(member: &protocol::TinyMember) -> String {
+    let trimmed = member.display_name.trim();
+    if trimmed.is_empty() {
+        "Someone".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn channel_members(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    offset: u32,
+    limit: u32,
+    reply: crate::adapters::Reply<Members>,
+) {
+    let dir = directory(saved);
+    let overrides = dir
+        .overrides
+        .get(conversation_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut visible: Vec<&protocol::TinyMember> = dir
+        .members
+        .iter()
+        .filter(|member| {
+            let is_owner = member.owner || member.role.eq_ignore_ascii_case("owner");
+            if dir.roles.is_empty() {
+                true
+            } else {
+                protocol::tiny_room_permissions(&dir.roles, &member.roles, is_owner, overrides)
+                    & protocol::TINY_VIEW_CHANNEL
+                    != 0
+            }
+        })
+        .collect();
+    visible.sort_by_key(|member| member_display_name(member).to_lowercase());
+
+    let mut hoisted: Vec<&protocol::TinyRole> = dir
+        .roles
+        .iter()
+        .filter(|role| role.hoist && !role.default)
+        .collect();
+    hoisted.sort_by_key(|role| std::cmp::Reverse(role.position));
+
+    let mut owners = Vec::new();
+    let mut by_role: Vec<Vec<&protocol::TinyMember>> = vec![Vec::new(); hoisted.len()];
+    let mut rest = Vec::new();
+    for member in visible {
+        if member.owner || member.role.eq_ignore_ascii_case("owner") {
+            owners.push(member);
+        } else if let Some(at) = hoisted.iter().position(|role| member.roles.contains(&role.id)) {
+            by_role[at].push(member);
+        } else {
+            rest.push(member);
+        }
+    }
+
+    let mut sections = Vec::new();
+    let mut ordered = Vec::new();
+    let mut push_group = |name: String, group: Vec<&protocol::TinyMember>| {
+        if !group.is_empty() {
+            sections.push(protocol::MemberSection {
+                name,
+                count: group.len() as u32,
+            });
+            for member in group {
+                ordered.push(protocol::Person::new(
+                    ctx.key(&member.user_id),
+                    member_display_name(member),
+                ));
+            }
+        }
+    };
+    push_group("Owner".to_owned(), owners);
+    for (role, group) in hoisted.iter().zip(by_role) {
+        push_group(role.name.clone(), group);
+    }
+    push_group("Members".to_owned(), rest);
+
+    let members = ordered
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    let _ = reply.send(Ok(Members {
+        pending: false,
+        sections,
+        members,
+    }));
+}
+
+fn conversation_info(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    reply: crate::adapters::Reply<ConversationAbout>,
+) {
+    let mut about = ConversationAbout::default();
+    if let Ok(Some(row)) = ctx.known(conversation_id) {
+        about.description = row.topic;
+        if row.kind == ConversationKind::Channel {
+            about.members = super::members_of(saved).ok().map(|members| members.len() as u32);
+        }
+    }
+    let _ = reply.send(Ok(about));
+}
+
+fn profile(saved: &Saved, person_id: &str, reply: crate::adapters::Reply<About>) {
+    let mut about = About::default();
+    if super::safe_id(person_id) {
+        if let Ok(members) = super::members_of(saved) {
+            if let Some(member) = members.into_iter().find(|member| member.user_id == person_id) {
+                about.joined = rfc3339(&member.created_at);
+                about.last_seen = member.last_seen_at.as_deref().and_then(rfc3339);
+                let roles = roles_of(saved);
+                let mut named: Vec<&protocol::TinyRole> = roles
+                    .iter()
+                    .filter(|role| !role.default && member.roles.contains(&role.id))
+                    .collect();
+                named.sort_by_key(|role| std::cmp::Reverse(role.position));
+                about.roles = named.into_iter().map(|role| role.name.clone()).collect();
+                if about.roles.is_empty() && (member.owner || member.role.eq_ignore_ascii_case("owner")) {
+                    about.roles.push("Owner".to_owned());
+                }
+            }
+        }
+    }
+    let _ = reply.send(Ok(about));
+}
+
 fn name_of(names: &HashMap<String, String>, saved: &Saved, author: &str) -> String {
     if author == saved.user_id && !saved.display_name.is_empty() {
         return saved.display_name.clone();
@@ -2204,11 +2414,27 @@ fn present(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|text| !text.is_empty())
 }
 
-/// Whether the stored space already has text channels, directs, and/or voice rooms. Used to
-/// refuse an empty list that would delete those rows and their messages. Directs sort after
-/// channels, so this must not use a paged tree read.
-fn kept_list_kinds(ctx: &Context) -> (bool, bool, bool) {
-    ctx.hub.store().space_text_kinds(&ctx.key(SPACE)).unwrap_or((false, false, false))
+/// Probe stored conversations when their list came back empty (capped at 50 probes). A 404
+/// confirms the channel/direct is gone or no longer viewable and removes it; 200, any other
+/// status, or a transport error keeps the row and its stored messages.
+const EMPTY_LIST_PROBE_CAP: usize = 50;
+
+fn probe_survivors(ctx: &Context, saved: &Saved, stored: Vec<ConversationRow>) -> Vec<ConversationRow> {
+    let mut survivors = Vec::new();
+    for (index, row) in stored.into_iter().enumerate() {
+        if index >= EMPTY_LIST_PROBE_CAP || !super::safe_id(&row.id) {
+            survivors.push(row);
+            continue;
+        }
+        let path = format!("/v1/conversations/{}/messages?limit=1", row.id);
+        match super::asked("GET", saved, &path, None) {
+            Ok((404, _)) => {
+                let _ = ctx.conversation_gone(&row.id);
+            }
+            _ => survivors.push(row),
+        }
+    }
+    survivors
 }
 
 /// The ids of the conversations the person is in: their channels and their direct messages.
@@ -2414,6 +2640,9 @@ struct WireChannel {
     /// Encrypted now, and some message from before that is still stored in the clear.
     #[serde(default)]
     plaintext_history: bool,
+    /// Per-role permission overrides on this channel, when the server includes them.
+    #[serde(default)]
+    overrides: Vec<protocol::TinyOverride>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -3438,6 +3667,9 @@ mod tests {
             if request.starts_with("GET /v1/directs ") && seen.load(Ordering::Relaxed) >= 2 {
                 return Some(http(200, "OK", r#"{"directs":[]}"#));
             }
+            if request.starts_with("GET /v1/conversations/channel-1/messages?limit=1 ") {
+                return Some(http(200, "OK", r#"{"messages":[]}"#));
+            }
             None
         });
         let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
@@ -3455,6 +3687,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_empty_channel_list_removes_a_channel_confirmed_gone_by_404_and_refreshes_the_rest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/channels ") && seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                return Some(http(200, "OK", r#"{"channels":[]}"#));
+            }
+            if request.starts_with("GET /v1/conversations/channel-1/messages?limit=1 ") {
+                return Some(http(404, "Not Found", r#"{"error":"not_found"}"#));
+            }
+            if request.starts_with("GET /v1/directs ") && seen.load(Ordering::Relaxed) >= 2 {
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"directs":[{{"id":"direct-1","peer":{{"user_id":"{PEER}","display_name":"Bea"}}}},{{"id":"direct-2","peer":{{"user_id":"{PEER}","display_name":"Bea New"}}}}]}}"#
+                    ),
+                ));
+            }
+            None
+        });
+        let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+        ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).unwrap();
+        refresh(&ctx, &saved);
+        assert!(ctx.known("channel-1").unwrap().is_none(), "404-confirmed deleted channel must be removed");
+        assert!(ctx.known("direct-2").unwrap().is_some(), "directs must still refresh when channels is empty");
+    }
+
+    #[test]
+    fn an_empty_channel_list_keeps_a_channel_confirmed_alive_by_200_or_error_and_refreshes_the_rest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/channels ") && seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                return Some(http(200, "OK", r#"{"channels":[]}"#));
+            }
+            if request.starts_with("GET /v1/conversations/channel-1/messages?limit=1 ") {
+                return Some(http(500, "Internal Server Error", r#"{"error":"boom"}"#));
+            }
+            if request.starts_with("GET /v1/directs ") && seen.load(Ordering::Relaxed) >= 2 {
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"directs":[{{"id":"direct-1","peer":{{"user_id":"{PEER}","display_name":"Bea"}}}},{{"id":"direct-2","peer":{{"user_id":"{PEER}","display_name":"Bea New"}}}}]}}"#
+                    ),
+                ));
+            }
+            None
+        });
+        let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+        ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).unwrap();
+        refresh(&ctx, &saved);
+        let page = ctx
+            .hub
+            .store()
+            .messages(&ctx.key("channel-1"), &Page::Newest, 10, 1_800_000_000)
+            .unwrap()
+            .expect("probe error keeps the channel");
+        assert_eq!(
+            page.messages.iter().find(|message| message.id == "m-kept").map(|message| message.text.as_str()),
+            Some("kept")
+        );
+        assert!(ctx.known("direct-2").unwrap().is_some(), "directs must still refresh when channels probe keeps survivors");
+    }
+
     /// An empty directs list with channels still present would delete every DM and its messages.
     #[test]
     fn an_empty_direct_list_does_not_drop_stored_messages() {
@@ -3464,6 +3765,9 @@ mod tests {
         let (_adapter, ctx, saved) = fixture(move |request| {
             if request.starts_with("GET /v1/directs ") && seen.fetch_add(1, Ordering::Relaxed) >= 1 {
                 return Some(http(200, "OK", r#"{"directs":[]}"#));
+            }
+            if request.starts_with("GET /v1/conversations/direct-1/messages?limit=1 ") {
+                return Some(http(200, "OK", r#"{"messages":[]}"#));
             }
             None
         });
@@ -3552,6 +3856,100 @@ mod tests {
             .unwrap();
         assert!(rows.iter().any(|row| row.key.id == "direct-1"));
         assert_eq!(direct.call, CallSupport::None);
+    }
+
+    #[test]
+    fn conversation_info_and_profile_answer_without_refusal_or_email() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/members ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"[{{"user_id":"{PEER}","display_name":"Bea","email":"bea@secret.test","role":"member","roles":["r-mod"],"created_at":"{WHEN}"}}]"#
+                    ),
+                ));
+            }
+            if request.starts_with("GET /v1/roles ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    r#"[{"id":"r-mod","name":"Mods","position":2,"permissions":1,"hoist":true,"default":false}]"#,
+                ));
+            }
+            None
+        });
+        let live = Live::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &live, Command::ConversationInfo { conversation_id: "channel-1".into(), reply: tx });
+        let info = rx.recv().unwrap().expect("ConversationInfo must answer Ok");
+        assert_eq!(info.members, Some(1));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &live, Command::Profile { person_id: PEER.into(), reply: tx });
+        let about = rx.recv().unwrap().expect("Profile must answer Ok");
+        assert_eq!(about.roles, vec!["Mods".to_owned()]);
+        assert_eq!(about.joined, rfc3339(WHEN));
+        assert!(about.contacts.is_empty() && about.fields.is_empty(), "never expose email");
+    }
+
+    #[test]
+    fn members_filters_by_view_channel_groups_sections_and_omits_email() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let member_hits = Arc::new(AtomicUsize::new(0));
+        let hits = member_hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/channels ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    r#"{"channels":[{"id":"channel-1","name":"secret","position":0,"overrides":[{"role_id":"r-everyone","allow":0,"deny":1},{"role_id":"r-mod","allow":1,"deny":0}]}]}"#,
+                ));
+            }
+            if request.starts_with("GET /v1/members ") {
+                hits.fetch_add(1, Ordering::Relaxed);
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"[
+                            {{"user_id":"{PEER}","display_name":"Bea","email":"bea@secret.test","role":"member","roles":["r-mod"]}},
+                            {{"user_id":"{ME}","display_name":"","email":"hidden@secret.test","role":"member","roles":[]}}
+                        ]"#
+                    ),
+                ));
+            }
+            if request.starts_with("GET /v1/roles ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    r#"[
+                        {"id":"r-everyone","name":"@everyone","position":0,"permissions":1,"hoist":false,"default":true},
+                        {"id":"r-mod","name":"Mods","position":2,"permissions":1,"hoist":true,"default":false}
+                    ]"#,
+                ));
+            }
+            None
+        });
+        let live = Live::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &live, Command::Members { conversation_id: "channel-1".into(), offset: 0, limit: 50, reply: tx });
+        let page = rx.recv().unwrap().expect("Command::Members must answer Ok");
+        assert!(!page.pending);
+        assert_eq!(page.members.len(), 1, "denied member must be excluded");
+        assert_eq!(page.members[0].key.id, PEER);
+        assert_eq!(page.members[0].name, "Bea");
+        assert!(page.members[0].handle.is_empty(), "never include email");
+        assert_eq!(page.sections, vec![protocol::MemberSection { name: "Mods".into(), count: 1 }]);
+
+        // A second click with offset=1 reuses the cached directory and returns empty page with same sections.
+        let before = member_hits.load(Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &live, Command::Members { conversation_id: "channel-1".into(), offset: 1, limit: 50, reply: tx });
+        let page2 = rx.recv().unwrap().expect("second Command::Members must answer Ok");
+        assert!(page2.members.is_empty(), "offset=1 skips the single member");
+        assert_eq!(page2.sections, vec![protocol::MemberSection { name: "Mods".into(), count: 1 }]);
+        assert_eq!(member_hits.load(Ordering::Relaxed), before, "recent directory copy is reused without another GET /v1/members");
     }
 
     #[test]

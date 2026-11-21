@@ -66,7 +66,7 @@ fn newer(me: &'static str, log: Arc<Mutex<Vec<String>>>) -> String {
     })
 }
 
-const OWNER: &str = r#"{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada","role":"owner","owner":true,"roles":[],"permissions":1048575,"rank":2147483647}"#;
+const OWNER: &str = r#"{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada","role":"owner","owner":true,"roles":[],"permissions":2097151,"rank":2147483647}"#;
 
 fn sent(log: &Arc<Mutex<Vec<String>>>, start: &str) -> Vec<String> {
     log.lock().unwrap().iter().filter(|request| request.starts_with(start)).cloned().collect()
@@ -129,6 +129,11 @@ fn every_change_goes_to_its_route_with_its_body() {
         assert_eq!(json_body(&last(&log, "POST /v1/roles "))["color"], "#22C55E");
         assert_eq!(role_update(account.clone(), MODS.into(), TinyRoleEdit { color: Some(String::new()), ..TinyRoleEdit::default() }), Response::Ok);
         assert!(json_body(&last(&log, &format!("PATCH /v1/roles/{MODS} ")))["color"].is_null());
+        assert_eq!(
+            role_update(account.clone(), MODS.into(), TinyRoleEdit { permissions: Some((1 << 21) - 1), ..TinyRoleEdit::default() }),
+            Response::Ok
+        );
+        assert_eq!(json_body(&last(&log, &format!("PATCH /v1/roles/{MODS} ")))["permissions"].as_u64(), Some((1 << 21) - 1));
         assert_eq!(role_delete(account.clone(), "gone".into()), said("That role is gone."));
         assert_eq!(role_order(account.clone(), vec![MODS.into()]), Response::Ok);
         assert_eq!(json_body(&last(&log, "PUT /v1/roles/order "))["ids"][0], MODS);
@@ -377,7 +382,7 @@ fn with_setup(me: &'static str, features: &'static str, log: Arc<Mutex<Vec<Strin
 }
 
 const SETUP_FEATURES: &str = r#""server","roles","first_run_setup""#;
-const NOT_OWNER: &str = r#"{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada","role":"admin","owner":false,"roles":[],"permissions":1048575,"rank":5}"#;
+const NOT_OWNER: &str = r#"{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada","role":"admin","owner":false,"roles":[],"permissions":2097151,"rank":5}"#;
 
 fn applied_to(apply: TinySetupApply, account: &AccountKey) -> Response {
     setup_apply(account.clone(), apply)
