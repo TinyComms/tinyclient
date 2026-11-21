@@ -2089,9 +2089,16 @@ impl Slack {
         let me = self.me.get().cloned().unwrap_or_default();
         if status.is_some() || status_emoji.is_some() {
             let clearing = status.as_deref() == Some("") && status_emoji.as_deref().unwrap_or("").is_empty();
+            let cached_me = self.cached(&me);
+            let strip_old_emoji = |s: &str| -> String {
+                match cached_me.as_ref().filter(|u| !u.emoji.is_empty()) {
+                    Some(u) => s.strip_prefix(&u.emoji).unwrap_or(s).trim().to_owned(),
+                    None => s.to_owned(),
+                }
+            };
             let text = match &status {
-                Some(t) => t.clone(),
-                None => self.cached(&me).map(|u| u.status).unwrap_or_default(),
+                Some(t) => strip_old_emoji(t),
+                None => cached_me.as_ref().map(|u| strip_old_emoji(&u.status)).unwrap_or_default(),
             };
             let emoji_code = if clearing {
                 String::new()
@@ -2099,7 +2106,8 @@ impl Slack {
                 slack_status_emoji(raw)
             } else {
                 // Preserve existing emoji when only status text changes.
-                self.cached(&me)
+                cached_me
+                    .as_ref()
                     .map(|u| slack_status_emoji(&u.emoji))
                     .unwrap_or_default()
             };
