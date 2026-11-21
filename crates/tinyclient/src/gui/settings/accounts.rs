@@ -164,6 +164,9 @@ impl SettingsWindow {
                 if network == Network::Telegram && account.link == Link::Connected {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
                 }
+                if network == Network::Discord && account.link == Link::Connected {
+                    group = group.child(self.discord_privacy_rows(account, ix, cx));
+                }
             }
             if network == Network::Tiny {
                 tiny_line = self.tiny_line();
@@ -363,6 +366,175 @@ impl SettingsWindow {
                     })),
                 ),
         );
+        box_div
+    }
+
+    fn load_discord_privacy(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.discord_privacy_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    match crate::client::ask(&protocol::Request::GetNetworkPrivacy { account: acc }) {
+                        Ok(protocol::Response::NetworkPrivacy { privacy }) => Some(privacy),
+                        _ => None,
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(privacy) = loaded {
+                    this.discord_privacy.insert(account, privacy);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn update_discord_privacy(
+        &mut self,
+        account: protocol::AccountKey,
+        mutate: impl FnOnce(&mut protocol::NetworkPrivacy),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut next) = self.discord_privacy.get(&account).cloned() else {
+            return;
+        };
+        let prev = next.clone();
+        mutate(&mut next);
+        self.discord_privacy.insert(account.clone(), next.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let sent = next.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&protocol::Request::SetNetworkPrivacy { account: acc, privacy: sent })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(protocol::Response::NetworkPrivacy { privacy }) => {
+                        this.discord_privacy.insert(account, privacy);
+                    }
+                    _ => {
+                        this.discord_privacy.insert(account, prev);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn discord_privacy_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_discord_privacy(account.key.clone(), cx);
+        let privacy = self.discord_privacy.get(&account.key).cloned();
+        let mut box_div = div().flex().flex_col();
+        let Some(priv_state) = privacy else {
+            return box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .type_small()
+                    .text_color(theme::text_faint())
+                    .child("Loading Privacy & Safety…"),
+            );
+        };
+        let row_wrap = |title: &'static str, sub: &'static str, control: AnyElement| {
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_ui().text_color(theme::text()).child(title))
+                        .child(div().type_small().text_color(theme::text_soft()).child(sub)),
+                )
+                .child(control)
+        };
+        let switches: [(&str, &str, &str, bool, usize); 5] = [
+            ("dc-fr-all", "Friend requests from everyone", "Anyone on Discord can send you a friend request.", priv_state.friend_requests_everyone, 0),
+            ("dc-fr-fof", "Friend requests from friends of friends", "People who share a mutual friend with you.", priv_state.friend_requests_mutual_friends, 1),
+            ("dc-fr-srv", "Friend requests from server members", "Members of servers you share.", priv_state.friend_requests_mutual_spaces, 2),
+            ("dc-dm-srv", "Direct messages from server members", "Default for new servers; override individual servers in their Details.", priv_state.allow_dms_from_spaces, 3),
+            ("dc-req-srv", "Message requests from server members", "Filter DMs from non-friends into Message Requests by default.", priv_state.allow_message_requests, 4),
+        ];
+        for (id, title, sub, on, which) in switches {
+            let acc = account.key.clone();
+            box_div = box_div.child(rule()).child(row_wrap(
+                title,
+                sub,
+                super::controls::switch((id, ix), title, on)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_discord_privacy(
+                            acc.clone(),
+                            move |p| match which {
+                                0 => p.friend_requests_everyone = !on,
+                                1 => p.friend_requests_mutual_friends = !on,
+                                2 => p.friend_requests_mutual_spaces = !on,
+                                3 => p.allow_dms_from_spaces = !on,
+                                _ => p.allow_message_requests = !on,
+                            },
+                            cx,
+                        );
+                    }))
+                    .into_any_element(),
+            ));
+        }
+        let filter_levels: [(&str, u8); 3] = [("Off", 0), ("Non-friends", 1), ("Everyone", 2)];
+        let filters: [(&str, &str, u8, bool); 2] = [
+            ("Explicit content filter", "Scan and blur explicit media in DMs.", priv_state.explicit_content_filter, true),
+            ("DM spam filter", "Filter direct messages from suspected spammers.", priv_state.dm_spam_filter, false),
+        ];
+        for (f_ix, (title, sub, current, is_explicit)) in filters.into_iter().enumerate() {
+            let mut seg = div().flex().items_center().gap(px(4.));
+            for (c_ix, (label, level)) in filter_levels.into_iter().enumerate() {
+                let acc = account.key.clone();
+                let active = current == level;
+                seg = seg.child(
+                    button(
+                        ("dc-filter", ix * 100 + f_ix * 10 + c_ix),
+                        if active { ButtonKind::Primary } else { ButtonKind::Secondary },
+                        label,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_discord_privacy(
+                            acc.clone(),
+                            move |p| {
+                                if is_explicit {
+                                    p.explicit_content_filter = level;
+                                } else {
+                                    p.dm_spam_filter = level;
+                                }
+                            },
+                            cx,
+                        );
+                    })),
+                );
+            }
+            box_div = box_div.child(rule()).child(row_wrap(title, sub, seg.into_any_element()));
+        }
+        // Data & personalisation settings stay in Discord.
+        box_div = box_div.child(rule()).child(row_wrap(
+            "Data & Privacy",
+            "Personalisation, analytics, and data export stay in Discord.",
+            button(("dc-priv-open", ix), ButtonKind::Ghost, "Open in Discord")
+                .on_click(|_, _, cx| cx.open_url("https://discord.com/channels/@me"))
+                .into_any_element(),
+        ));
         box_div
     }
 

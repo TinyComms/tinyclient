@@ -1663,6 +1663,21 @@ pub enum Request {
         key: PrivacyKey,
         policy: PrivacyPolicy,
     },
+    /// Read an account's Privacy & Safety settings (Discord `PreloadedUserSettings.privacy`).
+    GetNetworkPrivacy {
+        account: AccountKey,
+    },
+    /// Write an account's Privacy & Safety settings (Discord `PATCH /users/@me/settings-proto/1`
+    /// with all unknown fields preserved).
+    SetNetworkPrivacy {
+        account: AccountKey,
+        privacy: NetworkPrivacy,
+    },
+    /// Update a Space's per-server privacy switches (Discord: allow DMs and message requests).
+    SetSpacePrivacy {
+        space: Key,
+        privacy: SpacePrivacy,
+    },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2921,6 +2936,9 @@ pub enum Response {
     Privacy {
         key: PrivacyKey,
         policy: PrivacyPolicy,
+    },
+    NetworkPrivacy {
+        privacy: NetworkPrivacy,
     },
     Folders {
         folders: Vec<Folder>,

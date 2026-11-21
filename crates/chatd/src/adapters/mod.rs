@@ -215,6 +215,7 @@ pub struct SpaceAbout {
     pub events: bool,
     pub mobile_push: bool,
     pub channel_overrides: Vec<protocol::SpaceChannelOverride>,
+    pub privacy: Option<protocol::SpacePrivacy>,
 }
 
 impl Default for SpaceAbout {
@@ -232,6 +233,7 @@ impl Default for SpaceAbout {
             events: true,
             mobile_push: true,
             channel_overrides: Vec::new(),
+            privacy: None,
         }
     }
 }
@@ -726,6 +728,21 @@ pub enum Command {
         policy: protocol::PrivacyPolicy,
         reply: Reply<protocol::PrivacyPolicy>,
     },
+    /// Read an account's Privacy & Safety settings (Discord).
+    GetNetworkPrivacy {
+        reply: Reply<protocol::NetworkPrivacy>,
+    },
+    /// Write an account's Privacy & Safety settings (Discord).
+    SetNetworkPrivacy {
+        privacy: protocol::NetworkPrivacy,
+        reply: Reply<protocol::NetworkPrivacy>,
+    },
+    /// Update a Space's per-server privacy switches (Discord).
+    SetSpacePrivacy {
+        space_id: String,
+        privacy: protocol::SpacePrivacy,
+        reply: Reply<()>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -911,6 +928,9 @@ impl Command {
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNetworkPrivacy { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetNetworkPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpacePrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

@@ -82,9 +82,9 @@ fn bytes_of(message: &[u8], wanted: u64) -> Option<&[u8]> {
     })
 }
 
-/// A length-delimited field: its tag, its length, its bytes.
-fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
-    let mut varint = |mut value: u64| loop {
+/// Encodes an unsigned varint into `into`.
+fn write_varint(into: &mut Vec<u8>, mut value: u64) {
+    loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
@@ -92,10 +92,43 @@ fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
             break;
         }
         into.push(byte | 0x80);
-    };
-    varint(number << 3 | 2);
-    varint(bytes.len() as u64);
+    }
+}
+
+/// A length-delimited field: its tag, its length, its bytes.
+fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
+    write_varint(into, number << 3 | 2);
+    write_varint(into, bytes.len() as u64);
     into.extend_from_slice(bytes);
+}
+
+/// A varint field: its tag and value.
+fn write_varint_field(into: &mut Vec<u8>, number: u64, value: u64) {
+    write_varint(into, number << 3);
+    write_varint(into, value);
+}
+
+/// A wrapped scalar (`google.protobuf.BoolValue` / `UInt32Value`): length-delimited field
+/// containing varint field 1 when non-zero (empty message for 0/false).
+fn write_wrapped_varint(into: &mut Vec<u8>, number: u64, value: u64) {
+    let mut inner = Vec::new();
+    if value != 0 {
+        write_varint_field(&mut inner, 1, value);
+    }
+    write(into, number, &inner);
+}
+
+/// Packed repeated `fixed64` field for a list of numeric snowflake ids.
+fn write_packed_ids(into: &mut Vec<u8>, number: u64, list: &[String]) {
+    let mut packed = Vec::with_capacity(list.len() * 8);
+    for id in list {
+        if let Ok(parsed) = id.parse::<u64>() {
+            packed.extend_from_slice(&parsed.to_le_bytes());
+        }
+    }
+    if !packed.is_empty() {
+        write(into, number, &packed);
+    }
 }
 
 /// Our status settings as Discord sent them, out of the whole settings (or out of an update
@@ -235,9 +268,160 @@ pub fn guild_order(settings: &str) -> Option<Vec<String>> {
     (!order.is_empty()).then_some(order)
 }
 
+/// Friend-source bitflags (`PrivacySettings.friend_source_flags`, field 12).
+pub const FRIEND_SOURCE_ALL: u32 = 1 << 1;
+pub const FRIEND_SOURCE_MUTUAL_FRIENDS: u32 = 1 << 2;
+pub const FRIEND_SOURCE_MUTUAL_GUILDS: u32 = 1 << 3;
+
+/// Our privacy settings as Discord sent them (field 6 of `PreloadedUserSettings`).
+/// `None` when the blob does not contain a privacy block.
+pub fn privacy_settings(settings: &str) -> Option<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
+    bytes_of(&bytes, 6).map(<[u8]>::to_vec)
+}
+
+/// Decodes Discord's `PreloadedUserSettings.privacy` block (field 6) into `NetworkPrivacy`.
+/// Field numbers follow `discord-protos`:
+/// - 3: `restricted_guild_ids` (repeated fixed64)
+/// - 4: `default_guilds_restricted` (bool varint)
+/// - 12: `friend_source_flags` (`UInt32Value`: bit 1 all, bit 2 mutual friends, bit 3 mutual guilds)
+/// - 17: `message_request_restricted_guild_ids` (repeated fixed64)
+/// - 18: `default_message_request_restricted` (`BoolValue`)
+/// - 26: `explicit_content_filter` (enum varint: 0/1 off, 2 non-friends, 3 everyone)
+/// - 27: `dm_spam_filter_v2` (enum varint: 0/1 off, 2 non-friends, 3 everyone)
+pub fn decode_privacy(privacy: &[u8]) -> protocol::NetworkPrivacy {
+    let mut out = protocol::NetworkPrivacy::default();
+    ids(privacy, 3, &mut out.restricted_spaces);
+    ids(privacy, 17, &mut out.request_restricted_spaces);
+    for (number, field, _) in fields(privacy) {
+        match (number, field) {
+            (4, Field::Varint(v)) => out.allow_dms_from_spaces = v == 0,
+            (12, Field::Bytes(inner)) => {
+                let flags = wrapped_varint(inner).unwrap_or(0) as u32;
+                out.friend_requests_everyone = flags & FRIEND_SOURCE_ALL != 0;
+                out.friend_requests_mutual_friends = flags & FRIEND_SOURCE_MUTUAL_FRIENDS != 0;
+                out.friend_requests_mutual_spaces = flags & FRIEND_SOURCE_MUTUAL_GUILDS != 0;
+            }
+            (18, Field::Bytes(inner)) => {
+                out.allow_message_requests = wrapped_varint(inner).unwrap_or(0) == 0;
+            }
+            (26, Field::Varint(v)) => {
+                out.explicit_content_filter = match v {
+                    2 => 1,
+                    3 => 2,
+                    _ => 0,
+                };
+            }
+            (27, Field::Varint(v)) => {
+                out.dm_spam_filter = match v {
+                    2 => 1,
+                    3 => 2,
+                    _ => 0,
+                };
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Re-encodes `privacy` with the fields in `next` updated while copying every unknown field
+/// byte-for-byte so other Discord settings in the block are never lost.
+pub fn with_privacy(privacy: &[u8], next: &protocol::NetworkPrivacy) -> Vec<u8> {
+    let mut out = Vec::with_capacity(privacy.len() + 64);
+    for (number, _, raw) in fields(privacy) {
+        if !matches!(number, 3 | 4 | 12 | 17 | 18 | 26 | 27) {
+            out.extend_from_slice(raw);
+        }
+    }
+    write_packed_ids(&mut out, 3, &next.restricted_spaces);
+    if !next.allow_dms_from_spaces {
+        write_varint_field(&mut out, 4, 1);
+    }
+    let mut flags = 0u32;
+    if next.friend_requests_everyone {
+        flags |= FRIEND_SOURCE_ALL;
+    }
+    if next.friend_requests_mutual_friends {
+        flags |= FRIEND_SOURCE_MUTUAL_FRIENDS;
+    }
+    if next.friend_requests_mutual_spaces {
+        flags |= FRIEND_SOURCE_MUTUAL_GUILDS;
+    }
+    write_wrapped_varint(&mut out, 12, u64::from(flags));
+    write_packed_ids(&mut out, 17, &next.request_restricted_spaces);
+    write_wrapped_varint(&mut out, 18, u64::from(!next.allow_message_requests));
+    let explicit_wire = match next.explicit_content_filter {
+        1 => 2,
+        2 => 3,
+        _ => 1,
+    };
+    write_varint_field(&mut out, 26, explicit_wire);
+    let spam_wire = match next.dm_spam_filter {
+        1 => 2,
+        2 => 3,
+        _ => 1,
+    };
+    write_varint_field(&mut out, 27, spam_wire);
+    out
+}
+
+/// Wraps a `PrivacySettings` block in `PreloadedUserSettings` field 6 and base64-encodes it
+/// for `PATCH /users/@me/settings-proto/1`.
+pub fn privacy_update_settings(privacy: &[u8]) -> String {
+    let mut whole = Vec::with_capacity(privacy.len() + 4);
+    write(&mut whole, 6, privacy);
+    base64::engine::general_purpose::STANDARD.encode(whole)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_settings_round_trip_and_preserve_unknown_fields() {
+        // Build a PrivacySettings block with restricted guild 4000, default_guilds_restricted=true,
+        // friend_source_flags = mutual_guilds only (8), default_message_request_restricted=true,
+        // explicit_content_filter = 2 (non-friends), dm_spam_filter = 3 (everyone),
+        // PLUS two unknown fields (field 8 BoolValue=true, field 99 varint=77).
+        let mut raw = Vec::new();
+        write_packed_ids(&mut raw, 3, &["4000".to_owned()]);
+        write_varint_field(&mut raw, 4, 1);
+        write_wrapped_varint(&mut raw, 8, 1); // unknown field 8
+        write_wrapped_varint(&mut raw, 12, u64::from(FRIEND_SOURCE_MUTUAL_GUILDS));
+        write_packed_ids(&mut raw, 17, &["5000".to_owned()]);
+        write_wrapped_varint(&mut raw, 18, 1);
+        write_varint_field(&mut raw, 26, 2);
+        write_varint_field(&mut raw, 27, 3);
+        write_varint_field(&mut raw, 99, 77); // unknown field 99
+
+        let encoded = privacy_update_settings(&raw);
+        let extracted = privacy_settings(&encoded).unwrap();
+        let decoded = decode_privacy(&extracted);
+        assert!(!decoded.friend_requests_everyone);
+        assert!(!decoded.friend_requests_mutual_friends);
+        assert!(decoded.friend_requests_mutual_spaces);
+        assert!(!decoded.allow_dms_from_spaces);
+        assert!(!decoded.allow_message_requests);
+        assert_eq!(decoded.explicit_content_filter, 1);
+        assert_eq!(decoded.dm_spam_filter, 2);
+        assert_eq!(decoded.restricted_spaces, vec!["4000".to_owned()]);
+        assert_eq!(decoded.request_restricted_spaces, vec!["5000".to_owned()]);
+
+        // Mutate and re-encode: unknown fields 8 and 99 must remain intact byte-for-byte.
+        let mut next = decoded.clone();
+        next.friend_requests_everyone = true;
+        next.allow_dms_from_spaces = true;
+        next.restricted_spaces.push("6000".to_owned());
+        let rewritten = with_privacy(&extracted, &next);
+        let again = decode_privacy(&rewritten);
+        assert_eq!(again, next);
+        assert!(fields(&rewritten).iter().any(|(n, _, _)| *n == 8), "unknown field 8 must survive");
+        assert!(
+            fields(&rewritten).iter().any(|(n, f, _)| *n == 99 && matches!(f, Field::Varint(77))),
+            "unknown field 99 must survive"
+        );
+    }
 
     #[test]
     fn folders_flatten_into_one_order() {

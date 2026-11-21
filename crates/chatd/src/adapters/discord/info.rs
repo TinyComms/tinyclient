@@ -272,6 +272,11 @@ impl Discord {
             .collect();
         let nickname = info.nick.clone();
         let role_names: Vec<String> = roles.map(|role| role.name.clone()).take(protocol::PROFILE_ROLES).collect();
+        let decoded_privacy = super::proto::decode_privacy(&state.privacy_settings);
+        let space_privacy = protocol::SpacePrivacy {
+            allow_dms: !decoded_privacy.restricted_spaces.iter().any(|id| id == guild),
+            allow_requests: !decoded_privacy.request_restricted_spaces.iter().any(|id| id == guild),
+        };
         drop(state);
         let mut channel_overrides = Vec::with_capacity(raw_overrides.len());
         for (channel_id, ch_notify) in raw_overrides {
@@ -301,7 +306,52 @@ impl Discord {
             events,
             mobile_push,
             channel_overrides,
+            privacy: Some(space_privacy),
         })
+    }
+
+    /// Reads our Privacy & Safety settings from the cached `PreloadedUserSettings.privacy` block.
+    pub(super) fn get_network_privacy(&self) -> Result<protocol::NetworkPrivacy, Refusal> {
+        let raw = crate::hub::lock(&self.state).privacy_settings.clone();
+        Ok(super::proto::decode_privacy(&raw))
+    }
+
+    /// Writes updated Privacy & Safety settings to `PATCH /users/@me/settings-proto/1` with
+    /// every unknown protobuf field preserved untouched.
+    pub(super) fn set_network_privacy(&self, privacy: protocol::NetworkPrivacy) -> Result<protocol::NetworkPrivacy, Refusal> {
+        let kept = crate::hub::lock(&self.state).privacy_settings.clone();
+        let updated = super::proto::with_privacy(&kept, &privacy);
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated)});
+        self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+        crate::hub::lock(&self.state).privacy_settings = updated.clone();
+        Ok(super::proto::decode_privacy(&updated))
+    }
+
+    /// Updates a single server's "Allow direct messages" / "Allow message requests" switches
+    /// by adding or removing `guild` in `restricted_guild_ids` / `message_request_restricted_guild_ids`
+    /// and writing `PATCH /users/@me/settings-proto/1`.
+    pub(super) fn set_space_privacy(&self, guild: &str, privacy: protocol::SpacePrivacy) -> Result<(), Refusal> {
+        let kept = {
+            let state = crate::hub::lock(&self.state);
+            if !state.guilds.contains_key(guild) {
+                return Err(refused("This server is gone."));
+            }
+            state.privacy_settings.clone()
+        };
+        let mut net = super::proto::decode_privacy(&kept);
+        net.restricted_spaces.retain(|id| id != guild);
+        if !privacy.allow_dms {
+            net.restricted_spaces.push(guild.to_owned());
+        }
+        net.request_restricted_spaces.retain(|id| id != guild);
+        if !privacy.allow_requests {
+            net.request_restricted_spaces.push(guild.to_owned());
+        }
+        let updated = super::proto::with_privacy(&kept, &net);
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated)});
+        self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+        crate::hub::lock(&self.state).privacy_settings = updated;
+        Ok(())
     }
 
     /// Updates a server's notification level, switches (`suppress_everyone`, `suppress_roles`,

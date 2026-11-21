@@ -69,6 +69,69 @@ pub struct PrivacyException {
     pub chat: bool,
 }
 
+/// Account-level privacy & safety settings (Discord Privacy & Safety / Content & Social).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkPrivacy {
+    /// Anyone on the network may send a friend request.
+    #[serde(default = "yes")]
+    pub friend_requests_everyone: bool,
+    /// Friends of friends may send a friend request.
+    #[serde(default = "yes")]
+    pub friend_requests_mutual_friends: bool,
+    /// Server members may send a friend request.
+    #[serde(default = "yes")]
+    pub friend_requests_mutual_spaces: bool,
+    /// Allow direct messages from server members by default.
+    #[serde(default = "yes")]
+    pub allow_dms_from_spaces: bool,
+    /// Allow message requests from non-friends in servers by default.
+    #[serde(default = "yes")]
+    pub allow_message_requests: bool,
+    /// Explicit-content filter level (0 = off, 1 = non-friends, 2 = everyone).
+    #[serde(default)]
+    pub explicit_content_filter: u8,
+    /// DM spam filter level (0 = off, 1 = non-friends, 2 = everyone).
+    #[serde(default)]
+    pub dm_spam_filter: u8,
+    /// Server ids where DMs from members are restricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restricted_spaces: Vec<String>,
+    /// Server ids where message requests from members are restricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_restricted_spaces: Vec<String>,
+}
+
+impl Default for NetworkPrivacy {
+    fn default() -> NetworkPrivacy {
+        NetworkPrivacy {
+            friend_requests_everyone: true,
+            friend_requests_mutual_friends: true,
+            friend_requests_mutual_spaces: true,
+            allow_dms_from_spaces: true,
+            allow_message_requests: true,
+            explicit_content_filter: 0,
+            dm_spam_filter: 0,
+            restricted_spaces: Vec::new(),
+            request_restricted_spaces: Vec::new(),
+        }
+    }
+}
+
+/// Per-space privacy switches (Discord per-server Privacy Settings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpacePrivacy {
+    #[serde(default = "yes")]
+    pub allow_dms: bool,
+    #[serde(default = "yes")]
+    pub allow_requests: bool,
+}
+
+impl Default for SpacePrivacy {
+    fn default() -> SpacePrivacy {
+        SpacePrivacy { allow_dms: true, allow_requests: true }
+    }
+}
+
 /// Current privacy policy for one [`PrivacyKey`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivacyPolicy {
@@ -361,6 +424,9 @@ pub struct SpaceInfo {
     /// Channels whose notification setting overrides the Space's default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channel_overrides: Vec<SpaceChannelOverride>,
+    /// Per-space privacy switches (Discord: allow DMs and message requests from members).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<SpacePrivacy>,
 }
 
 /// Which of a custom emoji set this account may send.

@@ -989,6 +989,9 @@ impl Discord {
         if let Some(status) = ready.user_settings_proto.as_deref().and_then(proto::status_settings) {
             self.own_status(status);
         }
+        if let Some(privacy) = ready.user_settings_proto.as_deref().and_then(proto::privacy_settings) {
+            self.state.lock().unwrap().privacy_settings = privacy;
+        }
 
         // A few unread conversations are fetched ahead, once per run and never on a reconnect.
         let warm = {

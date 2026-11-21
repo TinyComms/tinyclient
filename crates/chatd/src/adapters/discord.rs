@@ -364,6 +364,8 @@ struct State {
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
     status_settings: Vec<u8>,
+    /// Raw `PreloadedUserSettings.privacy` bytes (field 6), preserved across updates.
+    privacy_settings: Vec<u8>,
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
     covered: HashMap<String, Vec<(u64, u64)>>,
@@ -1904,6 +1906,9 @@ impl Discord {
                     reset_channel.as_deref(),
                 ),
             ),
+            Command::GetNetworkPrivacy { reply } => answer(reply, self.get_network_privacy()),
+            Command::SetNetworkPrivacy { privacy, reply } => answer(reply, self.set_network_privacy(privacy)),
+            Command::SetSpacePrivacy { space_id, privacy, reply } => answer(reply, self.set_space_privacy(&space_id, privacy)),
             Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),

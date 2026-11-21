@@ -1996,6 +1996,7 @@ impl Chat {
             events: about.events,
             mobile_push: about.mobile_push,
             channel_overrides: about.channel_overrides,
+            privacy: about.privacy,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
@@ -2033,6 +2034,41 @@ impl Chat {
             reset_channel,
             reply,
         }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn get_network_privacy(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetNetworkPrivacy { reply }) {
+            Ok(privacy) => Response::NetworkPrivacy { privacy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_network_privacy(&self, account: AccountKey, privacy: protocol::NetworkPrivacy) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetNetworkPrivacy { privacy, reply }) {
+            Ok(privacy) => Response::NetworkPrivacy { privacy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_space_privacy(&self, space: Key, privacy: protocol::SpacePrivacy) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SetSpacePrivacy { space_id, privacy, reply }) {
             Ok(()) => {
                 self.hub.space_infos.forget(&space);
                 Response::Ok
@@ -3319,6 +3355,9 @@ impl Chat {
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
+            Request::GetNetworkPrivacy { account } => self.get_network_privacy(account),
+            Request::SetNetworkPrivacy { account, privacy } => self.set_network_privacy(account, privacy),
+            Request::SetSpacePrivacy { space, privacy } => self.set_space_privacy(space, privacy),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),

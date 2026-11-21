@@ -877,6 +877,34 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
             }
             notify_box = notify_box.child(list);
         }
+        if let Some(priv_opts) = info.privacy {
+            let sk_dms = key.clone();
+            let cur_dms = priv_opts.allow_dms;
+            let cur_reqs = priv_opts.allow_requests;
+            let sk_reqs = key.clone();
+            notify_box = notify_box
+                .child(div().mt(px(6.)).type_micro().font_weight(theme::MEDIUM).text_color(theme::text_faint()).child("PRIVACY"))
+                .child(toggle_row(
+                    "space-priv-dms-row",
+                    "Allow direct messages from members",
+                    None,
+                    draw::switch("space-priv-dms", cur_dms).on_click(cx.listener(move |pane, _, _, cx| {
+                        let next = protocol::SpacePrivacy { allow_dms: !cur_dms, allow_requests: cur_reqs };
+                        let req = Request::SetSpacePrivacy { space: sk_dms.clone(), privacy: next };
+                        pane.set_space_options(req, move |s| s.privacy = Some(next), cx);
+                    })),
+                ))
+                .child(toggle_row(
+                    "space-priv-reqs-row",
+                    "Allow message requests from members",
+                    None,
+                    draw::switch("space-priv-reqs", cur_reqs).on_click(cx.listener(move |pane, _, _, cx| {
+                        let next = protocol::SpacePrivacy { allow_dms: cur_dms, allow_requests: !cur_reqs };
+                        let req = Request::SetSpacePrivacy { space: sk_reqs.clone(), privacy: next };
+                        pane.set_space_options(req, move |s| s.privacy = Some(next), cx);
+                    })),
+                ));
+        }
         top.child(notify_box)
     } else {
         top

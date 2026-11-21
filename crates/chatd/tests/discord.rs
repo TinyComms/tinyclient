@@ -5259,3 +5259,101 @@ fn space_notification_switches_thread_settings_and_channel_overrides() {
     };
     assert_eq!(tinfo2.notify, protocol::Notify::Nothing);
 }
+
+#[test]
+fn privacy_safety_decode_write_and_per_server_dm_switches() {
+    // Craft a PreloadedUserSettings blob containing field 6 (PrivacySettings):
+    // - field 3 (restricted_guild_ids): [4000]
+    // - field 4 (default_guilds_restricted): 1 (true)
+    // - field 8 (unknown BoolValue): 1
+    // - field 12 (friend_source_flags): 8 (mutual guilds only)
+    // - field 18 (default_message_request_restricted): 1 (true)
+    // - field 26 (explicit_content_filter): 2 (non-friends)
+    // - field 27 (dm_spam_filter_v2): 3 (everyone)
+    let mut priv_block = Vec::new();
+    // field 3: packed fixed64 [4000]
+    let g4000 = 4000u64.to_le_bytes();
+    priv_block.extend_from_slice(&[0x1a, 8]);
+    priv_block.extend_from_slice(&g4000);
+    // field 4: varint 1
+    priv_block.extend_from_slice(&[0x20, 1]);
+    // field 8 (unknown): length-delimited [0x08, 0x01]
+    priv_block.extend_from_slice(&[0x42, 2, 0x08, 0x01]);
+    // field 12: UInt32Value(8) => tag (12<<3|2)=0x62, len 2, [0x08, 8]
+    priv_block.extend_from_slice(&[0x62, 2, 0x08, 8]);
+    // field 18: BoolValue(true) => tag (18<<3|2)=0x92,0x01, len 2, [0x08, 1]
+    priv_block.extend_from_slice(&[0x92, 0x01, 2, 0x08, 1]);
+    // field 26: varint 2 => tag (26<<3)=0xd0,0x01, val 2
+    priv_block.extend_from_slice(&[0xd0, 0x01, 2]);
+    // field 27: varint 3 => tag (27<<3)=0xd8,0x01, val 3
+    priv_block.extend_from_slice(&[0xd8, 0x01, 3]);
+
+    let mut outer = Vec::new();
+    // field 6: tag (6<<3|2)=0x32
+    outer.push(0x32);
+    outer.push(priv_block.len() as u8);
+    outer.extend_from_slice(&priv_block);
+    let encoded_proto = base64::engine::general_purpose::STANDARD.encode(&outer);
+
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user_settings_proto"] = json!(encoded_proto);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("account connected", || (world.link() == Link::Connected).then_some(()));
+    let account = world.account();
+
+    // 1. GetNetworkPrivacy reflects READY's privacy block.
+    let initial = match world.ask(Request::GetNetworkPrivacy { account: account.clone() }) {
+        Response::NetworkPrivacy { privacy } => privacy,
+        other => panic!("expected NetworkPrivacy, got {other:?}"),
+    };
+    assert!(!initial.friend_requests_everyone);
+    assert!(!initial.friend_requests_mutual_friends);
+    assert!(initial.friend_requests_mutual_spaces);
+    assert!(!initial.allow_dms_from_spaces);
+    assert!(!initial.allow_message_requests);
+    assert_eq!(initial.explicit_content_filter, 1);
+    assert_eq!(initial.dm_spam_filter, 2);
+    assert_eq!(initial.restricted_spaces, vec!["4000".to_owned()]);
+
+    // SpaceInfo for 4000 shows allow_dms = false, allow_requests = true.
+    let s4000 = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(s4000.privacy, Some(protocol::SpacePrivacy { allow_dms: false, allow_requests: true }));
+
+    // 2. SetNetworkPrivacy sends PATCH /users/@me/settings-proto/1 and preserves unknown field 8.
+    let mut updated = initial.clone();
+    updated.friend_requests_everyone = true;
+    updated.allow_dms_from_spaces = true;
+    updated.dm_spam_filter = 1;
+    let saved = match world.ask(Request::SetNetworkPrivacy { account: account.clone(), privacy: updated.clone() }) {
+        Response::NetworkPrivacy { privacy } => privacy,
+        other => panic!("expected NetworkPrivacy, got {other:?}"),
+    };
+    assert_eq!(saved, updated);
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), 1);
+    let sent_bytes = base64::engine::general_purpose::STANDARD
+        .decode(patches[0].body["settings"].as_str().unwrap())
+        .unwrap();
+    // Unknown field 8 bytes [0x42, 0x02, 0x08, 0x01] must survive intact inside the patched blob.
+    assert!(sent_bytes.windows(4).any(|w| w == [0x42, 2, 0x08, 0x01]), "unknown field 8 was lost on write");
+
+    // 3. SetSpacePrivacy toggles allow_dms=true and allow_requests=false for guild 4000.
+    assert_eq!(
+        world.ask(Request::SetSpacePrivacy {
+            space: world.key("4000"),
+            privacy: protocol::SpacePrivacy { allow_dms: true, allow_requests: false },
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len(), 2);
+    let s4000_after = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(s4000_after.privacy, Some(protocol::SpacePrivacy { allow_dms: true, allow_requests: false }));
+}
