@@ -810,6 +810,7 @@ impl Discord {
             close_direct: true,
             clear_history: false,
             pins: true,
+            blocks: true,
         });
         self.state.lock().unwrap().premium = premium;
     }

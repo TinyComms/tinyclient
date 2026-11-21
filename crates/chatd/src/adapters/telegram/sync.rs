@@ -337,6 +337,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         close_direct: false,
         clear_history: true,
         pins: true,
+        blocks: true,
     }
 }
 

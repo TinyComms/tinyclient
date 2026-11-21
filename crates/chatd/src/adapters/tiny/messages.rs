@@ -91,7 +91,18 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         Vec::new()
     };
     let callable = directs_callable(saved);
-    let has_pins = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_PINS);
+    let caps = super::manage::capabilities_of(saved);
+    let has_pins = caps.has(protocol::TINY_FEATURE_PINS);
+    let blocked_rows = if caps.has(protocol::TINY_FEATURE_BLOCKS) {
+        optional_list::<WireBlock>(saved, "/v1/blocks", "blocks").unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let blocked_ids: HashSet<String> = blocked_rows
+        .iter()
+        .filter(|b| super::safe_id(&b.user_id))
+        .map(|b| b.user_id.clone())
+        .collect();
     let mut people: Vec<PersonRow> = names
         .iter()
         .filter(|(id, _)| super::safe_id(id))
@@ -101,6 +112,15 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             ..PersonRow::default()
         })
         .collect();
+    for block in &blocked_rows {
+        if super::safe_id(&block.user_id) && !people.iter().any(|p| p.id == block.user_id) {
+            people.push(PersonRow {
+                id: block.user_id.clone(),
+                name: title_or(&block.display_name, "Someone"),
+                ..PersonRow::default()
+            });
+        }
+    }
     let mut groups = Vec::new();
     let mut rows = Vec::new();
     let mut noted = Vec::new();
@@ -183,6 +203,12 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             row.call = CallSupport::Native;
         }
         row.can_pin = has_pins;
+        if blocked_ids.contains(&direct.peer.user_id) {
+            row.filing = Some(crate::store::Filing {
+                hidden: true,
+                ..crate::store::Filing::default()
+            });
+        }
         let (e2ee, history) =
             sealed_state(saved, &direct.id, direct.e2ee, direct.plaintext_history);
         row.encryption = encryption_of(saved, &direct.id, e2ee, history);
@@ -225,6 +251,9 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     rows.extend(surviving_rooms);
     if !people.is_empty() {
         let _ = ctx.people(&people);
+    }
+    for id in &blocked_ids {
+        let _ = ctx.relation(id, protocol::Relation::Blocked);
     }
     if ctx.tree(SPACE, &groups, &rows).is_err() {
         return;
@@ -318,6 +347,19 @@ pub(crate) fn on_live(
                 let _ = ctx.pinned(conversation, message, false);
             }
         }
+        "block.updated" => {
+            let user_id = field(frame, "user_id");
+            let blocked = frame.get("blocked").and_then(Value::as_bool).unwrap_or(false);
+            if super::safe_id(user_id) {
+                let rel = if blocked {
+                    protocol::Relation::Blocked
+                } else {
+                    protocol::Relation::None
+                };
+                let _ = ctx.relation(user_id, rel);
+                hide_direct_for_peer(ctx, user_id, blocked);
+            }
+        }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
         // The sealed kind: a reaction blob in an encrypted conversation, opaque to the server.
         // Off the socket's thread: the event only says the server's list moved; the list folds.
@@ -386,6 +428,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "pin.removed"
             | "message.pinned"
             | "message.unpinned"
+            | "block.updated"
             | "reaction.updated"
             | "e2ee.reaction"
             | "read.updated"
@@ -471,6 +514,11 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             reply,
             ..
         } => search(ctx, saved, &query, scope, reply),
+        Command::Relate {
+            person_id,
+            action,
+            reply,
+        } => relate(ctx, saved, &person_id, action, reply),
         Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
@@ -2060,6 +2108,68 @@ fn search(
     }
 }
 
+#[derive(Clone, Deserialize)]
+struct WireBlock {
+    user_id: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+fn hide_direct_for_peer(ctx: &Context, user_id: &str, hidden: bool) {
+    let space = ctx.key(SPACE);
+    let directs = ctx
+        .hub
+        .store()
+        .space_rows_of_kinds(&space, &[ConversationKind::Direct])
+        .unwrap_or_default();
+    for row in directs {
+        if row.peer.as_deref() == Some(user_id) {
+            let _ = ctx.filing(
+                &row.id,
+                &crate::store::Filing {
+                    hidden,
+                    ..crate::store::Filing::default()
+                },
+            );
+        }
+    }
+}
+
+fn relate(
+    ctx: &Context,
+    saved: &Saved,
+    person_id: &str,
+    action: protocol::RelateAction,
+    reply: crate::adapters::Reply<()>,
+) {
+    if !super::safe_id(person_id) {
+        let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+        return;
+    }
+    let (method, blocked) = match action {
+        protocol::RelateAction::Block => ("PUT", true),
+        protocol::RelateAction::Unblock => ("DELETE", false),
+        _ => {
+            let _ = reply.send(Err(Refusal::Unsupported));
+            return;
+        }
+    };
+    let path = format!("/v1/blocks/{person_id}");
+    match super::asked(method, saved, &path, None) {
+        Ok((200 | 204, _)) => {
+            let rel = if blocked {
+                protocol::Relation::Blocked
+            } else {
+                protocol::Relation::None
+            };
+            let _ = ctx.relation(person_id, rel);
+            hide_direct_for_peer(ctx, person_id, blocked);
+            let _ = reply.send(Ok(()));
+        }
+        other => answer_ok(other, reply),
+    }
+}
+
 fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
     if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
         return;
@@ -2414,6 +2524,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
         allow_archives: scans && limits.archives,
         pins: caps.has(protocol::TINY_FEATURE_PINS),
         search: caps.has(protocol::TINY_FEATURE_MESSAGE_SEARCH),
+        blocks: caps.has(protocol::TINY_FEATURE_BLOCKS),
         ..Capabilities::default()
     }
 }

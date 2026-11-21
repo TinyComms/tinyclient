@@ -375,6 +375,8 @@ pub const TINY_FEATURE_FILE_SCAN: &str = "file_scan";
 pub const TINY_FEATURE_PINS: &str = "pins";
 /// Server-side plaintext message search (`GET /v1/search`).
 pub const TINY_FEATURE_MESSAGE_SEARCH: &str = "message_search";
+/// Member block list (`GET/PUT/DELETE /v1/blocks`).
+pub const TINY_FEATURE_BLOCKS: &str = "blocks";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.

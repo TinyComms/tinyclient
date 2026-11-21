@@ -107,6 +107,8 @@ pub(in crate::gui) struct Scene {
     pub close_direct_accounts: Vec<AccountKey>,
     /// Accounts whose server/network supports pinned messages (`Capabilities::pins`).
     pub pins_accounts: Vec<AccountKey>,
+    /// Accounts whose server/network supports blocking (`Capabilities::blocks`).
+    pub blocks_accounts: Vec<AccountKey>,
 }
 
 /// True when this run only draws a state for `--shot`: nothing that changes the user's state on
@@ -376,6 +378,9 @@ impl Shell {
             pins_accounts: snapshot.accounts.iter()
                 .filter(|account| account.can.pins)
                 .map(|account| account.key.clone()).collect(),
+            blocks_accounts: snapshot.accounts.iter()
+                .filter(|account| account.can.blocks)
+                .map(|account| account.key.clone()).collect(),
         }
     }
 
@@ -642,7 +647,11 @@ impl Shell {
 
     /// Answers, withdraws or ends a friendship, or blocks: only ever from a click. The row
     /// changes in place when the network has agreed.
-    fn relate(&mut self, person: &Person, action: RelateAction, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn confirm_block(&mut self, person: Key, cx: &mut Context<Self>) {
+        self.open_float(card::Float::Confirm(person, RelateAction::Block), gpui::Point::default(), cx);
+    }
+
+    pub(in crate::gui) fn relate(&mut self, person: &Person, action: RelateAction, cx: &mut Context<Self>) {
         if only_draws() {
             return;
         }

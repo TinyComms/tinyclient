@@ -803,6 +803,7 @@ fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
         (403, _) => "You can't do that.",
         (409, "last_owner") => "This server needs an owner. Make someone else the owner first.",
         (409, "already_member") => "That person is already on this server.",
+        (409, "block_limit") => "You've reached the maximum number of blocked people.",
         (404, _) if missing == Missing::Member => "That person is no longer on this server.",
         (404, _) if missing == Missing::Invite => "That invite is gone or was already used.",
         (404, _) if missing == Missing::Room => "That room is gone.",

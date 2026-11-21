@@ -313,6 +313,8 @@ pub struct Pane {
     shown: HashSet<String>,
     /// Long code blocks opened, by message and block.
     expanded: HashSet<(String, usize)>,
+    /// Blocked channel messages explicitly revealed by clicking "Show".
+    revealed_blocked: HashSet<String>,
     /// Coloured code, by message and block, so a scroll does not colour the same block again.
     code_colors: HashMap<(String, usize), (u64, Rc<highlight::Lit>)>,
     /// Blocks whose colouring is already running off this thread.
@@ -421,6 +423,7 @@ impl Pane {
             revealed: HashSet::new(),
             shown: HashSet::new(),
             expanded: HashSet::new(),
+            revealed_blocked: HashSet::new(),
             code_colors: HashMap::new(),
             code_coloring: HashSet::new(),
             copied: None,
@@ -552,6 +555,7 @@ impl Pane {
         self.revealed.clear();
         self.shown.clear();
         self.expanded.clear();
+        self.revealed_blocked.clear();
         self.code_colors.clear();
         self.code_coloring.clear();
         self.copied = None;

@@ -451,6 +451,7 @@ impl InfoPane {
             direct: self.row.as_ref().map(|row| (row.call, self.notify_of(row, None) == Notify::Nothing)),
             online: self.online(person.key.network),
             close_direct: super::scene_can_close_direct(&self.scene, &person.key),
+            can_block: self.scene.blocks_accounts.contains(&person.key.account()),
         }
     }
 
@@ -1133,7 +1134,8 @@ impl InfoPane {
                 let person = self.hub.person(key)?;
                 let seen = self.seen(&person);
                 if confirm {
-                    let (_, block) = facts::offers(&person);
+                    let can_block = self.scene.blocks_accounts.contains(&person.key.account());
+                    let (_, block) = facts::offers_with(&person, can_block);
                     return block.then(|| Float::Confirm(key.clone(), RelateAction::Block));
                 }
                 Some(Float::Person { person: key.clone(), seen, alt: false })

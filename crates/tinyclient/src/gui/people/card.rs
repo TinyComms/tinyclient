@@ -257,6 +257,7 @@ impl Floating {
             direct: self.direct.as_ref().map(|row| (row.call, row.muted)),
             online: self.online(person),
             close_direct: super::scene_can_close_direct(&self.scene, person),
+            can_block: self.scene.blocks_accounts.contains(&person.account()),
         }
     }
 

@@ -816,11 +816,55 @@ impl Pane {
                 .into_any_element()
         });
 
+        let blocked_hidden = !message.outgoing
+            && !message.deleted
+            && !message.sender.id.is_empty()
+            && !self.revealed_blocked.contains(&message.id)
+            && self.open.as_ref().is_some_and(|open| !open.kind.is_direct())
+            && self
+                .shell
+                .upgrade()
+                .zip(self.open.as_ref())
+                .is_some_and(|(shell, open)| {
+                    let key = Key::new(&open.key.account(), &message.sender.id);
+                    shell
+                        .read(cx)
+                        .people_state
+                        .hub()
+                        .person(&key)
+                        .is_some_and(|p| p.relation == protocol::Relation::Blocked)
+                });
         let mut sent = div().flex().flex_col();
         if message.deleted {
             // What it said is gone; the row stays for the thread that hangs off it.
             let tombstone = if message.moderated { "Removed by a moderator" } else { "Message deleted" };
             sent = sent.child(div().type_body().italic().text_color(theme::text_faint()).child(tombstone));
+        } else if blocked_hidden {
+            let reveal_id = message.id.clone();
+            sent = sent.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .type_body()
+                    .italic()
+                    .text_color(theme::text_faint())
+                    .child("Blocked message.")
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("reveal-blocked-{}", message.id)))
+                            .not_italic()
+                            .cursor_pointer()
+                            .text_color(theme::text_soft())
+                            .hover(|style| style.underline())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.revealed_blocked.insert(reveal_id.clone());
+                                cx.notify();
+                            }))
+                            .child("Show"),
+                    ),
+            );
         } else {
             let said = match &message.kind {
                 MessageKind::Unsupported { link } => vec![self.unsupported(message, link, cx).into_any_element()],

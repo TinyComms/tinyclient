@@ -354,6 +354,9 @@ pub struct Capabilities {
     /// This account supports pinned messages (`Request::Pinned`, `Request::Pin`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub pins: bool,
+    /// This account supports blocking and unblocking people (`Request::Relate` with Block/Unblock).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blocks: bool,
 }
 
 impl Capabilities {

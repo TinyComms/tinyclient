@@ -260,6 +260,8 @@ struct Target {
     space: Option<String>,
     read_only: bool,
     read_only_reason: String,
+    /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
+    blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
     /// What the account may send.
     can: Capabilities,
@@ -270,6 +272,7 @@ enum Locked {
     SignedOut,
     Expired,
     ReadOnly(String),
+    Blocked(protocol::Person),
     MessageRequest,
 }
 
@@ -279,6 +282,7 @@ impl Target {
             (Link::SignedOut, _) => Some(Locked::SignedOut),
             (Link::Expired, _) => Some(Locked::Expired),
             _ if self.special == protocol::Special::Request => Some(Locked::MessageRequest),
+            _ if self.blocked_peer.is_some() => Some(Locked::Blocked(self.blocked_peer.clone().unwrap())),
             (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Posts in a forum are started in the network's app.".to_owned())),
             _ if self.read_only => {
                 let why = if self.read_only_reason.is_empty() {
@@ -2204,6 +2208,30 @@ impl Composer {
                     })),
                 );
         }
+        if let Locked::Blocked(person) = locked {
+            return div()
+                .h(px(card_height()))
+                .pl(px(12.))
+                .pr(px(6.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(glyph("icons/circle-alert.svg", 16., theme::text_faint()))
+                .child(div().flex_1().min_w_0().truncate().child("You blocked this person."))
+                .child(button("composer-unblock", ButtonKind::Secondary, "Unblock").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let target = person.clone();
+                        let _ = this.shell.update(cx, |shell, cx| {
+                            shell.relate(&target, protocol::RelateAction::Unblock, cx);
+                        });
+                    },
+                )));
+        }
         let name = network.label();
         let (icon, words, action) = match locked {
             Locked::SignedOut => ("icons/lock.svg", format!("{name} is signed out."), Some("Sign in")),
@@ -2213,7 +2241,7 @@ impl Composer {
                 Some("Sign in again"),
             ),
             Locked::ReadOnly(sentence) => ("icons/lock.svg", sentence, None),
-            Locked::MessageRequest => unreachable!(),
+            Locked::MessageRequest | Locked::Blocked(_) => unreachable!(),
         };
         let expired = action == Some("Sign in again");
         div()
@@ -3360,6 +3388,14 @@ impl Shell {
         if open.max_file_bytes > 0 {
             can.max_file_bytes = can.max_file_bytes.max(open.max_file_bytes);
         }
+        let blocked_peer = (kind == ConversationKind::Direct)
+            .then(|| {
+                let peer_id = open.peer.as_deref()?;
+                let peer_key = Key::new(&open.key.account(), peer_id);
+                let person = self.people_state.hub().person(&peer_key)?;
+                (person.relation == protocol::Relation::Blocked).then_some(person)
+            })
+            .flatten();
         let target = Target {
             key: open.key.clone(),
             title: open.title.clone(),
@@ -3368,6 +3404,7 @@ impl Shell {
             space: open.space.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
+            blocked_peer,
             special: open.special,
             can,
         };
@@ -3396,6 +3433,7 @@ impl Shell {
             space: None,
             read_only: false,
             read_only_reason: String::new(),
+            blocked_peer: None,
             special: protocol::Special::None,
             can: self.can_of(thread),
         };
@@ -4004,6 +4042,7 @@ mod tests {
             space: None,
             read_only,
             read_only_reason: String::new(),
+            blocked_peer: None,
             special: protocol::Special::None,
             can: Capabilities::default(),
         }
