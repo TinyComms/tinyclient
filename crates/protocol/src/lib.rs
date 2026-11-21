@@ -1355,11 +1355,25 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         about: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pronouns: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         emoji: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         photo: bool,
+    },
+    /// Sets our own profile picture on a network from a local file path (empty clears it).
+    /// Maps Tiny's `TinyAvatar` onto the shared request.
+    SetAvatar {
+        account: AccountKey,
+        path: String,
+    },
+    /// Sets (or clears, when `None` or empty) our per-space nickname (e.g. Discord guild nickname).
+    SetNickname {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nickname: Option<String>,
     },
     Watch(Watching),
 

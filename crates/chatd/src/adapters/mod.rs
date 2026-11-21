@@ -420,6 +420,24 @@ pub enum Command {
         status: Option<String>,
         reply: Reply<()>,
     },
+    /// Edit our own profile fields on the network. `None` leaves a field unchanged.
+    SetProfile {
+        name: Option<String>,
+        about: Option<String>,
+        pronouns: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set (or clear, when `path` is empty) our own profile picture from a local file path.
+    SetAvatar {
+        path: String,
+        reply: Reply<()>,
+    },
+    /// Set (or clear, when `None` or empty) our per-space nickname.
+    SetNickname {
+        space_id: String,
+        nickname: Option<String>,
+        reply: Reply<()>,
+    },
     /// A registered file is wanted: answer with where and how to fetch it now.
     Download { id: String, url: String, reply: Reply<Download> },
     /// The pane's search asked the network itself: a Space's own search, or one conversation's.
@@ -492,6 +510,9 @@ impl Command {
             | Command::Delete { reply, .. }
             | Command::Relate { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::SetProfile { reply, .. }
+            | Command::SetAvatar { reply, .. }
+            | Command::SetNickname { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

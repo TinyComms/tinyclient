@@ -351,11 +351,28 @@ pub struct Capabilities {
     /// (`Request::ClearHistory`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub clear_history: bool,
+    /// Per-field own-profile edit capabilities (`Request::SetProfile`, `Request::SetAvatar`,
+    /// `Request::SetNickname`). The shell shows only the fields the network accepts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_name: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_about: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_pronouns: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_avatar: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_nickname: bool,
 }
 
 impl Capabilities {
     pub fn is_none(&self) -> bool {
         *self == Capabilities::default()
+    }
+
+    /// True if any own-profile field (name, about, pronouns, avatar) can be edited on this network.
+    pub fn can_edit_profile(&self) -> bool {
+        self.profile_name || self.profile_about || self.profile_pronouns || self.profile_avatar
     }
 }
 
@@ -539,5 +556,42 @@ pub struct Keychain {
 impl Keychain {
     pub fn is_settled(&self) -> bool {
         *self == Keychain::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AccountKey, Key, Network, Request};
+
+    #[test]
+    fn profile_edit_capabilities_and_requests_round_trip() {
+        let mut can = Capabilities::default();
+        assert!(!can.can_edit_profile());
+        can.profile_about = true;
+        assert!(can.can_edit_profile());
+        let json = serde_json::to_string(&can).unwrap();
+        let back: Capabilities = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, can);
+
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let reqs = [
+            Request::SetProfile {
+                account: account.clone(),
+                name: Some("Ada".into()),
+                about: Some("Builder".into()),
+                pronouns: Some("she/her".into()),
+                emoji: None,
+                username: None,
+                photo: false,
+            },
+            Request::SetAvatar { account: account.clone(), path: "/tmp/avatar.png".into() },
+            Request::SetNickname { space: Key::new(&account, "guild-1"), nickname: Some("Ada!".into()) },
+        ];
+        for req in reqs {
+            let s = serde_json::to_string(&req).unwrap();
+            let got: Request = serde_json::from_str(&s).unwrap();
+            assert_eq!(got, req);
+        }
     }
 }

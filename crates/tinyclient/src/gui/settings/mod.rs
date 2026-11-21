@@ -158,6 +158,7 @@ pub(super) enum Confirm {
     Clear,
     Reset,
     TinyEverywhere(Box<AccountStatus>),
+    EditProfile(Box<AccountStatus>),
 }
 
 /// Which device menu is open.
@@ -434,6 +435,10 @@ pub struct SettingsWindow {
     /// Custom proxy host and port for Settings › General › Network (GN2).
     pub(super) proxy_host: Entity<TextInput>,
     pub(super) proxy_port: Entity<TextInput>,
+    /// Own-profile edit fields for Settings › Accounts › Edit profile modal.
+    pub(super) profile_name: Entity<TextInput>,
+    pub(super) profile_about: Entity<TextInput>,
+    pub(super) profile_pronouns: Entity<TextInput>,
     /// The Linux passphrase for the screen lock. Other systems use the device prompt.
     #[cfg(target_os = "linux")]
     lock_phrase: Entity<TextInput>,
@@ -476,6 +481,9 @@ impl SettingsWindow {
             }
             input
         });
+        let profile_name = cx.new(|cx| TextInput::new("Display name", cx));
+        let profile_about = cx.new(|cx| TextInput::new("About me", cx));
+        let profile_pronouns = cx.new(|cx| TextInput::new("Pronouns", cx));
         #[cfg(target_os = "linux")]
         let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
@@ -557,6 +565,9 @@ impl SettingsWindow {
             notify_keywords,
             proxy_host,
             proxy_port,
+            profile_name,
+            profile_about,
+            profile_pronouns,
             #[cfg(target_os = "linux")]
             lock_phrase,
             _subscriptions: subscriptions,

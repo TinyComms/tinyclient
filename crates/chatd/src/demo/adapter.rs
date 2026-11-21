@@ -655,6 +655,22 @@ impl Demo {
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
             }
+            Command::SetProfile { name, about, pronouns: _, reply } => {
+                if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+                    demo.me.name = name;
+                }
+                if let Some(about) = about {
+                    let (presence, _) = demo.hub.shown(&demo.key(&demo.me.id));
+                    demo.ctx.presence(&demo.me.id, presence, &about, true);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetAvatar { path: _, reply } => {
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetNickname { space_id: _, nickname: _, reply } => {
+                let _ = reply.send(Ok(()));
+            }
             Command::Profile { person_id, reply } => drop(reply.send(Ok(demo.about(&person_id, None)))),
             Command::ProfileIn { person_id, space_id, reply } => drop(reply.send(Ok(demo.about(&person_id, Some(&space_id))))),
             Command::ConversationInfo { conversation_id, reply } => drop(reply.send(demo.conversation_about(&conversation_id))),
