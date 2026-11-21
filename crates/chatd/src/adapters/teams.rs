@@ -305,6 +305,9 @@ struct State {
     me: String,
     /// Set by any call that finds the session over, so the push thread ends it.
     expired: Option<String>,
+    /// Latest `clientTimestamp` (ms) written or applied per conversation for `consumptionhorizon`,
+    /// so stale out-of-order `ConversationUpdate` echoes cannot rewind a newer local read.
+    horizon_ms: HashMap<String, i64>,
     people: HashMap<String, Known>,
     /// What was already written this run and need not be again: pictures registered, and
     /// the names of reactions learned.
@@ -1084,9 +1087,12 @@ impl Teams {
             return Ok(());
         }
         // Teams keeps one marker for a channel, its reply chains included.
-        let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread_of(conversation)));
-        let horizon = json!({"consumptionhorizon": format!("{message};{};{message}", now_ms())});
+        let thread = thread_of(conversation);
+        let ts = now_ms();
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread));
+        let horizon = json!({"consumptionhorizon": format!("{message};{ts};{message}")});
         self.chat("PUT", &path, Body::Json(&horizon), true)?;
+        self.state().horizon_ms.insert(thread.to_owned(), ts);
         if let Some((channel, root)) = chain_of(conversation) {
             self.clear_chain_unread(channel, root)?;
         }
@@ -1097,12 +1103,15 @@ impl Teams {
     /// as read, or `"0"` when marking from the very start) so "Mark as unread" syncs across devices.
     fn mark_unread(&self, conversation: &str, message: &str) -> Result<(), Fault> {
         let marker = if millis(message) >= 1_000_000_000_000 { message } else { "0" };
+        let thread = thread_of(conversation);
+        let ts = now_ms();
         let path = format!(
             "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
-            escaped(thread_of(conversation))
+            escaped(thread)
         );
-        let horizon = json!({"consumptionhorizon": format!("{marker};{};{marker}", now_ms())});
+        let horizon = json!({"consumptionhorizon": format!("{marker};{ts};{marker}")});
         self.chat("PUT", &path, Body::Json(&horizon), true)?;
+        self.state().horizon_ms.insert(thread.to_owned(), ts);
         Ok(())
     }
 }

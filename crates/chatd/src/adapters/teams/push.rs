@@ -265,10 +265,19 @@ impl Teams {
             self.ctx.set_note(&format!("notify:{id}"), super::info::notify_word(level));
             self.ctx.muted(id, level == protocol::Notify::Nothing)?;
         }
-        let horizon = props["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
+        let mut parts = props["consumptionhorizon"].as_str().into_iter().flat_map(|h| h.split(';'));
+        let horizon = parts.next();
+        let client_ts = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
         let Some(read) = horizon.filter(|read| *read == "0" || super::millis(read) > 0) else {
             return Ok(());
         };
+        if client_ts > 0 {
+            let mut state = self.state();
+            if state.horizon_ms.get(id).is_some_and(|&prev_ts| client_ts < prev_ts) {
+                return Ok(());
+            }
+            state.horizon_ms.insert(id.to_owned(), client_ts);
+        }
         let newest = match conversation["lastMessage"]["id"].as_str() {
             Some(newest) => Some(newest.to_owned()),
             None => self.ctx.newest(id)?,

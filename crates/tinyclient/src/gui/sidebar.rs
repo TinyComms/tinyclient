@@ -2230,11 +2230,7 @@ impl Shell {
         if modal.busy {
             return;
         }
-        let code = modal
-            .preview
-            .as_ref()
-            .map(|p| p.code.clone())
-            .unwrap_or_else(|| modal.input.read(cx).text().trim().to_owned());
+        let code = modal.input.read(cx).text().trim().to_owned();
         if code.is_empty() {
             modal.error = Some("Enter an invite link or code.".to_owned());
             cx.notify();

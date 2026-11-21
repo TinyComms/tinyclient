@@ -1268,7 +1268,7 @@ impl Discord {
         };
         let context = base64::engine::general_purpose::STANDARD.encode(json!({"location": "Add Friend"}).to_string());
         self.rest
-            .call_with("POST", "/users/@me/relationships", Some(body), &[("X-Context-Properties", &context)])
+            .call_once_with("POST", "/users/@me/relationships", Some(body), &[("X-Context-Properties", &context)])
             .map(drop)
             .map_err(add_friend_refusal)
     }
@@ -1358,7 +1358,7 @@ impl Discord {
         let path = format!("/invites/{}", escaped(&code));
         let body = self
             .rest
-            .call_with("POST", &path, Some(json!({})), &[("X-Context-Properties", &context)])
+            .call_once_with("POST", &path, Some(json!({})), &[("X-Context-Properties", &context)])
             .map_err(invite_refusal)?;
         let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         let space_id = parsed

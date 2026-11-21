@@ -1316,7 +1316,11 @@ impl Teams {
             let state = self.state();
             (
                 state.own_meta.get(&(conversation.to_owned(), raw_id.to_owned())).cloned(),
-                state.scheduled.get(raw_id).copied(),
+                state
+                    .scheduled
+                    .get(raw_id)
+                    .copied()
+                    .or_else(|| (raw_id != id).then(|| stored.as_ref().map(|m| m.sent)).flatten()),
             )
         };
         let (kept_subject, body_text) = match meta.as_ref().and_then(|meta| meta.subject.as_deref()) {

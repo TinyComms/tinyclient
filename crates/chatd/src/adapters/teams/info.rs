@@ -240,6 +240,15 @@ impl Teams {
                 message: "Only Teams chats can be pinned here.".to_owned(),
             });
         }
+        if pin {
+            let state = self.state();
+            if !state.pinned_chats.iter().any(|id| id == thread) && state.pinned_chats.len() >= 15 {
+                return Err(Fault::Refused {
+                    status: 400,
+                    message: "Teams allows at most 15 pinned chats.".to_owned(),
+                });
+            }
+        }
         let path = format!("/v1/users/ME/conversations/{}/properties?name=pinned", escaped(thread));
         self.chat("PUT", &path, Body::Json(&json!({"pinned": if pin { "true" } else { "false" }})), false)?;
         let pin_pos = {
@@ -248,12 +257,6 @@ impl Teams {
                 if let Some(pos) = state.pinned_chats.iter().position(|id| id == thread) {
                     Some(pos as i32)
                 } else {
-                    if state.pinned_chats.len() >= 15 {
-                        return Err(Fault::Refused {
-                            status: 400,
-                            message: "Teams allows at most 15 pinned chats.".to_owned(),
-                        });
-                    }
                     state.pinned_chats.push(thread.to_owned());
                     Some((state.pinned_chats.len() - 1) as i32)
                 }

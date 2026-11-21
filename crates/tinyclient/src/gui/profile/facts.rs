@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn calls_are_native_handed_off_or_absent_by_network_and_never_for_apps() {
-        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false, can_block: false };
+        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false, can_block: false, can_friend_nickname: false };
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(actions(&tess, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Huddle in Slack".into())));
         let omar = person(Network::Teams, Relation::Contact);

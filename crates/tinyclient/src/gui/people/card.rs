@@ -915,7 +915,7 @@ impl Floating {
         let req = Request::SetFriendNickname { person, nickname };
         self.nick_error = None;
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { crate::ask(&req) }).await;
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
             let _ = this.update(cx, |this, cx| match answer {
                 Ok(Response::Ok) => this.close(cx),
                 Ok(Response::Error { detail, .. }) => {

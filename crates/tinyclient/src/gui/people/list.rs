@@ -1082,7 +1082,7 @@ impl PeopleList {
         cx.notify();
         let request = Request::AddFriend { account, username };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { crate::ask(&request) }).await;
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.adding_friend = false;
                 match answer {
