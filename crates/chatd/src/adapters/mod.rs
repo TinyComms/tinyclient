@@ -508,11 +508,24 @@ pub enum Command {
         folder_remove: Option<String>,
         reply: Reply<()>,
     },
-    /// Star or unstar one message on the network (Google Messages).
+    /// Star or unstar one message on the network (Google Messages, Slack Later).
     StarMessage {
         conversation_id: String,
         message_id: String,
         starred: bool,
+        reply: Reply<()>,
+    },
+    /// Saved / starred messages across the account (or one conversation when set), newest first.
+    StarredMessages {
+        conversation_id: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<Message>>,
+    },
+    /// Set or cancel a network reminder on one message (Slack `reminders.add` / `reminders.delete`).
+    Remind {
+        conversation_id: String,
+        message_id: String,
+        remind_at: Option<i64>,
         reply: Reply<()>,
     },
     /// Accept or decline/ignore a message request (Discord).
@@ -702,9 +715,11 @@ impl Command {
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
             | Command::File { reply, .. }
-            | Command::StarMessage { reply, .. } => {
+            | Command::StarMessage { reply, .. }
+            | Command::Remind { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

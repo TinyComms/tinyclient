@@ -595,6 +595,9 @@ pub struct Capabilities {
     /// This account supports browsing unjoined public channels, previewing, and joining them (`BrowseChannels`, `PreviewChannel`, `Join`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub browse_channels: bool,
+    /// This account supports saving/starring messages for Later and setting network reminders (`StarMessage`, `StarredMessages`, `Remind`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub save_messages: bool,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].

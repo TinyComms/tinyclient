@@ -468,10 +468,41 @@ impl Fake {
                 "snooze_endtime": 0,
             }))),
             "dnd.teamInfo" => Some(json!({"ok": true, "users": {}})),
-            // A conversation star is the channel alone. A timestamp would star a message.
             "stars.add" | "stars.remove" => {
-                if channel.is_empty() || !param("timestamp").is_empty() {
+                if channel.is_empty() {
                     return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
+            "stars.list" => {
+                Some(json!({
+                    "ok": true,
+                    "items": [{
+                        "type": "message",
+                        "channel": "C0GEN",
+                        "message": {"type": "message", "ts": ROOT, "user": "U0ANA", "text": "Saved item"},
+                        "date_create": 1760000500
+                    }]
+                }))
+            }
+            "reminders.add" => {
+                if param("text").is_empty() || param("time").is_empty() {
+                    return refused("cannot_parse");
+                }
+                Some(json!({
+                    "ok": true,
+                    "reminder": {
+                        "id": "Rm01SAVE",
+                        "text": param("text"),
+                        "time": param("time").parse::<i64>().unwrap_or(0),
+                        "complete_ts": 0
+                    }
+                }))
+            }
+            "reminders.list" => Some(json!({"ok": true, "reminders": []})),
+            "reminders.complete" | "reminders.delete" => {
+                if param("reminder").is_empty() {
+                    return refused("not_found");
                 }
                 Some(json!({"ok": true}))
             }
@@ -4030,4 +4061,89 @@ fn slack_share_forward_with_note_and_distinct_received_share() {
     assert_eq!(shared.author, "Nia");
     assert_eq!(shared.text, "The order shipped");
     assert_eq!(shared.link, "https://alpha.slack.com/archives/C0BUY/p1760000100000100");
+}
+
+#[test]
+fn slack_save_for_later_and_reminders() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (!m.is_empty()).then_some(m)
+    });
+    let target = msgs[0].id.clone();
+
+    // Save for later -> stars.add with channel + timestamp, flips message.starred = true.
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            starred: true,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.fake.calls(ALPHA, "stars.add").iter().any(|c| {
+            c.params.get("channel").map(String::as_str) == Some("C0GEN")
+                && c.params.get("timestamp").map(String::as_str) == Some(target.as_str())
+        }),
+        "expected stars.add with channel and timestamp"
+    );
+    assert!(world.message(&general, &target).unwrap().starred);
+
+    // Listing Later items fetches stars.list and returns saved messages.
+    let Response::Pinned { messages: saved, .. } = world.ask(Request::StarredMessages {
+        account: general.account(),
+        conversation: None,
+        limit: 50,
+    }) else {
+        panic!("expected Pinned response for StarredMessages");
+    };
+    assert!(!saved.is_empty(), "expected saved items from stars.list");
+    assert!(saved.iter().all(|m| m.starred));
+
+    // Remove from Later -> stars.remove with channel + timestamp, flips message.starred = false.
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            starred: false,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.fake.calls(ALPHA, "stars.remove").iter().any(|c| {
+            c.params.get("channel").map(String::as_str) == Some("C0GEN")
+                && c.params.get("timestamp").map(String::as_str) == Some(target.as_str())
+        }),
+        "expected stars.remove with channel and timestamp"
+    );
+    assert!(!world.message(&general, &target).unwrap().starred);
+
+    // Set a reminder on a message -> calls reminders.add and stores reminder.
+    let future = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+    assert_eq!(
+        world.ask(Request::Remind {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            remind_at: Some(future),
+        }),
+        Response::Ok
+    );
+    let added = world.fake.calls(ALPHA, "reminders.add");
+    assert_eq!(added.len(), 1, "expected reminders.add call");
+    assert_eq!(added[0].params.get("time").map(String::as_str), Some(future.to_string().as_str()));
+
+    // Cancel the reminder -> calls reminders.delete.
+    assert_eq!(
+        world.ask(Request::Remind {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            remind_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "reminders.delete").len(), 1, "expected reminders.delete call");
 }

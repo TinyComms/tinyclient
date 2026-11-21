@@ -2752,11 +2752,24 @@ impl Chat {
                 })
             }
             Request::Remind { conversation, message_id, remind_at } => {
-                if !self.shows(&conversation.account()) {
+                let account = conversation.account();
+                if !self.shows(&account) {
                     return error(ErrorCode::NotFound, "signed out");
                 }
                 if remind_at.is_some_and(|due| due <= now()) {
                     return error(ErrorCode::Refused, "That time has passed.");
+                }
+                if self.online(&account).is_ok() {
+                    if let Err(refused) = self.ask(&account, |reply| Command::Remind {
+                        conversation_id: conversation.id.clone(),
+                        message_id: message_id.clone(),
+                        remind_at,
+                        reply,
+                    }) {
+                        if !matches!(*refused, Response::Error { code: ErrorCode::Unsupported, .. }) {
+                            return *refused;
+                        }
+                    }
                 }
                 match self.hub.store().remind(&conversation, &message_id, remind_at) {
                     Ok(crate::store::RemindOutcome::Set | crate::store::RemindOutcome::Cleared) => {
@@ -3001,6 +3014,22 @@ impl Chat {
             Request::StarredMessages { account, conversation, limit } => {
                 let conv_id = conversation.as_ref().map(|c| c.id.clone());
                 let key = conversation.unwrap_or_else(|| Key::new(&account, ""));
+                if self.online(&account).is_ok() {
+                    match self.ask(&account, |reply| Command::StarredMessages {
+                        conversation_id: conv_id.clone(),
+                        limit,
+                        reply,
+                    }) {
+                        Ok(mut messages) => {
+                            messages.iter_mut().for_each(Message::bound);
+                            return Response::Pinned { conversation: key, messages };
+                        }
+                        Err(refused) if !matches!(*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                            return *refused;
+                        }
+                        Err(_) => {}
+                    }
+                }
                 match self.hub.store().starred_messages(&account, conv_id.as_deref(), limit) {
                     Ok(mut messages) => {
                         messages.iter_mut().for_each(Message::bound);

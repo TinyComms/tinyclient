@@ -1012,6 +1012,12 @@ impl Demo {
             Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
+            Command::StarredMessages { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)));
+            }
+            Command::Remind { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)));
+            }
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

@@ -195,6 +195,12 @@ fn reason(fault: Fault) -> String {
             "already_pinned" => "This message is already pinned.",
             "no_pin" => "This message is not pinned.",
             "not_pinnable" => "This message cannot be pinned.",
+            "cannot_parse" => "Slack could not understand that reminder time.",
+            "time_in_past" => "That reminder time has already passed.",
+            "cannot_add_bot" => "Slack cannot set reminders for bots.",
+            "cannot_add_others" => "This workspace does not let you set reminders for other people.",
+            "not_found" => "Slack could not find that reminder.",
+            "no_item_specified" => "Slack needs a message to save for later.",
             "too_long" => "That text is too long for Slack (250 character limit).",
             "msg_too_long" => "The message is too long for Slack.",
             "is_archived" => "This channel is archived.",
@@ -279,6 +285,8 @@ struct State {
     info_asked: HashMap<String, Instant>,
     /// The card last read for each person, answered again inside that hour.
     abouts: HashMap<String, About>,
+    /// Active Slack reminder ids keyed by `(channel_id, message_id)` so cancel calls `reminders.delete`.
+    reminders: HashMap<(String, String), String>,
 }
 
 /// `users.info` is asked about one person at most this often.
@@ -297,7 +305,18 @@ struct Pacer {
 /// Slack does not say whether the web client's token is counted by the same tiers.
 fn per_minute(method: &str) -> f64 {
     match method {
-        "users.setPresence" | "reactions.remove" | "emoji.list" | "usergroups.list" | "dnd.setSnooze" | "stars.add" | "stars.remove" => 20.,
+        "users.setPresence"
+        | "reactions.remove"
+        | "emoji.list"
+        | "usergroups.list"
+        | "dnd.setSnooze"
+        | "stars.add"
+        | "stars.remove"
+        | "stars.list"
+        | "reminders.add"
+        | "reminders.list"
+        | "reminders.complete"
+        | "reminders.delete" => 20.,
         "conversations.members" | "users.info" | "users.profile.get" => 100.,
         // One message a second per channel, and the sign-in check is in a tier of its own.
         "chat.postMessage" | "auth.test" => 60.,
@@ -1404,6 +1423,15 @@ impl Slack {
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
+            Command::StarMessage { conversation_id, message_id, starred, reply } => {
+                answer(reply, self.star_message(&conversation_id, &message_id, starred))
+            }
+            Command::StarredMessages { conversation_id, limit, reply } => {
+                answer(reply, self.starred_messages(conversation_id.as_deref(), limit))
+            }
+            Command::Remind { conversation_id, message_id, remind_at, reply } => {
+                answer(reply, self.remind_message(&conversation_id, &message_id, remind_at))
+            }
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
             Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
                 answer(reply, self.pin(&conversation_id, &message_id, pinned))
@@ -1766,10 +1794,128 @@ impl Slack {
 
     /// A `star_added` or `star_removed` for a conversation. A message star changes nothing here.
     fn star_heard(&self, event: &Value) -> Result<(), Failure> {
-        let Some((id, starred)) = conversation_star(event) else {
-            return Ok(());
+        if let Some((id, starred)) = conversation_star(event) {
+            return self.ctx.starred(&id, starred).map_err(|err| Failure::Dropped(err.to_string()));
+        }
+        let starred = event["type"] == "star_added";
+        let item = &event["item"];
+        if item["type"] == "message" {
+            let channel = item["channel"].as_str().unwrap_or("");
+            let ts = item["message"]["ts"].as_str().or_else(|| item["ts"].as_str()).unwrap_or("");
+            if !channel.is_empty() && !ts.is_empty() {
+                if let Ok(Some(mut msg)) = self.ctx.stored_message(channel, ts) {
+                    msg.starred = starred;
+                    self.ctx.message(channel, &msg)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Saves or removes a message in Slack Later (`stars.add` / `stars.remove` with channel + timestamp).
+    fn star_message(&self, conversation_id: &str, message_id: &str, starred: bool) -> Result<(), Fault> {
+        let channel = thread_of(conversation_id).map_or(conversation_id, |(c, _)| c);
+        match self.api(star_method(starred), &[("channel", channel), ("timestamp", message_id)]) {
+            Err(Fault::Slack(error)) if error == "already_starred" || error == "not_starred" => {}
+            other => {
+                other?;
+            }
+        }
+        if let Ok(Some(mut stored)) = self.ctx.stored_message(conversation_id, message_id) {
+            stored.starred = starred;
+            self.ctx.message(conversation_id, &stored).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        if conversation_id != channel {
+            if let Ok(Some(mut stored)) = self.ctx.stored_message(channel, message_id) {
+                stored.starred = starred;
+                self.ctx.message(channel, &stored).map_err(|err| Fault::Net(err.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists messages saved for Later from Slack (`stars.list`), newest first.
+    fn starred_messages(&self, conversation_id: Option<&str>, limit: u32) -> Result<Vec<Message>, Fault> {
+        let count = limit.clamp(1, 100).to_string();
+        let listed = self.api("stars.list", &[("count", count.as_str())])?;
+        let filter_channel = conversation_id.map(|c| thread_of(c).map_or(c, |(ch, _)| ch));
+        let mut out = Vec::new();
+        for item in listed["items"].as_array().into_iter().flatten() {
+            if item["type"] != "message" {
+                continue;
+            }
+            let Some(channel) = item["channel"].as_str().filter(|c| !c.is_empty()) else {
+                continue;
+            };
+            if filter_channel.is_some_and(|want| want != channel) {
+                continue;
+            }
+            if let Some(mut msg) = self.message(channel, &item["message"]) {
+                msg.starred = true;
+                out.push(msg);
+            }
+        }
+        out.sort_by_key(|m| std::cmp::Reverse(m.sent));
+        out.truncate(limit.clamp(1, 200) as usize);
+        Ok(out)
+    }
+
+    /// Sets or cancels a Slack reminder for a message (`reminders.add` / `reminders.delete`).
+    fn remind_message(&self, conversation_id: &str, message_id: &str, remind_at: Option<i64>) -> Result<(), Fault> {
+        let (channel, thread) = match thread_of(conversation_id) {
+            Some((c, root)) => (c, Some(root)),
+            None => (conversation_id, None),
         };
-        self.ctx.starred(&id, starred).map_err(|err| Failure::Dropped(err.to_string()))
+        let key = (channel.to_owned(), message_id.to_owned());
+        match remind_at {
+            Some(due) => {
+                let link = self.permalink(channel, message_id, thread.filter(|r| *r != message_id));
+                let snippet = self
+                    .ctx
+                    .stored_message(conversation_id, message_id)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.text)
+                    .unwrap_or_default();
+                let text = if snippet.is_empty() {
+                    link
+                } else {
+                    format!("{snippet} ({link})")
+                };
+                let time = due.to_string();
+                let added = self.api("reminders.add", &[("text", text.as_str()), ("time", time.as_str())])?;
+                if let Some(id) = added["reminder"]["id"].as_str().filter(|s| !s.is_empty()) {
+                    self.state().reminders.insert(key, id.to_owned());
+                }
+                Ok(())
+            }
+            None => {
+                let existing = self.state().reminders.remove(&key);
+                if let Some(id) = existing {
+                    self.reminder_delete(&id)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn reminders_list(&self) -> Result<Vec<Value>, Fault> {
+        let listed = self.api("reminders.list", &[])?;
+        Ok(listed["reminders"].as_array().cloned().unwrap_or_default())
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn reminder_complete(&self, reminder_id: &str) -> Result<(), Fault> {
+        self.api("reminders.complete", &[("reminder", reminder_id)])?;
+        Ok(())
+    }
+
+    pub(super) fn reminder_delete(&self, reminder_id: &str) -> Result<(), Fault> {
+        match self.api("reminders.delete", &[("reminder", reminder_id)]) {
+            Err(Fault::Slack(error)) if error == "not_found" => Ok(()),
+            other => other.map(drop),
+        }
     }
 
     /// Adds or takes back our reaction. The store already shows it; Slack's own event for it
@@ -2212,6 +2358,7 @@ fn capabilities() -> protocol::Capabilities {
         bookmarks: true,
         browse_channels: true,
         archive: true,
+        save_messages: true,
         ..protocol::Capabilities::default()
     }
 }
