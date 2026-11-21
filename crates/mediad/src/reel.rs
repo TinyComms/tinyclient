@@ -139,6 +139,8 @@ pub struct Reel {
     format: Box<dyn FormatReader>,
     track: u32,
     time_base: TimeBase,
+    /// Milliseconds, from the video track. The clock when the file has no audio.
+    duration: u32,
     nal_length: usize,
     sets: Vec<u8>,
     decoder: Box<dyn RgbDecode>,
@@ -179,10 +181,16 @@ impl Reel {
             .ok_or_else(|| UNREADABLE.to_owned())?;
         let track = video.id;
         let time_base = video.codec_params.time_base.ok_or_else(|| UNREADABLE.to_owned())?;
+        let frames = video.codec_params.n_frames.unwrap_or(0).saturating_sub(
+            u64::from(video.codec_params.delay.unwrap_or(0)) + u64::from(video.codec_params.padding.unwrap_or(0)),
+        );
+        let time = time_base.calc_time(frames);
+        let duration = (time.seconds as f64 * 1000. + time.frac * 1000.).round() as u32;
         Ok(Reel {
             format,
             track,
             time_base,
+            duration,
             nal_length: config.nal_length,
             sets: config.parameter_sets,
             decoder: open_decoder()?,
@@ -194,6 +202,11 @@ impl Reel {
             last_emit: 0,
             shown: None,
         })
+    }
+
+    /// Milliseconds, or 0 when the container does not say.
+    pub fn duration(&self) -> u32 {
+        self.duration
     }
 
     pub fn seek(&mut self, at: u32) -> Result<(), String> {

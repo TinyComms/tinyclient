@@ -4,7 +4,8 @@
 //!
 //! The loop decodes only as far ahead as the speaker needs ([`AHEAD`]); the rest of the time it
 //! waits on chatd's next word or on the speaker draining. A round video message also demuxes its
-//! H.264 picture ([`crate::reel`]) and sends frames. Its sound is silence while it is muted.
+//! H.264 picture ([`crate::reel`]) and sends frames. Its sound is silence while it is muted, and
+//! when the file has no audio track. A track that will not decode is still a failure.
 
 use crate::audio::Speaker;
 use crate::decode::Source;
@@ -22,6 +23,51 @@ use std::time::Duration;
 const AHEAD: Duration = Duration::from_millis(250);
 /// How often the speaker is looked at while it holds enough.
 const NAP: Duration = Duration::from_millis(20);
+/// Silence for a video with no audio track, one voice frame at a time, so the picture keeps up.
+const SILENT_MS: u32 = 20;
+
+/// What the speaker is fed. A file with an audio track, or silence the length of a picture
+/// whose container has none.
+enum Sound {
+    File(Source),
+    Silent { duration: u32, cursor: u32 },
+}
+
+impl Sound {
+    fn duration(&self) -> u32 {
+        match self {
+            Sound::File(source) => source.duration(),
+            Sound::Silent { duration, .. } => *duration,
+        }
+    }
+
+    fn seek(&mut self, at: u32) -> Result<u32, String> {
+        match self {
+            Sound::File(source) => source.seek(at),
+            Sound::Silent { duration, cursor } => {
+                *cursor = at.min(*duration);
+                Ok(at)
+            }
+        }
+    }
+
+    /// Appends the next piece. False once, with nothing added, at the end.
+    fn read(&mut self, out: &mut Vec<f32>) -> Result<bool, String> {
+        match self {
+            Sound::File(source) => source.read(out),
+            Sound::Silent { duration, cursor } => {
+                if *cursor >= *duration {
+                    return Ok(false);
+                }
+                let step = SILENT_MS.min(*duration - *cursor);
+                let frames = (u64::from(step) * u64::from(RATE) / 1000) as usize;
+                out.resize(out.len() + frames * CHANNELS, 0.);
+                *cursor += step;
+                Ok(true)
+            }
+        }
+    }
+}
 
 /// One event to chatd. A closed pipe is chatd gone, and with it whoever wanted to hear this:
 /// `out::write` exits.
@@ -96,13 +142,25 @@ pub fn run() -> io::Result<()> {
         }
         _ => return Ok(()),
     };
-    let mut source = Source::open(Path::new(&path)).unwrap_or_else(|detail| fail(detail));
-    let mut reel = if round {
-        Some(Reel::open(Path::new(&path)).unwrap_or_else(|detail| fail(detail)))
+    let file = Path::new(&path);
+    let opened = Source::open(file);
+    // `NO_AUDIO` is a video container with no audio track. Anything else, including a track
+    // this build cannot decode, still fails before the picture is opened.
+    let no_audio = opened.as_ref().is_err_and(|detail| detail == crate::decode::NO_AUDIO);
+    let mut reel = if round && (opened.is_ok() || no_audio) {
+        Some(Reel::open(file).unwrap_or_else(|detail| fail(detail)))
     } else {
         None
     };
-    let duration = source.duration();
+    let mut sound = match opened {
+        Ok(source) => Sound::File(source),
+        Err(_) if no_audio => match reel.as_ref() {
+            Some(picture) => Sound::Silent { duration: picture.duration(), cursor: 0 },
+            None => fail(crate::decode::NO_AUDIO.to_owned()),
+        },
+        Err(detail) => fail(detail),
+    };
+    let duration = sound.duration();
     let mut speaker = Speaker::open(output.as_deref()).unwrap_or_else(|err| {
         tracing::warn!("mediad: speaker: {err:?}");
         fail("The speaker could not be opened.")
@@ -110,7 +168,7 @@ pub fn run() -> io::Result<()> {
     let mut stretch = Stretch::new(rate_of(rate));
     let mut clock = Clock { from: 0, read: 0 };
     if at > 0 && (duration == 0 || at < duration) {
-        clock.from = source.seek(at).unwrap_or_else(|detail| fail(detail));
+        clock.from = sound.seek(at).unwrap_or_else(|detail| fail(detail));
         if let Some(reel) = &mut reel {
             reel.seek(at).unwrap_or_else(|detail| fail(detail));
         }
@@ -128,7 +186,7 @@ pub fn run() -> io::Result<()> {
                 speaker.clear();
                 let rate = stretch.rate();
                 stretch.reset(rate);
-                clock = Clock { from: source.seek(at).unwrap_or_else(|detail| fail(detail)), read: 0 };
+                clock = Clock { from: sound.seek(at).unwrap_or_else(|detail| fail(detail)), read: 0 };
                 if let Some(reel) = &mut reel {
                     reel.seek(clock.from).unwrap_or_else(|detail| fail(detail));
                 }
@@ -142,7 +200,7 @@ pub fn run() -> io::Result<()> {
                 // What was held is fed again at the new speed, so nothing is skipped; what the
                 // speaker dropped is read again from `at`.
                 stretch.reset(rate_of(rate));
-                clock = Clock { from: source.seek(at).unwrap_or_else(|detail| fail(detail)), read: 0 };
+                clock = Clock { from: sound.seek(at).unwrap_or_else(|detail| fail(detail)), read: 0 };
                 if let Some(reel) = &mut reel {
                     reel.seek(clock.from).unwrap_or_else(|detail| fail(detail));
                 }
@@ -166,7 +224,7 @@ pub fn run() -> io::Result<()> {
                     speaker.clear();
                     let rate = stretch.rate();
                     stretch.reset(rate);
-                    clock = Clock { from: source.seek(0).unwrap_or_else(|detail| fail(detail)), read: 0 };
+                    clock = Clock { from: sound.seek(0).unwrap_or_else(|detail| fail(detail)), read: 0 };
                     if let Some(reel) = &mut reel {
                         reel.seek(0).unwrap_or_else(|detail| fail(detail));
                     }
@@ -183,7 +241,7 @@ pub fn run() -> io::Result<()> {
             continue;
         }
         piece.clear();
-        let more = source.read(&mut piece).unwrap_or_else(|detail| fail(detail));
+        let more = sound.read(&mut piece).unwrap_or_else(|detail| fail(detail));
         clock.read += (piece.len() / CHANNELS) as u64;
         made.clear();
         stretch.push(&piece, &mut made);
@@ -205,5 +263,34 @@ pub fn run() -> io::Result<()> {
         if ended {
             speaker.finish();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silence_lasts_as_long_as_the_picture_and_then_ends() {
+        let mut sound = Sound::Silent { duration: 50, cursor: 0 };
+        assert_eq!(sound.duration(), 50);
+        let mut piece = Vec::new();
+        let mut reads = 0;
+        while sound.read(&mut piece).unwrap() {
+            reads += 1;
+            assert!(reads < 8, "did not end");
+        }
+        assert_eq!(reads, 3, "20 ms, 20 ms, then the last 10 ms");
+        assert!(piece.iter().all(|sample| *sample == 0.));
+        let ms = (piece.len() / CHANNELS) as u32 * 1000 / RATE;
+        assert_eq!(ms, 50);
+        let kept = piece.len();
+        assert!(!sound.read(&mut piece).unwrap());
+        assert_eq!(piece.len(), kept, "the end adds nothing");
+        assert_eq!(sound.seek(30).unwrap(), 30);
+        piece.clear();
+        assert!(sound.read(&mut piece).unwrap());
+        assert_eq!((piece.len() / CHANNELS) as u32 * 1000 / RATE, 20);
+        assert!(!sound.read(&mut Vec::new()).unwrap());
     }
 }

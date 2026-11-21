@@ -20,6 +20,10 @@ use symphonia::core::units::{Time, TimeBase};
 /// What the user is told when a file cannot be read; the reason goes to the log.
 pub const UNREADABLE: &str = "This file can't be played.";
 
+/// The container opened, and every track was one this reader does not decode (`CODEC_TYPE_NULL`).
+/// A round video with no AAC is this. A track that exists and will not decode stays [`UNREADABLE`].
+pub const NO_AUDIO: &str = "This file has no audio track.";
+
 enum Codec {
     Opus(opus::Decoder),
     Other(Box<dyn Decoder>),
@@ -84,8 +88,11 @@ impl Source {
             .map_err(why)?;
         let format = probed.format;
         // The first track of a round video is H.264, which this reader does not decode (symphonia
-        // leaves it `CODEC_TYPE_NULL`). Skip anything that is not audio so the AAC track still plays.
+        // leaves it `CODEC_TYPE_NULL`). Skip that so an AAC track still plays. A file with only
+        // those tracks has no audio (`NO_AUDIO`); the circle plays its picture in silence. A
+        // track this build cannot decode is a failure, not silence.
         let mut chosen = None;
+        let mut undecodable = false;
         for track in format.tracks() {
             let params = &track.codec_params;
             if params.codec == CODEC_TYPE_NULL {
@@ -95,9 +102,15 @@ impl Source {
                 chosen = Some((track.id, params.clone()));
                 break;
             }
+            undecodable = true;
             tracing::warn!("mediad: skipped a track this build cannot decode");
         }
-        let (track, params) = chosen.ok_or_else(|| UNREADABLE.to_owned())?;
+        let Some((track, params)) = chosen else {
+            if !undecodable && format.tracks().iter().any(|track| track.codec_params.codec == CODEC_TYPE_NULL) {
+                return Err(NO_AUDIO.to_owned());
+            }
+            return Err(UNREADABLE.to_owned());
+        };
         let (codec, rate, pre_skip, gain) = if params.codec == CODEC_TYPE_OPUS {
             let (pre_skip, gain) = params.extra_data.as_deref().and_then(opus_head).ok_or_else(|| {
                 tracing::warn!("mediad: an Opus stream this build cannot decode");
@@ -295,6 +308,21 @@ mod tests {
         assert_eq!(Source::open(&not_audio).err().as_deref(), Some(UNREADABLE));
         let missing = Source::open(Path::new("/nonexistent/voice.ogg")).err().unwrap();
         assert_eq!(missing, "The file is no longer on this computer.");
+    }
+
+    /// A round note this client records, and a Telegram note marked nosound, is a video-only MP4.
+    /// That is not a broken audio track: an AAC file still opens, and a file that is not media
+    /// is still refused.
+    #[test]
+    fn a_video_with_no_audio_track_is_named_apart_from_a_bad_file() {
+        let file = protocol::round_mp4(64, &[vec![0, 0, 0, 1, 0x65, 1, 2, 3]], 100);
+        let path = std::env::temp_dir().join(format!("tinyclient-nosound-{}.mp4", std::process::id()));
+        std::fs::write(&path, file.bytes).unwrap();
+        let opened = Source::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(opened.err().as_deref(), Some(NO_AUDIO));
+        assert!(Source::open(&fixture("tone.m4a")).is_ok(), "an AAC track still opens");
+        assert_eq!(Source::open(&fixture("../../Cargo.toml")).err().as_deref(), Some(UNREADABLE));
     }
 
     #[test]
