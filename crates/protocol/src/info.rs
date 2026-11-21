@@ -347,6 +347,64 @@ pub struct SpaceInfo {
     pub mark: Option<Mark>,
 }
 
+/// Lifecycle status of a Space's scheduled event (Discord `guild_scheduled_events`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventStatus {
+    #[default]
+    Scheduled,
+    Active,
+    Completed,
+    Canceled,
+}
+
+/// Where a Space's scheduled event takes place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventPlaceKind {
+    #[default]
+    Voice,
+    Stage,
+    External,
+}
+
+/// One scheduled event in a Space (`Request::Events`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEvent {
+    /// Event key (account + event id).
+    pub key: Key,
+    /// The Space hosting this event.
+    pub space: Key,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Scheduled start time, Unix seconds.
+    pub start: i64,
+    /// Scheduled end time, Unix seconds, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
+    /// Voice channel, stage channel, or external location.
+    #[serde(default)]
+    pub place_kind: EventPlaceKind,
+    /// Channel name or external location string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub place: String,
+    /// Voice or stage conversation key, when held inside a channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Key>,
+    #[serde(default)]
+    pub status: EventStatus,
+    /// Whether the signed-in user marked themselves interested.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interested: bool,
+    /// Number of interested users reported by the network.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub count: u32,
+    /// Event cover image, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<MediaFile>,
+}
+
 /// Which of a custom emoji set this account may send.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1287,5 +1345,43 @@ mod tests {
         };
         let back_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(back_resp, resp);
+    }
+
+    #[test]
+    fn space_events_requests_responses_and_change_round_trip() {
+        use crate::{Change, Response};
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4000");
+        let ev_key = Key::new(&account, "9001");
+        let ev = SpaceEvent {
+            key: ev_key.clone(),
+            space: space.clone(),
+            name: "Community Q&A".into(),
+            description: "Ask anything".into(),
+            start: 1_760_000_000,
+            end: Some(1_760_003_600),
+            place_kind: EventPlaceKind::Voice,
+            place: "General Voice".into(),
+            conversation: Some(Key::new(&account, "4201")),
+            status: EventStatus::Active,
+            interested: true,
+            count: 17,
+            cover: Some(MediaFile::new("event_cover:9001:abc", crate::MediaKind::Image)),
+        };
+        let reqs = [
+            Request::Events { space: space.clone() },
+            Request::EventInterest { space: space.clone(), event: ev_key, on: true },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let resp = Response::Events { space: space.clone(), events: vec![ev] };
+        let back_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back_resp, resp);
+
+        let change = Change::Events { space: space.clone() };
+        assert!(change.same_scope(&Change::Events { space }));
+        assert!(!change.is_ephemeral());
     }
 }

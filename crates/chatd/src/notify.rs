@@ -671,6 +671,51 @@ impl Notes {
             Err(err) => (false, err, None),
         }
     }
+
+    /// A scheduled event the user marked interested in has started. Respects global notification,
+    /// quiet-hours, pause, and Do Not Disturb settings.
+    pub fn scheduled_event(
+        &mut self,
+        values: &Values,
+        moment: &Moment,
+        space: &Key,
+        space_name: &str,
+        event_id: &str,
+        name: &str,
+        place: &str,
+    ) -> Option<String> {
+        if !values.on(settings::NOTIFY) || hushed(values, moment) || moment.dnd {
+            return None;
+        }
+        let word = values.word(GLOBAL, settings::MESSAGE_SOUND);
+        let sound = (values.on(settings::SOUNDS) && word != "none").then(|| word.to_owned());
+        let subtitle = if space_name.is_empty() {
+            "Event started".to_owned()
+        } else {
+            format!("{space_name} · Event started")
+        };
+        let body = if place.is_empty() {
+            "This event is live now.".to_owned()
+        } else {
+            format!("Live in {place}")
+        };
+        let note = Note {
+            id: format!("event:{}:{}:{}", space.network.as_str(), space.id, event_id),
+            title: name.to_owned(),
+            subtitle,
+            body,
+            kind: Kind::Plain,
+            reply_hint: String::new(),
+            sound: sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
+            locked_body: "Event started".to_owned(),
+            copy_code: None,
+        };
+        if let Err(err) = self.sink.post(&note) {
+            tracing::warn!("chatd: event notification not shown: {err}");
+            return sound;
+        }
+        sound.filter(|word| !system_plays(word))
+    }
 }
 
 /// The bundled file for a sound word, for systems that play it themselves.
@@ -736,6 +781,14 @@ pub enum Event {
     /// A reminder was set or taken back: the next one due is at another time, and one may be
     /// due already.
     Remind,
+    /// A Space's scheduled event the user is interested in just went live.
+    ScheduledEvent {
+        space: Key,
+        space_name: String,
+        event_id: String,
+        name: String,
+        place: String,
+    },
 }
 
 /// Who the notification thread is, to the hub.
@@ -1085,6 +1138,19 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
             }
             Event::Play(word) => playing.extend(play(&word, volume, None, 0)),
             Event::Remind => due(hub, &mut notes, &values),
+            Event::ScheduledEvent {
+                space,
+                space_name,
+                event_id,
+                name,
+                place,
+            } => {
+                let mut m = moment(hub, &space, &notes, Instant::now());
+                m.dnd = dnd(hub, &space);
+                if let Some(word) = notes.scheduled_event(&values, &m, &space, &space_name, &event_id, &name, &place) {
+                    playing.extend(play(&word, volume, None, 0));
+                }
+            }
         }
     }
 }

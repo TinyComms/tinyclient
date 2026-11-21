@@ -5197,3 +5197,144 @@ fn create_space_posts_guild_handles_templates_icon_and_refusals() {
         }
     }
 }
+
+#[test]
+fn scheduled_events_list_interest_and_gateway_updates() {
+    let world = World::start();
+    let space = world.key("4000");
+
+    // 1. Listing events calls GET /guilds/4000/scheduled-events?with_user_count=true and sorts Active first.
+    world.discord.script(
+        "/guilds/4000/scheduled-events",
+        200,
+        json!([
+            {
+                "id": "9001",
+                "guild_id": "4000",
+                "channel_id": "4201",
+                "name": "Weekly Standup",
+                "description": "Quick sync",
+                "scheduled_start_time": "2026-10-20T18:00:00+00:00",
+                "status": 1,
+                "entity_type": 2,
+                "user_count": 5,
+                "image": "evhash1"
+            },
+            {
+                "id": "9002",
+                "guild_id": "4000",
+                "name": "Live AMA",
+                "description": "Ask us anything",
+                "scheduled_start_time": "2026-10-21T18:00:00+00:00",
+                "status": 2,
+                "entity_type": 3,
+                "entity_metadata": {"location": "https://example.com/ama"},
+                "user_count": 42
+            }
+        ]),
+    );
+    match world.ask(Request::Events { space: space.clone() }) {
+        Response::Events { space: got_space, events } => {
+            assert_eq!(got_space, space);
+            assert_eq!(events.len(), 2);
+            // Active event sorts first even though its start time is later.
+            assert_eq!(events[0].key.id, "9002");
+            assert_eq!(events[0].status, protocol::EventStatus::Active);
+            assert_eq!(events[0].place_kind, protocol::EventPlaceKind::External);
+            assert_eq!(events[0].place, "https://example.com/ama");
+            assert_eq!(events[0].count, 42);
+
+            assert_eq!(events[1].key.id, "9001");
+            assert_eq!(events[1].status, protocol::EventStatus::Scheduled);
+            assert_eq!(events[1].place_kind, protocol::EventPlaceKind::Voice);
+            assert_eq!(events[1].conversation.as_ref().map(|k| k.id.as_str()), Some("4201"));
+            assert_eq!(events[1].cover.as_ref().map(|c| c.id.as_str()), Some("event_cover:9001:evhash1"));
+        }
+        other => panic!("expected Response::Events, got {other:?}"),
+    }
+    let list_reqs = world.discord.requests_to("GET", "/guilds/4000/scheduled-events");
+    assert_eq!(list_reqs.len(), 1);
+    assert!(list_reqs[0].path.contains("with_user_count=true"));
+
+    // 2. Marking interested sends PUT, unmarking sends DELETE.
+    world.discord.script("/guilds/4000/scheduled-events/9001/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventInterest {
+            space: space.clone(),
+            event: world.key("9001"),
+            on: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("PUT", "/guilds/4000/scheduled-events/9001/users/@me").len(),
+        1
+    );
+
+    // Re-listing preserves our interested flag for event 9001.
+    world.discord.script(
+        "/guilds/4000/scheduled-events",
+        200,
+        json!([
+            {
+                "id": "9001",
+                "guild_id": "4000",
+                "channel_id": "4201",
+                "name": "Weekly Standup",
+                "scheduled_start_time": "2026-10-20T18:00:00+00:00",
+                "status": 1,
+                "entity_type": 2,
+                "user_count": 6
+            }
+        ]),
+    );
+    match world.ask(Request::Events { space: space.clone() }) {
+        Response::Events { events, .. } => {
+            assert_eq!(events.len(), 1);
+            assert!(events[0].interested);
+            assert_eq!(events[0].count, 6);
+        }
+        other => panic!("expected Response::Events, got {other:?}"),
+    }
+
+    world.discord.script("/guilds/4000/scheduled-events/9001/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventInterest {
+            space: space.clone(),
+            event: world.key("9001"),
+            on: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("DELETE", "/guilds/4000/scheduled-events/9001/users/@me").len(),
+        1
+    );
+
+    // 3. Gateway event create/update/delete emit Change::Events for the guild.
+    let seq = match world.ask(Request::Status) {
+        Response::Status { seq, .. } => seq,
+        other => panic!("expected Status, got {other:?}"),
+    };
+    world.discord.push(
+        "GUILD_SCHEDULED_EVENT_CREATE",
+        json!({
+            "id": "9099",
+            "guild_id": "4000",
+            "name": "Pop-up Jam",
+            "scheduled_start_time": "2026-10-22T20:00:00+00:00",
+            "status": 1,
+            "entity_type": 2,
+            "channel_id": "4201"
+        }),
+    );
+    match world.ask(Request::Wait { after: seq, timeout_ms: 3000 }) {
+        Response::Changes { changes, .. } => {
+            assert!(
+                changes.iter().any(|c| c == &Change::Events { space: space.clone() }),
+                "expected Change::Events, got {changes:?}"
+            );
+        }
+        other => panic!("expected Response::Changes, got {other:?}"),
+    }
+}

@@ -363,6 +363,128 @@ impl Discord {
         self.spaces().map_err(refused)
     }
 
+    /// Lists scheduled and active events for a Discord server (`GET /guilds/{guild}/scheduled-events?with_user_count=true`).
+    pub(super) fn events(&self, guild: &str) -> Result<Vec<protocol::SpaceEvent>, Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let answer = self
+            .call("GET", &format!("/guilds/{guild}/scheduled-events?with_user_count=true"), None)
+            .map_err(refusal)?;
+        let fetched: Vec<model::ScheduledEvent> = serde_json::from_str(&answer).map_err(refused)?;
+        let mut covers = Vec::new();
+        let stored_list: Vec<super::StoredEvent> = {
+            let mut state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get_mut(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            let prev_interest: std::collections::HashMap<String, bool> = info
+                .events
+                .iter()
+                .map(|(id, stored)| (id.clone(), stored.interested))
+                .collect();
+            info.events.clear();
+            for mut ev in fetched {
+                if !matches!(ev.status, 1 | 2) {
+                    continue;
+                }
+                if ev.guild_id.is_empty() {
+                    ev.guild_id = guild.to_owned();
+                }
+                if let Some(hash) = ev.image.as_deref().filter(|h| !h.is_empty()) {
+                    covers.push(model::event_cover(&ev.id, hash));
+                }
+                let interested = prev_interest.get(&ev.id).copied().unwrap_or(false);
+                info.events.insert(ev.id.clone(), super::StoredEvent { event: ev, interested });
+            }
+            info.events.values().cloned().collect()
+        };
+        if !covers.is_empty() {
+            let _ = self.ctx.media(&covers);
+        }
+        let space_key = self.ctx.key(guild);
+        let mut out: Vec<protocol::SpaceEvent> = stored_list
+            .into_iter()
+            .map(|stored| {
+                let ev = stored.event;
+                let place_kind = match ev.entity_type {
+                    1 => protocol::EventPlaceKind::Stage,
+                    3 => protocol::EventPlaceKind::External,
+                    _ => protocol::EventPlaceKind::Voice,
+                };
+                let conversation = ev.channel_id.as_deref().filter(|s| !s.is_empty()).map(|id| self.ctx.key(id));
+                let place = match place_kind {
+                    protocol::EventPlaceKind::External => ev
+                        .entity_metadata
+                        .as_ref()
+                        .and_then(|m| m.location.clone())
+                        .unwrap_or_default(),
+                    protocol::EventPlaceKind::Voice | protocol::EventPlaceKind::Stage => ev
+                        .channel_id
+                        .as_deref()
+                        .and_then(|ch| self.ctx.known(ch).ok().flatten())
+                        .map(|row| row.title)
+                        .unwrap_or_default(),
+                };
+                let status = match ev.status {
+                    2 => protocol::EventStatus::Active,
+                    3 => protocol::EventStatus::Completed,
+                    4 => protocol::EventStatus::Canceled,
+                    _ => protocol::EventStatus::Scheduled,
+                };
+                let cover = ev
+                    .image
+                    .as_deref()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| model::event_cover(&ev.id, h).0);
+                protocol::SpaceEvent {
+                    key: self.ctx.key(&ev.id),
+                    space: space_key.clone(),
+                    name: ev.name,
+                    description: ev.description.unwrap_or_default(),
+                    start: ev.scheduled_start_time.as_deref().and_then(model::iso_seconds).unwrap_or(0),
+                    end: ev.scheduled_end_time.as_deref().and_then(model::iso_seconds),
+                    place_kind,
+                    place,
+                    conversation,
+                    status,
+                    interested: stored.interested,
+                    count: ev.user_count.unwrap_or(0),
+                    cover,
+                }
+            })
+            .collect();
+        out.sort_by_key(|ev| (ev.status != protocol::EventStatus::Active, ev.start, ev.key.id.clone()));
+        Ok(out)
+    }
+
+    /// Marks (`on: true`) or unmarks (`on: false`) ourselves as interested in a server's scheduled event.
+    pub(super) fn event_interest(&self, guild: &str, event_id: &str, on: bool) -> Result<(), Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let method = if on { "PUT" } else { "DELETE" };
+        let path = format!("/guilds/{guild}/scheduled-events/{event_id}/users/@me");
+        self.call(method, &path, None).map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(stored) = state
+                .guilds
+                .get_mut(guild)
+                .and_then(|info| info.events.get_mut(event_id))
+            {
+                let was = stored.interested;
+                stored.interested = on;
+                if was != on {
+                    let count = stored.event.user_count.unwrap_or(0);
+                    stored.event.user_count = Some(if on { count.saturating_add(1) } else { count.saturating_sub(1) });
+                }
+            }
+        }
+        self.ctx.events_changed(guild);
+        Ok(())
+    }
+
     /// The pinned messages, newest pin first, from the route the web client uses now; the older
     /// one answers where that one is not known. Both are the community's documentation,
     /// unconfirmed against a real account.

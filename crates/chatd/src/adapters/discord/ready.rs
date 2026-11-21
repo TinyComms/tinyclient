@@ -105,6 +105,7 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
         suppress_roles: settings.suppress_roles,
         channels: muted.map(|channel| (channel.channel_id.clone(), until(channel.mute_config.as_ref()))).collect(),
         hide_muted: settings.hide_muted_channels,
+        mute_scheduled_events: settings.mute_scheduled_events,
         opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
         opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
         level: settings.message_notifications,
@@ -355,6 +356,20 @@ impl Discord {
                 format: sticker.format_type,
                 roles: Box::default(),
             }).collect(),
+            events: guild
+                .guild_scheduled_events
+                .iter()
+                .filter(|ev| matches!(ev.status, 1 | 2))
+                .map(|ev| {
+                    (
+                        ev.id.clone(),
+                        super::StoredEvent {
+                            event: ev.clone(),
+                            interested: false,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -656,6 +671,11 @@ impl Discord {
                 }
                 if let Some(hash) = info.banner.as_deref() {
                     files.push(model::guild_banner(id, hash));
+                }
+                for stored in info.events.values() {
+                    if let Some(hash) = stored.event.image.as_deref().filter(|h| !h.is_empty()) {
+                        files.push(model::event_cover(&stored.event.id, hash));
+                    }
                 }
             }
             (rows, files)

@@ -167,8 +167,18 @@ pub struct State {
     pub create_channel: Option<CreateChannelModal>,
     pub join_server: Option<JoinServerModal>,
     pub create_server: Option<CreateServerModal>,
+    /// Cached scheduled & active events per Discord Space.
+    pub space_events: HashMap<Key, Vec<protocol::SpaceEvent>>,
+    /// Scheduled events modal when open for a Space.
+    pub events_modal: Option<EventsModal>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
+}
+
+pub struct EventsModal {
+    pub space: Key,
+    pub error: Option<String>,
+    pub busy_event: Option<String>,
 }
 
 pub struct JoinServerModal {
@@ -310,6 +320,8 @@ impl State {
             create_channel: None,
             join_server: None,
             create_server: None,
+            space_events: HashMap::new(),
+            events_modal: None,
             leave_space: None,
         }
     }
@@ -650,6 +662,11 @@ impl Shell {
             _ => None,
         };
         self.people_state.hub().watch_space(watched.as_ref(), cx);
+        if let Mode::Space(space) = &self.sidebar_state.mode {
+            if space.network == Network::Discord {
+                self.load_space_events(space.clone(), cx);
+            }
+        }
         self.trees.retain(|space, _| wanted.contains(space));
         for space in wanted {
             if !self.trees.contains_key(&space) {
@@ -2620,6 +2637,378 @@ impl Shell {
         )
     }
 
+    pub(in crate::gui) fn load_space_events(&mut self, space: Key, cx: &mut Context<Self>) {
+        let req = Request::Events { space: space.clone() };
+        self.off_thread(cx, move || ask(&req), move |this, answer, cx| {
+            if let Ok(Response::Events { space, events }) = answer {
+                this.sidebar_state.space_events.insert(space, events);
+                cx.notify();
+            }
+        });
+    }
+
+    pub(in crate::gui) fn open_space_events(&mut self, space: Key, cx: &mut Context<Self>) {
+        self.sidebar_state.events_modal = Some(EventsModal {
+            space: space.clone(),
+            error: None,
+            busy_event: None,
+        });
+        self.load_space_events(space, cx);
+        cx.notify();
+    }
+
+    fn toggle_event_interest(&mut self, space: Key, event: Key, on: bool, cx: &mut Context<Self>) {
+        if let Some(modal) = self.sidebar_state.events_modal.as_mut() {
+            if modal.busy_event.is_some() {
+                return;
+            }
+            modal.busy_event = Some(event.id.clone());
+            modal.error = None;
+        }
+        cx.notify();
+        let req = Request::EventInterest {
+            space: space.clone(),
+            event: event.clone(),
+            on,
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(modal) = this.sidebar_state.events_modal.as_mut() {
+                    modal.busy_event = None;
+                }
+                match answer {
+                    Ok(Response::Ok) => {
+                        if let Some(list) = this.sidebar_state.space_events.get_mut(&space) {
+                            if let Some(ev) = list.iter_mut().find(|e| e.key == event) {
+                                if ev.interested != on {
+                                    ev.interested = on;
+                                    ev.count = if on { ev.count.saturating_add(1) } else { ev.count.saturating_sub(1) };
+                                }
+                            }
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        if let Some(modal) = this.sidebar_state.events_modal.as_mut() {
+                            modal.error = Some(detail);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(modal) = this.sidebar_state.events_modal.as_mut() {
+                            modal.error = Some(err.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn join_space_event(&mut self, event: &protocol::SpaceEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event.place_kind {
+            protocol::EventPlaceKind::Voice => {
+                if let Some(conv) = &event.conversation {
+                    self.call_start(conv.clone(), cx);
+                }
+            }
+            protocol::EventPlaceKind::Stage => {
+                if let Some(conv) = &event.conversation {
+                    self.call_handoff(conv.clone(), cx);
+                }
+            }
+            protocol::EventPlaceKind::External => {
+                if !event.place.is_empty() {
+                    self.open_external_url(&event.place, window, cx);
+                }
+            }
+        }
+    }
+
+    fn space_events_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let Mode::Space(space) = &self.sidebar_state.mode else {
+            return None;
+        };
+        if space.network != Network::Discord {
+            return None;
+        }
+        let events = self.sidebar_state.space_events.get(space)?;
+        if events.is_empty() {
+            return None;
+        }
+        let live = events.iter().find(|e| e.status == protocol::EventStatus::Active).cloned();
+        let count = events.len();
+        let open_key = space.clone();
+        let mut strip = div()
+            .flex_none()
+            .px(px(theme::INSET))
+            .pb(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(4.));
+        if let Some(active) = live {
+            let can_join = active.conversation.is_some()
+                || (active.place_kind == protocol::EventPlaceKind::External
+                    && protocol::link::Destination::parse(&active.place).is_some());
+            let join_event = active.clone();
+            let place = active.place.clone();
+            strip = strip.child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(8.)).flex_none().rounded(px(4.)).bg(theme::online()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().min_w_0().truncate().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(active.name))
+                            .when(!place.is_empty(), |col| {
+                                col.child(div().min_w_0().truncate().type_micro().text_color(theme::text_soft()).child(place))
+                            }),
+                    )
+                    .when(can_join, |row| {
+                        row.child(
+                            button("space-live-event-join", ButtonKind::Primary, "Join")
+                                .h(px(22.))
+                                .px(px(8.))
+                                .type_small()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.join_space_event(&join_event, window, cx);
+                                })),
+                        )
+                    }),
+            );
+        }
+        strip = strip.child(
+            div()
+                .id("space-events-row")
+                .h(px(28.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_space_events(open_key.clone(), cx)))
+                .child(glyph("icons/calendar.svg", 15., theme::text_soft()))
+                .child(div().flex_1().type_ui().text_color(theme::text()).child("Events"))
+                .child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child(count.to_string()),
+                ),
+        );
+        Some(strip)
+    }
+
+    pub(in crate::gui) fn events_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.events_modal.as_ref()?;
+        let space = modal.space.clone();
+        let space_name = self
+            .spaces
+            .iter()
+            .find(|s| s.key == space)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Server".to_owned());
+        let events = self.sidebar_state.space_events.get(&space).cloned().unwrap_or_default();
+        let now = crate::view::now();
+        let mut list = div()
+            .id("space-events-list")
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .max_h(px(420.))
+            .overflow_y_scroll();
+        if events.is_empty() {
+            list = list.child(div().py(px(16.)).type_ui().text_color(theme::text_soft()).child("No upcoming events."));
+        } else {
+            for (ix, ev) in events.into_iter().enumerate() {
+                let is_live = ev.status == protocol::EventStatus::Active;
+                let when_line = if is_live {
+                    "Live now".to_owned()
+                } else if ev.start > 0 {
+                    format!("{} · {}", super::time::day(now, ev.start), super::time::clock(ev.start))
+                } else {
+                    "Scheduled".to_owned()
+                };
+                let cover = ev
+                    .cover
+                    .as_ref()
+                    .and_then(|file| self.people_state.hub().file(&ev.key.account(), file, cx).path)
+                    .map(std::path::PathBuf::from);
+                let interested = ev.interested;
+                let busy = modal.busy_event.as_deref() == Some(ev.key.id.as_str());
+                let toggle_space = space.clone();
+                let toggle_event = ev.key.clone();
+                let can_join = is_live
+                    && (ev.conversation.is_some()
+                        || (ev.place_kind == protocol::EventPlaceKind::External
+                            && protocol::link::Destination::parse(&ev.place).is_some()));
+                let join_event = ev.clone();
+                let count_text = if ev.count == 1 {
+                    "1 interested".to_owned()
+                } else {
+                    format!("{} interested", ev.count)
+                };
+                let mut item = div()
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col();
+                if let Some(path) = cover {
+                    item = item.child(
+                        div()
+                            .w_full()
+                            .h(px(112.))
+                            .overflow_hidden()
+                            .bg(theme::raised())
+                            .child(gpui::img(path).size_full().object_fit(gpui::ObjectFit::Cover)),
+                    );
+                }
+                let mut inner = div()
+                    .p(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .when(is_live, |row| row.child(div().size(px(8.)).rounded(px(4.)).bg(theme::online())))
+                            .child(div().type_small().text_color(if is_live { theme::online() } else { theme::text_soft() }).child(when_line)),
+                    )
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(ev.name.clone()));
+                if !ev.description.trim().is_empty() {
+                    inner = inner.child(div().type_small().text_color(theme::text_soft()).line_clamp(3).child(ev.description.trim().to_owned()));
+                }
+                if !ev.place.is_empty() {
+                    let place_icon = match ev.place_kind {
+                        protocol::EventPlaceKind::Voice => "icons/volume-2.svg",
+                        protocol::EventPlaceKind::Stage => "icons/radio.svg",
+                        protocol::EventPlaceKind::External => "icons/external-link.svg",
+                    };
+                    inner = inner.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child(glyph(place_icon, 13., theme::text_faint()))
+                            .child(div().min_w_0().truncate().child(ev.place.clone())),
+                    );
+                }
+                inner = inner.child(
+                    div()
+                        .mt(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(div().type_small().text_color(theme::text_faint()).child(count_text))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    button(
+                                        ("event-interest", ix),
+                                        if interested { ButtonKind::Primary } else { ButtonKind::Secondary },
+                                        if interested { "Interested" } else { "Mark interested" },
+                                    )
+                                    .h(px(26.))
+                                    .px(px(10.))
+                                    .type_small()
+                                    .when(!busy, |b| {
+                                        b.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_event_interest(
+                                                toggle_space.clone(),
+                                                toggle_event.clone(),
+                                                !interested,
+                                                cx,
+                                            );
+                                        }))
+                                    }),
+                                )
+                                .when(can_join, |bar| {
+                                    bar.child(
+                                        button(("event-join", ix), ButtonKind::Primary, "Join")
+                                            .h(px(26.))
+                                            .px(px(10.))
+                                            .type_small()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.sidebar_state.events_modal = None;
+                                                this.join_space_event(&join_event, window, cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        ),
+                );
+                item = item.child(inner);
+                list = list.child(item);
+            }
+        }
+        let card = div()
+            .id("space-events-card")
+            .w(px(440.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_title().text_color(theme::text()).child(format!("{space_name} · Events")))
+                    .child(icon_button("space-events-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.events_modal = None;
+                        cx.notify();
+                    }))),
+            )
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(list);
+        Some(
+            div()
+                .id("space-events-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.events_modal = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
     pub(super) fn open_create_channel(&mut self, space: Key, group: Option<String>, cx: &mut Context<Self>) {
         let name = cx.new(|cx| crate::gui::input::TextInput::new("channel-name", cx));
         self.sidebar_state.create_channel = Some(CreateChannelModal {
@@ -2831,6 +3220,7 @@ impl Shell {
             .when(!people && !tiny, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
+            .children(self.space_events_strip(cx))
             .child(
                 div()
                     .id("sidebar-list")

@@ -545,6 +545,18 @@ pub enum Command {
         template: Option<String>,
         reply: Reply<(String, Option<String>)>,
     },
+    /// Lists scheduled and active events for a Space.
+    Events {
+        space_id: String,
+        reply: Reply<Vec<protocol::SpaceEvent>>,
+    },
+    /// Marks or unmarks the signed-in user as interested in a scheduled event.
+    EventInterest {
+        space_id: String,
+        event_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -858,6 +870,8 @@ impl Command {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
@@ -1626,6 +1640,22 @@ impl Context {
     /// A Space's cached info is no longer current (e.g. `GUILD_UPDATE` or overview edit).
     pub fn space_info_stale(&self, space_id: &str) {
         self.hub.space_infos.forget(&self.key(space_id));
+    }
+
+    /// A Space's scheduled events changed: tells open shells to refresh them.
+    pub fn events_changed(&self, space_id: &str) {
+        self.hub.changed(Change::Events { space: self.key(space_id) });
+    }
+
+    /// A scheduled event the user is interested in just went live.
+    pub fn scheduled_event_started(&self, space_id: &str, space_name: &str, event_id: &str, name: &str, place: &str) {
+        self.hub.notify(crate::notify::Event::ScheduledEvent {
+            space: self.key(space_id),
+            space_name: space_name.to_owned(),
+            event_id: event_id.to_owned(),
+            name: name.to_owned(),
+            place: place.to_owned(),
+        });
     }
 
     /// What is held about a person's presence now, for a member row built here.

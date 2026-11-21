@@ -1618,6 +1618,7 @@ impl Render for Shell {
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.create_server_modal(cx))
+            .children(self.events_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))

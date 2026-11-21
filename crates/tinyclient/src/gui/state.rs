@@ -150,6 +150,7 @@ struct Dirty {
     spaces: bool,
     inbox: bool,
     trees: HashSet<Key>,
+    events: HashSet<Key>,
     rows: Vec<Key>,
 }
 
@@ -169,6 +170,9 @@ impl Dirty {
             Change::Spaces { .. } => self.spaces = true,
             Change::Tree { space } => {
                 self.trees.insert(space.clone());
+            }
+            Change::Events { space } => {
+                self.events.insert(space.clone());
             }
             Change::Messages { .. }
             | Change::People { .. }
@@ -547,6 +551,7 @@ impl Shell {
             spaces: true,
             inbox: true,
             trees: self.trees.keys().cloned().collect(),
+            events: HashSet::new(),
             rows: self.open.iter().cloned().collect(),
         };
         self.reload(dirty, cx);
@@ -614,6 +619,13 @@ impl Shell {
         for space in dirty.trees {
             if self.trees.contains_key(&space) {
                 self.load_tree(space, cx);
+            }
+        }
+        for space in dirty.events {
+            let viewing = matches!(&self.sidebar_state.mode, super::sidebar::Mode::Space(shown) if shown == &space)
+                || self.sidebar_state.events_modal.as_ref().is_some_and(|m| m.space == space);
+            if viewing {
+                self.load_space_events(space, cx);
             }
         }
         let mut directs = false;

@@ -1741,6 +1741,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         template: Option<String>,
     },
+    /// Lists scheduled and active events for a Space (e.g. Discord `GET /guilds/{id}/scheduled-events`).
+    Events {
+        space: Key,
+    },
+    /// Marks (`on: true`) or unmarks (`on: false`) the signed-in user as interested in an event.
+    EventInterest {
+        space: Key,
+        event: Key,
+        on: bool,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
@@ -2673,6 +2683,8 @@ pub enum Change {
     /// A Tiny server's people, roles, invites or rooms changed: ask `TinyCommunity`. Who is in
     /// a room's call is `Occupants`, and who is online `Presence`.
     Tiny { account: AccountKey },
+    /// A Space's scheduled events changed: ask `Events`.
+    Events { space: Key },
 }
 
 impl Change {
@@ -2693,6 +2705,7 @@ impl Change {
             | (Change::Members { conversation: a }, Change::Members { conversation: b })
             | (Change::Occupants { conversation: a, .. }, Change::Occupants { conversation: b, .. })
             | (Change::Tree { space: a }, Change::Tree { space: b })
+            | (Change::Events { space: a }, Change::Events { space: b })
             | (Change::Presence { person: a, .. }, Change::Presence { person: b, .. }) => a == b,
             (Change::Upload { conversation: a, client_id: x, .. }, Change::Upload { conversation: b, client_id: y, .. }) => {
                 a == b && x == y
@@ -2944,6 +2957,11 @@ pub enum Response {
         space: Key,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
+    },
+    /// Answers `Events`: scheduled and active events for `space`.
+    Events {
+        space: Key,
+        events: Vec<SpaceEvent>,
     },
     Pinned {
         conversation: Key,

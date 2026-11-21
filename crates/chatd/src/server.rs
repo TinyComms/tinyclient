@@ -1724,6 +1724,34 @@ impl Chat {
         }
     }
 
+    fn events(&self, space: Key) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::Events { space_id, reply }) {
+            Ok(events) => Response::Events { space, events },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn event_interest(&self, space: Key, event: Key, on: bool) -> Response {
+        let account = space.account();
+        if event.account() != account {
+            return error(ErrorCode::Refused, "event belongs to another account");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        let event_id = event.id.clone();
+        match self.ask(&account, |reply| Command::EventInterest { space_id, event_id, on, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -3302,6 +3330,8 @@ impl Chat {
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
             Request::CreateSpace { account, name, icon, template } => self.create_space(account, name, icon, template),
+            Request::Events { space } => self.events(space),
+            Request::EventInterest { space, event, on } => self.event_interest(space, event, on),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

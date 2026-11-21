@@ -162,6 +162,8 @@ struct Quiet {
     channels: HashMap<String, i64>,
     /// "Hide muted channels", as the user set it for the server.
     hide_muted: bool,
+    /// "Mute new events" (`mute_scheduled_events`) in Discord's server notification settings.
+    mute_scheduled_events: bool,
     /// "Show all channels" is off: only what is opted in shows.
     opt_in: bool,
     /// Channels and categories opted in.
@@ -186,6 +188,23 @@ struct Pickable {
 struct RoleInfo {
     name: String,
     permissions: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct StoredEvent {
+    pub event: model::ScheduledEvent,
+    pub interested: bool,
+}
+
+/// Whether a live transition of a scheduled event should post a local notification.
+pub(super) fn should_notify_scheduled_event(
+    was_status: u8,
+    now_status: u8,
+    interested: bool,
+    mute_scheduled_events: bool,
+    server_muted: bool,
+) -> bool {
+    was_status != 2 && now_status == 2 && interested && !mute_scheduled_events && !server_muted
 }
 
 /// What is kept of a server once its tree is in the store.
@@ -224,6 +243,7 @@ struct GuildInfo {
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
+    events: HashMap<String, StoredEvent>,
 }
 
 /// The gateway session, to resume it after a dropped socket.
@@ -1872,6 +1892,10 @@ impl Discord {
             Command::CreateSpace { name, icon, template, reply } => {
                 answer(reply, self.create_space(&name, icon.as_deref(), template.as_deref()))
             }
+            Command::Events { space_id, reply } => answer(reply, self.events(&space_id)),
+            Command::EventInterest { space_id, event_id, on, reply } => {
+                answer(reply, self.event_interest(&space_id, &event_id, on))
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
@@ -2334,5 +2358,22 @@ mod tests {
         assert!(msg(Refused::Status { status: 403, code: 40002, message: String::new(), retry_after: None }).contains("Verify your Discord email"));
         assert!(msg(Refused::Limited(10.0)).contains("Too many server creation requests"));
         assert!(msg(Refused::Challenge).contains("captcha"));
+    }
+
+    #[test]
+    fn scheduled_event_notification_respects_interest_and_mute_flags() {
+        // Transitions from scheduled (1) to active (2) while interested and unmuted -> notify.
+        assert!(should_notify_scheduled_event(1, 2, true, false, false));
+        // Already active (2 -> 2) -> do not notify twice.
+        assert!(!should_notify_scheduled_event(2, 2, true, false, false));
+        // Not interested -> do not notify.
+        assert!(!should_notify_scheduled_event(1, 2, false, false, false));
+        // mute_scheduled_events set -> do not notify.
+        assert!(!should_notify_scheduled_event(1, 2, true, true, false));
+        // Whole server muted -> do not notify.
+        assert!(!should_notify_scheduled_event(1, 2, true, false, true));
+        // Completed (3) or canceled (4) -> do not notify.
+        assert!(!should_notify_scheduled_event(2, 3, true, false, false));
+        assert!(!should_notify_scheduled_event(1, 4, true, false, false));
     }
 }

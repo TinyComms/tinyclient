@@ -519,6 +519,59 @@ pub struct Guild {
     pub emojis: Vec<GuildEmoji>,
     #[serde(default, deserialize_with = "nullable")]
     pub stickers: Vec<GuildSticker>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub guild_scheduled_events: Vec<ScheduledEvent>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct EventEntityMetadata {
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+/// One scheduled event in a Discord server (`guild_scheduled_events` in READY, gateway events,
+/// and `GET /guilds/{id}/scheduled-events`).
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ScheduledEvent {
+    pub id: String,
+    #[serde(default)]
+    pub guild_id: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub scheduled_start_time: Option<String>,
+    #[serde(default)]
+    pub scheduled_end_time: Option<String>,
+    /// 1 = scheduled, 2 = active, 3 = completed, 4 = canceled.
+    #[serde(default, deserialize_with = "nullable")]
+    pub status: u8,
+    /// 1 = stage, 2 = voice, 3 = external.
+    #[serde(default, deserialize_with = "nullable")]
+    pub entity_type: u8,
+    #[serde(default)]
+    pub entity_metadata: Option<EventEntityMetadata>,
+    #[serde(default)]
+    pub user_count: Option<u32>,
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// Payload for `GUILD_SCHEDULED_EVENT_USER_ADD` and `GUILD_SCHEDULED_EVENT_USER_REMOVE`.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ScheduledEventUser {
+    pub guild_scheduled_event_id: String,
+    pub user_id: String,
+    pub guild_id: String,
+}
+
+/// Cover image for a Discord scheduled event (`guild-events/{id}/{hash}.webp?size=512`).
+pub fn event_cover(event_id: &str, hash: &str) -> (MediaFile, String) {
+    let url = format!("{}/guild-events/{event_id}/{hash}.webp?size=512", cdn());
+    (MediaFile::new(format!("event_cover:{event_id}:{hash}"), MediaKind::Image), url)
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -613,9 +666,9 @@ impl Guild {
         wrapped.or(self.premium_subscription_count)
     }
 
-    pub fn features(&self) -> Option<&[String]> {
+    pub fn features(&self) -> &[String] {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.features.as_deref());
-        wrapped.or(self.features.as_deref())
+        wrapped.or(self.features.as_deref()).unwrap_or(&[])
     }
 
     pub fn vanity_url_code(&self) -> Option<&str> {
@@ -742,6 +795,8 @@ pub struct GuildSettings {
     pub channel_overrides: Vec<ChannelOverride>,
     #[serde(default, deserialize_with = "nullable")]
     pub hide_muted_channels: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub mute_scheduled_events: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub flags: u32,
     /// 0 all, 1 mentions, 2 nothing.
@@ -1232,5 +1287,35 @@ mod tests {
         assert_eq!(url, format!("{}/banners/4000/a_banhash.webp?size=600", cdn()));
         assert_eq!(guild_mark(&["PARTNERED".to_owned()]), Some(protocol::Mark::Verified));
         assert_eq!(guild_mark(&["COMMUNITY".to_owned()]), None);
+    }
+
+    #[test]
+    fn scheduled_event_and_cover_parse_cleanly() {
+        let ev: ScheduledEvent = serde_json::from_str(
+            r#"{
+                "id": "9001",
+                "guild_id": "4000",
+                "channel_id": "4201",
+                "name": "Game Night",
+                "description": "Bring snacks",
+                "scheduled_start_time": "2026-10-15T19:00:00+00:00",
+                "scheduled_end_time": "2026-10-15T21:00:00+00:00",
+                "status": 1,
+                "entity_type": 2,
+                "user_count": 12,
+                "image": "covhash"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(ev.id, "9001");
+        assert_eq!(ev.status, 1);
+        assert_eq!(ev.entity_type, 2);
+        assert_eq!(ev.user_count, Some(12));
+        let (file, url) = event_cover(&ev.id, ev.image.as_deref().unwrap());
+        assert_eq!(file.id, "event_cover:9001:covhash");
+        assert_eq!(url, format!("{}/guild-events/9001/covhash.webp?size=512", cdn()));
+
+        let settings: GuildSettings = serde_json::from_str(r#"{"guild_id":"4000","mute_scheduled_events":true}"#).unwrap();
+        assert!(settings.mute_scheduled_events);
     }
 }

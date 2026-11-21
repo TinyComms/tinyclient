@@ -1033,6 +1033,8 @@ impl Demo {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
