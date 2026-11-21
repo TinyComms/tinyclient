@@ -1117,7 +1117,17 @@ impl Fake {
                         "has_more": false
                     }));
                 }
-                let page = match (param("oldest"), param("inclusive"), param("latest")) {
+                let oldest = param("oldest");
+                if !oldest.is_empty() && oldest >= "1760000000" {
+                    if let Some(mut base) = self.fixture(token, &format!("conversations.history.{channel}")) {
+                        if let Some(arr) = base["messages"].as_array_mut() {
+                            arr.retain(|m| m["ts"].as_str().unwrap_or("") > oldest);
+                        }
+                        base["has_more"] = json!(false);
+                        return ok(base);
+                    }
+                }
+                let page = match (oldest, param("inclusive"), param("latest")) {
                     ("", "true", _) => ".around",
                     ("", _, "") => "",
                     ("", ..) => ".older",
@@ -6784,4 +6794,90 @@ fn slack_slash_commands_builtins_unknown_handoff_completion_and_ephemeral() {
         world.message(&general, eph_ts).is_none(),
         "ephemeral message must never be persisted in channel history"
     );
+}
+
+#[test]
+fn slack_all_unreads_fetches_paced_history_on_open_and_marks_read() {
+    let world = World::start();
+    world.ready();
+
+    // 1. At connect, All Unreads MUST NOT trigger extra `conversations.history` calls with `oldest`.
+    let before = world.fake.calls(ALPHA, "conversations.history");
+    assert!(
+        before.iter().all(|c| c.params.get("oldest").map(String::as_str).unwrap_or("").is_empty()),
+        "All Unreads must never run at connect; saw calls: {before:#?}"
+    );
+
+    // Confirm #general initially has the coarse `has_unreads` count of 1 from `client.counts`.
+    let general = alpha("C0GEN");
+    let deploy = alpha("C0DEP");
+    let ana = alpha("D0ANA");
+    assert_eq!(world.conversation(&general).unwrap().unread, 1);
+
+    // 2. Opening All Unreads for T01ALPHA fetches each unmuted unread conversation once with `oldest`,
+    // excluding muted C0RND (0 mentions), and upgrades #general to its real unread count.
+    let space = alpha("T01ALPHA");
+    let Response::AllUnreads { groups } = world.ask(Request::AllUnreads {
+        network: Some(Network::Slack),
+        space: Some(space.clone()),
+        limit: 15,
+    }) else {
+        panic!("expected Response::AllUnreads");
+    };
+
+    let ids: Vec<&str> = groups.iter().map(|g| g.conversation.key.id.as_str()).collect();
+    assert_eq!(ids.len(), 3, "expected 3 unmuted unread conversations (C0GEN, C0DEP, D0ANA), got {ids:?}");
+    assert!(ids.contains(&"C0GEN"));
+    assert!(ids.contains(&"C0DEP"));
+    assert!(ids.contains(&"D0ANA"));
+    assert!(!ids.contains(&"C0RND"), "muted channel without mentions must be excluded");
+
+    let gen_group = groups.iter().find(|g| g.conversation.key == general).expect("C0GEN group");
+    assert_eq!(gen_group.messages.len(), 5, "C0GEN has 5 messages strictly newer than last_read 1760000100.000100");
+    assert_eq!(gen_group.total_unread, 5);
+    assert_eq!(world.conversation(&general).unwrap().unread, 5, "real unread count persisted from All Unreads fetch");
+
+    let dep_group = groups.iter().find(|g| g.conversation.key == deploy).expect("C0DEP group");
+    assert_eq!(dep_group.messages.len(), 1);
+    assert!(dep_group.messages[0].text.contains("approve the rollout"));
+
+    let ana_group = groups.iter().find(|g| g.conversation.key == ana).expect("D0ANA group");
+    assert_eq!(ana_group.messages.len(), 1);
+    assert!(ana_group.messages[0].text.contains("got a minute?"));
+
+    // Verify exactly 3 new `conversations.history` calls were made with `oldest` (one per unread channel).
+    let after = world.fake.calls(ALPHA, "conversations.history");
+    let unread_calls: Vec<_> = after
+        .iter()
+        .filter(|c| !c.params.get("oldest").map(String::as_str).unwrap_or("").is_empty())
+        .collect();
+    assert_eq!(unread_calls.len(), 3, "expected 3 paced conversations.history calls with oldest, got {unread_calls:#?}");
+    for ch in ["C0GEN", "C0DEP", "D0ANA"] {
+        assert!(unread_calls.iter().any(|c| c.params.get("channel").map(String::as_str) == Some(ch)));
+    }
+
+    // 3. Marking one group read sends exactly one `conversations.mark` and clears it from All Unreads.
+    let marks_before = world.fake.calls(ALPHA, "conversations.mark").len();
+    let latest_dep = dep_group.messages.last().unwrap().id.clone();
+    assert!(matches!(
+        world.ask(Request::MarkRead { conversation: deploy.clone(), message_id: latest_dep }),
+        Response::Ok
+    ));
+    world.until("conversations.mark for C0DEP", || {
+        let calls = world.fake.calls(ALPHA, "conversations.mark");
+        (calls.len() == marks_before + 1 && calls.last().is_some_and(|c| c.params.get("channel").map(String::as_str) == Some("C0DEP")))
+            .then_some(())
+    });
+    assert_eq!(world.conversation(&deploy).unwrap().unread, 0);
+
+    // Re-opening All Unreads now returns only the remaining 2 unread groups.
+    let Response::AllUnreads { groups: remaining } = world.ask(Request::AllUnreads {
+        network: Some(Network::Slack),
+        space: Some(space),
+        limit: 15,
+    }) else {
+        panic!("expected Response::AllUnreads after mark read");
+    };
+    assert_eq!(remaining.len(), 2);
+    assert!(!remaining.iter().any(|g| g.conversation.key == deploy));
 }

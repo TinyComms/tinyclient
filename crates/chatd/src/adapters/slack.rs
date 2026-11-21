@@ -1690,6 +1690,7 @@ impl Slack {
                 answer(reply, self.section_move_channel(&conversation_id, from_section.as_deref(), &to_section))
             }
             Command::SlashCommands { reply } => answer(reply, self.slash_commands()),
+            Command::AllUnreads { limit, reply } => answer(reply, self.all_unreads(limit)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::StarMessage { conversation_id, message_id, starred, reply } => {

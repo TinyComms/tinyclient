@@ -39,8 +39,11 @@ channels, app DMs (GitHub, Linear, Google Calendar, Cloudflare), a few people. T
 ## 3. A workspace's sidebar, top to bottom
 
 1. **Header** (R2) with ⋯: Mark all read, Show (all / unreads only), Open in Slack.
-2. **Threads**: a fixed row with a count of followed threads that have new replies, and an accent
-   pill when one of them mentions me. See §4. This is the only built-in destination kept.
+2. **Unreads** and **Threads**: fixed rows at the top of the workspace sidebar. **Unreads** opens a
+   grouped scrolling list of unread messages across the workspace's unread channels and DMs,
+   fetched on open (never at connect) via paced, capped `conversations.history` calls (`oldest = last_read`),
+   upgrading coarse `has_unreads` flags to real unread counts with per-group and all mark-read.
+   **Threads** shows followed threads with new replies and an accent pill when one mentions me (§4).
 3. **The user's own sections, in Slack's order**, holding channels, DMs and apps exactly where the
    user filed them. Starred is a section like any other. Collapse is remembered (N5).
 4. **Channels** (Slack's default section): whatever no custom section claims.
@@ -53,8 +56,9 @@ channels, app DMs (GitHub, Linear, Google Calendar, Cloudflare), a few people. T
 Rules:
 - **R5. Sort within a section:** channels A to Z by name without the `#`, DMs and apps by recency.
   Slack's per-section sort override is honored if `channelSections` carries it [U], otherwise this default.
-- **R6. Built-in groups.** Cut: Unreads view (the "unreads only" filter and the Inbox Unread chip
-  cover it), Mentions & reactions (Inbox Mentions chip; reactions to me are cut), Activity tabs.
+- **R6. Built-in groups.** Kept: **Unreads** (paced, capped on-open fetch of unread channels and DMs,
+  built generically across networks; cut lifted in #606) and **Threads** (§4). Cut: Mentions & reactions
+  (Inbox Mentions chip; reactions to me are cut), Activity tabs.
   Hand off with one ⋯ menu line "Open in Slack": Later/saved, Drafts & sent, Huddles list,
   Canvases, Directories. Directories become People search (§5).
 - **R7. Show unreads only.** Honor Slack's sidebar pref and per-section overrides (all, unreads only,

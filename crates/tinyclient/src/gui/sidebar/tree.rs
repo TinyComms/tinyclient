@@ -62,6 +62,8 @@ pub enum Reveal {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Row {
+    /// A Slack workspace's All Unreads view: unread channels and DMs in one scrolling list (#606).
+    Unreads { space: Key, count: u32, mention: bool },
     /// A Slack workspace's Threads: followed threads with new replies.
     Threads { space: Key, count: u32, mention: bool },
     /// A Slack workspace's Drafts: conversations with unsent drafts.

@@ -9,7 +9,7 @@ use crate::store::Filing;
 use protocol::{
     ActivityItem, ActivityItemKind, AppHome, AppLink, AppProfile, AppSlashCommand, AppView,
     Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify,
-    SharedItem, SharedKind, SlashCommand, UserGroup,
+    SharedItem, SharedKind, SlashCommand, UnreadGroup, UserGroup,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -1556,6 +1556,59 @@ impl Slack {
         };
         out.extend(workspace);
         Ok(out)
+    }
+
+    /// Fetches unread messages for the newest unread conversations (All Unreads, #606).
+    ///
+    /// Runs ONLY when the user opens All Unreads (never at connect), is capped to at most 15
+    /// conversations per call, and paces every `conversations.history` request through `self.api`
+    /// (`self.pace`, half the documented tier rate). Upgrades coarse `has_unreads` counts to the
+    /// exact unread message count.
+    pub(super) fn all_unreads(&self, limit: u32) -> Result<Vec<UnreadGroup>, Fault> {
+        const MAX_CHANNELS: u32 = 15;
+        let cap = if limit == 0 { MAX_CHANNELS } else { limit.clamp(1, MAX_CHANNELS) };
+        let unread = self.ctx.unread_conversations(cap).map_err(|err| Fault::Net(err.to_string()))?;
+        let mut groups = Vec::with_capacity(unread.len());
+        for mut conv in unread {
+            let last_read = conv.last_read.as_deref().filter(|s| !s.is_empty());
+            let mut params = vec![("channel", conv.key.id.as_str()), ("limit", "50")];
+            if let Some(oldest) = last_read {
+                params.push(("oldest", oldest));
+            }
+            let history = match self.api("conversations.history", &params) {
+                Ok(history) => history,
+                Err(fault @ (Fault::Auth(_) | Fault::Limited(_))) => return Err(fault),
+                Err(_) => continue,
+            };
+            let entries = history["messages"].as_array().map_or(&[][..], Vec::as_slice);
+            self.authors(entries);
+            let mut messages: Vec<Message> = entries
+                .iter()
+                .filter_map(|entry| self.message(&conv.key.id, entry))
+                .filter(|msg| last_read.is_none_or(|lr| msg.id.as_str() > lr))
+                .collect();
+            messages.sort_by(|a, b| a.id.cmp(&b.id));
+            if !messages.is_empty() {
+                let _ = self.ctx.history(&conv.key.id, &messages);
+            }
+            let real_unread = if !messages.is_empty() {
+                messages.len() as u32
+            } else {
+                conv.unread
+            };
+            let latest_sent = messages.last().map_or(conv.updated, |m| m.sent.max(conv.updated));
+            if real_unread != conv.unread {
+                let _ = self.ctx.counts(&conv.key.id, real_unread, conv.mentions, last_read, latest_sent);
+                conv.unread = real_unread;
+                conv.updated = latest_sent;
+            }
+            groups.push(UnreadGroup {
+                conversation: conv,
+                messages,
+                total_unread: real_unread,
+            });
+        }
+        Ok(groups)
     }
 }
 

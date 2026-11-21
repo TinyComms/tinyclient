@@ -673,9 +673,10 @@ impl Shell {
             Mode::Space(space) => flat(space, 0),
             Mode::Network(Network::Slack) => match self.slack_space() {
                 Some(space) => {
+                    let unreads = self.unreads_row(&space);
                     let threads = self.threads_row(&space);
                     let drafts = self.drafts_row(&space);
-                    threads.into_iter().chain(drafts).chain(flat(&space, 0)).collect()
+                    unreads.into_iter().chain(threads).chain(drafts).chain(flat(&space, 0)).collect()
                 }
                 None => Vec::new(),
             },
@@ -994,6 +995,7 @@ impl Shell {
         match row {
             Row::Conversation { conversation, .. } => self.pick_row(&conversation, cx),
             Row::Group { space, id, collapsed, .. } => self.collapse(space, id, !collapsed, cx),
+            Row::Unreads { space, .. } => self.drill(home::Drill::Unreads(Some(space)), cx),
             Row::Threads { space, .. } => self.drill(home::Drill::Threads(space), cx),
             Row::Drafts { space, .. } => self.drill(home::Drill::Drafts(space), cx),
             Row::Fold { reveal, .. } => {
@@ -1392,6 +1394,15 @@ impl Shell {
                 let bar = div().h(px(8.)).w(gpui::relative(widths[ix % widths.len()])).rounded(px(theme::R_CHIP)).bg(theme::raised());
                 list_row(("loading", ix), height, false, false, div().children(indent(*depth, 8.)).gap(px(8.)).child(skeleton(20., 20.)).child(bar)).cursor_default()
             }
+            Row::Unreads { count, mention, .. } => {
+                let trailing = match (*count, *mention) {
+                    (0, _) => None,
+                    (count, true) => Some(badge_mention(count)),
+                    (count, false) => Some(super::components::badge_count_unread(count)),
+                };
+                self.action_row(("unreads", ix), Some("icons/inbox.svg"), "Unreads".into(), *count > 0, trailing, focused)
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+            }
             Row::Threads { count, mention, .. } => {
                 let trailing = match (*count, *mention) {
                     (0, _) => None,
@@ -1739,6 +1750,7 @@ impl Shell {
         };
         if let Some(drill) = &self.sidebar_state.drill {
             let title = match drill {
+                home::Drill::Unreads(_) => "All unreads".to_owned(),
                 home::Drill::Threads(_) => "Threads".to_owned(),
                 home::Drill::Drafts(_) => "Drafts & sent".to_owned(),
                 home::Drill::Archive => "Archive".to_owned(),
@@ -1747,7 +1759,9 @@ impl Shell {
                 home::Drill::Topics(forum) => forum.title.clone(),
             };
             let place = match drill {
-                home::Drill::Threads(space) | home::Drill::Drafts(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
+                home::Drill::Unreads(Some(space)) | home::Drill::Threads(space) | home::Drill::Drafts(space) => {
+                    self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone())
+                }
                 _ => None,
             };
             return strip

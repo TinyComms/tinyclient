@@ -4085,6 +4085,69 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::AllUnreads { network, space, limit } => {
+                let cap = if limit == 0 { 15 } else { limit.clamp(1, 30) };
+                let mut groups: Vec<protocol::UnreadGroup> = Vec::new();
+                let mut fetched_accounts: std::collections::HashSet<AccountKey> = std::collections::HashSet::new();
+                // Ask connected Slack accounts live (paced and capped inside the Slack adapter).
+                let live_slack_accounts: Vec<AccountKey> = if let Some(sp) = &space {
+                    let acct = sp.account();
+                    if sp.network == Network::Slack && self.shows(&acct) && self.hub.link(&acct) == Link::Connected {
+                        vec![acct]
+                    } else {
+                        Vec::new()
+                    }
+                } else if network.is_none() || network == Some(Network::Slack) {
+                    self.hub
+                        .store()
+                        .accounts()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| a.key)
+                        .filter(|k| k.network == Network::Slack && self.shows(k) && self.hub.link(k) == Link::Connected)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for acct in live_slack_accounts {
+                    if let Ok(live_groups) = self.ask(&acct, |reply| Command::AllUnreads { limit: cap, reply }) {
+                        fetched_accounts.insert(acct);
+                        groups.extend(live_groups);
+                    }
+                }
+                // Fill any remaining networks (or offline Slack accounts) from the local SQLite store.
+                let now = crate::hub::now();
+                let cached = match self.hub.store().unread_conversations(network, space.as_ref(), None, cap) {
+                    Ok(rows) => rows,
+                    Err(err) => return internal(err),
+                };
+                for conv in cached {
+                    let acct = conv.key.account();
+                    if !self.shows(&acct) || fetched_accounts.contains(&acct) {
+                        continue;
+                    }
+                    let messages = self
+                        .hub
+                        .store()
+                        .unread_messages(&conv.key, conv.last_read.as_deref().unwrap_or(""), 50, now)
+                        .unwrap_or_default();
+                    let total_unread = conv.unread.max(messages.len() as u32);
+                    groups.push(protocol::UnreadGroup {
+                        conversation: conv,
+                        messages,
+                        total_unread,
+                    });
+                }
+                groups.sort_by(|a, b| {
+                    let a_m = a.conversation.mentions > 0;
+                    let b_m = b.conversation.mentions > 0;
+                    let a_ts = a.messages.last().map_or(a.conversation.updated, |m| m.sent);
+                    let b_ts = b.messages.last().map_or(b.conversation.updated, |m| m.sent);
+                    b_m.cmp(&a_m).then_with(|| b_ts.cmp(&a_ts))
+                });
+                groups.truncate(cap as usize);
+                Response::AllUnreads { groups }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

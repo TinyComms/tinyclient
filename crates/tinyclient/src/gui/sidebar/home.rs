@@ -22,6 +22,8 @@ pub const MEETING_QUIET: i64 = 14 * 86_400;
 /// A list the home drills into, replacing itself until `‹`.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Drill {
+    /// All unread conversations and their unread messages in one list (#606).
+    Unreads(Option<Key>),
     /// A Slack workspace's followed threads.
     Threads(Key),
     /// A Slack workspace's active drafts.
@@ -49,6 +51,8 @@ pub enum Act {
     CallsMore,
     Meetings,
     MoreChats,
+    /// Mark every unread conversation in the All Unreads view as read (#606).
+    MarkAllUnreadsRead,
     /// Show or hide a team's opted-out channels. The id is the team's.
     Hidden(String),
 }
@@ -99,12 +103,18 @@ pub enum Item {
     Folder { id: String, name: String, color: Option<u32>, open: bool, lit: bool, mention: bool },
     /// A team's channel under its row.
     Channel(Rc<Conversation>),
+    /// A conversation header inside the All Unreads view (#606), with its per-group Mark as read action.
+    UnreadGroupHeader(Rc<protocol::UnreadGroup>),
+    /// One unread message row inside the All Unreads view (#606).
+    UnreadMessage { conversation: Key, title: String, message: Rc<protocol::Message> },
 }
 
 impl Item {
     pub fn height(&self) -> f32 {
         match self {
             Item::Header { first: true, .. } => 24.,
+            Item::UnreadGroupHeader(_) => 32.,
+            Item::UnreadMessage { .. } => 44.,
             Item::Chat(_) | Item::Voice(_) | Item::Call(_) => 48.,
             _ => 28.,
         }
@@ -120,6 +130,8 @@ impl Item {
     pub fn anchor(&self) -> Option<String> {
         match self {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => Some(format!("c/{}", c.key.id)),
+            Item::UnreadGroupHeader(g) => Some(format!("ug/{}", g.conversation.key.id)),
+            Item::UnreadMessage { conversation, message, .. } => Some(format!("um/{}/{}", conversation.id, message.id)),
             Item::Call(c) => Some(format!("call/{}", c.latest.message_id)),
             Item::Folder { id, .. } => Some(format!("f/{id}")),
             Item::Header { label, .. } => Some(format!("h/{label}")),
@@ -146,6 +158,8 @@ pub struct Home {
     pub archive_total: u32,
     /// The rows of the list drilled into.
     pub drilled: Vec<Rc<Conversation>>,
+    /// Unread groups loaded for `Drill::Unreads` (#606).
+    pub unreads: Vec<Rc<protocol::UnreadGroup>>,
     /// Recent calls loaded for `Drill::Calls`, newest first.
     pub calls: Vec<protocol::CallLogEntry>,
     pub calls_missed: bool,
@@ -178,6 +192,7 @@ impl Home {
         outgoing.epoch += 1;
         outgoing.loaded = outgoing.loaded_once;
         outgoing.drilled.clear();
+        outgoing.unreads.clear();
         if let Some(previous) = outgoing.network {
             saved.insert(previous, outgoing);
         }

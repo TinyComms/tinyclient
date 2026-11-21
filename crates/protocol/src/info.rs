@@ -5,7 +5,7 @@
 //! Every field here is optional on the wire and every list has a cap, as in the rest of the
 //! contract.
 
-use crate::{is_false, is_zero, Conversation, Key, MediaFile, Network, Space};
+use crate::{is_false, is_zero, Conversation, Key, MediaFile, Message, Network, Space};
 use serde::{Deserialize, Serialize};
 
 /// Most folders an account lists. Telegram allows 30 with Premium; Discord's server folders are
@@ -433,6 +433,17 @@ pub struct SlashCommand {
     pub usage: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub builtin: bool,
+}
+
+/// One conversation's unread messages in the All Unreads view (`Request::AllUnreads`, #606).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadGroup {
+    pub conversation: Conversation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
+    /// Exact unread count known after fetching messages past `last_read`.
+    #[serde(default)]
+    pub total_unread: u32,
 }
 
 /// Which of a custom emoji set this account may send.

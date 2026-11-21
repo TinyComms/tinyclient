@@ -26,6 +26,7 @@ struct Read {
     archive: Vec<Conversation>,
     archive_total: u32,
     drilled: Vec<Conversation>,
+    unreads: Vec<protocol::UnreadGroup>,
     calls: Vec<protocol::CallLogEntry>,
     calls_next: Option<String>,
     calls_more: bool,
@@ -63,13 +64,23 @@ impl Shell {
             _ => return,
         };
         // Keys only: the read runs off this thread.
+        enum DrillLoad {
+            Unreads(Option<Key>),
+            Threads(Key),
+            Drafts,
+            Archive,
+            Calls,
+            Requests,
+            Topics(Key),
+        }
         let drill = self.sidebar_state.drill.as_ref().map(|drill| match drill {
-            Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false),
-            Drill::Drafts(_) => (Shelf::Main, None, None, false),
-            Drill::Archive => (Shelf::Archive, None, None, false),
-            Drill::Calls => (Shelf::Main, None, None, true),
-            Drill::Requests => (Shelf::Requests, None, None, false),
-            Drill::Topics(forum) => (Shelf::Main, None, Some(forum.key.clone()), false),
+            Drill::Unreads(space) => DrillLoad::Unreads(space.clone()),
+            Drill::Threads(space) => DrillLoad::Threads(space.clone()),
+            Drill::Drafts(_) => DrillLoad::Drafts,
+            Drill::Archive => DrillLoad::Archive,
+            Drill::Calls => DrillLoad::Calls,
+            Drill::Requests => DrillLoad::Requests,
+            Drill::Topics(forum) => DrillLoad::Topics(forum.key.clone()),
         });
         let tg_account = self
             .snapshot
@@ -83,7 +94,13 @@ impl Shell {
         let read = move || -> std::io::Result<Read> {
             let mut read = Read::default();
             match drill {
-                Some((_, _, _, true)) => {
+                Some(DrillLoad::Unreads(space)) => {
+                    let net = space.as_ref().map(|s| s.network).or(Some(network));
+                    if let Response::AllUnreads { groups } = ask(&Request::AllUnreads { network: net, space, limit: 15 })? {
+                        read.unreads = groups;
+                    }
+                }
+                Some(DrillLoad::Calls) => {
                     if let Some(account) = tg_account {
                         if let Response::CallHistory { entries, next, more } =
                             ask(&Request::CallHistory { account, missed: calls_missed, before: None, limit: 30 })?
@@ -94,9 +111,11 @@ impl Shell {
                         }
                     }
                 }
-                Some((_, Some(space), _, false)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
-                Some((_, _, Some(forum), false)) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
-                Some((shelf, None, None, false)) => read.drilled = whole(network, None, shelf)?.0,
+                Some(DrillLoad::Threads(space)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
+                Some(DrillLoad::Topics(forum)) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
+                Some(DrillLoad::Archive) => read.drilled = whole(network, None, Shelf::Archive)?.0,
+                Some(DrillLoad::Requests) => read.drilled = whole(network, None, Shelf::Requests)?.0,
+                Some(DrillLoad::Drafts) => read.drilled = whole(network, None, Shelf::Main)?.0,
                 None => {}
             }
             match network {
@@ -141,6 +160,9 @@ impl Shell {
             home.archive = rows(read.archive);
             home.archive_total = read.archive_total;
             home.drilled = rows(read.drilled);
+            if matches!(this.sidebar_state.drill, Some(Drill::Unreads(_))) {
+                home.unreads = read.unreads.into_iter().map(Rc::new).collect();
+            }
             if matches!(this.sidebar_state.drill, Some(Drill::Calls)) {
                 home.calls = read.calls;
                 home.calls_next = read.calls_next;
@@ -170,9 +192,25 @@ impl Shell {
         state.enter_drill(drill);
         state.cursor = None;
         state.home.drilled.clear();
+        state.home.unreads.clear();
         state.home.loaded = false;
         self.rebuild_rows(cx);
         self.load_home(cx);
+    }
+
+    /// The Slack workspace's All Unreads row: unread channels and DMs in this workspace (#606).
+    pub(super) fn unreads_row(&self, space: &Key) -> Option<super::tree::Row> {
+        let tree = self.trees.get(space)?;
+        let unreads: Vec<&Rc<Conversation>> = tree
+            .conversations
+            .iter()
+            .filter(|c| c.kind != ConversationKind::Thread && !c.hidden && !c.archived && c.unread > 0 && (!c.muted || c.mentions > 0))
+            .collect();
+        Some(super::tree::Row::Unreads {
+            space: space.clone(),
+            count: unreads.len() as u32,
+            mention: unreads.iter().any(|c| c.mentions > 0),
+        })
     }
 
     /// The Slack workspace's Threads row: followed threads with new replies, from its tree.
@@ -193,6 +231,29 @@ impl Shell {
     pub(super) fn rebuild_home(&mut self, cx: &mut Context<Self>) {
         let state = &self.sidebar_state;
         let items: Vec<Item> = match (&state.mode, &state.drill) {
+            (Mode::Network(_), Some(Drill::Unreads(_))) => {
+                let mut out = Vec::new();
+                if !state.home.unreads.is_empty() {
+                    out.push(Item::Action {
+                        act: Act::MarkAllUnreadsRead,
+                        icon: "icons/check-check.svg",
+                        words: "Mark all as read".into(),
+                        after: format!("{} unread", state.home.unreads.len()),
+                        dot: None,
+                    });
+                }
+                for group in &state.home.unreads {
+                    out.push(Item::UnreadGroupHeader(group.clone()));
+                    for msg in &group.messages {
+                        out.push(Item::UnreadMessage {
+                            conversation: group.conversation.key.clone(),
+                            title: group.conversation.title.clone(),
+                            message: Rc::new(msg.clone()),
+                        });
+                    }
+                }
+                out
+            }
             (Mode::Network(_), Some(Drill::Requests)) => {
                 let mut out: Vec<Item> = state.home.drilled.iter().filter(|c| !c.spam).cloned().map(Item::Chat).collect();
                 let spam: Vec<Item> = state.home.drilled.iter().filter(|c| c.spam).cloned().map(Item::Chat).collect();
@@ -289,6 +350,18 @@ impl Shell {
         let home = &mut self.sidebar_state.home;
         match item {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => return self.pick_row(&c, cx),
+            Item::UnreadGroupHeader(group) => return self.pick_row(&group.conversation, cx),
+            Item::UnreadMessage { conversation, title, message } => {
+                let msg_id = message.id.clone();
+                let pane = self.pane(cx);
+                if self.open.as_ref() == Some(&conversation) {
+                    pane.update(cx, |pane, cx| pane.jump_to(&msg_id, cx));
+                } else {
+                    pane.update(cx, |pane, _| pane.land_next(msg_id));
+                    self.select(conversation, &title, cx);
+                }
+                return;
+            }
             Item::Call(group) => {
                 let key = group.latest.conversation.clone();
                 let msg_id = group.latest.message_id.clone();
@@ -360,6 +433,17 @@ impl Shell {
                 Act::MoreVoice => home.voice_all = true,
                 Act::MoreChats => home.chats_all = true,
                 Act::Meetings => home.meetings_open = !home.meetings_open,
+                Act::MarkAllUnreadsRead => {
+                    let space = match &self.sidebar_state.drill {
+                        Some(Drill::Unreads(space)) => space.clone(),
+                        _ => None,
+                    };
+                    let network = space.as_ref().map(|s| s.network).or(self.sidebar_state.home.network);
+                    self.sidebar_state.home.unreads.clear();
+                    self.rebuild_home(cx);
+                    self.off_thread(cx, move || ask(&Request::MarkAllRead { network, space }), |_, _, _| {});
+                    return;
+                }
                 Act::Hidden(id) => {
                     if !home.hidden_shown.remove(&id) {
                         home.hidden_shown.insert(id);
@@ -530,6 +614,65 @@ impl Shell {
                 click(list_row(("folder", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx).into_any_element()
             }
             Item::Channel(c) => self.place_row(&c, 1, focused, cx).into_any_element(),
+            Item::UnreadGroupHeader(group) => {
+                let conv = &group.conversation;
+                let label = if conv.kind == ConversationKind::Channel && !conv.title.starts_with('#') {
+                    format!("#{}", conv.title)
+                } else {
+                    conv.title.clone()
+                };
+                let count = group.total_unread;
+                let has_mention = conv.mentions > 0;
+                let mark_key = conv.key.clone();
+                let mark_through = group.messages.last().map(|m| m.id.clone()).unwrap_or_default();
+                let mark_btn = div()
+                    .id(("unread-group-mark", ix))
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CONTROL))
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let key = mark_key.clone();
+                        let message_id = mark_through.clone();
+                        this.sidebar_state.home.unreads.retain(|g| g.conversation.key != key);
+                        this.rebuild_home(cx);
+                        this.off_thread(cx, move || ask(&Request::MarkRead { conversation: key, message_id }), |_, _, _| {});
+                    }))
+                    .child("Mark read");
+                let badge = if has_mention {
+                    crate::gui::components::badge_mention(conv.mentions)
+                } else {
+                    crate::gui::components::badge_count_unread(count)
+                };
+                let content = div()
+                    .gap(px(6.))
+                    .child(div().flex_1().min_w_0().truncate().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(label))
+                    .child(badge)
+                    .child(mark_btn);
+                click(list_row(("unread-group", ix), theme::row_height(32.), false, focused, content), cx).into_any_element()
+            }
+            Item::UnreadMessage { message, .. } => {
+                let sender = if message.sender.name.is_empty() { "Someone".to_owned() } else { message.sender.name.clone() };
+                let snippet = if message.text.trim().is_empty() {
+                    if !message.attachments.is_empty() { "[attachment]".to_owned() } else { "New message".to_owned() }
+                } else {
+                    message.text.replace('\n', " ")
+                };
+                let content = div()
+                    .pl(px(8.))
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).truncate().child(sender))
+                    .child(div().type_small().text_color(theme::text_soft()).truncate().child(snippet));
+                click(list_row(("unread-msg", ix), theme::row_height(44.), false, focused, content), cx).into_any_element()
+            }
         }
     }
 
@@ -771,6 +914,7 @@ impl Shell {
     fn home_empty(&self) -> Div {
         let state = &self.sidebar_state;
         let (icon, title, detail): (&'static str, String, String) = match (&state.home.network, &state.drill) {
+            (_, Some(Drill::Unreads(_))) => ("icons/check.svg", "All caught up".into(), "Unread messages from your channels and DMs show here.".into()),
             (_, Some(Drill::Threads(_))) => ("icons/messages-square.svg", "No new replies".into(), "Threads you follow show here when someone replies.".into()),
             (_, Some(Drill::Drafts(_))) => ("icons/pencil.svg", "No drafts".into(), "Messages you start typing in this workspace appear here.".into()),
             (_, Some(Drill::Archive)) => ("icons/inbox.svg", "Nothing archived".into(), "Chats you archive in Telegram show up here.".into()),

@@ -915,6 +915,11 @@ pub enum Command {
     SlashCommands {
         reply: Reply<Vec<protocol::SlashCommand>>,
     },
+    /// Fetch unread messages across unread conversations for the All Unreads view (#606).
+    AllUnreads {
+        limit: u32,
+        reply: Reply<Vec<protocol::UnreadGroup>>,
+    },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }
@@ -1021,6 +1026,7 @@ impl Command {
             | Command::SectionReorder { reply, .. }
             | Command::SectionMoveChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AllUnreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1652,6 +1658,11 @@ impl Context {
             self.hub.changed(Change::Status);
         }
         Ok(())
+    }
+
+    /// Unread conversations on this account for the All Unreads view (#606).
+    pub fn unread_conversations(&self, limit: u32) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        self.hub.store().unread_conversations(None, None, Some(&self.account), limit)
     }
 
     /// Delivers an ephemeral message (only visible to this user) without ever writing it to SQLite.

@@ -2708,6 +2708,19 @@ pub enum Request {
     SlashCommands {
         account: AccountKey,
     },
+    /// Reads unread messages grouped by conversation across a network or workspace (All Unreads, #606).
+    /// On Slack this runs paced, capped `conversations.history` calls (`oldest = last_read`) ONLY
+    /// when opened (never at connect), upgrading coarse unread flags to real counts.
+    /// Answers `Response::AllUnreads`.
+    AllUnreads {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network: Option<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        /// Maximum unread conversations to include (server-clamped; 0 uses default 15).
+        #[serde(default)]
+        limit: u32,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3244,6 +3257,10 @@ pub enum Response {
     /// Built-in and workspace slash commands (`Request::SlashCommands`).
     SlashCommands {
         commands: Vec<SlashCommand>,
+    },
+    /// Unread messages grouped by conversation (`Request::AllUnreads`, #606).
+    AllUnreads {
+        groups: Vec<UnreadGroup>,
     },
 }
 
