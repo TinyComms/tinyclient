@@ -429,8 +429,15 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         Command::Delete {
             conversation_id,
             message_id,
+            scope,
             reply,
-        } => delete(ctx, saved, &conversation_id, &message_id, reply),
+        } => {
+            if scope == protocol::DeleteScope::Me {
+                let _ = reply.send(Err(Refusal::Refused("Tiny only supports deleting for everyone.".to_owned())));
+            } else {
+                delete(ctx, saved, &conversation_id, &message_id, reply);
+            }
+        }
         Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
@@ -438,6 +445,27 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         }
         Command::StartDirect { person_id, reply } => start_direct(ctx, saved, &person_id, reply),
         Command::StartDirectCall { person_id, reply } => start_direct_intent(ctx, saved, &person_id, true, reply),
+        Command::MembersRemove { person, reply, .. } => {
+            let answer = match super::manage::kick(ctx.account.clone(), person, String::new()) {
+                protocol::Response::Ok => Ok(()),
+                protocol::Response::Error { detail, .. } => Err(Refusal::Refused(detail)),
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
+        Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+            let edit = protocol::TinyRoomEdit {
+                name: title,
+                topic: topic.or(description),
+                ..protocol::TinyRoomEdit::default()
+            };
+            let answer = match super::manage::room_update(ctx.account.clone(), conversation_id, edit) {
+                protocol::Response::Ok => Ok(()),
+                protocol::Response::Error { detail, .. } => Err(Refusal::Refused(detail)),
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
         Command::Catalog { kind, reply, .. } => match kind {
             CatalogKind::Emoji | CatalogKind::Gifs => {
                 let _ = reply.send(Ok(CatalogPage::default()));

@@ -149,7 +149,7 @@ struct Open {
     receipt: Option<protocol::Receipt>,
     /// What this account may do on messages (`Capabilities`).
     can: protocol::Capabilities,
-    /// Per-conversation moderation / pin rights.
+    /// Per-conversation moderation and management rights for this account.
     rights: protocol::ConversationRights,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
@@ -340,6 +340,8 @@ pub struct Pane {
     confirm: Option<Rc<Message>>,
     /// The message being forwarded (or copied to another conversation).
     forward: Option<actions::Forwarding>,
+    /// Multi-message selection mode state (#795).
+    multi_select: actions::MultiSelect,
     /// The link a click asked about, until the person opens it or does not.
     link_ask: Option<links::LinkAsk>,
     /// Earlier wordings of one message, opened from its edited mark.
@@ -438,6 +440,7 @@ impl Pane {
             picker: None,
             confirm: None,
             forward: None,
+            multi_select: actions::MultiSelect::default(),
             link_ask: None,
             revisions: None,
             hold: None,
@@ -503,6 +506,7 @@ impl Pane {
         if let Some(open) = self.open.as_mut() {
             open.picture = picture;
             open.receipt = receipt;
+            open.rights = conversation.rights;
         }
     }
 
@@ -578,6 +582,7 @@ impl Pane {
         self.shown.clear();
         self.expanded.clear();
         self.code_colors.clear();
+        self.multi_select.clear();
         self.code_coloring.clear();
         self.copied = None;
         self.hovered = None;
@@ -1659,6 +1664,7 @@ impl Render for Pane {
             .children(self.live_call_row(cx))
             .children(self.history_banner(cx))
             .children(self.away.then(|| self.jump_button(cx)))
+            .children(self.selection_bar(cx))
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }

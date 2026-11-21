@@ -53,6 +53,13 @@ impl<T> Answer<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::gui) enum ManageKind {
+    Rename,
+    Topic,
+    AddMembers,
+}
+
 pub struct InfoPane {
     shell: WeakEntity<Shell>,
     hub: Hub,
@@ -74,6 +81,10 @@ pub struct InfoPane {
     about_open: bool,
     /// What the user set here, drawn before the row says so.
     notify_set: Option<(Key, Notify)>,
+    /// Inline conversation management input (rename, topic, add people).
+    manage: Option<(Key, ManageKind, Entity<crate::gui::input::TextInput>)>,
+    /// Pending confirmation to remove a member: (conversation, person_id, person_name).
+    pending_remove: Option<(Key, String, String)>,
     /// The content width, from the pane's.
     width: f32,
     /// The shell's Spaces, for In common and Details' icons.
@@ -124,6 +135,8 @@ impl InfoPane {
             phones_shown: false,
             about_open: false,
             notify_set: None,
+            manage: None,
+            pending_remove: None,
             width: 268.,
             spaces: Vec::new(),
         }
@@ -923,6 +936,96 @@ impl InfoPane {
 
     pub(in crate::gui) fn shell_weak(&self) -> WeakEntity<Shell> {
         self.shell.clone()
+    }
+
+    pub(in crate::gui) fn managing(&self) -> Option<&(Key, ManageKind, Entity<crate::gui::input::TextInput>)> {
+        self.manage.as_ref()
+    }
+
+    pub(in crate::gui) fn pending_remove(&self) -> Option<&(Key, String, String)> {
+        self.pending_remove.as_ref()
+    }
+
+    pub(in crate::gui) fn start_manage(
+        &mut self,
+        conversation: Key,
+        kind: ManageKind,
+        initial: &str,
+        placeholder: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = initial.to_owned();
+        let input = cx.new(|cx| {
+            let mut field = crate::gui::input::TextInput::new(placeholder, cx);
+            if !initial.is_empty() {
+                field.set_text(&initial, cx);
+            }
+            field
+        });
+        self.manage = Some((conversation, kind, input));
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_manage(&mut self, cx: &mut Context<Self>) {
+        self.manage = None;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn submit_manage(&mut self, cx: &mut Context<Self>) {
+        let Some((conversation, kind, input)) = self.manage.take() else {
+            return;
+        };
+        let value = input.read(cx).text().trim().to_owned();
+        let request = match kind {
+            ManageKind::Rename if !value.is_empty() => Request::ConversationUpdate {
+                conversation,
+                title: Some(value),
+                topic: None,
+                description: None,
+            },
+            ManageKind::Topic => Request::ConversationUpdate {
+                conversation,
+                title: None,
+                topic: Some(value),
+                description: None,
+            },
+            ManageKind::AddMembers => {
+                let people: Vec<String> = value
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if people.is_empty() {
+                    cx.notify();
+                    return;
+                }
+                Request::MembersAdd { conversation, people }
+            }
+            _ => {
+                cx.notify();
+                return;
+            }
+        };
+        super::ask_later(cx, request, |_, _| {});
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn ask_remove_member(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        self.pending_remove = Some((conversation, person_id, person_name));
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_remove_member(&mut self, cx: &mut Context<Self>) {
+        self.pending_remove = None;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn confirm_remove_member(&mut self, cx: &mut Context<Self>) {
+        let Some((conversation, person, _)) = self.pending_remove.take() else {
+            return;
+        };
+        super::ask_later(cx, Request::MembersRemove { conversation, person }, |_, _| {});
+        cx.notify();
     }
 }
 

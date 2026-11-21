@@ -606,6 +606,7 @@ mod tests {
             presence,
             status: String::new(),
             avatar: None,
+            can: protocol::Capabilities::default(),
         }
     }
 

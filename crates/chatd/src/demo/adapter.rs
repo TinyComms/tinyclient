@@ -356,6 +356,7 @@ impl Demo {
             pinned: Some((pick % 4) as u32),
             external: if self.ctx.account.network == Network::Slack && row.title == "customer-voice" { "Northwind Traders".to_owned() } else { String::new() },
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
+            disappearing: row.disappearing,
         })
     }
 
@@ -633,7 +634,7 @@ impl Demo {
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
+            Command::Delete { conversation_id, message_id, scope: _, reply } => {
                 let deleted = demo.ctx.deleted(&conversation_id, &message_id);
                 let _ = reply.send(deleted.map_err(|err| Refusal::Refused(err.to_string())));
             }
@@ -820,6 +821,80 @@ impl Demo {
             }
             Command::Source { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::SetDisappearing { conversation_id, seconds, reply } => {
+                let outcome = demo
+                    .ctx
+                    .disappearing(&conversation_id, (seconds > 0).then_some(seconds))
+                    .map_err(|err| Refusal::Refused(err.to_string()));
+                if outcome.is_ok() {
+                    let line = if seconds == 0 {
+                        "Disappearing messages are off".to_owned()
+                    } else {
+                        format!("Disappearing messages are set to {}", protocol::format_disappearing(seconds))
+                    };
+                    let now = crate::hub::now();
+                    let mut msg = Message::plain(format!("demo-ttl-{now}"), String::new(), line, now, false);
+                    msg.kind = protocol::MessageKind::System;
+                    let _ = demo.ctx.message(&conversation_id, &msg);
+                }
+                let _ = reply.send(outcome);
+            }
+            Command::MembersAdd { reply, .. } | Command::MembersRemove { reply, .. } | Command::ConversationPicture { reply, .. } => {
+                let _ = reply.send(Ok(()));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                let outcome = match demo.ctx.known(&conversation_id) {
+                    Ok(Some(row)) => {
+                        let mut updated = crate::store::ConversationRow::new(
+                            conversation_id.clone(),
+                            row.kind,
+                            title.unwrap_or(row.title),
+                        );
+                        updated.space = row.space;
+                        updated.group = row.group;
+                        updated.position = row.position;
+                        updated.peer = row.peer;
+                        updated.call = row.call;
+                        updated.topic = topic.or(description).unwrap_or(row.topic);
+                        updated.read_only = row.read_only;
+                        updated.private = row.private;
+                        updated.rights = row.rights;
+                        updated.disappearing = row.disappearing;
+                        demo.ctx.conversation(&updated).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused("no such conversation".to_owned())),
+                };
+                let _ = reply.send(outcome);
+            }
+            Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
+                let outcome = match demo.ctx.known(&conversation_id) {
+                    Ok(Some(row)) => {
+                        let mut folders = row.folders;
+                        if let Some(f) = folder_add {
+                            if !folders.contains(&f) {
+                                folders.push(f);
+                            }
+                        }
+                        if let Some(f) = folder_remove {
+                            folders.retain(|x| x != &f);
+                        }
+                        let filing = crate::store::Filing {
+                            folders,
+                            archived: archived.unwrap_or(row.archived),
+                            pin: match pinned {
+                                Some(true) => Some(0),
+                                Some(false) => None,
+                                None => row.pin,
+                            },
+                            hidden: row.hidden,
+                            followed: row.followed,
+                        };
+                        demo.ctx.filing(&conversation_id, &filing).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused("no such conversation".to_owned())),
+                };
+                let _ = reply.send(outcome);
             }
             // Nothing is behind these: what is stored is all there is.
             Command::Backfill(_)

@@ -187,6 +187,7 @@ pub struct ConversationAbout {
     pub pinned: Option<u32>,
     pub external: String,
     pub link: String,
+    pub disappearing: Option<u32>,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -303,10 +304,11 @@ pub enum Command {
         message_id: String,
         reply: Reply<String>,
     },
-    /// Delete a message for everyone. Report it through [`Context::deleted`] before answering.
+    /// Delete a message (`Everyone` or `Me`). Report it through [`Context::deleted`] before answering.
     Delete {
         conversation_id: String,
         message_id: String,
+        scope: protocol::DeleteScope,
         reply: Reply<()>,
     },
     /// The user's draft is changing. Pace it: at most one typing signal per 8 s per
@@ -329,6 +331,32 @@ pub enum Command {
         offset: u32,
         limit: u32,
         reply: Reply<Members>,
+    },
+    /// Add or invite people to a group or channel.
+    MembersAdd {
+        conversation_id: String,
+        people: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Remove one person from a group or channel.
+    MembersRemove {
+        conversation_id: String,
+        person: String,
+        reply: Reply<()>,
+    },
+    /// Rename a conversation or update its topic or description.
+    ConversationUpdate {
+        conversation_id: String,
+        title: Option<String>,
+        topic: Option<String>,
+        description: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set or clear a conversation's picture from a local file path.
+    ConversationPicture {
+        conversation_id: String,
+        path: String,
+        reply: Reply<()>,
     },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
@@ -360,10 +388,27 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Set or clear a conversation's disappearing-messages timer (`seconds == 0` turns it off).
+    /// Report the new timer through [`Context::disappearing`] before answering.
+    SetDisappearing {
+        conversation_id: String,
+        seconds: u32,
+        reply: Reply<()>,
+    },
     /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
     Star { conversation_id: String, starred: bool, reply: Reply<()> },
+    /// File a conversation on the network: pin/unpin, archive/unarchive, or add/remove a folder.
+    /// Report the new filing through [`Context::filing`] before answering.
+    File {
+        conversation_id: String,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        folder_add: Option<String>,
+        folder_remove: Option<String>,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -515,6 +560,10 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MembersAdd { reply, .. }
+            | Command::MembersRemove { reply, .. }
+            | Command::ConversationUpdate { reply, .. }
+            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. } | Command::StartDirectCall { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
@@ -522,10 +571,12 @@ impl Command {
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
-            | Command::Star { reply, .. } => {
+            | Command::Star { reply, .. }
+            | Command::File { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -814,6 +865,24 @@ impl Context {
     pub fn starred(&self, conversation_id: &str, starred: bool) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_starred(&conversation, starred)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    /// Per-conversation moderation and management rights for this account.
+    pub fn rights(&self, conversation_id: &str, rights: protocol::ConversationRights) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_rights(&conversation, rights)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    /// The network's disappearing-messages timer for a conversation (seconds; `None` or `Some(0)` means off).
+    pub fn disappearing(&self, conversation_id: &str, seconds: Option<u32>) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_disappearing(&conversation, seconds)? {
             self.hub.changed(Change::Conversation { conversation });
         }
         Ok(())

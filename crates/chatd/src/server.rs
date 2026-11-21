@@ -1542,7 +1542,7 @@ impl Chat {
 
     /// Edit and delete change nothing here: the answer is the network's, and the message
     /// changes when the adapter reports it.
-    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>) -> Response {
+    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>, scope: protocol::DeleteScope) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -1569,6 +1569,7 @@ impl Chat {
             None => self.ask(&account, |reply| Command::Delete {
                 conversation_id,
                 message_id,
+                scope,
                 reply,
             }),
         };
@@ -1818,6 +1819,7 @@ impl Chat {
             Err(refused) => return *refused,
         };
         let mut info = ConversationInfo {
+            disappearing: about.disappearing.or(row.disappearing),
             conversation: row,
             description: about.description,
             members: about.members,
@@ -2638,6 +2640,19 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::File { conversation, pinned, archived, folder_add, folder_remove } => {
+                if pinned.is_none() && archived.is_none() && folder_add.is_none() && folder_remove.is_none() {
+                    return Response::Ok;
+                }
+                self.act(&conversation, |conversation_id, reply| Command::File {
+                    conversation_id,
+                    pinned,
+                    archived,
+                    folder_add,
+                    folder_remove,
+                    reply,
+                })
+            }
             Request::Remind { conversation, message_id, remind_at } => {
                 if !self.shows(&conversation.account()) {
                     return error(ErrorCode::NotFound, "signed out");
@@ -2691,6 +2706,52 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::MembersAdd { conversation, people } => {
+                if people.is_empty() {
+                    return error(ErrorCode::Refused, "Pick at least one person to add.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::MembersAdd { conversation_id, people, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::MembersRemove { conversation, person } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No person named to remove.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::MembersRemove { conversation_id, person, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::ConversationUpdate { conversation, title, topic, description } => {
+                if title.is_none() && topic.is_none() && description.is_none() {
+                    return Response::Ok;
+                }
+                if title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                    return error(ErrorCode::Refused, "A conversation name cannot be empty.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::ConversationUpdate {
+                    conversation_id,
+                    title,
+                    topic,
+                    description,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::ConversationPicture { conversation, path } => {
+                let res = self.act(&conversation, |conversation_id, reply| Command::ConversationPicture { conversation_id, path, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
             request @ (Request::StartDirect { .. } | Request::StartDirectCall { .. }) => {
                 let (person, call) = match request {
                     Request::StartDirect { person } => (person, false),
@@ -2721,6 +2782,13 @@ impl Chat {
             Request::SpaceInfo { space } => self.space_info(space),
             Request::SetMute { conversation, notify, until } => {
                 self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, until, reply })
+            }
+            Request::SetDisappearing { conversation, seconds } => {
+                let res = self.act(&conversation, |conversation_id, reply| Command::SetDisappearing { conversation_id, seconds, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
             }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
             Request::CloseDirect { conversation } => {
@@ -2822,8 +2890,8 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
             Request::Reactions { conversation } => self.reactions(conversation),
-            Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans),
-            Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None, Vec::new()),
+            Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
+            Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
@@ -3642,7 +3710,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
         emoji: "👍".into(),
         on: true,
     });
-    let delete = chat.handle(Request::Delete { conversation: conversation.clone(), message_id: "1".into() });
+    let delete = chat.handle(Request::Delete { conversation: conversation.clone(), message_id: "1".into(), scope: protocol::DeleteScope::Everyone });
     if !matches!(edit, Response::Error { code: ErrorCode::Offline, .. })
         || !matches!(react, Response::Error { code: ErrorCode::Offline, .. })
         || !matches!(delete, Response::Error { code: ErrorCode::Offline, .. })
@@ -4249,5 +4317,334 @@ mod tests {
     #[test]
     fn a_text_sent_while_offline_waits_and_a_late_one_fails_instead_of_going() {
         assert_eq!(super::prove_offline_queue(), Ok(()));
+    }
+
+    #[test]
+    fn filing_a_conversation_moves_it_to_archive_and_back() {
+        use crate::adapters::{self, Command};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Filing, Store};
+        use protocol::{AccountKey, ConversationKind, Key, Link, Network, Request, Response, Shelf};
+        use std::sync::Arc;
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Telegram, account: "tg".into() };
+        let conv = Key::new(&account, "u:42");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        ctx.conversation(&ConversationRow::new("u:42", ConversationKind::Direct, "Mara"))
+        .unwrap();
+
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
+                        let row = worker_ctx.known(&conversation_id).unwrap().unwrap();
+                        let mut folders = row.folders;
+                        if let Some(f) = folder_add {
+                            if !folders.contains(&f) {
+                                folders.push(f);
+                            }
+                        }
+                        if let Some(f) = folder_remove {
+                            folders.retain(|x| x != &f);
+                        }
+                        let filing = Filing {
+                            folders,
+                            archived: archived.unwrap_or(row.archived),
+                            pin: match pinned {
+                                Some(true) => Some(0),
+                                Some(false) => None,
+                                None => row.pin,
+                            },
+                            hidden: row.hidden,
+                            followed: row.followed,
+                        };
+                        worker_ctx.filing(&conversation_id, &filing).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        // Archive moves the chat from Main to Archive shelf.
+        assert_eq!(
+            chat.handle(Request::File {
+                conversation: conv.clone(),
+                pinned: None,
+                archived: Some(true),
+                folder_add: None,
+                folder_remove: None,
+            }),
+            Response::Ok
+        );
+        let Response::Conversations { conversations: main_rows, .. } = chat.handle(Request::Home {
+            network: Network::Telegram,
+            account: Some(account.clone()),
+            folder: None,
+            shelf: Shelf::Main,
+            offset: 0,
+            limit: 50,
+        }) else {
+            panic!("expected Conversations");
+        };
+        assert!(main_rows.is_empty(), "archived chat must leave Main shelf");
+        let Response::Conversations { conversations: arch_rows, .. } = chat.handle(Request::Home {
+            network: Network::Telegram,
+            account: Some(account.clone()),
+            folder: None,
+            shelf: Shelf::Archive,
+            offset: 0,
+            limit: 50,
+        }) else {
+            panic!("expected Conversations");
+        };
+        assert_eq!(arch_rows.len(), 1);
+        assert!(arch_rows[0].archived);
+
+        // Unarchive + pin + add to folder brings it back pinned and filed.
+        assert_eq!(
+            chat.handle(Request::File {
+                conversation: conv.clone(),
+                pinned: Some(true),
+                archived: Some(false),
+                folder_add: Some("work".into()),
+                folder_remove: None,
+            }),
+            Response::Ok
+        );
+        let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conv }) else {
+            panic!("expected Conversation");
+        };
+        assert!(!row.archived);
+        assert_eq!(row.pin, Some(0));
+        assert_eq!(row.folders, vec!["work".to_owned()]);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn delete_passes_scope_and_persists_conversation_rights() {
+        use crate::adapters::{self, Command};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Store};
+        use protocol::{AccountKey, ConversationKind, ConversationRights, DeleteScope, Key, Link, Message, Network, Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Telegram, account: "tg".into() };
+        let conv = Key::new(&account, "g:1");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        let mut row = ConversationRow::new("g:1", ConversationKind::Group, "Mods");
+        row.rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
+        ctx.conversation(&row).unwrap();
+        let other_msg = Message::plain("m1", "other", "remove me", 1_700_000_000, false);
+        let other_msg2 = Message::plain("m2", "other", "remove locally", 1_700_000_001, false);
+        ctx.message("g:1", &other_msg).unwrap();
+        ctx.message("g:1", &other_msg2).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, DeleteScope)>::new()));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::Delete { conversation_id, message_id, scope, reply } => {
+                        seen_worker.lock().unwrap().push((message_id.clone(), scope));
+                        worker_ctx.deleted(&conversation_id, &message_id).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        let Response::Conversation { conversation: stored } = chat.handle(Request::Conversation { conversation: conv.clone() }) else {
+            panic!("expected Conversation");
+        };
+        assert!(stored.rights.delete_others);
+
+        assert_eq!(
+            chat.handle(Request::Delete { conversation: conv.clone(), message_id: "m1".into(), scope: DeleteScope::Everyone }),
+            Response::Ok
+        );
+        assert_eq!(
+            chat.handle(Request::Delete { conversation: conv, message_id: "m2".into(), scope: DeleteScope::Me }),
+            Response::Ok
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("m1".to_owned(), DeleteScope::Everyone), ("m2".to_owned(), DeleteScope::Me)]
+        );
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn disappearing_timer_updates_row_and_info() {
+        use crate::adapters::{self, Command, ConversationAbout};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Store};
+        use protocol::{AccountKey, ConversationKind, Key, Link, Network, Request, Response};
+        use std::sync::Arc;
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Signal, account: "sig".into() };
+        let conv = Key::new(&account, "u:9");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        ctx.conversation(&ConversationRow::new("u:9", ConversationKind::Direct, "Nora")).unwrap();
+
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::SetDisappearing { conversation_id, seconds, reply } => {
+                        worker_ctx.disappearing(&conversation_id, (seconds > 0).then_some(seconds)).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::ConversationInfo { reply, .. } => {
+                        let _ = reply.send(Ok(ConversationAbout::default()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        assert_eq!(chat.handle(Request::SetDisappearing { conversation: conv.clone(), seconds: 30 }), Response::Ok);
+        let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conv.clone() }) else {
+            panic!("expected Conversation");
+        };
+        assert_eq!(row.disappearing, Some(30));
+
+        let Response::ConversationInfo { info } = chat.handle(Request::ConversationInfo { conversation: conv.clone() }) else {
+            panic!("expected ConversationInfo");
+        };
+        assert_eq!(info.disappearing, Some(30));
+
+        assert_eq!(chat.handle(Request::SetDisappearing { conversation: conv.clone(), seconds: 0 }), Response::Ok);
+        let Response::Conversation { conversation: cleared } = chat.handle(Request::Conversation { conversation: conv }) else {
+            panic!("expected Conversation");
+        };
+        assert_eq!(cleared.disappearing, None);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn conversation_management_requests_update_conversation_and_members() {
+        use crate::adapters::{self, Command};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Store};
+        use protocol::{AccountKey, ConversationKind, ConversationRights, ErrorCode, Key, Link, Network, Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Slack, account: "w1".into() };
+        let conv = Key::new(&account, "C1");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        let mut row = ConversationRow::new("C1", ConversationKind::Group, "Old Name");
+        row.rights = ConversationRights {
+            add_members: true,
+            remove_members: true,
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+            ..ConversationRights::default()
+        };
+        ctx.conversation(&row).unwrap();
+
+        let members = Arc::new(Mutex::new(vec!["U1".to_owned()]));
+        let members_worker = Arc::clone(&members);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::MembersAdd { people, reply, .. } => {
+                        members_worker.lock().unwrap().extend(people);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::MembersRemove { person, reply, .. } => {
+                        members_worker.lock().unwrap().retain(|p| p != &person);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                        let cur = worker_ctx.known(&conversation_id).unwrap().unwrap();
+                        let mut next = ConversationRow::new(conversation_id, cur.kind, title.unwrap_or(cur.title));
+                        next.topic = topic.or(description).unwrap_or(cur.topic);
+                        next.rights = cur.rights;
+                        worker_ctx.conversation(&next).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::ConversationPicture { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        // Empty people list and empty title are refused cleanly.
+        assert!(matches!(
+            chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec![] }),
+            Response::Error { code: ErrorCode::Refused, .. }
+        ));
+        assert!(matches!(
+            chat.handle(Request::ConversationUpdate {
+                conversation: conv.clone(),
+                title: Some("   ".into()),
+                topic: None,
+                description: None,
+            }),
+            Response::Error { code: ErrorCode::Refused, .. }
+        ));
+
+        // Add, remove, rename + topic, and picture succeed.
+        assert_eq!(chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec!["U2".into()] }), Response::Ok);
+        assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned(), "U2".to_owned()]);
+        assert_eq!(chat.handle(Request::MembersRemove { conversation: conv.clone(), person: "U2".into() }), Response::Ok);
+        assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned()]);
+        assert_eq!(
+            chat.handle(Request::ConversationUpdate {
+                conversation: conv.clone(),
+                title: Some("New Name".into()),
+                topic: Some("Ship week".into()),
+                description: None,
+            }),
+            Response::Ok
+        );
+        let Response::Conversation { conversation: updated } = chat.handle(Request::Conversation { conversation: conv.clone() }) else {
+            panic!("expected Conversation");
+        };
+        assert_eq!(updated.title, "New Name");
+        assert_eq!(updated.topic, "Ship week");
+        assert!(updated.rights.add_members && updated.rights.remove_members && updated.rights.rename && updated.rights.edit_topic && updated.rights.edit_picture);
+        assert_eq!(chat.handle(Request::ConversationPicture { conversation: conv, path: "/tmp/pic.png".into() }), Response::Ok);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
     }
 }

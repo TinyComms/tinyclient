@@ -525,9 +525,12 @@ pub struct Conversation {
     /// Flagged as spam by the network (e.g. Discord spam message request).
     #[serde(default, skip_serializing_if = "is_false")]
     pub spam: bool,
-    /// Per-conversation moderation / pin rights for this account.
+    /// Per-conversation moderation and management rights for this account.
     #[serde(default, skip_serializing_if = "ConversationRights::is_none")]
     pub rights: ConversationRights,
+    /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disappearing: Option<u32>,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -592,6 +595,7 @@ impl Conversation {
             read_only_reason: String::new(),
             spam: false,
             rights: ConversationRights::default(),
+            disappearing: None,
         }
     }
 
@@ -1158,6 +1162,23 @@ pub struct ForwardOutcome {
     pub error: Option<String>,
 }
 
+/// Who a `Request::Delete` removes the message for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteScope {
+    /// Remove the message for everyone in the conversation (the default).
+    #[default]
+    Everyone,
+    /// Remove the message on this user's side only (Telegram, Signal, Google Messages).
+    Me,
+}
+
+impl DeleteScope {
+    pub fn is_everyone(&self) -> bool {
+        *self == DeleteScope::Everyone
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1211,6 +1232,20 @@ pub enum Request {
     Star {
         conversation: Key,
         starred: bool,
+    },
+    /// Files a conversation on the network: pins or unpins it, archives or unarchives it,
+    /// or adds or removes it from a folder. Unset fields are left alone. The new filing is
+    /// reported back through the row's `Conversation` change and `Folders` change.
+    File {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_add: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_remove: Option<String>,
     },
     /// Puts a reminder on one message, to be told about it when the time comes, or takes it
     /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is
@@ -1334,6 +1369,31 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
+    /// Adds or invites people (by person id) to a group or channel.
+    MembersAdd {
+        conversation: Key,
+        people: Vec<String>,
+    },
+    /// Removes one person (by person id) from a group or channel.
+    MembersRemove {
+        conversation: Key,
+        person: String,
+    },
+    /// Renames a conversation or updates its topic or description. Unset fields are left alone.
+    ConversationUpdate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Sets a conversation's picture from a local file path (empty clears it).
+    ConversationPicture {
+        conversation: Key,
+        path: String,
+    },
     /// The direct conversation with a person, created if there is none. Nothing reaches the other
     /// person until a message is sent.
     StartDirect {
@@ -1375,6 +1435,12 @@ pub enum Request {
         notify: Notify,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<i64>,
+    },
+    /// Sets or clears a conversation's disappearing-messages timer (`seconds == 0` turns it off).
+    /// Separate from local cache retention (`keep_days`).
+    SetDisappearing {
+        conversation: Key,
+        seconds: u32,
     },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
     Leave {
@@ -1614,10 +1680,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spans: Vec<Span>,
     },
-    /// Deletes a message for everyone. Waits for the network, like `Edit`.
+    /// Deletes a message. `scope` defaults to `Everyone` (so older shells keep working);
+    /// `Me` removes it on this user's side only (Telegram, Signal, Google Messages).
     Delete {
         conversation: Key,
         message_id: String,
+        #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
+        scope: DeleteScope,
     },
     /// Forwards one or more messages to up to [`FORWARD_LIMIT`] conversations on the same account.
     /// Cross-account targets are refused; callers use a separate re-send for "Copy to…".
@@ -2903,6 +2972,119 @@ mod tests {
             assert!(!json.contains(absent), "{absent} in {json}");
         }
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
+    }
+
+    #[test]
+    fn file_request_and_capabilities_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u:1");
+        let req = Request::File {
+            conversation: key.clone(),
+            pinned: Some(true),
+            archived: Some(false),
+            folder_add: Some("2".into()),
+            folder_remove: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("folder_remove"), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+
+        // Minimal request with only archived set leaves other fields None.
+        let minimal: Request = serde_json::from_str(&format!(
+            r#"{{"op":"file","conversation":{},"archived":true}}"#,
+            serde_json::to_string(&key).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(
+            minimal,
+            Request::File { conversation: key, pinned: None, archived: Some(true), folder_add: None, folder_remove: None }
+        );
+
+        let can = Capabilities { pin_chats: 5, archive: true, folders_edit: true, ..Capabilities::default() };
+        let cjson = serde_json::to_string(&can).unwrap();
+        assert_eq!(serde_json::from_str::<Capabilities>(&cjson).unwrap(), can);
+        // Older capabilities JSON without these fields defaults to 0 / false.
+        let old: Capabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!((old.pin_chats, old.archive, old.folders_edit), (0, false, false));
+    }
+
+    #[test]
+    fn delete_scope_and_conversation_rights_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u:1");
+        // Default scope stays off the wire for backward compatibility.
+        let everyone = Request::Delete { conversation: key.clone(), message_id: "9".into(), scope: DeleteScope::Everyone };
+        let json = serde_json::to_string(&everyone).unwrap();
+        assert!(!json.contains("scope"), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), everyone);
+
+        // Explicit `Me` scope round-trips.
+        let mine = Request::Delete { conversation: key.clone(), message_id: "9".into(), scope: DeleteScope::Me };
+        let me_json = serde_json::to_string(&mine).unwrap();
+        assert!(me_json.contains(r#""scope":"me""#), "{me_json}");
+        assert_eq!(serde_json::from_str::<Request>(&me_json).unwrap(), mine);
+
+        // Older shell request without `scope` decodes as `Everyone`.
+        let legacy: Request = serde_json::from_str(&format!(
+            r#"{{"op":"delete","conversation":{},"message_id":"9"}}"#,
+            serde_json::to_string(&key).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(legacy, everyone);
+
+        // ConversationRights bitmask + serde round-trip.
+        let rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
+        assert_eq!(ConversationRights::from_bits(rights.to_bits()), rights);
+        assert!(ConversationRights::default().is_empty());
+        assert!(!rights.is_empty());
+    }
+
+    #[test]
+    fn disappearing_timer_request_and_presets_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Signal, account: "sig".into() }, "u:1");
+        let req = Request::SetDisappearing { conversation: key.clone(), seconds: 30 };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+
+        assert_eq!(format_disappearing(0), "Off");
+        assert_eq!(format_disappearing(30), "30s");
+        assert_eq!(format_disappearing(300), "5m");
+        assert_eq!(format_disappearing(3_600), "1h");
+        assert_eq!(format_disappearing(86_400), "1d");
+        assert_eq!(format_disappearing(604_800), "1w");
+        assert!(disappearing_presets(Network::Signal).contains(&30));
+        assert!(disappearing_presets(Network::Telegram).contains(&86_400));
+    }
+
+    #[test]
+    fn conversation_management_requests_and_rights_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Slack, account: "w1".into() }, "C1");
+        let add = Request::MembersAdd { conversation: key.clone(), people: vec!["U1".into(), "U2".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&add).unwrap()).unwrap(), add);
+
+        let remove = Request::MembersRemove { conversation: key.clone(), person: "U2".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&remove).unwrap()).unwrap(), remove);
+
+        let update = Request::ConversationUpdate {
+            conversation: key.clone(),
+            title: Some("ops-new".into()),
+            topic: Some("deployments".into()),
+            description: None,
+        };
+        let ujson = serde_json::to_string(&update).unwrap();
+        assert!(!ujson.contains("description"), "{ujson}");
+        assert_eq!(serde_json::from_str::<Request>(&ujson).unwrap(), update);
+
+        let pic = Request::ConversationPicture { conversation: key, path: "/tmp/icon.png".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pic).unwrap()).unwrap(), pic);
+
+        let all = ConversationRights {
+            delete_others: true,
+            add_members: true,
+            remove_members: true,
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+        };
+        assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }
 }
 

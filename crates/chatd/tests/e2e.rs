@@ -968,7 +968,7 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     // Deleting the message a reply answers leaves the reply saying so.
     let frost = find("Frost on the cushion moss");
     assert_eq!(edited.reply_to.as_ref().map(|quoted| (quoted.id.as_str(), quoted.deleted)), Some((frost.id.as_str(), false)));
-    assert_eq!(chatd.ask(Request::Delete { conversation: room.clone(), message_id: frost.id.clone() }), Response::Ok);
+    assert_eq!(chatd.ask(Request::Delete { conversation: room.clone(), message_id: frost.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     let messages = chatd.newest(&room);
     assert!(messages.iter().all(|message| message.id != frost.id), "the deleted message is still listed");
     let orphaned = find("Same spot, and the camera was level.").reply_to.expect("still a reply");
@@ -979,7 +979,7 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     let root = find("Trail camera build log");
     let thread = root.thread.clone().expect("a thread");
     assert_eq!((thread.participants.len(), thread.unread), (3, 2));
-    assert_eq!(chatd.ask(Request::Delete { conversation: room.clone(), message_id: root.id.clone() }), Response::Ok);
+    assert_eq!(chatd.ask(Request::Delete { conversation: room.clone(), message_id: root.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     let tomb = chatd.newest(&room).into_iter().find(|message| message.id == root.id).expect("the tombstone");
     assert_eq!((tomb.deleted, tomb.text.as_str(), tomb.thread.as_ref()), (true, "", Some(&thread)));
     let hanging = chatd.row(&demo(&thread.id));

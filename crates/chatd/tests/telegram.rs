@@ -1962,7 +1962,7 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
     assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "That reaction isn't allowed here.".into() });
     assert!(world.message("u7002", "12").unwrap().reactions.iter().all(|reaction| reaction.emoji != "🚫"));
 
-    assert_eq!(world.ask(Request::Delete { conversation: key("u7002"), message_id: "101".into() }), Response::Ok);
+    assert_eq!(world.ask(Request::Delete { conversation: key("u7002"), message_id: "101".into(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     assert!(world.message("u7002", "101").is_none());
     assert!(world.calls().contains(&"DeleteMessages [101] revoke true".to_owned()));
 

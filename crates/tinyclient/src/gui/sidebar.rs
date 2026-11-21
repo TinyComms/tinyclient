@@ -775,6 +775,29 @@ impl Shell {
         });
     }
 
+    /// Pins/unpins, archives/unarchives, or files a conversation in a folder on the network.
+    pub(super) fn file_conversation(
+        &mut self,
+        conversation: Key,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        folder_add: Option<String>,
+        folder_remove: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let request = Request::File { conversation, pinned, archived, folder_add, folder_remove };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+            if this.sidebar_state.home.network.is_some() {
+                this.load_home(cx);
+            }
+        });
+    }
+
     pub(super) fn pin(&mut self, space: Key, pinned: bool, cx: &mut Context<Self>) {
         let pins = &mut self.sidebar_state.pins;
         pins.retain(|pin| pin != &space);

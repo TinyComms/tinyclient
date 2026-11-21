@@ -353,6 +353,10 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gif_file: false,
         mention_format: protocol::MentionFormat::Plain,
         mention_spans: true,
+        pin_chats: if premium { 10 } else { 5 },
+        archive: true,
+        folders_edit: true,
+        disappearing: true,
         ..Default::default()
     }
 }

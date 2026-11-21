@@ -240,6 +240,9 @@ pub struct ConversationInfo {
     /// The public link (`t.me/name`), where there is one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub link: String,
+    /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disappearing: Option<u32>,
 }
 
 /// A Space's info: opened from its name, never from a conversation.
@@ -308,34 +311,88 @@ pub struct ConversationRights {
     /// May pin or unpin messages in this conversation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pin: bool,
-    /// May delete other people's messages in this conversation.
+    /// May delete other people's messages in this conversation (Discord
+    /// `MANAGE_MESSAGES`, Slack admin, Telegram `delete_messages`, Signal group admin,
+    /// Teams owner).
     #[serde(default, skip_serializing_if = "is_false")]
     pub delete_others: bool,
     /// May add, remove, or manage members in this conversation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_members: bool,
+    /// May add/invite people to this conversation (`Request::MembersAdd`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_members: bool,
+    /// May remove people from this conversation (`Request::MembersRemove`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remove_members: bool,
+    /// May rename this conversation (`Request::ConversationUpdate`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rename: bool,
+    /// May edit this conversation's topic or description (`Request::ConversationUpdate`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_topic: bool,
+    /// May change this conversation's picture (`Request::ConversationPicture`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_picture: bool,
 }
 
 impl ConversationRights {
-    const PIN: u32 = 1 << 0;
-    const DELETE_OTHERS: u32 = 1 << 1;
-    const MANAGE_MEMBERS: u32 = 1 << 2;
+    const PIN: i64 = 1 << 0;
+    const DELETE_OTHERS: i64 = 1 << 1;
+    const MANAGE_MEMBERS: i64 = 1 << 2;
+    const ADD_MEMBERS: i64 = 1 << 3;
+    const REMOVE_MEMBERS: i64 = 1 << 4;
+    const RENAME: i64 = 1 << 5;
+    const EDIT_TOPIC: i64 = 1 << 6;
+    const EDIT_PICTURE: i64 = 1 << 7;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
     }
 
-    pub fn to_bits(self) -> u32 {
-        (u32::from(self.pin) * Self::PIN)
-            | (u32::from(self.delete_others) * Self::DELETE_OTHERS)
-            | (u32::from(self.manage_members) * Self::MANAGE_MEMBERS)
+    pub fn is_empty(&self) -> bool {
+        self.is_none()
     }
 
-    pub fn from_bits(bits: u32) -> Self {
+    pub fn to_bits(self) -> i64 {
+        let mut bits = 0i64;
+        if self.pin {
+            bits |= Self::PIN;
+        }
+        if self.delete_others {
+            bits |= Self::DELETE_OTHERS;
+        }
+        if self.manage_members {
+            bits |= Self::MANAGE_MEMBERS;
+        }
+        if self.add_members {
+            bits |= Self::ADD_MEMBERS;
+        }
+        if self.remove_members {
+            bits |= Self::REMOVE_MEMBERS;
+        }
+        if self.rename {
+            bits |= Self::RENAME;
+        }
+        if self.edit_topic {
+            bits |= Self::EDIT_TOPIC;
+        }
+        if self.edit_picture {
+            bits |= Self::EDIT_PICTURE;
+        }
+        bits
+    }
+
+    pub fn from_bits(bits: i64) -> Self {
         Self {
-            pin: bits & Self::PIN != 0,
-            delete_others: bits & Self::DELETE_OTHERS != 0,
-            manage_members: bits & Self::MANAGE_MEMBERS != 0,
+            pin: (bits & Self::PIN) != 0,
+            delete_others: (bits & Self::DELETE_OTHERS) != 0,
+            manage_members: (bits & Self::MANAGE_MEMBERS) != 0,
+            add_members: (bits & Self::ADD_MEMBERS) != 0,
+            remove_members: (bits & Self::REMOVE_MEMBERS) != 0,
+            rename: (bits & Self::RENAME) != 0,
+            edit_topic: (bits & Self::EDIT_TOPIC) != 0,
+            edit_picture: (bits & Self::EDIT_PICTURE) != 0,
         }
     }
 }
@@ -459,6 +516,46 @@ pub struct Capabilities {
     pub profile_avatar: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_nickname: bool,
+    /// Most chats this account may pin on the network (`Request::File`). 0: cannot pin.
+    /// Telegram allows 5 without Premium and 10 with Premium.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pin_chats: u32,
+    /// This account supports archiving and unarchiving conversations on the network (`Request::File`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archive: bool,
+    /// This account supports adding and removing conversations from folders (`Request::File`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub folders_edit: bool,
+    /// This account supports setting a conversation's disappearing-messages timer (`Request::SetDisappearing`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disappearing: bool,
+}
+
+/// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.
+pub fn disappearing_presets(network: Network) -> &'static [u32] {
+    match network {
+        Network::Signal => &[0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200],
+        Network::Telegram => &[0, 86_400, 604_800, 2_678_400],
+        _ => &[0, 30, 300, 3_600, 86_400, 604_800],
+    }
+}
+
+/// Short human-readable label for a disappearing-messages timer in seconds.
+pub fn format_disappearing(seconds: u32) -> String {
+    if seconds == 0 {
+        return "Off".to_owned();
+    }
+    if seconds % 604_800 == 0 {
+        format!("{}w", seconds / 604_800)
+    } else if seconds % 86_400 == 0 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds % 3_600 == 0 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 impl Capabilities {

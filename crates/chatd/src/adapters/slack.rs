@@ -1394,8 +1394,12 @@ impl Slack {
             Command::Edit { conversation_id, message_id, text, spans, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text, &spans));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
-                answer(reply, self.delete(&conversation_id, &message_id));
+            Command::Delete { conversation_id, message_id, scope, reply } => {
+                if scope == protocol::DeleteScope::Me {
+                    let _ = reply.send(Err(Refusal::Refused("Slack only supports deleting for everyone.".to_owned())));
+                } else {
+                    answer(reply, self.delete(&conversation_id, &message_id));
+                }
             }
             Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),

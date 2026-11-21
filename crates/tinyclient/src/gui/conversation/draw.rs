@@ -795,7 +795,9 @@ impl Pane {
         // The message in the composer for editing is marked, so it is plain which one is changing.
         let editing = self.shell.upgrade().and_then(|shell| shell.read(cx).composer_editing(cx));
         let editing = !self.is_thread() && editing.as_deref() == Some(message.id.as_str());
-        let bar = if editing { Some(theme::accent()) } else { bar };
+        let selecting = self.multi_select.active;
+        let ticked = selecting && self.multi_select.contains(&message.id);
+        let bar = if editing || ticked { Some(theme::accent()) } else { bar };
         let owns = self.owns_overlay(&message.id);
 
         let gutter: Option<AnyElement> = Some(if head {
@@ -896,9 +898,39 @@ impl Pane {
                 div()
                     .flex()
                     .gap(px(metrics.gap))
+                    .when(selecting, |row| {
+                        let sel_id = message.id.clone();
+                        row.child(
+                            div()
+                                .id(name_id("sel-tick", &message.id))
+                                .w(px(18.))
+                                .h(px(18.))
+                                .mt(px(2.))
+                                .flex_none()
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(if ticked { theme::accent() } else { tokens::border_strong() })
+                                .when(ticked, |box_| box_.bg(theme::accent()))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .when(ticked, |box_| box_.child(glyph("icons/check.svg", 12., gpui::rgb(0xffffff))))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                    this.toggle_selected_row(&sel_id, event.modifiers().shift, cx);
+                                })),
+                        )
+                    })
                     .children(gutter)
                     .child(column),
             )
+            .when(selecting, |row| {
+                let sel_id = message.id.clone();
+                row.cursor_pointer().on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    this.toggle_selected_row(&sel_id, event.modifiers().shift, cx);
+                }))
+            })
             .children(at_edge.map(|receipt| {
                 div().absolute().top(px(1.)).right(px(metrics.inset)).h(px(20.)).flex().items_center().child(receipt_mark(&message.id, receipt))
             }))
@@ -1169,6 +1201,24 @@ impl Pane {
         }
         if edited_alone {
             out.push(self.edited_mark(message, cx));
+        }
+        if let Some(expires_at) = message.expires_at {
+            if let Some(label) = expiry_label(expires_at, crate::view::now()) {
+                out.push(
+                    div()
+                        .id(name_id("expires", &message.id))
+                        .h(px(16.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .tooltip(tip(format!("Disappears in {label}"), None))
+                        .child(glyph("icons/clock.svg", 11., theme::text_faint()))
+                        .child(label)
+                        .into_any_element(),
+                );
+            }
         }
         out
     }
@@ -2729,5 +2779,31 @@ mod tests {
         assert_eq!(ended_dur.label, "Call with Bea · 12 min");
         let ended_plain = call_line_spec(&make(protocol::CallOutcome::Ended, true, None), "Bea");
         assert_eq!(ended_plain.label, "Call with Bea");
+    }
+
+    #[test]
+    fn expiry_label_formats_countdown_cleanly() {
+        assert_eq!(expiry_label(100, 100), Some("expiring".into()));
+        assert_eq!(expiry_label(125, 100), Some("25s".into()));
+        assert_eq!(expiry_label(400, 100), Some("5m".into()));
+        assert_eq!(expiry_label(7_300, 100), Some("2h".into()));
+        assert_eq!(expiry_label(172_900, 100), Some("2d".into()));
+    }
+}
+
+/// Short remaining-time label for a disappearing message's `expires_at` timestamp.
+pub(crate) fn expiry_label(expires_at: i64, now: i64) -> Option<String> {
+    let left = expires_at - now;
+    if left <= 0 {
+        return Some("expiring".to_owned());
+    }
+    if left >= 86_400 {
+        Some(format!("{}d", left / 86_400))
+    } else if left >= 3_600 {
+        Some(format!("{}h", left / 3_600))
+    } else if left >= 60 {
+        Some(format!("{}m", left / 60))
+    } else {
+        Some(format!("{left}s"))
     }
 }

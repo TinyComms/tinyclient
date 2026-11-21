@@ -3,9 +3,9 @@
 
 use super::draw;
 use super::facts::{self, MembersShown, NotifyControl};
-use crate::gui::components::{button_with_icon, glyph, icon_button, pair, segment, segmented, tip, Avatar, ButtonKind, Shape as Plate};
+use crate::gui::components::{button, button_with_icon, glyph, icon_button, pair, segment, segmented, tip, Avatar, ButtonKind, Shape as Plate};
 use crate::gui::people::card::Float;
-use crate::gui::people::info::InfoPane;
+use crate::gui::people::info::{InfoPane, ManageKind};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
@@ -48,6 +48,51 @@ fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
     chips = chips.child(set);
     let muted = (row.muted).then(|| div().type_small().text_color(theme::text_faint()).child("Muted conversations make no sound."));
     div().flex().flex_col().gap(px(6.)).child(div().type_ui().child("Sound")).child(chips).children(muted)
+}
+
+/// Disappearing-messages timer control in the info pane (separate from local `keep_days`).
+fn disappearing_row(
+    pane: &InfoPane,
+    row: &Conversation,
+    info: Option<&protocol::ConversationInfo>,
+    cx: &mut Context<InfoPane>,
+) -> Option<Div> {
+    let (_, scene, ..) = pane.parts();
+    let can = scene
+        .accounts
+        .iter()
+        .find(|a| a.key == row.key.account())
+        .map(|a| a.can)
+        .unwrap_or_default();
+    let active = info.and_then(|i| i.disappearing).or(row.disappearing).unwrap_or(0);
+    if !can.disappearing && active == 0 {
+        return None;
+    }
+    let presets = protocol::disappearing_presets(row.key.network);
+    let mut choices = segmented();
+    for (ix, &secs) in presets.iter().enumerate() {
+        let key = row.key.clone();
+        let label = protocol::format_disappearing(secs);
+        let seg = segment(("details-disappearing", ix), label, active == secs).px(px(8.));
+        let seg = if can.disappearing {
+            seg.on_click(cx.listener(move |_, _, _, cx| {
+                let req = Request::SetDisappearing { conversation: key.clone(), seconds: secs };
+                crate::gui::people::ask_later(cx, req, |_, _| {});
+            }))
+        } else {
+            seg
+        };
+        choices = choices.child(seg);
+    }
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().type_ui().child("Disappearing messages"))
+            .child(div().flex().flex_wrap().gap(px(4.)).child(choices))
+            .child(div().type_small().text_color(theme::text_faint()).child("Auto-deletes on the network (separate from local retention).")),
+    )
 }
 
 /// Notifications' segmented choice for a channel.
@@ -163,6 +208,106 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         .mt(px(12.)),
     );
     top = top.child(sound_row(row, cx).mt(px(8.)));
+    if let Some(timer_row) = disappearing_row(pane, row, info, cx) {
+        top = top.child(timer_row.mt(px(8.)));
+    }
+    if facts::can_rename(row) || facts::can_edit_topic(row) || facts::can_add_members(row) {
+        let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().gap(px(6.));
+        if facts::can_rename(row) {
+            let key = row.key.clone();
+            let current = row.title.clone();
+            manage_bar = manage_bar.child(
+                button("details-rename", ButtonKind::Secondary, "Edit name")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.start_manage(key.clone(), ManageKind::Rename, &current, "Conversation name", cx);
+                    })),
+            );
+        }
+        if facts::can_edit_topic(row) {
+            let key = row.key.clone();
+            let current = row.topic.clone();
+            manage_bar = manage_bar.child(
+                button("details-topic", ButtonKind::Secondary, "Edit topic")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.start_manage(key.clone(), ManageKind::Topic, &current, "Topic or description", cx);
+                    })),
+            );
+        }
+        if facts::can_add_members(row) {
+            let key = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-add-members", ButtonKind::Secondary, "Add people…")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.start_manage(key.clone(), ManageKind::AddMembers, "", "Person IDs (comma-separated)", cx);
+                    })),
+            );
+        }
+        top = top.child(manage_bar);
+    }
+    if let Some((mkey, _, input)) = pane.managing() {
+        if mkey == &row.key {
+            top = top.child(
+                div()
+                    .mt(px(8.))
+                    .p(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(input.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(6.))
+                            .child(button("manage-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(
+                                cx.listener(|pane, _, _, cx| pane.cancel_manage(cx)),
+                            ))
+                            .child(button("manage-save", ButtonKind::Primary, "Save").h(px(24.)).px(px(10.)).type_small().on_click(
+                                cx.listener(|pane, _, _, cx| pane.submit_manage(cx)),
+                            )),
+                    ),
+            );
+        }
+    }
+    if let Some((rkey, _, person_name)) = pane.pending_remove() {
+        if rkey == &row.key {
+            let prompt = facts::remove_member_confirm_text(person_name, &row.title);
+            top = top.child(
+                div()
+                    .mt(px(8.))
+                    .p(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(div().type_small().child(prompt))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(6.))
+                            .child(button("remove-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(
+                                cx.listener(|pane, _, _, cx| pane.cancel_remove_member(cx)),
+                            ))
+                            .child(button("remove-confirm", ButtonKind::Danger, "Remove").h(px(24.)).px(px(10.)).type_small().on_click(
+                                cx.listener(|pane, _, _, cx| pane.confirm_remove_member(cx)),
+                            )),
+                    ),
+            );
+        }
+    }
     if !online {
         let words = facts::heads_up_words(&facts::HeadsUp::Offline, &row.title, network, crate::view::now());
         top = top.child(draw::heads_up_banner(&words, None).mt(px(12.)));
@@ -194,6 +339,10 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     let face = Avatar::new(&person.key, &person.name, 24.).image(avatar.as_ref()).build();
                     let face = face.children(Shape::of(shown).and_then(|shape| presence::dot(shape, 24., &ring)));
                     let key = person.key.clone();
+                    let can_remove = facts::can_remove_members(row);
+                    let remove_conv = row.key.clone();
+                    let remove_id = person.key.id.clone();
+                    let remove_name = person.name.clone();
                     sections = sections.child(
                         div()
                             .id(("details-member", ix))
@@ -207,9 +356,19 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                             .cursor_pointer()
                             .hover(|row| row.bg(theme::hover()))
                             .child(face)
-                            .child(div().min_w_0().truncate().type_ui().child(person.name.clone()))
+                            .child(div().flex_1().min_w_0().truncate().type_ui().child(person.name.clone()))
                             .children((person.title == "Owner").then(|| div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
                             .children((!word.is_empty()).then(|| div().flex_none().type_small().text_color(theme::text_faint()).child(format!("· {word}"))))
+                            .when(can_remove, |item| {
+                                item.child(
+                                    icon_button(("details-member-remove", ix), "icons/x.svg", false)
+                                        .tooltip(tip("Remove from group", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_remove_member(remove_conv.clone(), remove_id.clone(), remove_name.clone(), cx);
+                                        })),
+                                )
+                            })
                             .on_mouse_down(MouseButton::Left, cx.listener(move |pane, event: &gpui::MouseDownEvent, _, cx| {
                                 let (key, at) = (key.clone(), event.position);
                                 pane.shell_do(cx, move |shell, cx| shell.open_profile(key, at, cx));

@@ -767,8 +767,8 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
         }
-        Command::Delete { conversation_id, message_id, reply } => {
-            let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
+        Command::Delete { conversation_id, message_id, scope, reply } => {
+            let _ = reply.send(delete(account, &conversation_id, &message_id, scope).map_err(refused));
         }
         Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
@@ -816,11 +816,20 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetMute { conversation_id, notify, until, reply } => {
             let _ = reply.send(info::set_mute(account, &conversation_id, notify, until).map_err(refused));
         }
+        Command::SetDisappearing { conversation_id, seconds, reply } => {
+            let _ = reply.send(info::set_disappearing(account, &conversation_id, seconds).map_err(refused));
+        }
         Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
         }
         Command::ClearHistory { conversation_id, delete_chat, revoke, reply } => {
             let _ = reply.send(info::clear_history(account, &conversation_id, delete_chat, revoke).map_err(refused));
+        }
+        Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
+            let _ = reply.send(
+                filing::file(account, &conversation_id, pinned, archived, folder_add.as_deref(), folder_remove.as_deref())
+                    .map_err(refused),
+            );
         }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
@@ -1056,17 +1065,24 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans:
     Ok(())
 }
 
-fn delete(account: &Account, conversation: &str, message: &str) -> Result<(), Fault> {
+fn delete(account: &Account, conversation: &str, message: &str, scope: protocol::DeleteScope) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
     match who {
         Who::Channel(_) => {
+            if scope == protocol::DeleteScope::Me {
+                return Err(Fault::Rpc {
+                    code: 400,
+                    name: "CHANNEL_DELETE_FOR_EVERYONE_ONLY".to_owned(),
+                    value: None,
+                });
+            }
             let channel = account.input_channel(who)?;
             account.ask(&tl::functions::channels::DeleteMessages { channel, id: vec![id] })?;
         }
-        // For everyone, which is what `Delete` means.
         _ => {
-            account.ask(&tl::functions::messages::DeleteMessages { revoke: true, id: vec![id] })?;
+            let revoke = scope == protocol::DeleteScope::Everyone;
+            account.ask(&tl::functions::messages::DeleteMessages { revoke, id: vec![id] })?;
         }
     }
     let _ = account.ctx.deleted(conversation, message);

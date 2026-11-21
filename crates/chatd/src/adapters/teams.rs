@@ -930,8 +930,12 @@ impl Teams {
             Command::Edit { conversation_id, message_id, text, spans, reply } => {
                 let _ = reply.send(self.edit(&conversation_id, &message_id, &text, &spans).map_err(refuse));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
-                let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
+            Command::Delete { conversation_id, message_id, scope, reply } => {
+                if scope == protocol::DeleteScope::Me {
+                    let _ = reply.send(Err(Refusal::Refused("Teams only supports deleting for everyone.".to_owned())));
+                } else {
+                    let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
+                }
             }
             Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.report(self.watch().map_err(Failure::from)),
