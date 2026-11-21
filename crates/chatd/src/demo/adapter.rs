@@ -1025,6 +1025,12 @@ impl Demo {
             Command::Remind { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
+            Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AddFriend { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

@@ -445,6 +445,13 @@ impl Fake {
                     GENERAL => "messages.general",
                     DEPLOYS => "messages.deploys",
                     CHAT_ANA => "messages.ana",
+                    "19:grp1@thread.v2" => {
+                        let msgs: Vec<Value> = (1..=8u64)
+                            .rev()
+                            .map(|i| message("19:grp1@thread.v2", None, 1_759_500_000_000 + i * 100, BEN, "Ben Okafor", &format!("<p>update {i}</p>")))
+                            .collect();
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
+                    }
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
                     "48:notifications" => "messages.activity",
                     _ => return ok(json!({"messages": [], "_metadata": {}})),
@@ -453,6 +460,7 @@ impl Fake {
             }
             ("POST", "messages") => self.post(call, conversation),
             ("PUT", "properties") => ok(json!({})),
+            ("DELETE", "") => ok(json!({})),
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
             _ => answer("404 Not Found", json!({"errorCode": 404, "message": "not here"})),
         }
@@ -469,6 +477,9 @@ impl Fake {
             let mut limited = answer("429 Too Many Requests", json!({"errorCode": 429, "message": "API calls quota exceeded!"}));
             limited.headers.push(("Retry-After", "7".to_owned()));
             return limited;
+        }
+        if sent["content"].as_str().unwrap_or("").contains("moderated post") {
+            return answer("403 Forbidden", json!({"errorCode": 403, "message": "User is not allowed to post in this channel."}));
         }
         let arrived = 1_760_001_000_000 + u64::from(self.posted.fetch_add(1, Ordering::Relaxed)) * 1000;
         let (thread, root) = conversation.split_once(";messageid=").map_or((conversation, None), |(thread, root)| (thread, Some(root.to_owned())));
@@ -528,6 +539,19 @@ impl Fake {
             let query = call.body.to_lowercase();
             let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
+        }
+        if call.path.ends_with("/v1/urlpreview") {
+            let asked = call.json();
+            let url = asked["url"].as_str().unwrap_or("");
+            if url == "https://example.com/release" {
+                return ok(json!({
+                    "url": url,
+                    "title": "TinyClient Release",
+                    "description": "Wave 4D Teams improvements",
+                    "siteName": "Example",
+                    "previewImage": format!("{}/ams/v1/objects/preview-1/views/imgo", self.base),
+                }));
+            }
         }
         answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
     }
@@ -822,8 +846,8 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
         ]
     );
     assert!(rows.iter().all(|row| row.space.is_none()), "a chat is in no Space");
-    // Teams supplies a boolean unread flag; only mentions support a numeric badge.
-    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Dot));
+    // Direct chats show their actual unread count; channels show a dot unless mentioned.
+    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Count(1)));
     assert_eq!(rows[0].avatar.as_ref().map(|avatar| (avatar.kind, avatar.width)), Some((MediaKind::Avatar, 64)));
     assert_eq!((rows[0].preview.as_str(), rows[0].preview_from.as_str(), rows[0].preview_mine), ("Can you look at the deploy?", "Ana Ruiz", false));
     assert!(rows[2].muted && rows[2].unread == 0, "muted by me, and what I said last is not unread");
@@ -970,13 +994,12 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     assert_eq!(std::fs::read(path).unwrap(), SHEET);
     assert_eq!(world.fake.calls("GET", &content).len(), 1);
 
-    // A card is named and linked into the official app, never blank.
-    let card = by("1760000300300");
-    assert_eq!(card.text, "Card: Build 512 passed");
-    let MessageKind::Unsupported { link } = &card.kind else {
-        panic!("{:?}", card.kind);
-    };
-    assert_eq!(link, &format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000300300?tenantId={HOME}"));
+    // An adaptive card renders into Message::card and stays a normal message (reactable, quotable).
+    let card_msg = by("1760000300300");
+    assert_eq!(card_msg.kind, MessageKind::Normal);
+    let card = card_msg.card.as_deref().expect("adaptive card parsed into Message::card");
+    assert_eq!(card.title, "Build 512 passed");
+    assert_eq!(card.actions, vec![protocol::CardAction { label: "Open".into(), url: "https://ci.example/512".into() }]);
 
     // A Loop component is named and linked to its file, not left as a blank card.
     let looped = by("1760000310310");
@@ -1688,3 +1711,633 @@ fn reply_to_my_channel_post_marks_chain_and_channel_unread_while_untouched_post_
     });
     assert_eq!(read_post.thread.unwrap().unread, 0);
 }
+
+#[test]
+fn chat_pin_hide_and_delete_sync_with_teams() {
+    let world = World::start();
+    world.ready();
+
+    // Capabilities advertise chat pinning, hiding (close_direct), and deleting (clear_history).
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.pin_chats > 0 && caps.close_direct && caps.clear_history);
+
+    let grp1 = key("19:grp1@thread.v2");
+    let grp2 = key("19:grp2@thread.v2");
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Pin grp1 and grp2 in order.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let pinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((pinned_call.query.as_str(), pinned_call.json()), ("name=pinned", json!({"pinned": "true"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, Some(0));
+
+    assert_eq!(
+        world.ask(Request::File { conversation: grp2.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&grp2).unwrap().pin, Some(1));
+
+    // Unpin grp1.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(false), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let unpinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((unpinned_call.query.as_str(), unpinned_call.json()), ("name=pinned", json!({"pinned": "false"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Hide grp1 via CloseDirect; it becomes hidden and writes hidden=true.
+    assert_eq!(world.ask(Request::CloseDirect { conversation: grp1.clone() }), Response::Ok);
+    let hidden_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((hidden_call.query.as_str(), hidden_call.json()), ("name=hidden", json!({"hidden": "true"})));
+    assert!(world.conversation(&grp1).unwrap().hidden);
+
+    // A ConversationUpdate from another device unhides grp1 and pins it.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"hidden": "false", "pinned": "true"}}),
+        false,
+    );
+    world.until("grp1 unhidden and pinned by push", || {
+        world.conversation(&grp1).filter(|row| !row.hidden && row.pin.is_some())
+    });
+
+    // Delete grp1 for me only via ClearHistory { delete_chat: true }.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: grp1.clone(), delete_chat: true, revoke: false }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", "19:grp1@thread.v2").is_empty());
+    assert!(world.conversation(&grp1).is_none());
+
+    // Channels cannot be deleted as chats.
+    assert!(matches!(
+        world.ask(Request::ClearHistory { conversation: key(GENERAL), delete_chat: true, revoke: false }),
+        Response::Error { .. }
+    ));
+}
+
+#[test]
+fn link_previews_received_sent_and_opted_out() {
+    let world = World::start();
+    world.ready();
+
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.suppress_embeds);
+
+    // 1. Received message with web link preview and M365 file link card.
+    let chat = key(CHAT_ANA);
+    let mut incoming = message(CHAT_ANA, None, 1_760_000_950_000, ANA, "Ana Ruiz", "<p>See https://example.com/doc</p>");
+    incoming["properties"]["links"] = json!(json!([
+        {
+            "url": "https://example.com/doc",
+            "title": "Architecture Doc",
+            "description": "Design overview",
+            "siteName": "Example",
+            "previewImage": format!("{}/ams/v1/objects/img-1/views/imgo", world.fake.base),
+        },
+        {
+            "url": "https://contoso.sharepoint.com/:w:/s/Platform/Doc1",
+            "fileName": "Spec.docx",
+            "fileType": "docx",
+            "description": "Shared specification"
+        }
+    ]).to_string());
+    world.fake.push("NewMessage", incoming, false);
+    let received = world.until("received message with previews", || world.message(&chat, "1760000950000"));
+    assert_eq!(received.previews.len(), 2);
+    assert_eq!((received.previews[0].title.as_str(), received.previews[0].site.as_str()), ("Architecture Doc", "Example"));
+    assert!(received.previews[0].image.is_some());
+    assert_eq!((received.previews[1].title.as_str(), received.previews[1].site.as_str()), ("Spec.docx", "Word · SharePoint"));
+
+    // 2. Sent message with a URL unfurls through Teams' middle tier and attaches properties.links.
+    world.send(&chat, "1760000960000001", "Check https://example.com/release");
+    let sent = world.until("sent message with preview", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000001") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.previews.len(), 1);
+    assert_eq!(sent.previews[0].title, "TinyClient Release");
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["links"].as_str().unwrap_or("").contains("TinyClient Release"));
+
+    // 3. Opting out via suppress_embeds skips unfurl and omits properties.links.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000960000002".to_owned(),
+        text: "No preview https://example.com/release".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { suppress_embeds: true, ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let opted_out = world.until("opted-out message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000002") && m.state == SendState::Sent)
+    });
+    assert!(opted_out.previews.is_empty());
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1, "suppress_embeds must not call urlpreview");
+    let posted2 = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted2.json()["properties"]["links"].is_null());
+}
+
+#[test]
+fn notification_levels_read_write_and_live_update() {
+    let world = World::start();
+    world.ready();
+
+    let general = key(GENERAL);
+    let grp1 = key("19:grp1@thread.v2");
+
+    // Unmuted channel with no explicit override starts at All; setting Mentions updates both alerts and channelNotificationSettings.
+    let info = match world.ask(Request::ConversationInfo { conversation: general.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(info.notify, protocol::Notify::All);
+
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "false", "mentions": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "off" && c.json()["channelNotificationSettings"]["mentions"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update channel back to All: writes alerts=true and channelNotificationSettings allPosts=bannerAndFeed.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update chat to Mentions: writes alerts=false + mentions=true and does NOT mark row muted.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let grp_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((grp_call.query.as_str(), grp_call.json()), ("name=alerts", json!({"alerts": "false", "mentions": "true"})));
+    assert!(!world.conversation(&grp1).unwrap().muted);
+
+    // Live ConversationUpdate push muting grp1 reflects in row.muted.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"alerts": "false"}}),
+        false,
+    );
+    world.until("grp1 muted by ConversationUpdate", || {
+        world.conversation(&grp1).filter(|row| row.muted)
+    });
+}
+
+#[test]
+fn scheduled_chat_message_send_edit_cancel_and_channel_refusal() {
+    let world = World::start();
+    world.ready();
+
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.schedule);
+
+    let chat = key(CHAT_ANA);
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+
+    // 1. Schedule a message in a chat.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000970000001".to_owned(),
+        text: "Remind me in an hour".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let scheduled = world.until("scheduled message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000970000001") && m.state == SendState::Sent)
+    });
+    assert!(scheduled.id.starts_with("scheduled:"), "got id {}", scheduled.id);
+    assert_eq!(scheduled.sent, future_ts);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 2. Edit the scheduled message preserves scheduledTime and targets the raw message id.
+    let raw_id = scheduled.id.trim_start_matches("scheduled:").to_owned();
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            text: "Updated reminder".to_owned(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let edited_call = world.fake.calls("PUT", &format!("{CHAT_ANA}/messages/{raw_id}")).pop().unwrap();
+    assert!(edited_call.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 3. Cancel (delete) the scheduled message sends DELETE for the raw id and removes it.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", &format!("{CHAT_ANA}/messages/{raw_id}")).is_empty());
+    assert!(world.message(&chat, &scheduled.id).is_none());
+
+    // 4. Scheduling in a channel is refused cleanly without posting to Teams.
+    let general = key(GENERAL);
+    let posts_before = world.fake.calls("POST", &format!("{GENERAL}/messages")).len();
+    match world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "1760000970000002".to_owned(),
+        text: "Channel schedule attempt".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let failed = world.until("channel scheduled send fails", || {
+        world.messages(&general).into_iter().find(|m| {
+            m.client_id.as_deref() == Some("1760000970000002") && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    assert!(matches!(failed.state, SendState::Failed { ref reason } if reason.contains("channels")));
+    assert_eq!(world.fake.calls("POST", &format!("{GENERAL}/messages")).len(), posts_before);
+}
+
+#[test]
+fn unread_count_from_horizon_and_mark_unread_sync() {
+    let world = World::start();
+    world.ready();
+
+    let grp1 = key("19:grp1@thread.v2");
+
+    // 1. Set consumption horizon at msg 1 (1759500000100), then open grp1 (8 messages: 100..=800).
+    //    Backfill counts the 7 messages past the horizon instead of collapsing to 1.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": "1759500000100;1759500000150;1759500000100"},
+            "lastMessage": {"id": "1759500000800"}
+        }),
+        false,
+    );
+    world.until("grp1 horizon recorded", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000100"))
+    });
+    world.open(&grp1, 8);
+    let counted = world.until("grp1 unread count refined to 7", || {
+        world.conversation(&grp1).filter(|row| row.unread == 7)
+    });
+    assert_eq!(counted.unread, 7);
+
+    // 2. Mark read at msg 8, then MarkUnread from msg 5 (1759500000500) -> writes prior msg (1759500000400) to Teams.
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    world.until("MarkRead PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000800;")
+        })
+    });
+    assert_eq!(world.ask(Request::MarkUnread { conversation: grp1.clone(), message_id: "1759500000500".into() }), Response::Ok);
+    let unread_call = world.until("MarkUnread PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;")
+        })
+    });
+    assert!(unread_call.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;"));
+
+    // 3. Another device moving consumptionhorizon backwards via ConversationUpdate rewinds last_read and unread count
+    //    (with a clientTimestamp newer than our local MarkRead write).
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    let newer_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": format!("1759500000300;{newer_ts};1759500000300")},
+            "lastMessage": {"id": "1759500000800"}
+        }),
+        false,
+    );
+    let rewound = world.until("grp1 rewound to 5 unread", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000300") && row.unread == 5)
+    });
+    assert_eq!(rewound.unread, 5);
+}
+
+#[test]
+fn adaptive_connector_and_hero_cards_render_and_malformed_falls_back() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+    let fixtures = world.fake.fixture("cards").expect("cards fixture");
+
+    for name in ["connector_alert", "adaptive_facts_buttons", "hero_card", "malformed_card"] {
+        world.fake.push("NewMessage", fixtures[name].clone(), false);
+    }
+    world.until("all four card messages to arrive", || {
+        let msgs = world.messages(&general);
+        ["1760000801001", "1760000801002", "1760000801003", "1760000801004"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+
+    // 1. Office 365 connector alert
+    let alert = world.message(&general, "1760000801001").unwrap();
+    assert_eq!(alert.kind, MessageKind::Normal);
+    let alert_card = alert.card.as_deref().expect("connector card");
+    assert_eq!(alert_card.title, "High latency on checkout");
+    assert_eq!(alert_card.author, "PagerDuty");
+    assert_eq!(alert_card.color, Some(0xD93025));
+    assert_eq!(alert_card.fields, vec![("Service".into(), "checkout-api".into()), ("P99".into(), "2450 ms".into())]);
+    assert!(alert_card.image.is_none(), "external connector image must not be fetched");
+    assert!(alert_card.actions.iter().any(|a| a.label == "View Incident" && a.url == "https://pagerduty.example/incidents/904"));
+    assert!(alert_card.actions.iter().any(|a| a.label == "Acknowledge · Open in Teams"));
+    assert!(alert_card.actions.iter().any(|a| a.label == "Latency chart" && a.url == "https://cdn.pagerduty.example/chart.png"));
+
+    // 2. Adaptive card with facts, table, hosted + external image, OpenUrl + Submit
+    let adaptive = world.message(&general, "1760000801002").unwrap();
+    assert_eq!(adaptive.kind, MessageKind::Normal);
+    let ac = adaptive.card.as_deref().expect("adaptive card");
+    assert_eq!(ac.title, "Release v2.4.0 approval needed");
+    assert_eq!(ac.fields, vec![("Environment".into(), "Production".into()), ("Commit".into(), "a7fa2e22".into())]);
+    assert!(ac.text.contains("Check | Result") && ac.text.contains("Tests | Pass"), "{}", ac.text);
+    assert!(ac.image.is_some(), "Teams-hosted image should be registered");
+    assert!(ac.actions.iter().any(|a| a.label == "External banner" && a.url == "https://external.example/banner.png"));
+    assert!(ac.actions.iter().any(|a| a.label == "Diff" && a.url == "https://github.com/org/repo/compare/v2.3...v2.4"));
+    assert!(ac.actions.iter().any(|a| a.label == "Approve · Open in Teams"));
+
+    // 3. Hero card
+    let hero = world.message(&general, "1760000801003").unwrap();
+    assert_eq!(hero.kind, MessageKind::Normal);
+    let hc = hero.card.as_deref().expect("hero card");
+    assert_eq!(hc.title, "PR #42: Fix timeouts");
+    assert_eq!(hc.author, "tinyclient / main");
+    assert_eq!(hc.text, "All checks green.");
+    assert!(hc.image.is_none(), "external hero image must not be fetched");
+    assert!(hc.actions.iter().any(|a| a.label == "View PR" && a.url == "https://github.com/org/repo/pull/42"));
+    assert!(hc.actions.iter().any(|a| a.label == "Merge · Open in Teams"));
+
+    // 4. Malformed card falls back cleanly to Unsupported (never a blank row)
+    let broken = world.message(&general, "1760000801004").unwrap();
+    assert!(broken.card.is_none());
+    assert_eq!(broken.text, "Card");
+    assert!(matches!(broken.kind, MessageKind::Unsupported { ref link } if link.contains("1760000801004")));
+}
+
+#[test]
+fn channel_post_subject_announcements_moderation_and_threads_layout() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+
+    // 1. Account advertises channel_subject capability.
+    assert!(world.account(HOME).can.channel_subject);
+
+    // 2. Sending a channel post with a subject emits properties.subject and bolds the first line.
+    let client_id = "1760000999000617";
+    let req = Request::Send {
+        conversation: general.clone(),
+        client_id: client_id.to_owned(),
+        text: "Deployment window is Friday 10:00 UTC.".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            subject: Some("Maintenance window".to_owned()),
+            ..protocol::Outgoing::default()
+        },
+    };
+    assert!(matches!(world.ask(req), Response::Sent { .. }));
+    let sent = world.until("channel post with subject accepted", || {
+        world.messages(&general).into_iter().find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.text, "Maintenance window\nDeployment window is Friday 10:00 UTC.");
+    assert!(ranges(&sent).contains(&("Maintenance window", &Style::Bold)));
+    let posted = world.fake.calls("POST", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages")).pop().unwrap();
+    assert_eq!(posted.json()["properties"]["subject"].as_str(), Some("Maintenance window"));
+
+    // 3. Moderated channel 403 refusal surfaces a clear moderation message.
+    let mod_id = "1760000999000618";
+    world.send(&general, mod_id, "moderated post");
+    let refused = world.until("moderated post refusal", || {
+        world.message(&general, mod_id).filter(|m| m.state != SendState::Pending)
+    });
+    assert_eq!(
+        refused.state,
+        SendState::Failed { reason: "Only channel moderators can start new posts here.".to_owned() }
+    );
+
+    // 4. Announcement post extracts headline + subhead, treats banner as decoration, marks row.
+    let mut ann = message(GENERAL, Some("1760000810001"), 1_760_000_810_001, ANA, "Ana Ruiz", "<p>All hands at 14:00.</p>");
+    ann["properties"] = json!({
+        "cardType": "announcement",
+        "title": "Q4 Town Hall",
+        "subject": "Engineering & Product",
+        "bannerColor": "#5B5FC7",
+        "bannerImage": "https://external.example/banner.jpg"
+    });
+    world.fake.push("NewMessage", ann, false);
+    let stored_ann = world.until("announcement to arrive", || world.message(&general, "1760000810001"));
+    assert!(stored_ann.announcement);
+    assert_eq!(stored_ann.kind, MessageKind::Normal);
+    assert_eq!(stored_ann.text, "Q4 Town Hall\nEngineering & Product\nAll hands at 14:00.");
+    assert!(ranges(&stored_ann).contains(&("Q4 Town Hall", &Style::Bold)));
+    assert!(ranges(&stored_ann).contains(&("Engineering & Product", &Style::Italic)));
+    assert!(stored_ann.attachments.is_empty(), "announcement banner is decoration only");
+
+    // 5. Threads-layout channel reply using rootMessageId (without ;messageid= in conversationLink)
+    // still maps to the post's reply chain.
+    let mut threaded_reply = message(GENERAL, None, 1_760_000_810_050, BEN, "Ben Okafor", "<p>Count me in!</p>");
+    threaded_reply["rootMessageId"] = json!("1760000810001");
+    world.fake.push("NewMessage", threaded_reply, false);
+    let ann_with_reply = world.until("announcement thread summary", || {
+        world.message(&general, "1760000810001").filter(|m| m.thread.as_ref().is_some_and(|t| t.replies == 1))
+    });
+    assert_eq!(ann_with_reply.thread.unwrap().replies, 1);
+    let ann_chain = key(&format!("{GENERAL};messageid=1760000810001"));
+    assert_eq!(world.messages(&ann_chain).last().map(|m| m.text.as_str()), Some("Count me in!"));
+}
+
+#[test]
+fn forwarded_messages_are_read_with_origin_metadata_and_forwarded_to_multiple_chats() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    let ana = key(CHAT_ANA);
+    let grp1 = key("19:grp1@thread.v2");
+    world.open(&general, 6);
+    world.open(&ana, 3);
+
+    // 1. Account advertises native forward capability.
+    assert!(world.account(HOME).can.forward);
+
+    // 2. Receiving a forwarded Teams message maps original sender, conversation, link, note, and body.
+    let orig_link = format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000100100?tenantId={HOME}");
+    let mut inbound = message(
+        CHAT_ANA,
+        None,
+        1_760_000_820_001,
+        ANA,
+        "Ana Ruiz",
+        &format!(
+            "<p>FYI see below</p>\
+             <blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Forward\" itemid=\"1760000100100\">\
+             <strong itemprop=\"mri\" itemid=\"{BEN}\">Ben Okafor</strong>\
+             <span itemprop=\"time\" itemid=\"1760000100100\"></span>\
+             <span itemprop=\"conversation\">General</span>\
+             <a itemprop=\"sourceLink\" href=\"{orig_link}\"></a>\
+             <p itemprop=\"preview\">Deploy is scheduled for 16:00.</p></blockquote>"
+        ),
+    );
+    inbound["properties"] = json!({
+        "forwardedMessage": json!({
+            "originalMessageId": "1760000100100",
+            "originalConversationId": GENERAL,
+            "originalConversationTitle": "General",
+            "originalSenderDisplayName": "Ben Okafor",
+            "originalArrivalTime": 1_760_000_100_100u64,
+            "deepLink": orig_link,
+        }).to_string()
+    });
+    world.fake.push("NewMessage", inbound, false);
+    let received = world.until("forwarded message to arrive", || world.message(&ana, "1760000820001"));
+    assert_eq!(received.text, "FYI see below\nDeploy is scheduled for 16:00.");
+    let fwd = received.forwarded.as_deref().expect("Message::forwarded populated");
+    assert_eq!(fwd.from_title, "Ben Okafor");
+    assert_eq!(fwd.from_space, "General");
+    assert_eq!(fwd.link, orig_link);
+
+    // 3. Forwarding a message with a shared file to two chats sends forward markup, optional note,
+    // and preserves file references without re-uploading to OneDrive.
+    let uploads_before = world.fake.calls("POST", ":/createUploadSession").len();
+    let req = Request::Forward {
+        from: general.clone(),
+        message_ids: vec!["1760000250250".to_owned()],
+        to: vec![ana.clone(), grp1.clone()],
+        note: "Sharing Q4 numbers".to_owned(),
+    };
+    let Response::Forwarded { results } = world.ask(req) else {
+        panic!("expected Response::Forwarded");
+    };
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.ok), "{results:?}");
+    assert_eq!(world.fake.calls("POST", ":/createUploadSession").len(), uploads_before, "forwarded files must not be re-uploaded");
+
+    for target_id in [CHAT_ANA, "19:grp1@thread.v2"] {
+        let sent = world
+            .fake
+            .calls("POST", &format!("/chat/v1/users/ME/conversations/{target_id}/messages"))
+            .pop()
+            .expect("forwarded post reached target");
+        let body = sent.json();
+        let html = body["content"].as_str().unwrap_or("");
+        assert!(html.contains("Sharing Q4 numbers"), "{html}");
+        assert!(html.contains("http://schema.skype.com/Forward"), "{html}");
+        assert!(html.contains("Ana Ruiz"), "{html}");
+        assert!(html.contains("Numbers are in"), "{html}");
+        assert!(body["properties"]["forwardedMessage"].as_str().is_some(), "forwardedMessage property present");
+        let files: Vec<Value> = serde_json::from_str(body["properties"]["files"].as_str().expect("preserved files property")).unwrap();
+        assert_eq!(files[0]["fileName"].as_str(), Some("Q4 plan.xlsx"));
+    }
+}
+
+#[test]
+fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises importance capability.
+    assert!(world.account(HOME).can.importance);
+
+    // 2. Receive Normal, Important (`high`), and Urgent (`urgent`) fixtures.
+    let fixtures = world.fake.fixture("importance").expect("importance fixture");
+    for kind in ["normal", "important", "urgent"] {
+        world.fake.push("NewMessage", fixtures[kind].clone(), false);
+    }
+    world.until("all three importance fixtures", || {
+        let msgs = world.messages(&ana);
+        ["1760000830001", "1760000830002", "1760000830003"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+    assert_eq!(world.message(&ana, "1760000830001").unwrap().importance, protocol::Importance::Normal);
+    assert_eq!(world.message(&ana, "1760000830002").unwrap().importance, protocol::Importance::Important);
+    assert_eq!(world.message(&ana, "1760000830003").unwrap().importance, protocol::Importance::Urgent);
+
+    // 3. Send Important and Urgent messages and verify properties.importance on the wire.
+    let send_with_imp = |client_id: &str, text: &str, importance: protocol::Importance| {
+        let req = Request::Send {
+            conversation: ana.clone(),
+            client_id: client_id.to_owned(),
+            text: text.to_owned(),
+            reply_to: None,
+            with: protocol::Outgoing { importance, ..protocol::Outgoing::default() },
+        };
+        assert!(matches!(world.ask(req), Response::Sent { .. }));
+        world.until("sent message accepted", || {
+            world
+                .messages(&ana)
+                .into_iter()
+                .find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+        })
+    };
+
+    let imp_msg = send_with_imp("1760000999000627", "Review before EOD", protocol::Importance::Important);
+    assert_eq!(imp_msg.importance, protocol::Importance::Important);
+    let imp_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000627")
+        .expect("important POST");
+    assert_eq!(imp_call.json()["properties"]["importance"].as_str(), Some("high"));
+
+    let urg_msg = send_with_imp("1760000999000628", "Site down!", protocol::Importance::Urgent);
+    assert_eq!(urg_msg.importance, protocol::Importance::Urgent);
+    let urg_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000628")
+        .expect("urgent POST");
+    assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
+}
+

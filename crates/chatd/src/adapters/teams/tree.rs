@@ -17,8 +17,10 @@ const OLD_CHATS: &str = "chats";
 const NOTES: &str = "48:notes";
 /// Teams' Activity stream: mentions, replies and reactions, as messages of a conversation.
 const ACTIVITY: &str = "48:notifications";
-/// The Activity stream's page read at connect.
+/// The Activity stream's page read at connect, and maximum pages walked when all entries on a
+/// page are newer than the last run.
 const ACTIVITY_PAGE: u32 = 50;
+const ACTIVITY_MAX_PAGES: usize = 5;
 /// The longest a reply chain's title is: the start of its post.
 const CHAIN_TITLE: usize = 40;
 /// Unread chats whose newest page is fetched after connecting, paced, so their rows have a
@@ -40,8 +42,53 @@ fn text<'a>(value: &'a Value, name: &str) -> &'a str {
     value[name].as_str().unwrap_or("")
 }
 
-fn is_channel(id: &str) -> bool {
+pub(super) fn is_channel(id: &str) -> bool {
     id.contains("@thread.tacv2") || id.contains("@thread.skype")
+}
+
+/// Parses Teams' pinned chat ids in their Teams order from user-level properties
+/// (`pinnedChats`, `userDetails.pinnedChats`, `userProperties.pinnedChats`) and per-chat
+/// `isPinned` / `properties.pinned` flags.
+pub(super) fn pinned_chat_order(listed: &Value, chats: &[Value]) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut push = |id: &str| {
+        if !id.is_empty() && !order.iter().any(|existing: &String| existing == id) {
+            order.push(id.to_owned());
+        }
+    };
+    let sources = [
+        &listed["pinnedChats"],
+        &listed["userDetails"]["pinnedChats"],
+        &listed["userProperties"]["pinnedChats"],
+    ];
+    for source in sources {
+        match source {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(id) = item.as_str() {
+                        push(id);
+                    }
+                }
+            }
+            Value::String(raw) => {
+                if let Ok(items) = serde_json::from_str::<Vec<String>>(raw) {
+                    for id in items {
+                        push(&id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for chat in chats {
+        let pinned = chat["isPinned"] == true
+            || chat["properties"]["pinned"] == true
+            || chat["properties"]["pinned"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if pinned {
+            push(text(chat, "id"));
+        }
+    }
+    order
 }
 
 /// What Teams says of how far a channel or chat was read.
@@ -57,7 +104,18 @@ struct Counted {
 fn counted(entry: &Value, me: &str) -> Counted {
     let last = &entry["lastMessage"];
     let newest = id_of(&last["id"]);
-    let read = id_of(&entry["consumptionHorizon"]["originalArrivalTime"]);
+    let read = {
+        let from_obj = id_of(&entry["consumptionHorizon"]["originalArrivalTime"]);
+        if millis(&from_obj) > 0 {
+            from_obj
+        } else {
+            entry["properties"]["consumptionhorizon"]
+                .as_str()
+                .and_then(|h| h.split(';').next())
+                .unwrap_or("")
+                .to_owned()
+        }
+    };
     let from = text(last, "from");
     let mine = entry["isLastMessageFromMe"] == true || (!me.is_empty() && from.rsplit('/').next() == Some(me));
     let unread = if mine || millis(&newest) == 0 {
@@ -96,11 +154,12 @@ impl Teams {
         let url = format!("{}/api/csa/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true", self.api);
         let mut listed = self.call("GET", &url, Auth::Both(AGGREGATOR), Body::None, true)?.body;
         let (teams, chats) = (taken(&mut listed, "teams"), taken(&mut listed, "chats"));
+        let pinned_order = pinned_chat_order(&listed, &chats);
         drop(listed);
         let me = self.me();
         // The chats first: written with no Space, they leave the one an earlier build kept them
         // in before that Space goes.
-        self.chats(chats, &me, first)?;
+        self.chats(chats, &pinned_order, &me, first)?;
         let teams: Vec<&Value> = teams.iter().filter(|team| team["isDeleted"] != true && !text(team, "id").is_empty()).collect();
         let spaces: Vec<SpaceRow> = teams
             .iter()
@@ -142,7 +201,13 @@ impl Teams {
                 self.ctx.set_note(&format!("group:{id}"), group);
             }
             for channel in channels {
-                self.count(text(channel, "id"), &counted(channel, &me), channel["isMuted"] == true)?;
+                let chan_id = text(channel, "id");
+                let level = super::info::parse_notify(channel, true)
+                    .or_else(|| super::info::parse_notify(&channel["properties"], true))
+                    .unwrap_or(protocol::Notify::All);
+                self.state().notify.insert(chan_id.to_owned(), level);
+                self.ctx.set_note(&format!("notify:{chan_id}"), super::info::notify_word(level));
+                self.count(chan_id, &counted(channel, &me), level == protocol::Notify::Nothing)?;
             }
         }
         self.state().listed = Some(Instant::now());
@@ -167,7 +232,7 @@ impl Teams {
         Ok(())
     }
 
-    fn chats(&self, chats: Vec<Value>, me: &str, first: bool) -> Result<(), Fault> {
+    fn chats(&self, chats: Vec<Value>, pinned_order: &[String], me: &str, first: bool) -> Result<(), Fault> {
         let others = |chat: &Value| -> Vec<String> {
             let members = chat["members"].as_array().into_iter().flatten();
             members.filter_map(|member| member["mri"].as_str()).filter(|mri| *mri != me).map(str::to_owned).collect()
@@ -202,7 +267,8 @@ impl Teams {
             let mut row = self.chat_row(id, &title_of(chat), &people, partner.map(String::as_str));
             row.position = position as i32;
             row.meeting = is_meeting(chat);
-            row.filing = Some(Filing { hidden: chat["hidden"] == true, ..Filing::default() });
+            let pin = pinned_order.iter().position(|pinned_id| pinned_id == id).map(|ix| ix as i32);
+            row.filing = Some(Filing { hidden: chat["hidden"] == true, pin, ..Filing::default() });
             if row.title.is_empty() {
                 // Never the user's own name: the last sender is used only when it was not me.
                 let last = &chat["lastMessage"];
@@ -229,7 +295,11 @@ impl Teams {
         // The list the user owns on Teams: the people they have a chat with. Apps are not people.
         let relations: Vec<(String, Relation)> = partners.keys().map(|person| (person.clone(), Relation::Contact)).collect();
         self.ctx.relations(&relations)?;
-        self.state().partners = partners;
+        {
+            let mut state = self.state();
+            state.partners = partners;
+            state.pinned_chats = pinned_order.to_vec();
+        }
         if first {
             for id in warm {
                 let _ = self.ctx.commands.send(Command::Warm(id));
@@ -272,33 +342,56 @@ impl Teams {
         }
     }
 
-    /// The Activity stream's newest page, once at connect: each mention of me newer than its
-    /// conversation's read marker counts, so mentions that came while tinyclient was closed are
-    /// not lost. Unverified: the shape of an activity (`properties.activity`), read off the web
-    /// client's own reading of this stream.
+    /// The Activity stream at connect: each mention of me newer than its conversation's read
+    /// marker counts, so mentions that came while tinyclient was closed are not lost. Pages past
+    /// 50 when every entry on a full page is newer than the last run (capped at [`ACTIVITY_MAX_PAGES`]).
     fn activity_feed(&self) -> Result<(), Fault> {
-        let (items, _) = self.page(ACTIVITY, ACTIVITY_PAGE, "startTime=1")?;
+        let last_seen_ms = self.ctx.note("activity_cursor").as_deref().map(millis).unwrap_or(0);
+        let mut newest_seen_ms = last_seen_ms;
         let mut found: HashMap<String, Vec<String>> = HashMap::new();
-        for item in &items {
-            let activity = match &item["properties"]["activity"] {
-                Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
-                other => other.clone(),
-            };
-            let kind = text(&activity, "activityType").to_ascii_lowercase();
-            if !kind.contains("mention") {
-                continue;
+        let mut window = "startTime=1".to_owned();
+
+        for _ in 0..ACTIVITY_MAX_PAGES {
+            let (items, older) = self.page(ACTIVITY, ACTIVITY_PAGE, &window)?;
+            if items.is_empty() {
+                break;
             }
-            let (thread, message) = (text(&activity, "sourceThreadId"), id_of(&activity["sourceMessageId"]));
-            if thread.is_empty() || millis(&message) == 0 {
-                continue;
+            let mut all_newer = true;
+            for item in &items {
+                let item_ms = millis(&id_of(&item["id"]));
+                if item_ms > newest_seen_ms {
+                    newest_seen_ms = item_ms;
+                }
+                if last_seen_ms > 0 && item_ms > 0 && item_ms <= last_seen_ms {
+                    all_newer = false;
+                }
+                let activity = match &item["properties"]["activity"] {
+                    Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+                    other => other.clone(),
+                };
+                let kind = text(&activity, "activityType").to_ascii_lowercase();
+                if !kind.contains("mention") {
+                    continue;
+                }
+                let (thread, message) = (text(&activity, "sourceThreadId"), id_of(&activity["sourceMessageId"]));
+                if thread.is_empty() || millis(&message) == 0 {
+                    continue;
+                }
+                // A mention in a reply chain is the chain's.
+                let chain = id_of(&activity["sourceReplyChainId"]);
+                let place = if millis(&chain) > 0 && chain != message { chain_id(thread, &chain) } else { thread.to_owned() };
+                let ids = found.entry(place).or_default();
+                if !ids.contains(&message) {
+                    ids.push(message);
+                }
             }
-            // A mention in a reply chain is the chain's.
-            let chain = id_of(&activity["sourceReplyChainId"]);
-            let place = if millis(&chain) > 0 && chain != message { chain_id(thread, &chain) } else { thread.to_owned() };
-            let ids = found.entry(place).or_default();
-            if !ids.contains(&message) {
-                ids.push(message);
+            if items.len() < ACTIVITY_PAGE as usize || older.is_empty() || !all_newer {
+                break;
             }
+            window = format!("startTime=1&syncState={older}");
+        }
+        if newest_seen_ms > last_seen_ms {
+            self.ctx.set_note("activity_cursor", &newest_seen_ms.to_string());
         }
         for (place, messages) in found {
             let Some(row) = self.ctx.known(&place)?.or(self.ctx.known(thread_of(&place))?) else {
@@ -501,5 +594,22 @@ mod tests {
     fn channels_are_told_from_chats_by_their_ids() {
         assert!(is_channel("19:abc@thread.tacv2") && is_channel("19:abc@thread.skype"));
         assert!(!is_channel("19:a_b@unq.gbl.spaces") && !is_channel("19:meeting_x@thread.v2"));
+    }
+
+    #[test]
+    fn pinned_chats_are_read_in_teams_order_from_list_and_chat_flags() {
+        let listed = json!({
+            "userDetails": {
+                "pinnedChats": "[\"19:grp2@thread.v2\",\"19:grp1@thread.v2\"]"
+            },
+            "chats": [
+                {"id": "19:grp1@thread.v2", "isPinned": true},
+                {"id": "19:grp2@thread.v2", "isPinned": true},
+                {"id": "19:grp3@thread.v2", "properties": {"pinned": "true"}}
+            ]
+        });
+        let chats = listed["chats"].as_array().unwrap();
+        let pins = pinned_chat_order(&listed, chats);
+        assert_eq!(pins, vec!["19:grp2@thread.v2", "19:grp1@thread.v2", "19:grp3@thread.v2"]);
     }
 }

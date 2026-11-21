@@ -68,6 +68,8 @@ pub fn wire(text: &str, tokens: &[Token], format: MentionFormat) -> String {
                 out.push_str(&format!("<#{}|{label}>", token.id));
             }
             (MentionFormat::Teams, Kind::Emoji) => out.push_str(&token.label),
+            (MentionFormat::Signal, Kind::Person) => out.push_str(&format!("<@{}>", token.id)),
+            (MentionFormat::Signal, _) => out.push_str(&token.label),
             (MentionFormat::Plain, _) => out.push_str(&token.label),
         }
         at = token.range.end;
@@ -337,6 +339,7 @@ mod tests {
         assert_eq!(wire(text, &tokens, MentionFormat::Discord), "ask <@77> in <#5>, cc <@&3>");
         assert_eq!(wire(text, &tokens, MentionFormat::Slack), "ask <@77> in <#5>, cc <!subteam^3>");
         assert_eq!(wire(text, &tokens, MentionFormat::Teams), "ask <@77|Mara Okafor> in <#5|platform>, cc <@&3|admins>");
+        assert_eq!(wire(text, &tokens, MentionFormat::Signal), "ask <@77> in #platform, cc @admins");
         assert_eq!(wire(text, &tokens, MentionFormat::Plain), text);
         assert_eq!(wire("no tokens <here>", &[], MentionFormat::Discord), "no tokens <here>");
         let text = "nice :mossparrot: :party:";

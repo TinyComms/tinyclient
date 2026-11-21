@@ -1473,6 +1473,7 @@ impl Slack {
             thumbnail,
             color: colour(&card["color"]),
             sponsored: false,
+            ..Card::default()
         };
         if framed.title.is_empty() && framed.text.is_empty() && framed.fields.is_empty() && framed.image.is_none() {
             framed.text = words(&card["fallback"]);

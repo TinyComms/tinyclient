@@ -361,6 +361,10 @@ pub struct PeopleList {
     built: Instant,
     regroup_pending: bool,
     refused: Option<String>,
+    /// Add-friend username input shown at the top of Discord › Pending (`Capabilities::add_friend_by_username`).
+    add_friend_input: Entity<TextInput>,
+    adding_friend: bool,
+    add_friend_feedback: Option<(String, bool)>,
 }
 
 impl PeopleList {
@@ -375,6 +379,16 @@ impl PeopleList {
             InputKey::Up => this.step(false, cx),
             InputKey::Down => this.step(true, cx),
             InputKey::Escape => this.search.update(cx, |search, cx| search.clear(cx)),
+        })
+        .detach();
+        let add_friend_input = cx.new(|cx| TextInput::new("Add friend by username", cx));
+        cx.subscribe(&add_friend_input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Changed => {
+                if this.add_friend_feedback.take().is_some() {
+                    cx.notify();
+                }
+            }
+            InputEvent::Submit => this.submit_add_friend(cx),
         })
         .detach();
         let list = ListState::new(0, ListAlignment::Top, px(200.));
@@ -406,6 +420,9 @@ impl PeopleList {
             built: Instant::now(),
             regroup_pending: false,
             refused: None,
+            add_friend_input,
+            adding_friend: false,
+            add_friend_feedback: None,
         };
         people.load(cx);
         people
@@ -1037,6 +1054,107 @@ impl PeopleList {
         Some(empty_state("icons/users.svg", &title, &detail).px(px(24.)))
     }
 
+    /// The connected account matching the current scope that supports adding friends by username.
+    fn add_friend_account(&self) -> Option<AccountKey> {
+        let scope = self.scope?;
+        self.scene
+            .accounts
+            .iter()
+            .find(|own| own.key.network == scope && own.link == Link::Connected && own.can.add_friend_by_username)
+            .map(|own| own.key.clone())
+    }
+
+    fn submit_add_friend(&mut self, cx: &mut Context<Self>) {
+        if self.adding_friend || super::only_draws() {
+            return;
+        }
+        let Some(account) = self.add_friend_account() else {
+            return;
+        };
+        let username = self.add_friend_input.read(cx).text().trim().to_owned();
+        if username.is_empty() {
+            self.add_friend_feedback = Some(("Enter a username.".to_owned(), true));
+            cx.notify();
+            return;
+        }
+        self.adding_friend = true;
+        self.add_friend_feedback = None;
+        cx.notify();
+        let request = Request::AddFriend { account, username };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.adding_friend = false;
+                match answer {
+                    Ok(Response::Ok) => {
+                        this.add_friend_input.update(cx, |input, cx| input.clear(cx));
+                        this.add_friend_feedback = Some(("Friend request sent.".to_owned(), false));
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.add_friend_feedback = Some((detail, true));
+                    }
+                    Ok(_) => {
+                        this.add_friend_feedback = Some(("Could not send friend request.".to_owned(), true));
+                    }
+                    Err(err) => {
+                        this.add_friend_feedback = Some((err.to_string(), true));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The add-friend username bar at the top of People › Pending for accounts that support it.
+    fn add_friend_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        if self.chip != Chip::Pending || !self.needle.is_empty() {
+            return None;
+        }
+        self.add_friend_account()?;
+        let focused = self.add_friend_input.focus_handle(cx).is_focused(window);
+        let busy = self.adding_friend;
+        let feedback = self.add_friend_feedback.as_ref().map(|(text, err)| {
+            div()
+                .pt(px(4.))
+                .type_small()
+                .text_color(if *err { theme::danger() } else { theme::text_soft() })
+                .child(text.clone())
+        });
+        Some(
+            div()
+                .flex_none()
+                .px(px(theme::PANE_PAD))
+                .pb(px(8.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            search_field(focused)
+                                .flex_1()
+                                .min_w_0()
+                                .line_height(px(18.))
+                                .child(self.add_friend_input.clone()),
+                        )
+                        .child(
+                            button(
+                                "add-friend-send",
+                                ButtonKind::Primary,
+                                if busy { "Sending…" } else { "Send" },
+                            )
+                            .when(!busy, |btn| {
+                                btn.on_click(cx.listener(|this, _, _, cx| this.submit_add_friend(cx)))
+                            }),
+                        ),
+                )
+                .children(feedback),
+        )
+    }
+
     /// The chips of a scoped list, after its way back.
     fn scoped_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         let scope = self.scope?;
@@ -1174,6 +1292,7 @@ impl Render for PeopleList {
                     .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(self.search.clone()).children(clear)),
             )
             .children(self.scoped_bar(cx))
+            .children(self.add_friend_bar(window, cx))
             .children(self.refused.clone().map(|words| line(words, theme::danger())))
             .child(div().flex_1().min_h_0().child(body))
     }

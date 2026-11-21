@@ -358,7 +358,7 @@ impl EmojiScope {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MentionFormat {
-    /// Mentions stay as their plain display label (Telegram, Signal, Messages, Tiny).
+    /// Mentions stay as their plain display label (Telegram, Messages, Tiny).
     #[default]
     Plain,
     /// `<@id>`, `<@&id>`, `<#id>`, `<:name:id>` / `<a:name:id>`.
@@ -367,6 +367,8 @@ pub enum MentionFormat {
     Slack,
     /// `<@id|label>`, `<@&id|label>`, `<#id|label>`; custom emoji stay `:name:`.
     Teams,
+    /// `<@aci>` for person mentions; adapter replaces with U+FFFC and UTF-16 `BodyRange(MentionAci)`.
+    Signal,
 }
 
 impl MentionFormat {
@@ -579,6 +581,9 @@ pub struct Capabilities {
     /// This account supports message reactions.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reactions: bool,
+    /// This account supports fetching who reacted to a message (`Request::Reactors`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reactors: bool,
     /// How inline mentions are formatted on the wire for this account.
     #[serde(default, skip_serializing_if = "MentionFormat::is_plain")]
     pub mention_format: MentionFormat,
@@ -631,6 +636,12 @@ pub struct Capabilities {
     /// This account supports blocking and unblocking people (`Request::Relate` with Block/Unblock).
     #[serde(default, skip_serializing_if = "is_false")]
     pub blocks: bool,
+    /// This account supports sending a friend request by typing a username (`Request::AddFriend`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_friend_by_username: bool,
+    /// This account supports setting a private nickname on a friend (`Request::SetFriendNickname`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub friend_nickname: bool,
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,
@@ -640,6 +651,9 @@ pub struct Capabilities {
     /// This account supports browsing unjoined public channels, previewing, and joining them (`BrowseChannels`, `PreviewChannel`, `Join`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub browse_channels: bool,
+    /// This account supports an optional subject line on new channel posts (Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channel_subject: bool,
     /// This account supports saving/starring messages for Later and setting network reminders (`StarMessage`, `StarredMessages`, `Remind`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub save_messages: bool,
@@ -649,6 +663,31 @@ pub struct Capabilities {
     /// This account supports workspace-wide file listing and deleting own files (`AccountFiles`, `DeleteFile`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_files: bool,
+    /// This account supports previewing and joining a Space from an invite link (`InvitePreview`, `InviteJoin`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub join_space_by_invite: bool,
+    /// This account supports leaving a Space (`Request::LeaveSpace`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub leave_space: bool,
+}
+
+/// Preview of a Space invite (`Request::InvitePreview`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitePreview {
+    pub code: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
@@ -981,6 +1020,9 @@ pub struct Outgoing {
     /// `files.getUploadURLExternal` when uploading a code/text snippet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet_type: Option<String>,
+    /// Optional one-line subject for a new channel post (Teams).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -1001,6 +1043,7 @@ impl Default for Outgoing {
             contact: None,
             send_as: None,
             snippet_type: None,
+            subject: None,
         }
     }
 }

@@ -8,9 +8,11 @@
 //! not kept either. Names (who a session or key is for) are left in the clear so a prefix can be
 //! listed; what they name is sealed.
 //!
-//! A new identity key for someone is trusted, as presage's own stores do by default: tinyclient
-//! does not show safety numbers yet.
+//! Per-contact identity verification state (`Default`, `Verified`, `Unverified`) is sealed alongside
+//! each trusted identity key. Receiving remains trusting (as in Signal Desktop); sending to a
+//! verified contact whose identity key has changed is refused until the user approves or re-verifies.
 
+use super::wire::{self, IdentityState, SafetyNumber};
 use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use async_trait::async_trait;
@@ -83,6 +85,17 @@ struct Inner {
     db: Mutex<Connection>,
     cipher: Aes256GcmSiv,
     path: PathBuf,
+    on_identity_changed: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct IdentityRecord {
+    #[serde(default)]
+    state: IdentityState,
+    #[serde(default)]
+    key: Vec<u8>,
+    #[serde(default)]
+    unapproved_change: bool,
 }
 
 /// One account's state. Cloned freely: every clone is the same file.
@@ -132,7 +145,12 @@ impl Vault {
              CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;",
         )
         .map_err(|err| err.to_string())?;
-        let vault = Vault(Arc::new(Inner { db: Mutex::new(db), cipher, path: path.to_owned() }));
+        let vault = Vault(Arc::new(Inner {
+            db: Mutex::new(db),
+            cipher,
+            path: path.to_owned(),
+            on_identity_changed: Mutex::new(None),
+        }));
         // A key that does not open what is there is the wrong key: say so now, not mid-message.
         if let Some(name) = vault.first_name().map_err(|err| err.0)? {
             vault.get(&name).map_err(|_| format!("the Signal state does not open with the key in {}", crate::session::STORE))?;
@@ -229,6 +247,95 @@ impl Vault {
     pub fn password(&self) -> Option<String> {
         let reg: serde_json::Value = self.json("reg").ok().flatten()?;
         reg.get("password")?.as_str().map(str::to_owned)
+    }
+
+    /// Registers a channel notified with the contact's ACI whenever a stored identity key is replaced.
+    pub fn set_identity_change_sink(&self, sink: tokio::sync::mpsc::UnboundedSender<String>) {
+        *self.0.on_identity_changed.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    fn notify_identity_changed(&self, aci: &str) {
+        if let Some(sink) = self.0.on_identity_changed.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = sink.send(aci.to_owned());
+        }
+    }
+
+    fn identity_record(&self, aci: &str) -> IdentityRecord {
+        self.json(&format!("identity_state.{aci}")).ok().flatten().unwrap_or_default()
+    }
+
+    fn put_identity_record(&self, aci: &str, record: &IdentityRecord) -> Held<()> {
+        self.put_json(&format!("identity_state.{aci}"), record)
+    }
+
+    /// Returns `(verification_state, has_unapproved_change)` for a contact ACI.
+    pub fn identity_state(&self, aci: &str) -> (IdentityState, bool) {
+        let rec = self.identity_record(aci);
+        (rec.state, rec.unapproved_change)
+    }
+
+    /// Returns the stored serialized 33-byte identity key for a contact ACI, if known.
+    /// When an unapproved key change is pending (e.g. a send-side rotation), prefers the new key
+    /// recorded in `identity_state.{aci}` over the stale `aci.trusted.{aci}` entry so the user
+    /// sees and approves the new safety number rather than the old one.
+    pub fn peer_identity_key(&self, aci: &str) -> Option<Vec<u8>> {
+        let rec = self.identity_record(aci);
+        if rec.unapproved_change && !rec.key.is_empty() {
+            return Some(rec.key);
+        }
+        self.get(&format!("aci.trusted.{aci}"))
+            .ok()
+            .flatten()
+            .or_else(|| (!rec.key.is_empty()).then_some(rec.key))
+    }
+
+    /// Updates a contact's verification state, optionally updating their stored key and clearing any
+    /// unapproved-change send block.
+    pub fn set_identity_state(&self, aci: &str, state: IdentityState, key: Option<&[u8]>, clear_change: bool) -> Held<()> {
+        let mut rec = self.identity_record(aci);
+        rec.state = state;
+        if let Some(key) = key.filter(|k| !k.is_empty()) {
+            rec.key = key.to_vec();
+            let _ = self.put(&format!("aci.trusted.{aci}"), key);
+        } else if let Some(stored) = self.peer_identity_key(aci) {
+            rec.key = stored.clone();
+            let _ = self.put(&format!("aci.trusted.{aci}"), &stored);
+        }
+        if clear_change {
+            rec.unapproved_change = false;
+        }
+        self.put_identity_record(aci, &rec)
+    }
+
+    /// Applies an identity record from Signal's Storage Service without silently clearing a newer
+    /// local unapproved key change for a different key.
+    pub fn sync_storage_identity(&self, aci: &str, state: IdentityState, key: &[u8]) {
+        let existing = self.identity_record(aci);
+        if existing.unapproved_change && !key.is_empty() && !existing.key.is_empty() && existing.key.as_slice() != key {
+            return;
+        }
+        let mut rec = existing;
+        rec.state = state;
+        if !key.is_empty() {
+            rec.key = key.to_vec();
+            let _ = self.put(&format!("aci.trusted.{aci}"), key);
+        }
+        if state == IdentityState::Verified && !key.is_empty() && rec.key.as_slice() == key {
+            rec.unapproved_change = false;
+        }
+        let _ = self.put_identity_record(aci, &rec);
+    }
+
+    /// Computes the 60-digit Signal v2 safety number for `remote_aci` using our stored ACI identity
+    /// key pair and their stored identity key.
+    pub fn safety_number(&self, local_aci: &str, remote_aci: &str) -> Option<SafetyNumber> {
+        let local_bytes = self.get("aci.identity").ok().flatten()?;
+        let local_pair = IdentityKeyPair::try_from(local_bytes.as_slice()).ok()?;
+        let local_key = local_pair.identity_key().serialize();
+        let remote_key = self.peer_identity_key(remote_aci)?;
+        let digits = wire::safety_number_for_acis(local_aci, &local_key, remote_aci, &remote_key)?;
+        let (state, changed) = self.identity_state(remote_aci);
+        Some(SafetyNumber { digits, state, changed })
     }
 
     /// Every group the account is in, with its master key.
@@ -581,12 +688,58 @@ impl IdentityKeyStore for Keys {
     async fn save_identity(&mut self, address: &ProtocolAddress, identity: &IdentityKey) -> Signal<IdentityChange> {
         let name = format!("trusted.{}", address.name());
         let before = self.get(&name)?;
-        self.put(&name, &identity.serialize())?;
-        let replaced = before.is_some_and(|before| before.as_slice() != &*identity.serialize());
+        let serialized = identity.serialize();
+        self.put(&name, &serialized)?;
+        let replaced = before.as_ref().is_some_and(|before| before.as_slice() != &*serialized);
+        if self.side == "aci" {
+            let aci = address.name();
+            if replaced {
+                let mut rec = self.vault.identity_record(aci);
+                if rec.state == IdentityState::Verified {
+                    rec.state = IdentityState::Unverified;
+                    rec.unapproved_change = true;
+                }
+                rec.key = serialized.to_vec();
+                let _ = self.vault.put_identity_record(aci, &rec);
+                self.vault.notify_identity_changed(aci);
+            } else if before.is_none() {
+                let mut rec = self.vault.identity_record(aci);
+                if rec.key.is_empty() {
+                    rec.key = serialized.to_vec();
+                    let _ = self.vault.put_identity_record(aci, &rec);
+                }
+            }
+        }
         Ok(IdentityChange::from_changed(replaced))
     }
 
-    async fn is_trusted_identity(&self, _address: &ProtocolAddress, _identity: &IdentityKey, _direction: Direction) -> Signal<bool> {
+    async fn is_trusted_identity(&self, address: &ProtocolAddress, identity: &IdentityKey, direction: Direction) -> Signal<bool> {
+        // Receiving stays trusting, matching Signal Desktop / Android / iOS.
+        if direction == Direction::Receiving || self.side != "aci" {
+            return Ok(true);
+        }
+        let aci = address.name();
+        let mut rec = self.vault.identity_record(aci);
+        if rec.unapproved_change {
+            return Ok(false);
+        }
+        if rec.state == IdentityState::Verified {
+            let expected = if !rec.key.is_empty() {
+                Some(rec.key.clone())
+            } else {
+                self.get(&format!("trusted.{aci}"))?
+            };
+            if let Some(expected) = expected {
+                if expected.as_slice() != &*identity.serialize() {
+                    rec.state = IdentityState::Unverified;
+                    rec.unapproved_change = true;
+                    rec.key = identity.serialize().to_vec();
+                    let _ = self.vault.put_identity_record(aci, &rec);
+                    self.vault.notify_identity_changed(aci);
+                    return Ok(false);
+                }
+            }
+        }
         Ok(true)
     }
 

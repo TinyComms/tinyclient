@@ -466,6 +466,7 @@ impl InfoPane {
             online: self.online(person.key.network),
             close_direct: super::scene_can_close_direct(&self.scene, &person.key),
             can_block: self.scene.blocks_accounts.contains(&person.key.account()),
+            can_friend_nickname: self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.can.friend_nickname),
         }
     }
 
@@ -603,6 +604,39 @@ impl InfoPane {
                 sections = sections.child(draw::label("In common", !any));
                 any = true;
                 sections = sections.child(self.in_common(person, &common, cx));
+            }
+            let safety_digits = profile
+                .fields
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("Safety number"))
+                .map(|(_, v)| v.clone());
+            let safety_status = profile
+                .fields
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("Safety status"))
+                .map(|(_, v)| v.clone());
+            let extra_fields: Vec<(String, String)> = profile
+                .fields
+                .iter()
+                .filter(|(k, v)| {
+                    !v.trim().is_empty()
+                        && !k.eq_ignore_ascii_case("Safety number")
+                        && !k.eq_ignore_ascii_case("Safety status")
+                        && !k.eq_ignore_ascii_case("About emoji")
+                })
+                .cloned()
+                .collect();
+            if !extra_fields.is_empty() {
+                sections = sections.child(draw::label("Details", !any));
+                any = true;
+                for (ix, (label, value)) in extra_fields.into_iter().enumerate() {
+                    sections = sections.child(draw::fact(("info-field", ix), "icons/info.svg", label, value));
+                }
+            }
+            if let Some(digits) = safety_digits.filter(|d| !d.trim().is_empty() && !is_self) {
+                sections = sections.child(draw::label("Safety number", !any));
+                any = true;
+                sections = sections.child(self.safety_section(person, digits, safety_status.as_deref().unwrap_or(""), online, cx));
             }
         }
         let failed = matches!(self.profile, Answer::Failed) && online;
@@ -850,6 +884,67 @@ impl InfoPane {
             );
         }
         rows
+    }
+
+    fn safety_section(&self, person: &Person, digits: String, status: &str, online: bool, cx: &mut Context<Self>) -> Div {
+        let copy_digits = digits.clone();
+        let changed = status.to_ascii_lowercase().contains("changed");
+        let verified = status.eq_ignore_ascii_case("verified");
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .id("info-safety-digits")
+                    .p(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .type_small()
+                    .text_color(theme::text())
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme::hover()))
+                    .child(digits)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy(copy_digits.clone(), "Safety number", cx);
+                    })),
+            );
+        if !status.is_empty() {
+            let color = if changed { theme::danger() } else { theme::text_soft() };
+            block = block.child(div().type_small().text_color(color).child(status.to_owned()));
+        }
+        if person.key.network == Network::Signal && online {
+            let (label, prefix) = if changed {
+                ("Approve new safety number", "\u{1}signal-safety-approve\u{1}")
+            } else if verified {
+                ("Clear verification", "\u{1}signal-safety-unverify\u{1}")
+            } else {
+                ("Mark as verified", "\u{1}signal-safety-verify\u{1}")
+            };
+            let cmd = format!("{prefix}{}", person.key.id);
+            let account = person.key.account();
+            block = block.child(
+                button("info-safety-action", ButtonKind::Secondary, label)
+                    .w_full()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let pane = cx.weak_entity();
+                        let shell = this.shell.clone();
+                        let request = Request::Handoff {
+                            conversation: Key::new(&account, cmd.clone()),
+                        };
+                        super::ask_later(cx, request, move |answer, cx| {
+                            if matches!(answer, Ok(Response::Link { .. })) {
+                                let _ = pane.update(cx, |this, cx| this.retry(cx));
+                            } else if let Ok(Response::Error { detail, .. }) = answer {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                                });
+                            }
+                        });
+                    })),
+            );
+        }
+        block
     }
 
     fn failed_line(&self, cx: &mut Context<Self>) -> Div {

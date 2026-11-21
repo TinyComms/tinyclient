@@ -44,10 +44,10 @@ mod wire;
 use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
-use crate::store::{ConversationRow, Filing, FolderRow, PersonRow};
+use crate::store::{ConversationRow, Filing, FolderRow, PersonDetails, PersonRow};
 use protocol::{
     Attachment, CatalogItem, CatalogKind, Contact, ContactKind, ConversationKind, ConversationRights, Delivery, Link,
-    MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft,
+    Mark, MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft,
     Reaction, RelateAction, Relation, ReplyTo, ReportReason, ReportTarget, Span, Special,
 };
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,28 @@ const CALL_LINK_CREATE: &str = "\u{1}signal-call-link-create\u{1}";
 const CALL_LINK_UPDATE: &str = "\u{1}signal-call-link-update\u{1}";
 const CALL_LINK_JOIN: &str = "\u{1}signal-call-link-join\u{1}";
 const CALL_LINK_DELETE: &str = "\u{1}signal-call-link-delete\u{1}";
+/// Signal safety-number actions packed into `Handoff.conversation_id`:
+/// - `\u{1}signal-safety-verify\u{1}<aci>` -> mark contact Verified, returns formatted 60-digit safety number
+/// - `\u{1}signal-safety-approve\u{1}<aci>` -> approve changed key (Default), clears send block
+/// - `\u{1}signal-safety-unverify\u{1}<aci>` -> clear Verified mark back to Default
+const SAFETY_VERIFY: &str = "\u{1}signal-safety-verify\u{1}";
+const SAFETY_APPROVE: &str = "\u{1}signal-safety-approve\u{1}";
+const SAFETY_UNVERIFY: &str = "\u{1}signal-safety-unverify\u{1}";
+
+/// Packs a Signal safety-number verify request for `Request::Handoff`.
+pub fn safety_verify_command(aci: &str) -> String {
+    format!("{SAFETY_VERIFY}{aci}")
+}
+
+/// Packs a Signal safety-number approve (clear changed-key send block) request for `Request::Handoff`.
+pub fn safety_approve_command(aci: &str) -> String {
+    format!("{SAFETY_APPROVE}{aci}")
+}
+
+/// Packs a Signal safety-number unverify request for `Request::Handoff`.
+pub fn safety_unverify_command(aci: &str) -> String {
+    format!("{SAFETY_UNVERIFY}{aci}")
+}
 
 /// Packs a Signal call link creation request for `Request::Handoff`.
 pub fn call_link_create_command(name: &str, approve_all: bool) -> String {
@@ -633,6 +655,22 @@ fn forget(saved: &Saved) {
 struct Live {
     /// Names as the user knows people: contact names, else what their messages said.
     names: HashMap<String, String>,
+    /// Contact nicknames from Signal's synced storage (preferred over profile names in rows).
+    nicknames: HashMap<String, String>,
+    /// Private notes on contacts from Signal's synced storage.
+    notes: HashMap<String, String>,
+    /// Phone numbers shared by contacts (from contact sync or synced storage).
+    phones: HashMap<String, String>,
+    /// Stored Signal usernames (from username search or synced storage).
+    usernames: HashMap<String, String>,
+    /// Universal default disappearing-messages timer in seconds from AccountRecord (0 = off).
+    default_timer: u32,
+    /// Account's "Generate link previews" setting (from configuration sync or AccountRecord).
+    link_previews: bool,
+    /// Per-contact identity verification state (`Default`, `Verified`, `Unverified`).
+    identity_states: HashMap<String, wire::IdentityState>,
+    /// Verified contacts whose identity key changed and has not yet been approved.
+    identity_changed: HashSet<String>,
     /// Unread incoming messages per conversation, (author, sent), oldest first.
     unread: HashMap<String, VecDeque<(String, u64)>>,
     /// Our sent messages and their conversation, for receipts that name only the time.
@@ -693,6 +731,11 @@ struct Live {
     call_history: VecDeque<(String, u64)>,
     /// Created or synced call links keyed by their 32-byte root key.
     call_links: HashMap<[u8; 32], wire::CallLink>,
+    /// Pinned messages across conversations, persisted at `pins_path`.
+    pinned_messages: Vec<PinRecord>,
+    /// `{support}/signal/{aci}.pins`. Empty when nothing is kept on disk.
+    pins_path: PathBuf,
+    pins_loaded: bool,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -706,7 +749,17 @@ struct Ring {
 
 impl Live {
     fn name(&self, id: &str) -> String {
+        if let Some(nick) = self.nicknames.get(id).filter(|s| !s.is_empty()) {
+            return nick.clone();
+        }
         self.names.get(id).cloned().unwrap_or_else(|| NO_NAME.to_owned())
+    }
+
+    fn known_name(&self, id: &str) -> String {
+        if let Some(nick) = self.nicknames.get(id).filter(|s| !s.is_empty()) {
+            return nick.clone();
+        }
+        self.names.get(id).cloned().unwrap_or_default()
     }
 
     fn unread(&mut self, conversation: &str, author: &str, sent: u64) {
@@ -781,7 +834,13 @@ impl Live {
     }
 
     fn timer_of(&self, conversation: &str) -> wire::Timer {
-        self.timers.get(conversation).copied().unwrap_or_default()
+        if let Some(timer) = self.timers.get(conversation) {
+            return *timer;
+        }
+        if self.default_timer > 0 && !conversation.starts_with("g.") {
+            return wire::Timer { seconds: self.default_timer, version: 1 };
+        }
+        wire::Timer::default()
     }
 
     fn remember_expiring(&mut self, conversation: &str, message_id: &str, seconds: u32) {
@@ -873,6 +932,123 @@ impl Live {
             write_reactions(&self.reactions_path, &self.reacted_order, &self.reactions);
         }
         before.filter(|before| Some(before.as_str()) != emoji)
+    }
+
+    fn load_pins(&mut self) {
+        if self.pins_loaded {
+            return;
+        }
+        self.pins_loaded = true;
+        self.pinned_messages = read_pins(&self.pins_path);
+    }
+
+    fn record_pin(&mut self, conversation: &str, message_id: &str, pinned_by: String, pinned_at: i64, expires_at: Option<i64>) {
+        self.load_pins();
+        self.pinned_messages
+            .retain(|p| !(p.conversation == conversation && p.message_id == message_id));
+        self.pinned_messages.push(PinRecord {
+            conversation: conversation.to_owned(),
+            message_id: message_id.to_owned(),
+            pinned_by,
+            pinned_at,
+            expires_at,
+        });
+        if self.pinned_messages.len() > 512 {
+            let extra = self.pinned_messages.len() - 512;
+            self.pinned_messages.drain(..extra);
+        }
+        write_pins(&self.pins_path, &self.pinned_messages);
+    }
+
+    fn remove_pin(&mut self, conversation: &str, message_id: &str) -> bool {
+        self.load_pins();
+        let before = self.pinned_messages.len();
+        self.pinned_messages
+            .retain(|p| !(p.conversation == conversation && p.message_id == message_id));
+        let changed = self.pinned_messages.len() != before;
+        if changed {
+            write_pins(&self.pins_path, &self.pinned_messages);
+        }
+        changed
+    }
+
+    fn prune_expired_pins(&mut self, now: i64) -> Vec<(String, String)> {
+        self.load_pins();
+        let mut expired = Vec::new();
+        self.pinned_messages.retain(|p| {
+            if p.expires_at.is_some_and(|exp| exp <= now) {
+                expired.push((p.conversation.clone(), p.message_id.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        if !expired.is_empty() {
+            write_pins(&self.pins_path, &self.pinned_messages);
+        }
+        expired
+    }
+
+    fn pins_for(&mut self, conversation: &str) -> Vec<PinRecord> {
+        self.load_pins();
+        let mut out: Vec<PinRecord> = self
+            .pinned_messages
+            .iter()
+            .filter(|p| p.conversation == conversation)
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.pinned_at));
+        out.truncate(protocol::PINNED_LIMIT);
+        out
+    }
+}
+
+/// One pinned message remembered for a Signal conversation (Signal has no server pin index).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PinRecord {
+    conversation: String,
+    message_id: String,
+    pinned_by: String,
+    pinned_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<i64>,
+}
+
+fn pins_path(aci: &str) -> PathBuf {
+    protocol::support_dir().join("signal").join(format!("{aci}.pins"))
+}
+
+fn read_pins(path: &Path) -> Vec<PinRecord> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    if meta.len() > REACTIONS_FILE_LIMIT {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<PinRecord>>(&bytes).unwrap_or_default()
+}
+
+fn write_pins(path: &Path, rows: &[PinRecord]) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(bytes) = serde_json::to_vec(rows) else {
+        return;
+    };
+    let tmp = path.with_extension("pins.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -989,7 +1165,11 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     }
     // What is learned (names, settings, unread) outlives one connection. Reactions outlive the
     // process: the file is what a later reaction replaces, once this memory is gone.
-    let live = Arc::new(Mutex::new(Live { reactions_path: reactions_path(&saved.aci), ..Live::default() }));
+    let live = Arc::new(Mutex::new(Live {
+        reactions_path: reactions_path(&saved.aci),
+        pins_path: pins_path(&saved.aci),
+        ..Live::default()
+    }));
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
     let (socket_ctx, held, socket_saved, socket_live) = (ctx.clone(), current.clone(), saved.clone(), live.clone());
     std::thread::Builder::new()
@@ -1043,7 +1223,7 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
     show_self(&account);
     // Nothing is counted until an adapter says so; Signal counts its own body limit.
-    ctx.capabilities(capabilities());
+    ctx.capabilities(capabilities(account.live().link_previews));
     *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
     if ctx.stopped() {
@@ -1134,6 +1314,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
             row.peer = Some(aci.clone());
             row.listed = true;
             row.private = true;
+            row.rights.pin = true;
             row
         }
         Peer::Group(_) => {
@@ -1172,6 +1353,27 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
         message.kind = MessageKind::Unsupported { link: String::new() };
     }
     message.contacts = text.contacts.clone();
+    for (idx, preview) in text.previews.iter().enumerate() {
+        if !wire::preview_url_in_body(&text.text, &preview.url) {
+            continue;
+        }
+        let image = preview.image.as_ref().filter(|b| !b.is_empty()).and_then(|bytes| {
+            let mut file = MediaFile::new(format!("signal:preview:{}:{}:{idx}", text.sent, author), MediaKind::Image);
+            file.width = preview.image_width;
+            file.height = preview.image_height;
+            file.bytes = bytes.len() as u64;
+            account
+                .ctx
+                .landed(&file, &format!("signal://preview/{}/{}/{idx}", text.sent, author), bytes)
+        });
+        message.previews.push(protocol::Preview {
+            url: preview.url.clone(),
+            site: crate::adapters::tiny::preview::real_host(&preview.url),
+            title: preview.title.clone(),
+            description: preview.description.clone(),
+            image,
+        });
+    }
     if wire::find_group_invite_link(&message.text).is_some() {
         message.card = Some(Box::new(protocol::Card {
             title: "Signal group invite".to_owned(),
@@ -1218,18 +1420,6 @@ fn apply(account: &Account, event: Event) {
     let ctx = &account.ctx;
     match event {
         Event::Contacts(contacts) => {
-            let people: Vec<PersonRow> = contacts
-                .iter()
-                .map(|contact| PersonRow {
-                    id: contact.id.clone(),
-                    name: if contact.name.is_empty() { NO_NAME.to_owned() } else { contact.name.clone() },
-                    handle: String::new(),
-                    avatar: ctx.avatar_of(&contact.id),
-                    bot: false,
-                    status: String::new(),
-                    link: String::new(),
-                })
-                .collect();
             {
                 let mut live = account.live();
                 for contact in &contacts {
@@ -1239,8 +1429,30 @@ fn apply(account: &Account, event: Event) {
                     if !contact.name.is_empty() {
                         live.names.insert(contact.id.clone(), contact.name.clone());
                     }
+                    if !contact.phone.is_empty() {
+                        live.phones.insert(contact.id.clone(), contact.phone.clone());
+                    }
                 }
             }
+            let people: Vec<PersonRow> = {
+                let live = account.live();
+                contacts
+                    .iter()
+                    .map(|contact| {
+                        let display = live.known_name(&contact.id);
+                        let handle = live.usernames.get(&contact.id).cloned().unwrap_or_default();
+                        PersonRow {
+                            id: contact.id.clone(),
+                            name: if display.is_empty() { NO_NAME.to_owned() } else { display },
+                            handle,
+                            avatar: ctx.avatar_of(&contact.id),
+                            bot: false,
+                            status: String::new(),
+                            link: String::new(),
+                        }
+                    })
+                    .collect()
+            };
             let _ = ctx.people(&people);
             let owned: Vec<(String, Relation)> = {
                 let live = account.live();
@@ -1253,10 +1465,11 @@ fn apply(account: &Account, event: Event) {
                     .collect()
             };
             let _ = ctx.relations(&owned);
-            // A row named before the contact was known takes the contact's name.
-            for contact in contacts.iter().filter(|contact| !contact.name.is_empty()) {
-                if let Ok(Some(_)) = ctx.known(&contact.id) {
-                    ensure_row(account, &Peer::Direct(contact.id.clone()), &contact.name);
+            // A row named before the contact was known takes the contact's name (preferring nickname).
+            for contact in &contacts {
+                let display = account.live().known_name(&contact.id);
+                if !display.is_empty() && matches!(ctx.known(&contact.id), Ok(Some(_))) {
+                    ensure_row(account, &Peer::Direct(contact.id.clone()), &display);
                 }
             }
         }
@@ -1346,9 +1559,9 @@ fn apply(account: &Account, event: Event) {
                 }
             }
             match &peer {
-                // A person's row takes the name the user knows them by, once there is one.
+                // A person's row takes the name the user knows them by (preferring nickname), once there is one.
                 Peer::Direct(aci) => {
-                    let title = account.live().names.get(aci).cloned().unwrap_or_default();
+                    let title = account.live().known_name(aci);
                     ensure_row(account, &peer, &title);
                 }
                 Peer::Group(_) => {
@@ -1550,10 +1763,21 @@ fn apply(account: &Account, event: Event) {
                 entry.admin_passkey = admin_passkey;
             }
         }
-        Event::Settings { read_receipts, typing } => {
-            let mut live = account.live();
-            live.read_receipts = read_receipts;
-            live.typing = typing;
+        Event::Settings { read_receipts, typing, link_previews } => {
+            let updated_lp = {
+                let mut live = account.live();
+                live.read_receipts = read_receipts;
+                live.typing = typing;
+                if let Some(lp) = link_previews {
+                    live.link_previews = lp;
+                    Some(lp)
+                } else {
+                    None
+                }
+            };
+            if let Some(lp) = updated_lp {
+                ctx.capabilities(capabilities(lp));
+            }
         }
         Event::TimerChanged { peer, seconds, version } => {
             let conversation = peer.conversation();
@@ -1656,6 +1880,7 @@ fn apply(account: &Account, event: Event) {
                 sync_filing(account, &conv);
             }
         }
+        Event::StorageSync(snapshot) => apply_storage_sync(account, snapshot),
         Event::Folders(folders) => {
             let (rows, known): (Vec<FolderRow>, Vec<String>) = {
                 let mut live = account.live();
@@ -1732,7 +1957,318 @@ fn apply(account: &Account, event: Event) {
                 }
             }
         }
-        Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
+        Event::IdentityChanged { peer } => {
+            if let Peer::Direct(aci) = peer {
+                let (name, was_verified, shared_groups) = {
+                    let mut live = account.live();
+                    let was_verified = live.identity_states.get(&aci) == Some(&wire::IdentityState::Verified);
+                    if was_verified {
+                        live.identity_states.insert(aci.clone(), wire::IdentityState::Unverified);
+                        live.identity_changed.insert(aci.clone());
+                    }
+                    let name = live.name(&aci);
+                    let shared: Vec<String> = live
+                        .groups
+                        .iter()
+                        .filter(|(_, members)| members.iter().any(|m| m == &aci))
+                        .map(|(conv, _)| conv.clone())
+                        .collect();
+                    (name, was_verified, shared)
+                };
+                if was_verified {
+                    let _ = ctx.details(&[(aci.clone(), PersonDetails { mark: None, ..PersonDetails::default() })]);
+                }
+                let line = format!("Your safety number with {name} has changed");
+                let sent_ms = now_ms();
+                let sent_s = (sent_ms / 1_000) as i64;
+                let direct_title = account.live().known_name(&aci);
+                ensure_row(account, &Peer::Direct(aci.clone()), &direct_title);
+                let mut dm_msg = Message::plain(format!("signal-identity-{sent_ms}-{aci}"), String::new(), line.clone(), sent_s, false);
+                dm_msg.kind = MessageKind::System;
+                let _ = ctx.message(&aci, &dm_msg);
+                for conv in shared_groups {
+                    let mut grp_msg = Message::plain(format!("signal-identity-{sent_ms}-{aci}-{conv}"), String::new(), line.clone(), sent_s, false);
+                    grp_msg.kind = MessageKind::System;
+                    let _ = ctx.message(&conv, &grp_msg);
+                }
+            }
+        }
+        Event::VerifiedChanged { aci, state } => {
+            {
+                let mut live = account.live();
+                live.identity_states.insert(aci.clone(), state);
+                live.identity_changed.remove(&aci);
+            }
+            let mark = (state == wire::IdentityState::Verified).then_some(Mark::Verified);
+            let _ = ctx.details(&[(aci, PersonDetails { mark, ..PersonDetails::default() })]);
+        }
+        Event::Pinned { peer, by, author, target, duration_secs } => {
+            if target == 0 || author.is_empty() {
+                return;
+            }
+            let conv = peer.conversation();
+            {
+                let live = account.live();
+                if live.blocked.contains(&conv) {
+                    return;
+                }
+                if matches!(peer, Peer::Group(_))
+                    && live.group_info.get(&conv).is_some_and(|g| !group_rights(g, &by).pin)
+                {
+                    return;
+                }
+            }
+            let msg_id = wire::message_id(target, &author);
+            let now = crate::hub::now();
+            let expires_at = duration_secs.filter(|&s| s > 0).map(|s| now + i64::from(s));
+            let by_name = if by == account.me { "You".to_owned() } else { account.live().name(&by) };
+            account.live().record_pin(&conv, &msg_id, by_name.clone(), now, expires_at);
+            let _ = ctx.pinned(&conv, &msg_id, true);
+            if let Ok(Some(mut stored)) = ctx.stored_message(&conv, &msg_id) {
+                stored.pinned = true;
+                stored.pinned_by = Some(by_name.clone());
+                stored.pinned_at = Some(now);
+                let _ = ctx.message(&conv, &stored);
+            }
+            let sent_ms = now_ms();
+            let mut sys = Message::plain(
+                format!("signal-pin-{sent_ms}-{target}"),
+                String::new(),
+                format!("{by_name} pinned a message"),
+                (sent_ms / 1_000) as i64,
+                by == account.me,
+            );
+            sys.kind = MessageKind::System;
+            let _ = ctx.message(&conv, &sys);
+        }
+        Event::Unpinned { peer, by, author, target } => {
+            if target == 0 || author.is_empty() {
+                return;
+            }
+            let conv = peer.conversation();
+            if matches!(peer, Peer::Group(_))
+                && account.live().group_info.get(&conv).is_some_and(|g| !group_rights(g, &by).pin)
+            {
+                return;
+            }
+            let msg_id = wire::message_id(target, &author);
+            account.live().remove_pin(&conv, &msg_id);
+            let _ = ctx.pinned(&conv, &msg_id, false);
+            if let Ok(Some(mut stored)) = ctx.stored_message(&conv, &msg_id) {
+                stored.pinned = false;
+                stored.pinned_by = None;
+                stored.pinned_at = None;
+                let _ = ctx.message(&conv, &stored);
+            }
+        }
+        Event::Caught => {
+            prune_expired_pins(account);
+        }
+        Event::Closed(_) | Event::Ended(_) => {}
+    }
+}
+
+fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
+    let ctx = &account.ctx;
+    let mut to_file: HashSet<String> = HashSet::new();
+    let mut mutes: Vec<(String, bool)> = Vec::new();
+    let mut mark_unreads: Vec<String> = Vec::new();
+    let mut relation_updates: Vec<(String, Relation)> = Vec::new();
+    let mut mark_updates: Vec<(String, Option<Mark>)> = Vec::new();
+    let mut people_rows: Vec<PersonRow> = Vec::new();
+    let mut seed_rows: Vec<(Peer, String)> = Vec::new();
+    let mut updated_link_previews: Option<bool> = None;
+    {
+        let mut live = account.live();
+        if let Some(acct) = snapshot.account {
+            if let Some(keep) = acct.keep_muted_archived {
+                live.keep_muted_archived = keep;
+            }
+            if let Some(lp) = acct.link_previews {
+                live.link_previews = lp;
+                updated_link_previews = Some(lp);
+            }
+            live.default_timer = acct.universal_expire_timer;
+            for old in &live.pinned {
+                to_file.insert(old.clone());
+            }
+            live.pinned = acct
+                .pinned
+                .into_iter()
+                .filter_map(|id| Peer::parse(&id).map(|p| p.conversation()))
+                .collect();
+            for id in &live.pinned {
+                to_file.insert(id.clone());
+                if let Some(peer) = Peer::parse(id) {
+                    let title = match &peer {
+                        Peer::Direct(aci) => live.known_name(aci),
+                        Peer::Group(_) => live.group_info.get(id).map(|g| g.title.clone()).unwrap_or_default(),
+                    };
+                    seed_rows.push((peer, title));
+                }
+            }
+            if acct.note_to_self_marked_unread {
+                mark_unreads.push(account.me.clone());
+            }
+        }
+        for contact in snapshot.contacts {
+            if !wire::is_aci(&contact.aci) {
+                continue;
+            }
+            let aci = contact.aci;
+            if !contact.name.is_empty() {
+                live.names.insert(aci.clone(), contact.name);
+            }
+            if !contact.nickname.is_empty() {
+                live.nicknames.insert(aci.clone(), contact.nickname);
+            } else {
+                live.nicknames.remove(&aci);
+            }
+            if !contact.note.is_empty() {
+                live.notes.insert(aci.clone(), contact.note);
+            } else {
+                live.notes.remove(&aci);
+            }
+            if !contact.phone.is_empty() {
+                live.phones.insert(aci.clone(), contact.phone);
+            }
+            if !contact.username.is_empty() {
+                live.usernames.insert(aci.clone(), contact.username);
+            }
+            live.identity_states.insert(aci.clone(), contact.identity_state);
+            if contact.identity_state == wire::IdentityState::Verified {
+                live.identity_changed.remove(&aci);
+                mark_updates.push((aci.clone(), Some(Mark::Verified)));
+            } else {
+                mark_updates.push((aci.clone(), None));
+            }
+            live.contacts.insert(aci.clone());
+            if contact.whitelisted {
+                live.accepted.insert(aci.clone());
+                live.requests.remove(&aci);
+            }
+            if contact.blocked {
+                live.blocked.insert(aci.clone());
+                relation_updates.push((aci.clone(), Relation::Blocked));
+            } else {
+                live.blocked.remove(&aci);
+                relation_updates.push((aci.clone(), Relation::Contact));
+            }
+            if contact.muted_until > 0 {
+                live.muted_until.insert(aci.clone(), contact.muted_until);
+            } else {
+                live.muted_until.remove(&aci);
+            }
+            let is_muted = live.is_muted(&aci);
+            mutes.push((aci.clone(), is_muted));
+            let was_archived = live.archived.contains(&aci);
+            if contact.archived {
+                live.archived.insert(aci.clone());
+            } else {
+                live.archived.remove(&aci);
+            }
+            if was_archived != contact.archived || contact.archived {
+                to_file.insert(aci.clone());
+            }
+            if contact.marked_unread {
+                mark_unreads.push(aci.clone());
+            }
+            let display = live.known_name(&aci);
+            let handle = live.usernames.get(&aci).cloned().unwrap_or_default();
+            people_rows.push(PersonRow {
+                id: aci.clone(),
+                name: if display.is_empty() { NO_NAME.to_owned() } else { display.clone() },
+                handle,
+                avatar: ctx.avatar_of(&aci),
+                bot: false,
+                status: String::new(),
+                link: String::new(),
+            });
+            if !contact.hidden {
+                seed_rows.push((Peer::Direct(aci), display));
+            }
+        }
+        for group in snapshot.groups {
+            let peer = Peer::Group(group.id);
+            let conv = peer.conversation();
+            if group.whitelisted {
+                live.accepted.insert(conv.clone());
+                live.requests.remove(&conv);
+            }
+            if group.blocked {
+                live.blocked.insert(conv.clone());
+            } else {
+                live.blocked.remove(&conv);
+            }
+            if group.muted_until > 0 {
+                live.muted_until.insert(conv.clone(), group.muted_until);
+            } else {
+                live.muted_until.remove(&conv);
+            }
+            if group.dont_notify_for_mentions_if_muted {
+                live.dont_notify_mentions.insert(conv.clone());
+            } else {
+                live.dont_notify_mentions.remove(&conv);
+            }
+            let is_muted = live.is_muted(&conv);
+            mutes.push((conv.clone(), is_muted));
+            let was_archived = live.archived.contains(&conv);
+            if group.archived {
+                live.archived.insert(conv.clone());
+            } else {
+                live.archived.remove(&conv);
+            }
+            if was_archived != group.archived || group.archived {
+                to_file.insert(conv.clone());
+            }
+            if group.marked_unread {
+                mark_unreads.push(conv.clone());
+            }
+            let title = if !group.title.is_empty() {
+                group.title
+            } else {
+                live.group_info.get(&conv).map(|g| g.title.clone()).unwrap_or_default()
+            };
+            seed_rows.push((peer, title));
+        }
+    }
+    if !people_rows.is_empty() {
+        let _ = ctx.people(&people_rows);
+    }
+    for (person_id, rel) in relation_updates {
+        let _ = ctx.relation(&person_id, rel);
+    }
+    if !mark_updates.is_empty() {
+        let details: Vec<(String, PersonDetails)> = mark_updates
+            .into_iter()
+            .map(|(id, mark)| (id, PersonDetails { mark, ..PersonDetails::default() }))
+            .collect();
+        let _ = ctx.details(&details);
+    }
+    for (peer, title) in seed_rows {
+        let conv = peer.conversation();
+        ensure_row(account, &peer, &title);
+        if !account.live().folders.is_empty() {
+            to_file.insert(conv);
+        }
+    }
+    for (conv, muted) in mutes {
+        let _ = ctx.muted(&conv, muted);
+        if !account.live().folders.is_empty() {
+            to_file.insert(conv);
+        }
+    }
+    for conv in mark_unreads {
+        let _ = ctx.mark_unread(&conv);
+        if !account.live().folders.is_empty() {
+            to_file.insert(conv);
+        }
+    }
+    for conv in to_file {
+        sync_filing(account, &conv);
+    }
+    if let Some(lp) = updated_link_previews {
+        ctx.capabilities(capabilities(lp));
     }
 }
 
@@ -2036,7 +2572,17 @@ fn search_people(account: &Account, query: &str) {
     if let Some(username) = username_of(query) {
         match account.wire.lookup(username) {
             Ok(Some(aci)) if wire::is_aci(&aci) => {
-                let name = account.live().names.entry(aci.clone()).or_insert_with(|| username.to_owned()).clone();
+                let name = {
+                    let mut live = account.live();
+                    live.usernames.insert(aci.clone(), username.to_owned());
+                    let known = live.known_name(&aci);
+                    if known.is_empty() {
+                        live.names.insert(aci.clone(), username.to_owned());
+                        username.to_owned()
+                    } else {
+                        known
+                    }
+                };
                 let _ = account.ctx.people(&[PersonRow {
                     avatar: account.ctx.avatar_of(&aci),
                     id: aci,
@@ -2093,6 +2639,9 @@ fn offline(ctx: &Context, command: Command) {
         | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Profile { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
@@ -2111,7 +2660,7 @@ pub fn reaction_rules() -> protocol::ReactionRules {
 /// What this account may send: text up to the body other clients keep in the message itself,
 /// files up to Signal's limits, and a one-day edit window (how long Signal Desktop still sends an
 /// edit; a late delete is delete-for-me instead, decided in `delete`).
-fn capabilities() -> protocol::Capabilities {
+fn capabilities(link_previews: bool) -> protocol::Capabilities {
     let files = files::capabilities();
     protocol::Capabilities {
         text_limit: TEXT_LIMIT,
@@ -2122,8 +2671,9 @@ fn capabilities() -> protocol::Capabilities {
         reply: true,
         edit: true,
         delete: true,
-        pins: false,
+        pins: true,
         forward: false,
+        suppress_embeds: link_previews,
         polls: Some(protocol::PollCapabilities {
             max_options: protocol::POLL_OPTIONS as u8,
             max_duration_secs: 0,
@@ -2131,7 +2681,8 @@ fn capabilities() -> protocol::Capabilities {
             anonymous: false,
         }),
         reactions: true,
-        mention_spans: true,
+        mention_format: protocol::MentionFormat::Signal,
+        mention_spans: false,
         disappearing: true,
         view_once: false,
         profile_name: true,
@@ -2231,7 +2782,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(outcome);
         }
         Command::Send { conversation_id, client_id, text, reply_to } => {
-            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[]);
+            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[], false);
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -2372,6 +2923,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ConversationPicture { conversation_id, path, reply } => {
             let _ = reply.send(group_picture(account, &conversation_id, &path));
         }
+        Command::Pinned { conversation_id, reply } => {
+            let _ = reply.send(pinned_messages(account, &conversation_id));
+        }
+        Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+            let _ = reply.send(pin_message(account, &conversation_id, &message_id, pinned));
+        }
         Command::Catalog { kind, query, cursor, reply, .. } => {
             let _ = reply.send(catalog(account, kind, &query, cursor.as_deref()));
         }
@@ -2385,8 +2942,13 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
             let _ = reply.send(Ok(()));
         }
-        Command::Profile { person_id, reply } if person_id == account.me => {
-            let _ = reply.send(own_about(account));
+        Command::Profile { person_id, reply } => {
+            let outcome = if person_id == account.me {
+                own_about(account)
+            } else {
+                person_about(account, &person_id)
+            };
+            let _ = reply.send(outcome);
         }
         Command::SetPresence { status, reply, .. } => {
             let Some((name, about, emoji)) = status.as_deref().and_then(profile_edit) else {
@@ -2588,6 +3150,98 @@ fn own_about(account: &Account) -> Result<About, Refusal> {
     Ok(about)
 }
 
+/// Fetches another person's Signal profile (decrypted name/about/emoji/badges, masked phone,
+/// stored username, shared groups, nickname & private note, and 60-digit safety number).
+fn person_about(account: &Account, person_id: &str) -> Result<About, Refusal> {
+    if !wire::is_aci(person_id) {
+        return Err(Refusal::Refused("That person isn't one Signal knows.".to_owned()));
+    }
+    let profile = account.wire.person_profile(person_id).map_err(refused)?;
+    let safety = account.wire.safety_number(person_id).ok().flatten();
+    let (nickname, note, phone, username, mutual_spaces, known_name, refresh_person) = {
+        let mut live = account.live();
+        let mut refresh = None;
+        if !profile.name.is_empty() {
+            live.names.insert(person_id.to_owned(), profile.name.clone());
+            let display = live.known_name(person_id);
+            let handle = live.usernames.get(person_id).cloned().unwrap_or_default();
+            refresh = Some((display, handle));
+        }
+        let nickname = live.nicknames.get(person_id).cloned().unwrap_or_default();
+        let note = live.notes.get(person_id).cloned().unwrap_or_default();
+        let phone = live.phones.get(person_id).cloned().unwrap_or_default();
+        let username = live.usernames.get(person_id).cloned().unwrap_or_default();
+        let mut mutual: Vec<String> = live
+            .group_info
+            .values()
+            .filter(|g| g.member && g.member_ids.iter().any(|id| id == person_id))
+            .map(|g| if g.title.is_empty() { "Signal group".to_owned() } else { g.title.clone() })
+            .collect();
+        mutual.sort();
+        mutual.dedup();
+        let known_name = live.known_name(person_id);
+        (nickname, note, phone, username, mutual, known_name, refresh)
+    };
+    if let Some((display, handle)) = refresh_person {
+        let _ = account.ctx.people(&[PersonRow {
+            id: person_id.to_owned(),
+            name: if display.is_empty() { NO_NAME.to_owned() } else { display },
+            handle,
+            avatar: account.ctx.avatar_of(person_id),
+            ..PersonRow::default()
+        }]);
+    }
+    let bio = if !profile.about.trim().is_empty() {
+        if !profile.emoji.trim().is_empty() {
+            format!("{} {}", profile.emoji.trim(), profile.about.trim())
+        } else {
+            profile.about.trim().to_owned()
+        }
+    } else if !profile.key_known && known_name.is_empty() {
+        "Name not shared yet".to_owned()
+    } else {
+        String::new()
+    };
+    let mutual_total = mutual_spaces.len() as u32;
+    let mut about = About {
+        bio,
+        nickname,
+        note,
+        mutual_spaces,
+        mutual_total,
+        ..About::default()
+    };
+    if !phone.is_empty() {
+        about.contacts.push(Contact { kind: ContactKind::Phone, value: phone, masked: true });
+    }
+    if !profile.emoji.trim().is_empty() {
+        about.fields.push(("About emoji".into(), profile.emoji.trim().to_owned()));
+    }
+    if !profile.badges.is_empty() {
+        about.fields.push(("Badges".into(), profile.badges.join(", ")));
+    }
+    if !username.is_empty() {
+        about.fields.push(("Username".into(), username));
+    }
+    if let Some(safety) = safety {
+        let formatted = wire::format_safety_number(&safety.digits);
+        if !formatted.is_empty() {
+            about.fields.push(("Safety number".into(), formatted));
+            let status = if safety.changed {
+                "Changed — approval required"
+            } else {
+                match safety.state {
+                    wire::IdentityState::Verified => "Verified",
+                    wire::IdentityState::Unverified => "Unverified",
+                    wire::IdentityState::Default => "Not verified",
+                }
+            };
+            about.fields.push(("Safety status".into(), status.to_owned()));
+        }
+    }
+    Ok(about)
+}
+
 fn set_own(account: &Account, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Refusal> {
     if name.as_ref().is_some_and(|name| name.trim().is_empty()) {
         return Err(Refusal::Refused("A name is needed.".into()));
@@ -2606,7 +3260,7 @@ fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
     let can_add = is_admin || matches!(group.member_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
     let can_edit = is_admin || matches!(group.attributes_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
     ConversationRights {
-        pin: false,
+        pin: can_edit,
         delete_others: is_admin,
         manage_members: is_admin,
         add_members: can_add,
@@ -2879,6 +3533,87 @@ fn group_picture(account: &Account, conversation_id: &str, path: &str) -> Result
     account.wire.group_set_avatar(&group_id, bytes).map_err(refused)
 }
 
+fn prune_expired_pins(account: &Account) {
+    let now = crate::hub::now();
+    let expired = account.live().prune_expired_pins(now);
+    for (conv, msg_id) in expired {
+        let _ = account.ctx.pinned(&conv, &msg_id, false);
+        if let Ok(Some(mut stored)) = account.ctx.stored_message(&conv, &msg_id) {
+            stored.pinned = false;
+            stored.pinned_by = None;
+            stored.pinned_at = None;
+            let _ = account.ctx.message(&conv, &stored);
+        }
+    }
+}
+
+fn pinned_messages(account: &Account, conversation_id: &str) -> Result<Vec<Message>, Refusal> {
+    let _ = peer(conversation_id).map_err(refused)?;
+    prune_expired_pins(account);
+    let records = account.live().pins_for(conversation_id);
+    let mut out = Vec::with_capacity(records.len());
+    for rec in records {
+        if let Ok(Some(mut msg)) = account.ctx.stored_message(conversation_id, &rec.message_id) {
+            msg.pinned = true;
+            if !rec.pinned_by.is_empty() {
+                msg.pinned_by = Some(rec.pinned_by);
+            }
+            if rec.pinned_at > 0 {
+                msg.pinned_at = Some(rec.pinned_at);
+            }
+            out.push(msg);
+        }
+    }
+    Ok(out)
+}
+
+fn pin_message(account: &Account, conversation_id: &str, message_id: &str, pinned: bool) -> Result<(), Refusal> {
+    let to = peer(conversation_id).map_err(refused)?;
+    let (sent, author) = target(message_id).map_err(refused)?;
+    if matches!(to, Peer::Group(_)) {
+        let allowed = account
+            .live()
+            .group_info
+            .get(conversation_id)
+            .is_some_and(|g| group_rights(g, &account.me).pin);
+        if !allowed {
+            return Err(Refusal::Refused("Only group admins can pin or unpin messages.".into()));
+        }
+    }
+    let body = if pinned {
+        Body::Pin { author, target: sent, duration_secs: None }
+    } else {
+        Body::Unpin { author, target: sent }
+    };
+    account.wire.send(&to, body).map_err(refused)?;
+    let now = crate::hub::now();
+    if pinned {
+        account.live().record_pin(conversation_id, message_id, "You".to_owned(), now, None);
+    } else {
+        account.live().remove_pin(conversation_id, message_id);
+    }
+    let _ = account.ctx.pinned(conversation_id, message_id, pinned);
+    if let Ok(Some(mut stored)) = account.ctx.stored_message(conversation_id, message_id) {
+        stored.pinned = pinned;
+        stored.pinned_by = pinned.then(|| "You".to_owned());
+        stored.pinned_at = pinned.then_some(now);
+        let _ = account.ctx.message(conversation_id, &stored);
+    }
+    if pinned {
+        let sent_ms = now_ms();
+        let mut sys = Message::plain(
+            format!("signal-pin-{sent_ms}-{sent}"),
+            String::new(),
+            "You pinned a message".to_owned(),
+            (sent_ms / 1_000) as i64,
+            true,
+        );
+        sys.kind = MessageKind::System;
+        let _ = account.ctx.message(conversation_id, &sys);
+    }
+    Ok(())
+}
+
 fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
     if kind != CatalogKind::Gifs {
         return Err(Refusal::Unsupported);
@@ -2955,7 +3690,38 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
         account.live().call_links.remove(&root_key);
         return Ok("deleted".to_owned());
     }
+    if let Some(aci) = raw.strip_prefix(SAFETY_VERIFY) {
+        return set_safety_state(account, aci.trim(), wire::IdentityState::Verified);
+    }
+    if let Some(aci) = raw.strip_prefix(SAFETY_APPROVE) {
+        return set_safety_state(account, aci.trim(), wire::IdentityState::Default);
+    }
+    if let Some(aci) = raw.strip_prefix(SAFETY_UNVERIFY) {
+        return set_safety_state(account, aci.trim(), wire::IdentityState::Default);
+    }
     Err(Refusal::Unsupported)
+}
+
+fn set_safety_state(account: &Account, aci: &str, state: wire::IdentityState) -> Result<String, Refusal> {
+    if !wire::is_aci(aci) {
+        return Err(Refusal::Refused("That person isn't one Signal knows.".to_owned()));
+    }
+    account.wire.set_verified(aci, state).map_err(refused)?;
+    {
+        let mut live = account.live();
+        live.identity_states.insert(aci.to_owned(), state);
+        live.identity_changed.remove(aci);
+    }
+    let mark = (state == wire::IdentityState::Verified).then_some(Mark::Verified);
+    let _ = account.ctx.details(&[(aci.to_owned(), PersonDetails { mark, ..PersonDetails::default() })]);
+    let formatted = account
+        .wire
+        .safety_number(aci)
+        .ok()
+        .flatten()
+        .map(|s| wire::format_safety_number(&s.digits))
+        .unwrap_or_default();
+    Ok(formatted)
 }
 
 fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick_id: &str) -> Result<Message, Fault> {
@@ -2983,7 +3749,8 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
     let quote = quote_of(account, conversation, reply_to)?;
     let attachment = show_file(account, client_id, 0, &gif_file);
     let timer = account.live().timer_of(conversation);
-    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: vec![gif_file], timer }) {
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, &[]);
+    let sent = match account.wire.send(&to, Body::Files { text: wire_body, quote: quote.clone(), ranges, files: vec![gif_file], timer }) {
         Ok(sent) => sent,
         Err(fault) => {
             forget_landed(&[attachment]);
@@ -2992,7 +3759,15 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
     };
     account.live().echoed(sent);
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        text: shown.text,
+        spans: shown.spans,
+        quote,
+        ..Text::default()
+    };
     let mut message = message(account, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
@@ -3074,15 +3849,73 @@ fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Re
     })
 }
 
-fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span]) -> Result<Message, Fault> {
-    let to = peer(conversation)?;
-    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
+/// Formats outgoing text for Signal: GroupsV2 encode mentions as `\u{FFFC}` + UTF-16 `MentionAci`
+/// ranges, while 1:1 DMs expand any `<@aci>` tokens into plain `@Name` text so official clients
+/// never display a literal object-replacement glyph (`￼`).
+fn format_outgoing_body(
+    account: &Account,
+    to: &Peer,
+    text: &str,
+    mention_spans: &[Span],
+) -> (String, Vec<style::Range>, style::Styled) {
+    let resolve = |aci: &str| {
+        if aci == account.me {
+            "you".to_owned()
+        } else {
+            account.live().known_name(aci)
+        }
+    };
+    let (wire_body, ranges) = match to {
+        Peer::Group(_) => style::parse_with_inline_mentions(text, mention_spans, resolve),
+        Peer::Direct(_) => style::parse_plain_inline_mentions(text, resolve),
+    };
     let shown = style::apply(&wire_body, &ranges, &account.me);
+    (wire_body, ranges, shown)
+}
+
+fn send_text(
+    account: &Account,
+    conversation: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    mention_spans: &[Span],
+    suppress_embeds: bool,
+) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, mention_spans);
     let quote = quote_of(account, conversation, reply_to)?;
-    let timer = account.live().timer_of(conversation);
-    let sent = account.wire.send(&to, Body::Text { text: wire_body, quote: quote.clone(), ranges, timer })?;
+    let (timer, previews_enabled) = {
+        let live = account.live();
+        (live.timer_of(conversation), live.link_previews)
+    };
+    let mut previews = Vec::new();
+    if previews_enabled && !suppress_embeds {
+        if let Some(url) = crate::adapters::tiny::preview::first_https_url(&wire_body) {
+            if let Ok(Some(fetched)) = account.wire.fetch_link_preview(&url) {
+                if wire::preview_url_in_body(&shown.text, &fetched.url) {
+                    previews.push(fetched);
+                }
+            }
+        }
+    }
+    let sent = account.wire.send(&to, Body::Text {
+        text: wire_body,
+        quote: quote.clone(),
+        ranges,
+        timer,
+        previews: previews.clone(),
+    })?;
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: shown.text, spans: shown.spans, quote, ..Text::default() };
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        text: shown.text,
+        spans: shown.spans,
+        quote,
+        previews,
+        ..Text::default()
+    };
     let mut message = message(account, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
@@ -3120,7 +3953,7 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
             account.ctx.sent(conversation, client_id, outcome);
             return;
         }
-        let outcome = send_text(account, conversation, text, reply_to, &with.spans).map_err(|fault| fault.words());
+        let outcome = send_text(account, conversation, text, reply_to, &with.spans, with.suppress_embeds).map_err(|fault| fault.words());
         account.ctx.sent(conversation, client_id, outcome);
         return;
     }
@@ -3164,7 +3997,8 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     // would keep every payload in memory a second time for the whole upload.
     let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
     let timer = account.live().timer_of(conversation);
-    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared, timer }) {
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, &[]);
+    let sent = match account.wire.send(&to, Body::Files { text: wire_body, quote: quote.clone(), ranges, files: prepared, timer }) {
         Ok(sent) => sent,
         Err(fault) => {
             forget_landed(&attachments);
@@ -3173,7 +4007,15 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     };
     account.live().echoed(sent);
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        text: shown.text,
+        spans: shown.spans,
+        quote,
+        ..Text::default()
+    };
     let mut message = message(account, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
@@ -3245,8 +4087,7 @@ fn edit(account: &Account, conversation: &str, message_id: &str, text: &str, men
     if !can(sent, now_ms(), true, conversation == account.me).edit {
         return Err(Fault::Refused("This message can no longer be edited.".to_owned()));
     }
-    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
-    let shown = style::apply(&wire_body, &ranges, &account.me);
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, mention_spans);
     let timer = account.live().timer_of(conversation);
     account.wire.send(&to, Body::Edit { target: sent, text: wire_body, ranges, timer })?;
     if let Ok(Some(mut message)) = account.ctx.stored_message(conversation, message_id) {

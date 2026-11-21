@@ -4,8 +4,8 @@
 use super::html::{self, Lookup};
 use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
 use protocol::{
-    Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind, Reaction,
-    ReplyTo, Span, Style, ThreadSummary,
+    Attachment, ConversationKind, Forwarded, MediaFile, MediaKind, MentionKind, Message,
+    MessageKind, Preview, Reaction, ReplyTo, Span, Style, ThreadSummary,
 };
 use serde_json::{json, Value};
 
@@ -50,15 +50,60 @@ fn person(from: &str) -> &str {
 }
 
 /// The conversation a message is in and, in a channel, the post its reply chain hangs off:
-/// `…/conversations/19:x@thread.tacv2;messageid=1700000000000`.
+/// `…/conversations/19:x@thread.tacv2;messageid=1700000000000`. Newer threads-layout channels may
+/// carry `rootMessageId` or `properties.parentMessageId` instead of `;messageid=`.
 fn placed(raw: &Value) -> Option<(String, Option<String>)> {
     let link = raw["conversationLink"].as_str().unwrap_or("");
     let named = link.split_once("/conversations/").map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
     let named = named.or(raw["conversationid"].as_str()).filter(|named| !named.is_empty())?;
-    Some(match chain_of(named) {
+    let (channel, mut root) = match chain_of(named) {
         Some((channel, root)) => (channel.to_owned(), Some(root.to_owned())),
         None => (named.to_owned(), None),
-    })
+    };
+    if root.is_none() {
+        let fallback = [&raw["rootMessageId"], &raw["parentMessageId"], &raw["properties"]["parentMessageId"]]
+            .into_iter()
+            .map(id_of)
+            .find(|id| millis(id) > 0);
+        if let Some(parent) = fallback {
+            root = Some(parent);
+        }
+    }
+    Some((channel, root))
+}
+
+/// Detects a Teams channel announcement post and extracts its headline and optional subhead.
+/// Any banner image or color is treated as decoration only (never fetched).
+fn announcement_parts(props: &Value, content: &str) -> Option<(String, Option<String>)> {
+    let parsed_ann = match &props["announcement"] {
+        Value::String(text) if text.trim().starts_with('{') => serde_json::from_str::<Value>(text).ok(),
+        Value::Object(_) => Some(props["announcement"].clone()),
+        _ => None,
+    };
+    let is_ann = props["cardType"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("announcement"))
+        || props["postType"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("announcement"))
+        || props["isAnnouncement"] == true
+        || props["isAnnouncement"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"))
+        || parsed_ann.is_some()
+        || props["bannerImage"].as_str().is_some_and(|s| !s.trim().is_empty())
+        || props["bannerColor"].as_str().is_some_and(|s| !s.trim().is_empty())
+        || props["headerImage"].as_str().is_some_and(|s| !s.trim().is_empty())
+        || content.contains("http://schema.skype.com/Announcement");
+    if !is_ann {
+        return None;
+    }
+    let ann_title = parsed_ann.as_ref().and_then(|v| v["title"].as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let ann_sub = parsed_ann.as_ref().and_then(|v| v["subhead"].as_str().or(v["subtitle"].as_str())).map(str::trim).filter(|s| !s.is_empty());
+    let title = ann_title
+        .or_else(|| props["title"].as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .or_else(|| props["subject"].as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("")
+        .to_owned();
+    let subhead = ann_sub
+        .or_else(|| props["subhead"].as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .or_else(|| props["subject"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != title))
+        .map(str::to_owned);
+    Some((title, subhead))
 }
 
 /// A value Teams writes as a string, a number, or leaves out: `edittime`, `deletetime`.
@@ -67,6 +112,24 @@ fn set(value: &Value) -> bool {
         Value::String(text) => !text.is_empty() && text != "0" && text != "null",
         Value::Number(number) => number.as_f64().is_some_and(|number| number > 0.),
         _ => false,
+    }
+}
+
+/// Maps Teams' `properties.importance` (`high` / `urgent`) into [`protocol::Importance`].
+fn importance_of(value: &Value) -> protocol::Importance {
+    match value.as_str().map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
+        "urgent" => protocol::Importance::Urgent,
+        "high" | "important" => protocol::Importance::Important,
+        _ => protocol::Importance::Normal,
+    }
+}
+
+/// Wire value for Teams' `properties.importance` when sending.
+fn importance_wire(importance: protocol::Importance) -> Option<&'static str> {
+    match importance {
+        protocol::Importance::Normal => None,
+        protocol::Importance::Important => Some("high"),
+        protocol::Importance::Urgent => Some("urgent"),
     }
 }
 
@@ -317,6 +380,170 @@ impl Lookup for Refs<'_> {
     }
 }
 
+/// Extracts the first `https://` or `http://` URL from outgoing text.
+pub(super) fn first_url(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| matches!(c, '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\''));
+        let cleaned = trimmed.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'));
+        if (cleaned.starts_with("https://") || cleaned.starts_with("http://")) && cleaned.len() > 10 {
+            return Some(cleaned.to_owned());
+        }
+    }
+    None
+}
+
+/// Maps a Microsoft 365 file extension to a human-readable app label.
+fn m365_app(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "doc" | "docx" => Some("Word"),
+        "xls" | "xlsx" | "csv" => Some("Excel"),
+        "ppt" | "pptx" => Some("PowerPoint"),
+        "one" => Some("OneNote"),
+        "pdf" => Some("PDF"),
+        _ => None,
+    }
+}
+
+/// Parses Teams `properties.links` and `properties.urlpreviews` into `protocol::Preview` cards,
+/// including Microsoft 365 file link metadata. Preview images are registered only when `hosted`
+/// confirms they live on Teams' own media host.
+pub(super) fn parse_link_previews(
+    props: &Value,
+    msg_id: &str,
+    hosted: impl Fn(&str) -> bool,
+    media: &mut Vec<(MediaFile, String)>,
+) -> Vec<Preview> {
+    let mut entries = listed(&props["links"]);
+    entries.extend(listed(&props["urlpreviews"]));
+    let mut previews = Vec::new();
+    for (idx, item) in entries.into_iter().enumerate() {
+        let url = [&item["url"], &item["originalUrl"], &item["href"], &item["webUrl"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or("");
+        if url.is_empty() || previews.iter().any(|p: &Preview| p.url == url) {
+            continue;
+        }
+        let file_name = [&item["fileName"], &item["name"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty());
+        let file_type = [&item["fileType"], &item["type"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+        let host = super::https_host(url).unwrap_or("");
+        let is_m365 = file_name.is_some()
+            || super::within(host, "sharepoint.com")
+            || super::within(host, "1drv.ms")
+            || super::within(host, "onedrive.live.com")
+            || super::within(host, "office.com")
+            || item["@type"].as_str().is_some_and(|t| t.contains("File") || t.contains("SharePoint"));
+        let title = [&item["title"], &item["previewTitle"], &item["fileName"], &item["name"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        let description = [&item["description"], &item["previewDescription"], &item["snippet"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        let raw_site = [&item["site"], &item["siteName"], &item["domain"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty());
+        let site = if is_m365 {
+            let service = raw_site.unwrap_or_else(|| {
+                if super::within(host, "sharepoint.com") {
+                    "SharePoint"
+                } else if super::within(host, "1drv.ms") || super::within(host, "onedrive.live.com") {
+                    "OneDrive"
+                } else {
+                    "Microsoft 365"
+                }
+            });
+            let ext = if !file_type.is_empty() && !file_type.contains('/') {
+                file_type
+            } else {
+                file_name.and_then(|n| n.rsplit_once('.').map(|(_, e)| e)).unwrap_or("")
+            };
+            match m365_app(ext) {
+                Some(app) if !service.eq_ignore_ascii_case(app) => format!("{app} · {service}"),
+                _ => service.to_owned(),
+            }
+        } else {
+            raw_site.map(str::to_owned).unwrap_or_else(|| host.to_owned())
+        };
+        let img_url = [
+            item["image"].as_str(),
+            item["previewImage"].as_str(),
+            item["previewImage"]["url"].as_str(),
+            item["thumbnailUrl"].as_str(),
+            item["imageUrl"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|u| !u.is_empty() && hosted(u));
+        let image = img_url.map(|u| {
+            let file = MediaFile::new(format!("preview:{msg_id}:{idx}"), MediaKind::Image);
+            media.push((file.clone(), u.to_owned()));
+            file
+        });
+        if title.is_empty() && description.is_empty() && image.is_none() && !is_m365 {
+            continue;
+        }
+        previews.push(Preview {
+            url: url.to_owned(),
+            site,
+            title,
+            description,
+            image,
+        });
+    }
+    previews
+}
+
+/// Counts non-outgoing messages newer than the consumption horizon (`last_read`) and how many
+/// mention us. When no horizon is known, counts non-outgoing messages newer than our latest own
+/// message on the page.
+pub(super) fn count_unread_against_horizon(messages: &[Message], last_read: Option<&str>) -> (u32, u32) {
+    let horizon = last_read.map(millis).filter(|ms| *ms > 0).unwrap_or_else(|| {
+        messages
+            .iter()
+            .filter(|m| m.outgoing)
+            .map(|m| millis(&m.id))
+            .max()
+            .unwrap_or(0)
+    });
+    let mut unread = 0u32;
+    let mut mentions = 0u32;
+    for msg in messages {
+        if msg.outgoing || msg.deleted || msg.kind == MessageKind::System {
+            continue;
+        }
+        let ts = millis(&msg.id);
+        if ts > 0 && ts > horizon {
+            unread = unread.saturating_add(1);
+            if msg.mentions_me {
+                mentions = mentions.saturating_add(1);
+            }
+        }
+    }
+    (unread, mentions)
+}
+
 /// The header of a quoted reply, as Teams' own client writes it.
 fn quote_markup(reply: &ReplyTo) -> String {
     // A quote's name and preview are already plain text. Escaping them must not read markdown.
@@ -331,6 +558,50 @@ fn quote_markup(reply: &ReplyTo) -> String {
         name = text(&reply.sender),
         preview = text(&reply.snippet),
     )
+}
+
+/// The forwarded message block, as Teams' client writes it, carrying original sender, time,
+/// source conversation, link back to the original, and body.
+fn forward_markup(original: &Message, from_title: &str, link: &str) -> String {
+    let text = |text: &str| html::escape_plain(text);
+    let sent_ms = match millis(&original.id) {
+        0 => original.sent.saturating_mul(1000).to_string(),
+        ms => ms.to_string(),
+    };
+    let mut out = format!(
+        "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Forward\" itemid=\"{id}\">\
+         <strong itemprop=\"mri\" itemid=\"{person}\">{name}</strong>\
+         <span itemprop=\"time\" itemid=\"{sent_ms}\"></span>",
+        id = text(&original.id),
+        person = text(&original.sender.id),
+        name = text(original.shown_sender()),
+    );
+    if !from_title.is_empty() {
+        out.push_str(&format!("<span itemprop=\"conversation\">{}</span>", text(from_title)));
+    }
+    if !link.is_empty() {
+        out.push_str(&format!("<a itemprop=\"sourceLink\" href=\"{}\"></a>", text(link)));
+    }
+    out.push_str(&format!("<p itemprop=\"preview\">{}</p></blockquote>", text(&original.text)));
+    out
+}
+
+/// Parses `properties.forwardedMessage` / `properties.forwardContext` when present as JSON.
+fn forwarded_property(props: &Value) -> Option<Value> {
+    for key in ["forwardedMessage", "forwardContext", "forwarded"] {
+        match props.get(key) {
+            Some(Value::Object(_)) => return Some(props[key].clone()),
+            Some(Value::String(s)) if s.trim().starts_with('{') => {
+                if let Ok(v) = serde_json::from_str::<Value>(s) {
+                    if v.is_object() {
+                        return Some(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 impl Teams {
@@ -412,12 +683,17 @@ impl Teams {
             0 => seconds(raw["composetime"].as_str().or(raw["originalarrivaltime"].as_str()).unwrap_or("")),
             sent => sent,
         };
-        let mut message = Message::plain(id.clone(), name.clone(), "", sent, from == me);
+        let scheduled_at = props["scheduledTime"].as_str().map(seconds).filter(|at| *at > 0);
+        let is_scheduled = scheduled_at.is_some_and(|at| kind == "Scheduled" || at > sent);
+        let msg_id = if is_scheduled { format!("scheduled:{id}") } else { id.clone() };
+        let msg_sent = if is_scheduled { scheduled_at.unwrap_or(sent) } else { sent };
+        let mut message = Message::plain(msg_id, name.clone(), "", msg_sent, from == me);
         message.sender.bot = from.starts_with("28:");
         message.sender.avatar = self.picture(&from, &name);
         message.sender.id = from;
         message.edited = set(&props["edittime"]);
         message.edited_at = props["edittime"].as_str().filter(|_| message.edited).map(seconds).filter(|at| *at > 0);
+        message.importance = importance_of(&props["importance"]);
         let content = raw["content"].as_str().unwrap_or("");
         match kind {
             "Event/Call" => {
@@ -447,10 +723,25 @@ impl Teams {
             "Text" => html::parse(&format!("<p>{}</p>", html::escape_plain(content)), &refs, &me),
             _ => html::parse(content, &refs, &me),
         };
-        // A channel post's headline is part of what it says.
-        let subject = [&props["subject"], &props["title"]].into_iter().filter_map(Value::as_str).find(|subject| !subject.trim().is_empty());
+        // A channel post's headline or announcement header is part of what it says.
+        let announcement = announcement_parts(props, content);
+        let subject = if let Some((ref headline, ref subhead)) = announcement {
+            message.announcement = true;
+            if !headline.is_empty() {
+                Some(headline.as_str())
+            } else {
+                subhead.as_deref()
+            }
+        } else {
+            [&props["subject"], &props["title"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|subject| !subject.is_empty())
+        };
+        let announcement_subhead = announcement.as_ref().and_then(|(h, s)| s.as_deref().filter(|sub| !h.is_empty() && *sub != h));
         if message.outgoing {
-            let subject_owned = subject.map(|s| s.trim().to_owned());
+            let subject_owned = subject.map(str::to_owned);
             let images_html = html::inline_images_html(content, |url| self.pictures(url));
             if subject_owned.is_some() || !images_html.is_empty() {
                 let mut state = self.state();
@@ -460,7 +751,16 @@ impl Teams {
                 state.own_meta.insert((conversation.to_owned(), id.clone()), OwnMeta { subject: subject_owned, images_html });
             }
         }
-        if let Some(subject) = subject.map(str::trim) {
+        if let Some(subhead) = announcement_subhead {
+            let shift = (subhead.len() + usize::from(!parsed.text.is_empty())) as u32;
+            for span in &mut parsed.spans {
+                span.start += shift;
+                span.end += shift;
+            }
+            parsed.text = if parsed.text.is_empty() { subhead.to_owned() } else { format!("{subhead}\n{}", parsed.text) };
+            parsed.spans.insert(0, Span { start: 0, end: subhead.len() as u32, style: Style::Italic });
+        }
+        if let Some(subject) = subject.map(str::trim).filter(|s| !s.is_empty()) {
             let shift = (subject.len() + usize::from(!parsed.text.is_empty())) as u32;
             for span in &mut parsed.spans {
                 span.start += shift;
@@ -488,7 +788,15 @@ impl Teams {
         for gif in parsed.gifs {
             message.attachments.push(giphy_gif(&gif, &mut media));
         }
-        for shared in listed(&props["files"]) {
+        let shared_files = listed(&props["files"]);
+        if !shared_files.is_empty() {
+            let mut state = self.state();
+            if state.file_props.len() >= super::REMEMBERED {
+                state.file_props.clear();
+            }
+            state.file_props.insert((conversation.to_owned(), id.clone()), shared_files.clone());
+        }
+        for shared in shared_files {
             let info = &shared["fileInfo"];
             let urls = [&info["shareUrl"], &shared["objectUrl"], &info["fileUrl"]];
             let Some(url) = urls.into_iter().filter_map(Value::as_str).find(|url| url.starts_with("https://")) else {
@@ -520,6 +828,7 @@ impl Teams {
                 parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
             }
         }
+        message.previews = parse_link_previews(props, &id, |url| self.pictures(url) || self.ours(url), &mut media);
         if let Err(err) = self.ctx.media(&media) {
             tracing::warn!("chatd: Teams: {err}");
         }
@@ -533,6 +842,89 @@ impl Teams {
             snippet: quote.preview.chars().take(120).collect(),
             deleted: false,
         });
+        // Forwarded message: from HTML `schema.skype.com/Forward` block and/or `properties.forwardedMessage`.
+        let fwd_prop = forwarded_property(props);
+        if parsed.forward.is_some() || fwd_prop.is_some() {
+            let prop_str = |keys: &[&str]| -> String {
+                fwd_prop
+                    .as_ref()
+                    .and_then(|v| keys.iter().find_map(|k| v[*k].as_str()).map(str::trim).filter(|s| !s.is_empty()))
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            let html_fwd = parsed.forward.as_ref();
+            let orig_sender = html_fwd
+                .map(|f| f.name.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| prop_str(&["originalSenderDisplayName", "originalSenderName", "senderName"]));
+            let orig_conv_id = prop_str(&["originalConversationId", "sourceThreadId", "conversationId"]);
+            let orig_conv_title = html_fwd
+                .map(|f| f.conversation.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let t = prop_str(&["originalConversationTitle", "sourceConversationName", "conversationTitle"]);
+                    (!t.is_empty()).then_some(t)
+                })
+                .or_else(|| {
+                    (!orig_conv_id.is_empty())
+                        .then(|| self.ctx.known(&orig_conv_id).ok().flatten().map(|r| r.title))
+                        .flatten()
+                })
+                .unwrap_or_default();
+            let orig_msg_id = html_fwd
+                .map(|f| f.id.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    fwd_prop
+                        .as_ref()
+                        .map(|v| id_of(&v["originalMessageId"]))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default()
+                });
+            let orig_link = html_fwd
+                .map(|f| f.link.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let l = prop_str(&["deepLink", "link", "sourceLink"]);
+                    (!l.is_empty()).then_some(l)
+                })
+                .or_else(|| {
+                    (!orig_conv_id.is_empty() && !orig_msg_id.is_empty())
+                        .then(|| super::links::message_share(&orig_conv_id, &orig_msg_id, &self.session.tenant, None))
+                })
+                .unwrap_or_default();
+            let fwd_body = html_fwd
+                .map(|f| f.preview.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| prop_str(&["originalMessageContent", "content", "preview"]));
+            if !fwd_body.is_empty() {
+                if message.text.is_empty() {
+                    message.text = fwd_body;
+                } else if !message.text.contains(&fwd_body) {
+                    message.text.push('\n');
+                    message.text.push_str(&fwd_body);
+                }
+            }
+            let author = orig_sender.clone();
+            let (from_title, from_space) = match (orig_sender.is_empty(), orig_conv_title.is_empty()) {
+                (false, false) => (orig_sender, orig_conv_title),
+                (false, true) => (orig_sender, String::new()),
+                (true, false) => (orig_conv_title, String::new()),
+                (true, true) => (String::new(), String::new()),
+            };
+            message.forwarded = Some(Box::new(Forwarded {
+                from_title,
+                from_space,
+                link: orig_link,
+                author,
+                text: String::new(),
+            }));
+        }
         message.reactions = self.reactions(&props["emotions"], &me);
         // What cannot be drawn is named and linked, never left blank.
         let cards = listed(&props["cards"]);
@@ -561,12 +953,25 @@ impl Teams {
             let link = if component.url.is_empty() { self.message_link(conversation, &id, raw) } else { component.url };
             message.kind = MessageKind::Unsupported { link };
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
-            let title = cards.iter().find_map(|card| card_title(card, 6));
-            if message.text.is_empty() {
-                message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
+            let link = self.message_link(conversation, &id, raw);
+            let mut rendered = super::card::parse_cards(&cards, content, &id, &link, |url| self.pictures(url));
+            if !rendered.cards.is_empty() {
+                if !rendered.media.is_empty() {
+                    if let Err(err) = self.ctx.media(&rendered.media) {
+                        tracing::warn!("chatd: Teams: {err}");
+                    }
+                }
+                message.card = Some(Box::new(rendered.cards.remove(0)));
+                message.cards = rendered.cards;
+                // Keep the message normal (reactable, quotable) when the card rendered.
+            } else {
+                let title = cards.iter().find_map(|card| card_title(card, 6));
+                if message.text.is_empty() {
+                    message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
+                }
+                message.kind = MessageKind::Unsupported { link };
             }
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
-        } else if message.text.is_empty() && message.attachments.is_empty() {
+        } else if message.text.is_empty() && message.attachments.is_empty() && message.card.is_none() && message.previews.is_empty() {
             message.text = "Unsupported message".to_owned();
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
@@ -642,8 +1047,8 @@ impl Teams {
             return Ok(());
         }
         // A chat the user hid comes back with a new message, as it does in Teams.
-        if self.ctx.known(place)?.is_some_and(|row| row.hidden) {
-            let filing = crate::store::Filing { hidden: false, ..crate::store::Filing::default() };
+        if let Some(row) = self.ctx.known(place)?.filter(|row| row.hidden) {
+            let filing = crate::store::Filing { hidden: false, pin: row.pin, ..crate::store::Filing::default() };
             self.ctx.filing(place, &filing)?;
         }
         let Some(root) = root.filter(|root| *root != message.id) else {
@@ -789,7 +1194,7 @@ impl Teams {
     /// Records a page. In a channel the posts are its own and each reply goes to its chain; a
     /// chain, a chat and anything else holds every message itself. `more_before` is true when
     /// Teams gave a cursor for a still older page.
-    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<(), Fault> {
+    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<Vec<Message>, Fault> {
         let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
         let (mut own, mut replies): (Vec<Message>, Vec<(String, Message)>) = (Vec::new(), Vec::new());
         for raw in raws {
@@ -840,7 +1245,7 @@ impl Teams {
                 self.bump(conversation, root, &of(root), false)?;
             }
         }
-        Ok(())
+        Ok(own)
     }
 
     /// The newest page. A reply chain keeps the cursor, the same way a chat does, so scrolling
@@ -853,11 +1258,27 @@ impl Teams {
             self.chain_known(channel, root)?;
             let (messages, older) = self.page(conversation, CHAIN, "startTime=1")?;
             self.remember_cursor(conversation, &messages, &older);
-            return self.record(conversation, &messages, !older.is_empty());
+            self.record(conversation, &messages, !older.is_empty())?;
+            return Ok(());
         }
         let (messages, older) = self.page(conversation, PAGE, "startTime=1")?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages, !older.is_empty())?;
+        let own = self.record(conversation, &messages, !older.is_empty())?;
+        // Refine Teams' boolean unread flag into an exact count against the consumption horizon.
+        if let Some(row) = self.ctx.known(conversation)? {
+            if row.unread > 0 || row.last_read.is_some() {
+                let (unread, mentions) = count_unread_against_horizon(&own, row.last_read.as_deref());
+                if unread > row.unread || mentions > row.mentions {
+                    self.ctx.counts(
+                        conversation,
+                        unread.max(row.unread),
+                        mentions.max(row.mentions),
+                        row.last_read.as_deref(),
+                        row.updated,
+                    )?;
+                }
+            }
+        }
         self.seen_by(conversation)
     }
 
@@ -915,7 +1336,8 @@ impl Teams {
         let note = self.ctx.note(&format!("older:{conversation}")).unwrap_or_default();
         let (messages, older) = self.page(conversation, history_limit(conversation), &older_window(&note, before))?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages, !older.is_empty())
+        self.record(conversation, &messages, !older.is_empty())?;
+        Ok(())
     }
 
     /// True when a reply older than `before` is already stored, so this scroll was fetched.
@@ -936,7 +1358,8 @@ impl Teams {
             return Ok(());
         }
         let (messages, _) = self.page(conversation, PAGE, &format!("startTime={}", millis(after)))?;
-        self.record(conversation, &messages, true)
+        self.record(conversation, &messages, true)?;
+        Ok(())
     }
 
     /// The page that ends just after `around`; what follows it is asked for as it is read.
@@ -953,7 +1376,8 @@ impl Teams {
         if chain {
             self.remember_cursor(conversation, &messages, &older);
         }
-        self.record(conversation, &messages, !older.is_empty())
+        self.record(conversation, &messages, !older.is_empty())?;
+        Ok(())
     }
 
     // Acting on messages.
@@ -989,16 +1413,78 @@ impl Teams {
     /// in that chain. A reply to a message in a chat quotes it, as Teams does; a reply to a
     /// post in a channel goes into the post's chain and is shown in the channel as a reply.
     pub(super) fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
-        self.post_with_spans(conversation, client_id, text, reply_to, &[]);
+        self.post_with_outgoing(conversation, client_id, text, reply_to, &protocol::Outgoing::default());
     }
 
-    pub(super) fn post_with_spans(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[Span]) {
-        let outcome = self.posted_with(conversation, client_id, text, reply_to, spans, None).map_err(super::reason);
+    pub(super) fn post_with_outgoing(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing) {
+        let outcome = self.posted_with(conversation, client_id, text, reply_to, with, None).map_err(super::reason);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
-    /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], mut properties: Option<Value>) -> Result<Message, Fault> {
+    /// Asks Teams' own middle-tier unfurl service for link preview metadata.
+    /// Never fetches the target URL directly.
+    fn unfurl_link(&self, url: &str) -> Option<(Value, Preview)> {
+        let place = self.place().ok()?;
+        let endpoint = format!("{}/v1/urlpreview", place.middle);
+        let body = json!({"url": url});
+        let answer = self.call("POST", &endpoint, super::Auth::Both(super::SPACES), Body::Json(&body), false).ok()?;
+        let info = &answer.body;
+        let title = [&info["title"], &info["previewTitle"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
+        let description = [&info["description"], &info["previewDescription"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
+        if title.is_empty() && description.is_empty() {
+            return None;
+        }
+        let site = [&info["siteName"], &info["site"], &info["domain"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .find(|s| !s.is_empty())
+            .unwrap_or_else(|| super::https_host(url).unwrap_or(""));
+        let mut entry = json!({
+            "url": url,
+            "title": title,
+            "description": description,
+            "siteName": site,
+        });
+        let img_url = [&info["image"], &info["previewImage"], &info["thumbnailUrl"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .find(|u| !u.is_empty() && (self.pictures(u) || self.ours(u)));
+        let mut media = Vec::new();
+        let image = img_url.map(|u| {
+            entry["previewImage"] = Value::String(u.to_owned());
+            let file = MediaFile::new(format!("preview:sent:{}", escaped(url)), MediaKind::Image);
+            media.push((file.clone(), u.to_owned()));
+            file
+        });
+        if !media.is_empty() {
+            let _ = self.ctx.media(&media);
+        }
+        let preview = Preview {
+            url: url.to_owned(),
+            site: site.to_owned(),
+            title: title.to_owned(),
+            description: description.to_owned(),
+            image,
+        };
+        Some((entry, preview))
+    }
+
+    /// The same, with `properties` (the files or links a message names) beside the body.
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing, mut properties: Option<Value>) -> Result<Message, Fault> {
+        let mention_spans = &with.spans;
+        let mut sent_previews = Vec::new();
+        let allow_previews = !with.suppress_embeds && self.ctx.hub.settings().on(protocol::settings::LINK_PREVIEWS);
+        if allow_previews {
+            if let Some(url) = first_url(text) {
+                if let Some((entry, preview)) = self.unfurl_link(&url) {
+                    let props = properties.get_or_insert_with(|| json!({}));
+                    if let Some(map) = props.as_object_mut() {
+                        map.insert("links".to_owned(), Value::String(Value::Array(vec![entry]).to_string()));
+                    }
+                    sent_previews.push(preview);
+                }
+            }
+        }
         let (mut content, mentions_json) = if !mention_spans.is_empty() {
             let (c, m) = html::compose_with_mentions(text, mention_spans);
             (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
@@ -1018,6 +1504,30 @@ impl Teams {
             None => None,
         };
         let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
+        let post_subject = if channel && reply_to.is_none() {
+            with.subject
+                .as_deref()
+                .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
+                .filter(|s| !s.is_empty())
+                .map(|mut s| {
+                    protocol::clip(&mut s, 200);
+                    s
+                })
+        } else {
+            None
+        };
+        if let Some(ref subject) = post_subject {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("subject".to_owned(), Value::String(subject.clone()));
+            }
+        }
+        if let Some(level) = importance_wire(with.importance) {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("importance".to_owned(), Value::String(level.to_owned()));
+            }
+        }
         match (reply_to, &quote) {
             (Some(original), _) if channel => target = chain_id(conversation, original),
             (_, Some(quote)) => content = format!("{}{content}", quote_markup(quote)),
@@ -1028,7 +1538,13 @@ impl Teams {
         if let Some(properties) = properties {
             body["properties"] = properties;
         }
-        let answer = self.chat("POST", &path, Body::Json(&body), false)?;
+        let answer = self.chat("POST", &path, Body::Json(&body), false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } if channel && reply_to.is_none() => Fault::Refused {
+                status: 403,
+                message: "Only channel moderators can start new posts here.".to_owned(),
+            },
+            other => other,
+        })?;
         let id = id_of(&answer.body["OriginalArrivalTime"]);
         if millis(&id) == 0 {
             return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
@@ -1036,12 +1552,31 @@ impl Teams {
         let me = self.me();
         let name = self.own_name();
         let sent = millis(&id) / 1000;
-        let (shown, mut spans) = html::styled(text);
+        let (mut shown, mut spans) = html::styled(text);
         if !mention_spans.is_empty() && shown == text {
             spans.extend(mention_spans.iter().cloned());
         }
-        let mut message = Message::plain(id, name.clone(), shown, sent, true);
+        if let Some(ref subject) = post_subject {
+            let shift = (subject.len() + usize::from(!shown.is_empty())) as u32;
+            for span in &mut spans {
+                span.start += shift;
+                span.end += shift;
+            }
+            shown = if shown.is_empty() { subject.clone() } else { format!("{subject}\n{shown}") };
+            spans.insert(0, Span { start: 0, end: subject.len() as u32, style: Style::Bold });
+            let mut state = self.state();
+            if state.own_meta.len() >= super::REMEMBERED {
+                state.own_meta.clear();
+            }
+            state.own_meta.insert(
+                (conversation.to_owned(), id.clone()),
+                OwnMeta { subject: Some(subject.clone()), images_html: String::new() },
+            );
+        }
+        let mut message = Message::plain(id.clone(), name.clone(), shown, sent, true);
         message.spans = spans;
+        message.importance = with.importance;
+        message.previews = sent_previews;
         message.sender.avatar = self.picture(&me, &name);
         message.sender.id = me;
         if let Some((channel, root)) = chain_of(&target) {
@@ -1060,8 +1595,19 @@ impl Teams {
     }
 
     pub(super) fn edit(&self, conversation: &str, id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
+        let raw_id = id.strip_prefix("scheduled:").unwrap_or(id);
         let stored = self.ctx.stored_message(conversation, id)?;
-        let meta = self.state().own_meta.get(&(conversation.to_owned(), id.to_owned())).cloned();
+        let (meta, scheduled_at) = {
+            let state = self.state();
+            (
+                state.own_meta.get(&(conversation.to_owned(), raw_id.to_owned())).cloned(),
+                state
+                    .scheduled
+                    .get(raw_id)
+                    .copied()
+                    .or_else(|| (raw_id != id).then(|| stored.as_ref().map(|m| m.sent)).flatten()),
+            )
+        };
         let (kept_subject, body_text) = match meta.as_ref().and_then(|meta| meta.subject.as_deref()) {
             Some(subject) => {
                 let bold_line = format!("**{subject}**\n");
@@ -1103,7 +1649,7 @@ impl Teams {
             content = format!("{}{content}", quote_markup(quote));
         }
         let mut body = self.body(&now_ms().to_string(), &content);
-        if mentions_json.is_some() || kept_subject.is_some() {
+        if mentions_json.is_some() || kept_subject.is_some() || scheduled_at.is_some() {
             let mut props = serde_json::Map::new();
             if let Some(encoded) = mentions_json {
                 props.insert("mentions".to_owned(), Value::String(encoded));
@@ -1111,9 +1657,12 @@ impl Teams {
             if let Some(subject) = &kept_subject {
                 props.insert("subject".to_owned(), Value::String(subject.clone()));
             }
+            if let Some(at) = scheduled_at {
+                props.insert("scheduledTime".to_owned(), Value::String(super::iso_utc(at)));
+            }
             body["properties"] = Value::Object(props);
         }
-        self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
+        self.chat("PUT", &self.message_path(conversation, raw_id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
             let (mut shown, mut spans) = html::styled(body_text);
             if !rebased_mentions.is_empty() && shown == body_text {
@@ -1137,12 +1686,17 @@ impl Teams {
     }
 
     pub(super) fn delete(&self, conversation: &str, id: &str) -> Result<(), Fault> {
-        let path = format!("{}?behavior=softDelete", self.message_path(conversation, id));
+        let raw_id = id.strip_prefix("scheduled:").unwrap_or(id);
+        let path = format!("{}?behavior=softDelete", self.message_path(conversation, raw_id));
         self.chat("DELETE", &path, Body::None, false)?;
+        self.state().scheduled.remove(raw_id);
         self.ctx.deleted(conversation, id)?;
+        if raw_id != id {
+            self.ctx.deleted(conversation, raw_id)?;
+        }
         // A post deleted in its channel is gone from the top of its chain too.
         if chain_of(conversation).is_none() {
-            self.ctx.deleted(&chain_id(conversation, id), id)?;
+            self.ctx.deleted(&chain_id(conversation, raw_id), raw_id)?;
         }
         Ok(())
     }
@@ -1162,6 +1716,82 @@ impl Teams {
         };
         self.chat(method, &path, Body::Json(&body), false)?;
         Ok(())
+    }
+
+    /// Forwards one or more messages to target conversations on this account, with an optional
+    /// note and Teams forward markup referencing original sender, time, link, and any shared
+    /// files without re-uploading.
+    pub(super) fn forward(
+        &self,
+        from: &str,
+        message_ids: &[String],
+        targets: &[String],
+        note: &str,
+    ) -> Vec<(String, Result<(), String>)> {
+        let source_title = self.ctx.known(from).ok().flatten().map(|r| r.title).unwrap_or_default();
+        let mut blocks = Vec::new();
+        let mut forwarded_files: Vec<Value> = Vec::new();
+        let mut first_meta: Option<Value> = None;
+
+        for mid in message_ids {
+            let Ok(Some(original)) = self.ctx.stored_message(from, mid) else {
+                continue;
+            };
+            let parent = chain_of(from).map(|(_, root)| root).filter(|r| *r != original.id);
+            let link = super::links::message_share(thread_of(from), &original.id, &self.session.tenant, parent);
+            blocks.push(forward_markup(&original, &source_title, &link));
+            if first_meta.is_none() {
+                let sent_ms = match millis(&original.id) {
+                    0 => original.sent.saturating_mul(1000),
+                    ms => ms,
+                };
+                first_meta = Some(json!({
+                    "originalMessageId": original.id,
+                    "originalConversationId": thread_of(from),
+                    "originalConversationTitle": source_title,
+                    "originalSenderMri": original.sender.id,
+                    "originalSenderDisplayName": original.shown_sender(),
+                    "originalArrivalTime": sent_ms,
+                    "deepLink": link,
+                }));
+            }
+            if let Some(files) = self.state().file_props.get(&(from.to_owned(), mid.clone())).cloned() {
+                forwarded_files.extend(files);
+            }
+        }
+        if blocks.is_empty() {
+            return targets
+                .iter()
+                .map(|target| (target.clone(), Err("Original message not found.".to_owned())))
+                .collect();
+        }
+        let mut content = String::new();
+        let note = note.trim();
+        if !note.is_empty() {
+            content.push_str(&html::compose_rich(note).0);
+        }
+        for block in &blocks {
+            content.push_str(block);
+        }
+        let mut props = serde_json::Map::new();
+        if let Some(meta) = first_meta {
+            props.insert("forwardedMessage".to_owned(), Value::String(meta.to_string()));
+        }
+        if !forwarded_files.is_empty() {
+            props.insert("files".to_owned(), Value::String(Value::Array(forwarded_files).to_string()));
+        }
+        let mut results = Vec::with_capacity(targets.len());
+        for (ix, target) in targets.iter().enumerate() {
+            let client_id = (now_ms().saturating_add(ix as i64)).to_string();
+            let mut body = self.body(&client_id, &content);
+            if !props.is_empty() {
+                body["properties"] = Value::Object(props.clone());
+            }
+            let path = format!("/v1/users/ME/conversations/{}/messages", escaped(target));
+            let res = self.chat("POST", &path, Body::Json(&body), false).map(|_| ()).map_err(super::reason);
+            results.push((target.clone(), res));
+        }
+        results
     }
 }
 
@@ -1396,5 +2026,78 @@ mod tests {
         assert_eq!(super::super::links::parse_share(&desktop).map(|found| (found.kind, found.conversation)), Some((super::super::links::ShareKind::Chat, chat.to_owned())));
         assert!(super::super::links::parse_share("https://ex.com/plan").is_none());
         assert!(super::super::links::parse_share("https://teams.microsoft.com/l/chat/0/0?users=a@contoso.com").is_none());
+    }
+
+    #[test]
+    fn importance_maps_to_and_from_teams_wire_values() {
+        assert_eq!(importance_of(&Value::Null), protocol::Importance::Normal);
+        assert_eq!(importance_of(&json!("standard")), protocol::Importance::Normal);
+        assert_eq!(importance_of(&json!("high")), protocol::Importance::Important);
+        assert_eq!(importance_of(&json!("HIGH")), protocol::Importance::Important);
+        assert_eq!(importance_of(&json!("urgent")), protocol::Importance::Urgent);
+        assert_eq!(importance_wire(protocol::Importance::Normal), None);
+        assert_eq!(importance_wire(protocol::Importance::Important), Some("high"));
+        assert_eq!(importance_wire(protocol::Importance::Urgent), Some("urgent"));
+    }
+
+    #[test]
+    fn link_previews_and_m365_cards_are_parsed_with_safe_image_filtering() {
+        let props = json!({
+            "links": json!([
+                {
+                    "url": "https://example.com/post",
+                    "title": "Release Notes",
+                    "description": "What shipped today",
+                    "siteName": "Example",
+                    "previewImage": "https://eu-api.asm.skype.com/v1/objects/abc/views/imgo"
+                },
+                {
+                    "url": "https://evil.example/track",
+                    "title": "External Img",
+                    "description": "Should not register external image",
+                    "previewImage": "https://evil.example/pixel.png"
+                }
+            ]).to_string(),
+            "urlpreviews": [
+                {
+                    "url": "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF",
+                    "fileName": "Q4 Budget.xlsx",
+                    "fileType": "xlsx",
+                    "description": "Platform team spreadsheet"
+                }
+            ]
+        });
+        let mut media = Vec::new();
+        let previews = parse_link_previews(&props, "1760000900000", |u| u.contains("asm.skype.com"), &mut media);
+        assert_eq!(previews.len(), 3);
+        assert_eq!((previews[0].title.as_str(), previews[0].site.as_str()), ("Release Notes", "Example"));
+        assert!(previews[0].image.is_some());
+        assert_eq!(media.len(), 1);
+        assert_eq!(previews[1].title, "External Img");
+        assert!(previews[1].image.is_none(), "non-Teams image host must not be registered");
+        assert_eq!((previews[2].title.as_str(), previews[2].site.as_str()), ("Q4 Budget.xlsx", "Excel · SharePoint"));
+        assert_eq!(first_url("Check out https://example.com/release!"), Some("https://example.com/release".to_owned()));
+        assert_eq!(first_url("no links here"), None);
+    }
+
+    #[test]
+    fn unread_count_counts_all_non_outgoing_messages_past_consumption_horizon() {
+        let mut msgs = Vec::new();
+        for i in 1..=8u64 {
+            let mut m = Message::plain(format!("{}", 1_760_000_000_000 + i * 1000), "Ana", format!("msg {i}"), 1_760_000_000 + i as i64, false);
+            if i == 5 || i == 7 {
+                m.mentions_me = true;
+            }
+            msgs.push(m);
+        }
+        // Add an outgoing message past the horizon — must not count as unread.
+        msgs.push(Message::plain("1760000009000", "Me", "ok", 1_760_000_009, true));
+
+        // Horizon at msg 1 -> 7 unread messages (2..=8), 2 mentions (5 and 7).
+        assert_eq!(count_unread_against_horizon(&msgs, Some("1760000001000")), (7, 2));
+        // Horizon at msg 8 -> 0 unread.
+        assert_eq!(count_unread_against_horizon(&msgs, Some("1760000008000")), (0, 0));
+        // No horizon -> counts only non-outgoing messages newer than latest outgoing (9000) -> 0.
+        assert_eq!(count_unread_against_horizon(&msgs, None), (0, 0));
     }
 }
