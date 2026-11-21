@@ -2476,6 +2476,19 @@ pub enum Request {
         room_id: String,
     },
 
+    /// Publish (crosspost) a message in an announcement channel to following channels (Discord).
+    /// Answers `Ok`.
+    Publish {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Follow an announcement channel into `into` (a channel where the account holds
+    /// `ConversationRights::manage_webhooks`). Answers `Ok`.
+    Follow {
+        conversation: Key,
+        into: Key,
+    },
+
     /// The push-to-talk key went down or up, from the shell's global hotkey. `priority` is the
     /// priority key: on a Tiny server it also asks to be heard over everyone else, which the
     /// server honours only with priority_speaker. Refused with no call.
@@ -3584,8 +3597,20 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            manage_webhooks: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
+
+        let pub_req = Request::Publish {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            message_id: "99".into(),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pub_req).unwrap()).unwrap(), pub_req);
+        let follow_req = Request::Follow {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            into: Key { network: Network::Discord, account: "1".into(), id: "5101".into() },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&follow_req).unwrap()).unwrap(), follow_req);
     }
 }
 

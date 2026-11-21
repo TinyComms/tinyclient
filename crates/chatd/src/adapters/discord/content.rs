@@ -895,6 +895,22 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     } else {
         None
     };
+    let flags = posted.flags.unwrap_or(0);
+    let published = flags & model::CROSSPOSTED != 0;
+    let crosspost_source = if flags & model::IS_CROSSPOST != 0 {
+        posted.message_reference.as_ref().map_or_else(String::new, |origin| {
+            let space = origin.guild_id.as_deref().and_then(|g| place.names.space(g));
+            let channel = origin.channel_id.as_deref().and_then(|c| place.names.channel(c)).map(|name| format!("#{name}"));
+            match (space, channel) {
+                (Some(s), Some(c)) => format!("{s} › {c}"),
+                (Some(s), None) => s,
+                (None, Some(c)) => c,
+                (None, None) => "Announcement".to_owned(),
+            }
+        })
+    } else {
+        String::new()
+    };
     // Our own client's nonce is the shell's client id: digits, at most 25.
     let client_id = posted.nonce.clone().filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
     let message = Message {
@@ -946,6 +962,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         can_delete: None,
         importance: protocol::Importance::Normal,
         announcement: false,
+        published,
+        crosspost_source,
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
@@ -1032,6 +1050,9 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     }
     if let Some(pinned) = update.pinned {
         stored.pinned = pinned;
+    }
+    if let Some(flags) = update.flags {
+        stored.published = flags & model::CROSSPOSTED != 0;
     }
     if update.edited_timestamp.is_some() {
         stored.edited = true;

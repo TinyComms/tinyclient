@@ -407,6 +407,9 @@ pub struct ConversationRights {
     /// May change this conversation's picture (`Request::ConversationPicture`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit_picture: bool,
+    /// May manage webhooks in this channel (Discord `MANAGE_WEBHOOKS`, required to follow an announcement channel here).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_webhooks: bool,
 }
 
 impl ConversationRights {
@@ -418,6 +421,7 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
+    const MANAGE_WEBHOOKS: i64 = 1 << 8;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -453,6 +457,9 @@ impl ConversationRights {
         if self.edit_picture {
             bits |= Self::EDIT_PICTURE;
         }
+        if self.manage_webhooks {
+            bits |= Self::MANAGE_WEBHOOKS;
+        }
         bits
     }
 
@@ -466,6 +473,7 @@ impl ConversationRights {
             rename: (bits & Self::RENAME) != 0,
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+            manage_webhooks: (bits & Self::MANAGE_WEBHOOKS) != 0,
         }
     }
 }
@@ -684,6 +692,9 @@ pub struct Capabilities {
     /// The network marks this account as not permitted to enter age-restricted channels (`nsfw_allowed == false` on Discord).
     #[serde(default, skip_serializing_if = "is_false")]
     pub age_restricted_blocked: bool,
+    /// This account supports following announcement channels (`Request::Follow`) and publishing messages in them (`Request::Publish`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub announcement_follow: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

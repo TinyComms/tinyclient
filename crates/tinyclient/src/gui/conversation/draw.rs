@@ -1068,6 +1068,7 @@ impl Pane {
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
             .children(self.otp_chip(message, cx))
+            .children(self.publish_chip(message, cx))
             .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -1316,6 +1317,14 @@ impl Pane {
             )
             .children(message.sender.bot.then(|| tag("APP")))
             .children(message.saved_history.then(|| tag("SAVED")))
+            .children(message.published.then(|| tag("PUBLISHED")))
+            .children((!message.crosspost_source.is_empty()).then(|| {
+                div()
+                    .flex_none()
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .child(format!("from {}", message.crosspost_source))
+            }))
             .children(message.pinned.then(|| {
                 div()
                     .flex_none()
@@ -1529,6 +1538,39 @@ impl Pane {
                     });
                 })
                 .detach();
+            }));
+        Some(div().flex().child(chip).into_any_element())
+    }
+
+    /// One-click "Publish" chip under my own unpublished messages in an announcement channel.
+    fn publish_chip(&mut self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !message.outgoing || !self.can(message).publish {
+            return None;
+        }
+        let msg = message.clone();
+        let chip = div()
+            .id(name_id("publish", &message.id))
+            .mt(px(4.))
+            .h(px(26.))
+            .px(px(10.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::field())
+            .border_1()
+            .border_color(theme::border())
+            .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+            .active(|style| style.bg(theme::pressed()))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .type_small()
+            .text_color(theme::text())
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(crate::gui::components::glyph("icons/megaphone.svg", 12., theme::text_soft()))
+            .child("Publish")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.publish_message(&msg, cx);
             }));
         Some(div().flex().child(chip).into_any_element())
     }

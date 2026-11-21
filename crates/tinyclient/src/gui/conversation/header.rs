@@ -207,8 +207,50 @@ impl Shell {
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
+            .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details))
+    }
+
+    /// Follow button in the header strip for Discord announcement channels.
+    fn follow_button(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if open.kind != ConversationKind::Announcement {
+            return None;
+        }
+        let allowed = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.account(&open.key.account()))
+            .is_some_and(|a| a.can.announcement_follow);
+        if !allowed {
+            return None;
+        }
+        let conv = open.clone();
+        Some(
+            div()
+                .id("announcement-follow")
+                .flex_none()
+                .h(px(26.))
+                .px(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::field())
+                .border_1()
+                .border_color(theme::border())
+                .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+                .active(|style| style.bg(theme::pressed()))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .cursor_pointer()
+                .type_small()
+                .font_weight(theme::MEDIUM)
+                .text_color(theme::text())
+                .tooltip(tip("Follow this announcement channel into one of your servers", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| this.open_follow(&conv, window, cx)))
+                .child(glyph("icons/megaphone.svg", 13., theme::text_soft()))
+                .child("Follow"),
+        )
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the

@@ -5129,3 +5129,132 @@ fn age_restricted_channels_threads_account_flag_and_explicit_media() {
     });
     assert!(flagged.attachments[0].spoiler, "explicit-flagged attachment must be blurred as spoiler");
 }
+
+#[test]
+fn announcement_publish_crosspost_source_and_follow() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Grant MANAGE_WEBHOOKS (1 << 29 = 536_870_912) on @everyone in guild 4000,
+    // and add an announcement channel 4109 (type 5) alongside text channel 4101.
+    let guild = ready["guilds"].as_array_mut().unwrap().iter_mut().find(|g| g["id"] == "4000").unwrap();
+    let everyone = guild["roles"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "4000").unwrap();
+    let perms: u64 = everyone["permissions"].as_str().unwrap().parse().unwrap();
+    everyone["permissions"] = json!((perms | (1u64 << 29)).to_string());
+    guild["channels"].as_array_mut().unwrap().push(json!({
+        "id": "4109",
+        "type": 5,
+        "name": "news",
+        "position": 9,
+        "permission_overwrites": []
+    }));
+
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Capabilities advertises announcement_follow and channel 4101 carries manage_webhooks.
+    let status = world.ask(Request::Status);
+    let account = match status {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap(),
+        other => panic!("expected status, got {other:?}"),
+    };
+    assert!(account.can.announcement_follow);
+    let target = match world.ask(Request::Conversation { conversation: world.key("4101") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected conversation 4101, got {other:?}"),
+    };
+    assert!(target.rights.manage_webhooks, "MANAGE_WEBHOOKS bit must set rights.manage_webhooks");
+
+    // Seed an unpublished announcement message in 4109.
+    let ann_msg = json!({
+        "id": "1300000010000001100",
+        "channel_id": "4109",
+        "type": 0,
+        "author": me(),
+        "content": "v1.0 is out!",
+        "timestamp": "2026-10-13T09:00:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [],
+        "pinned": false,
+        "flags": 0
+    });
+    world.discord.push("MESSAGE_CREATE", ann_msg.clone());
+    let before = wait("announcement message", || {
+        world.messages("4109").into_iter().find(|m| m.id == "1300000010000001100")
+    });
+    assert!(!before.published);
+
+    // 1. Publish hits POST /channels/4109/messages/{id}/crosspost and marks message published.
+    let mut crossposted = ann_msg.clone();
+    crossposted["flags"] = json!(1); // CROSSPOSTED
+    world.discord.script("/channels/4109/messages/1300000010000001100/crosspost", 200, crossposted);
+    assert_eq!(
+        world.ask(Request::Publish {
+            conversation: world.key("4109"),
+            message_id: "1300000010000001100".into(),
+        }),
+        Response::Ok
+    );
+    let crosspost_reqs = world.discord.requests_to("POST", "/channels/4109/messages/1300000010000001100/crosspost");
+    assert_eq!(crosspost_reqs.len(), 1);
+    let after = wait("published flag update", || {
+        world.messages("4109").into_iter().find(|m| m.id == "1300000010000001100" && m.published)
+    });
+    assert!(after.published);
+
+    // 2. Rate-limited crosspost (429) surfaces Discord's refusal.
+    world.discord.script(
+        "/channels/4109/messages/1300000010000001101/crosspost",
+        429,
+        json!({"message": "You are being rate limited.", "retry_after": 3600.0}),
+    );
+    match world.ask(Request::Publish {
+        conversation: world.key("4109"),
+        message_id: "1300000010000001101".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(!detail.is_empty()),
+        other => panic!("expected rate-limit error, got {other:?}"),
+    }
+
+    // 3. Incoming crossposted message (IS_CROSSPOST = bit 1) labels crosspost_source from message_reference.
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000001102",
+        "channel_id": "4101",
+        "type": 0,
+        "author": {"id": "7777", "username": "Server #news", "bot": true, "discriminator": "0000", "avatar": null},
+        "content": "v1.0 is out!",
+        "timestamp": "2026-10-13T09:01:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [],
+        "pinned": false,
+        "flags": 2,
+        "message_reference": {
+            "guild_id": "4000",
+            "channel_id": "4109",
+            "message_id": "1300000010000001100"
+        }
+    }));
+    let received = wait("crosspost message", || {
+        world.messages("4101").into_iter().find(|m| m.id == "1300000010000001102")
+    });
+    assert!(received.crosspost_source.contains("#news"), "expected #news in crosspost_source, got {:?}", received.crosspost_source);
+
+    // 4. Follow posts {"webhook_channel_id": "4101"} to POST /channels/4109/followers.
+    world.discord.script("/channels/4109/followers", 200, json!({"channel_id": "4109", "webhook_id": "8888"}));
+    assert_eq!(
+        world.ask(Request::Follow {
+            conversation: world.key("4109"),
+            into: world.key("4101"),
+        }),
+        Response::Ok
+    );
+    let follow_reqs = world.discord.requests_to("POST", "/channels/4109/followers");
+    assert_eq!(follow_reqs.len(), 1);
+    assert_eq!(follow_reqs[0].body, json!({"webhook_channel_id": "4101"}));
+}

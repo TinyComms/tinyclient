@@ -111,6 +111,17 @@ pub struct Forwarding {
     pub note: String,
 }
 
+/// The announcement Follow picker: choose a channel where this account has Manage Webhooks,
+/// then explicitly confirm before creating a webhook in the target server.
+pub struct Following {
+    pub source: protocol::Key,
+    pub source_title: String,
+    /// `(space_name, channel)` candidates where `rights.manage_webhooks` is true.
+    pub candidates: Vec<(String, protocol::Conversation)>,
+    pub selected: Option<protocol::Key>,
+    pub loading: bool,
+}
+
 /// The reaction picker, open for a message.
 pub struct Picking {
     pub message: String,
@@ -133,6 +144,8 @@ pub struct Can {
     pub delete: bool,
     /// Pin or unpin this message (`Capabilities::pins` and `ConversationRights::pin`).
     pub pin: bool,
+    /// Publish (crosspost) an announcement-channel message to following servers.
+    pub publish: bool,
     /// Forward this message natively (`Capabilities::forward`).
     pub forward: bool,
     /// May delete this message for everyone (own message or moderator with `rights.delete_others`).
@@ -214,6 +227,7 @@ pub fn can_with_rights(
         pins: network != Network::Messages,
         forward: network != Network::Messages,
         reactions: true,
+        announcement_follow: network == Network::Discord,
         ..Capabilities::default()
     };
     can_with_network(message, network, &caps, rights, kind, in_thread, 0)
@@ -240,6 +254,7 @@ pub fn can_in(
         pins: network != Network::Messages,
         forward: network != Network::Messages,
         reactions: true,
+        announcement_follow: network == Network::Discord,
         ..Capabilities::default()
     };
     can_with_network_topic(message, network, &caps, ConversationRights::default(), kind, in_thread, topic, now)
@@ -295,6 +310,11 @@ pub fn can_with_network_topic(
         };
     let unsent = !sent && message.outgoing;
     let delete = delete_everyone || delete_me || (!message.deleted && unsent && own);
+    let publish = act
+        && kind == ConversationKind::Announcement
+        && caps.announcement_follow
+        && !message.published
+        && (own || rights.delete_others);
     Can {
         act,
         react: act && caps.reactions,
@@ -303,6 +323,7 @@ pub fn can_with_network_topic(
         edit,
         delete,
         pin: act && caps.pins && rights.pin,
+        publish,
         forward: act && caps.forward,
         delete_everyone,
         delete_me,
@@ -356,6 +377,8 @@ enum MenuAct {
     Edit,
     /// Pin or unpin a message when `can.pin` is true.
     Pin,
+    /// Publish (crosspost) an announcement-channel message to following servers.
+    Publish,
     /// Forward natively (`can.forward`) or "Copy to…" fallback (`can.act && !can.forward`).
     Forward,
     Link,
@@ -539,6 +562,9 @@ fn menu_acts(
     if can.pin {
         acts.push(MenuAct::Pin);
     }
+    if can.publish {
+        acts.push(MenuAct::Publish);
+    }
     if can.act {
         acts.push(MenuAct::Forward);
     }
@@ -685,6 +711,8 @@ impl Pane {
         if self.menu.is_some()
             || self.picker.is_some()
             || self.confirm.is_some()
+            || self.forward.is_some()
+            || self.follow.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
             || self.link_ask.is_some()
@@ -716,6 +744,8 @@ impl Pane {
         let own = self.menu.is_some()
             || self.picker.is_some()
             || self.confirm.is_some()
+            || self.forward.is_some()
+            || self.follow.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
             || self.link_ask.is_some()
@@ -781,6 +811,9 @@ impl Pane {
             self.close_viewer(cx);
         } else if self.confirm.is_some() {
             self.confirm = None;
+            cx.notify();
+        } else if self.follow.is_some() {
+            self.follow = None;
             cx.notify();
         } else if self.action_confirm.is_some() {
             self.action_confirm = None;
@@ -1136,6 +1169,19 @@ impl Pane {
         .detach();
     }
 
+    /// Publishes (crossposts) an announcement-channel message to all following servers.
+    /// Surfaces Discord's refusal (such as the 10/hour channel rate limit) verbatim.
+    pub(super) fn publish_message(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let request = Request::Publish {
+            conversation,
+            message_id: message.id.clone(),
+        };
+        self.act(request, "Couldn't publish", cx);
+    }
+
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
@@ -1228,6 +1274,7 @@ impl Pane {
             MenuAct::React => self.open_picker(&message.id, at, window, cx),
             MenuAct::Edit => self.edit(&message, window, cx),
             MenuAct::Pin => self.toggle_pin(&message, cx),
+            MenuAct::Publish => self.publish_message(&message, cx),
             MenuAct::Forward => {
                 let native = self.can(&message).forward;
                 self.open_forward(message, native, window, cx);
@@ -1503,6 +1550,13 @@ impl Pane {
                         .into_any_element(),
                 );
             }
+            if can.publish {
+                rows.push(
+                    row("sheet-publish", "icons/megaphone.svg", "Publish".into(), false)
+                        .on_click(then(|this, message, _, cx| this.publish_message(message, cx)))
+                        .into_any_element(),
+                );
+            }
             if can.act {
                 let label = if can.forward { "Forward…" } else { "Copy to…" };
                 rows.push(
@@ -1714,6 +1768,13 @@ impl Pane {
                     menu_item("pin", Some("icons/pin.svg"), label, None)
                         .when(lit(MenuAct::Pin), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Pin)),
+                );
+            }
+            if can.publish {
+                items = items.child(
+                    menu_item("publish", Some("icons/megaphone.svg"), "Publish", None)
+                        .when(lit(MenuAct::Publish), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Publish)),
                 );
             }
             if can.act {
@@ -2309,6 +2370,220 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    /// Opens the Follow announcement channel picker, loading channels across the account's
+    /// servers where this account has `ConversationRights::manage_webhooks`.
+    pub(super) fn open_follow(
+        &mut self,
+        source: protocol::Key,
+        source_title: String,
+        spaces: Vec<protocol::Space>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow = Some(Following {
+            source: source.clone(),
+            source_title,
+            candidates: Vec::new(),
+            selected: None,
+            loading: true,
+        });
+        window.focus(&self.focus, cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let candidates: Vec<(String, protocol::Conversation)> = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::new();
+                    for space in spaces {
+                        let req = Request::Tree {
+                            space: space.key.clone(),
+                            offset: 0,
+                            limit: 500,
+                            peek: false,
+                        };
+                        if let Ok(Response::Tree { conversations, .. }) = ask(&req) {
+                            for conv in conversations {
+                                if conv.rights.manage_webhooks
+                                    && conv.key != source
+                                    && matches!(
+                                        conv.kind,
+                                        ConversationKind::Channel | ConversationKind::Announcement
+                                    )
+                                {
+                                    out.push((space.name.clone(), conv));
+                                }
+                            }
+                        }
+                    }
+                    out
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(follow) = this.follow.as_mut() {
+                    follow.candidates = candidates;
+                    follow.loading = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn submit_follow(&mut self, cx: &mut Context<Self>) {
+        let Some(follow) = self.follow.take() else {
+            return;
+        };
+        cx.notify();
+        let Some(into) = follow.selected else {
+            return;
+        };
+        let target_label = follow
+            .candidates
+            .iter()
+            .find(|(_, c)| c.key == into)
+            .map(|(space, c)| {
+                if space.is_empty() {
+                    format!("#{}", c.title)
+                } else {
+                    format!("#{} ({space})", c.title)
+                }
+            })
+            .unwrap_or_else(|| into.id.clone());
+        let request = Request::Follow {
+            conversation: follow.source,
+            into,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    let _ = this.shell.update(cx, |shell, cx| {
+                        shell.toast(
+                            Some(("icons/check.svg", theme::text_soft())),
+                            format!("Following in {target_label}"),
+                            cx,
+                        );
+                    });
+                }
+                Ok(Response::Error { detail, .. }) => this.say(format!("Couldn't follow: {detail}"), cx),
+                Err(err) => this.say(format!("Couldn't follow: {}", crate::client::trouble_words("follow", &err)), cx),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    fn follow_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let follow = self.follow.as_ref()?;
+        let selected_label = follow.selected.as_ref().and_then(|sel| {
+            follow.candidates.iter().find(|(_, c)| &c.key == sel).map(|(space, c)| {
+                if space.is_empty() {
+                    format!("#{}", c.title)
+                } else {
+                    format!("#{} in {space}", c.title)
+                }
+            })
+        });
+        let body = match &selected_label {
+            Some(target) => format!(
+                "Follow #{} into {target}? This creates a webhook in the target server.",
+                follow.source_title
+            ),
+            None => format!(
+                "Choose a channel where you have Manage Webhooks to receive posts from #{}.",
+                follow.source_title
+            ),
+        };
+        let list_el = if follow.loading {
+            div()
+                .py(px(12.))
+                .type_ui()
+                .text_color(theme::text_faint())
+                .child("Loading channels…")
+                .into_any_element()
+        } else if follow.candidates.is_empty() {
+            div()
+                .py(px(12.))
+                .type_ui()
+                .text_color(theme::text_faint())
+                .child("No channels where you have Manage Webhooks.")
+                .into_any_element()
+        } else {
+            let rows = follow.candidates.iter().take(60).map(|(space, conv)| {
+                let key = conv.key.clone();
+                let picked = follow.selected.as_ref() == Some(&key);
+                let title = if conv.title.is_empty() { conv.key.id.clone() } else { conv.title.clone() };
+                let label = if space.is_empty() { format!("#{title}") } else { format!("#{title} · {space}") };
+                div()
+                    .id(ElementId::Name(format!("follow-{}", conv.key.id).into()))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .when(picked, |d| d.bg(theme::selected()))
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(label))
+                    .when(picked, |d| d.child(div().type_micro().text_color(theme::accent_text()).child("Selected")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(f) = this.follow.as_mut() {
+                            f.selected = Some(key.clone());
+                            cx.notify();
+                        }
+                    }))
+            });
+            div()
+                .id("follow-candidates")
+                .mt(px(8.))
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(rows)
+                .into_any_element()
+        };
+        let can_confirm = follow.selected.is_some();
+        let panel = modal(format!("Follow #{}", follow.source_title))
+            .w(px(420.))
+            .child(modal_body(body))
+            .child(list_el)
+            .child(
+                modal_buttons()
+                    .child(button("follow-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.follow = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button("follow-confirm", ButtonKind::Primary, "Follow")
+                            .when(!can_confirm, |b| b.opacity(0.45).cursor_default())
+                            .when(can_confirm, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_follow(cx)))),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("follow-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.follow = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("follow-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     fn select_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = self.open_select.as_ref()?;
         let mut list = menu().w(px(240.));
@@ -2429,6 +2704,7 @@ impl Pane {
                 self.action_confirm_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
+                self.follow_layer(window, cx),
                 self.link_layer(window, cx),
             ]
             .into_iter()
@@ -2444,6 +2720,7 @@ impl Pane {
             self.action_confirm_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),
+            self.follow_layer(window, cx),
             self.link_layer(window, cx),
         ]
         .into_iter()
@@ -2657,6 +2934,11 @@ impl Pane {
             cx.notify();
             return true;
         }
+        if key == "escape" && self.follow.is_some() {
+            self.follow = None;
+            cx.notify();
+            return true;
+        }
         if key == "escape" && self.multi_select.confirm_delete {
             self.multi_select.confirm_delete = false;
             cx.notify();
@@ -2808,6 +3090,7 @@ mod tests {
             forward: true,
             polls: Some(protocol::PollCapabilities::default()),
             reactions: true,
+            announcement_follow: true,
             ..Capabilities::default()
         }
     }
@@ -3123,5 +3406,31 @@ mod tests {
         assert!(!can_in(&old, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
         assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "Text message", 900, now).edit);
         assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "", 900, now).edit);
+    }
+
+    #[test]
+    fn announcement_publish_follows_rights_and_published_flag() {
+        let caps = discord_caps();
+        let plain = ConversationRights::default();
+        let mod_rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
+
+        let mut mine = Message::plain("m1", "Me", "release notes", 10, true);
+        let theirs = Message::plain("m2", "Mara", "patch notes", 11, false);
+
+        // Own unpublished message in an announcement channel can be published.
+        let mine_ann = can(&mine, &caps, plain, ConversationKind::Announcement, false, 20);
+        assert!(mine_ann.publish);
+        assert!(menu_acts(mine_ann, false, 0, false, true, false, false, false, false).contains(&MenuAct::Publish));
+
+        // Not offered in a regular text channel.
+        assert!(!can(&mine, &caps, plain, ConversationKind::Channel, false, 20).publish);
+
+        // Once published, no longer offered.
+        mine.published = true;
+        assert!(!can(&mine, &caps, plain, ConversationKind::Announcement, false, 20).publish);
+
+        // Others' unpublished messages require Manage Messages (`delete_others`).
+        assert!(!can(&theirs, &caps, plain, ConversationKind::Announcement, false, 20).publish);
+        assert!(can(&theirs, &caps, mod_rights, ConversationKind::Announcement, false, 20).publish);
     }
 }

@@ -52,7 +52,13 @@ pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;
 pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
 pub const PIN_MESSAGES: u64 = 1 << 51;
+
+/// Discord message flags.
+pub const CROSSPOSTED: u64 = 1 << 0;
+pub const IS_CROSSPOST: u64 = 1 << 1;
+pub const SUPPRESS_EMBEDS: u64 = 1 << 2;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
 pub fn user_link(id: &str) -> String {
@@ -1047,6 +1053,9 @@ pub struct Posted {
     pub nonce: Option<String>,
     #[serde(default)]
     pub call: Option<CallPayload>,
+    /// Discord message flags bitmask (`CROSSPOSTED`, `IS_CROSSPOST`, `SUPPRESS_EMBEDS`, etc.).
+    #[serde(default)]
+    pub flags: Option<u64>,
 }
 
 /// Discord's `call` object on a type-3 call system message.

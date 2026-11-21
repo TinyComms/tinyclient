@@ -1035,7 +1035,9 @@ impl Demo {
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FollowThread { reply, .. }
+            | Command::Publish { reply, .. }
+            | Command::Follow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

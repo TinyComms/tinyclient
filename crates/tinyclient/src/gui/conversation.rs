@@ -387,6 +387,8 @@ pub struct Pane {
     confirm: Option<Rc<Message>>,
     /// The message being forwarded (or copied to another conversation).
     forward: Option<actions::Forwarding>,
+    /// The announcement Follow picker modal.
+    follow: Option<actions::Following>,
     /// Multi-message selection mode state (#795).
     multi_select: actions::MultiSelect,
     /// The link a click asked about, until the person opens it or does not.
@@ -502,6 +504,7 @@ impl Pane {
             picker: None,
             confirm: None,
             forward: None,
+            follow: None,
             multi_select: actions::MultiSelect::default(),
             link_ask: None,
             revisions: None,
@@ -750,6 +753,7 @@ impl Pane {
         self.open_select = None;
         self.pending_actions.clear();
         self.forward = None;
+        self.follow = None;
         self.link_ask = None;
         self.hold = None;
         self.land = false;
@@ -2111,6 +2115,22 @@ impl Shell {
             snapshot.open = None;
         }
         cx.notify();
+    }
+
+    /// Opens the Follow announcement channel picker for `open`, listing channels across this
+    /// account's servers where the user has Manage Webhooks.
+    pub(super) fn open_follow(&mut self, open: &Conversation, window: &mut Window, cx: &mut Context<Self>) {
+        let account = open.key.account();
+        let spaces: Vec<protocol::Space> = self
+            .spaces
+            .iter()
+            .filter(|space| space.key.account() == account)
+            .cloned()
+            .collect();
+        let source = open.key.clone();
+        let source_title = open.title.clone();
+        let pane = self.pane(cx);
+        pane.update(cx, |pane, cx| pane.open_follow(source, source_title, spaces, window, cx));
     }
 
     /// The open conversation was marked unread from a row or the menu bar. The pane keeps the

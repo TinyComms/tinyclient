@@ -1718,6 +1718,39 @@ impl Chat {
         }
     }
 
+    fn publish(&self, conversation: Key, message_id: String) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::Publish {
+            conversation_id: conversation.id,
+            message_id,
+            reply,
+        }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn follow_announcement(&self, conversation: Key, into: Key) -> Response {
+        let account = conversation.account();
+        if into.account() != account {
+            return error(ErrorCode::Refused, "Choose a channel on the same account.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::Follow {
+            conversation_id: conversation.id,
+            into_channel_id: into.id,
+            reply,
+        }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn report(
         &self,
         target: protocol::ReportTarget,
@@ -3361,6 +3394,8 @@ impl Chat {
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
+            Request::Publish { conversation, message_id } => self.publish(conversation, message_id),
+            Request::Follow { conversation, into } => self.follow_announcement(conversation, into),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 

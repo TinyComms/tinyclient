@@ -836,6 +836,12 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Published (crossposted) from an announcement channel to following channels (Discord `CROSSPOSTED`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub published: bool,
+    /// Source server/channel label for a crossposted announcement message (Discord `IS_CROSSPOST`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub crosspost_source: String,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -945,6 +951,8 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            published: false,
+            crosspost_source: String::new(),
         }
     }
 
@@ -1021,6 +1029,7 @@ impl Message {
         if let Some(via) = &mut self.sent_via {
             clip(via, 64);
         }
+        clip(&mut self.crosspost_source, 200);
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
         for control in &mut self.controls {
             clip(&mut control.block_id, 255);
@@ -1099,6 +1108,8 @@ impl Message {
         self.deliveries.clear();
         self.receipt_note.clear();
         self.pinned = false;
+        self.published = false;
+        self.crosspost_source.clear();
         self.mentions_me = false;
         self.deleted = true;
     }

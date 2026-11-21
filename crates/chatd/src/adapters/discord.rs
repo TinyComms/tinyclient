@@ -1203,6 +1203,30 @@ impl Discord {
         Ok(results)
     }
 
+    /// Publishes (crossposts) a message in an announcement channel (`POST /channels/{id}/messages/{msg}/crosspost`).
+    fn publish(&self, channel: &str, message: &str) -> Result<(), Refusal> {
+        let raw = self
+            .call("POST", &format!("/channels/{channel}/messages/{message}/crosspost"), None)
+            .map_err(refusal)?;
+        if let Ok(posted) = serde_json::from_str::<Posted>(&raw) {
+            if !posted.id.is_empty() {
+                let _ = self.updated(posted);
+            }
+        }
+        Ok(())
+    }
+
+    /// Follows an announcement channel into `into_channel_id` (`POST /channels/{id}/followers`).
+    fn follow_announcement(&self, channel: &str, into_channel_id: &str) -> Result<(), Refusal> {
+        self.call(
+            "POST",
+            &format!("/channels/{channel}/followers"),
+            Some(json!({ "webhook_channel_id": into_channel_id })),
+        )
+        .map(drop)
+        .map_err(refusal)
+    }
+
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
     /// managing friends is what Discord's anti-abuse system watches most closely.
     ///
@@ -1881,6 +1905,12 @@ impl Discord {
             }
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
+            }
+            Command::Publish { conversation_id, message_id, reply } => {
+                answer(reply, self.publish(&conversation_id, &message_id))
+            }
+            Command::Follow { conversation_id, into_channel_id, reply } => {
+                answer(reply, self.follow_announcement(&conversation_id, &into_channel_id))
             }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))

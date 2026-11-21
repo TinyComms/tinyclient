@@ -719,6 +719,18 @@ pub enum Command {
         action: RelateAction,
         reply: Reply<()>,
     },
+    /// Publish (crosspost) a message in an announcement channel (Discord).
+    Publish {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<()>,
+    },
+    /// Follow an announcement channel into `into_channel_id` (Discord).
+    Follow {
+        conversation_id: String,
+        into_channel_id: String,
+        reply: Reply<()>,
+    },
     /// Send a friend request by username (e.g. Discord `POST /users/@me/relationships`).
     AddFriend {
         username: String,
@@ -857,7 +869,9 @@ impl Command {
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
-            | Command::FollowThread { reply, .. } => {
+            | Command::FollowThread { reply, .. }
+            | Command::Publish { reply, .. }
+            | Command::Follow { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
