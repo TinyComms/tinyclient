@@ -268,6 +268,76 @@ impl Discord {
         }
     }
 
+    /// Sets a server's or category's notifications (`PATCH /users/@me/guilds/{id}/settings`).
+    /// When `category` is `Some(id)`, writes `channel_overrides[id]`; otherwise writes the
+    /// top-level server `muted`, `mute_config`, and `message_notifications`.
+    pub(super) fn set_space_notify(
+        &self,
+        guild: &str,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<&str>,
+    ) -> Result<(), Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let clock = now();
+        let body = space_notify_body(notify, until, category, clock);
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                let end = until.filter(|&t| t > clock).unwrap_or(i64::MAX);
+                {
+                    let mut state = crate::hub::lock(&self.state);
+                    if let Some(info) = state.guilds.get_mut(guild) {
+                        if let Some(cat) = category.filter(|c| !c.is_empty()) {
+                            match notify {
+                                Notify::Nothing => {
+                                    info.quiet.channels.insert(cat.to_owned(), end);
+                                }
+                                Notify::All => {
+                                    info.quiet.channels.remove(cat);
+                                    info.quiet.levels.insert(cat.to_owned(), 0);
+                                }
+                                Notify::Mentions => {
+                                    info.quiet.channels.remove(cat);
+                                    info.quiet.levels.insert(cat.to_owned(), 1);
+                                }
+                            }
+                        } else {
+                            match notify {
+                                Notify::Nothing => {
+                                    info.quiet.muted_until = Some(end);
+                                    if until.is_none() {
+                                        info.quiet.level = 2;
+                                    }
+                                }
+                                Notify::All => {
+                                    info.quiet.muted_until = None;
+                                    info.quiet.level = 0;
+                                }
+                                Notify::Mentions => {
+                                    info.quiet.muted_until = None;
+                                    info.quiet.level = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.apply_quiet(Some(guild)).map_err(refused)?;
+                self.replant(guild).map_err(refused)?;
+                self.reschedule_unmute();
+                Ok(())
+            }
+        }
+    }
+
     /// Leaves a group DM (`close` false) or closes a DM as Discord's × does (`close` true). Both
     /// are one `DELETE` of the channel; a server's channel is neither. The row goes, as it does
     /// in Discord; a closed DM comes back with its next message.
@@ -503,5 +573,93 @@ impl Discord {
             });
         }
         Ok(found_hits)
+    }
+}
+
+/// Builds the `PATCH /users/@me/guilds/{id}/settings` body for muting or changing the
+/// notification level of a server (when `category` is `None`) or a category (`Some(id)`).
+pub(super) fn space_notify_body(
+    notify: Notify,
+    until: Option<i64>,
+    category: Option<&str>,
+    now: i64,
+) -> serde_json::Value {
+    let timed = notify == Notify::Nothing && until.is_some_and(|t| t > now);
+    let mute_config = match until.filter(|&t| notify == Notify::Nothing && t > now) {
+        Some(end) => json!({
+            "end_time": model::seconds_iso(end),
+            "selected_time_window": (end - now).max(1),
+        }),
+        None => json!({"end_time": null, "selected_time_window": -1}),
+    };
+    if let Some(cat) = category.filter(|c| !c.is_empty()) {
+        let mut setting = match notify {
+            Notify::All => json!({"muted": false, "message_notifications": 0}),
+            Notify::Mentions => json!({"muted": false, "message_notifications": 1}),
+            Notify::Nothing => json!({"muted": true}),
+        };
+        setting["mute_config"] = mute_config;
+        json!({"channel_overrides": {cat: setting}})
+    } else {
+        match notify {
+            Notify::All => json!({
+                "muted": false,
+                "message_notifications": 0,
+                "mute_config": mute_config,
+            }),
+            Notify::Mentions => json!({
+                "muted": false,
+                "message_notifications": 1,
+                "mute_config": mute_config,
+            }),
+            Notify::Nothing if timed => json!({
+                "muted": true,
+                "mute_config": mute_config,
+            }),
+            Notify::Nothing => json!({
+                "muted": true,
+                "message_notifications": 2,
+                "mute_config": mute_config,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn space_notify_body_shapes_server_levels_timed_mute_and_category_overrides() {
+        let clock = 1_760_000_000;
+        let all = space_notify_body(Notify::All, None, None, clock);
+        assert_eq!(all["muted"], false);
+        assert_eq!(all["message_notifications"], 0);
+        assert_eq!(all["mute_config"]["end_time"], serde_json::Value::Null);
+        assert_eq!(all["mute_config"]["selected_time_window"], -1);
+
+        let mentions = space_notify_body(Notify::Mentions, None, None, clock);
+        assert_eq!(mentions["muted"], false);
+        assert_eq!(mentions["message_notifications"], 1);
+
+        let nothing = space_notify_body(Notify::Nothing, None, None, clock);
+        assert_eq!(nothing["muted"], true);
+        assert_eq!(nothing["message_notifications"], 2);
+        assert_eq!(nothing["mute_config"]["end_time"], serde_json::Value::Null);
+
+        let timed = space_notify_body(Notify::Nothing, Some(clock + 3600), None, clock);
+        assert_eq!(timed["muted"], true);
+        assert!(timed.get("message_notifications").is_none());
+        assert_eq!(timed["mute_config"]["selected_time_window"], 3600);
+        assert_eq!(timed["mute_config"]["end_time"], model::seconds_iso(clock + 3600));
+
+        let cat = space_notify_body(Notify::Nothing, Some(clock + 900), Some("4050"), clock);
+        assert_eq!(cat["channel_overrides"]["4050"]["muted"], true);
+        assert_eq!(cat["channel_overrides"]["4050"]["mute_config"]["selected_time_window"], 900);
+        assert_eq!(cat["channel_overrides"]["4050"]["mute_config"]["end_time"], model::seconds_iso(clock + 900));
+
+        let cat_unmute = space_notify_body(Notify::All, None, Some("4050"), clock);
+        assert_eq!(cat_unmute["channel_overrides"]["4050"]["muted"], false);
+        assert_eq!(cat_unmute["channel_overrides"]["4050"]["message_notifications"], 0);
     }
 }

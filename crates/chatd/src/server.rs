@@ -3191,6 +3191,20 @@ impl Chat {
             Request::SetMute { conversation, notify, until } => {
                 self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, until, reply })
             }
+            Request::SetSpaceNotify { space, notify, until, category } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SetSpaceNotify { space_id, notify, until, category, reply }) {
+                    Ok(()) => {
+                        self.hub.space_infos.forget(&space);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::SetDisappearing { conversation, seconds } => {
                 let res = self.act(&conversation, |conversation_id, reply| Command::SetDisappearing { conversation_id, seconds, reply });
                 if res == Response::Ok {

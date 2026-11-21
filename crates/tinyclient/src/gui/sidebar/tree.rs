@@ -66,7 +66,7 @@ pub enum Row {
     Threads { space: Key, count: u32, mention: bool },
     /// A Slack workspace's Drafts: conversations with unsent drafts.
     Drafts { space: Key, count: u32 },
-    Group { space: Key, id: String, name: String, collapsed: bool, rollup: Rollup, depth: u8 },
+    Group { space: Key, id: String, name: String, collapsed: bool, muted: bool, rollup: Rollup, depth: u8 },
     Conversation { conversation: Rc<Conversation>, depth: u8 },
     Occupant { occupant: Occupant, depth: u8 },
     /// `+4` under a voice channel.
@@ -243,6 +243,7 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
             id: group.id.clone(),
             name: group.name.clone(),
             collapsed,
+            muted: group.muted,
             rollup: if collapsed { rollup } else { Rollup::default() },
             depth,
         });
@@ -258,7 +259,7 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
         apps.sort_by_key(|app| std::cmp::Reverse(app.updated));
         let opened = rules.opened.is_some_and(|opened| opened.contains(APPS_GROUP));
         let rollup = Rollup::of(apps.iter().map(|c| &***c));
-        rows.push(Row::Group { space: space.clone(), id: APPS_GROUP.into(), name: "Apps".into(), collapsed: !opened, rollup: if opened { Rollup::default() } else { rollup }, depth });
+        rows.push(Row::Group { space: space.clone(), id: APPS_GROUP.into(), name: "Apps".into(), collapsed: !opened, muted: false, rollup: if opened { Rollup::default() } else { rollup }, depth });
         // Folded apps stay folded unless one names me: their plain unread is the header's dot.
         if !opened {
             apps.retain(|app| app.mentions > 0 || open == Some(&app.key));

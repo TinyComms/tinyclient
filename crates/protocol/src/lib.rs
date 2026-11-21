@@ -1555,6 +1555,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<i64>,
     },
+    /// The network's notification setting for a whole Space (or one category inside it, when
+    /// `category` is set). `until` is when a mute ends, as Unix seconds; absent means until
+    /// turned off or not muted.
+    SetSpaceNotify {
+        space: Key,
+        notify: Notify,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+    },
     /// Sets or clears a conversation's disappearing-messages timer (`seconds == 0` turns it off).
     /// Separate from local cache retention (`keep_days`).
     SetDisappearing {

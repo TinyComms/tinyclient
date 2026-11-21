@@ -82,6 +82,8 @@ pub struct InfoPane {
     about_open: bool,
     /// What the user set here, drawn before the row says so.
     notify_set: Option<(Key, Notify)>,
+    /// What the user set for a Space's notifications, drawn before SpaceInfo reloads.
+    space_notify_set: Option<(Key, Notify)>,
     /// Inline conversation management input (rename, topic, add people).
     manage: Option<(Key, ManageKind, Entity<crate::gui::input::TextInput>)>,
     /// Pending confirmation to remove a member: (conversation, person_id, person_name).
@@ -136,6 +138,7 @@ impl InfoPane {
             phones_shown: false,
             about_open: false,
             notify_set: None,
+            space_notify_set: None,
             manage: None,
             pending_remove: None,
             width: 268.,
@@ -1045,6 +1048,57 @@ impl InfoPane {
         self.set_notify(conversation, notify, cx);
     }
 
+    pub(in crate::gui) fn space_notify_shown(&self, space: &Key, told: Notify) -> Notify {
+        match &self.space_notify_set {
+            Some((key, notify)) if key == space => *notify,
+            _ => told,
+        }
+    }
+
+    pub(in crate::gui) fn space_notify_to(&mut self, space: Key, notify: Notify, cx: &mut Context<Self>) {
+        let previous = self.space_notify_set.clone();
+        self.space_notify_set = Some((space.clone(), notify));
+        cx.notify();
+        if only_draws() {
+            return;
+        }
+        let pane = cx.weak_entity();
+        let shell = self.shell.clone();
+        let saved = space.clone();
+        super::ask_later(
+            cx,
+            Request::SetSpaceNotify { space, notify, until: None, category: None },
+            move |answer, cx| {
+                let accepted = matches!(&answer, Ok(Response::Ok));
+                let _ = pane.update(cx, |this, cx| {
+                    let still = this.space_notify_set.as_ref().is_some_and(|(key, set)| key == &saved && *set == notify);
+                    if still {
+                        this.space_notify_set = kept_notify(previous, &saved, notify, accepted);
+                        if accepted {
+                            if let Answer::Got(info) = &mut this.space_info {
+                                if info.space.key == saved {
+                                    info.notify = notify;
+                                }
+                            }
+                        }
+                        cx.notify();
+                    }
+                });
+                if accepted {
+                    return;
+                }
+                let detail = match answer {
+                    Ok(Response::Error { detail, .. }) => detail,
+                    Err(err) => crate::client::trouble_words("save", &err),
+                    _ => crate::client::OTHER_ANSWER.to_owned(),
+                };
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), format!("Can't change notifications: {detail}"), cx);
+                });
+            },
+        );
+    }
+
     pub(in crate::gui) fn shared_of(&self, network: Network, window: &Window, cx: &mut Context<Self>) -> Div {
         self.shared_part(network, window, cx)
     }
@@ -1271,6 +1325,22 @@ impl Shell {
             return;
         }
         self.conversation_act(Request::SetMute { conversation, notify, until: None }, "Can't change notifications".to_owned(), cx);
+    }
+
+    /// Sets a Space's (or category's) notifications or timed mute from a menu.
+    pub(in crate::gui) fn set_space_notify(
+        &mut self,
+        space: Key,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.conversation_act(
+            Request::SetSpaceNotify { space, notify, until, category },
+            "Can't change notifications".to_owned(),
+            cx,
+        );
     }
 
     /// Closes a DM as the network's own ×: it leaves the list until a new message.

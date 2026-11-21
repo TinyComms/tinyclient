@@ -264,7 +264,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (200, profile)
         }
         ("PATCH", ["users", "@me", "guilds", guild, "settings"]) => {
-            // The server's settings whole, with the override asked for, as Discord answers.
+            // The server's settings whole, with the override or top-level fields asked for, as Discord answers.
             let overrides = seen.body["channel_overrides"].as_object().cloned().unwrap_or_default();
             let overrides: Vec<Value> = overrides
                 .into_iter()
@@ -274,7 +274,25 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 })
                 .collect();
             let guild_id = if *guild == "@me" { Value::Null } else { json!(guild) };
-            (200, json!({"guild_id": guild_id, "muted": false, "suppress_everyone": false, "suppress_roles": false, "message_notifications": 0, "flags": 0, "channel_overrides": overrides}))
+            let muted = seen.body.get("muted").and_then(Value::as_bool).unwrap_or(false);
+            let mute_config = seen.body.get("mute_config").cloned().unwrap_or(Value::Null);
+            let message_notifications = seen.body.get("message_notifications").and_then(Value::as_u64).unwrap_or(0);
+            let hide_muted = seen.body.get("hide_muted_channels").and_then(Value::as_bool).unwrap_or(false);
+            let flags = seen.body.get("flags").and_then(Value::as_u64).unwrap_or(0);
+            (
+                200,
+                json!({
+                    "guild_id": guild_id,
+                    "muted": muted,
+                    "mute_config": mute_config,
+                    "suppress_everyone": false,
+                    "suppress_roles": false,
+                    "message_notifications": message_notifications,
+                    "hide_muted_channels": hide_muted,
+                    "flags": flags,
+                    "channel_overrides": overrides,
+                }),
+            )
         }
         ("DELETE", ["channels", channel]) => (200, json!({"id": channel, "type": 1})),
         ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
@@ -5043,5 +5061,85 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
             assert!(spaces.iter().any(|s| s.key.id == "4999"), "other server 4999 should remain");
         }
         other => panic!("expected Response::Spaces, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_space_notify_mutes_server_with_duration_levels_and_category() {
+    let world = World::start();
+    let guild = world.key("4000");
+
+    // 1. Timed mute for 1 hour sends muted: true with mute_config end_time & selected_time_window.
+    let until = now() + 3600;
+    assert_eq!(
+        world.ask(Request::SetSpaceNotify {
+            space: guild.clone(),
+            notify: protocol::Notify::Nothing,
+            until: Some(until),
+            category: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["muted"], true);
+    assert!(patches[0].body["mute_config"]["end_time"].as_str().is_some_and(|s| s.ends_with('Z')));
+    assert!(patches[0].body["mute_config"]["selected_time_window"].as_i64().unwrap_or(0) > 3500);
+
+    // Space is now marked muted, and SpaceInfo reflects Notify::Nothing.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let found = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            assert!(found.muted, "server should be muted after SetSpaceNotify");
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+    match world.ask(Request::SpaceInfo { space: guild.clone() }) {
+        Response::SpaceInfo { info } => assert_eq!(info.notify, protocol::Notify::Nothing),
+        other => panic!("expected SpaceInfo, got {other:?}"),
+    }
+
+    // 2. Switching to Mentions unmutes and sets message_notifications = 1.
+    assert_eq!(
+        world.ask(Request::SetSpaceNotify {
+            space: guild.clone(),
+            notify: protocol::Notify::Mentions,
+            until: None,
+            category: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 2);
+    assert_eq!(patches[1].body["muted"], false);
+    assert_eq!(patches[1].body["message_notifications"], 1);
+    match world.ask(Request::SpaceInfo { space: guild.clone() }) {
+        Response::SpaceInfo { info } => assert_eq!(info.notify, protocol::Notify::Mentions),
+        other => panic!("expected SpaceInfo, got {other:?}"),
+    }
+
+    // 3. Muting a category writes channel_overrides[<category_id>] and marks the Group muted.
+    assert_eq!(
+        world.ask(Request::SetSpaceNotify {
+            space: guild.clone(),
+            notify: protocol::Notify::Nothing,
+            until: None,
+            category: Some("4050".into()),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[2].body["channel_overrides"]["4050"]["muted"], true);
+
+    // 4. Unknown server is refused locally.
+    match world.ask(Request::SetSpaceNotify {
+        space: world.key("99999"),
+        notify: protocol::Notify::Nothing,
+        until: None,
+        category: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for unknown guild, got {other:?}"),
     }
 }

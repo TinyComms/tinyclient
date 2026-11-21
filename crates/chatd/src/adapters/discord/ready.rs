@@ -536,7 +536,7 @@ impl Discord {
     /// Works out a server's visible channels again from what is kept of them, after a role's
     /// permissions or our own roles changed. Unread state and threads stay as they are: the
     /// store keeps both through a tree replacement.
-    fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
+    pub(super) fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
         let kept: Vec<Kept> = match self.ctx.note(&format!("kept:{guild_id}")).map(|kept| serde_json::from_str(&kept)) {
             Some(Ok(kept)) => kept,
             _ => return Ok(()),
@@ -1351,7 +1351,7 @@ impl Discord {
     }
 
     /// Writes the mute of every row a settings entry covers.
-    fn apply_quiet(&self, guild: Option<&str>) -> rusqlite::Result<()> {
+    pub(super) fn apply_quiet(&self, guild: Option<&str>) -> rusqlite::Result<()> {
         let now = now();
         let rows: Vec<(String, bool)> = {
             let state = self.state.lock().unwrap();
@@ -1374,7 +1374,7 @@ impl Discord {
         Ok(())
     }
 
-    fn reschedule_unmute(&self) {
+    pub(super) fn reschedule_unmute(&self) {
         let now = now();
         let mut state = self.state.lock().unwrap();
         let ends = state.guilds.values().filter_map(|info| info.quiet.next_end(now));

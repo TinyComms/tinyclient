@@ -16,7 +16,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
     SharedString, Window, WindowControlArea,
 };
-use protocol::{CallState, Conversation, Key, Link, Network, Presence};
+use protocol::{CallState, Conversation, Key, Link, Network, Notify, Presence};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -126,6 +126,8 @@ pub enum Menu {
     Own,
     Network(Network),
     Space(Key),
+    /// A category header's context menu, where the pointer was.
+    Group { space: Key, id: String, name: String, muted: bool, at: Point<Pixels> },
     /// A conversation row's context menu, where the pointer was.
     Row(Rc<Conversation>, Point<Pixels>),
 }
@@ -743,8 +745,12 @@ impl Shell {
                 placed("menu-network-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-network", 120, items))
             }
             Menu::Space(_) => {
-                let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
+                let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
+            }
+            Menu::Group { at, .. } => {
+                let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
+                placed("menu-group-at", Place::Pointer(*at), Layer::Menu, window, fade_in("menu-group", 120, items))
             }
             Menu::Row(_, position) => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
@@ -869,6 +875,44 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                if space.network == Network::Discord {
+                    let space_muted = self.spaces.iter().any(|s| &s.key == space && s.muted);
+                    items.push(menu_separator().into_any_element());
+                    if space_muted {
+                        let unmute_space = space.clone();
+                        items.push(
+                            menu_item("space-unmute", Some("icons/bell.svg"), "Unmute server", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.set_space_notify(unmute_space.clone(), Notify::All, None, None, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    } else {
+                        items.push(menu_label("Mute server").into_any_element());
+                        for (ix, (label, secs)) in [
+                            ("For 15 minutes", Some(15 * 60i64)),
+                            ("For 1 hour", Some(60 * 60)),
+                            ("For 8 hours", Some(8 * 60 * 60)),
+                            ("For 24 hours", Some(24 * 60 * 60)),
+                            ("Until I turn it back on", None),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let mute_space = space.clone();
+                            items.push(
+                                menu_item(SharedString::from(format!("space-mute-{ix}")), Some("icons/bell-off.svg"), label, None)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        let until = secs.map(|s| crate::view::now() + s);
+                                        this.set_space_notify(mute_space.clone(), Notify::Nothing, until, None, cx);
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
                 let can_leave = snapshot.accounts.iter().any(|a| {
                     a.key == space.account() && a.link == Link::Connected && a.can.leave_space
                 });
@@ -889,6 +933,46 @@ impl Shell {
                             }))
                             .into_any_element(),
                     );
+                }
+            }
+            Menu::Group { space, id, muted, .. } => {
+                if space.network == Network::Discord {
+                    if *muted {
+                        let space_key = space.clone();
+                        let cat_id = id.clone();
+                        items.push(
+                            menu_item("group-unmute", Some("icons/bell.svg"), "Unmute category", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.set_space_notify(space_key.clone(), Notify::All, None, Some(cat_id.clone()), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    } else {
+                        items.push(menu_label("Mute category").into_any_element());
+                        for (ix, (label, secs)) in [
+                            ("For 15 minutes", Some(15 * 60i64)),
+                            ("For 1 hour", Some(60 * 60)),
+                            ("For 8 hours", Some(8 * 60 * 60)),
+                            ("For 24 hours", Some(24 * 60 * 60)),
+                            ("Until I turn it back on", None),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let space_key = space.clone();
+                            let cat_id = id.clone();
+                            items.push(
+                                menu_item(SharedString::from(format!("group-mute-{ix}")), Some("icons/bell-off.svg"), label, None)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        let until = secs.map(|s| crate::view::now() + s);
+                                        this.set_space_notify(space_key.clone(), Notify::Nothing, until, Some(cat_id.clone()), cx);
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
+                    }
                 }
             }
             Menu::Row(conversation, _) => {
@@ -1092,6 +1176,9 @@ impl Shell {
                     .child(super::components::Avatar::new(space, &name, 28.).shape(super::components::Shape::Place).image_at(icon).build())
                     .child(div().min_w_0().truncate().phone_title().child(name));
                 column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
+            Menu::Group { name, .. } => {
+                column().child(super::phone::sheet_title(name.clone())).children(self.menu_items(open, snapshot, cx)).into_any_element()
             }
             Menu::Row(conversation, _) => {
                 // What the sheet is about: the row's own face and title, and where it lives.

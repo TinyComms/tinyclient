@@ -543,6 +543,14 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Set the network's notification setting for a whole Space, or one category inside it.
+    SetSpaceNotify {
+        space_id: String,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<String>,
+        reply: Reply<()>,
+    },
     /// Set or clear a conversation's disappearing-messages timer (`seconds == 0` turns it off).
     /// Report the new timer through [`Context::disappearing`] before answering.
     SetDisappearing {
@@ -847,6 +855,7 @@ impl Command {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::SetSpaceNotify { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }

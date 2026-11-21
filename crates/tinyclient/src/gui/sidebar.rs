@@ -1442,7 +1442,7 @@ impl Shell {
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
-            Row::Group { space, id, name, collapsed, rollup, depth, .. } => {
+            Row::Group { space, id, name, collapsed, muted, rollup, depth, .. } => {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
                 let dot = rollup_badge(rollup.attention, rollup.unread).filter(|_| *collapsed);
                 let chevron = if *collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" };
@@ -1450,6 +1450,10 @@ impl Shell {
                 let can_create = self.spaces.iter().any(|s| &s.key == space && s.can_create_channels);
                 let add_space = space.clone();
                 let add_group = id.clone();
+                let menu_space = space.clone();
+                let menu_id = id.clone();
+                let menu_name = name.clone();
+                let menu_muted = *muted;
                 let add_btn = can_create.then(|| {
                     div()
                         .id((gpui::ElementId::from("group-add"), id.clone()))
@@ -1480,6 +1484,23 @@ impl Shell {
                     .children(dot);
                 list_row((gpui::ElementId::from("group"), id.clone()), height, false, focused, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .when(space.network == Network::Discord, |row| {
+                        row.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.open_menu(
+                                    Menu::Group {
+                                        space: menu_space.clone(),
+                                        id: menu_id.clone(),
+                                        name: menu_name.clone(),
+                                        muted: menu_muted,
+                                        at: event.position,
+                                    },
+                                    cx,
+                                );
+                            }),
+                        )
+                    })
             }
             Row::Conversation { conversation: c, depth } => self.place_row(c, *depth, focused, cx),
         }

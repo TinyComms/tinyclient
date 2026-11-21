@@ -664,20 +664,25 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
         .child(div().pt(px(16.)).child(Avatar::new(key, &name, draw::AVATAR).shape(Plate::Place).image(icon.as_ref()).build()))
         .child(div().mt(px(12.)).min_w_0().truncate().type_title().child(name.clone()))
         .children(line.map(|line| line.type_ui().text_color(theme::text_soft())));
-    // CONTRACT: no request sets a Space's notifications, so the setting `SpaceInfo` gives is
-    // shown as it is, read-only, and changed in the network's app.
-    let notify = info.as_ref().filter(|_| key.network == Network::Discord).map(|info| info.notify);
+    let notify = info
+        .as_ref()
+        .filter(|_| key.network == Network::Discord)
+        .map(|info| pane.space_notify_shown(key, info.notify));
     let top = top.children(notify.map(|notify| {
-        let shown = |ix: usize, words: &'static str, at: Notify| segment(("space-notify", ix), words, notify == at).px(px(8.)).cursor_default();
+        let choice = |ix: usize, words: &'static str, at: Notify, cx: &mut Context<InfoPane>| {
+            let space_key = key.clone();
+            segment(("space-notify", ix), words, notify == at)
+                .px(px(8.))
+                .on_click(cx.listener(move |pane, _, _, cx| pane.space_notify_to(space_key.clone(), at, cx)))
+        };
         div()
             .id("space-notify-row")
             .mt(px(12.))
-            .tooltip(tip(format!("Change this in {}", key.network.label()), None))
             .child(draw::notifications_row(
                 segmented()
-                    .child(shown(0, "All", Notify::All))
-                    .child(shown(1, "Mentions", Notify::Mentions))
-                    .child(shown(2, "Nothing", Notify::Nothing)),
+                    .child(choice(0, "All", Notify::All, cx))
+                    .child(choice(1, "Mentions", Notify::Mentions, cx))
+                    .child(choice(2, "Nothing", Notify::Nothing, cx)),
             ))
     }));
     let mut body = div().flex().flex_col().pb(px(theme::PANE_PAD)).child(top);
