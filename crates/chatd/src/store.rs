@@ -1513,6 +1513,75 @@ impl Store {
         Ok((channels, directs, voice))
     }
 
+    /// Stored top-level rows of the given kinds in `space`, ordered by position and id. Used when
+    /// a refresh gets an empty list for one kind and probes survivors before `replace_tree`.
+    pub fn space_rows_of_kinds(
+        &self,
+        space: &Key,
+        kinds: &[ConversationKind],
+    ) -> rusqlite::Result<Vec<ConversationRow>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<String> = kinds.iter().map(|kind| word(kind).to_owned()).collect();
+        let mut stmt = self.db.prepare(
+            "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
+                    listed, topic, read_only, private, encryption, bot, meeting, special, mark,
+                    opted_out, icon
+               FROM conversation
+              WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
+              ORDER BY position, id",
+        )?;
+        let rows = stmt
+            .query_map(params![word(&space.network), space.account, space.id], |row| {
+                let kind_word: String = row.get(1)?;
+                let kind: ConversationKind = from_word(kind_word.clone())?;
+                let space_id: String = row.get(3)?;
+                let section: String = row.get(4)?;
+                let avatar: String = row.get(6)?;
+                let peer: String = row.get(7)?;
+                let call: String = row.get(8)?;
+                let encryption: String = row.get(14)?;
+                let special: String = row.get(17)?;
+                let mark: String = row.get(18)?;
+                Ok((
+                    kind_word,
+                    ConversationRow {
+                        id: row.get(0)?,
+                        kind,
+                        title: row.get(2)?,
+                        space: (!space_id.is_empty()).then_some(space_id),
+                        group: (!section.is_empty()).then_some(section),
+                        position: row.get(5)?,
+                        avatar: (!avatar.is_empty()).then_some(avatar),
+                        peer: (!peer.is_empty()).then_some(peer),
+                        call: from_word(call)?,
+                        limit: row.get(9)?,
+                        listed: row.get(10)?,
+                        topic: row.get(11)?,
+                        parent: None,
+                        root: None,
+                        read_only: row.get(12)?,
+                        private: row.get(13)?,
+                        encryption: from_word(encryption)?,
+                        bot: row.get(15)?,
+                        meeting: row.get(16)?,
+                        special: from_word(special)?,
+                        mark: (!mark.is_empty()).then(|| from_word(mark)).transpose()?,
+                        opted_out: row.get(19)?,
+                        icon: row.get(20)?,
+                        filing: None,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(kind_word, _)| wanted.contains(kind_word))
+            .map(|(_, row)| row)
+            .collect())
+    }
+
     /// Whether a conversation may appear where the user asked for what is listed: hidden
     /// conversations and message requests stay out of it, as they stay out of the cache's own
     /// search. A conversation the store does not know is not listed.
