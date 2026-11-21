@@ -840,10 +840,11 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
             let _ = reply.send(info::forward(account, &from_conversation_id, &message_ids, &to_conversation_ids, &note).map_err(refused));
         }
-        Command::Search { query, scope, reply, .. } => {
+        Command::Search { query, scope, cursor, reply, .. } => {
             let result = match scope {
                 super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
-                super::SearchScope::Space(_) | super::SearchScope::Account => Err(Refusal::Unsupported),
+                super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
+                super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result);
         }

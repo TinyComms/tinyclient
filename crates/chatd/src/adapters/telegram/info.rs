@@ -402,6 +402,111 @@ pub(super) fn search_messages(account: &Account, conversation: &str, query: &str
     }).collect())
 }
 
+/// Parses an optional global search cursor `"<offset_rate>:<peer>:<offset_id>"`.
+fn parse_global_cursor(cursor: Option<&str>) -> (i32, Option<Who>, i32) {
+    let Some(cursor) = cursor else {
+        return (0, None, 0);
+    };
+    let mut parts = cursor.split(':');
+    let rate = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+    let peer = parts.next().and_then(|s| Who::parse(s).map(|(w, _)| w));
+    let id = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+    (rate, peer, id)
+}
+
+/// Account-wide text search across all Telegram chats (`messages.searchGlobal`), bounded to 100 hits
+/// with pagination via `(offset_rate, offset_peer, offset_id)`.
+pub(super) fn search_global(account: &Account, query: &str, cursor: Option<&str>) -> Result<Vec<protocol::MessageHit>, Fault> {
+    const LIMIT: usize = 100;
+    const MAX_PAGES: usize = 4;
+    let q: String = query.chars().take(1024).collect();
+    let (mut offset_rate, initial_peer, mut offset_id) = parse_global_cursor(cursor);
+    let mut offset_peer = initial_peer
+        .and_then(|who| account.input(who).ok())
+        .unwrap_or(tl::enums::InputPeer::Empty);
+
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for _ in 0..MAX_PAGES {
+        if hits.len() >= LIMIT {
+            break;
+        }
+        let want = (LIMIT - hits.len()).min(100) as i32;
+        let request = tl::functions::messages::SearchGlobal {
+            broadcasts_only: false,
+            groups_only: false,
+            users_only: false,
+            folder_id: None,
+            q: q.clone(),
+            filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+            min_date: 0,
+            max_date: 0,
+            offset_rate,
+            offset_peer: offset_peer.clone(),
+            offset_id,
+            limit: want,
+        };
+        let answer = account.ask(&request)?;
+        let next_rate = match &answer {
+            tl::enums::messages::Messages::Slice(slice) => slice.next_rate,
+            _ => None,
+        };
+        let (raw, _) = sync::searched(account, answer);
+        if raw.is_empty() {
+            break;
+        }
+        let mut last_peer_id: Option<(Who, i32)> = None;
+        for item in &raw {
+            let mapped = {
+                let dir = account.dir();
+                super::content::map(&dir, item)
+            };
+            let Some(mapped) = mapped else {
+                continue;
+            };
+            last_peer_id = Some((mapped.peer, mapped.id));
+            let is_forum = account.dir().get(mapped.peer).is_some_and(|known| known.forum);
+            let conv_id = match (is_forum, mapped.topic) {
+                (true, Some(topic)) => peers::thread_id(mapped.peer, topic),
+                _ => mapped.peer.text(),
+            };
+            if !seen.insert((conv_id.clone(), mapped.message.id.clone())) {
+                continue;
+            }
+            let known_row = account.ctx.known(&conv_id).ok().flatten();
+            let title = known_row
+                .as_ref()
+                .map(|row| row.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| account.dir().name(mapped.peer));
+            let space_title = known_row.as_ref().map(|row| row.space_title.clone()).unwrap_or_default();
+            hits.push(protocol::MessageHit {
+                conversation: account.ctx.key(&conv_id),
+                message_id: mapped.message.id,
+                sent: mapped.message.sent,
+                sender: mapped.message.sender.name,
+                snippet: crate::store::snippet(&mapped.message.text, query),
+                title,
+                space_title,
+                outgoing: mapped.message.outgoing,
+            });
+            if hits.len() >= LIMIT {
+                break;
+            }
+        }
+        match (next_rate, last_peer_id) {
+            (Some(rate), Some((peer, id))) if rate != 0 && (rate != offset_rate || id != offset_id) => {
+                offset_rate = rate;
+                offset_id = id;
+                offset_peer = account.input(peer).unwrap_or(tl::enums::InputPeer::Empty);
+            }
+            _ => break,
+        }
+    }
+    Ok(hits)
+}
+
 /// The pinned messages, newest first.
 pub(super) fn pinned(account: &Account, conversation: &str) -> Result<Vec<Message>, Fault> {
     Ok(search(account, conversation, "", tl::enums::MessagesFilter::InputMessagesFilterPinned, 0, protocol::PINNED_LIMIT as i32)?.0)
@@ -567,4 +672,16 @@ pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, be
         }
     }
     Ok(SharedPage { items, more, total })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_global_cursor_handles_empty_and_valid() {
+        assert_eq!(parse_global_cursor(None), (0, None, 0));
+        assert_eq!(parse_global_cursor(Some("1700000000:u7003:31")), (1_700_000_000, Some(Who::User(7003)), 31));
+        assert_eq!(parse_global_cursor(Some("bad")), (0, None, 0));
+    }
 }

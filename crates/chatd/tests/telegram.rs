@@ -3418,3 +3418,37 @@ fn forward_to_chat_saved_messages_and_refuses_noforwards() {
         other => panic!("expected refusal for noforwards chat, got {other:?}"),
     }
 }
+
+#[test]
+fn global_search_across_chats_with_pagination() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.search_global, "Telegram must advertise search_global capability");
+
+    // Search across all chats without having opened them first.
+    let resp = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(account()),
+        network: None,
+        query: "trail".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    });
+    let (hits, not_searched) = match resp {
+        Response::MessageHits { hits, not_searched, .. } => (hits, not_searched),
+        other => panic!("expected MessageHits, got {other:?}"),
+    };
+    assert!(not_searched.is_empty(), "Telegram should have been searched: {not_searched:?}");
+    let distinct_chats: std::collections::HashSet<String> = hits.iter().map(|h| h.conversation.id.clone()).collect();
+    assert!(
+        distinct_chats.len() >= 2,
+        "expected global search hits from at least 2 distinct chats, got {distinct_chats:?} (hits: {hits:?})"
+    );
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("SearchGlobal trail")),
+        "expected messages.searchGlobal on wire, got: {:#?}",
+        world.calls()
+    );
+}

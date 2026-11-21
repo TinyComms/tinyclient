@@ -1757,6 +1757,8 @@ mod tests {
         assert!(!network_searches(&searching, Network::Telegram, Scope::Space), "Telegram searches one conversation at a time");
         assert!(!network_searches(&searching, Network::Teams, Scope::Space), "Teams is not asked yet");
         assert!(!network_searches(&searching, Network::Slack, Scope::Everywhere), "Everywhere is the cache alone");
+        let global = Capabilities { search: true, search_global: true, ..Capabilities::default() };
+        assert!(network_searches(&global, Network::Telegram, Scope::Everywhere), "Telegram global search asks at Everywhere scope");
         // A network that has not said it searches is never asked, whatever the scope.
         let quiet = Capabilities::default();
         assert!(!network_searches(&quiet, Network::Slack, Scope::Conversation));

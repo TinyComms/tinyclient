@@ -2995,6 +2995,43 @@ impl World {
             self.log(&format!("UploadMedia {kind}"));
             return Some(answer(media));
         }
+        if let Some(request) = asked::<f::messages::SearchGlobal>(body) {
+            self.log(&format!("SearchGlobal {} rate={} id={}", request.q, request.offset_rate, request.offset_id));
+            let needle = request.q.to_lowercase();
+            let mut matched: Vec<(i32, i32, tl::enums::Message)> = Vec::new();
+            for msgs in self.messages.values() {
+                for raw in msgs.values() {
+                    if let tl::enums::Message::Message(m) = raw {
+                        if needle.is_empty() || m.message.to_lowercase().contains(&needle) {
+                            matched.push((m.date, m.id, raw.clone()));
+                        }
+                    }
+                }
+            }
+            matched.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            let total = matched.len() as i32;
+            if request.offset_rate > 0 {
+                matched.retain(|(date, id, _)| {
+                    *date < request.offset_rate || (*date == request.offset_rate && *id < request.offset_id)
+                });
+            }
+            // Return 1 hit per page when more than 1 matches so pagination is exercised on the wire.
+            let page_size = if matched.len() > 1 { 1 } else { matched.len() };
+            let next_rate = (matched.len() > page_size).then(|| matched[page_size - 1].0);
+            let page: Vec<tl::enums::Message> = matched.into_iter().take(page_size).map(|(_, _, m)| m).collect();
+            let slice = tl::types::messages::MessagesSlice {
+                inexact: false,
+                count: total,
+                next_rate,
+                offset_id_offset: None,
+                search_flood: None,
+                messages: page,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::messages::Messages::Slice(slice)));
+        }
         if let Some(request) = asked::<f::messages::ForwardMessages>(body) {
             let from_who = input_who(&request.from_peer);
             let to_who = input_who(&request.to_peer);
