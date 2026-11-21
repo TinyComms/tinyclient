@@ -383,6 +383,210 @@ impl Teams {
         Ok(())
     }
 
+    /// Parses one `48:notifications` message into a [`protocol::ActivityItem`].
+    fn parse_activity_item(
+        &self,
+        item: &Value,
+        read_horizon: i64,
+        read_ids: &std::collections::HashSet<String>,
+    ) -> Option<protocol::ActivityItem> {
+        let id = id_of(&item["id"]);
+        if id.is_empty() {
+            return None;
+        }
+        let activity = match &item["properties"]["activity"] {
+            Value::String(raw) => serde_json::from_str(raw).unwrap_or(Value::Null),
+            other => other.clone(),
+        };
+        let thread = text(&activity, "sourceThreadId");
+        if thread.is_empty() {
+            return None;
+        }
+        let raw_kind = text(&activity, "activityType").to_ascii_lowercase();
+        let kind = if raw_kind.contains("mention") {
+            protocol::ActivityItemKind::Mention
+        } else if raw_kind.contains("reply") || raw_kind.contains("thread") {
+            protocol::ActivityItemKind::ThreadReply
+        } else if raw_kind.contains("react") || raw_kind.contains("like") || raw_kind.contains("emotion") {
+            protocol::ActivityItemKind::Reaction
+        } else if raw_kind.contains("add") || raw_kind.contains("team") || raw_kind.contains("member") || raw_kind.contains("invite") {
+            protocol::ActivityItemKind::Invite
+        } else if raw_kind.contains("app") || raw_kind.contains("bot") || raw_kind.contains("card") {
+            protocol::ActivityItemKind::App
+        } else {
+            protocol::ActivityItemKind::Other
+        };
+        let message_id = {
+            let src = id_of(&activity["sourceMessageId"]);
+            if src.is_empty() { id.clone() } else { src }
+        };
+        let chain = id_of(&activity["sourceReplyChainId"]);
+        let thread_id = (millis(&chain) > 0 && chain != message_id).then(|| chain_id(thread, &chain));
+        let actor_id = {
+            let src = text(&activity, "sourceUserId");
+            if !src.is_empty() {
+                src.to_owned()
+            } else {
+                text(item, "from").rsplit('/').next().unwrap_or("").to_owned()
+            }
+        };
+        let actor = {
+            let from_act = text(&activity, "sourceUserImDisplayName");
+            if !from_act.is_empty() {
+                from_act.to_owned()
+            } else {
+                let from_msg = text(item, "imdisplayname");
+                if !from_msg.is_empty() {
+                    from_msg.to_owned()
+                } else {
+                    self.name_of(&actor_id).unwrap_or_default()
+                }
+            }
+        };
+        let emoji = if kind == protocol::ActivityItemKind::Reaction {
+            let key = [&activity["reactionKey"], &activity["emoji"], &activity["activitySubtype"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|s| !s.is_empty())
+                .unwrap_or("");
+            if key.is_empty() { String::new() } else { super::emoji::emoji_of(key) }
+        } else {
+            String::new()
+        };
+        let snippet = [&activity["messagePreview"], &activity["activityTitle"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                let content = text(item, "content");
+                if content.is_empty() {
+                    None
+                } else {
+                    let parsed = super::html::parse(content, &super::people::Nobody, &self.me()).text;
+                    let cleaned = parsed.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+                    (!cleaned.is_empty()).then_some(cleaned)
+                }
+            })
+            .unwrap_or_else(|| {
+                if raw_kind.contains("call") || raw_kind.contains("voicemail") {
+                    "Missed call".to_owned()
+                } else if kind == protocol::ActivityItemKind::Invite {
+                    "Added you to a team".to_owned()
+                } else {
+                    String::new()
+                }
+            });
+        let item_ms = millis(&id);
+        let time = match item_ms / 1000 {
+            0 => seconds(text(item, "composetime")),
+            ts => ts,
+        };
+        let prop_read = item["properties"]["isRead"] == true
+            || item["properties"]["isRead"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || activity["isRead"] == true
+            || activity["read"] == true;
+        let horizon_read = read_horizon > 0 && item_ms > 0 && item_ms <= read_horizon;
+        let unread = !(prop_read || horizon_read || read_ids.contains(&id));
+        Some(protocol::ActivityItem {
+            id,
+            kind,
+            conversation: self.ctx.key(thread),
+            message_id,
+            thread_id,
+            actor,
+            actor_id,
+            emoji,
+            text: snippet,
+            time,
+            unread,
+        })
+    }
+
+    /// Fetches a page of the Teams `48:notifications` activity feed for `Command::ActivityFeed`.
+    pub(super) fn fetch_activity_feed(
+        &self,
+        kind: Option<protocol::ActivityItemKind>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::adapters::ActivityPage, Fault> {
+        let page_size = limit.clamp(1, ACTIVITY_PAGE);
+        let window = match cursor.filter(|c| !c.is_empty()) {
+            Some(sync) => format!("startTime=1&syncState={sync}"),
+            None => "startTime=1".to_owned(),
+        };
+        let (raw_items, older) = self.page(ACTIVITY, page_size, &window)?;
+        let read_horizon = self.ctx.note("activity_read_horizon").as_deref().map(millis).unwrap_or(0);
+        let read_ids = self.state().activity_read.clone();
+        let items = raw_items
+            .iter()
+            .filter_map(|raw| self.parse_activity_item(raw, read_horizon, &read_ids))
+            .filter(|item| kind.is_none_or(|wanted| item.kind == wanted))
+            .collect();
+        Ok(crate::adapters::ActivityPage {
+            items,
+            cursor: (!older.is_empty()).then_some(older),
+        })
+    }
+
+    /// Marks one activity item (`Some(id)`) or all items (`None`) read on `48:notifications`.
+    pub(super) fn mark_activity_read(&self, item_id: Option<&str>) -> Result<(), Fault> {
+        if let Some(id) = item_id.filter(|id| !id.is_empty()) {
+            let path = format!(
+                "/v1/users/ME/conversations/{}/messages/{}/properties?name=isRead",
+                escaped(ACTIVITY),
+                escaped(id)
+            );
+            self.chat("PUT", &path, Body::Json(&serde_json::json!({"isRead": "true"})), false)?;
+            self.state().activity_read.insert(id.to_owned());
+        } else {
+            let ts = super::now_ms();
+            let path = format!(
+                "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
+                escaped(ACTIVITY)
+            );
+            let horizon = serde_json::json!({"consumptionhorizon": format!("{ts};{ts};{ts}")});
+            self.chat("PUT", &path, Body::Json(&horizon), false)?;
+            self.ctx.set_note("activity_read_horizon", &ts.to_string());
+        }
+        Ok(())
+    }
+
+    /// Handles a live push event arriving on `48:notifications`.
+    pub(super) fn handle_activity_push(&self, raw: &Value) -> Result<(), Fault> {
+        let item_ms = millis(&id_of(&raw["id"]));
+        if item_ms > 0 {
+            let prev = self.ctx.note("activity_cursor").as_deref().map(millis).unwrap_or(0);
+            if item_ms > prev {
+                self.ctx.set_note("activity_cursor", &item_ms.to_string());
+            }
+        }
+        let read_horizon = self.ctx.note("activity_read_horizon").as_deref().map(millis).unwrap_or(0);
+        let read_ids = self.state().activity_read.clone();
+        let Some(item) = self.parse_activity_item(raw, read_horizon, &read_ids) else {
+            return Ok(());
+        };
+        if item.kind == protocol::ActivityItemKind::Mention {
+            let place = item.thread_id.as_deref().unwrap_or(&item.conversation.id);
+            if let Some(row) = self.ctx.known(place)?.or(self.ctx.known(&item.conversation.id)?) {
+                let msg_ms = millis(&item.message_id);
+                let read = row.last_read.as_deref().map(millis).unwrap_or(0);
+                if msg_ms > read {
+                    let next_mentions = row.mentions.saturating_add(1);
+                    self.ctx.counts(
+                        &row.key.id,
+                        row.unread.max(next_mentions),
+                        next_mentions,
+                        row.last_read.as_deref(),
+                        item.time.max(row.updated),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// True once the conversation a message belongs to has a row. A chat never seen (someone
     /// has just started it) is described by Teams and recorded; a channel that is not in the
     /// tree is one the user hid or left, and stays out.

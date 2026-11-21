@@ -783,6 +783,12 @@ impl Teams {
         let Some((place, root)) = placed(raw) else {
             return Ok(());
         };
+        if place == "48:notifications" {
+            if new {
+                self.handle_activity_push(raw)?;
+            }
+            return Ok(());
+        }
         match self.read(&place, raw) {
             Read::Typing { person, name, on } => {
                 if person != self.me() && self.ctx.known(&place)?.is_some() {

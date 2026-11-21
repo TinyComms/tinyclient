@@ -2055,3 +2055,111 @@ fn unread_count_from_horizon_and_mark_unread_sync() {
     });
     assert_eq!(rewound.unread, 5);
 }
+
+#[test]
+fn activity_feed_lists_mentions_replies_reactions_missed_calls_and_marks_read() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Account advertises activity_feed capability.
+    assert!(world.account(HOME).can.activity_feed);
+
+    // 2. Fetch full activity feed from 48:notifications.
+    let account = protocol::AccountKey { network: Network::Teams, account: HOME.to_owned() };
+    let Response::ActivityFeed { items, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected Response::ActivityFeed");
+    };
+    assert_eq!(items.len(), 6, "expected all 6 activity items: {items:?}");
+
+    let mention = items.iter().find(|i| i.id == "1760000900001").expect("mention item");
+    assert_eq!(mention.kind, protocol::ActivityItemKind::Mention);
+    assert_eq!(mention.conversation, key("19:grp1@thread.v2"));
+    assert_eq!(mention.message_id, "1759600000000");
+    assert!(mention.unread);
+
+    let reaction = items.iter().find(|i| i.id == "1760000900003").expect("reaction item");
+    assert_eq!(reaction.kind, protocol::ActivityItemKind::Reaction);
+    assert_eq!(reaction.emoji, "👍");
+    assert_eq!(reaction.text, "Shipped the fix");
+
+    let reply = items.iter().find(|i| i.id == "1760000900004").expect("reply item");
+    assert_eq!(reply.kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(reply.conversation, key(GENERAL));
+    assert_eq!(reply.thread_id.as_deref(), Some("19:platform0general@thread.tacv2;messageid=1760000200200"));
+    assert_eq!(reply.message_id, "1760000210210");
+    assert_eq!(reply.actor, "Ana Ruiz");
+
+    let missed = items.iter().find(|i| i.id == "1760000900005").expect("missed call item");
+    assert_eq!(missed.kind, protocol::ActivityItemKind::Other);
+    assert_eq!(missed.text, "Missed call");
+
+    let added = items.iter().find(|i| i.id == "1760000900006").expect("added-to-team item");
+    assert_eq!(added.kind, protocol::ActivityItemKind::Invite);
+    assert_eq!(added.text, "Added you to Design");
+
+    // 3. Kind filter narrows the returned items.
+    let Response::ActivityFeed { items: reactions_only, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: Some(protocol::ActivityItemKind::Reaction),
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected filtered Response::ActivityFeed");
+    };
+    assert_eq!(reactions_only.len(), 1);
+    assert_eq!(reactions_only[0].id, "1760000900003");
+
+    // 4. Marking a single item read sends PUT isRead and clears unread on refetch.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead {
+            account: account.clone(),
+            item_id: Some("1760000900001".to_owned()),
+        }),
+        Response::Ok
+    );
+    let mark_call = world
+        .fake
+        .calls("PUT", "/48:notifications/messages/1760000900001/properties")
+        .pop()
+        .expect("PUT isRead for activity item");
+    assert_eq!(mark_call.query, "name=isRead");
+
+    let Response::ActivityFeed { items: after_one, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected Response::ActivityFeed after mark-one");
+    };
+    assert!(!after_one.iter().find(|i| i.id == "1760000900001").unwrap().unread);
+    assert!(after_one.iter().find(|i| i.id == "1760000900004").unwrap().unread);
+
+    // 5. Marking all read advances 48:notifications consumptionhorizon and clears remaining unread.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead { account: account.clone(), item_id: None }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", "/48:notifications/properties")
+            .iter()
+            .any(|c| c.query == "name=consumptionhorizon"),
+        "expected PUT consumptionhorizon on 48:notifications"
+    );
+    let Response::ActivityFeed { items: after_all, .. } = world.ask(Request::ActivityFeed {
+        account,
+        kind: None,
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected Response::ActivityFeed after mark-all");
+    };
+    assert!(after_all.iter().all(|i| !i.unread), "all activity items should be read");
+}

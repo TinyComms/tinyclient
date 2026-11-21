@@ -332,6 +332,8 @@ struct State {
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
     scheduled: HashMap<String, i64>,
+    /// Activity feed item ids marked read locally this session.
+    activity_read: HashSet<String>,
 }
 
 /// What a call presents.
@@ -925,6 +927,7 @@ impl Teams {
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
+            activity_feed: true,
             ..protocol::Capabilities::default()
         });
         {
@@ -993,6 +996,12 @@ impl Teams {
             }
             Command::SpaceInfo { space_id, reply } => {
                 let _ = reply.send(self.space_info(&space_id).map_err(refuse));
+            }
+            Command::ActivityFeed { kind, cursor, limit, reply } => {
+                let _ = reply.send(self.fetch_activity_feed(kind, cursor.as_deref(), limit).map_err(refuse));
+            }
+            Command::ActivityMarkRead { item_id, reply } => {
+                let _ = reply.send(self.mark_activity_read(item_id.as_deref()).map_err(refuse));
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
