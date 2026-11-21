@@ -1220,6 +1220,19 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
             community.channels.retain(|ch| ch.id != *channel_id);
             changed(community)
         }
+        Request::TinyChannelOverrideSet { account, channel_id, role_id, allow, deny } if ours(account) => {
+            if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == *channel_id) {
+                ch.overrides.retain(|over| over.role_id != *role_id);
+                ch.overrides.push(TinyOverride { role_id: role_id.clone(), allow: *allow, deny: *deny });
+            }
+            changed(community)
+        }
+        Request::TinyChannelOverrideClear { account, channel_id, role_id } if ours(account) => {
+            if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == *channel_id) {
+                ch.overrides.retain(|over| over.role_id != *role_id);
+            }
+            changed(community)
+        }
         Request::TinyRoomDelete { account, room_id } if ours(account) => {
             community.rooms.retain(|room| room.id != *room_id);
             changed(community)

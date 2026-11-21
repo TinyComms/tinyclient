@@ -3127,6 +3127,8 @@ impl Chat {
             Request::TinyRoomUpdate { account, room_id, room } => adapters::tiny::manage::room_update(account, room_id, room),
             Request::TinyOverrideSet { account, room_id, role_id, allow, deny } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
             Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),
+            Request::TinyChannelOverrideSet { account, channel_id, role_id, allow, deny } => adapters::tiny::manage::channel_override_set(account, channel_id, role_id, allow, deny),
+            Request::TinyChannelOverrideClear { account, channel_id, role_id } => adapters::tiny::manage::channel_override_clear(account, channel_id, role_id),
             Request::TinyInviteWith { account, options } => adapters::tiny::manage::invite_with(account, options),
             Request::TinyAudit { account, filter } => adapters::tiny::manage::audit(account, filter),
             Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),

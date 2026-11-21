@@ -1192,6 +1192,30 @@ pub(crate) fn override_clear(account: AccountKey, room_id: String, role_id: Stri
     change(&account, Some(TINY_FEATURE_ROLES), "community.rooms.overrides", "DELETE", &path, None, Missing::Room)
 }
 
+pub(crate) fn channel_override_set(account: AccountKey, channel_id: String, role_id: String, allow: u64, deny: u64) -> Response {
+    if !ids_ok(&[&channel_id, &role_id]) || (allow | deny) & !TINY_ALL != 0 || allow & deny != 0 {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let path = format!("/v1/channels/{channel_id}/overrides/{role_id}");
+    sent(&saved, "PUT", &path, Some(json!({ "allow": allow, "deny": deny })), Missing::Channel)
+}
+
+pub(crate) fn channel_override_clear(account: AccountKey, channel_id: String, role_id: String) -> Response {
+    if !ids_ok(&[&channel_id, &role_id]) {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let path = format!("/v1/channels/{channel_id}/overrides/{role_id}");
+    sent(&saved, "DELETE", &path, None, Missing::Channel)
+}
+
 // Invites and the audit.
 
 pub(crate) fn invite_with(account: AccountKey, options: TinyInviteOptions) -> Response {

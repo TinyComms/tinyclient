@@ -352,10 +352,17 @@ impl Shell {
         if can_manage {
             let edit_id = channel_id.to_owned();
             let delete_id = channel_id.to_owned();
+            let modern = page.community.has(protocol::TINY_FEATURE_ROLES) || page.community.has(protocol::TINY_FEATURE_CATEGORIES);
             items = items
                 .child(
                     self.plain(menu_item("tiny-text-channel-edit", Some("icons/pencil.svg"), "Edit channel…", None), cx)
-                        .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::EditChannel(edit_id.clone()), window, cx))),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if modern {
+                                this.tiny_open_settings(super::settings::Page::Channels, Some(edit_id.clone()), window, cx);
+                            } else {
+                                this.tiny_open_modal(Modal::EditChannel(edit_id.clone()), window, cx);
+                            }
+                        })),
                 )
                 .child(menu_separator())
                 .child(

@@ -893,3 +893,35 @@ fn channel_update_never_sends_e2ee_and_clears_topic_and_delete_explains_404() {
         );
     });
 }
+
+#[test]
+fn channel_override_set_and_clear_hit_channel_routes_and_reject_overlap() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("PUT /v1/channels/ch-1/overrides/role-1 ") {
+            return http(200, "OK", r#"{"id":"ch-1"}"#);
+        }
+        if first.starts_with("DELETE /v1/channels/ch-1/overrides/role-1 ") {
+            return http(200, "OK", r#"{"id":"ch-1"}"#);
+        }
+        http(404, "Not Found", r#"{"error":"not_found"}"#)
+    });
+    with_session(&base, "owner", |account| {
+        // Overlapping allow & deny refused locally before sending.
+        assert_eq!(channel_override_set(account.clone(), "ch-1".into(), "role-1".into(), 1, 1), said(CHECK));
+        assert!(sent(&log, "PUT /v1/channels/").is_empty());
+
+        // Set sends PUT /v1/channels/{id}/overrides/{role_id} with {allow, deny}.
+        assert_eq!(channel_override_set(account.clone(), "ch-1".into(), "role-1".into(), 5, 512), Response::Ok);
+        let body = json_body(&last(&log, "PUT /v1/channels/ch-1/overrides/role-1 "));
+        assert_eq!(body["allow"], 5);
+        assert_eq!(body["deny"], 512);
+
+        // Clear sends DELETE /v1/channels/{id}/overrides/{role_id}.
+        assert_eq!(channel_override_clear(account, "ch-1".into(), "role-1".into()), Response::Ok);
+        assert!(!sent(&log, "DELETE /v1/channels/ch-1/overrides/role-1 ").is_empty());
+    });
+}

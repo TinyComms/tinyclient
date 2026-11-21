@@ -2114,6 +2114,19 @@ pub enum Request {
         room_id: String,
         role_id: String,
     },
+    /// One role's allow and deny bits in one text channel (manage_roles and manage_channels).
+    TinyChannelOverrideSet {
+        account: AccountKey,
+        channel_id: String,
+        role_id: String,
+        allow: u64,
+        deny: u64,
+    },
+    TinyChannelOverrideClear {
+        account: AccountKey,
+        channel_id: String,
+        role_id: String,
+    },
     /// An invite with roles, a label, a use limit and an expiry (`invite_options`). Answers
     /// `TinyCode`, as `TinyInvite` does.
     TinyInviteWith {

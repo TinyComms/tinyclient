@@ -785,7 +785,7 @@ fn tiny_bits(id: &str) -> Option<u64> {
         | "community.categories.manage" => {
             TINY_MANAGE_CHANNELS
         }
-        "community.rooms.overrides" => TINY_MANAGE_CHANNELS | TINY_MANAGE_ROLES,
+        "community.rooms.overrides" | "community.channels.overrides" => TINY_MANAGE_CHANNELS | TINY_MANAGE_ROLES,
         "community.calls.join" => TINY_CONNECT,
         "community.calls.kick" => TINY_DISCONNECT_MEMBERS,
         "community.calls.mute" => TINY_MUTE_MEMBERS,
