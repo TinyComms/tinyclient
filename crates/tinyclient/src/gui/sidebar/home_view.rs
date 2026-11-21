@@ -119,7 +119,12 @@ impl Shell {
                         read.folders = folders;
                     }
                 }
-                Network::Teams | Network::Signal | Network::Messages => read.chats = whole(network, None, Shelf::Main)?.0,
+                Network::Teams => {
+                    read.chats = whole(network, None, Shelf::Main)?.0;
+                    let requests = Request::Home { network, account: None, folder: None, shelf: Shelf::Requests, offset: 0, limit: 1 };
+                    read.requests = conversations(&requests)?.1;
+                }
+                Network::Signal | Network::Messages => read.chats = whole(network, None, Shelf::Main)?.0,
                 Network::Slack | Network::Tiny => {}
             }
             Ok(read)

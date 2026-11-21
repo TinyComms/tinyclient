@@ -4,7 +4,10 @@
 use super::{escaped, Auth, Body, Fault, Teams, PRESENCE, REMEMBERED, SPACES};
 use crate::adapters::{About, Members};
 use crate::store::{PersonDetails, PersonRow};
-use protocol::{Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation};
+use protocol::{
+    Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection,
+    Person, Presence, RelateAction, Relation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -35,6 +38,87 @@ pub(super) struct Known {
     /// A guest in this tenant.
     #[serde(rename = "g", default)]
     pub guest: bool,
+    /// Home tenant id of this person when reported by Teams.
+    #[serde(rename = "tid", default)]
+    pub tenant_id: String,
+    /// Organization or tenant display name (e.g. "Fabrikam", "Personal account").
+    #[serde(rename = "org", default)]
+    pub tenant_name: String,
+    /// Federated, cross-tenant, or personal/consumer account outside our tenant.
+    #[serde(rename = "x", default)]
+    pub external: bool,
+}
+
+/// True when a Teams MRI belongs to a personal / consumer or Skype federated account.
+pub(super) fn is_consumer_mri(id: &str) -> bool {
+    id.starts_with("8:live:") || id.starts_with("8:msa:") || id.starts_with("8:tfl:") || id.starts_with("8:sfb:")
+}
+
+/// True when a user profile from Teams belongs to an external organization or personal account.
+pub(super) fn is_external_user(user: &Value, id: &str, home_tenant: &str) -> bool {
+    if is_consumer_mri(id) {
+        return true;
+    }
+    if user["isExternal"] == true || user["isFederated"] == true || user["isTflUser"] == true {
+        return true;
+    }
+    let user_type = user["userType"].as_str().unwrap_or("");
+    if matches!(
+        user_type.to_ascii_lowercase().as_str(),
+        "federated" | "external" | "consumer" | "personal" | "tfl"
+    ) {
+        return true;
+    }
+    let tenant = user["tenantId"]
+        .as_str()
+        .or_else(|| user["tenant_id"].as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    !tenant.is_empty() && !home_tenant.is_empty() && !tenant.eq_ignore_ascii_case(home_tenant)
+}
+
+/// Human-readable organization label for an external or personal account.
+pub(super) fn external_org_name(user: &Value, id: &str) -> String {
+    let named = [
+        user["tenantName"].as_str(),
+        user["organizationName"].as_str(),
+        user["companyName"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|s| !s.is_empty());
+    if let Some(org) = named {
+        return org.to_owned();
+    }
+    if is_consumer_mri(id) || user["isTflUser"] == true {
+        return "Personal account".to_owned();
+    }
+    let mail = user["email"]
+        .as_str()
+        .or_else(|| user["userPrincipalName"].as_str())
+        .unwrap_or("");
+    if let Some((_, domain)) = mail.split_once('@') {
+        let domain = domain.trim();
+        if !domain.is_empty() {
+            return domain.to_owned();
+        }
+    }
+    "External".to_owned()
+}
+
+/// True when a search query is shaped like an email address for federated lookup.
+pub(super) fn looks_like_email(query: &str) -> bool {
+    let trimmed = query.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !trimmed.chars().any(char::is_whitespace)
 }
 
 /// Most people whose out-of-office note is held, from the presence answers.
@@ -219,6 +303,15 @@ impl Teams {
                 name if name.is_empty() => format!("{} {}", text("givenName"), text("surname")).trim().to_owned(),
                 name => name,
             };
+            let tenant_id = Some(text("tenantId"))
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| text("tenant_id"));
+            let external = is_external_user(user, id, &self.session.tenant);
+            let tenant_name = if external {
+                external_org_name(user, id)
+            } else {
+                text("tenantName")
+            };
             let known = Known {
                 name,
                 mail: Some(text("userPrincipalName")).filter(|mail| !mail.is_empty()).unwrap_or_else(|| text("email")),
@@ -226,6 +319,9 @@ impl Teams {
                 department: text("department"),
                 bot: id.starts_with("28:") || user["type"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("bot")),
                 guest: user["userType"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("guest")),
+                tenant_id,
+                tenant_name,
+                external,
             };
             learned.push((id.to_owned(), known));
         }
@@ -236,7 +332,13 @@ impl Teams {
         let details: Vec<(String, PersonDetails)> = learned
             .iter()
             .map(|(id, known)| {
-                let mark = known.guest.then_some(Mark::Guest);
+                let mark = if known.external {
+                    Some(Mark::External)
+                } else if known.guest {
+                    Some(Mark::Guest)
+                } else {
+                    None
+                };
                 (id.clone(), PersonDetails { title: known.title.clone(), mark, ..PersonDetails::default() })
             })
             .collect();
@@ -299,26 +401,148 @@ impl Teams {
         }
     }
 
-    /// The tenant's directory, searched on Teams' side. At most 25 land in the store.
+    /// The tenant's directory, searched on Teams' side. When `query` looks like an email address,
+    /// also asks Teams' federated external lookup (`externalsearchv3`) so people in other
+    /// organizations or personal Teams accounts can be found and messaged.
     pub(super) fn search(&self, query: &str) -> Result<(), Fault> {
         let path = "/beta/users/searchV2?includeDLs=false&includeBots=false&enableGuest=true&source=newChat&skypeTeamsInfo=true";
         let found = self.middle(path, Body::Text(query))?;
         let people = Teams::listed(&found);
         self.learn(&people[..people.len().min(25)]);
+        if looks_like_email(query) {
+            let email = query.trim();
+            let ext_url = format!(
+                "{}/beta/users/{}/externalsearchv3?includeTFLUsers=true",
+                self.place()?.middle,
+                escaped(email)
+            );
+            if let Ok(answer) = self.call("GET", &ext_url, Auth::Both(SPACES), Body::None, true) {
+                let mut external_people: Vec<Value> = Teams::listed(&answer.body).to_vec();
+                if external_people.is_empty() && answer.body.is_object() && answer.body["mri"].is_string() {
+                    external_people.push(answer.body);
+                }
+                for person in &mut external_people {
+                    if let Some(obj) = person.as_object_mut() {
+                        let tenant = obj.get("tenantId").and_then(Value::as_str).unwrap_or("");
+                        if tenant.is_empty() || !tenant.eq_ignore_ascii_case(&self.session.tenant) {
+                            obj.insert("isExternal".to_owned(), Value::Bool(true));
+                        }
+                    }
+                }
+                self.learn(&external_people[..external_people.len().min(10)]);
+            }
+        }
         Ok(())
     }
 
+    /// Reads the user's blocked-people list from Teams' middle tier (best-effort) and updates
+    /// local `Relation::Blocked` entries.
+    pub(super) fn load_blocklist(&self) {
+        let Ok(place) = self.place() else {
+            return;
+        };
+        let url = format!("{}/beta/users/blocklist", place.middle);
+        let Ok(answer) = self.call("GET", &url, Auth::Both(SPACES), Body::None, true) else {
+            return;
+        };
+        let list = [
+            &answer.body["blockedUsers"],
+            &answer.body["value"],
+            &answer.body["users"],
+            &answer.body,
+        ]
+        .into_iter()
+        .find_map(Value::as_array);
+        let Some(entries) = list else {
+            return;
+        };
+        let mut blocked_ids = Vec::new();
+        let mut user_objs = Vec::new();
+        for entry in entries {
+            if let Some(mri) = entry.as_str().filter(|s| !s.is_empty()) {
+                blocked_ids.push(mri.to_owned());
+            } else if let Some(mri) = entry["mri"].as_str().or_else(|| entry["id"].as_str()).filter(|s| !s.is_empty()) {
+                blocked_ids.push(mri.to_owned());
+                if entry["displayName"].is_string() || entry["email"].is_string() {
+                    user_objs.push(entry.clone());
+                }
+            }
+        }
+        if !user_objs.is_empty() {
+            self.learn(&user_objs);
+        }
+        {
+            let mut state = self.state();
+            state.blocked = blocked_ids.iter().cloned().collect();
+        }
+        for id in blocked_ids {
+            if let Err(err) = self.ctx.relation(&id, Relation::Blocked) {
+                tracing::warn!("chatd: Teams: {err}");
+            }
+        }
+    }
+
+    /// Blocks or unblocks a person on Teams via the middle-tier blocklist endpoint.
+    pub(super) fn relate(&self, person_id: &str, action: RelateAction) -> Result<(), Fault> {
+        let place = self.place()?;
+        let url = format!("{}/beta/users/blocklist/{}", place.middle, escaped(person_id));
+        match action {
+            RelateAction::Block => {
+                self.call("PUT", &url, Auth::Both(SPACES), Body::Json(&json!({"mri": person_id})), false)?;
+                self.state().blocked.insert(person_id.to_owned());
+                self.ctx.relation(person_id, Relation::Blocked)?;
+                Ok(())
+            }
+            RelateAction::Unblock => {
+                self.call("DELETE", &url, Auth::Both(SPACES), Body::None, false)?;
+                let restored = {
+                    let mut state = self.state();
+                    state.blocked.remove(person_id);
+                    if state.partners.contains_key(person_id) {
+                        Relation::Contact
+                    } else {
+                        Relation::None
+                    }
+                };
+                self.ctx.relation(person_id, restored)?;
+                Ok(())
+            }
+            _ => Err(Fault::Refused {
+                status: 400,
+                message: "Teams only supports blocking and unblocking people here.".to_owned(),
+            }),
+        }
+    }
+
     fn person(&self, id: &str, known: &Known) -> Person {
+        let relation = {
+            let state = self.state();
+            if state.blocked.contains(id) {
+                Relation::Blocked
+            } else if state.partners.contains_key(id) {
+                Relation::Contact
+            } else {
+                Relation::None
+            }
+        };
+        let mark = if known.external {
+            Some(Mark::External)
+        } else if known.guest {
+            Some(Mark::Guest)
+        } else {
+            None
+        };
         Person {
             key: self.ctx.key(id),
             name: if known.name.is_empty() { id.to_owned() } else { known.name.clone() },
             handle: known.mail.clone(),
             avatar: self.picture(id, &known.name),
             bot: known.bot,
-            relation: if self.state().partners.contains_key(id) { Relation::Contact } else { Relation::None },
+            relation,
             presence: self.ctx.presence_of(id),
             status: String::new(),
             link: Teams::link(&known.mail),
+            mark,
             ..Person::new(self.ctx.key(id), "")
         }
     }
@@ -527,9 +751,14 @@ impl Teams {
         let known = learned.into_iter().find(|(id, _)| id == person).map(|(_, known)| known).or_else(|| self.cached(person));
         let known = known.unwrap_or_default();
         let (away, away_until) = self.state().away.get(person).cloned().unwrap_or_default();
+        let mut fields = Vec::new();
+        if known.external && !known.tenant_name.is_empty() {
+            fields.push(("Organization".to_owned(), known.tenant_name.clone()));
+        }
         Ok(About {
             title: known.title,
             department: known.department,
+            fields,
             contacts: Some(known.mail).filter(|mail| !mail.is_empty()).map(|value| Contact { kind: ContactKind::Email, value, masked: false }).into_iter().collect(),
             away,
             away_until,
@@ -689,5 +918,25 @@ mod tests {
             Teams::share_history_ms(Some(protocol::HistoryShare::Days { days: 7 }), now),
             now - 7 * 86_400_000
         );
+    }
+
+    #[test]
+    fn external_detection_and_email_shape_distinguish_federated_and_personal_accounts() {
+        let home = "11111111-1111-4111-8111-111111111111";
+        let internal = json!({"tenantId": home, "userType": "Member", "tenantName": "Contoso"});
+        assert!(!is_external_user(&internal, "8:orgid:ana", home));
+
+        let federated = json!({"tenantId": "99999999-9999-4999-8999-999999999999", "tenantName": "Fabrikam"});
+        assert!(is_external_user(&federated, "8:orgid:ext1", home));
+        assert_eq!(external_org_name(&federated, "8:orgid:ext1"), "Fabrikam");
+
+        let personal = json!({"email": "sam@outlook.com"});
+        assert!(is_external_user(&personal, "8:live:sam123", home));
+        assert_eq!(external_org_name(&personal, "8:live:sam123"), "Personal account");
+
+        assert!(looks_like_email("eva@fabrikam.com"));
+        assert!(!looks_like_email("eva"));
+        assert!(!looks_like_email("eva@localhost"));
+        assert!(!looks_like_email("eva @fabrikam.com"));
     }
 }

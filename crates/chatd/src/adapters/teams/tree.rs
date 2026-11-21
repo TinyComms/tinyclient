@@ -6,7 +6,7 @@
 use super::{chain_id, escaped, id_of, millis, now_ms, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, TREE_FRESH};
 use crate::adapters::{ActivityPage, Command};
 use crate::store::{ConversationRow, Filing, PreviewLine, SpaceRow};
-use protocol::{ActivityItem, ActivityItemKind, CallSupport, ConversationKind, Relation, Special};
+use protocol::{ActivityItem, ActivityItemKind, CallSupport, ConversationKind, Mark, Relation, Special};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -221,6 +221,7 @@ impl Teams {
             if let Err(fault) = self.activity_feed() {
                 tracing::warn!("chatd: Teams: activity: {}", super::reason(fault));
             }
+            self.load_blocklist();
         }
         Ok(())
     }
@@ -273,6 +274,18 @@ impl Teams {
             let mut row = self.chat_row(id, &title_of(chat), &people, partner.map(String::as_str));
             row.position = position as i32;
             row.meeting = is_meeting(chat);
+            let pending_req = is_pending_request(chat);
+            let chat_external = is_external_chat(chat, &people, &self.session.tenant)
+                || people.iter().any(|p| self.cached(p).is_some_and(|k| k.external) || super::people::is_consumer_mri(p));
+            if chat_external {
+                row.mark = Some(Mark::External);
+            } else if partner.is_some_and(|p| self.cached(p).is_some_and(|k| k.guest)) {
+                row.mark = Some(Mark::Guest);
+            }
+            if pending_req {
+                row.special = Special::Request;
+                row.mark.get_or_insert(Mark::External);
+            }
             let pin = pinned_order.iter().position(|pinned_id| pinned_id == id).map(|ix| ix as i32);
             row.filing = Some(Filing { hidden: chat["hidden"] == true, pin, ..Filing::default() });
             if row.title.is_empty() {
@@ -286,8 +299,10 @@ impl Teams {
                     _ => "Chat".to_owned(),
                 };
             }
-            if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
-                partners.insert(partner.clone(), id.to_owned());
+            if !pending_req {
+                if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
+                    partners.insert(partner.clone(), id.to_owned());
+                }
             }
             if counted.unread && warm.len() < WARMED {
                 warm.push(id.to_owned());
@@ -298,8 +313,15 @@ impl Teams {
                 self.ctx.preview(id, &line)?;
             }
         }
-        // The list the user owns on Teams: the people they have a chat with. Apps are not people.
-        let relations: Vec<(String, Relation)> = partners.keys().map(|person| (person.clone(), Relation::Contact)).collect();
+        // The list the user owns on Teams: the people they have a chat with, plus any blocked people.
+        // Apps are not people.
+        let blocked: HashSet<String> = self.state().blocked.clone();
+        let mut relations: Vec<(String, Relation)> = partners
+            .keys()
+            .filter(|person| !blocked.contains(*person))
+            .map(|person| (person.clone(), Relation::Contact))
+            .collect();
+        relations.extend(blocked.into_iter().map(|person| (person, Relation::Blocked)));
         self.ctx.relations(&relations)?;
         {
             let mut state = self.state();
@@ -746,13 +768,27 @@ impl Teams {
         let mut row = self.chat_row(thread, text(properties, "topic"), &people, partner);
         row.meeting = thread.starts_with("19:meeting_");
         row.position = LAST;
+        let pending_req = is_pending_request(&described);
+        let chat_external = is_external_chat(&described, &people, &self.session.tenant)
+            || people.iter().any(|p| self.cached(p).is_some_and(|k| k.external) || super::people::is_consumer_mri(p));
+        if chat_external {
+            row.mark = Some(Mark::External);
+        } else if partner.is_some_and(|p| self.cached(p).is_some_and(|k| k.guest)) {
+            row.mark = Some(Mark::Guest);
+        }
+        if pending_req {
+            row.special = Special::Request;
+            row.mark.get_or_insert(Mark::External);
+        }
         if row.title.is_empty() {
             row.title = if people.len() > 1 { format!("Group chat ({})", people.len() + 1) } else { "Chat".to_owned() };
         }
         self.ctx.conversation(&row)?;
-        if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
-            self.state().partners.insert(partner.to_owned(), thread.to_owned());
-            self.ctx.relation(partner, Relation::Contact)?;
+        if !pending_req {
+            if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
+                self.state().partners.insert(partner.to_owned(), thread.to_owned());
+                self.ctx.relation(partner, Relation::Contact)?;
+            }
         }
         Ok(true)
     }
@@ -825,6 +861,43 @@ fn title_of(chat: &Value) -> String {
 /// A meeting's chat: by its id, or by what the list says it is (unverified field).
 fn is_meeting(chat: &Value) -> bool {
     text(chat, "id").starts_with("19:meeting_") || chat["chatType"] == "meeting" || chat["meetingInformation"].is_object()
+}
+
+/// True when a Teams chat object or thread description indicates a pending external/federated
+/// chat request awaiting Accept or Block.
+pub(super) fn is_pending_request(chat: &Value) -> bool {
+    let flag = |v: &Value| *v == Value::Bool(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"));
+    let word = |v: &Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("pending"));
+    let props = &chat["properties"];
+    flag(&chat["isPending"])
+        || flag(&chat["isExternalChatPending"])
+        || flag(&props["isPendingExternal"])
+        || flag(&props["isExternalChatPending"])
+        || word(&chat["chatState"])
+        || word(&chat["acceptanceStatus"])
+        || word(&props["externalChatState"])
+        || word(&props["chatState"])
+}
+
+/// True when a Teams chat or thread description involves someone outside our tenant.
+pub(super) fn is_external_chat(chat: &Value, people: &[String], home_tenant: &str) -> bool {
+    let flag = |v: &Value| *v == Value::Bool(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"));
+    let props = &chat["properties"];
+    if flag(&chat["isExternal"])
+        || flag(&chat["isFederated"])
+        || flag(&props["isExternal"])
+        || flag(&props["isFederated"])
+        || flag(&props["isExternalThread"])
+    {
+        return true;
+    }
+    if people.iter().any(|p| super::people::is_consumer_mri(p)) {
+        return true;
+    }
+    chat["members"].as_array().into_iter().flatten().any(|m| {
+        let tid = m["tenantId"].as_str().unwrap_or("");
+        !tid.is_empty() && !home_tenant.is_empty() && !tid.eq_ignore_ascii_case(home_tenant)
+    })
 }
 
 /// The chat list's `lastMessage` as the row's preview line, its markup read for words alone.

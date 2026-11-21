@@ -196,6 +196,8 @@ struct Fake {
     saved: Mutex<Vec<Value>>,
     /// Dynamically created group threads (for #619).
     threads: Mutex<HashMap<String, Value>>,
+    /// Blocked user MRIs (for #621).
+    blocked: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -232,6 +234,7 @@ impl Fake {
                 }
             })]),
             threads: Mutex::default(),
+            blocked: Mutex::new(vec!["8:orgid:00000000-0000-4000-8000-0000000000bb".to_owned()]),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -531,6 +534,32 @@ impl Fake {
                         "properties": {"threadType": "chat", "topic": "Budget Archive"},
                         "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
                     })),
+                    "19:extreq1@unq.gbl.spaces" => Some(json!({
+                        "id": thread,
+                        "properties": {
+                            "threadType": "chat",
+                            "uniquerosterthread": "true",
+                            "isExternal": "true",
+                            "externalChatState": "pending"
+                        },
+                        "members": [
+                            {"id": ME, "role": "Admin"},
+                            {"id": "8:orgid:00000000-0000-4000-8000-0000000000e1", "role": "Admin", "tenantId": "99999999-9999-4999-8999-999999999999"}
+                        ]
+                    })),
+                    "19:extreq2@unq.gbl.spaces" => Some(json!({
+                        "id": thread,
+                        "properties": {
+                            "threadType": "chat",
+                            "uniquerosterthread": "true",
+                            "isExternal": "true",
+                            "externalChatState": "pending"
+                        },
+                        "members": [
+                            {"id": ME, "role": "Admin"},
+                            {"id": "8:live:personal_spammer", "role": "Admin"}
+                        ]
+                    })),
                     "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
                     _ => None,
                 });
@@ -735,10 +764,32 @@ impl Fake {
         }))
     }
 
-    /// The middle tier: people by id, people by name, and their pictures.
+    /// The middle tier: people by id, people by name, federated lookup, blocklist, and previews.
     fn middle(&self, call: &Call) -> Reply {
-        let users = self.fixture("users").unwrap();
-        let users = users.as_array().unwrap();
+        let mut users = self.fixture("users").unwrap().as_array().cloned().unwrap_or_default();
+        users.push(json!({
+            "mri": "8:orgid:00000000-0000-4000-8000-0000000000e1",
+            "displayName": "Eva Vance",
+            "email": "eva@fabrikam.com",
+            "userPrincipalName": "eva@fabrikam.com",
+            "tenantId": "99999999-9999-4999-8999-999999999999",
+            "tenantName": "Fabrikam",
+            "userType": "Federated",
+            "type": "ADUser"
+        }));
+        users.push(json!({
+            "mri": "8:live:personal_spammer",
+            "displayName": "Sam Consumer",
+            "email": "sam@outlook.com",
+            "type": "Consumer"
+        }));
+        users.push(json!({
+            "mri": "8:orgid:00000000-0000-4000-8000-0000000000bb",
+            "displayName": "Blocked Bob",
+            "email": "bob@other.org",
+            "tenantId": "88888888-8888-4888-8888-888888888888",
+            "tenantName": "OtherCorp"
+        }));
         if call.path.ends_with("/beta/users/fetchShortProfile") {
             let wanted = call.json();
             let wanted: Vec<&str> = wanted.as_array().unwrap().iter().filter_map(Value::as_str).collect();
@@ -747,8 +798,57 @@ impl Fake {
         }
         if call.path.ends_with("/beta/users/searchV2") {
             let query = call.body.to_lowercase();
-            let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
+            let found: Vec<&Value> = users
+                .iter()
+                .filter(|user| {
+                    user["tenantName"].as_str() == Some("Contoso")
+                        && user["displayName"].as_str().unwrap().to_lowercase().contains(&query)
+                })
+                .collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
+        }
+        if call.path.ends_with("/externalsearchv3") {
+            let email = call
+                .path
+                .trim_end_matches("/externalsearchv3")
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            let found: Vec<&Value> = users
+                .iter()
+                .filter(|u| u["email"].as_str().is_some_and(|e| e.to_lowercase() == email))
+                .collect();
+            return ok(json!({"value": found}));
+        }
+        if call.path.ends_with("/beta/users/blocklist") && call.method == "GET" {
+            let list: Vec<Value> = self
+                .blocked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|mri| {
+                    users
+                        .iter()
+                        .find(|u| u["mri"].as_str() == Some(mri.as_str()))
+                        .cloned()
+                        .unwrap_or_else(|| json!({"mri": mri}))
+                })
+                .collect();
+            return ok(json!({"blockedUsers": list}));
+        }
+        if let Some(mri) = call.path.split("/beta/users/blocklist/").nth(1) {
+            if call.method == "PUT" {
+                let mut blocked = self.blocked.lock().unwrap();
+                if !blocked.iter().any(|b| b == mri) {
+                    blocked.push(mri.to_owned());
+                }
+                return ok(json!({}));
+            }
+            if call.method == "DELETE" {
+                self.blocked.lock().unwrap().retain(|b| b != mri);
+                return ok(json!({}));
+            }
         }
         if call.path.ends_with("/v1/urlpreview") {
             let asked = call.json();
@@ -3095,5 +3195,136 @@ fn group_chat_create_rename_add_with_history_remove_and_live_topic_update() {
     world.until("live TopicUpdate updates row title", || {
         world.conversation(&grp_key).filter(|row| row.title == "Resolved Bridge")
     });
+}
+
+#[test]
+fn external_federated_badge_request_accept_block_and_email_lookup() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account(HOME).can.blocks);
+
+    // 1. Blocked list loaded on connect surfaces Blocked Bob under Relation::Blocked.
+    let blocked = world.until("initial blocked list loaded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Teams),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::People { people, .. } if !people.is_empty() => Some(people),
+            _ => None,
+        }
+    });
+    assert!(blocked.iter().any(|p| p.key.id == "8:orgid:00000000-0000-4000-8000-0000000000bb"));
+
+    // 2. Email search invokes federated externalsearchv3 and marks the outside user Mark::External
+    //    with their organization name ("Fabrikam").
+    let eva = world.until("federated email search finds Eva", || {
+        match world.ask(Request::People {
+            network: Some(Network::Teams),
+            relation: None,
+            query: Some("eva@fabrikam.com".to_owned()),
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::People { people, .. } => people
+                .into_iter()
+                .find(|p| p.key.id == "8:orgid:00000000-0000-4000-8000-0000000000e1"),
+            _ => None,
+        }
+    });
+    assert_eq!(eva.mark, Some(protocol::Mark::External));
+    let eva_profile = match world.ask(Request::Profile { person: eva.key.clone(), space: None }) {
+        Response::Profile { profile } => profile,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(eva_profile.fields.iter().any(|(k, v)| k == "Organization" && v == "Fabrikam"), "{:?}", eva_profile.fields);
+
+    // 3. Incoming pending external chat lands on Shelf::Requests with Mark::External & Special::Request.
+    let ext_req1 = key("19:extreq1@unq.gbl.spaces");
+    world.fake.push(
+        "NewMessage",
+        message(
+            "19:extreq1@unq.gbl.spaces",
+            None,
+            1_760_009_600_001,
+            "8:orgid:00000000-0000-4000-8000-0000000000e1",
+            "Eva Vance",
+            "<p>Hello from Fabrikam!</p>",
+        ),
+        false,
+    );
+    let pending_row = world.until("pending external request arrives", || {
+        world.conversation(&ext_req1).filter(|r| r.special == protocol::Special::Request)
+    });
+    assert_eq!(pending_row.mark, Some(protocol::Mark::External));
+
+    let req_shelf = match world.ask(Request::Home {
+        network: Network::Teams,
+        account: None,
+        folder: None,
+        shelf: protocol::Shelf::Requests,
+        offset: 0,
+        limit: 20,
+    }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(req_shelf.iter().any(|c| c.key == ext_req1));
+
+    // ConversationInfo surfaces the external org name.
+    let ext_info = match world.ask(Request::ConversationInfo { conversation: ext_req1.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(ext_info.external, "Fabrikam");
+
+    // 4. Accepting the request clears Special::Request, keeps Mark::External, and writes accepted state.
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: ext_req1.clone(), accept: true }),
+        Response::Ok
+    );
+    let accepted = world.conversation(&ext_req1).unwrap();
+    assert_eq!(accepted.special, protocol::Special::None);
+    assert_eq!(accepted.mark, Some(protocol::Mark::External));
+
+    // 5. Declining/blocking a second external request (personal account) blocks the sender and removes the chat.
+    let ext_req2 = key("19:extreq2@unq.gbl.spaces");
+    world.fake.push(
+        "NewMessage",
+        message(
+            "19:extreq2@unq.gbl.spaces",
+            None,
+            1_760_009_600_002,
+            "8:live:personal_spammer",
+            "Sam Consumer",
+            "<p>Buy my widgets</p>",
+        ),
+        false,
+    );
+    world.until("second external request arrives", || {
+        world.conversation(&ext_req2).filter(|r| r.special == protocol::Special::Request)
+    });
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: ext_req2.clone(), accept: false }),
+        Response::Ok
+    );
+    assert!(world.conversation(&ext_req2).is_none());
+    assert!(
+        !world.fake.calls("PUT", "/beta/users/blocklist/8:live:personal_spammer").is_empty(),
+        "declining external request must block sender"
+    );
+
+    // 6. Unblocking restores relation via DELETE /beta/users/blocklist/{mri}.
+    assert_eq!(
+        world.ask(Request::Relate {
+            person: key("8:live:personal_spammer"),
+            action: protocol::RelateAction::Unblock,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", "/beta/users/blocklist/8:live:personal_spammer").is_empty());
 }
 

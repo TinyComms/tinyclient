@@ -368,6 +368,8 @@ struct State {
     activity_newest_ms: i64,
     /// When the last server-side search ran, for separate pacing.
     search_at: Option<Instant>,
+    /// Blocked user MRIs on Teams.
+    blocked: HashSet<String>,
 }
 
 /// What a call presents.
@@ -959,6 +961,7 @@ impl Teams {
             search: true,
             search_global: true,
             groups: 250,
+            blocks: true,
             pin_chats: 15,
             close_direct: true,
             clear_history: true,
@@ -1088,6 +1091,12 @@ impl Teams {
             }
             Command::Search { query, scope, filters, cursor, at, reply } => {
                 let _ = reply.send(self.search_messages(&query, &scope, &filters, cursor.as_deref(), at).map_err(refuse));
+            }
+            Command::Relate { person_id, action, reply } => {
+                let _ = reply.send(self.relate(&person_id, action).map_err(refuse));
+            }
+            Command::AnswerMessageRequest { conversation_id, accept, reply } => {
+                let _ = reply.send(self.answer_external_request(&conversation_id, accept).map_err(refuse));
             }
             Command::CloseDirect { conversation_id, reply } => {
                 let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));

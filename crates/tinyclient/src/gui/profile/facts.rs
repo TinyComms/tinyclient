@@ -801,6 +801,7 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
             format!("Block {name} on {net}?"),
             match network {
                 Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them from their profile or Blocked.".to_owned(),
+                Network::Teams => "They won't be able to message or call you on Teams. You can unblock them from their profile or Blocked.".to_owned(),
                 Network::Tiny => "They won't be able to message or call you, and their messages in channels are hidden. You can unblock them from their profile or Blocked.".to_owned(),
                 _ => format!("They won't be able to message or call you on {net}. You can unblock them in {net}."),
             },
@@ -934,8 +935,22 @@ pub fn conversation_tag(conversation: &Conversation, info: Option<&ConversationI
     if let Some(external) = info.map(|info| info.external.trim()).filter(|external| !external.is_empty()) {
         return Some(match conversation.key.network {
             Network::Slack => format!("External · {external}"),
+            Network::Teams if !external.eq_ignore_ascii_case("Shared channel") => {
+                if external.eq_ignore_ascii_case("External") {
+                    "External".to_owned()
+                } else {
+                    format!("External · {external}")
+                }
+            }
             _ => "Shared".to_owned(),
         });
+    }
+    if conversation.key.network == Network::Teams {
+        match conversation.mark {
+            Some(protocol::Mark::External) => return Some("External".to_owned()),
+            Some(protocol::Mark::Guest) => return Some("Guest".to_owned()),
+            _ => {}
+        }
     }
     // Signal marks every chat private because the chat is encrypted. That is not a private channel.
     if conversation.private && conversation.key.network != Network::Signal {
@@ -1297,6 +1312,14 @@ mod tests {
         assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Direct)), NotifyControl::LocalSwitch);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
+        let teams_dm = row(Network::Teams, ConversationKind::Direct);
+        assert_eq!(conversation_tag(&teams_dm, Some(&info)).as_deref(), Some("External · Northwind"));
+        info.external = "Shared channel".into();
+        assert_eq!(conversation_tag(&teams_dm, Some(&info)).as_deref(), Some("Shared"));
+        info.external.clear();
+        let mut teams_marked = row(Network::Teams, ConversationKind::Direct);
+        teams_marked.mark = Some(protocol::Mark::External);
+        assert_eq!(conversation_tag(&teams_marked, None).as_deref(), Some("External"));
         info.creator = "Dev Patel".into();
         assert!(created_line(&info).is_empty() || created_line(&info) == "Created by Dev Patel");
         assert_eq!(thousands(1_204), "1,204");

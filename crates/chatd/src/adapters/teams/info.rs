@@ -240,6 +240,24 @@ impl Teams {
         };
         let created = millis(&id_of(&properties["createdat"])) / 1000;
         let shared = properties["sharedChannel"] == true || properties["threadType"] == "sharedChannel";
+        let external = if shared {
+            "Shared channel".to_owned()
+        } else if let Some(peer) = row.as_ref().and_then(|r| r.peer.as_deref()) {
+            self.cached(peer)
+                .filter(|k| k.external || k.guest)
+                .map(|k| {
+                    if !k.tenant_name.is_empty() {
+                        k.tenant_name
+                    } else if k.external {
+                        "External".to_owned()
+                    } else {
+                        "Guest".to_owned()
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let pinned_entries = parse_pinned_messages(properties);
         let pinned_count = Some(pinned_entries.len() as u32);
         self.state().pinned_messages.insert(thread.to_owned(), pinned_entries);
@@ -251,7 +269,7 @@ impl Teams {
             creator,
             notify,
             pinned: pinned_count,
-            external: if shared { "Shared channel".to_owned() } else { String::new() },
+            external,
             link: self.share_link(thread, row.as_ref(), shared),
             ..ConversationAbout::default()
         })
@@ -425,6 +443,58 @@ impl Teams {
         self.state().pinned_chats.retain(|id| id != thread);
         self.ctx.conversation_gone(thread)?;
         Ok(())
+    }
+
+    /// Accepts or declines/blocks a pending external Teams chat request (`Special::Request`).
+    pub(super) fn answer_external_request(&self, conversation: &str, accept: bool) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        let known = self.ctx.known(thread)?;
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=externalChatState", escaped(thread));
+        if accept {
+            self.chat("PUT", &path, Body::Json(&json!({"externalChatState": "accepted"})), false)?;
+            if let Some(known) = known {
+                let row = crate::store::ConversationRow {
+                    space: known.space,
+                    group: known.group,
+                    position: known.position,
+                    avatar: known.avatar.map(|a| a.id),
+                    peer: known.peer.clone(),
+                    call: known.call,
+                    call_video: known.call_video,
+                    limit: known.limit,
+                    topic: known.topic,
+                    parent: known.parent,
+                    root: known.root,
+                    read_only: known.read_only,
+                    read_only_reason: known.read_only_reason,
+                    private: known.private,
+                    encryption: known.encryption,
+                    bot: known.bot,
+                    meeting: known.meeting,
+                    special: protocol::Special::None,
+                    mark: known.mark,
+                    opted_out: known.opted_out,
+                    rights: known.rights,
+                    can_pin: known.can_pin,
+                    moderate: known.moderate,
+                    joined: known.joined,
+                    ..crate::store::ConversationRow::new(&known.key.id, known.kind, &known.title)
+                };
+                self.ctx.conversation(&row)?;
+                if let Some(peer) = known.peer.filter(|p| p.starts_with("8:")) {
+                    self.state().partners.insert(peer.clone(), thread.to_owned());
+                    self.ctx.relation(&peer, protocol::Relation::Contact)?;
+                }
+            }
+            Ok(())
+        } else {
+            let _ = self.chat("PUT", &path, Body::Json(&json!({"externalChatState": "blocked"})), false);
+            if let Some(peer) = known.and_then(|k| k.peer).filter(|p| p.starts_with("8:")) {
+                self.relate(&peer, protocol::RelateAction::Block)?;
+            }
+            self.ctx.conversation_gone(thread)?;
+            Ok(())
+        }
     }
 
     /// Renames a Teams group chat or channel and/or updates its description.

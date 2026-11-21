@@ -357,6 +357,15 @@ pub fn signal(home: &Home) -> Vec<Item> {
 /// teams, collapsed, each showing the channels that need me (rule 3) or all when opened.
 pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Conversation>>, open: Option<&Key>, now: i64) -> Vec<Item> {
     let mut out = Vec::new();
+    if home.requests > 0 {
+        out.push(Item::Action {
+            act: Act::Requests,
+            icon: "icons/mail.svg",
+            words: "Message requests".into(),
+            after: home.requests.to_string(),
+            dot: None,
+        });
+    }
     let pinned: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| c.starred || c.pin.is_some()).collect();
     if !pinned.is_empty() {
         header(&mut out, "Pinned");
@@ -609,6 +618,17 @@ mod tests {
         let home = Home { chats: vec![Rc::new(notes), Rc::new(ana)], ..Home::for_network(Network::Teams) };
         let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
         assert_eq!(got, ["[Chats]", "ana", "notes"]);
+    }
+
+    #[test]
+    fn teams_shows_message_requests_row_when_pending() {
+        let home = Home {
+            requests: 2,
+            chats: vec![chat("ana", 0)],
+            ..Home::for_network(Network::Teams)
+        };
+        let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
+        assert_eq!(got, ["<Message requests>", "[Chats]", "ana"]);
     }
 
     #[test]
