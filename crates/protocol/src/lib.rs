@@ -479,6 +479,9 @@ pub struct Conversation {
     /// Only invited people see it: drawn with a lock.
     #[serde(default, skip_serializing_if = "is_false")]
     pub private: bool,
+    /// Shared channel across teams or organizations (Teams `channelType == 2`): drawn with a link icon.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
     /// End-to-end encrypted or not, where the network says (a Tiny server). A plaintext
     /// conversation can be upgraded once; messages from before that stay readable by the server.
     #[serde(default, skip_serializing_if = "Encryption::is_unknown")]
@@ -615,6 +618,7 @@ impl Conversation {
             limit: 0,
             read_only: false,
             private: false,
+            shared: false,
             encryption: Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(),

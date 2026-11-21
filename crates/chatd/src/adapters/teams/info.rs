@@ -134,7 +134,18 @@ impl Teams {
             }
         };
         let created = millis(&id_of(&properties["createdat"])) / 1000;
-        let shared = properties["sharedChannel"] == true || properties["threadType"] == "sharedChannel";
+        let shared = properties["sharedChannel"] == true
+            || properties["threadType"] == "sharedChannel"
+            || row.as_ref().is_some_and(|r| r.shared);
+        let external = if shared {
+            if row.as_ref().is_some_and(|r| r.mark == Some(protocol::Mark::External)) {
+                "External shared channel".to_owned()
+            } else {
+                "Shared channel".to_owned()
+            }
+        } else {
+            String::new()
+        };
         Ok(ConversationAbout {
             // A chat's topic is its title, already on the row: only a description is more.
             description: text("description"),
@@ -142,7 +153,7 @@ impl Teams {
             created: (created > 0).then_some(created),
             creator,
             notify,
-            external: if shared { "Shared channel".to_owned() } else { String::new() },
+            external,
             link: self.share_link(thread, row.as_ref(), shared),
             ..ConversationAbout::default()
         })

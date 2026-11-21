@@ -190,6 +190,8 @@ struct Fake {
     heard: Mutex<Vec<String>>,
     pushed: AtomicU32,
     posted: AtomicU32,
+    /// Optional replacement payload for `/api/csa/api/v1/teams/users/me`.
+    teams_override: Mutex<Option<Value>>,
 }
 
 impl Fake {
@@ -206,6 +208,7 @@ impl Fake {
             heard: Mutex::default(),
             pushed: AtomicU32::new(0),
             posted: AtomicU32::new(0),
+            teams_override: Mutex::default(),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -319,7 +322,15 @@ impl Fake {
                 authz["tokens"]["skypeToken"] = skype.into();
                 ok(authz)
             }
-            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => ok(self.fixture("teams.users.me").unwrap()),
+            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => {
+                let body = self
+                    .teams_override
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| self.fixture("teams.users.me").unwrap());
+                ok(body)
+            }
             "/v4/a" if header("x-skypetoken") == skype => ok(json!({
                 "socketio": format!("{}/", self.base), "surl": format!("{}/v4/f/abc123/", self.base),
                 "url": format!("{}/v4/f/abc123/", self.base), "ttl": 587_000, "ccid": "cc-1",
@@ -2359,4 +2370,92 @@ fn read_by_lists_readers_and_live_seen_updates_on_horizon_push() {
         world.conversation(&ana).filter(|row| row.seen)
     });
     assert!(seen_row.seen);
+}
+
+#[test]
+fn shared_channels_are_distinguished_from_private_and_external_orgs_marked() {
+    let world = World::start();
+    world.ready();
+
+    // Replace the teams/users/me payload with a team having standard (0), private (1),
+    // same-org shared (2), and an external-org shared channel whose host team we are not a member of.
+    let ext_tenant = "99999999-9999-4999-8999-999999999999";
+    let custom = json!({
+        "teams": [
+            {
+                "id": GENERAL,
+                "displayName": "Platform",
+                "isDeleted": false,
+                "isArchived": false,
+                "tenantId": HOME,
+                "channels": [
+                    {
+                        "id": GENERAL,
+                        "displayName": "General",
+                        "isGeneral": true,
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "channelType": 0,
+                        "tenantId": HOME
+                    },
+                    {
+                        "id": "19:platform0leads@thread.tacv2",
+                        "displayName": "Leads",
+                        "isGeneral": false,
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "channelType": 1,
+                        "tenantId": HOME
+                    },
+                    {
+                        "id": "19:platform0shared@thread.tacv2",
+                        "displayName": "Cross-Team Sync",
+                        "isGeneral": false,
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "channelType": 2,
+                        "tenantId": HOME
+                    }
+                ]
+            }
+        ],
+        "sharedChannels": [
+            {
+                "id": "19:partner0extshared@thread.tacv2",
+                "displayName": "Vendor Launch",
+                "parentTeamId": "19:partner0general@thread.tacv2",
+                "parentTeamName": "Partner Engineering",
+                "isGeneral": false,
+                "isFavorite": true,
+                "isDeleted": false,
+                "channelType": 2,
+                "tenantId": ext_tenant
+            }
+        ],
+        "chats": []
+    });
+    *world.fake.teams_override.lock().unwrap() = Some(custom);
+    // Trigger a fresh teams/users/me listing via trouter.message_loss.
+    world.fake.socket.lock().unwrap().as_ref().unwrap().send("5:99+::{\"name\":\"trouter.message_loss\"}".to_owned()).unwrap();
+
+    // Wait for the external shared channel to appear under its host team.
+    let ext_row = world.until("external shared channel listed", || {
+        world.conversation(&key("19:partner0extshared@thread.tacv2"))
+    });
+    assert!(ext_row.shared, "channelType 2 must set shared=true");
+    assert!(!ext_row.private, "shared channel must not be marked private (lock)");
+    assert_eq!(ext_row.mark, Some(protocol::Mark::External), "cross-tenant shared channel must be marked External");
+    assert_eq!(ext_row.space.as_deref(), Some("19:partner0general@thread.tacv2"));
+
+    // Standard, private, and same-org shared channels in Platform.
+    let std_row = world.conversation(&key(GENERAL)).unwrap();
+    assert!(!std_row.private && !std_row.shared && std_row.mark.is_none());
+
+    let priv_row = world.conversation(&key("19:platform0leads@thread.tacv2")).unwrap();
+    assert!(priv_row.private && !priv_row.shared && priv_row.mark.is_none());
+
+    let same_org_shared = world.conversation(&key("19:platform0shared@thread.tacv2")).unwrap();
+    assert!(same_org_shared.shared, "same-org channelType 2 must set shared=true");
+    assert!(!same_org_shared.private, "same-org shared channel must not set private=true");
+    assert_eq!(same_org_shared.mark, None, "same-org shared channel should not be marked External");
 }
