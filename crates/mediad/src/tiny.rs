@@ -1377,9 +1377,10 @@ impl Call {
                 }
             }
         }
-        let keep_camera = self.controls.camera();
+        let preview_camera = !self.controls.camera() && self.controls.camera_preview();
+        let keep_camera = self.controls.camera() || preview_camera;
         let share = self.connected && self.sending_share && self.controls.share();
-        let camera = self.connected && self.sending_camera && keep_camera;
+        let camera = self.connected && self.sending_camera && self.controls.camera();
         let desired = video::desired(share, camera);
         if let Some(estimate) = self.estimate {
             let estimate = self.uplink.usable(estimate, desired, Instant::now());
@@ -1394,7 +1395,7 @@ impl Call {
             self.desired = desired;
             self.link.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
         }
-        self.video.want(Wants { share, camera, keep_camera, rates: self.rates });
+        self.video.want(Wants { share, camera, preview_camera, keep_camera, rates: self.rates });
         while let Some(word) = self.video.next() {
             match word {
                 Word::Frame { track, payload, rtp, at } => self.write_video(track, payload, rtp, at),

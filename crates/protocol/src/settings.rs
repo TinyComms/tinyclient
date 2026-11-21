@@ -278,7 +278,7 @@ fn kind(key: &str) -> Option<Kind> {
         VOICE_VOLUME => Kind::Percent(100),
         INPUT_VOLUME => Kind::Percent(100),
         SENSITIVITY => Kind::Percent(25),
-        INPUT | OUTPUT => Kind::Device,
+        INPUT | OUTPUT | CAMERA => Kind::Device,
         PTT_KEY | PRIORITY_KEY | MUTE_KEY | DEAFEN_KEY => Kind::Hotkey,
         _ if gain_user(key).is_some() => Kind::Gain,
         KEEP_DAYS => Kind::Choice(&KEEP_DAYS_CHOICES, 90),

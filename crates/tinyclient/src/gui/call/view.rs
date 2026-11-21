@@ -277,7 +277,6 @@ impl Shell {
             && subject.kind.is_direct()
             && call.state == CallState::Joined
             && (call.participants.len() + 1) < 10;
-        let menu = self.call_menu();
 
         let back = icon_button("call-view-back", "icons/arrow-left.svg", false)
             .tooltip(tip("Back to conversation (Esc)", None))
@@ -359,14 +358,6 @@ impl Shell {
             },
             cx,
         );
-        let bar_popover = match menu {
-            Some(Menu::Devices) => Some((300., self.call_devices_menu(&call, cx).p(px(6.)))),
-            Some(Menu::AddPeople) => Some((280., self.call_add_people_menu(&call, cx).p(px(6.)))),
-            Some(Menu::Person { account, user_id, name }) => {
-                Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
-            }
-            _ => None,
-        };
         div()
             .id("call-view-pane")
             .size_full()
@@ -375,39 +366,7 @@ impl Shell {
             .child(bar)
             .children(banner)
             .child(stage_el)
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .flex_none()
-                    .child(controls)
-                    .children(bar_popover.map(|(width, body)| {
-                        deferred(
-                            div()
-                                .id("call-view-popover")
-                                .absolute()
-                                .bottom(relative(1.))
-                                .left_0()
-                                .right_0()
-                                .pb(px(8.))
-                                .flex()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .w(px(width))
-                                        .rounded(px(12.))
-                                        .bg(theme::overlay())
-                                        .border_1()
-                                        .border_color(theme::border())
-                                        .shadow(theme::shadow_popover())
-                                        .occlude()
-                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                                        .child(body),
-                                ),
-                        )
-                        .priority(1)
-                    })),
-            )
+            .child(controls)
     }
 
     /// Over the stage while my call here is not simply up: connecting or reconnecting with how
@@ -1781,6 +1740,7 @@ impl Shell {
             }))
         });
         let camera = pictures.then(|| {
+            let call_cam = call.cloned();
             bar_button(
                 "tiny-bar-camera",
                 "icons/video.svg",
@@ -1788,7 +1748,12 @@ impl Shell {
             )
             .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
+                cx.stop_propagation();
+                if let Some(call) = &call_cam {
+                    this.call_camera_clicked(call, camera_on, cx);
+                } else {
+                    this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
+                }
             }))
         });
         let refused = self
@@ -1822,18 +1787,34 @@ impl Shell {
                     .tooltip(tip(words, None))
                     .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_health(cx)))
             });
-        let devices = bar_button("tiny-bar-devices", "icons/settings.svg", BarLook::Rest)
-            .tooltip(tip("Devices", None))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if room_context {
-                    crate::gui::settings::open(crate::gui::settings::Section::Audio, cx);
-                } else {
-                    cx.stop_propagation();
-                    this.call_menu_toggle(Menu::Devices, cx);
-                }
-            }));
+        let has_call = call.is_some();
+        let menu = self.call_menu();
+        let devices = bar_button(
+            "tiny-bar-devices",
+            "icons/settings.svg",
+            if menu == Some(Menu::Devices) { BarLook::On } else { BarLook::Rest },
+        )
+        .tooltip(tip("Devices", None))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if has_call {
+                cx.stop_propagation();
+                this.call_menu_toggle(Menu::Devices, cx);
+            } else {
+                crate::gui::settings::open(crate::gui::settings::Section::Audio, cx);
+            }
+        }));
+        let bar_popover = call.and_then(|call| match menu {
+            Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
+            Some(Menu::CameraPreview) => Some((284., self.call_camera_preview_menu(call, cx).p(px(8.)))),
+            Some(Menu::AddPeople) => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
+            Some(Menu::Person { account, user_id, name }) => {
+                Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
+            }
+            _ => None,
+        });
         let call_error = room_context.then(|| self.tiny_state.call_error.clone()).flatten();
-        bar.children(self.call_view_pills(opts.ptt_only, call, opts.held, opts.room_context, cx))
+        bar.relative()
+            .children(self.call_view_pills(opts.ptt_only, call, opts.held, opts.room_context, cx))
             .child(
                 div()
                     .max_w_full()
@@ -1878,6 +1859,32 @@ impl Shell {
             }))
             .children(call_error.map(|detail| {
                 div().type_small().text_color(theme::danger()).child(detail)
+            }))
+            .children(bar_popover.map(|(width, body)| {
+                deferred(
+                    div()
+                        .id("call-view-popover")
+                        .absolute()
+                        .bottom(relative(1.))
+                        .left_0()
+                        .right_0()
+                        .pb(px(8.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(width))
+                                .rounded(px(12.))
+                                .bg(theme::overlay())
+                                .border_1()
+                                .border_color(theme::border())
+                                .shadow(theme::shadow_popover())
+                                .occlude()
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+                                .child(body),
+                        ),
+                )
+                .priority(1)
             }))
     }
 

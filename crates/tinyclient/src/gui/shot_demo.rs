@@ -971,6 +971,8 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         output_level: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
         self_view: None,

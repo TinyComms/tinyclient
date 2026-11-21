@@ -107,6 +107,9 @@ impl Call {
                 }
             }
             MediaRequest::Camera { on } => {
+                if on {
+                    self.controls.set_camera_preview(false);
+                }
                 if on && (self.voice.is_some() || self.tiny.is_some()) {
                     if let Err(words) = picture::probe_camera() {
                         return MediaResponse::Refused { detail: words };
@@ -116,6 +119,15 @@ impl Call {
                 if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_camera(on);
                 }
+            }
+            MediaRequest::CameraPreview { on } => {
+                if on && (self.voice.is_some() || self.tiny.is_some()) {
+                    if let Err(words) = picture::probe_camera() {
+                        return MediaResponse::Refused { detail: words };
+                    }
+                }
+                self.controls.set_camera_preview(on);
+                return MediaResponse::Done;
             }
             MediaRequest::ShareWatch { source } => {
                 match &source {
@@ -411,9 +423,18 @@ fn watch_devices(controls: &Controls) {
         let mut listing = audio::listing();
         listing.inputs.truncate(DEVICES_LIMIT);
         listing.outputs.truncate(DEVICES_LIMIT);
-        let now = (listing.inputs, listing.outputs);
+        // Only query camera names while the device menu or preview is open (never thumbnails,
+        // and never under the audio stand-in used by automated voice tests).
+        let cameras = if controls.metering() && std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_none() {
+            let mut cams = picture::cameras(None);
+            cams.truncate(DEVICES_LIMIT);
+            cams
+        } else {
+            Vec::new()
+        };
+        let now = (listing.inputs, listing.outputs, cameras);
         if asked || told.as_ref() != Some(&now) {
-            out::send(&MediaResponse::DeviceList { inputs: now.0.clone(), outputs: now.1.clone() });
+            out::send(&MediaResponse::DeviceList { inputs: now.0.clone(), outputs: now.1.clone(), cameras: now.2.clone() });
             told = Some(now);
         }
         asked = controls.listing_due(DEVICES_EVERY);

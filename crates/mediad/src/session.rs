@@ -87,6 +87,7 @@ pub struct Controls {
     /// The camera and the share the user asked for, and whether the one picture is watched.
     share: AtomicBool,
     camera: AtomicBool,
+    camera_preview: AtomicBool,
     watch: AtomicBool,
     /// Stops a Go Live leg without hanging up the voice call. The voice loop does not read these.
     share_leg_stop: AtomicBool,
@@ -168,6 +169,14 @@ impl Controls {
 
     pub fn camera(&self) -> bool {
         self.camera.load(Ordering::Relaxed)
+    }
+
+    pub fn set_camera_preview(&self, on: bool) {
+        self.camera_preview.store(on, Ordering::Relaxed);
+    }
+
+    pub fn camera_preview(&self) -> bool {
+        self.camera_preview.load(Ordering::Relaxed)
     }
 
     pub fn set_watch(&self, on: bool) {

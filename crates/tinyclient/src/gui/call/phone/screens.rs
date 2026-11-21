@@ -223,6 +223,8 @@ mod tests {
             device_stuck: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cameras: Vec::new(),
+            camera_id: String::new(),
             security: None,
             picture: None,
             self_view: None,

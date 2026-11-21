@@ -228,6 +228,8 @@ pub fn desired(share: bool, camera: bool) -> u64 {
 pub struct Wants {
     pub share: bool,
     pub camera: bool,
+    /// Capture the camera for local `SelfView` preview only, sending no encoded frames.
+    pub preview_camera: bool,
     /// The camera stays open: it is only waiting for a renegotiation. Off, it is closed.
     pub keep_camera: bool,
     pub rates: Rates,
@@ -235,7 +237,7 @@ pub struct Wants {
 
 impl Wants {
     fn any(&self) -> bool {
-        self.share || self.camera
+        self.share || self.camera || self.preview_camera
     }
 }
 
@@ -565,6 +567,21 @@ impl<S: Source> Capture<S> {
                     }
                 }
             }
+        } else if wants.preview_camera {
+            match self.source.camera(None, None) {
+                Ok(_) => {
+                    if let Some(painted) = self.source.self_view() {
+                        if self.tell.send(Word::SelfView { share: false, painted: Some(painted) }).is_err() {
+                            return false;
+                        }
+                    }
+                }
+                Err(words) => {
+                    if !self.refused(Track::Low, Ask::default(), words, false) {
+                        return false;
+                    }
+                }
+            }
         }
         true
     }
@@ -643,7 +660,7 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
             if seen.keep_camera && !wants.keep_camera {
                 work.source.close_camera();
             }
-            if seen.camera && !wants.camera {
+            if (seen.camera || seen.preview_camera) && !wants.camera && !wants.preview_camera {
                 let _ = work.tell.send(Word::SelfView { share: false, painted: None });
             }
             if seen.share && !wants.share {
@@ -1490,6 +1507,7 @@ mod tests {
         Wants {
             share,
             camera,
+            preview_camera: false,
             keep_camera: camera,
             rates: Rates::default(),
         }
@@ -1781,6 +1799,28 @@ mod tests {
             !due && wants.keep_camera,
             "a reconnect turns sending off, not the camera"
         );
+    }
+
+    #[test]
+    fn camera_preview_paints_self_view_without_sending_any_encoded_frames() {
+        let (mut work, words) = work(Arc::default());
+        work.source.painting = true;
+        let preview = Wants {
+            preview_camera: true,
+            keep_camera: true,
+            ..Wants::default()
+        };
+        assert!(work.round(&preview, Instant::now(), 15.0));
+        assert!(work.source.high.is_empty() && work.source.low.is_empty(), "preview encodes no layers");
+        let mut saw_self_view = false;
+        while let Ok(word) = words.try_recv() {
+            match word {
+                Word::SelfView { share: false, painted: Some(_) } => saw_self_view = true,
+                Word::Frame { .. } => panic!("camera preview must not emit frames for peers"),
+                _ => {}
+            }
+        }
+        assert!(saw_self_view, "camera preview produces SelfView frames");
     }
 
     /// Stands in for the decoder. `fails` lists frames that do not decode, by first byte.

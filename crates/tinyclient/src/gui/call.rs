@@ -104,6 +104,8 @@ fn now() -> i64 {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Menu {
     Devices,
+    /// Camera picker and live preview before turning the camera on.
+    CameraPreview,
     People,
     /// Add friends to a Discord 1:1 or group DM call.
     AddPeople,
@@ -316,6 +318,8 @@ pub struct State {
     /// The focused stream has the whole window. True when the window was made full screen for
     /// it, and so goes back when it ends.
     pub(in crate::gui) full: Option<bool>,
+    /// True once the user has turned their camera on at least once in this session.
+    pub(in crate::gui) camera_used: bool,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -492,6 +496,8 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         device_stuck: false,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
         self_view: None,

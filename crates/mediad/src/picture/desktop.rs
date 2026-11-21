@@ -466,7 +466,7 @@ impl Outgoing {
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
     /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
     pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
-        if (self.high.is_none() || self.low.is_none()) && needs_openh264() {
+        if (high.is_some() || low.is_some()) && (self.high.is_none() || self.low.is_none()) && needs_openh264() {
             load_api()?;
         }
         let began = Instant::now();

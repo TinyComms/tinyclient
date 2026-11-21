@@ -1041,10 +1041,17 @@ impl Shell {
             })
         });
         let camera = pictures.then(|| {
+            let call_cam = call.clone();
             control(
                 "call-camera",
                 "icons/video.svg",
-                if camera_on { Look::On } else { Look::Rest },
+                if camera_on {
+                    Look::On
+                } else if menu == Some(Menu::CameraPreview) {
+                    Look::Open
+                } else {
+                    Look::Rest
+                },
                 enabled,
             )
             .when(enabled, |camera| {
@@ -1059,7 +1066,7 @@ impl Shell {
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
+                        this.call_camera_clicked(&call_cam, camera_on, cx);
                     }))
             })
         });
@@ -1106,7 +1113,7 @@ impl Shell {
         )
         .when(enabled, |devices| {
             devices
-                .tooltip(tip("Microphone and speaker", None))
+                .tooltip(tip("Devices", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
                     this.call_menu_toggle(Menu::Devices, cx);
@@ -1156,6 +1163,7 @@ impl Shell {
 
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
+            Some(Menu::CameraPreview) if joined => Some((284., self.call_camera_preview_menu(call, cx).p(px(8.)))),
             Some(Menu::People) if joined => Some((280., self.call_people_list(call, subject, cx).py(px(6.)))),
             Some(Menu::AddPeople) if joined => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
             Some(Menu::Security) if self.call_security_open(Place::Dock) => {
@@ -1373,6 +1381,8 @@ mod tests {
             device_stuck: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cameras: Vec::new(),
+            camera_id: String::new(),
             security: None,
             picture: None,
             self_view: None,

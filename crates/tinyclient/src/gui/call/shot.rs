@@ -283,6 +283,15 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         output_level: menu.then_some(48),
         inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone", "Krisp Microphone (Krisp Audio)"]),
         outputs: listed(&["MacBook Pro Speakers", "Studio headset"]),
+        cameras: if menu || name == "camera_preview" {
+            vec![
+                protocol::CameraSource { id: "cam-1".into(), name: "FaceTime HD Camera".into(), thumbnail: String::new() },
+                protocol::CameraSource { id: "cam-2".into(), name: "Desk USB Camera".into(), thumbnail: String::new() },
+            ]
+        } else {
+            Vec::new()
+        },
+        camera_id: "cam-1".to_owned(),
         input_id: "shot-MacBook Pro Microphone".to_owned(),
         output_id: "shot-MacBook Pro Speakers".to_owned(),
         device_notice: None,
@@ -346,6 +355,7 @@ pub(super) fn left() -> Option<String> {
 pub(super) fn menu() -> Option<Menu> {
     match named()?.as_str() {
         "devices_menu" => Some(Menu::Devices),
+        "camera_preview" => Some(Menu::CameraPreview),
         "people_menu" => Some(Menu::People),
         "security" | "security_bar" => Some(Menu::Security),
         _ => None,
@@ -443,6 +453,8 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         output_level: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
         self_view: None,

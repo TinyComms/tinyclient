@@ -635,6 +635,8 @@ mod tests {
             level: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cameras: Vec::new(),
+            camera_id: String::new(),
             output_level: None,
             input_id: String::new(),
             output_id: String::new(),

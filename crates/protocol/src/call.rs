@@ -269,6 +269,13 @@ pub struct Call {
     pub inputs: Vec<AudioDevice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<AudioDevice>,
+    /// Every camera the system lists (names and ids only), at most [`DEVICES_LIMIT`]. Filled
+    /// while the device menu or camera preview is open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cameras: Vec<CameraSource>,
+    /// The system's id for the chosen camera, when one is chosen or active.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub camera_id: String,
     /// How the call's media is protected, for the lock in the call's header. `None` for a call
     /// that says nothing about it (every network but a Tiny server today).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -551,6 +558,9 @@ pub enum MediaRequest {
     TinyRenegotiation { sdp: String },
     /// Our camera, on or off. A Tiny room and a Discord call.
     Camera { on: bool },
+    /// Local camera preview before turning the camera on: captures for `SelfView` without sending
+    /// video to peers.
+    CameraPreview { on: bool },
     /// Who the one video slot carries now. `None` when the server sends `video: null`.
     TinyPicture { picture: Option<TinyPicture> },
     /// One `call.e2ee` frame from the server, as its JSON text, in the order it arrived.
@@ -955,7 +965,12 @@ pub enum MediaResponse {
     },
     /// Every device the system lists. Sent at start, when `Meter` turns on, and whenever one is
     /// plugged in or removed, or the default moves.
-    DeviceList { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice> },
+    DeviceList {
+        inputs: Vec<AudioDevice>,
+        outputs: Vec<AudioDevice>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cameras: Vec<CameraSource>,
+    },
     /// Media stopped and mediad is reconnecting on its own.
     Interrupted,
     /// The call cannot go on. mediad exits after sending this.
@@ -1105,5 +1120,25 @@ mod tests {
         let wire = serde_json::to_string(&disabled).unwrap();
         assert!(wire.contains(r#""video_allowed":false"#), "{wire}");
         assert!(!serde_json::from_str::<Call>(&wire).unwrap().video_allowed);
+    }
+
+    #[test]
+    fn camera_preview_and_device_list_cameras_round_trip_with_old_wire_compat() {
+        let preview = MediaRequest::CameraPreview { on: true };
+        let json = serde_json::to_string(&preview).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), preview);
+
+        // Old mediad sends DeviceList without `cameras`: still parses cleanly as empty.
+        let old: MediaResponse = serde_json::from_str(r#"{"media":"device_list","inputs":[],"outputs":[]}"#).unwrap();
+        assert_eq!(old, MediaResponse::DeviceList { inputs: Vec::new(), outputs: Vec::new(), cameras: Vec::new() });
+
+        let with_cams = MediaResponse::DeviceList {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            cameras: vec![CameraSource { id: "c1".into(), name: "Desk Cam".into(), thumbnail: String::new() }],
+        };
+        let wire = serde_json::to_string(&with_cams).unwrap();
+        assert!(wire.contains(r#""cameras""#), "{wire}");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&wire).unwrap(), with_cams);
     }
 }

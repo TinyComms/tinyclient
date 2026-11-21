@@ -127,6 +127,7 @@ impl Drive {
             Wants {
                 share: true,
                 camera: false,
+                preview_camera: false,
                 keep_camera: false,
                 rates: Rates { share: crate::picture::share_quality().bps, high: 0, low: 0 },
             }
@@ -134,6 +135,7 @@ impl Drive {
             Wants {
                 share: false,
                 camera: true,
+                preview_camera: false,
                 keep_camera: true,
                 rates: Rates { share: 0, high: CAMERA_HIGH_BPS, low: 0 },
             }
