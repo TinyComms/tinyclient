@@ -58,6 +58,7 @@ pub struct Actions {
 pub fn handoff_words(network: Network) -> String {
     match network {
         Network::Slack => "Huddle in Slack".to_owned(),
+        Network::Telegram => "Open chat in Telegram".to_owned(),
         other => format!("Call in {}", other.label()),
     }
 }
@@ -69,6 +70,7 @@ pub fn call_label(call: &Call, network: Network, beside_message: bool) -> String
         (Call::Native, _) => "Call".to_owned(),
         (Call::Handoff(words), false) => words.clone(),
         (Call::Handoff(_), true) if network == Network::Slack => "Huddle".to_owned(),
+        (Call::Handoff(_), true) if network == Network::Telegram => "Telegram".to_owned(),
         (Call::Handoff(_), true) => "Call".to_owned(),
     }
 }
@@ -942,10 +944,10 @@ mod tests {
         let unseen = Seen { online: true, ..Seen::default() };
         assert_eq!(actions(&tess, &unseen, Surface::Pane).call, None);
         assert_eq!(actions(&person(Network::Discord, Relation::None), &unseen, Surface::Pane).call, Some(Call::Native));
-        // A Telegram person's call is a hand-off, DM held or not; their service account has none.
+        // A Telegram person's hand-off opens the chat in Telegram, DM held or not; their service account has none.
         let nadia = person(Network::Telegram, Relation::Contact);
-        assert_eq!(actions(&nadia, &unseen, Surface::Card).call, Some(Call::Handoff("Call in Telegram".into())));
-        assert_eq!(actions(&nadia, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Call in Telegram".into())));
+        assert_eq!(actions(&nadia, &unseen, Surface::Card).call, Some(Call::Handoff("Open chat in Telegram".into())));
+        assert_eq!(actions(&nadia, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Open chat in Telegram".into())));
         let mut service = nadia.clone();
         service.mark = Some(Mark::Verified);
         assert_eq!(actions(&service, &unseen, Surface::Card).call, None);
@@ -1168,8 +1170,10 @@ mod tests {
     #[test]
     fn a_hand_off_beside_message_is_one_word() {
         let handoff = Call::Handoff(handoff_words(Network::Telegram));
-        assert_eq!(call_label(&handoff, Network::Telegram, false), "Call in Telegram");
-        assert_eq!(call_label(&handoff, Network::Telegram, true), "Call");
+        assert_eq!(call_label(&handoff, Network::Telegram, false), "Open chat in Telegram");
+        assert_eq!(call_label(&handoff, Network::Telegram, true), "Telegram");
+        assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Teams)), Network::Teams, false), "Call in Teams");
+        assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Teams)), Network::Teams, true), "Call");
         assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Slack)), Network::Slack, true), "Huddle");
         assert_eq!(call_label(&Call::Native, Network::Discord, false), "Call");
     }

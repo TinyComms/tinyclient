@@ -493,7 +493,16 @@ fn icon(name: &'static str, size: f32, color: Rgba, hover: Option<(&'static str,
 fn handoff_label(network: Network) -> String {
     match network {
         Network::Slack => "Open huddle in Slack".to_owned(),
+        Network::Telegram => "Open chat in Telegram".to_owned(),
         other => format!("Open in {}", other.label()),
+    }
+}
+
+fn handoff_tooltip(network: Network) -> String {
+    match network {
+        Network::Slack => "Open huddle in Slack".to_owned(),
+        Network::Telegram => "Opens this chat in the Telegram app to start a call there. tinyclient doesn't carry Telegram calls.".to_owned(),
+        other => format!("{0} calls open in the {0} app. tinyclient doesn't carry them.", other.label()),
     }
 }
 
@@ -1269,11 +1278,7 @@ impl Shell {
             // A Slack huddle stays an icon until something in the model says one is live.
             CallSupport::Handoff => {
                 let quiet = network == Network::Slack;
-                let hint = if quiet {
-                    "Open huddle in Slack".to_owned()
-                } else {
-                    format!("{0} calls open in the {0} app. tinyclient doesn't carry them.", network.label())
-                };
+                let hint = handoff_tooltip(network);
                 let mut pill = pill
                     .border_color(theme::border())
                     .text_color(theme::text_soft())
@@ -1435,5 +1440,21 @@ mod tests {
         assert_eq!(named(&there(&["Iris Navarro", "Jun Aoki"], 2)), "Iris and Jun are in this call");
         assert_eq!(named(&there(&["Iris Navarro", "Jun Aoki", "Dev Patel"], 3)), "Iris, Jun and 1 more are in this call");
         assert_eq!(named(&there(&[], 4)), "4 people are in this call");
+    }
+
+    #[test]
+    fn handoff_labels_and_tooltips_say_what_each_network_opens() {
+        assert_eq!(handoff_label(Network::Telegram), "Open chat in Telegram");
+        assert_eq!(handoff_label(Network::Slack), "Open huddle in Slack");
+        assert_eq!(handoff_label(Network::Teams), "Open in Teams");
+        assert_eq!(
+            handoff_tooltip(Network::Telegram),
+            "Opens this chat in the Telegram app to start a call there. tinyclient doesn't carry Telegram calls."
+        );
+        assert_eq!(handoff_tooltip(Network::Slack), "Open huddle in Slack");
+        assert_eq!(
+            handoff_tooltip(Network::Teams),
+            "Teams calls open in the Teams app. tinyclient doesn't carry them."
+        );
     }
 }
