@@ -684,6 +684,22 @@ fn connect(
     ended
 }
 
+fn peer_phone(chat: &Chat) -> Option<String> {
+    if chat.group {
+        return None;
+    }
+    let raw = chat
+        .participants
+        .iter()
+        .find(|p| !p.is_me && !p.number.is_empty())
+        .map(|p| p.number.as_str())?;
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '+')
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 fn row(chat: &Chat) -> ConversationRow {
     let kind = if chat.group {
         ConversationKind::Group
@@ -693,8 +709,12 @@ fn row(chat: &Chat) -> ConversationRow {
     let mut row = ConversationRow::new(chat.id.clone(), kind, chat.title.clone());
     row.listed = true;
     row.private = !chat.group;
-    // A call stays on the phone. The row opens messages.google.com.
-    row.call = protocol::CallSupport::Handoff;
+    // A 1:1 chat with a phone number hands off to the OS `tel:` handler; groups have no call button.
+    row.call = if peer_phone(chat).is_some() {
+        protocol::CallSupport::Handoff
+    } else {
+        protocol::CallSupport::None
+    };
     if !chat.group && !chat.mine.is_empty() {
         row.peer = Some(chat.id.clone());
     }
@@ -730,6 +750,7 @@ fn file_as(account: &Account, id: &str, status: u64) {
             updated: 0,
             phones: false,
             status,
+            participants: Vec::new(),
         });
         chat.status = status;
         chat
@@ -766,6 +787,9 @@ fn remember(account: &Account, incoming: &[Chat]) -> Vec<Chat> {
             if chat.status == 0 {
                 chat.status = had.status;
             }
+            if chat.participants.is_empty() {
+                chat.participants = had.participants.clone();
+            }
         }
         held.insert(chat.id.clone(), chat.clone());
         kept.push(chat);
@@ -790,6 +814,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
             updated: 0,
             phones: false,
             status: 0,
+            participants: Vec::new(),
         });
         chat.phones = on;
         chat.clone()
@@ -864,6 +889,7 @@ fn apply(account: &Account, event: Event) {
                     updated: 0,
                     phones: false,
                     status: 0,
+                    participants: Vec::new(),
                 };
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));
@@ -1620,8 +1646,15 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answer.map_err(Refusal::Refused));
         }
-        Command::Handoff { reply, .. } => {
-            let _ = reply.send(Ok("https://messages.google.com/web/".to_owned()));
+        Command::Handoff { conversation_id, reply } => {
+            let url = account
+                .chats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&conversation_id)
+                .and_then(peer_phone)
+                .map(|number| format!("tel:{number}"));
+            let _ = reply.send(url.ok_or(Refusal::Unsupported));
         }
         Command::SignOut(reply) => {
             if let Err(why) = account.drive.unpair() {
