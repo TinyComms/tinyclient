@@ -2937,7 +2937,7 @@ fn shared_contact_of(contact: &data_message::Contact) -> protocol::SharedContact
         .filter_map(|e| e.value.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
         .collect();
     let organization = contact.organization.as_deref().map(str::trim).unwrap_or("").to_owned();
-    protocol::SharedContact { name, phones, emails, organization, avatar: None }
+    protocol::SharedContact { name, phones, emails, organization, avatar: None, person_id: None }
 }
 
 fn proto_contact(contact: &protocol::SharedContact) -> data_message::Contact {

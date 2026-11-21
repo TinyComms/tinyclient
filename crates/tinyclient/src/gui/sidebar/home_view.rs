@@ -65,6 +65,7 @@ impl Shell {
         // Keys only: the read runs off this thread.
         let drill = self.sidebar_state.drill.as_ref().map(|drill| match drill {
             Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false),
+            Drill::Drafts(_) => (Shelf::Main, None, None, false),
             Drill::Archive => (Shelf::Archive, None, None, false),
             Drill::Calls => (Shelf::Main, None, None, true),
             Drill::Requests => (Shelf::Requests, None, None, false),
@@ -181,6 +182,13 @@ impl Shell {
         Some(super::tree::Row::Threads { space: space.clone(), count: news.len() as u32, mention: news.iter().any(|c| c.mentions > 0) })
     }
 
+    /// The Slack workspace's Drafts row: shown when any conversation in the workspace has a draft.
+    pub(super) fn drafts_row(&self, space: &Key) -> Option<super::tree::Row> {
+        let tree = self.trees.get(space)?;
+        let count = tree.conversations.iter().filter(|c| !c.draft.trim().is_empty()).count() as u32;
+        (count > 0).then(|| super::tree::Row::Drafts { space: space.clone(), count })
+    }
+
     /// The home's items again, from what is held.
     pub(super) fn rebuild_home(&mut self, cx: &mut Context<Self>) {
         let state = &self.sidebar_state;
@@ -216,6 +224,18 @@ impl Shell {
                 }
                 out
             }
+            (Mode::Network(_), Some(Drill::Drafts(space))) => self
+                .trees
+                .get(space)
+                .map(|tree| {
+                    tree.conversations
+                        .iter()
+                        .filter(|c| !c.draft.trim().is_empty())
+                        .cloned()
+                        .map(Item::Chat)
+                        .collect()
+                })
+                .unwrap_or_default(),
             (Mode::Network(_), Some(_)) => state.home.drilled.iter().cloned().map(Item::Chat).collect(),
             (Mode::Network(Network::Discord), None) | (Mode::Space(Key { network: Network::Discord, .. }), None) => {
                 let spaces: Vec<protocol::Space> = self.spaces.iter().filter(|s| s.key.network == Network::Discord).cloned().collect();
@@ -752,6 +772,7 @@ impl Shell {
         let state = &self.sidebar_state;
         let (icon, title, detail): (&'static str, String, String) = match (&state.home.network, &state.drill) {
             (_, Some(Drill::Threads(_))) => ("icons/messages-square.svg", "No new replies".into(), "Threads you follow show here when someone replies.".into()),
+            (_, Some(Drill::Drafts(_))) => ("icons/pencil.svg", "No drafts".into(), "Messages you start typing in this workspace appear here.".into()),
             (_, Some(Drill::Archive)) => ("icons/inbox.svg", "Nothing archived".into(), "Chats you archive in Telegram show up here.".into()),
             (_, Some(Drill::Calls)) => ("icons/phone.svg", "No recent calls".into(), "Your Telegram calls show up here.".into()),
             (_, Some(Drill::Requests)) => ("icons/mail.svg", "No message requests".into(), "Messages from people you don't know wait here.".into()),

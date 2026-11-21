@@ -2470,6 +2470,33 @@ impl Pane {
                     .into_any_element(),
             );
         }
+        let message_btn = contact.person_id.as_ref().and_then(|pid| {
+            let open = self.open.as_ref()?;
+            let person = protocol::Person::new(
+                protocol::Key {
+                    network: open.key.network,
+                    account: open.key.account.clone(),
+                    id: pid.clone(),
+                },
+                title.to_owned(),
+            );
+            Some(
+                div()
+                    .pt(px(4.))
+                    .child(
+                        div()
+                            .id(name_id(&format!("contact-message-{}-{idx}", message.id), ""))
+                            .cursor_pointer()
+                            .type_micro()
+                            .text_color(theme::accent())
+                            .hover(|s| s.underline())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let _ = this.shell.update(cx, |shell, cx| shell.start_direct(&person, cx));
+                            }))
+                            .child("Message"),
+                    ),
+            )
+        });
         div()
             .mt(px(4.))
             .max_w(px(340.))
@@ -2485,6 +2512,7 @@ impl Pane {
             .child(div().type_body().font_weight(theme::SEMIBOLD).child(title.to_owned()))
             .children((!contact.organization.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(contact.organization.clone())))
             .children(rows)
+            .children(message_btn)
             .into_any_element()
     }
 

@@ -64,6 +64,8 @@ pub enum Reveal {
 pub enum Row {
     /// A Slack workspace's Threads: followed threads with new replies.
     Threads { space: Key, count: u32, mention: bool },
+    /// A Slack workspace's Drafts: conversations with unsent drafts.
+    Drafts { space: Key, count: u32 },
     Group { space: Key, id: String, name: String, collapsed: bool, rollup: Rollup, depth: u8 },
     Conversation { conversation: Rc<Conversation>, depth: u8 },
     Occupant { occupant: Occupant, depth: u8 },

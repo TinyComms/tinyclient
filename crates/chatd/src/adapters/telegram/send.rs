@@ -40,15 +40,19 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
         return;
     }
     if with.files.is_empty() {
-        let outcome = match &with.pick {
-            Some(pick) => send_pick(account, conversation, client_id, text, reply_to, &pick.id, opts),
-            None => match pasted_place(text) {
-                Some(found) => send_place(account, conversation, client_id, reply_to, &found, opts),
-                None => match dice_emoticon(text) {
-                    Some(emoticon) => send_dice(account, conversation, client_id, text, reply_to, emoticon, opts),
-                    None => super::send_text(account, conversation, client_id, text, reply_to, opts, &with.spans),
+        let outcome = if let Some(contact) = &with.contact {
+            send_contact(account, conversation, client_id, text, reply_to, contact, opts)
+        } else {
+            match &with.pick {
+                Some(pick) => send_pick(account, conversation, client_id, text, reply_to, &pick.id, opts),
+                None => match pasted_place(text) {
+                    Some(found) => send_place(account, conversation, client_id, reply_to, &found, opts),
+                    None => match dice_emoticon(text) {
+                        Some(emoticon) => send_dice(account, conversation, client_id, text, reply_to, emoticon, opts),
+                        None => super::send_text(account, conversation, client_id, text, reply_to, opts, &with.spans),
+                    },
                 },
-            },
+            }
         };
         ctx.sent(conversation, client_id, outcome.map_err(|fault| fault.words()));
         return;
@@ -208,6 +212,50 @@ fn send_dice(account: &Account, conversation: &str, client_id: &str, text: &str,
     let media = tl::types::InputMediaDice { emoticon: emoticon.to_owned() }.into();
     let answer = account.ask(&send_media(&target, media, "", None, random, opts))?;
     made(account, conversation, &target, text, opts, &answer)
+}
+
+/// Shares a contact card via `messages.sendMedia` (`InputMediaContact`).
+fn send_contact(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    contact: &protocol::SharedContact,
+    opts: Options,
+) -> Result<Message, Fault> {
+    let target = target(account, conversation, reply_to)?;
+    let random = random_id(client_id);
+    remember_random(account, random, client_id);
+    let (first_name, last_name) = super::split_name(contact.name.trim());
+    let phone_number = contact.phones.first().cloned().unwrap_or_default();
+    let mut vcard = String::new();
+    if !contact.emails.is_empty() || !contact.organization.trim().is_empty() {
+        vcard.push_str("BEGIN:VCARD\nVERSION:3.0\n");
+        if !contact.name.trim().is_empty() {
+            vcard.push_str(&format!("FN:{}\n", contact.name.trim()));
+        }
+        if !contact.organization.trim().is_empty() {
+            vcard.push_str(&format!("ORG:{}\n", contact.organization.trim()));
+        }
+        for email in &contact.emails {
+            let e = email.trim();
+            if !e.is_empty() {
+                vcard.push_str(&format!("EMAIL:{e}\n"));
+            }
+        }
+        vcard.push_str("END:VCARD");
+    }
+    let media: tl::enums::InputMedia = tl::types::InputMediaContact {
+        phone_number,
+        first_name,
+        last_name,
+        vcard,
+    }
+    .into();
+    let (plain, entities) = super::prepared(account, conversation, text);
+    let answer = account.ask(&send_media(&target, media, &plain, entities, random, opts))?;
+    made(account, conversation, &target, &plain, opts, &answer)
 }
 
 fn send_media(

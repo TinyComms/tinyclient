@@ -416,6 +416,111 @@ pub(super) fn search_messages(account: &Account, conversation: &str, query: &str
     }).collect())
 }
 
+/// Parses an optional global search cursor `"<offset_rate>:<peer>:<offset_id>"`.
+fn parse_global_cursor(cursor: Option<&str>) -> (i32, Option<Who>, i32) {
+    let Some(cursor) = cursor else {
+        return (0, None, 0);
+    };
+    let mut parts = cursor.split(':');
+    let rate = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+    let peer = parts.next().and_then(|s| Who::parse(s).map(|(w, _)| w));
+    let id = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+    (rate, peer, id)
+}
+
+/// Account-wide text search across all Telegram chats (`messages.searchGlobal`), bounded to 100 hits
+/// with pagination via `(offset_rate, offset_peer, offset_id)`.
+pub(super) fn search_global(account: &Account, query: &str, cursor: Option<&str>) -> Result<Vec<protocol::MessageHit>, Fault> {
+    const LIMIT: usize = 100;
+    const MAX_PAGES: usize = 4;
+    let q: String = query.chars().take(1024).collect();
+    let (mut offset_rate, initial_peer, mut offset_id) = parse_global_cursor(cursor);
+    let mut offset_peer = initial_peer
+        .and_then(|who| account.input(who).ok())
+        .unwrap_or(tl::enums::InputPeer::Empty);
+
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for _ in 0..MAX_PAGES {
+        if hits.len() >= LIMIT {
+            break;
+        }
+        let want = (LIMIT - hits.len()).min(100) as i32;
+        let request = tl::functions::messages::SearchGlobal {
+            broadcasts_only: false,
+            groups_only: false,
+            users_only: false,
+            folder_id: None,
+            q: q.clone(),
+            filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+            min_date: 0,
+            max_date: 0,
+            offset_rate,
+            offset_peer: offset_peer.clone(),
+            offset_id,
+            limit: want,
+        };
+        let answer = account.ask(&request)?;
+        let next_rate = match &answer {
+            tl::enums::messages::Messages::Slice(slice) => slice.next_rate,
+            _ => None,
+        };
+        let (raw, _) = sync::searched(account, answer);
+        if raw.is_empty() {
+            break;
+        }
+        let mut last_peer_id: Option<(Who, i32)> = None;
+        for item in &raw {
+            let mapped = {
+                let dir = account.dir();
+                super::content::map(&dir, item)
+            };
+            let Some(mapped) = mapped else {
+                continue;
+            };
+            last_peer_id = Some((mapped.peer, mapped.id));
+            let is_forum = account.dir().get(mapped.peer).is_some_and(|known| known.forum);
+            let conv_id = match (is_forum, mapped.topic) {
+                (true, Some(topic)) => peers::thread_id(mapped.peer, topic),
+                _ => mapped.peer.text(),
+            };
+            if !seen.insert((conv_id.clone(), mapped.message.id.clone())) {
+                continue;
+            }
+            let known_row = account.ctx.known(&conv_id).ok().flatten();
+            let title = known_row
+                .as_ref()
+                .map(|row| row.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| account.dir().name(mapped.peer));
+            let space_title = known_row.as_ref().map(|row| row.space_title.clone()).unwrap_or_default();
+            hits.push(protocol::MessageHit {
+                conversation: account.ctx.key(&conv_id),
+                message_id: mapped.message.id,
+                sent: mapped.message.sent,
+                sender: mapped.message.sender.name,
+                snippet: crate::store::snippet(&mapped.message.text, query),
+                title,
+                space_title,
+                outgoing: mapped.message.outgoing,
+            });
+            if hits.len() >= LIMIT {
+                break;
+            }
+        }
+        match (next_rate, last_peer_id) {
+            (Some(rate), Some((peer, id))) if rate != 0 && (rate != offset_rate || id != offset_id) => {
+                offset_rate = rate;
+                offset_id = id;
+                offset_peer = account.input(peer).unwrap_or(tl::enums::InputPeer::Empty);
+            }
+            _ => break,
+        }
+    }
+    Ok(hits)
+}
+
 /// The pinned messages, newest first.
 pub(super) fn pinned(account: &Account, conversation: &str) -> Result<Vec<Message>, Fault> {
     Ok(search(account, conversation, "", tl::enums::MessagesFilter::InputMessagesFilterPinned, 0, protocol::PINNED_LIMIT as i32)?.0)
@@ -451,6 +556,9 @@ pub(super) fn forward(
     note: &str,
 ) -> Result<Vec<(String, Result<(), String>)>, Fault> {
     let (from_who, _) = Who::parse(from).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    if account.dir().get(from_who).is_some_and(|known| known.noforwards) {
+        return Err(invalid("CHAT_FORWARDS_RESTRICTED"));
+    }
     let from_peer = account.input(from_who)?;
     let ids: Vec<i32> = message_ids
         .iter()
@@ -466,14 +574,22 @@ pub(super) fn forward(
         .map_or(1, |d| d.as_nanos() as i64);
     for (t_ix, target) in targets.iter().enumerate() {
         let res: Result<(), Fault> = (|| {
-            let (to_who, top_msg_id) = Who::parse(target).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
-            let to_peer = account.input(to_who)?;
+            let (to_who, top_msg_id) = if matches!(target.as_str(), "self" | "saved") {
+                (Who::User(account.me), None)
+            } else {
+                Who::parse(target).ok_or_else(|| invalid("PEER_ID_INVALID"))?
+            };
+            let to_peer = if to_who == Who::User(account.me) {
+                tl::enums::InputPeer::PeerSelf
+            } else {
+                account.input(to_who)?
+            };
             let random_id: Vec<i64> = ids
                 .iter()
                 .enumerate()
                 .map(|(m_ix, _)| base.wrapping_add(((t_ix as i64) << 16) + m_ix as i64 + 1))
                 .collect();
-            account.ask(&tl::functions::messages::ForwardMessages {
+            let answer = account.ask(&tl::functions::messages::ForwardMessages {
                 silent: false,
                 background: false,
                 with_my_score: false,
@@ -496,8 +612,9 @@ pub(super) fn forward(
                 allow_paid_stars: None,
                 suggested_post: None,
             })?;
+            super::live::answered(account, &answer);
             if !note.is_empty() {
-                account.ask(&tl::functions::messages::SendMessage {
+                let note_answer = account.ask(&tl::functions::messages::SendMessage {
                     no_webpage: false,
                     silent: false,
                     background: false,
@@ -521,10 +638,11 @@ pub(super) fn forward(
                     allow_paid_stars: None,
                     suggested_post: None,
                 })?;
+                super::live::answered(account, &note_answer);
             }
             Ok(())
         })();
-        results.push((target.clone(), res.map_err(|e| format!("{e:?}"))));
+        results.push((target.clone(), res.map_err(|e| e.words())));
     }
     Ok(results)
 }
@@ -762,4 +880,135 @@ pub(super) fn set_privacy(
         account.ask(&tl::functions::account::SetPrivacy { key: tl_privacy_key(key), rules })?;
     account.learn(&got.users, &got.chats);
     Ok(map_privacy_rules(account, key, &got.rules))
+}
+
+fn tl_report_reason(reason: protocol::ReportReason) -> tl::enums::ReportReason {
+    match reason {
+        protocol::ReportReason::Spam => tl::enums::ReportReason::InputReportReasonSpam,
+        protocol::ReportReason::Violence => tl::enums::ReportReason::InputReportReasonViolence,
+        protocol::ReportReason::Illegal => tl::enums::ReportReason::InputReportReasonIllegalDrugs,
+        protocol::ReportReason::Impersonation => tl::enums::ReportReason::InputReportReasonFake,
+        protocol::ReportReason::Harassment => tl::enums::ReportReason::InputReportReasonPersonalDetails,
+        protocol::ReportReason::Other => tl::enums::ReportReason::InputReportReasonOther,
+    }
+}
+
+fn pick_report_option(options: &[tl::enums::MessageReportOption], reason: protocol::ReportReason) -> Option<Vec<u8>> {
+    let keywords: &[&str] = match reason {
+        protocol::ReportReason::Spam => &["spam"],
+        protocol::ReportReason::Violence => &["violence", "threat"],
+        protocol::ReportReason::Illegal => &["illegal", "drug", "abuse"],
+        protocol::ReportReason::Impersonation => &["fake", "impersonat", "scam"],
+        protocol::ReportReason::Harassment => &["harass", "personal", "bully", "abuse"],
+        protocol::ReportReason::Other => &["other"],
+    };
+    fn unwrap(opt: &tl::enums::MessageReportOption) -> &tl::types::MessageReportOption {
+        let tl::enums::MessageReportOption::Option(o) = opt;
+        o
+    }
+    options
+        .iter()
+        .map(unwrap)
+        .find(|o| {
+            let lower = o.text.to_lowercase();
+            keywords.iter().any(|kw| lower.contains(kw))
+        })
+        .or_else(|| options.iter().map(unwrap).find(|o| o.text.to_lowercase().contains("other")))
+        .or_else(|| options.first().map(unwrap))
+        .map(|o| o.option.clone())
+}
+
+/// Reports a message (`messages.report`, walking Telegram's option tree) or a user/chat (`account.reportPeer`).
+pub(super) fn report(
+    account: &Account,
+    target: &protocol::ReportTarget,
+    reason: protocol::ReportReason,
+    note: &str,
+    block: bool,
+) -> Result<(), Fault> {
+    match target {
+        protocol::ReportTarget::Message { conversation, message_id } => {
+            let (who, _) = Who::parse(&conversation.id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+            let id = message_id.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+            let peer = account.input(who)?;
+            let mut option = Vec::new();
+            for _ in 0..4 {
+                let result = account.ask(&tl::functions::messages::Report {
+                    peer: peer.clone(),
+                    id: vec![id],
+                    option: option.clone(),
+                    message: note.to_owned(),
+                })?;
+                match result {
+                    tl::enums::ReportResult::Reported => break,
+                    tl::enums::ReportResult::ChooseOption(choose) => {
+                        let Some(next) = pick_report_option(&choose.options, reason) else {
+                            break;
+                        };
+                        if next == option {
+                            break;
+                        }
+                        option = next;
+                    }
+                    tl::enums::ReportResult::AddComment(add) => {
+                        account.ask(&tl::functions::messages::Report {
+                            peer: peer.clone(),
+                            id: vec![id],
+                            option: add.option,
+                            message: note.to_owned(),
+                        })?;
+                        break;
+                    }
+                }
+            }
+            if block && matches!(who, Who::User(_)) {
+                let _ = super::relate(account, &conversation.id, protocol::RelateAction::Block);
+            }
+            Ok(())
+        }
+        protocol::ReportTarget::Person(key) | protocol::ReportTarget::Conversation(key) => {
+            let (who, _) = Who::parse(&key.id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+            let peer = account.input(who)?;
+            account.ask(&tl::functions::account::ReportPeer {
+                peer,
+                reason: tl_report_reason(reason),
+                message: note.to_owned(),
+            })?;
+            if block && matches!(who, Who::User(_)) {
+                let _ = super::relate(account, &key.id, protocol::RelateAction::Block);
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_global_cursor_handles_empty_and_valid() {
+        assert_eq!(parse_global_cursor(None), (0, None, 0));
+        assert_eq!(parse_global_cursor(Some("1700000000:u7003:31")), (1_700_000_000, Some(Who::User(7003)), 31));
+        assert_eq!(parse_global_cursor(Some("bad")), (0, None, 0));
+    }
+
+    #[test]
+    fn report_reason_and_option_mapping() {
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Spam), tl::enums::ReportReason::InputReportReasonSpam));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Violence), tl::enums::ReportReason::InputReportReasonViolence));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Illegal), tl::enums::ReportReason::InputReportReasonIllegalDrugs));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Impersonation), tl::enums::ReportReason::InputReportReasonFake));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Harassment), tl::enums::ReportReason::InputReportReasonPersonalDetails));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Other), tl::enums::ReportReason::InputReportReasonOther));
+
+        let opts = vec![
+            tl::enums::MessageReportOption::Option(tl::types::MessageReportOption { text: "Spam".into(), option: b"spam".to_vec() }),
+            tl::enums::MessageReportOption::Option(tl::types::MessageReportOption { text: "Violence".into(), option: b"violence".to_vec() }),
+            tl::enums::MessageReportOption::Option(tl::types::MessageReportOption { text: "Other".into(), option: b"other".to_vec() }),
+        ];
+        assert_eq!(pick_report_option(&opts, protocol::ReportReason::Spam).as_deref(), Some(&b"spam"[..]));
+        assert_eq!(pick_report_option(&opts, protocol::ReportReason::Violence).as_deref(), Some(&b"violence"[..]));
+        assert_eq!(pick_report_option(&opts, protocol::ReportReason::Impersonation).as_deref(), Some(&b"other"[..]));
+    }
 }

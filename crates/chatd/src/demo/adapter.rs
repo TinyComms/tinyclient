@@ -1004,6 +1004,7 @@ impl Demo {
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
@@ -1028,6 +1029,10 @@ impl Demo {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

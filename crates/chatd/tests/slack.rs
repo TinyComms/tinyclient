@@ -130,6 +130,10 @@ struct Fake {
     dnd_info: Mutex<Option<Value>>,
     /// Channel bookmarks keyed by channel_id.
     bookmarks: Mutex<HashMap<String, Vec<Value>>>,
+    /// Optional override for `drafts.list` response.
+    drafts_list: Mutex<Option<Value>>,
+    /// Scheduled messages keyed by scheduled_message_id.
+    scheduled: Mutex<Vec<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -181,6 +185,8 @@ impl Fake {
                     json!({"id": "Bk2", "channel_id": "C0GEN", "title": "Team Canvas", "link": "https://alpha.slack.com/docs/T01ALPHA/F0CANVAS", "emoji": "", "type": "canvas"}),
                 ],
             )])),
+            drafts_list: Mutex::default(),
+            scheduled: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -385,10 +391,49 @@ impl Fake {
                 echo(event);
                 Some(json!({"ok": true, "files": files}))
             }
-            "chat.scheduleMessage" => Some(json!({
-                "ok": true, "channel": channel, "scheduled_message_id": "Q0SCHED", "post_at": param("post_at").parse::<i64>().unwrap(),
-                "message": {"type": "message", "user": me(token), "text": param("text"), "bot_id": null},
-            })),
+            "chat.scheduleMessage" => {
+                let mut list = self.scheduled.lock().unwrap();
+                let id = if list.is_empty() {
+                    "Q0SCHED".to_owned()
+                } else {
+                    format!("Q0SCHED{}", list.len() + 1)
+                };
+                let post_at = param("post_at").parse::<i64>().unwrap();
+                let mut entry = json!({
+                    "id": id,
+                    "channel_id": channel,
+                    "post_at": post_at,
+                    "date_created": 1760000900,
+                    "text": param("text"),
+                });
+                if !param("thread_ts").is_empty() {
+                    entry["thread_ts"] = param("thread_ts").into();
+                }
+                list.push(entry);
+                Some(json!({
+                    "ok": true, "channel": channel, "scheduled_message_id": id, "post_at": post_at,
+                    "message": {"type": "message", "user": me(token), "text": param("text"), "bot_id": null},
+                }))
+            }
+            "chat.scheduledMessages.list" => {
+                let list = self.scheduled.lock().unwrap();
+                let filtered: Vec<Value> = list
+                    .iter()
+                    .filter(|item| channel.is_empty() || item["channel_id"].as_str() == Some(channel))
+                    .cloned()
+                    .collect();
+                Some(json!({"ok": true, "scheduled_messages": filtered}))
+            }
+            "chat.deleteScheduledMessage" => {
+                let target = param("scheduled_message_id");
+                let mut list = self.scheduled.lock().unwrap();
+                let before = list.len();
+                list.retain(|item| item["id"].as_str() != Some(target));
+                if list.len() == before {
+                    return refused("invalid_scheduled_message_id");
+                }
+                Some(json!({"ok": true}))
+            }
             "users.profile.set" => {
                 let asked: Value = serde_json::from_str(param("profile")).unwrap();
                 let mut profile = self.user(token, me(token)).unwrap()["profile"].clone();
@@ -476,6 +521,27 @@ impl Fake {
                 "snooze_endtime": 0,
             }))),
             "dnd.teamInfo" => Some(json!({"ok": true, "users": {}})),
+            "dnd.setSnooze" => {
+                let mins = param("num_minutes").parse::<i64>().unwrap_or(0);
+                if mins <= 0 {
+                    return refused("missing_duration");
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+                Some(json!({
+                    "ok": true,
+                    "snooze_enabled": true,
+                    "snooze_endtime": now + mins * 60,
+                    "snooze_remaining": mins * 60,
+                }))
+            }
+            "dnd.endSnooze" => Some(json!({
+                "ok": true,
+                "dnd_enabled": false,
+                "next_dnd_start_ts": 0,
+                "next_dnd_end_ts": 0,
+                "snooze_enabled": false,
+                "snooze_endtime": 0,
+            })),
             "stars.add" | "stars.remove" => {
                 if channel.is_empty() {
                     return refused("invalid_arguments");
@@ -511,6 +577,45 @@ impl Fake {
             "reminders.complete" | "reminders.delete" => {
                 if param("reminder").is_empty() {
                     return refused("not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "subscriptions.thread.add" | "subscriptions.thread.remove" => {
+                if channel.is_empty() || param("thread_ts").is_empty() {
+                    return refused("thread_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "drafts.list" => self.drafts_list.lock().unwrap().clone().or_else(|| Some(json!({
+                "ok": true,
+                "drafts": []
+            }))),
+            "drafts.create" => Some(json!({
+                "ok": true,
+                "draft": {
+                    "id": "Dr01LOCAL",
+                    "client_last_updated_ts": "1760000900.000000",
+                    "destinations": serde_json::from_str::<Value>(param("destinations")).unwrap_or(json!([])),
+                    "blocks": serde_json::from_str::<Value>(param("blocks")).unwrap_or(json!([])),
+                }
+            })),
+            "drafts.update" => {
+                if param("draft_id").is_empty() {
+                    return refused("draft_not_found");
+                }
+                Some(json!({
+                    "ok": true,
+                    "draft": {
+                        "id": param("draft_id"),
+                        "client_last_updated_ts": "1760000910.000000",
+                        "destinations": serde_json::from_str::<Value>(param("destinations")).unwrap_or(json!([])),
+                        "blocks": serde_json::from_str::<Value>(param("blocks")).unwrap_or(json!([])),
+                    }
+                }))
+            }
+            "drafts.delete" => {
+                if param("draft_id").is_empty() {
+                    return refused("draft_not_found");
                 }
                 Some(json!({"ok": true}))
             }
@@ -2381,6 +2486,7 @@ fn connecting_asks_little_spaces_what_it_warms_and_a_reconnect_asks_less() {
             ("client.counts", connections),
             ("conversations.history", history),
             ("dnd.info", connections),
+            ("drafts.list", connections),
             ("edge:users/info", 1),
             ("team.info", 1),
             ("usergroups.list", connections),
@@ -4381,5 +4487,381 @@ fn slack_rich_status_emoji_expiration_and_custom_emoji_read() {
         };
         let ana = people.into_iter().find(|p| p.key.id == "U0ANA")?;
         (ana.emoji == ":partyparrot:" && ana.status.contains("Deploying")).then_some(())
+    });
+}
+
+#[test]
+fn slack_drafts_sync_create_update_delete_and_live_events() {
+    let world = World::start_with(|fake| {
+        *fake.drafts_list.lock().unwrap() = Some(json!({
+            "ok": true,
+            "drafts": [{
+                "id": "Dr01REMOTE",
+                "client_last_updated_ts": "1760000800.000000",
+                "destinations": [{"channel_id": "C0DEP"}],
+                "blocks": [{
+                    "type": "rich_text",
+                    "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "Hydrated from Slack"}]
+                    }]
+                }]
+            }]
+        }));
+    });
+    world.ready();
+
+    let dep = alpha("C0DEP");
+    let general = alpha("C0GEN");
+
+    // 1. drafts.list on connect hydrates C0DEP's draft.
+    world.until("C0DEP draft hydrated from drafts.list", || {
+        let row = world.conversation(&dep)?;
+        (row.draft == "Hydrated from Slack").then_some(())
+    });
+
+    // 2. Writing a draft on C0GEN calls drafts.create, updating calls drafts.update, clearing calls drafts.delete.
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: "First draft".into() }), Response::Ok);
+    world.until("drafts.create called", || (!world.fake.calls(ALPHA, "drafts.create").is_empty()).then_some(()));
+    let created = world.fake.calls(ALPHA, "drafts.create").pop().unwrap();
+    assert!(created.params["destinations"].contains("C0GEN"));
+    assert!(created.params["blocks"].contains("First draft"));
+
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: "Edited draft".into() }), Response::Ok);
+    world.until("drafts.update called", || (!world.fake.calls(ALPHA, "drafts.update").is_empty()).then_some(()));
+    let updated = world.fake.calls(ALPHA, "drafts.update").pop().unwrap();
+    assert_eq!(updated.params["draft_id"], "Dr01LOCAL");
+    assert!(updated.params["blocks"].contains("Edited draft"));
+
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: String::new() }), Response::Ok);
+    world.until("drafts.delete called", || (!world.fake.calls(ALPHA, "drafts.delete").is_empty()).then_some(()));
+    let deleted = world.fake.calls(ALPHA, "drafts.delete").pop().unwrap();
+    assert_eq!(deleted.params["draft_id"], "Dr01LOCAL");
+
+    // 3. Live draft_saved and draft_deleted socket events sync into the store.
+    world.fake.push(ALPHA, json!({
+        "type": "draft_saved",
+        "draft": {
+            "id": "Dr02LIVE",
+            "client_last_updated_ts": "1999999999.000000",
+            "destinations": [{"channel_id": "C0GEN"}],
+            "blocks": [{
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [{"type": "text", "text": "Typed on phone"}]
+                }]
+            }]
+        }
+    }));
+    world.until("live draft_saved synced", || {
+        let row = world.conversation(&general)?;
+        (row.draft == "Typed on phone").then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "draft_deleted",
+        "draft_id": "Dr02LIVE"
+    }));
+    world.until("live draft_deleted cleared", || {
+        let row = world.conversation(&general)?;
+        row.draft.is_empty().then_some(())
+    });
+}
+
+#[test]
+fn slack_dnd_snooze_resume_and_live_dnd_updated() {
+    let world = World::start();
+    world.ready();
+
+    let account = alpha("C0GEN").account();
+    assert!(world.account("T01ALPHA").can.dnd_snooze, "Slack should advertise dnd_snooze capability");
+
+    // 1. Pausing notifications with a clear_at calls dnd.setSnooze and switches presence to Dnd.
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Dnd,
+            status: None,
+            status_emoji: None,
+            clear_at: Some(now + 1800),
+        }),
+        Response::Ok
+    );
+    let snooze = world.fake.calls(ALPHA, "dnd.setSnooze").pop().expect("dnd.setSnooze called");
+    let mins: i64 = snooze.params["num_minutes"].parse().unwrap();
+    assert!((29..=31).contains(&mins), "expected ~30 minutes, got {mins}");
+    world.until("account presence becomes Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Dnd).then_some(())
+    });
+
+    // 2. Resuming notifications (setting Online) calls dnd.endSnooze and clears Dnd.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: None,
+            status_emoji: None,
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "dnd.endSnooze").len(), 1);
+    world.until("account presence returns to Online", || {
+        (world.account("T01ALPHA").presence == Presence::Online).then_some(())
+    });
+
+    // 3. Live dnd_updated socket event sets and clears Dnd.
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated",
+        "user": "U0ME",
+        "dnd_status": {
+            "dnd_enabled": false,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": true,
+            "snooze_endtime": now + 3600,
+        }
+    }));
+    world.until("live dnd_updated sets Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Dnd).then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated",
+        "user": "U0ME",
+        "dnd_status": {
+            "dnd_enabled": false,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": false,
+            "snooze_endtime": 0,
+        }
+    }));
+    world.until("live dnd_updated clears Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Online).then_some(())
+    });
+}
+
+#[test]
+fn slack_scheduled_messages_list_cancel_and_reschedule() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    assert!(world.account("T01ALPHA").can.schedule, "Slack should advertise schedule capability");
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let first_at = now + 3600;
+    let later_at = now + 7200;
+
+    // 1. Schedule a message.
+    let mut with = protocol::Outgoing::default();
+    with.schedule = Some(first_at);
+    let sent = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "sched1".into(),
+        text: "Standup notes".into(),
+        reply_to: None,
+        with,
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    world.until("chat.scheduleMessage called", || {
+        (!world.fake.calls(ALPHA, "chat.scheduleMessage").is_empty()).then_some(())
+    });
+
+    // 2. List scheduled messages via chat.scheduledMessages.list.
+    let Response::ScheduledMessages { messages } = world.ask(Request::ScheduledMessages {
+        conversation: general.clone(),
+    }) else {
+        panic!("expected Response::ScheduledMessages");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "Q0SCHED");
+    assert_eq!(messages[0].text, "Standup notes");
+    assert_eq!(messages[0].post_at, first_at);
+
+    // 3. Edit & reschedule via delete + chat.scheduleMessage.
+    let Response::ScheduledMessage { message: updated } = world.ask(Request::RescheduleMessage {
+        conversation: general.clone(),
+        scheduled_id: "Q0SCHED".into(),
+        text: Some("Updated standup notes".into()),
+        post_at: later_at,
+    }) else {
+        panic!("expected Response::ScheduledMessage");
+    };
+    assert_eq!(updated.text, "Updated standup notes");
+    assert_eq!(updated.post_at, later_at);
+    assert_eq!(world.fake.calls(ALPHA, "chat.deleteScheduledMessage").len(), 1);
+    assert_eq!(world.fake.calls(ALPHA, "chat.scheduleMessage").len(), 2);
+
+    // 4. Cancel the rescheduled message via chat.deleteScheduledMessage.
+    assert_eq!(
+        world.ask(Request::CancelScheduled {
+            conversation: general.clone(),
+            scheduled_id: updated.id.clone(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "chat.deleteScheduledMessage").len(), 2);
+
+    // 5. List is now empty.
+    let Response::ScheduledMessages { messages } = world.ask(Request::ScheduledMessages {
+        conversation: general.clone(),
+    }) else {
+        panic!("expected Response::ScheduledMessages");
+    };
+    assert!(messages.is_empty());
+}
+
+#[test]
+fn slack_search_filters_and_no_duplicate_in_modifier() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let filters = protocol::SearchFilters {
+        from: Some(alpha("U0ANA")),
+        has: Some(protocol::SearchHas::Links),
+        before: Some(1_767_225_600),
+        after: Some(1_735_689_600),
+        mentions_me: false,
+    };
+    let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(general.clone()),
+        space: None,
+        account: None,
+        network: None,
+        query: "deploy".into(),
+        filters: filters.clone(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::MessageHits");
+    };
+    let call = world.fake.calls(ALPHA, "search.messages").pop().expect("search.messages call");
+    let sent = &call.params["query"];
+    assert!(sent.contains("deploy"), "{sent}");
+    assert!(sent.contains("in:#general"), "{sent}");
+    assert!(sent.contains("from:<@U0ANA>"), "{sent}");
+    assert!(sent.contains("has:link"), "{sent}");
+    assert!(sent.contains("before:2026-01-01"), "{sent}");
+    assert!(sent.contains("after:2025-01-01"), "{sent}");
+
+    // When user already typed `in:#deployments`, do not append a duplicate `in:#general`.
+    let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(general.clone()),
+        space: None,
+        account: None,
+        network: None,
+        query: "in:#deployments during:2026-11 release".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::MessageHits");
+    };
+    let call2 = world.fake.calls(ALPHA, "search.messages").pop().expect("second search.messages call");
+    let sent2 = &call2.params["query"];
+    assert!(sent2.contains("in:#deployments"), "{sent2}");
+    assert!(!sent2.contains("in:#general"), "must not duplicate in: modifier: {sent2}");
+    assert!(sent2.contains("during:2026-11"), "{sent2}");
+}
+
+#[test]
+fn slack_follow_unfollow_thread_and_unread_reply_counting() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.follow_threads, "Slack should advertise follow_threads");
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+
+    // 1. Follow the thread -> calls subscriptions.thread.add and marks followed=true.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: thread.clone(), on: true }),
+        Response::Ok
+    );
+    let add = world.fake.calls(ALPHA, "subscriptions.thread.add").pop().expect("subscriptions.thread.add called");
+    assert_eq!(add.params["channel"], "C0GEN");
+    assert_eq!(add.params["thread_ts"], ROOT);
+    world.until("thread marked followed", || {
+        world.conversation(&thread).filter(|c| c.followed).map(|_| ())
+    });
+
+    // 2. A live socket reply from Ana increments unread reply count to 1 without opening the thread.
+    let reply1 = "1760000901.000901";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Following up on this thread",
+        "ts": reply1,
+        "thread_ts": ROOT,
+        "event_ts": reply1,
+    }));
+    world.until("followed thread unread becomes 1", || {
+        world.conversation(&thread).filter(|c| c.unread == 1).map(|_| ())
+    });
+
+    // 3. thread_marked clears unread back to 0.
+    world.fake.push(ALPHA, json!({
+        "type": "thread_marked",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+            "unread_count": 0,
+            "last_read": reply1,
+        }
+    }));
+    world.until("thread_marked clears unread", || {
+        world.conversation(&thread).filter(|c| c.unread == 0).map(|_| ())
+    });
+
+    // 4. Unfollow the thread -> calls subscriptions.thread.remove and marks followed=false.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: thread.clone(), on: false }),
+        Response::Ok
+    );
+    let rem = world.fake.calls(ALPHA, "subscriptions.thread.remove").pop().expect("subscriptions.thread.remove called");
+    assert_eq!(rem.params["channel"], "C0GEN");
+    assert_eq!(rem.params["thread_ts"], ROOT);
+    world.until("thread marked unfollowed", || {
+        world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
+    });
+
+    // 5. A reply in an unfollowed thread does NOT increment unread.
+    let reply2 = "1760000902.000902";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Noise after unfollow",
+        "ts": reply2,
+        "thread_ts": ROOT,
+        "event_ts": reply2,
+    }));
+    world.until("reply2 stored in thread", || world.message(&thread, reply2));
+    assert_eq!(world.conversation(&thread).unwrap().unread, 0);
+
+    // 6. Live thread_subscribed and thread_unsubscribed socket events flip followed state.
+    world.fake.push(ALPHA, json!({
+        "type": "thread_subscribed",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+        }
+    }));
+    world.until("live thread_subscribed sets followed=true", || {
+        world.conversation(&thread).filter(|c| c.followed).map(|_| ())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "thread_unsubscribed",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+        }
+    }));
+    world.until("live thread_unsubscribed sets followed=false", || {
+        world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
     });
 }
