@@ -50,8 +50,8 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote,
-    SafetyNumber, StorageSnapshot, Text, Wire,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer,
+    PersonProfile, Quote, SafetyNumber, StorageSnapshot, Text, Wire,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -159,6 +159,41 @@ fn initial_identities() -> HashMap<String, FakeIdentity> {
     map
 }
 
+fn initial_profiles() -> HashMap<String, PersonProfile> {
+    let mut map = HashMap::new();
+    map.insert(
+        GRACE.to_owned(),
+        PersonProfile {
+            name: "Grace Ombra".into(),
+            about: "Likes bridge".into(),
+            emoji: "🃏".into(),
+            badges: vec!["Sustainer".into()],
+            key_known: true,
+        },
+    );
+    map.insert(
+        ALAN.to_owned(),
+        PersonProfile {
+            name: "Alan Ferro".into(),
+            about: "Leads trumps".into(),
+            emoji: "♠️".into(),
+            badges: Vec::new(),
+            key_known: true,
+        },
+    );
+    map.insert(
+        STRANGER.to_owned(),
+        PersonProfile {
+            name: String::new(),
+            about: String::new(),
+            emoji: String::new(),
+            badges: Vec::new(),
+            key_known: false,
+        },
+    );
+    map
+}
+
 pub struct Fake {
     events: Sender<Event>,
     heard: Mutex<Option<Receiver<Event>>>,
@@ -179,6 +214,8 @@ pub struct Fake {
     call_links: Arc<Mutex<HashMap<[u8; 32], CallLink>>>,
     /// Per-contact identity keys and verification states for safety numbers.
     identities: Arc<Mutex<HashMap<String, FakeIdentity>>>,
+    /// Scripted decrypted profiles for other Signal accounts.
+    profiles: Arc<Mutex<HashMap<String, PersonProfile>>>,
 }
 
 impl Fake {
@@ -220,6 +257,7 @@ impl Fake {
             club: Arc::new(Mutex::new(club_state)),
             call_links: Arc::default(),
             identities: Arc::new(Mutex::new(initial_identities())),
+            profiles: Arc::new(Mutex::new(initial_profiles())),
         };
         fake.listen();
         fake
@@ -227,7 +265,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups, club, identities) = (
+        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles) = (
             self.events.clone(),
             self.closed.clone(),
             self.refuse.clone(),
@@ -236,6 +274,7 @@ impl Fake {
             self.lookups.clone(),
             self.club.clone(),
             self.identities.clone(),
+            self.profiles.clone(),
         );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
@@ -245,6 +284,38 @@ impl Fake {
                 let Some(line) = line.map(str::trim) else {
                     return true;
                 };
+                if let Some(rest) = line.strip_prefix("profile ") {
+                    let mut parts = rest.splitn(2, ' ');
+                    let target = parts.next().unwrap_or("").trim();
+                    let body = parts.next().unwrap_or("");
+                    let aci = if let Some((id, _)) = who(target) {
+                        Some(id.to_owned())
+                    } else if target == "stranger" {
+                        Some(STRANGER.to_owned())
+                    } else if super::wire::is_aci(target) {
+                        Some(target.to_owned())
+                    } else {
+                        None
+                    };
+                    if let Some(aci) = aci {
+                        let fields: Vec<&str> = body.split('|').map(str::trim).collect();
+                        let mut map = profiles.lock().unwrap_or_else(|p| p.into_inner());
+                        let entry = map.entry(aci).or_default();
+                        entry.key_known = true;
+                        entry.about = fields.first().copied().unwrap_or("").to_owned();
+                        entry.emoji = fields.get(1).copied().unwrap_or("").to_owned();
+                        entry.badges = fields
+                            .get(2)
+                            .copied()
+                            .unwrap_or("")
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                    }
+                    return true;
+                }
                 if let Some(rest) = line.strip_prefix("lookup ") {
                     let mut parts = rest.split_whitespace();
                     let username = parts.next().unwrap_or("");
@@ -1478,6 +1549,21 @@ impl Wire for Fake {
         record(&format!("verify {aci} {label}"));
         let _ = self.events.send(Event::VerifiedChanged { aci: aci.to_owned(), state });
         Ok(())
+    }
+
+    fn person_profile(&self, aci: &str) -> Result<PersonProfile, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("person-profile {aci}"));
+        let found = self
+            .profiles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(aci)
+            .cloned()
+            .unwrap_or(PersonProfile { key_known: false, ..PersonProfile::default() });
+        Ok(found)
     }
 
     fn close(&self) {

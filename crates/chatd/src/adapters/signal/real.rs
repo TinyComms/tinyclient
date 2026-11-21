@@ -11,8 +11,8 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote,
-    SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer,
+    PersonProfile, Quote, SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -21,6 +21,7 @@ use presage::libsignal_service::groups_v2::{AccessControl, AccessRequired, Membe
 use presage::libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use presage::libsignal_service::master_key::StorageServiceKey;
 use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, MasterKey, ProfileKey, PushService, ServiceCredentials, ServiceError, Uuid};
+use presage::libsignal_service::profile_cipher::ProfileCipher;
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::{AttachmentSpec, AttachmentUploadError, MessageSenderError};
@@ -94,6 +95,7 @@ enum Ask {
     JoinCallLink { url: String, answer: Sender<Result<CallLinkJoin, Fault>> },
     SafetyNumber { aci: String, answer: Sender<Result<Option<SafetyNumber>, Fault>> },
     SetVerified { aci: String, state: IdentityState, answer: Sender<Result<(), Fault>> },
+    PersonProfile { aci: String, answer: Sender<Result<PersonProfile, Fault>> },
 }
 
 pub struct Real {
@@ -633,6 +635,10 @@ impl Wire for Real {
 
     fn set_verified(&self, aci: &str, state: IdentityState) -> Result<(), Fault> {
         self.ask(|answer| Ask::SetVerified { aci: aci.to_owned(), state, answer })
+    }
+
+    fn person_profile(&self, aci: &str) -> Result<PersonProfile, Fault> {
+        self.ask(|answer| Ask::PersonProfile { aci: aci.to_owned(), answer })
     }
 
     fn close(&self) {
@@ -1659,7 +1665,58 @@ impl Session {
             Ask::SetVerified { aci, state, answer } => {
                 let _ = answer.send(self.set_verified(&aci, state).await);
             }
+            Ask::PersonProfile { aci, answer } => {
+                let _ = answer.send(self.person_profile(&aci).await);
+            }
         }
+    }
+
+    async fn person_profile(&mut self, aci: &str) -> Result<PersonProfile, Fault> {
+        let uuid = Uuid::parse_str(aci).map_err(|_| Fault::Refused("That person isn't one Signal knows.".to_owned()))?;
+        let id = ServiceId::Aci(Aci::from(uuid));
+        let Some(key) = self.manager.store().profile_key(&id).await.ok().flatten() else {
+            return Ok(PersonProfile { key_known: false, ..PersonProfile::default() });
+        };
+        // Prefer the raw SignalServiceProfile over websocket so we can also read visible badges.
+        if let Ok(credentials) = self.credentials() {
+            let mut push = PushService::new(SignalServers::Production, Some(credentials.clone()), "tinyclient");
+            if let Ok(mut socket) = push.ws::<Identified>("/v1/websocket/", "/v1/keepalive", &[], Some(credentials)).await {
+                if let Ok(encrypted) = socket.retrieve_profile_by_id(Aci::from(uuid), Some(key)).await {
+                    let badges: Vec<String> = encrypted
+                        .badges
+                        .iter()
+                        .filter(|b| b.visible && !b.name.trim().is_empty())
+                        .map(|b| b.name.trim().to_owned())
+                        .collect();
+                    let cipher = ProfileCipher::new(key);
+                    if let Ok(decrypted) = cipher.decrypt(encrypted) {
+                        let name = decrypted.name.map(|n| n.to_string()).unwrap_or_default();
+                        if !name.is_empty() {
+                            self.names.insert(aci.to_owned(), name.clone());
+                        }
+                        return Ok(PersonProfile {
+                            name,
+                            about: decrypted.about.unwrap_or_default(),
+                            emoji: decrypted.about_emoji.unwrap_or_default(),
+                            badges,
+                            key_known: true,
+                        });
+                    }
+                }
+            }
+        }
+        let profile = self.manager.retrieve_profile_by_uuid(Aci::from(uuid), key).await.map_err(fault)?;
+        let name = profile.name.map(|n| n.to_string()).unwrap_or_default();
+        if !name.is_empty() {
+            self.names.insert(aci.to_owned(), name.clone());
+        }
+        Ok(PersonProfile {
+            name,
+            about: profile.about.unwrap_or_default(),
+            emoji: profile.about_emoji.unwrap_or_default(),
+            badges: Vec::new(),
+            key_known: true,
+        })
     }
 
     async fn set_verified(&mut self, aci: &str, state: IdentityState) -> Result<(), Fault> {

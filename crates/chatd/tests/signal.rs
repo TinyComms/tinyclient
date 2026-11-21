@@ -2343,3 +2343,76 @@ fn safety_number_change_writes_system_rows_and_blocks_verified_send_until_approv
     assert!(world.calls().contains(&format!("verify {GRACE} verified")));
     assert!(world.calls().contains(&format!("verify {GRACE} default")));
 }
+
+#[test]
+fn person_profile_returns_about_badges_masked_phone_username_shared_groups_nickname_note_and_safety_number() {
+    const STRANGER: &str = "d4d4d4d4-0000-4000-8000-000000000004";
+    let manifest = format!(
+        r#"{{"contacts":[{{"aci":"{GRACE}","name":"Grace Ombra","nickname":"Bridge Grace","note":"Always opens 1NT","phone":"+15550100002","whitelisted":true}},{{"aci":"{STRANGER}","name":"","whitelisted":false}}],"groups":[{{"id":"{CLUB_HEX}","title":"Bridge club","whitelisted":true}}]}}"#,
+        CLUB_HEX = CLUB.trim_start_matches("g.")
+    );
+    let world = World::start_with_setup(Some(SESSION), |support| {
+        std::fs::write(support.join("signal.storage.json"), &manifest).unwrap();
+    });
+    world.connected();
+
+    // Learn Grace's username via username lookup so it is stored and surfaced in her profile.
+    world.steer(&format!("lookup grace.42 {GRACE}"));
+    let (_, seq) = world.status();
+    let _ = world.ask(Request::People {
+        network: Some(Network::Signal),
+        relation: None,
+        query: Some("grace.42".into()),
+        offset: 0,
+        limit: 10,
+    });
+    world.changed(seq, "grace.42 lookup to finish", |change| match change {
+        Change::Searched { query, .. } if query == "grace.42" => Some(()),
+        _ => None,
+    });
+
+    // Fetch Grace's full profile.
+    let Response::Profile { profile } = world.ask(Request::Profile {
+        person: key(GRACE),
+        space: None,
+    }) else {
+        panic!("expected Response::Profile for Grace");
+    };
+    assert!(profile.bio.contains("Likes bridge"), "expected decrypted about in bio: {:?}", profile.bio);
+    assert!(profile.bio.contains("🃏"), "expected about emoji in bio: {:?}", profile.bio);
+    assert_eq!(profile.nickname, "Bridge Grace");
+    assert_eq!(profile.note, "Always opens 1NT");
+    assert_eq!(profile.person.name, "Bridge Grace", "nickname must be preferred over profile name");
+    assert_eq!(profile.person.handle, "grace.42");
+    assert!(
+        profile.contacts.iter().any(|c| c.kind == ContactKind::Phone && c.value == "+15550100002" && c.masked),
+        "expected masked phone number in profile contacts: {:?}",
+        profile.contacts
+    );
+    assert!(
+        profile.mutual_spaces.iter().any(|s| s == "Bridge club"),
+        "expected shared group Bridge club: {:?}",
+        profile.mutual_spaces
+    );
+    assert!(
+        profile.fields.iter().any(|(k, v)| k == "Badges" && v.contains("Sustainer")),
+        "expected Badges field: {:?}",
+        profile.fields
+    );
+    let safety = profile
+        .fields
+        .iter()
+        .find(|(k, _)| k == "Safety number")
+        .map(|(_, v)| v.as_str())
+        .expect("expected Safety number field");
+    assert_eq!(safety.split(' ').count(), 12);
+
+    // A stranger whose profile key is unknown shows "Name not shared yet" instead of an empty bug state.
+    let Response::Profile { profile: stranger } = world.ask(Request::Profile {
+        person: key(STRANGER),
+        space: None,
+    }) else {
+        panic!("expected Response::Profile for Stranger");
+    };
+    assert_eq!(stranger.bio, "Name not shared yet");
+}

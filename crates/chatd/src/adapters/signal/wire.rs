@@ -965,6 +965,10 @@ pub trait Wire: Send + Sync {
     fn set_verified(&self, _aci: &str, _state: IdentityState) -> Result<(), Fault> {
         Err(Fault::Refused("Safety number verification is not available.".to_owned()))
     }
+    /// Fetches and decrypts another person's versioned Signal profile using their stored profile key.
+    fn person_profile(&self, _aci: &str) -> Result<PersonProfile, Fault> {
+        Ok(PersonProfile::default())
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
@@ -981,6 +985,18 @@ pub struct OwnCard {
     pub phone: String,
     /// A signal.me link when a username is known. Empty otherwise. The shell draws the QR.
     pub link: String,
+}
+
+/// Another person's decrypted versioned Signal profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonProfile {
+    pub name: String,
+    pub about: String,
+    pub emoji: String,
+    /// Visible donation / sustainer badges reported by Signal.
+    pub badges: Vec<String>,
+    /// False when no profile key is stored for this person yet ("Name not shared yet").
+    pub key_known: bool,
 }
 
 /// What a finished link produced.

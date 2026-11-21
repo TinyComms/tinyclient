@@ -2346,7 +2346,17 @@ fn search_people(account: &Account, query: &str) {
     if let Some(username) = username_of(query) {
         match account.wire.lookup(username) {
             Ok(Some(aci)) if wire::is_aci(&aci) => {
-                let name = account.live().names.entry(aci.clone()).or_insert_with(|| username.to_owned()).clone();
+                let name = {
+                    let mut live = account.live();
+                    live.usernames.insert(aci.clone(), username.to_owned());
+                    let known = live.known_name(&aci);
+                    if known.is_empty() {
+                        live.names.insert(aci.clone(), username.to_owned());
+                        username.to_owned()
+                    } else {
+                        known
+                    }
+                };
                 let _ = account.ctx.people(&[PersonRow {
                     avatar: account.ctx.avatar_of(&aci),
                     id: aci,
@@ -2403,6 +2413,7 @@ fn offline(ctx: &Context, command: Command) {
         | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Profile { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
@@ -2695,8 +2706,13 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
             let _ = reply.send(Ok(()));
         }
-        Command::Profile { person_id, reply } if person_id == account.me => {
-            let _ = reply.send(own_about(account));
+        Command::Profile { person_id, reply } => {
+            let outcome = if person_id == account.me {
+                own_about(account)
+            } else {
+                person_about(account, &person_id)
+            };
+            let _ = reply.send(outcome);
         }
         Command::SetPresence { status, reply, .. } => {
             let Some((name, about, emoji)) = status.as_deref().and_then(profile_edit) else {
@@ -2894,6 +2910,98 @@ fn own_about(account: &Account) -> Result<About, Refusal> {
     }
     if !card.username.is_empty() {
         about.fields.push(("Username".into(), card.username));
+    }
+    Ok(about)
+}
+
+/// Fetches another person's Signal profile (decrypted name/about/emoji/badges, masked phone,
+/// stored username, shared groups, nickname & private note, and 60-digit safety number).
+fn person_about(account: &Account, person_id: &str) -> Result<About, Refusal> {
+    if !wire::is_aci(person_id) {
+        return Err(Refusal::Refused("That person isn't one Signal knows.".to_owned()));
+    }
+    let profile = account.wire.person_profile(person_id).map_err(refused)?;
+    let safety = account.wire.safety_number(person_id).ok().flatten();
+    let (nickname, note, phone, username, mutual_spaces, known_name, refresh_person) = {
+        let mut live = account.live();
+        let mut refresh = None;
+        if !profile.name.is_empty() {
+            live.names.insert(person_id.to_owned(), profile.name.clone());
+            let display = live.known_name(person_id);
+            let handle = live.usernames.get(person_id).cloned().unwrap_or_default();
+            refresh = Some((display, handle));
+        }
+        let nickname = live.nicknames.get(person_id).cloned().unwrap_or_default();
+        let note = live.notes.get(person_id).cloned().unwrap_or_default();
+        let phone = live.phones.get(person_id).cloned().unwrap_or_default();
+        let username = live.usernames.get(person_id).cloned().unwrap_or_default();
+        let mut mutual: Vec<String> = live
+            .group_info
+            .values()
+            .filter(|g| g.member && g.member_ids.iter().any(|id| id == person_id))
+            .map(|g| if g.title.is_empty() { "Signal group".to_owned() } else { g.title.clone() })
+            .collect();
+        mutual.sort();
+        mutual.dedup();
+        let known_name = live.known_name(person_id);
+        (nickname, note, phone, username, mutual, known_name, refresh)
+    };
+    if let Some((display, handle)) = refresh_person {
+        let _ = account.ctx.people(&[PersonRow {
+            id: person_id.to_owned(),
+            name: if display.is_empty() { NO_NAME.to_owned() } else { display },
+            handle,
+            avatar: account.ctx.avatar_of(person_id),
+            ..PersonRow::default()
+        }]);
+    }
+    let bio = if !profile.about.trim().is_empty() {
+        if !profile.emoji.trim().is_empty() {
+            format!("{} {}", profile.emoji.trim(), profile.about.trim())
+        } else {
+            profile.about.trim().to_owned()
+        }
+    } else if !profile.key_known && known_name.is_empty() {
+        "Name not shared yet".to_owned()
+    } else {
+        String::new()
+    };
+    let mutual_total = mutual_spaces.len() as u32;
+    let mut about = About {
+        bio,
+        nickname,
+        note,
+        mutual_spaces,
+        mutual_total,
+        ..About::default()
+    };
+    if !phone.is_empty() {
+        about.contacts.push(Contact { kind: ContactKind::Phone, value: phone, masked: true });
+    }
+    if !profile.emoji.trim().is_empty() {
+        about.fields.push(("About emoji".into(), profile.emoji.trim().to_owned()));
+    }
+    if !profile.badges.is_empty() {
+        about.fields.push(("Badges".into(), profile.badges.join(", ")));
+    }
+    if !username.is_empty() {
+        about.fields.push(("Username".into(), username));
+    }
+    if let Some(safety) = safety {
+        let formatted = wire::format_safety_number(&safety.digits);
+        if !formatted.is_empty() {
+            about.fields.push(("Safety number".into(), formatted));
+            let status = if safety.changed {
+                "Changed — approval required"
+            } else {
+                match safety.state {
+                    wire::IdentityState::Verified => "Verified",
+                    wire::IdentityState::Unverified => "Unverified",
+                    wire::IdentityState::Default => "Not verified",
+                }
+            };
+            about.fields.push(("Safety status".into(), status.to_owned()));
+        }
     }
     Ok(about)
 }
