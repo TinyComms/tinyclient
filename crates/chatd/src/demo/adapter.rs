@@ -211,10 +211,14 @@ impl Demo {
                     }
                     let mut attached = Attachment::new(name, MediaFile { bytes, path: Some(path), ..MediaFile::new(id, kind) });
                     attached.spoiler = file.spoiler;
+                    attached.view_once = file.view_once;
                     attached
                 })
                 .collect();
-            let message = demo.accepted(&conversation_id, text, reply_to, attachments);
+            let mut message = demo.accepted(&conversation_id, text, reply_to, attachments);
+            message.importance = with.importance;
+            message.effect = with.effect.clone();
+            message.spans = with.spans.clone();
             demo.ctx.sent(&conversation_id, &client_id, Ok(message));
             crate::blobs::upload::discard(&with.files);
         });
@@ -643,7 +647,7 @@ impl Demo {
     fn serve(demo: &Arc<Demo>, command: Command) {
         match command {
             Command::Send { conversation_id, client_id, text, reply_to } => demo.send(&conversation_id, &client_id, text, reply_to),
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji), on);
                 let _ = reply.send(reacted.map_err(|err| Refusal::Refused(err.to_string())));
             }

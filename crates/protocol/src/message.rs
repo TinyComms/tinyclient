@@ -172,6 +172,9 @@ pub struct Attachment {
     /// A round video message (Telegram's): drawn in a circle.
     #[serde(default, skip_serializing_if = "is_false")]
     pub round: bool,
+    /// View-once media (Signal, Telegram): hidden until explicitly viewed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
 }
 
 impl Attachment {
@@ -188,6 +191,7 @@ impl Attachment {
             sticker: false,
             waveform: Vec::new(),
             round: false,
+            view_once: false,
         }
     }
 }
@@ -597,6 +601,12 @@ pub struct Message {
     /// Structured metadata for a call transcript row (`MessageKind::System`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<CallNote>,
+    /// Message importance (Teams: Normal / Important / Urgent).
+    #[serde(default, skip_serializing_if = "crate::Importance::is_normal")]
+    pub importance: crate::Importance,
+    /// Optional message effect identifier (Telegram).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -686,6 +696,8 @@ impl Message {
             deliveries: Vec::new(),
             receipt_note: String::new(),
             call: None,
+            importance: crate::Importance::Normal,
+            effect: None,
         }
     }
 
@@ -751,6 +763,9 @@ impl Message {
             clip(&mut delivery.failed, 200);
         }
         clip(&mut self.receipt_note, 200);
+        if let Some(effect) = &mut self.effect {
+            clip(effect, 64);
+        }
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
@@ -869,5 +884,28 @@ mod tests {
         assert_eq!(parsed.closes_at, None);
         assert!(!parsed.anonymous);
         assert_eq!(parsed.total_votes(), 1);
+    }
+
+    #[test]
+    fn send_options_round_trip_and_stay_off_wire_by_default() {
+        let plain = crate::Outgoing::default();
+        assert!(plain.is_plain());
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("importance") && !json.contains("broadcast") && !json.contains("effect"));
+
+        let rich = crate::Outgoing {
+            importance: crate::Importance::Urgent,
+            broadcast: true,
+            effect: Some("confetti".into()),
+            files: vec![crate::OutgoingFile {
+                path: "/tmp/a.jpg".into(),
+                view_once: true,
+                ..crate::OutgoingFile::default()
+            }],
+            ..crate::Outgoing::default()
+        };
+        assert!(!rich.is_plain());
+        let wire = serde_json::to_string(&rich).unwrap();
+        assert_eq!(serde_json::from_str::<crate::Outgoing>(&wire).unwrap(), rich);
     }
 }

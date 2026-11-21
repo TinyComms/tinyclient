@@ -157,6 +157,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         reply_ping: true,
         polls: demo_polls.clone(),
         groups: 10,
+        burst_reactions: true,
         ..Capabilities::default()
     }));
     for account in [slack::harbor(), slack::fernhill()] {
@@ -167,6 +168,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
             schedule: true,
             suppress_embeds: true,
             groups: 8,
+            thread_broadcast: true,
             ..Capabilities::default()
         }));
     }
@@ -190,14 +192,17 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
             anonymous: true,
         }),
         groups: 200,
+        effects: true,
+        view_once: true,
         ..Capabilities::default()
     }));
-    s.capabilities.push((teams::account(), Capabilities { max_file_bytes: 250 * mb, max_files: 10, groups: 20, ..Capabilities::default() }));
+    s.capabilities.push((teams::account(), Capabilities { max_file_bytes: 250 * mb, max_files: 10, groups: 20, importance: true, ..Capabilities::default() }));
     s.capabilities.push((super::signal::account(), Capabilities {
         max_file_bytes: 100 * mb,
         max_files: 10,
         polls: demo_polls,
         groups: 100,
+        view_once: true,
         ..Capabilities::default()
     }));
     let _ = s.store.set_space_can_create_channels(&Key::new(&discord::account(), discord::MOSS), true);

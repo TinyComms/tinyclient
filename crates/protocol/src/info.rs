@@ -357,6 +357,37 @@ pub struct Capabilities {
     /// Maximum members in a group chat this account can create (`Request::StartGroup`). 0: unsupported.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub groups: u32,
+    /// This account supports marking messages as Important or Urgent (`Outgoing::importance`, Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub importance: bool,
+    /// This account supports broadcasting a thread reply to the channel (`Outgoing::broadcast`, Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thread_broadcast: bool,
+    /// This account supports Telegram-style message effects (`Outgoing::effect`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub effects: bool,
+    /// This account supports view-once media attachments (`OutgoingFile::view_once`, Signal/Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
+    /// This account supports super / burst reactions (`Request::React { burst: true }`, Discord Nitro).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub burst_reactions: bool,
+}
+
+/// Message urgency level (Teams: Normal, Important, Urgent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Importance {
+    #[default]
+    Normal,
+    Important,
+    Urgent,
+}
+
+impl Importance {
+    pub fn is_normal(&self) -> bool {
+        *self == Importance::Normal
+    }
 }
 
 /// What a network allows when creating a poll.
@@ -425,6 +456,9 @@ pub struct OutgoingFile {
     /// Send the file as it is (a HEIC rather than the JPEG made at staging).
     #[serde(default, skip_serializing_if = "is_false")]
     pub original: bool,
+    /// View-once media (Signal, Telegram): hidden until opened and cannot be kept.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
     /// Optional video/audio metadata and poster thumbnail path staged by the shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<OutgoingMedia>,
@@ -509,6 +543,15 @@ pub struct Outgoing {
     /// true for text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<PollDraft>,
+    /// Message importance (Teams: Normal / Important / Urgent).
+    #[serde(default, skip_serializing_if = "Importance::is_normal")]
+    pub importance: Importance,
+    /// Also send a thread reply to the parent channel (Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcast: bool,
+    /// Optional message effect identifier from the account's catalog (Telegram).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -523,6 +566,9 @@ impl Default for Outgoing {
             voice: None,
             spans: Vec::new(),
             poll: None,
+            importance: Importance::Normal,
+            broadcast: false,
+            effect: None,
         }
     }
 }

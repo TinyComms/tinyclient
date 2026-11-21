@@ -756,7 +756,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             send::send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
         }
         Command::CancelSend { conversation_id, client_id } => send::cancel(account, &conversation_id, &client_id),
-        Command::React { conversation_id, message_id, emoji, on, reply } => {
+        Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
             let _ = reply.send(react::react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { conversation_id, reply } => {

@@ -1911,7 +1911,7 @@ fn reactions_follow_each_chats_own_rules_and_what_they_refuse_never_reaches_tele
     assert_eq!(world.called("GetAvailableReactions"), 1, "the list is asked once a connection");
     assert!(world.calls().iter().any(|call| call.starts_with("GetFullChannel c9001")));
 
-    let react = |id: &str, message: &str, emoji: &str| world.ask(Request::React { conversation: key(id), message_id: message.into(), emoji: emoji.into(), on: true });
+    let react = |id: &str, message: &str, emoji: &str| world.ask(Request::React { conversation: key(id), message_id: message.into(), emoji: emoji.into(), on: true , burst: false });
     let refused = |answer: Response| match answer {
         Response::Error { code: ErrorCode::Refused, detail } => detail,
         other => panic!("not refused: {other:?}"),
@@ -1955,10 +1955,10 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
     assert!(edited.edited && edited.text == "See you at seven");
 
     // A reaction shows at once and is what Telegram then says; a refused one is taken back.
-    assert_eq!(world.ask(Request::React { conversation: key("u7002"), message_id: "12".into(), emoji: "👍".into(), on: true }), Response::Ok);
+    assert_eq!(world.ask(Request::React { conversation: key("u7002"), message_id: "12".into(), emoji: "👍".into(), on: true , burst: false }), Response::Ok);
     let ours = world.message("u7002", "12").unwrap().reactions;
     assert_eq!((ours.len(), ours[0].emoji.as_str(), ours[0].count, ours[0].mine), (1, "👍", 1, true));
-    let refused = world.ask(Request::React { conversation: key("u7002"), message_id: "12".into(), emoji: "🚫".into(), on: true });
+    let refused = world.ask(Request::React { conversation: key("u7002"), message_id: "12".into(), emoji: "🚫".into(), on: true , burst: false });
     assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "That reaction isn't allowed here.".into() });
     assert!(world.message("u7002", "12").unwrap().reactions.iter().all(|reaction| reaction.emoji != "🚫"));
 

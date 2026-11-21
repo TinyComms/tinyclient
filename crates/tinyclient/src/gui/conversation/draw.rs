@@ -837,6 +837,44 @@ impl Pane {
                 None => sent.children(said).children(attached),
             };
             sent = sent
+                .children((message.importance != protocol::Importance::Normal).then(|| {
+                    let (label, color) = match message.importance {
+                        protocol::Importance::Urgent => ("URGENT", theme::danger()),
+                        protocol::Importance::Important => ("IMPORTANT", theme::warning()),
+                        protocol::Importance::Normal => ("", theme::text_faint()),
+                    };
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(color)
+                                .type_micro()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(color)
+                                .child(label),
+                        )
+                }))
+                .children(message.effect.as_ref().map(|effect| {
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .type_micro()
+                                .text_color(theme::accent())
+                                .child(format!("✨ {effect}")),
+                        )
+                }))
                 .children(message.card.as_deref().map(|card| self.app_card(card)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(self.cards(message, window, cx));

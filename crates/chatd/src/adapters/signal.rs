@@ -1436,6 +1436,7 @@ fn capabilities() -> protocol::Capabilities {
             multiple: true,
             anonymous: false,
         }),
+        view_once: true,
         ..protocol::Capabilities::default()
     }
 }
@@ -1461,7 +1462,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&account.ctx.account, &client_id),
-        Command::React { conversation_id, message_id, emoji, on, reply } => {
+        Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),

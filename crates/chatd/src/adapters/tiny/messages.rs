@@ -415,7 +415,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             send_with(ctx, saved, conversation_id, client_id, text, reply_to, *with);
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
-        Command::React { conversation_id, message_id, emoji, on, reply } => react(ctx, saved, &conversation_id, &message_id, &emoji, on, reply),
+        Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => react(ctx, saved, &conversation_id, &message_id, &emoji, on, reply),
         Command::ReactionRules { reply, .. } => {
             let _ = reply.send(Ok(ReactionRules::default()));
         }

@@ -568,6 +568,10 @@ pub struct Composer {
     pending_file: Option<(Key, String)>,
     /// Inline poll creation form when the user clicks "Create poll".
     poll_composer: Option<PollComposer>,
+    /// Per-message send options (Issue #776): Teams importance, Slack thread broadcast, Telegram effect.
+    importance: protocol::Importance,
+    broadcast: bool,
+    effect: Option<String>,
 }
 
 impl Composer {
@@ -659,6 +663,9 @@ impl Composer {
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
             poll_composer: None,
+            importance: protocol::Importance::Normal,
+            broadcast: false,
+            effect: None,
         }
     }
 
@@ -979,7 +986,13 @@ impl Composer {
             schedule,
             spans: if as_file { Vec::new() } else { mention_spans },
             poll: None,
+            importance: if controls.importance { self.importance } else { protocol::Importance::Normal },
+            broadcast: controls.broadcast && self.thread && self.broadcast,
+            effect: if controls.effects { self.effect.clone() } else { None },
         };
+        self.importance = protocol::Importance::Normal;
+        self.broadcast = false;
+        self.effect = None;
         let (shown, wire) = match as_file {
             true => (String::new(), String::new()),
             false => {
@@ -1587,6 +1600,96 @@ impl Composer {
     }
 
     /// ⌘U: the system's file panel, several at once.
+    fn send_options_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let controls = self.controls();
+        let show_importance = controls.importance;
+        let show_broadcast = controls.broadcast && self.thread;
+        let show_effects = controls.effects;
+        if !show_importance && !show_broadcast && !show_effects {
+            return None;
+        }
+        let mut bar = div().pb(px(4.)).pl(px(4.)).flex().items_center().gap(px(8.));
+        if show_importance {
+            let imp = self.importance;
+            let (label, color) = match imp {
+                protocol::Importance::Normal => ("Importance: Normal", theme::text_faint()),
+                protocol::Importance::Important => ("! Important", theme::warning()),
+                protocol::Importance::Urgent => ("!! Urgent", theme::danger()),
+            };
+            bar = bar.child(
+                div()
+                    .id("opt-importance")
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .type_small()
+                    .text_color(color)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.importance = match this.importance {
+                            protocol::Importance::Normal => protocol::Importance::Important,
+                            protocol::Importance::Important => protocol::Importance::Urgent,
+                            protocol::Importance::Urgent => protocol::Importance::Normal,
+                        };
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
+        if show_broadcast {
+            let on = self.broadcast;
+            bar = bar.child(
+                div()
+                    .id("opt-broadcast")
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .type_small()
+                    .text_color(if on { theme::accent_text() } else { theme::text_faint() })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.broadcast = !this.broadcast;
+                        cx.notify();
+                    }))
+                    .child(if on { "☑ Also send to channel" } else { "☐ Also send to channel" }),
+            );
+        }
+        if show_effects {
+            let label = match self.effect.as_deref() {
+                None => "✨ Effect: None".to_owned(),
+                Some(e) => format!("✨ Effect: {e}"),
+            };
+            let active = self.effect.is_some();
+            bar = bar.child(
+                div()
+                    .id("opt-effect")
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .type_small()
+                    .text_color(if active { theme::accent_text() } else { theme::text_faint() })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.effect = match this.effect.as_deref() {
+                            None => Some("confetti".to_owned()),
+                            Some("confetti") => Some("fire".to_owned()),
+                            Some("fire") => Some("hearts".to_owned()),
+                            _ => None,
+                        };
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
+        Some(bar)
+    }
+
     fn toggle_poll_composer(&mut self, cx: &mut Context<Self>) {
         if self.poll_composer.is_some() {
             self.poll_composer = None;
@@ -3535,6 +3638,7 @@ impl Render for Composer {
         let anchors = self.anchors.clone();
         // The row sits over the card's text, not its edge.
         dock.child(div().pl(px(13.)).child(self.typing.clone()))
+            .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
             .child(div().relative().child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))

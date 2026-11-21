@@ -1782,7 +1782,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     world.general();
     let shipping = "1760000300.000300";
     let reaction = |emoji: &str| world.message(&general, shipping).unwrap().reactions.into_iter().find(|have| have.emoji == emoji);
-    let react = |emoji: &str, on: bool| world.ask(Request::React { conversation: general.clone(), message_id: shipping.to_owned(), emoji: emoji.to_owned(), on });
+    let react = |emoji: &str, on: bool| world.ask(Request::React { conversation: general.clone(), message_id: shipping.to_owned(), emoji: emoji.to_owned(), on , burst: false });
 
     // A reaction is asked of Slack by name, shows at once, and Slack's own word of it on the
     // socket is the same reaction, not a second one.

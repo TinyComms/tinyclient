@@ -280,6 +280,7 @@ pub enum Command {
         message_id: String,
         emoji: String,
         on: bool,
+        burst: bool,
         reply: Reply<()>,
     },
     /// What reactions a conversation takes from this account, from what the network says of

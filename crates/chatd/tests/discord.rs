@@ -2529,7 +2529,7 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
     wait("history of the conversation", || Some(world.messages(dm)).filter(|messages| messages.len() == 5));
     let (rich, mine) = ("1300000010000000010", "1300000000000000009");
     let react = |message: &str, emoji: &str, on: bool| {
-        world.ask(Request::React { conversation: world.key(dm), message_id: message.to_owned(), emoji: emoji.to_owned(), on })
+        world.ask(Request::React { conversation: world.key(dm), message_id: message.to_owned(), emoji: emoji.to_owned(), on , burst: false })
     };
     let reaction = |message: &str, emoji: &str| {
         let stored = world.messages(dm).into_iter().find(|stored| stored.id == message).unwrap();
@@ -2650,7 +2650,7 @@ fn reactions_follow_the_channels_permissions_and_what_they_refuse_never_reaches_
     let held = |channel: &str, id: &str| world.messages(channel).iter().any(|message| message.id == id);
     wait("the messages", || (held("4101", &full) && held("4105", &said) && held("4102", &news)).then_some(()));
     let react = |channel: &str, message: &str, emoji: &str| {
-        world.ask(Request::React { conversation: world.key(channel), message_id: message.to_owned(), emoji: emoji.to_owned(), on: true })
+        world.ask(Request::React { conversation: world.key(channel), message_id: message.to_owned(), emoji: emoji.to_owned(), on: true , burst: false })
     };
     let refused = |answer: Response| match answer {
         Response::Error { code: ErrorCode::Refused, detail } => detail,
@@ -2921,7 +2921,7 @@ fn a_run_of_refusals_stops_every_request_and_says_so() {
     wait("history of the conversation", || Some(world.messages(dm)).filter(|messages| messages.len() == 5));
     let mine = "1300000000000000009";
     world.discord.forbidden.lock().unwrap().push(format!("/channels/{dm}/messages/{mine}/reactions"));
-    let react = || world.ask(Request::React { conversation: world.key(dm), message_id: mine.to_owned(), emoji: "👀".to_owned(), on: true });
+    let react = || world.ask(Request::React { conversation: world.key(dm), message_id: mine.to_owned(), emoji: "👀".to_owned(), on: true , burst: false });
 
     // Discord bans an address at 10,000 refusals in ten minutes. This stops at 50.
     for _ in 0..49 {

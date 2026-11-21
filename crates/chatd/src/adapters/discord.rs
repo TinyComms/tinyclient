@@ -1607,7 +1607,7 @@ impl Discord {
                 let outcome = self.send(&conversation_id, &client_id, &text, reply_to.as_deref());
                 self.ctx.sent(&conversation_id, &client_id, outcome);
             }
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
             }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {

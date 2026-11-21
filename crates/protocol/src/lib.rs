@@ -1486,6 +1486,9 @@ pub enum Request {
         message_id: String,
         emoji: String,
         on: bool,
+        /// Discord Nitro super / burst reaction.
+        #[serde(default, skip_serializing_if = "is_false")]
+        burst: bool,
     },
     /// What reactions the conversation takes from this account: asked when it opens, kept
     /// five minutes. chatd refuses a `React` these rules refuse, before the network hears of it.

@@ -1463,10 +1463,13 @@ impl Chat {
     /// conversation's rules refuse is refused here and never sent; one that replaces mine (a
     /// network with one reaction a person) takes mine off at once too. A custom emoji that is
     /// not on the message yet has no name here to draw, so that one waits for the network's word.
-    fn react(&self, conversation: Key, message_id: String, emoji: String, on: bool) -> Response {
+    fn react(&self, conversation: Key, message_id: String, emoji: String, on: bool, burst: bool) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
+        }
+        if burst && !self.hub.capabilities(&account).burst_reactions {
+            return error(ErrorCode::Unsupported, "Super reactions are not available on this account.");
         }
         let ours = |emoji: &str| Reaction {
             emoji: emoji.to_owned(),
@@ -1518,6 +1521,7 @@ impl Chat {
             message_id: id,
             emoji: emoji.clone(),
             on,
+            burst,
             reply,
         });
         match asked {
@@ -2683,7 +2687,7 @@ impl Chat {
                 Response::Ok
             }
 
-            Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
+            Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans),
             Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None, Vec::new()),
@@ -3158,6 +3162,7 @@ fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
             spoiler: attachment.spoiler,
             as_file: false,
             original: false,
+            view_once: attachment.view_once,
             media: None,
         })
     })
@@ -3476,6 +3481,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                view_once: false,
                 media: None,
             }],
             ..Outgoing::default()
@@ -3500,6 +3506,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
         message_id: "1".into(),
         emoji: "👍".into(),
         on: true,
+        burst: false,
     });
     let delete = chat.handle(Request::Delete { conversation: conversation.clone(), message_id: "1".into() });
     if !matches!(edit, Response::Error { code: ErrorCode::Offline, .. })
