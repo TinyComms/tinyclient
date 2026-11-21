@@ -510,12 +510,39 @@ impl Floating {
                     }
                 })))
             }
+            Item::IgnoreUser => {
+                let person = person.cloned();
+                div().child(menu_item("menu-ignore-user", Some("icons/eye-off.svg"), "Ignore", None).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(person) = person.clone() {
+                        this.shell_do(cx, move |shell, cx| shell.relate(&person, RelateAction::IgnoreUser, cx));
+                    }
+                    this.close(cx);
+                })))
+            }
+            Item::UnignoreUser => {
+                let person = person.cloned();
+                div().child(menu_item("menu-unignore-user", Some("icons/eye.svg"), "Stop ignoring", None).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(person) = person.clone() {
+                        this.shell_do(cx, move |shell, cx| shell.relate(&person, RelateAction::UnignoreUser, cx));
+                    }
+                    this.close(cx);
+                })))
+            }
             Item::Block => {
                 let key = person.map(|person| person.key.clone());
                 div().child(menu_item_danger("menu-block", Some("icons/circle-alert.svg"), "Block").on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(key) = key.clone() {
                         this.turn_to(Float::Confirm(key, RelateAction::Block), cx);
                     }
+                })))
+            }
+            Item::Unblock => {
+                let person = person.cloned();
+                div().child(menu_item("menu-unblock", Some("icons/circle-alert.svg"), "Unblock", None).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(person) = person.clone() {
+                        this.shell_do(cx, move |shell, cx| shell.relate(&person, RelateAction::Unblock, cx));
+                    }
+                    this.close(cx);
                 })))
             }
             Item::Leave => {

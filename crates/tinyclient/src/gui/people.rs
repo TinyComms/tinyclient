@@ -715,6 +715,9 @@ fn relate_failed(action: RelateAction, name: &str) -> String {
         RelateAction::Cancel => format!("Can't cancel the request to {name}"),
         RelateAction::Remove => format!("Can't remove {name}"),
         RelateAction::Block => format!("Can't block {name}"),
+        RelateAction::Unblock => format!("Can't unblock {name}"),
+        RelateAction::IgnoreUser => format!("Can't ignore {name}"),
+        RelateAction::UnignoreUser => format!("Can't stop ignoring {name}"),
     }
 }
 

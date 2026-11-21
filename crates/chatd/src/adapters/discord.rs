@@ -1091,13 +1091,17 @@ impl Discord {
                 return Err(Refusal::Refused("A friend request cannot be sent to this person.".into()));
             }
         }
-        let path = format!("/users/@me/relationships/{person}");
         let context = |location: &str| base64::engine::general_purpose::STANDARD.encode(json!({"location": location}).to_string());
-        let (method, body, location, becomes) = match action {
-            RelateAction::Add => ("PUT", Some(json!({})), "User Profile", Relation::Outgoing),
-            RelateAction::Accept => ("PUT", Some(json!({})), "Friends", Relation::Friend),
-            RelateAction::Block => ("PUT", Some(json!({"type": 2})), "ContextMenu", Relation::Blocked),
-            RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => ("DELETE", None, "Friends", Relation::None),
+        let (method, path, body, location, becomes) = match action {
+            RelateAction::Add => ("PUT", format!("/users/@me/relationships/{person}"), Some(json!({})), "User Profile", Relation::Outgoing),
+            RelateAction::Accept => ("PUT", format!("/users/@me/relationships/{person}"), Some(json!({})), "Friends", Relation::Friend),
+            RelateAction::Block => ("PUT", format!("/users/@me/relationships/{person}"), Some(json!({"type": 2})), "ContextMenu", Relation::Blocked),
+            RelateAction::Unblock => ("DELETE", format!("/users/@me/relationships/{person}"), None, "Blocked", Relation::None),
+            RelateAction::IgnoreUser => ("PUT", format!("/users/@me/relationships/{person}/ignore"), None, "ContextMenu", Relation::Ignored),
+            RelateAction::UnignoreUser => ("DELETE", format!("/users/@me/relationships/{person}/ignore"), None, "ContextMenu", Relation::None),
+            RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => {
+                ("DELETE", format!("/users/@me/relationships/{person}"), None, "Friends", Relation::None)
+            }
         };
         let context = context(location);
         self.rest.call_with(method, &path, body, &[("X-Context-Properties", &context)]).map_err(refusal)?;

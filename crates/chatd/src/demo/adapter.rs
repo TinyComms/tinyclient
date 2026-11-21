@@ -642,7 +642,10 @@ impl Demo {
                     RelateAction::Add => Relation::Outgoing,
                     RelateAction::Accept => Relation::Friend,
                     RelateAction::Block => Relation::Blocked,
-                    RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => Relation::None,
+                    RelateAction::IgnoreUser => Relation::Ignored,
+                    RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove | RelateAction::Unblock | RelateAction::UnignoreUser => {
+                        Relation::None
+                    }
                 };
                 let related = demo.ctx.relation(&person_id, relation);
                 let _ = reply.send(related.map_err(|err| Refusal::Refused(err.to_string())));

@@ -550,7 +550,10 @@ pub enum Item {
     CloseDirect,
     Separator,
     RemoveFriend,
+    IgnoreUser,
+    UnignoreUser,
     Block,
+    Unblock,
     Leave,
 }
 
@@ -606,8 +609,17 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if remove {
         items.push(Item::RemoveFriend);
     }
+    if person.key.network == Network::Discord && !person.bot && person.relation != Relation::Blocked {
+        if person.relation == Relation::Ignored {
+            items.push(Item::UnignoreUser);
+        } else {
+            items.push(Item::IgnoreUser);
+        }
+    }
     if block {
         items.push(Item::Block);
+    } else if person.relation == Relation::Blocked && matches!(person.key.network, Network::Discord | Network::Telegram) {
+        items.push(Item::Unblock);
     }
     tidy(items)
 }
@@ -687,7 +699,7 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
         Act::Block => (
             format!("Block {name} on {net}?"),
             match network {
-                Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them in Discord.".to_owned(),
+                Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them from their profile or Blocked.".to_owned(),
                 _ => format!("They won't be able to message or call you on {net}. You can unblock them in {net}."),
             },
             "Block",

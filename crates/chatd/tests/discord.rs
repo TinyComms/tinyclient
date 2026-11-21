@@ -239,6 +239,15 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             shared.push("RELATIONSHIP_REMOVE", json!({"id": person, "type": 1, "nickname": null}));
             (204, Value::Null)
         }
+        ("PUT", ["users", "@me", "relationships", person, "ignore"]) => {
+            let user = json!({"id": person, "username": format!("user{person}"), "global_name": format!("User {person}")});
+            shared.push("RELATIONSHIP_ADD", json!({"id": person, "type": 0, "user_ignored": true, "nickname": null, "user": user}));
+            (204, Value::Null)
+        }
+        ("DELETE", ["users", "@me", "relationships", person, "ignore"]) => {
+            shared.push("RELATIONSHIP_REMOVE", json!({"id": person, "type": 0, "user_ignored": false, "nickname": null}));
+            (204, Value::Null)
+        }
         ("PATCH", ["users", "@me", "settings-proto", "1"]) => (200, json!({"settings": seen.body["settings"]})),
         ("GET", ["users", person, "profile"]) => {
             let mut profile = json!({
@@ -4189,4 +4198,42 @@ fn voice_channel_respects_connect_permission_and_user_limit() {
         other => panic!("expected Failed, got {other:?}"),
     }
     assert!(world.discord.frames_of(4).is_empty(), "must not send op 4 when channel is full");
+}
+
+#[test]
+fn unblock_and_ignore_user_relationships() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["users"].as_array_mut().unwrap().push(json!({
+        "id": "2007", "username": "nora", "global_name": "Nora", "discriminator": "0", "avatar": null
+    }));
+    ready["relationships"].as_array_mut().unwrap().push(json!({
+        "id": "2007", "user_id": "2007", "type": 0, "user_ignored": true, "nickname": null
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Ignored user from READY is parsed as Relation::Ignored.
+    assert!(
+        world.people(Some(Relation::Ignored), None).iter().any(|p| p.key.id == "2007"),
+        "user_ignored in READY should map to Relation::Ignored"
+    );
+
+    // Unblock blocked user 2005: DELETE /users/@me/relationships/2005.
+    assert!(world.people(Some(Relation::Blocked), None).iter().any(|p| p.key.id == "2005"));
+    assert_eq!(world.ask(Request::Relate { person: world.key("2005"), action: RelateAction::Unblock }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", "/users/@me/relationships/2005").len(), 1);
+    assert!(world.people(Some(Relation::Blocked), None).iter().all(|p| p.key.id != "2005"));
+
+    // Ignore user 2006 without blocking: PUT /users/@me/relationships/2006/ignore.
+    assert_eq!(world.ask(Request::Relate { person: world.key("2006"), action: RelateAction::IgnoreUser }), Response::Ok);
+    assert_eq!(world.discord.requests_to("PUT", "/users/@me/relationships/2006/ignore").len(), 1);
+    assert!(world.people(Some(Relation::Ignored), None).iter().any(|p| p.key.id == "2006"));
+    assert!(world.people(Some(Relation::Blocked), None).iter().all(|p| p.key.id != "2006"));
+
+    // Unignore user 2006: DELETE /users/@me/relationships/2006/ignore.
+    assert_eq!(world.ask(Request::Relate { person: world.key("2006"), action: RelateAction::UnignoreUser }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", "/users/@me/relationships/2006/ignore").len(), 1);
+    assert!(world.people(Some(Relation::Ignored), None).iter().all(|p| p.key.id != "2006"));
 }

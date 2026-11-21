@@ -850,6 +850,9 @@ fn serve(account: &Arc<Account>, command: Command) {
                 RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {
                     Err(Refusal::Refused("Telegram has no friend request.".to_owned()))
                 }
+                RelateAction::IgnoreUser | RelateAction::UnignoreUser => {
+                    Err(Refusal::Refused("Telegram does not support ignoring users.".to_owned()))
+                }
                 action => relate(account, &person_id, action).map_err(refused),
             };
             let _ = reply.send(answer);
@@ -1662,7 +1665,14 @@ fn relate(account: &Account, person_id: &str, action: RelateAction) -> Result<()
                 let _ = account.ctx.relation(person_id, Relation::None);
             }
         }
-        RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {}
+        RelateAction::Unblock => {
+            let peer = account.input(who)?;
+            let contact = account.dir().get(who).is_some_and(|known| known.contact);
+            account.ask(&tl::functions::contacts::Unblock { my_stories_from: false, id: peer })?;
+            account.set_user_blocked(user_id, false);
+            let _ = account.ctx.relation(person_id, if contact { Relation::Contact } else { Relation::None });
+        }
+        RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel | RelateAction::IgnoreUser | RelateAction::UnignoreUser => {}
     }
     Ok(())
 }

@@ -635,6 +635,8 @@ impl Leaves for RelateAction {
                 _ => Relation::None,
             },
             RelateAction::Block => Relation::Blocked,
+            RelateAction::Unblock | RelateAction::UnignoreUser => Relation::None,
+            RelateAction::IgnoreUser => Relation::Ignored,
         }
     }
 }

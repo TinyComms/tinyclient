@@ -653,6 +653,8 @@ pub enum Relation {
     /// I asked.
     Outgoing,
     Blocked,
+    /// Ignored without blocking (Discord): messages and notifications are suppressed without telling them.
+    Ignored,
 }
 
 /// Never stored. Known only for people the shell is watching and for lists the user owns.
@@ -887,6 +889,12 @@ pub enum RelateAction {
     /// End the friendship.
     Remove,
     Block,
+    /// Lift a block.
+    Unblock,
+    /// Ignore someone without blocking them (Discord).
+    IgnoreUser,
+    /// Stop ignoring someone (Discord).
+    UnignoreUser,
 }
 
 /// What someone is doing in a composer. Networks that only have typing leave this as [`Typing`].

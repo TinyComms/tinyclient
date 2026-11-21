@@ -546,6 +546,8 @@ pub struct Relationship {
     pub user: Option<User>,
     #[serde(default)]
     pub user_id: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub user_ignored: bool,
 }
 
 impl Relationship {
@@ -563,6 +565,7 @@ impl Relationship {
             2 => protocol::Relation::Blocked,
             3 => protocol::Relation::Incoming,
             4 => protocol::Relation::Outgoing,
+            _ if self.user_ignored => protocol::Relation::Ignored,
             _ => protocol::Relation::None,
         }
     }
