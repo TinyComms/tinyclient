@@ -343,9 +343,12 @@ pub struct Occupant {
     pub muted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub deafened: bool,
-    /// Sharing a screen or a camera.
+    /// Sharing a screen.
     #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,
+    /// Camera is on.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub camera: bool,
     /// Heard right now, where the network says so to someone in the call (a Tiny server's
     /// `call.speaking`), or on stage: a stage channel's platform holds whoever Discord does
     /// not suppress.

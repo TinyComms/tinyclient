@@ -477,7 +477,7 @@ fn build() -> Fixture {
     campfire.occupants = Some(Occupants {
         people: ["yusuf", "ines"]
             .into_iter()
-            .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), muted: id == "ines", deafened: false, streaming: false, speaking: id == "yusuf" })
+            .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), muted: id == "ines", deafened: false, streaming: false, camera: false, speaking: id == "yusuf" })
             .collect(),
         total: 2,
     });

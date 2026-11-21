@@ -3956,3 +3956,60 @@ fn a_voice_message_and_a_gif_from_tenor_are_attachments_fetched_only_from_discor
     let paths: Vec<&str> = fetched.iter().map(|seen| seen.path.as_str()).collect();
     assert_eq!(paths, ["/media/attachments/1/9201/voice-message.ogg?ex=7fffffff&is=1&hm=abc"]);
 }
+
+#[test]
+fn call_roster_reports_camera_and_screen_share_separately() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "self_stream": true, "self_video": false
+        }),
+    );
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "self_stream": false, "self_video": true,
+            "member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock"}, "nick": null, "roles": []}
+        }),
+    );
+
+    let active = wait("the roster with camera and share", || {
+        call().filter(|call| {
+            let dev = call.participants.iter().find(|p| p.id == "2002");
+            let sam = call.participants.iter().find(|p| p.id == "2006");
+            dev.is_some_and(|p| p.sharing && !p.camera) && sam.is_some_and(|p| p.camera && !p.sharing)
+        })
+    });
+    let dev = active.participants.iter().find(|p| p.id == "2002").unwrap();
+    let sam = active.participants.iter().find(|p| p.id == "2006").unwrap();
+    assert_eq!((dev.camera, dev.sharing), (false, true));
+    assert_eq!((sam.camera, sam.sharing), (true, false));
+
+    // Occupants on the tree row also keep screen share (streaming) and camera apart.
+    let occupants = wait("the channel occupants with camera and share", || {
+        match world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) {
+            Response::Tree { conversations, .. } => {
+                let row = conversations.iter().find(|r| r.key.id == "4201")?;
+                let occ = row.occupants.as_ref()?;
+                let dev = occ.people.iter().find(|p| p.person.id == "2002")?;
+                let sam = occ.people.iter().find(|p| p.person.id == "2006")?;
+                (dev.streaming && !dev.camera && sam.camera && !sam.streaming).then(|| (dev.clone(), sam.clone()))
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!((occupants.0.streaming, occupants.0.camera), (true, false));
+    assert_eq!((occupants.1.streaming, occupants.1.camera), (false, true));
+}

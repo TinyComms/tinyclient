@@ -795,7 +795,7 @@ mod tests {
         let occupants = |ids: &[&str]| Occupants {
             people: ids
                 .iter()
-                .map(|id| protocol::Occupant { person: key(id), name: (*id).into(), muted: false, deafened: false, streaming: false, speaking: false })
+                .map(|id| protocol::Occupant { person: key(id), name: (*id).into(), muted: false, deafened: false, streaming: false, camera: false, speaking: false })
                 .collect(),
             total: ids.len() as u32,
         };

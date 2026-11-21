@@ -326,6 +326,7 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
             muted,
             deafened,
             streaming,
+            camera: false,
             speaking: false,
         };
         let mut people: Vec<Occupant> = seats.iter().map(seated).collect();

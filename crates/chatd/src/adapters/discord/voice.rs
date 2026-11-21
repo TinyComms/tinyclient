@@ -175,7 +175,8 @@ pub struct Heard {
     name: String,
     muted: bool,
     deafened: bool,
-    streaming: bool,
+    camera: bool,
+    sharing: bool,
     /// On a stage's platform (`suppress` false there): who the channel hears. A voice
     /// channel's states never have it true, whatever `suppress` says there.
     live: bool,
@@ -329,6 +330,8 @@ impl Discord {
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    camera: heard.camera,
+                    sharing: heard.sharing,
                     ..Participant::default()
                 })
                 .collect();
@@ -383,7 +386,8 @@ impl Discord {
                     name: heard.name.clone(),
                     muted: heard.muted,
                     deafened: heard.deafened,
-                    streaming: heard.streaming,
+                    streaming: heard.sharing,
+                    camera: heard.camera,
                     speaking: heard.live,
                 });
                 let people: Vec<Occupant> = people.collect();
@@ -472,7 +476,8 @@ impl Discord {
                     name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
                     muted: voice.self_mute || voice.mute,
                     deafened: voice.self_deaf || voice.deaf,
-                    streaming: voice.self_stream || voice.self_video,
+                    camera: voice.self_video,
+                    sharing: voice.self_stream,
                     live: stages.contains(channel.as_str()) && !voice.suppress,
                 };
                 changed.insert(channel.clone());

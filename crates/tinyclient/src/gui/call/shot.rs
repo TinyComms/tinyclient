@@ -348,6 +348,7 @@ pub(super) fn running() -> Option<Occupants> {
         muted: false,
         deafened: false,
         streaming: false,
+        camera: false,
         speaking: false,
     };
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3 })

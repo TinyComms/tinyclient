@@ -2036,7 +2036,7 @@ pub(crate) mod tests {
         });
         let hub = test_hub();
         with_session(&base, "owner", |account| {
-            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), muted: true, deafened: false, speaking: false, streaming: false };
+            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), muted: true, deafened: false, speaking: false, streaming: false, camera: false };
             hub.set_occupants(Key::new(&account, LOBBY), protocol::Occupants { people: vec![seat], total: 1 });
             hub.set_presence(Key::new(&account, BEA), Presence::Online, "", true);
             match community(&hub, account) {

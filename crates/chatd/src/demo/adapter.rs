@@ -508,6 +508,7 @@ impl Demo {
             muted: false,
             deafened: false,
             streaming: false,
+            camera: false,
             speaking: false,
         });
         change(&mut occupants.people, me);

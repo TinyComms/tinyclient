@@ -1221,6 +1221,7 @@ impl Shell {
                     .child(Avatar::new(&occupant.person, &occupant.name, 20.).image_at(self.person_picture(&occupant.person, cx)).build())
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(occupant.name.clone()))
                     .when(occupant.streaming, |row| row.child(glyph("icons/monitor-up.svg", 14., theme::text_soft())))
+                    .when(occupant.camera, |row| row.child(glyph("icons/video.svg", 14., theme::text_soft())))
                     .when(occupant.muted && !occupant.deafened, |row| row.child(glyph("icons/mic-off.svg", 14., theme::danger())))
                     .when(occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::danger())));
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
@@ -2289,7 +2290,7 @@ pub(crate) mod tests {
         Occupants {
             people: speaking
                 .iter()
-                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), muted: false, deafened: false, streaming: false, speaking: *live })
+                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), muted: false, deafened: false, streaming: false, camera: false, speaking: *live })
                 .collect(),
             total: speaking.len() as u32,
         }
