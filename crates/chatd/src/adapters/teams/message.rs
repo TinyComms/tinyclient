@@ -637,7 +637,7 @@ impl Teams {
         }
     }
 
-    fn arrived(&self, place: &str, root: Option<&str>, message: Message) -> Result<(), Fault> {
+    fn arrived(&self, place: &str, root: Option<&str>, mut message: Message) -> Result<(), Fault> {
         if !self.known(place)? {
             return Ok(());
         }
@@ -647,21 +647,44 @@ impl Teams {
             self.ctx.filing(place, &filing)?;
         }
         let Some(root) = root.filter(|root| *root != message.id) else {
+            if let Some(stored) = self.ctx.stored_message(place, &message.id)? {
+                message.thread = stored.thread;
+            }
             self.ctx.message(place, &message)?;
             return Ok(());
         };
         // A reply lives in its chain, not in the channel's own pages.
         let chain = chain_id(place, root);
         self.chain_known(place, root)?;
-        if message.mentions_me || message.outgoing {
+        let followed = self.followed_chain(place, root)?;
+        let unread_reply = !message.outgoing && (message.mentions_me || followed);
+        if message.mentions_me || message.outgoing || followed {
             self.ctx.message(&chain, &message)?;
+            if unread_reply {
+                self.ctx.mark_unread(place)?;
+            }
         } else {
-            // Teams tells nobody of a reply unless it names them or they follow the post, and
-            // does not say who follows. Opening the chain shows it.
+            // Teams tells nobody of a reply unless it names them or they follow the post.
+            // Opening the chain shows it.
             self.ctx.history(&chain, std::slice::from_ref(&message))?;
             self.ctx.typing_stopped(&chain, &message.sender.id);
         }
-        self.bump(place, root, &[&message])
+        self.bump(place, root, &[&message], unread_reply)
+    }
+
+    /// True when I wrote this post or have replied in its chain, matching Teams' default follow rule.
+    fn followed_chain(&self, channel: &str, root: &str) -> Result<bool, Fault> {
+        let me = self.ctx.key(&self.me());
+        if let Some(post) = self.ctx.stored_message(channel, root)? {
+            if post.outgoing || post.thread.as_ref().is_some_and(|thread| thread.participants.contains(&me)) {
+                return Ok(true);
+            }
+        }
+        let chain = chain_id(channel, root);
+        if self.ctx.stored_message(&chain, root)?.is_some_and(|post| post.outgoing) {
+            return Ok(true);
+        }
+        Ok(self.replies_held(&chain, root)?.iter().any(|reply| reply.outgoing))
     }
 
     /// An edit, or a reaction given or taken back: Teams sends the whole message again. Only
@@ -706,14 +729,37 @@ impl Teams {
     }
 
     /// Replies arrived for a post that is stored: its summary counts them.
-    fn bump(&self, channel: &str, root: &str, replies: &[&Message]) -> Result<(), Fault> {
+    fn bump(&self, channel: &str, root: &str, replies: &[&Message], unread: bool) -> Result<(), Fault> {
         let Some(mut first) = self.ctx.stored_message(channel, root)? else {
             return Ok(());
         };
-        let after = self.summary(channel, root, first.thread.clone(), replies);
+        let before_replies = first.thread.as_ref().map_or(0, |thread| thread.replies);
+        let mut after = self.summary(channel, root, first.thread.clone(), replies);
+        if unread {
+            if let Some(summary) = after.as_mut() {
+                let added = summary.replies.saturating_sub(before_replies);
+                if added > 0 {
+                    summary.unread = summary.unread.saturating_add(added);
+                }
+            }
+        }
         if after != first.thread {
             first.thread = after;
             self.ctx.history(channel, &[first])?;
+        }
+        Ok(())
+    }
+
+    /// Clears `ThreadSummary.unread` on the parent post when its reply chain is marked read.
+    pub(super) fn clear_chain_unread(&self, channel: &str, root: &str) -> Result<(), Fault> {
+        let Some(mut first) = self.ctx.stored_message(channel, root)? else {
+            return Ok(());
+        };
+        if let Some(thread) = first.thread.as_mut() {
+            if thread.unread > 0 {
+                thread.unread = 0;
+                self.ctx.history(channel, &[first])?;
+            }
         }
         Ok(())
     }
@@ -791,7 +837,7 @@ impl Teams {
             self.ctx.history(&chain_id(conversation, root), &answers)?;
             // A post older than this page still counts what was just seen of its chain.
             if !own.iter().any(|post| post.id == root) {
-                self.bump(conversation, root, &of(root))?;
+                self.bump(conversation, root, &of(root), false)?;
             }
         }
         Ok(())
@@ -822,7 +868,10 @@ impl Teams {
         };
         let replies = self.replies_held(&chain_id(parent, root), root)?;
         let refs: Vec<&Message> = replies.iter().collect();
-        let exact = self.summary(parent, root, None, &refs);
+        let mut exact = self.summary(parent, root, None, &refs);
+        if let (Some(summary), Some(prev)) = (exact.as_mut(), first.thread.as_ref()) {
+            summary.unread = prev.unread;
+        }
         if exact != first.thread {
             first.thread = exact;
             self.ctx.history(parent, &[first])?;
@@ -991,7 +1040,7 @@ impl Teams {
                 self.chain_known(channel, root)?;
                 self.ctx.history(&target, std::slice::from_ref(&message))?;
             }
-            self.bump(channel, root, &[&message])?;
+            self.bump(channel, root, &[&message], false)?;
         }
         message.reply_to = quote;
         Ok(message)

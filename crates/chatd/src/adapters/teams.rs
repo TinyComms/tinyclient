@@ -1028,6 +1028,9 @@ impl Teams {
         let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread_of(conversation)));
         let horizon = json!({"consumptionhorizon": format!("{message};{};{message}", now_ms())});
         self.chat("PUT", &path, Body::Json(&horizon), true)?;
+        if let Some((channel, root)) = chain_of(conversation) {
+            self.clear_chain_unread(channel, root)?;
+        }
         Ok(())
     }
 }

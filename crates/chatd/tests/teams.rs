@@ -1640,3 +1640,47 @@ fn editing_a_message_preserves_formatting_mentions_images_and_subject() {
     assert!(found.contains(&("@Ana Ruiz", &Style::Mention { kind: MentionKind::User, id: ANA.into() })));
     assert_eq!(updated.attachments.len(), 1);
 }
+
+#[test]
+fn reply_to_my_channel_post_marks_chain_and_channel_unread_while_untouched_post_does_not() {
+    let world = World::start();
+    world.ready();
+    let deploys = key(DEPLOYS);
+    world.open(&deploys, 1);
+    assert_eq!(world.conversation(&deploys).unwrap().unread, 0);
+
+    // 1. A reply to someone else's post I never touched does not raise unread on the chain or channel.
+    let ben_root = "1760000400400";
+    let ben_chain = key(&format!("{DEPLOYS};messageid={ben_root}"));
+    world.fake.push("NewMessage", message(DEPLOYS, Some(ben_root), 1_760_000_850_000, ANA, "Ana Ruiz", "<p>nice</p>"), false);
+    let ben_post = world.until("Ben's post to count the reply", || {
+        world.message(&deploys, ben_root).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.replies == 1))
+    });
+    assert_eq!(ben_post.thread.unwrap().unread, 0);
+    assert_eq!(world.conversation(&ben_chain).unwrap().unread, 0);
+    assert_eq!(world.conversation(&deploys).unwrap().unread, 0);
+
+    // 2. A reply to a post I wrote raises unread on the chain, the post's thread summary, and the channel.
+    let client_id = "1760000999000555";
+    world.send(&deploys, client_id, "deploying v514?");
+    let mine = world.until("my post to be accepted", || {
+        world.messages(&deploys).into_iter().find(|message| message.client_id.as_deref() == Some(client_id) && message.state == SendState::Sent)
+    });
+    assert_eq!(world.conversation(&deploys).unwrap().unread, 0);
+    let my_chain = key(&format!("{DEPLOYS};messageid={}", mine.id));
+    let reply_id = 1_760_001_500_000u64;
+    world.fake.push("NewMessage", message(DEPLOYS, Some(&mine.id), reply_id, ANA, "Ana Ruiz", "<p>go ahead</p>"), false);
+    let my_post = world.until("my post to count the reply", || {
+        world.message(&deploys, &mine.id).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.replies == 1))
+    });
+    assert_eq!(my_post.thread.unwrap().unread, 1);
+    assert_eq!(world.conversation(&my_chain).unwrap().unread, 1);
+    assert!(world.conversation(&deploys).unwrap().unread >= 1);
+
+    // 3. Marking the chain read clears ThreadSummary.unread on the post.
+    assert_eq!(world.ask(Request::MarkRead { conversation: my_chain.clone(), message_id: reply_id.to_string() }), Response::Ok);
+    let read_post = world.until("my post thread unread to clear", || {
+        world.message(&deploys, &mine.id).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.unread == 0))
+    });
+    assert_eq!(read_post.thread.unwrap().unread, 0);
+}
