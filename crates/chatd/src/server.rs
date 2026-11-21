@@ -2176,6 +2176,21 @@ impl Chat {
     }
 
     fn resolve_link(&self, url: &str) -> Response {
+        if let Some(parsed) = protocol::link::telegram_app_link(url) {
+            return match self.hub.store().resolve_link(&parsed) {
+                Ok(Some(conv)) => Response::Resolved {
+                    conversation: Some(conv.key),
+                    message_id: parsed.message_id,
+                    title: conv.title,
+                },
+                Ok(None) => self.preview_telegram_link(url),
+                Err(err) => internal(err),
+            };
+        }
+        // telegram.dog, tg://, a traversal, or a pack: not an in-app open, and not a command.
+        if protocol::link::telegram_family(url) {
+            return Response::Resolved { conversation: None, message_id: None, title: String::new() };
+        }
         let Some(parsed) = protocol::link::parse_network_link(url) else {
             return Response::Resolved { conversation: None, message_id: None, title: String::new() };
         };
@@ -2188,6 +2203,32 @@ impl Chat {
             Ok(None) => Response::Resolved { conversation: None, message_id: None, title: String::new() },
             Err(err) => internal(err),
         }
+    }
+
+    /// A `t.me` link the cache does not have. One connected Telegram account may preview it.
+    /// Nothing here joins the chat. No connected account, or no such username, is "not here".
+    fn preview_telegram_link(&self, url: &str) -> Response {
+        let accounts: Vec<AccountKey> = self
+            .hub
+            .links()
+            .into_iter()
+            .filter(|linked| linked.account.network == Network::Telegram && linked.link == Link::Connected)
+            .map(|linked| linked.account)
+            .collect();
+        for account in accounts {
+            match self.ask(&account, |reply| Command::OpenLink { url: url.to_owned(), reply }) {
+                Ok(Some(opened)) => {
+                    return Response::Resolved {
+                        conversation: Some(Key::new(&account, opened.conversation_id)),
+                        message_id: opened.message_id,
+                        title: opened.title,
+                    };
+                }
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        Response::Resolved { conversation: None, message_id: None, title: String::new() }
     }
 
     fn source(&self, conversation: Key, message_id: String) -> Response {
@@ -5591,5 +5632,115 @@ mod tests {
 
         let commands = seen.lock().unwrap().clone();
         assert_eq!(commands, vec![("ch-1".to_owned(), "m-1".to_owned())]);
+    }
+
+    fn telegram_link_account() -> (std::sync::Arc<super::Chat>, protocol::AccountKey, crate::adapters::Context, std::sync::mpsc::Receiver<crate::adapters::Command>) {
+        use crate::hub::lock;
+        use crate::store::Store;
+        use protocol::{AccountKey, Link, Network};
+        use std::sync::Arc;
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Telegram, account: "tg".into() };
+        let (adapter, ctx, rx) = crate::adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        (chat, account, ctx, rx)
+    }
+
+    #[test]
+    fn a_telegram_link_resolves_a_cached_chat_and_asks_once_when_it_is_missing() {
+        use crate::adapters::{Command, OpenedLink};
+        use crate::hub::lock;
+        use crate::store::ConversationRow;
+        use protocol::{ConversationKind, Key, Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let (chat, account, ctx, rx) = telegram_link_account();
+        ctx.conversation(&ConversationRow::new("rustlang", ConversationKind::Channel, "Rust")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::OpenLink { url, reply } => {
+                        seen_worker.lock().unwrap().push(url);
+                        let _ = reply.send(Ok(Some(OpenedLink {
+                            conversation_id: "c99".into(),
+                            message_id: None,
+                            title: "Other".into(),
+                        })));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        let Response::Resolved { conversation, message_id, title } = chat.handle(Request::Resolve { url: "https://t.me/rustlang/99".into() }) else {
+            panic!("expected Resolved");
+        };
+        assert_eq!(conversation, Some(Key::new(&account, "rustlang")));
+        assert_eq!(message_id.as_deref(), Some("99"));
+        assert_eq!(title, "Rust");
+        assert!(seen.lock().unwrap().is_empty(), "a cached t.me link does not ask the network");
+
+        let Response::Resolved { conversation, message_id, title } = chat.handle(Request::Resolve { url: "https://telegram.me/othername".into() }) else {
+            panic!("expected Resolved");
+        };
+        assert_eq!(conversation, Some(Key::new(&account, "c99")));
+        assert_eq!(message_id, None);
+        assert_eq!(title, "Other");
+        assert_eq!(seen.lock().unwrap().clone(), vec!["https://telegram.me/othername".to_owned()]);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn a_foreign_host_or_a_traversal_does_not_open_a_telegram_link() {
+        use crate::adapters::Command;
+        use crate::hub::lock;
+        use protocol::{Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let (chat, account, ctx, rx) = telegram_link_account();
+        let seen = Arc::new(Mutex::new(0u32));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::OpenLink { reply, .. } => {
+                        *seen_worker.lock().unwrap() += 1;
+                        let _ = reply.send(Ok(None));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        for url in [
+            "https://example.com/rustlang",
+            "https://t.me/%2e%2e/rustlang",
+            "https://t.me/../rustlang",
+            "https://telegram.dog/rustlang",
+            "tg://resolve?domain=rustlang",
+            "https://t.me/ab",
+        ] {
+            let Response::Resolved { conversation, .. } = chat.handle(Request::Resolve { url: url.into() }) else {
+                panic!("expected Resolved for {url}");
+            };
+            assert_eq!(conversation, None, "{url}");
+        }
+        assert_eq!(*seen.lock().unwrap(), 0, "no open command for a foreign host or a bad path");
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
     }
 }

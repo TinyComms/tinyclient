@@ -149,7 +149,11 @@ impl Pane {
                 return;
             }
         }
-        if !external && protocol::link::parse_network_link(url).is_some() {
+        // Only t.me and telegram.me open in the app. telegram.dog, tg://, a traversal, or a pack
+        // is still a Telegram address, so it must not fall through to the wider parser.
+        let in_app = protocol::link::telegram_app_link(url).is_some()
+            || (!protocol::link::telegram_family(url) && protocol::link::parse_network_link(url).is_some());
+        if !external && in_app {
             let owned = url.to_owned();
             let request = protocol::Request::Resolve { url: owned.clone() };
             let window_handle = window.window_handle();

@@ -537,6 +537,15 @@ impl Directory {
         self.map.get(&who)
     }
 
+    /// The peer whose public username is `handle`, without the `@`.
+    pub fn by_handle(&self, handle: &str) -> Option<Who> {
+        let want = handle.trim_start_matches('@');
+        if want.is_empty() {
+            return None;
+        }
+        self.map.iter().find(|(_, known)| known.handle.eq_ignore_ascii_case(want)).map(|(who, _)| *who)
+    }
+
     /// People this account has learned, id then what is known of them.
     pub fn users(&self) -> Vec<(i64, Known)> {
         self.map.iter().filter_map(|(who, known)| match who { Who::User(id) => Some((*id, known.clone())), _ => None }).collect()

@@ -920,6 +920,7 @@ impl Demo {
             Command::Source { reply, .. } | Command::CreateGroup { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
+            Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarMessage { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }

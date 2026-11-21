@@ -267,6 +267,14 @@ pub enum Picture {
     Watch(Option<String>),
 }
 
+/// A Telegram link opened inside the app. `None` when the chat is not one this account can show.
+#[derive(Debug, Clone)]
+pub struct OpenedLink {
+    pub conversation_id: String,
+    pub message_id: Option<String>,
+    pub title: String,
+}
+
 /// What chatd asks of an adapter. Ids are the network's own; the account is the adapter's.
 pub enum Command {
     /// Fetch the recent history of a conversation the user opened, and correct what is cached
@@ -866,6 +874,9 @@ pub enum Command {
     SignOut(Reply<()>),
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
+    /// Open a `t.me` or `telegram.me` link as a chat this account already has, or a preview of a
+    /// public username. Never joins. Other adapters refuse it.
+    OpenLink { url: String, reply: Reply<Option<OpenedLink>> },
 }
 
 impl Command {
@@ -962,6 +973,7 @@ impl Command {
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
