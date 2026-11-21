@@ -1257,11 +1257,14 @@ impl Discord {
             .map_err(refusal)?;
         let posted: Posted = serde_json::from_str(&raw)
             .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
-        if posted.id.is_empty() {
+        if posted.id != message || posted.channel_id != channel {
             return Err(Refusal::Refused("Discord's answer was unreadable: not a message".to_owned()));
         }
-        let _ = self.updated(posted);
-        Ok(())
+        self.updated(posted).map_err(|failed| match failed {
+            Failure::SignedOut(why) | Failure::Dropped(why) => {
+                Refusal::Refused(format!("Discord's answer was unreadable: {why}"))
+            }
+        })
     }
 
     /// Follows an announcement channel into `into_channel_id` (`POST /channels/{id}/followers`).

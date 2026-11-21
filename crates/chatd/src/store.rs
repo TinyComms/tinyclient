@@ -2329,7 +2329,7 @@ impl Store {
         let pattern = format!("%{}%", like_prefix(query));
         let mut stmt = self.db.prepare(
             "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
-                    COALESCE(s.name, '')
+                    COALESCE(s.name, ''), c.age_restricted
                FROM message m
                JOIN conversation c ON c.network = m.network AND c.account = m.account
                   AND c.id = m.conversation
@@ -2370,6 +2370,7 @@ impl Store {
                         title: row.get(7)?,
                         space_title: row.get(8)?,
                         outgoing: message.outgoing,
+                        age_restricted: row.get(9)?,
                     },
                     message,
                 ))
@@ -2428,7 +2429,7 @@ impl Store {
         self.db
             .prepare(&format!(
                 "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
-                        COALESCE(s.name, '')
+                        COALESCE(s.name, ''), c.age_restricted
                    FROM message m
                    JOIN conversation c ON c.network = m.network AND c.account = m.account
                       AND c.id = m.conversation
@@ -2467,6 +2468,7 @@ impl Store {
                         title: row.get(7)?,
                         space_title: row.get(8)?,
                         outgoing: message.outgoing,
+                        age_restricted: row.get(9)?,
                     })
                 },
             )?

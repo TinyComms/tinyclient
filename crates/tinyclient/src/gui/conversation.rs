@@ -2181,18 +2181,6 @@ impl Shell {
         conversation.age_restricted && !self.conversation_state.passed_age_gate.contains(&conversation.key)
     }
 
-    /// Whether a conversation the lists or the open row know about is still behind the gate.
-    pub(in crate::gui) fn conversation_age_gated(&self, key: &Key) -> bool {
-        if let Some(row) = self.sidebar_state.find(&self.trees, key) {
-            return self.age_gated(&row);
-        }
-        self.snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.open.as_ref())
-            .filter(|open| &open.key == key)
-            .is_some_and(|open| self.age_gated(open))
-    }
-
     /// Age-gate flags for a thread pane. The thread row wins; otherwise the open parent
     /// channel's mark is used, and the session check is the same one `show` applies.
     fn thread_age_gate(&self, thread: &Key, parent: &Key) -> (bool, bool) {

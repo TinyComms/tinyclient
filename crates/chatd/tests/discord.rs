@@ -5221,6 +5221,20 @@ fn announcement_publish_crosspost_source_and_follow() {
         "an already published message must not crosspost again"
     );
 
+    // A 2xx body that is not this message is refused and does not count as published.
+    world.discord.script(
+        "/channels/4109/messages/1300000010000001109/crosspost",
+        200,
+        json!({"id": "1300"}),
+    );
+    match world.ask(Request::Publish {
+        conversation: world.key("4109"),
+        message_id: "1300000010000001109".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("not a message"), "{detail}"),
+        other => panic!("expected an unreadable publish, got {other:?}"),
+    }
+
     // 2. Rate-limited crosspost (429) surfaces Discord's refusal.
     world.discord.script(
         "/channels/4109/messages/1300000010000001101/crosspost",

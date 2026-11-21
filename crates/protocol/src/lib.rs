@@ -1176,6 +1176,9 @@ pub struct MessageHit {
     /// Mine, so the row can say "You".
     #[serde(default, skip_serializing_if = "is_false")]
     pub outgoing: bool,
+    /// The conversation is age-restricted. A search hit keeps this even when the row is not on screen.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted: bool,
 }
 
 /// A reminder the user set on one message ("Remind me…"). Local to this device: no network
@@ -3412,6 +3415,7 @@ mod tests {
             title: String::new(),
             space_title: String::new(),
             outgoing: false,
+            age_restricted: false,
         };
         assert_eq!(
             serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),

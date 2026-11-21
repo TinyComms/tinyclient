@@ -2751,6 +2751,7 @@ fn search(
                     snippet,
                     title,
                     space_title: space_title.clone(),
+                    age_restricted: false,
                 });
             }
             // If the server skipped encrypted conversations in a space-wide search, merge cached hits

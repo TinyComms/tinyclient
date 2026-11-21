@@ -831,6 +831,7 @@ fn hits(query: &str, only: Option<&Key>) -> Vec<MessageHit> {
                 title: row.map(|r| r.title.clone()).unwrap_or_default(),
                 space_title: row.map(|r| r.space_title.clone()).unwrap_or_default(),
                 outgoing: m.outgoing,
+                age_restricted: row.is_some_and(|r| r.age_restricted),
             })
         })
         .collect();

@@ -80,6 +80,7 @@ impl Slack {
                 title,
                 space_title: known.space_title.clone(),
                 outgoing: !me.is_empty() && found["user"].as_str() == Some(me),
+                age_restricted: known.age_restricted,
             });
         }
         Ok(hits)

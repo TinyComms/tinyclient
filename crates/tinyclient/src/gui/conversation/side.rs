@@ -1480,7 +1480,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                             .items_center()
                             .gap(px(6.))
                             .child({
-                                let gated = shell.conversation_age_gated(&hit.conversation);
+                                let gated = hit.age_restricted && !shell.age_gate_passed(&hit.conversation);
                                 let snippet = if gated { chat::AGE_GATE_LINE.to_owned() } else { hit.snippet.clone() };
                                 let highlights: Vec<(Range<usize>, HighlightStyle)> = if gated {
                                     Vec::new()
@@ -1991,6 +1991,7 @@ mod tests {
             title: "general".into(),
             space_title: "Northwind".into(),
             outgoing: false,
+            age_restricted: false,
         };
         assert_eq!(said_at(&hit), "Northwind › general");
         hit.space_title.clear();
@@ -2022,6 +2023,7 @@ mod tests {
             title: String::new(),
             space_title: String::new(),
             outgoing: false,
+            age_restricted: false,
         };
         page.hits = Some(vec![hit_of("1", 20, &key("C_a"))]);
         assert_eq!(page.listed().iter().map(|(hit, cached)| (hit.message_id.as_str(), *cached)).collect::<Vec<_>>(), [("1", true)]);
