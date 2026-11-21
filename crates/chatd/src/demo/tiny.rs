@@ -147,6 +147,7 @@ fn role(
         position,
         permissions,
         hoist,
+        mentionable: false,
         default: id == EVERYONE,
         member_count: count,
     }

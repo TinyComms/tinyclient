@@ -56,6 +56,7 @@ fn envelope_strategy() -> impl Strategy<Value = Envelope> {
             sent_at,
             // A message or an edit never carries the reaction's word.
             on: false,
+            ..Envelope::default()
         })
 }
 

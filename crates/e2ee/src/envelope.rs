@@ -27,6 +27,7 @@ const MAX_ID: usize = 128;
 const MAX_NAME: usize = 255;
 const MAX_MIME: usize = 127;
 const MAX_WAVEFORM: usize = 100;
+const MAX_MENTIONS: usize = 50;
 const VERSION: u64 = 1;
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -89,6 +90,17 @@ pub struct AttachmentRef {
     pub waveform: Vec<u8>,
 }
 
+/// A structured @mention carried inside a sealed envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionRef {
+    /// `"user"`, `"role"`, or `"everyone"`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub start: u32,
+    pub end: u32,
+}
+
 /// A message or an edit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Envelope {
@@ -96,6 +108,8 @@ pub struct Envelope {
     /// The id of the message this one answers. Messages only.
     pub reply_to: Option<String>,
     pub attachments: Vec<AttachmentRef>,
+    /// Structured @mentions in `text` (UTF-8 byte offsets). Messages and edits.
+    pub mentions: Vec<MentionRef>,
     /// Milliseconds since the Unix epoch, as the sender's clock said. Messages only. Unverified:
     /// the server's `created_at` is the order.
     pub sent_at: Option<i64>,
@@ -133,6 +147,8 @@ struct Wire {
     reply_to: Option<String>,
     #[serde(default)]
     attachments: Vec<WireAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mentions: Vec<MentionRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sent_at: Option<i64>,
     /// Reactions only, and always written there: absent means nothing on a message or an edit.
@@ -202,6 +218,11 @@ impl Envelope {
                 Kind::Edit => None,
             },
             attachments,
+            mentions: if kind == Kind::Reaction {
+                Vec::new()
+            } else {
+                self.mentions.iter().take(MAX_MENTIONS).cloned().collect()
+            },
             sent_at: if kind == Kind::Message {
                 self.sent_at
             } else {
@@ -270,10 +291,16 @@ impl Envelope {
             Kind::Edit => (None, None, false),
             Kind::Reaction => (wire.reply_to, None, wire.on.expect("checked above")),
         };
+        let mentions = if kind == Kind::Reaction {
+            Vec::new()
+        } else {
+            wire.mentions.into_iter().take(MAX_MENTIONS).collect()
+        };
         Ok(Envelope {
             text: wire.text,
             reply_to,
             attachments,
+            mentions,
             sent_at,
             on,
         })

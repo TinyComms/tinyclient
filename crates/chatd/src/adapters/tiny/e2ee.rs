@@ -480,6 +480,8 @@ pub(crate) struct Opened {
     pub sent_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<OpenedFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<::e2ee::envelope::MentionRef>,
     /// An edit: the message it edits. Its text replaces the target's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edits: Option<String>,
@@ -2784,6 +2786,7 @@ impl Device {
                     .iter()
                     .map(OpenedFile::of)
                     .collect(),
+                mentions: incoming.envelope.mentions.clone(),
                 edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
                 edited_by: None,
                 at: super::messages::unix_of(row.created_at).unwrap_or(0),
@@ -2846,6 +2849,7 @@ impl Device {
             reply_to: envelope.reply_to.clone(),
             sent_at: envelope.sent_at,
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
+            mentions: envelope.mentions.clone(),
             edits: target_id.map(str::to_owned),
             edited_by: None,
             at: std::time::SystemTime::now()

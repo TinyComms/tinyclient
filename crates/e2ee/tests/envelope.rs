@@ -52,6 +52,7 @@ fn a_message_and_an_edit_round_trip() {
         attachments: vec![attachment(1), attachment(2)],
         sent_at: Some(1_730_000_000_000),
         on: false,
+        ..Envelope::default()
     };
     let bytes = envelope.encode(Kind::Message).unwrap();
     assert_eq!(Envelope::decode(Kind::Message, &bytes).unwrap(), envelope);
@@ -314,4 +315,26 @@ fn voice_attachment_fields_roundtrip_and_default_absent() {
     assert_eq!(decoded.attachments[0].duration, 12);
     assert!(decoded.attachments[0].voice);
     assert_eq!(decoded.attachments[0].waveform, vec![10, 80, 200, 150, 40]);
+}
+
+#[test]
+fn mention_refs_roundtrip_in_message_and_edit_envelopes() {
+    let mention = e2ee::envelope::MentionRef {
+        kind: "user".into(),
+        id: Some("u-42".into()),
+        start: 3,
+        end: 9,
+    };
+    let env = Envelope {
+        text: "hi @Mara!".into(),
+        mentions: vec![mention.clone()],
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.mentions, vec![mention.clone()]);
+
+    let edit_encoded = env.encode(Kind::Edit).unwrap();
+    let edit_decoded = Envelope::decode(Kind::Edit, &edit_encoded).unwrap();
+    assert_eq!(edit_decoded.mentions, vec![mention]);
 }

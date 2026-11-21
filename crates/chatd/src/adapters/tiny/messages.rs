@@ -149,6 +149,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
                 channel.last_message.as_ref(),
                 false,
             )
+            .mentions(channel.mentions)
             .sealed(channel.e2ee),
         );
         rows.push(row);
@@ -195,6 +196,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
                 direct.last_message.as_ref(),
                 mine,
             )
+            .mentions(direct.mentions)
             .sealed(direct.e2ee),
         );
         rows.push(row);
@@ -423,9 +425,9 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             conversation_id,
             message_id,
             text,
-            spans: _,
+            spans,
             reply,
-        } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
+        } => edit(ctx, saved, &conversation_id, &message_id, &text, &spans, reply),
         Command::Delete {
             conversation_id,
             message_id,
@@ -538,6 +540,7 @@ struct Note {
     /// The conversation is end-to-end encrypted: its last line has no body for the server.
     sealed: bool,
     unread: u32,
+    mentions: u32,
     last_read: Option<String>,
     peer_read: Option<String>,
     last: Option<WireLast>,
@@ -552,11 +555,17 @@ impl Note {
             id: id.to_owned(),
             sealed: false,
             unread,
+            mentions: 0,
             last_read: kept(last_read),
             peer_read: kept(peer_read),
             last: last.cloned(),
             mine,
         }
+    }
+
+    fn mentions(mut self, mentions: u32) -> Note {
+        self.mentions = mentions;
+        self
     }
 
     fn sealed(mut self, sealed: bool) -> Note {
@@ -570,7 +579,7 @@ impl Note {
         let updated = if updated == 0 && self.peer_read.is_some() { 1 } else { updated };
         let direct = self.peer_read.is_some() || self.last_read.is_some();
         let updated = if updated == 0 && direct { 1 } else { updated };
-        let _ = ctx.counts(&self.id, self.unread, 0, self.last_read.as_deref(), updated);
+        let _ = ctx.counts(&self.id, self.unread, self.mentions, self.last_read.as_deref(), updated);
         if let Some(last) = &self.last {
             if super::safe_id(&last.id) {
                 if self.sealed {
@@ -619,11 +628,11 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
     }
     // The broadcast copies the actor's unread into the channel object. Ours stays until our
     // own list (`publish`) says otherwise, or a live message moves it.
-    let unread = match ctx.known(&channel.id) {
-        Ok(Some(existing)) => existing.unread,
-        _ => channel.unread,
+    let (unread, mentions) = match ctx.known(&channel.id) {
+        Ok(Some(existing)) => (existing.unread, existing.mentions),
+        _ => (channel.unread, channel.mentions),
     };
-    Note::from_last(&channel.id, unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee).apply(ctx, saved, names);
+    Note::from_last(&channel.id, unread, None, None, channel.last_message.as_ref(), false).mentions(mentions).sealed(channel.e2ee).apply(ctx, saved, names);
 }
 
 fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, frame: &Value) {
@@ -679,7 +688,7 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     // leave messages already heard intact; only the REST shape supplies a full snapshot.
     if !paired {
         let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
-        Note::from_last(&direct.id, direct.unread, direct.last_read.as_deref(), direct.peer_read.as_deref(), direct.last_message.as_ref(), mine).sealed(direct.e2ee).apply(ctx, saved, names);
+        Note::from_last(&direct.id, direct.unread, direct.last_read.as_deref(), direct.peer_read.as_deref(), direct.last_message.as_ref(), mine).mentions(direct.mentions).sealed(direct.e2ee).apply(ctx, saved, names);
     }
 }
 
@@ -721,6 +730,9 @@ fn refold(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, convers
         message.saved_history = false;
         message.text = opened.text.clone();
         message.edited = true;
+        message.spans.clear();
+        message.mentions_me = false;
+        apply_mentions(&mut message, saved, &opened.mentions, true);
         relink(&mut message);
         let mut media = Vec::new();
         message.attachments = sealed_attachments(saved, opened, &mut media);
@@ -1563,6 +1575,10 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
 /// encrypted conversation can wait for the people of a new group to join it (`e2ee::send`), so
 /// it has a thread of its own, and does not hold up the plain ones.
 fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
+    send_spans(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new());
+}
+
+fn send_spans(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, spans: Vec<protocol::Span>) {
     if !super::safe_id(&conversation_id) {
         let outcome = Err(super::CHECK.to_owned());
         ctx.sent(&conversation_id, &client_id, outcome);
@@ -1574,7 +1590,7 @@ fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String
     let (posting, saved) = (ctx.clone(), saved.clone());
     in_order(account, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
-            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[], &spans);
             let sent = outcome.is_ok();
             posting.sent(&conversation_id, &client_id, outcome);
             crate::sendtime::stage("store");
@@ -1625,12 +1641,59 @@ fn in_order(account: (String, String), job: Job) {
     }
 }
 
-fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &str, text: &str, reply_to: Option<&str>, attachment_ids: &[String]) -> Result<Message, String> {
+fn server_has_feature(saved: &Saved, feature: &str) -> bool {
+    let was = super::manage::known(saved);
+    if was.checked {
+        return was.capabilities.has(feature);
+    }
+    super::manage::learn(saved).capabilities.has(feature)
+}
+
+fn mentions_from_spans(text: &str, spans: &[protocol::Span]) -> Vec<e2ee_core::envelope::MentionRef> {
+    let mut out = Vec::new();
+    for span in spans {
+        if out.len() >= 50 {
+            break;
+        }
+        let (start, end) = (span.start as usize, span.end as usize);
+        if start >= end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let protocol::Style::Mention { kind, id } = &span.style else {
+            continue;
+        };
+        let (kind_str, id_opt) = match kind {
+            protocol::MentionKind::User if !id.is_empty() => ("user", Some(id.clone())),
+            protocol::MentionKind::Role if !id.is_empty() => ("role", Some(id.clone())),
+            protocol::MentionKind::Everyone => ("everyone", None),
+            _ => continue,
+        };
+        out.push(e2ee_core::envelope::MentionRef {
+            kind: kind_str.to_owned(),
+            id: id_opt,
+            start: span.start,
+            end: span.end,
+        });
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_message(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachment_ids: &[String],
+    spans: &[protocol::Span],
+) -> Result<Message, String> {
     if !super::safe_id(conversation_id) {
         return Err(super::CHECK.to_owned());
     }
     if sealed_here(ctx, saved, conversation_id)? {
-        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids);
+        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids, spans);
     }
     let mut body = serde_json::Map::new();
     body.insert("body".to_owned(), Value::String(text.to_owned()));
@@ -1640,6 +1703,10 @@ fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: 
     }
     if !attachment_ids.is_empty() {
         body.insert("attachment_ids".to_owned(), json!(attachment_ids));
+    }
+    let mentions = mentions_from_spans(text, spans);
+    if !mentions.is_empty() && server_has_feature(saved, protocol::TINY_FEATURE_MENTIONS) {
+        body.insert("mentions".to_owned(), json!(mentions));
     }
     let path = format!("/v1/conversations/{conversation_id}/messages");
     let answer = super::asked("POST", saved, &path, Some(Value::Object(body)));
@@ -1672,11 +1739,23 @@ fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bo
 /// An end-to-end encrypted message: the envelope is encrypted by this device and posted as
 /// ciphertext. What the server answers is read back through the cache, which holds the text.
 #[allow(clippy::too_many_arguments)]
-fn post_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &str, text: &str, reply_to: Option<&str>, attachments: Vec<e2ee_core::AttachmentRef>, attachment_ids: &[String]) -> Result<Message, String> {
+#[allow(clippy::too_many_arguments)]
+fn post_sealed(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachments: Vec<e2ee_core::AttachmentRef>,
+    attachment_ids: &[String],
+    spans: &[protocol::Span],
+) -> Result<Message, String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.reply_to = reply_to.filter(|id| super::safe_id(id)).map(str::to_owned);
     envelope.attachments = attachments;
+    envelope.mentions = mentions_from_spans(text, spans);
     envelope.sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
     let answer = e2ee::send(&device, conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, attachment_ids)?;
     accept_message(ctx, saved, conversation_id, &answer)
@@ -1684,7 +1763,7 @@ fn post_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &
 
 fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
     if outgoing.files.is_empty() {
-        send(ctx, saved, conversation_id, client_id, text, reply_to);
+        send_spans(ctx, saved, conversation_id, client_id, text, reply_to, outgoing.spans);
         return;
     }
     if outgoing.files.len() > protocol::ATTACHMENTS_LIMIT {
@@ -1710,6 +1789,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
     let saved = saved.clone();
     let posting = ctx.clone();
     let mut files = outgoing.files;
+    let spans = outgoing.spans;
     let voice = outgoing.voice;
     let voice_duration_secs = voice.as_ref().map(|v| {
         if v.duration == 0 {
@@ -1748,7 +1828,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             }
             upload.check()?;
             let ids: Vec<String> = refs.iter().map(|file| file.id.clone()).collect();
-            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids)
+            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans)
         });
         return;
     }
@@ -1772,7 +1852,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             ids.push(id.to_owned());
         }
         upload.check()?;
-        post_message(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids)
+        post_message(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids, &spans)
     });
 }
 
@@ -1829,14 +1909,14 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
     answer_ok(answer, reply);
 }
 
-fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str, reply: crate::adapters::Reply<()>) {
+fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str, spans: &[protocol::Span], reply: crate::adapters::Reply<()>) {
     if !super::safe_id(message_id) {
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
     }
     match sealed_here(ctx, saved, conversation_id) {
         Ok(true) => {
-            let _ = reply.send(edit_sealed(ctx, saved, conversation_id, message_id, text).map_err(Refusal::Refused));
+            let _ = reply.send(edit_sealed(ctx, saved, conversation_id, message_id, text, spans).map_err(Refusal::Refused));
             return;
         }
         Ok(false) => {}
@@ -1846,13 +1926,20 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
         }
     }
     let path = format!("/v1/messages/{message_id}");
-    match super::asked("PATCH", saved, &path, Some(json!({ "body": text }))) {
+    let mut payload = serde_json::Map::new();
+    payload.insert("body".to_owned(), Value::String(text.to_owned()));
+    if server_has_feature(saved, protocol::TINY_FEATURE_MENTIONS) {
+        let mentions = mentions_from_spans(text, spans);
+        payload.insert("mentions".to_owned(), json!(mentions));
+    }
+    match super::asked("PATCH", saved, &path, Some(Value::Object(payload))) {
         Ok((200 | 201, value)) => {
             if let Ok(message) = accept_message(ctx, saved, conversation_id, &value) {
                 let _ = ctx.message(conversation_id, &message);
             } else if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
                 message.text = text.to_owned();
                 message.edited = true;
+                message.spans.clear();
                 relink(&mut message);
                 let _ = ctx.message(conversation_id, &message);
             }
@@ -1864,17 +1951,21 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
 
 /// An edit of an encrypted message: a ciphertext of kind `edit` that names it. It keeps the
 /// message's attachments; every member's device folds it in.
-fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str) -> Result<(), String> {
+fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str, spans: &[protocol::Span]) -> Result<(), String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.attachments = device.editable_attachments(conversation_id, message_id)?;
+    envelope.mentions = mentions_from_spans(text, spans);
     let client_id = format!("edit-{message_id}-{}", crate::hub::now());
     device.post(conversation_id, &client_id, e2ee_core::Kind::Edit, Some(message_id), &envelope, &[])?;
     drop(device);
     if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
         message.text = text.to_owned();
         message.edited = true;
+        message.spans.clear();
+        message.mentions_me = false;
+        apply_mentions(&mut message, saved, &envelope.mentions, true);
         relink(&mut message);
         let _ = ctx.message(conversation_id, &message);
     }
@@ -2080,14 +2171,61 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         }
         message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
     }
+    if !deleted {
+        apply_mentions(&mut message, saved, &wire.mentions, false);
+    }
     relink(&mut message);
     Some(message)
 }
 
-/// Web addresses in the text become links. The spans point into the text as it is now, so those
-/// from before an edit go; Tiny sends plain text and has no other styling.
+/// Maps structured mentions onto `Style::Mention` spans, validates UTF-8 byte ranges against
+/// `message.text`, and sets `message.mentions_me` when an entry names this account, one of its
+/// roles, or everyone.
+fn apply_mentions(message: &mut Message, saved: &Saved, mentions: &[e2ee_core::envelope::MentionRef], _encrypted: bool) {
+    if mentions.is_empty() || message.text.is_empty() {
+        return;
+    }
+    let known = super::manage::known(saved);
+    let my_roles: &[String] = known.access.as_ref().map(|a| a.roles.as_slice()).unwrap_or(&[]);
+    for mention in mentions.iter().take(50) {
+        let (start, end) = (mention.start as usize, mention.end as usize);
+        if start >= end
+            || end > message.text.len()
+            || !message.text.is_char_boundary(start)
+            || !message.text.is_char_boundary(end)
+        {
+            continue;
+        }
+        let (kind, id, hits_me) = match mention.kind.as_str() {
+            "user" => {
+                let Some(id) = mention.id.as_deref().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                (protocol::MentionKind::User, id.to_owned(), id == saved.user_id)
+            }
+            "role" => {
+                let Some(id) = mention.id.as_deref().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                (protocol::MentionKind::Role, id.to_owned(), my_roles.iter().any(|r| r == id))
+            }
+            "everyone" => (protocol::MentionKind::Everyone, String::new(), true),
+            _ => continue,
+        };
+        message.spans.push(protocol::Span {
+            start: mention.start,
+            end: mention.end,
+            style: protocol::Style::Mention { kind, id },
+        });
+        if hits_me && !message.outgoing {
+            message.mentions_me = true;
+        }
+    }
+}
+
+/// Web addresses in the text become links, preserving any structured mention or custom-emoji spans.
 fn relink(message: &mut Message) {
-    message.spans.clear();
+    message.spans.retain(|span| !matches!(span.style, protocol::Style::Link { .. }));
     protocol::link::linkify(message);
 }
 
@@ -2137,6 +2275,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
                 message.edited = opened.edited_by.is_some();
                 message.reply_to = reply_of(opened.reply_to.as_ref().map(|id| Value::String(id.clone())).as_ref());
                 message.attachments = sealed_attachments(saved, opened, media);
+                apply_mentions(&mut message, saved, &opened.mentions, true);
             }
             Some(Read::Edit) => return None,
             Some(Read::Undecryptable) | None => {
@@ -2264,6 +2403,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
         allow_archives: scans && limits.archives,
         abuse_reports: server_caps.has(protocol::TINY_FEATURE_ABUSE_REPORTS),
         voice_notes: max_file_bytes > 0,
+        mention_spans: server_caps.has(protocol::TINY_FEATURE_MENTIONS),
         reply: true,
         edit: true,
         delete: true,
@@ -2754,6 +2894,8 @@ struct WireChannel {
     position: i32,
     #[serde(default, deserialize_with = "flex_u32")]
     unread: u32,
+    #[serde(default, deserialize_with = "flex_u32")]
+    mentions: u32,
     #[serde(default)]
     last_message: Option<WireLast>,
     /// End-to-end encrypted, for good once it is. Absent on a server older than encrypted text.
@@ -2778,6 +2920,8 @@ struct WireDirect {
     plaintext_history: bool,
     #[serde(default, deserialize_with = "flex_u32")]
     unread: u32,
+    #[serde(default, deserialize_with = "flex_u32")]
+    mentions: u32,
     #[serde(default)]
     last_read: Option<String>,
     #[serde(default)]
@@ -2958,6 +3102,8 @@ struct WireMessage {
     attachments: Vec<WireFile>,
     #[serde(default)]
     reactions: Vec<WireReaction>,
+    #[serde(default)]
+    mentions: Vec<e2ee_core::envelope::MentionRef>,
     /// An end-to-end encrypted row: `body` is empty, and these say what it is.
     #[serde(default)]
     e2ee: bool,
@@ -3453,7 +3599,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["e2ee"], true, "call setup never creates plaintext text history");
-        assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[]).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
+        assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[], &[]).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
     }
 
     #[test]
@@ -4290,7 +4436,7 @@ mod tests {
         let stored = ctx.stored_message("sealed-1", "s-1").unwrap().unwrap();
         assert_eq!(stored.text, protocol::UNDECRYPTABLE, "never a blank, and never the server's body");
         assert_eq!(stored.seal, Seal::Undecryptable);
-        let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[]);
+        let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[], &[]);
         assert_eq!(outcome.err().as_deref(), Some(NOT_SET_UP));
         assert!(!posted.load(std::sync::atomic::Ordering::SeqCst), "nothing was posted in plain text");
     }
@@ -4376,7 +4522,7 @@ mod tests {
         pending.sender.id = ME.to_owned();
         pending.state = SendState::Pending;
         ctx.hub.store().ingest(&ctx.key("direct-1"), &pending, false).unwrap();
-        let outcome = post_message(&ctx, &saved, "direct-1", "client-1", "hi", None, &[]);
+        let outcome = post_message(&ctx, &saved, "direct-1", "client-1", "hi", None, &[], &[]);
         ctx.sent("direct-1", "client-1", outcome);
         assert!(ctx.stored_message("direct-1", "client-1").unwrap().is_none());
         let stored = ctx.stored_message("direct-1", "server-1").unwrap().unwrap();
@@ -4398,7 +4544,7 @@ mod tests {
         message.sender.id = ME.to_owned();
         ctx.hub.store().ingest(&ctx.key("direct-1"), &message, false).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        edit(&ctx, &saved, "direct-1", "e-1", "changed", tx);
+        edit(&ctx, &saved, "direct-1", "e-1", "changed", &[], tx);
         assert_eq!(rx.recv().unwrap(), Ok(()));
         let stored = ctx.stored_message("direct-1", "e-1").unwrap().unwrap();
         assert_eq!(stored.text, "changed");
@@ -4690,5 +4836,106 @@ mod tests {
         assert_eq!(atts[0].file.kind, MediaKind::Audio);
         assert_eq!(atts[0].duration, 14);
         assert_eq!(atts[0].waveform, vec![20, 120, 240, 80]);
+    }
+
+    #[test]
+    fn mentions_send_receive_edit_and_sealed_badge() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log_srv = log.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            log_srv.lock().unwrap().push(request.to_owned());
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["mentions"]}"#));
+            }
+            if request.starts_with("GET /v1/me ") {
+                return Some(http(200, "OK", r#"{"user_id":"11111111-1111-1111-1111-111111111111","owner":false,"roles":["role-dev"],"permissions":63,"rank":1}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            if request.starts_with("POST /v1/conversations/chan-1/messages ") {
+                return Some(http(201, "Created", &json!({
+                    "id": "m-10",
+                    "author_id": ME,
+                    "body": "hi @Bea",
+                    "created_at": WHEN,
+                    "mentions": [{"kind": "user", "id": PEER, "start": 3, "end": 7}]
+                }).to_string()));
+            }
+            if request.starts_with("PATCH /v1/messages/m-10 ") {
+                return Some(http(200, "OK", &json!({
+                    "id": "m-10",
+                    "author_id": ME,
+                    "body": "hey @everyone",
+                    "created_at": WHEN,
+                    "edited_at": WHEN,
+                    "mentions": [{"kind": "everyone", "start": 4, "end": 13}]
+                }).to_string()));
+            }
+            None
+        });
+        assert!(account_caps(&saved).mention_spans);
+        let spans = vec![protocol::Span {
+            start: 3,
+            end: 7,
+            style: protocol::Style::Mention { kind: protocol::MentionKind::User, id: PEER.to_owned() },
+        }];
+        let sent = post_message(&ctx, &saved, "chan-1", "c-1", "hi @Bea", None, &[], &spans).unwrap();
+        assert_eq!(sent.spans.len(), 1);
+        assert!(matches!(&sent.spans[0].style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == PEER));
+        assert!(!sent.mentions_me, "own message does not set mentions_me");
+
+        // Verify POST body carried structured mentions.
+        let post_req = log.lock().unwrap().iter().find(|r| r.starts_with("POST /v1/conversations/chan-1/messages ")).cloned().unwrap();
+        let body: Value = serde_json::from_str(post_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["mentions"][0]["kind"], "user");
+        assert_eq!(body["mentions"][0]["id"], PEER);
+        assert_eq!(body["mentions"][0]["start"], 3);
+        assert_eq!(body["mentions"][0]["end"], 7);
+
+        // Incoming plaintext mention of ME sets mentions_me and Style::Mention.
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-11",
+            "author_id": PEER,
+            "body": "ping @Ada https://example.com",
+            "created_at": WHEN,
+            "mentions": [{"kind": "user", "id": ME, "start": 5, "end": 9}]
+        })).unwrap();
+        let mut media = Vec::new();
+        let incoming = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert!(incoming.mentions_me);
+        assert!(incoming.spans.iter().any(|s| matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == ME)));
+        assert!(incoming.spans.iter().any(|s| matches!(&s.style, protocol::Style::Link { .. })), "relink preserves mentions alongside links");
+
+        // Edit sends updated mentions.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let edit_spans = vec![protocol::Span {
+            start: 4,
+            end: 13,
+            style: protocol::Style::Mention { kind: protocol::MentionKind::Everyone, id: String::new() },
+        }];
+        edit(&ctx, &saved, "chan-1", "m-10", "hey @everyone", &edit_spans, tx);
+        assert!(rx.recv().unwrap().is_ok());
+        let patch_req = log.lock().unwrap().iter().find(|r| r.starts_with("PATCH /v1/messages/m-10 ")).cloned().unwrap();
+        let patch_body: Value = serde_json::from_str(patch_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(patch_body["mentions"][0]["kind"], "everyone");
+
+        // Sealed incoming mention of ME sets mentions_me and Style::Mention.
+        let sealed_wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-12",
+            "author_id": PEER,
+            "e2ee": true,
+            "created_at": WHEN
+        })).unwrap();
+        let mut opened = HashMap::new();
+        opened.insert("m-12".to_owned(), Read::Opened(e2ee::Opened {
+            text: "secret @Ada".into(),
+            mentions: vec![e2ee_core::envelope::MentionRef { kind: "user".into(), id: Some(ME.to_owned()), start: 7, end: 11 }],
+            ..e2ee::Opened::default()
+        }));
+        let sealed_msg = map_message(&saved, &HashMap::new(), &sealed_wire, &opened, &mut media).unwrap();
+        assert!(sealed_msg.mentions_me);
+        assert!(sealed_msg.spans.iter().any(|s| matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == ME)));
     }
 }

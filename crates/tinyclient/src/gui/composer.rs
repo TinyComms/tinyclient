@@ -2390,7 +2390,42 @@ impl Composer {
         let rows = match (answer, target.space.as_deref()) {
             (Ok(Response::People { people, .. }), _) => {
                 self.hub.learn(&people);
-                complete::people(self.known(&target.key), people, &account, &trigger.query)
+                let mut rows = complete::people(self.known(&target.key), people, &account, &trigger.query);
+                if target.key.network == protocol::Network::Tiny {
+                    if let Some(shell) = self.shell.upgrade() {
+                        let shell = shell.read(cx);
+                        if let Some(community) = shell.tiny_state.community.as_ref().filter(|_| shell.tiny_state.account.as_ref() == Some(&account)) {
+                            let can_everyone = community.access.as_ref().is_some_and(|a| a.has(protocol::TINY_MENTION_EVERYONE));
+                            if can_everyone && mention::rank("everyone", "", &trigger.query).is_some() {
+                                rows.push(complete::Row {
+                                    kind: mention::Kind::Role,
+                                    key: Key::new(&account, "everyone"),
+                                    name: "everyone".to_owned(),
+                                    handle: String::new(),
+                                    second: "Notify everyone in this channel".to_owned(),
+                                    person: None,
+                                });
+                            }
+                            for role in &community.roles {
+                                if role.default || (!role.mentionable && !can_everyone) {
+                                    continue;
+                                }
+                                if mention::rank(&role.name, "", &trigger.query).is_some() {
+                                    rows.push(complete::Row {
+                                        kind: mention::Kind::Role,
+                                        key: Key::new(&account, &role.id),
+                                        name: role.name.clone(),
+                                        handle: String::new(),
+                                        second: "Role".to_owned(),
+                                        person: None,
+                                    });
+                                }
+                            }
+                            rows.truncate(complete::ROWS);
+                        }
+                    }
+                }
+                rows
             }
             (Ok(Response::Conversations { conversations, .. }), Some(space)) => complete::channels(conversations, &account, space, &trigger.query),
             _ => Vec::new(),

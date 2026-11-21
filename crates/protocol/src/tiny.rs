@@ -373,6 +373,8 @@ pub const TINY_FEATURE_UPLOAD_LIMITS: &str = "upload_limits";
 pub const TINY_FEATURE_FILE_SCAN: &str = "file_scan";
 /// Members can file abuse reports (`POST /v1/reports`).
 pub const TINY_FEATURE_ABUSE_REPORTS: &str = "abuse_reports";
+/// Structured @mentions (`mentions` on messages and unread mention counts).
+pub const TINY_FEATURE_MENTIONS: &str = "mentions";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.
@@ -413,8 +415,10 @@ pub const TINY_DISCONNECT_MEMBERS: u64 = 1 << 17;
 pub const TINY_VIEW_AUDIT_LOG: u64 = 1 << 18;
 pub const TINY_MANAGE_SERVER: u64 = 1 << 19;
 pub const TINY_MANAGE_REPORTS: u64 = 1 << 20;
+pub const TINY_MANAGE_MESSAGES: u64 = 1 << 21;
+pub const TINY_MENTION_EVERYONE: u64 = 1 << 22;
 /// Every bit there is.
-pub const TINY_ALL: u64 = (1 << 21) - 1;
+pub const TINY_ALL: u64 = (1 << 23) - 1;
 /// The bits a room's override may change.
 pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_CONNECT
@@ -427,7 +431,9 @@ pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_MUTE_MEMBERS
     | TINY_DEAFEN_MEMBERS
     | TINY_MOVE_MEMBERS
-    | TINY_DISCONNECT_MEMBERS;
+    | TINY_DISCONNECT_MEMBERS
+    | TINY_MANAGE_MESSAGES
+    | TINY_MENTION_EVERYONE;
 /// What @everyone has on a server that was never changed.
 pub const TINY_EVERYONE_DEFAULT: u64 = TINY_VIEW_CHANNEL | TINY_CONNECT | TINY_SPEAK | TINY_VIDEO | TINY_SHARE_SCREEN | TINY_VOICE_ACTIVITY;
 
@@ -576,6 +582,9 @@ pub struct TinyRole {
     /// Shown as its own group in the member list.
     #[serde(default, deserialize_with = "or_default")]
     pub hoist: bool,
+    /// Whether any member may @mention this role without `mention_everyone`.
+    #[serde(default, deserialize_with = "or_default")]
+    pub mentionable: bool,
     /// @everyone.
     #[serde(default, deserialize_with = "or_default")]
     pub default: bool,

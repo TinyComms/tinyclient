@@ -90,19 +90,20 @@ pub fn spans(text: &str, tokens: &[Token], structured: bool) -> Vec<protocol::Sp
     let mut out = Vec::new();
     let mut at = 0;
     for token in live {
-        if token.range.start < at || token.id.is_empty() {
+        if token.range.start < at {
             continue;
         }
-        let kind = match token.kind {
-            Kind::Person => MentionKind::User,
-            Kind::Channel => MentionKind::Channel,
-            Kind::Role => MentionKind::Role,
-            Kind::Emoji => continue,
+        let (kind, id) = match token.kind {
+            Kind::Person if !token.id.is_empty() => (MentionKind::User, token.id.clone()),
+            Kind::Channel if !token.id.is_empty() => (MentionKind::Channel, token.id.clone()),
+            Kind::Role if token.id == "everyone" => (MentionKind::Everyone, String::new()),
+            Kind::Role if !token.id.is_empty() => (MentionKind::Role, token.id.clone()),
+            _ => continue,
         };
         out.push(protocol::Span {
             start: token.range.start as u32,
             end: token.range.end as u32,
-            style: Style::Mention { kind, id: token.id.clone() },
+            style: Style::Mention { kind, id },
         });
         at = token.range.end;
     }
@@ -205,13 +206,13 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             Style::Strike => "~~",
             Style::Code => "`",
             Style::Mention { kind, id } => {
-                let kind = match kind {
-                    MentionKind::User => Kind::Person,
-                    MentionKind::Channel => Kind::Channel,
-                    MentionKind::Role => Kind::Role,
-                    MentionKind::Everyone => continue,
+                let (kind, id) = match kind {
+                    MentionKind::User => (Kind::Person, id.clone()),
+                    MentionKind::Channel => (Kind::Channel, id.clone()),
+                    MentionKind::Role => (Kind::Role, id.clone()),
+                    MentionKind::Everyone => (Kind::Role, "everyone".to_owned()),
                 };
-                mentions.push((start..end, kind, id.clone()));
+                mentions.push((start..end, kind, id));
                 continue;
             }
             _ => continue,
