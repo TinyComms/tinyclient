@@ -2,7 +2,7 @@
 //! to it (the registration), and from then on each event arrives as a small request that has to
 //! be answered. See the notes at the top of `teams.rs` for where each step was read.
 
-use super::{bare, escaped, now_ms, uuid, Auth, Body, Fault, Teams, SPACES};
+use super::{bare, escaped, now_ms, uuid, Auth, Body, Fault, Teams, SPACES, TEAMS};
 use crate::adapters::net::{address, gunzip, Socket};
 use crate::adapters::{Command, Failure};
 use base64::Engine;
@@ -64,11 +64,12 @@ impl Teams {
     /// which is made when the socket says it is up.
     pub(super) fn open(&self) -> Result<Push, Failure> {
         // One endpoint for as long as the account is here: Teams limits how many a user has.
-        let endpoint = self.ctx.note("endpoint").unwrap_or_else(|| {
+        let endpoint = self.ctx.note("endpoint").filter(|id| !id.is_empty()).unwrap_or_else(|| {
             let made = uuid();
             self.ctx.set_note("endpoint", &made);
             made
         });
+        self.state().endpoint = Some(endpoint.clone());
         let base = address("TINYCLIENT_TEAMS_TROUTER", TROUTER);
         let base = base.trim_end_matches('/');
         let named = self.call("POST", &format!("{base}/v4/a?epid={}", escaped(&endpoint)), Auth::Push, Body::None, true)?.body;
@@ -190,8 +191,57 @@ impl Teams {
         });
         let url = format!("{}/registrar/prod/V2/registrations", self.api);
         self.call("POST", &url, Auth::Both(SPACES), Body::Json(&body), true)?;
+        self.state().endpoint = Some(push.endpoint.clone());
         push.registered = Some(Instant::now());
         Ok(())
+    }
+
+    /// Best-effort removal of this device's trouter push registration on sign-out.
+    /// Uses a short 3-second timeout so it never stalls chatd's sign-out window.
+    pub(super) fn unregister_push(&self) {
+        let endpoint = {
+            let mut state = self.state();
+            if state.expired.is_some() {
+                state.endpoint = None;
+                None
+            } else {
+                state.endpoint.take()
+            }
+        }
+        .or_else(|| self.ctx.note("endpoint"))
+        .filter(|id| !id.is_empty());
+        self.ctx.set_note("endpoint", "");
+        let Some(endpoint) = endpoint else {
+            return;
+        };
+        let url = format!("{}/registrar/prod/V2/registrations/{}", self.api, escaped(&endpoint));
+        if !self.ours(&url) {
+            return;
+        }
+        let Ok(headers) = self.headers(Auth::Both(SPACES)) else {
+            return;
+        };
+        let fast: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+            .tls_config(crate::tls::config())
+            .timeout_global(Some(Duration::from_secs(3)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .user_agent(&self.session.user_agent)
+            .build()
+            .into();
+        let mut req = fast
+            .delete(&url)
+            .header("Accept", "application/json")
+            .header("BehaviorOverride", "redirectAs404")
+            .header("Origin", TEAMS)
+            .header("Referer", "https://teams.microsoft.com/");
+        for (name, value) in &headers {
+            req = req.header(*name, value.as_str());
+        }
+        if let Err(err) = req.call() {
+            tracing::warn!("chatd: Teams: unregister push on sign-out failed: {}", crate::adapters::net::redact(&err.to_string()));
+        }
     }
 
     /// One event, by the path it was delivered to.

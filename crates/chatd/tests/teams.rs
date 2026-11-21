@@ -332,6 +332,13 @@ impl Fake {
                 body: b"sid-42:180:180:websocket,xhr-polling".to_vec(),
             },
             "/registrar/prod/V2/registrations" if bearer("spaces") && header("x-skypetoken") == skype => answer("202 Accepted", json!({})),
+            _ if call.method == "DELETE"
+                && path.starts_with("/registrar/prod/V2/registrations/")
+                && bearer("spaces")
+                && header("x-skypetoken") == skype =>
+            {
+                answer("202 Accepted", json!({}))
+            }
             _ if path.starts_with("/chat/") => {
                 if header("authentication") != format!("skypetoken={skype}") {
                     return unauthorized();
@@ -2339,5 +2346,46 @@ fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance(
         .find(|c| c.json()["clientmessageid"] == "1760000999000628")
         .expect("urgent POST");
     assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
+}
+
+#[test]
+fn signing_out_removes_push_registration_for_signed_out_tenant() {
+    let world = World::start();
+    world.ready();
+
+    // Wait until trouter registered the endpoint id.
+    let reg_id = world.until("initial push registration", || {
+        world
+            .fake
+            .calls("POST", "/registrar/prod/V2/registrations")
+            .into_iter()
+            .find_map(|c| c.json()["registrationId"].as_str().map(str::to_owned))
+    });
+    assert!(!reg_id.is_empty());
+
+    // Sign out of the home tenant; only that tenant's push registration should be deleted.
+    let answer = world.ask(Request::SignOut {
+        account: protocol::AccountKey {
+            network: Network::Teams,
+            account: HOME.to_owned(),
+        },
+        erase: false,
+    });
+    assert!(matches!(answer, Response::Ok), "{answer:?}");
+
+    let delete_path = format!("/registrar/prod/V2/registrations/{reg_id}");
+    let deleted = world.until("registrar DELETE on sign-out", || {
+        world.fake.calls("DELETE", &delete_path).into_iter().next()
+    });
+    assert!(
+        deleted.headers.get("authorization").is_some_and(|v| v.starts_with("Bearer at.spaces.")),
+        "DELETE carries spaces bearer: {:?}",
+        deleted.headers
+    );
+    assert!(
+        deleted.headers.contains_key("x-skypetoken"),
+        "DELETE carries X-Skypetoken: {:?}",
+        deleted.headers
+    );
 }
 

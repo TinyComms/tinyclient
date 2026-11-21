@@ -165,6 +165,9 @@ impl SettingsWindow {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
                 }
             }
+            if network == Network::Teams && !mine.is_empty() {
+                group = group.child(self.teams_sessions_row(cx));
+            }
             if network == Network::Tiny {
                 tiny_line = self.tiny_line();
             }
@@ -366,6 +369,38 @@ impl SettingsWindow {
         box_div
     }
 
+    fn teams_sessions_row(&self, _cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .child(rule())
+            .child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().type_ui().text_color(theme::text()).child("Microsoft sessions"))
+                            .child(div().type_small().text_color(theme::text_soft()).child(
+                                "Signing out removes this device's push registration. End Microsoft sessions across devices at myaccount.microsoft.com.",
+                            )),
+                    )
+                    .child(
+                        button("teams-manage-sessions", ButtonKind::Secondary, "Manage sessions ↗")
+                            .on_click(|_, _, cx| crate::gui::conversation::links::open_external_link("https://myaccount.microsoft.com/", cx)),
+                    ),
+            )
+    }
+
     pub(super) fn sign_out(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_out(account, false, cx));
         cx.notify();
@@ -376,12 +411,18 @@ impl SettingsWindow {
         let network = network_name(account.key.network);
         let name = if account.name.is_empty() { network.to_owned() } else { account.name.clone() };
         let key = account.key.clone();
+        let mut lines = vec![
+            crate::host::sign_out_body(network),
+            format!("Nothing is deleted on {network}. Your other accounts are not touched."),
+        ];
+        if account.key.network == Network::Teams {
+            lines.push(
+                "This removes TinyClient's push registration at Microsoft. To end Microsoft sessions across devices, visit myaccount.microsoft.com.".to_owned(),
+            );
+        }
         super::modal_panel(
             format!("Sign out of {name}?"),
-            vec![
-                crate::host::sign_out_body(network),
-                format!("Nothing is deleted on {network}. Your other accounts are not touched."),
-            ],
+            lines,
             button("sign-out-confirm", ButtonKind::Danger, "Sign out").on_click(cx.listener(move |this, _, _, cx| {
                 this.confirm = None;
                 this.sign_out(key.clone(), cx);

@@ -343,6 +343,8 @@ struct State {
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
     scheduled: HashMap<String, i64>,
+    /// Active trouter registration endpoint id, removed on sign-out.
+    endpoint: Option<String>,
 }
 
 /// What a call presents.
@@ -1042,9 +1044,14 @@ impl Teams {
             Command::Handoff { conversation_id, reply } => {
                 let _ = reply.send(Ok(self.call_link(&conversation_id)));
             }
-            // The refresh token is Microsoft's to revoke, from the account's own security
-            // page; no client read ends it from here. Signing out forgets it.
-            Command::SignOut(reply) => drop(reply.send(Ok(()))),
+            // Remove the trouter push registration at Microsoft before forgetting the local token.
+            // Entra v2.0 public clients have no single-refresh-token revocation endpoint, and
+            // Graph's `/me/revokeSignInSessions` ends every Microsoft session across all devices,
+            // so session revocation stays on `https://myaccount.microsoft.com/`.
+            Command::SignOut(reply) => {
+                self.unregister_push();
+                let _ = reply.send(Ok(()));
+            }
             command => command.unsupported(&self.ctx),
         }
     }
