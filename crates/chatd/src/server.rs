@@ -4017,6 +4017,28 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::UnreadItems { conversation, kind, limit } => {
+                let account = conversation.account();
+                let conversation_id = conversation.id;
+                let limit = limit.clamp(1, protocol::PAGE_LIMIT);
+                match self.ask(&account, |reply| Command::UnreadItems {
+                    conversation_id,
+                    kind,
+                    limit,
+                    reply,
+                }) {
+                    Ok(message_ids) => Response::UnreadItems { message_ids },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::MarkUnreadItemsRead { conversation, kind, message_ids } => {
+                self.act(&conversation, |conversation_id, reply| Command::MarkUnreadItemsRead {
+                    conversation_id,
+                    kind,
+                    message_ids,
+                    reply,
+                })
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

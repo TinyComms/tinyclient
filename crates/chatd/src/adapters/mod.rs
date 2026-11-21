@@ -705,6 +705,20 @@ pub enum Command {
         session_id: String,
         reply: Reply<()>,
     },
+    /// Fetches unread mention or reaction message IDs in a conversation.
+    UnreadItems {
+        conversation_id: String,
+        kind: protocol::UnreadItemKind,
+        limit: u32,
+        reply: Reply<Vec<String>>,
+    },
+    /// Marks unread mentions or reactions read in a conversation.
+    MarkUnreadItemsRead {
+        conversation_id: String,
+        kind: protocol::UnreadItemKind,
+        message_ids: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -940,6 +954,8 @@ impl Command {
             Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1199,6 +1215,23 @@ impl Context {
     ) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_counts(&conversation, unread, mentions, last_read, updated)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
+    pub fn unread_reactions(&self, conversation_id: &str, count: u32) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_unread_reactions(&conversation, count)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    pub fn mentions_count(&self, conversation_id: &str, count: u32) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_mentions_count(&conversation, count)? {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
         }

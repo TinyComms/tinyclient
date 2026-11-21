@@ -1048,6 +1048,8 @@ impl Demo {
             Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

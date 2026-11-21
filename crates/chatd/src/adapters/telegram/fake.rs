@@ -568,6 +568,10 @@ struct World {
     notify_exceptions: Vec<(Who, bool)>,
     /// Active sessions (`hash`, `app`, `device`, `region`, `country`, `current`).
     sessions: Vec<(i64, &'static str, &'static str, &'static str, &'static str, bool)>,
+    /// Unread mention message IDs per conversation (`messages.getUnreadMentions`).
+    unread_mentions: HashMap<String, Vec<i32>>,
+    /// Unread reaction message IDs per conversation (`messages.getUnreadReactions`).
+    unread_reactions: HashMap<String, Vec<i32>>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -644,6 +648,8 @@ impl World {
                 (91_001, "Telegram iOS", "iPhone 15", "Seattle", "US", false),
                 (91_002, "Telegram Desktop", "MacBook Pro", "Portland", "US", false),
             ],
+            unread_mentions: HashMap::new(),
+            unread_reactions: HashMap::new(),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1904,6 +1910,22 @@ impl World {
                 self.store(None, msg.clone());
                 vec![new(msg)]
             }
+            // Seed 2 unread mentions and 2 unread reactions in Trail crew (g8001).
+            "unread-jumps" => {
+                let crew = Who::Group(CREW);
+                let mut m21 = message(crew, 21, TOBIN, t0() + 10, "@mira_k bring the stove!");
+                m21.mentioned = true;
+                let mut m22 = message(crew, 22, ODALYS, t0() + 20, "@mira_k check the map!");
+                m22.mentioned = true;
+                let m23 = message(crew, 23, ME, t0() + 30, "Stove packed.");
+                let m24 = message(crew, 24, ME, t0() + 40, "Map packed.");
+                for m in [&m21, &m22, &m23, &m24] {
+                    self.store(None, m.clone());
+                }
+                self.unread_mentions.insert(crew.text(), vec![21, 22]);
+                self.unread_reactions.insert(crew.text(), vec![23, 24]);
+                vec![new(m21), new(m22), new(m23), new(m24)]
+            }
             // The channel's post gains a section of comments: the post says its count and the
             // linked group it is answered in, and two comments stand in the thread. A number
             // after the word says how many of them the user has not read.
@@ -2253,6 +2275,74 @@ impl World {
             self.log(&format!("ResetAuthorization {}", request.hash));
             self.sessions.retain(|s| s.0 != request.hash || s.5);
             return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::GetUnreadMentions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("GetUnreadMentions {k}"));
+            let ids = self.unread_mentions.get(&k).cloned().unwrap_or_default();
+            let msgs: Vec<tl::enums::Message> = ids
+                .into_iter()
+                .filter_map(|id| self.messages.get(&k).and_then(|m| m.get(&id)).cloned())
+                .collect();
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages: msgs,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
+        }
+        if let Some(request) = asked::<f::messages::ReadMessageContents>(body) {
+            let joined = request.id.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            self.log(&format!("ReadMessageContents {joined}"));
+            for list in self.unread_mentions.values_mut() {
+                list.retain(|id| !request.id.contains(id));
+            }
+            return answer(tl::enums::messages::AffectedMessages::Messages(
+                tl::types::messages::AffectedMessages { pts: 1, pts_count: 0 },
+            ));
+        }
+        if let Some(request) = asked::<f::channels::ReadMessageContents>(body) {
+            let joined = request.id.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            self.log(&format!("ReadMessageContents {joined}"));
+            for list in self.unread_mentions.values_mut() {
+                list.retain(|id| !request.id.contains(id));
+            }
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::ReadMentions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("ReadMentions {k}"));
+            self.unread_mentions.remove(&k);
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 1, pts_count: 0, offset: 0 },
+            ));
+        }
+        if let Some(request) = asked::<f::messages::GetUnreadReactions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("GetUnreadReactions {k}"));
+            let ids = self.unread_reactions.get(&k).cloned().unwrap_or_default();
+            let msgs: Vec<tl::enums::Message> = ids
+                .into_iter()
+                .filter_map(|id| self.messages.get(&k).and_then(|m| m.get(&id)).cloned())
+                .collect();
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages: msgs,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
+        }
+        if let Some(request) = asked::<f::messages::ReadReactions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("ReadReactions {k}"));
+            self.unread_reactions.remove(&k);
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 1, pts_count: 0, offset: 0 },
+            ));
         }
         if asked::<f::messages::GetSavedDialogs>(body).is_some() {
             self.log("GetSavedDialogs");

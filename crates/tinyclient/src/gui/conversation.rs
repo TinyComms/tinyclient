@@ -404,6 +404,10 @@ pub struct Pane {
     /// Active Saved Messages filter `(peer_id, tag)` and its fetched messages.
     saved_filter: Option<(Option<String>, Option<String>)>,
     saved_filtered: Option<Vec<Rc<Message>>>,
+    /// Queued unread mention / reaction message IDs for jumping through unread items.
+    unread_jumps_for: Option<Key>,
+    unread_mention_ids: Vec<String>,
+    unread_reaction_ids: Vec<String>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -528,6 +532,9 @@ impl Pane {
             saved_tags: Vec::new(),
             saved_filter: None,
             saved_filtered: None,
+            unread_jumps_for: None,
+            unread_mention_ids: Vec::new(),
+            unread_reaction_ids: Vec::new(),
             #[cfg(feature = "gui-shot")]
             script: if thread { shot::Script::default() } else { shot::Script::from_env() },
         }
@@ -1778,6 +1785,188 @@ impl Pane {
         })
         .detach();
     }
+    fn jump_next_unread(&mut self, kind: protocol::UnreadItemKind, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        if self.unread_jumps_for.as_ref() != Some(&conversation) {
+            self.unread_jumps_for = Some(conversation.clone());
+            self.unread_mention_ids.clear();
+            self.unread_reaction_ids.clear();
+        }
+        let queue = match kind {
+            protocol::UnreadItemKind::Mentions => &mut self.unread_mention_ids,
+            protocol::UnreadItemKind::Reactions => &mut self.unread_reaction_ids,
+        };
+        if let Some(id) = queue.first().cloned() {
+            queue.remove(0);
+            let done = queue.is_empty();
+            self.jump_to(&id, cx);
+            let conv = conversation.clone();
+            let message_ids = if done { Vec::new() } else { vec![id] };
+            cx.spawn(async move |_, cx| {
+                let _ = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::client::ask(&Request::MarkUnreadItemsRead {
+                            conversation: conv,
+                            kind,
+                            message_ids,
+                        })
+                    })
+                    .await;
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
+        let conv = conversation.clone();
+        cx.spawn(async move |this, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&Request::UnreadItems {
+                        conversation: conv.clone(),
+                        kind,
+                        limit: 20,
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.key() != Some(&conversation) {
+                    return;
+                }
+                if let Ok(Response::UnreadItems { mut message_ids }) = answer {
+                    if let Some(first) = message_ids.first().cloned() {
+                        message_ids.remove(0);
+                        let done = message_ids.is_empty();
+                        match kind {
+                            protocol::UnreadItemKind::Mentions => this.unread_mention_ids = message_ids,
+                            protocol::UnreadItemKind::Reactions => this.unread_reaction_ids = message_ids,
+                        }
+                        this.jump_to(&first, cx);
+                        let conv_mark = conversation.clone();
+                        let mark_ids = if done { Vec::new() } else { vec![first] };
+                        cx.spawn(async move |_, cx| {
+                            let _ = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    crate::client::ask(&Request::MarkUnreadItemsRead {
+                                        conversation: conv_mark,
+                                        kind,
+                                        message_ids: mark_ids,
+                                    })
+                                })
+                                .await;
+                        })
+                        .detach();
+                    } else {
+                        let conv_mark = conversation.clone();
+                        cx.spawn(async move |_, cx| {
+                            let _ = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    crate::client::ask(&Request::MarkUnreadItemsRead {
+                                        conversation: conv_mark,
+                                        kind,
+                                        message_ids: Vec::new(),
+                                    })
+                                })
+                                .await;
+                        })
+                        .detach();
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn unread_jump_buttons(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if self.thread {
+            return None;
+        }
+        let key = self.key()?.clone();
+        let (mentions, reactions) = self.shell.upgrade().and_then(|shell| {
+            let shell = shell.read(cx);
+            let snap = shell.snapshot.as_ref()?;
+            let can = snap.accounts.iter().find(|a| a.key == key.account())?.can.unread_jumps;
+            if !can {
+                return None;
+            }
+            let conv = snap.open.as_ref()?;
+            (conv.key == key).then_some((conv.mentions, conv.unread_reactions))
+        })?;
+        if mentions == 0 && reactions == 0 {
+            return None;
+        }
+        // Sit above the "jump to latest" pill while that pill is on screen.
+        let bottom = if self.away {
+            if self.metrics == Metrics::PHONE { px(68.) } else { px(48.) }
+        } else {
+            px(16.)
+        };
+        let mut stack = div()
+            .absolute()
+            .bottom(bottom)
+            .right(px(16.))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(6.));
+        if reactions > 0 {
+            stack = stack.child(
+                div()
+                    .id("jump-unread-reactions")
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow(theme::shadow_popover())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .type_small()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::text())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(format!("♥ {reactions}"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.jump_next_unread(protocol::UnreadItemKind::Reactions, cx);
+                    })),
+            );
+        }
+        if mentions > 0 {
+            stack = stack.child(
+                div()
+                    .id("jump-unread-mentions")
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .bg(theme::accent())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .shadow(theme::shadow_popover())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .type_small()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::on_accent())
+                    .cursor_pointer()
+                    .child(format!("@ {mentions}"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.jump_next_unread(protocol::UnreadItemKind::Mentions, cx);
+                    })),
+            );
+        }
+        Some(stack)
+    }
+
     fn load_saved_dialogs(&mut self, key: Key, cx: &mut Context<Self>) {
         if self.saved_loaded_for.as_ref() == Some(&key) {
             return;
@@ -2123,6 +2312,7 @@ impl Render for Pane {
             .children(self.saved_filter_bar(cx))
             .children(self.live_call_row(cx))
             .children(self.history_banner(cx))
+            .children(self.unread_jump_buttons(cx))
             .children(self.away.then(|| self.jump_button(cx)))
             .children(self.selection_bar(cx))
             .children(self.action_layers(window, cx))

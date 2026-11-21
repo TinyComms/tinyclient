@@ -1290,6 +1290,113 @@ pub(super) fn end_session(account: &Account, session_id: &str) -> Result<(), Fau
     Ok(())
 }
 
+/// Fetch unread mention or reaction message IDs in a conversation
+/// (`messages.getUnreadMentions` / `messages.getUnreadReactions`).
+pub(super) fn unread_items(
+    account: &Account,
+    conversation_id: &str,
+    kind: protocol::UnreadItemKind,
+    limit: u32,
+) -> Result<Vec<String>, Fault> {
+    let (who, topic) = Who::parse(conversation_id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let limit = (limit.clamp(1, protocol::PAGE_LIMIT)) as i32;
+    let raw = match kind {
+        protocol::UnreadItemKind::Mentions => account.ask(&tl::functions::messages::GetUnreadMentions {
+            peer,
+            top_msg_id: topic,
+            offset_id: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+        })?,
+        protocol::UnreadItemKind::Reactions => account.ask(&tl::functions::messages::GetUnreadReactions {
+            peer,
+            top_msg_id: topic,
+            saved_peer_id: None,
+            offset_id: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+        })?,
+    };
+    let messages_raw = match raw {
+        tl::enums::messages::Messages::Messages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::Slice(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::ChannelMessages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::NotModified(_) => Vec::new(),
+    };
+    let dir = account.dir();
+    let mut ids = Vec::new();
+    let mut mapped_msgs = Vec::new();
+    for raw_msg in &messages_raw {
+        if let Some(mapped) = super::content::map(&dir, raw_msg) {
+            ids.push(mapped.id.to_string());
+            mapped_msgs.push(mapped.message);
+        }
+    }
+    if !mapped_msgs.is_empty() {
+        let _ = account.ctx.history(conversation_id, &mapped_msgs);
+    }
+    Ok(ids)
+}
+
+/// Mark unread mentions or reactions read (`messages.readMessageContents` / `channels.readMessageContents`
+/// / `messages.readMentions` / `messages.readReactions`).
+pub(super) fn mark_unread_items_read(
+    account: &Account,
+    conversation_id: &str,
+    kind: protocol::UnreadItemKind,
+    message_ids: &[String],
+) -> Result<(), Fault> {
+    let (who, topic) = Who::parse(conversation_id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    match kind {
+        protocol::UnreadItemKind::Mentions => {
+            let parsed_ids: Vec<i32> = message_ids.iter().filter_map(|id| id.parse::<i32>().ok()).collect();
+            if !parsed_ids.is_empty() {
+                match who {
+                    Who::Channel(_) => {
+                        let channel = account.input_channel(who)?;
+                        account.ask(&tl::functions::channels::ReadMessageContents { channel, id: parsed_ids })?;
+                    }
+                    _ => {
+                        account.ask(&tl::functions::messages::ReadMessageContents { id: parsed_ids })?;
+                    }
+                }
+            } else {
+                let peer = account.input(who)?;
+                account.ask(&tl::functions::messages::ReadMentions { peer, top_msg_id: topic })?;
+                let _ = account.ctx.mentions_count(conversation_id, 0);
+            }
+        }
+        protocol::UnreadItemKind::Reactions => {
+            // `messages.readReactions` clears every unread reaction in the chat. A walk
+            // through the list names the one just opened; only an empty list is the clear.
+            if message_ids.is_empty() {
+                let peer = account.input(who)?;
+                account.ask(&tl::functions::messages::ReadReactions {
+                    peer,
+                    top_msg_id: topic,
+                    saved_peer_id: None,
+                })?;
+                let _ = account.ctx.unread_reactions(conversation_id, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

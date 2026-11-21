@@ -699,6 +699,9 @@ pub struct Capabilities {
     /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
     #[serde(default, skip_serializing_if = "is_false")]
     pub active_sessions: bool,
+    /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread_jumps: bool,
 }
 
 /// Scope of an account-wide notification default (Telegram `InputNotifyUsers` / `Chats` / `Broadcasts`).
@@ -775,6 +778,14 @@ pub struct ActiveSession {
     pub last_active: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub current: bool,
+}
+
+/// Which unread markers to list or clear in a conversation (`UnreadItems` / `MarkUnreadItemsRead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadItemKind {
+    Mentions,
+    Reactions,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

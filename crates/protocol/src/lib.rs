@@ -446,6 +446,9 @@ pub struct Conversation {
     /// Unread messages that mention me.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub mentions: u32,
+    /// Unread reactions to my messages (Telegram `unread_reactions_count`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread_reactions: u32,
     /// Muted on the network. Drawn dimmed, never a dot, still a quiet mention count.
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
@@ -607,6 +610,7 @@ impl Conversation {
             peer: None,
             unread: 0,
             mentions: 0,
+            unread_reactions: 0,
             muted: false,
             starred: false,
             preview: String::new(),
@@ -2707,6 +2711,23 @@ pub enum Request {
         account: AccountKey,
         session_id: String,
     },
+    /// Fetch unread mention or reaction message IDs in a conversation (Telegram `messages.getUnreadMentions` / `getUnreadReactions`).
+    /// Answers `Response::UnreadItems`.
+    UnreadItems {
+        conversation: Key,
+        kind: UnreadItemKind,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Mark unread mentions or reactions read in a conversation (`readMessageContents`, `readMentions`, `readReactions`).
+    /// When `message_ids` is empty, marks all unread items of `kind` read in the conversation.
+    /// Answers `Response::Ok`.
+    MarkUnreadItemsRead {
+        conversation: Key,
+        kind: UnreadItemKind,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3245,6 +3266,10 @@ pub enum Response {
     /// Active signed-in devices/sessions (`Request::ActiveSessions`).
     ActiveSessions {
         sessions: Vec<ActiveSession>,
+    },
+    /// Unread mention or reaction message IDs in a conversation (`Request::UnreadItems`).
+    UnreadItems {
+        message_ids: Vec<String>,
     },
 }
 
