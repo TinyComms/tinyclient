@@ -1316,9 +1316,6 @@ impl SettingsWindow {
             None if accounts.iter().any(|account| matches!(account.key.network, Network::Discord | Network::Slack)) => {
                 groups.push(div().pt(px(gap)).flex().flex_col().child(group_label(label_of("P2"))).child(caption("Discord and Slack have no read receipts.")));
             }
-            None if accounts.iter().all(|account| account.key.network == Network::Tiny) => {
-                groups.push(div().flex().flex_col().child(caption("Tiny does not share typing or read receipts from tinyclient.").pt(px(0.))));
-            }
             None => {}
         }
         groups
@@ -1337,7 +1334,7 @@ impl SettingsWindow {
                 ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
                 ("P2", Network::Messages) => (Some("On your devices"), Some("Messages does not let tinyclient change read receipts.")),
-                ("P2", Network::Discord | Network::Slack) | ("P1" | "P2", Network::Tiny) => continue,
+                ("P2", Network::Discord | Network::Slack) => continue,
                 _ => (None, None),
             };
             let name = if account.name.is_empty() { network_name(network).to_owned() } else { account.name.clone() };
