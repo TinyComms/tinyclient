@@ -572,7 +572,7 @@ impl Chat {
         let dir = support_dir();
         let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |meta| meta.len());
         let messages = size("chat.sqlite") + size("chat.sqlite-wal") + size("chat.sqlite-shm");
-        Response::Storage { messages, files: self.blobs.bytes() }
+        Response::Storage { messages, files: self.blobs.bytes(), chats: self.hub.store().chat_cache(40).unwrap_or_default() }
     }
 
     /// Clear (D3): the files, then the messages, then every window reads what is left.
@@ -2298,6 +2298,26 @@ impl Chat {
         }
     }
 
+    fn get_auto_download(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetAutoDownload { reply }) {
+            Ok(settings) => Response::AutoDownload { settings },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_auto_download(&self, account: AccountKey, settings: protocol::AutoDownload) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetAutoDownload { settings, reply }) {
+            Ok(settings) => Response::AutoDownload { settings },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Drops an unsent row locally. A queued send is cancelled this way: the adapter never had it.
     fn drop_unsent(&self, conversation: Key, client_id: &str, message: &Message) -> Response {
         match self.hub.store().delete_message(&conversation, client_id) {
@@ -3294,6 +3314,8 @@ impl Chat {
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
+            Request::GetAutoDownload { account } => self.get_auto_download(account),
+            Request::SetAutoDownload { account, settings } => self.set_auto_download(account, settings),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),

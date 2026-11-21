@@ -90,6 +90,75 @@ pub struct PrivacyPolicy {
     pub premium_only: bool,
 }
 
+fn disabled_preset() -> bool {
+    true
+}
+
+/// One connection class of Telegram's `autoDownloadSettings` (roaming, mobile, or Wi-Fi).
+/// A missing preset is off, so an older frame never starts fetching full files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoDownloadPreset {
+    #[serde(default = "disabled_preset")]
+    pub disabled: bool,
+    #[serde(default)]
+    pub photo_size_max: i64,
+    #[serde(default)]
+    pub video_size_max: i64,
+    #[serde(default)]
+    pub file_size_max: i64,
+}
+
+impl Default for AutoDownloadPreset {
+    fn default() -> Self {
+        Self { disabled: true, photo_size_max: 0, video_size_max: 0, file_size_max: 0 }
+    }
+}
+
+/// Telegram's three auto-download presets, plus the local chat-kind gates this app keeps.
+/// Size limits are Telegram's (`account.getAutoDownloadSettings`). Which chats may use them
+/// is local and stays off until the account turns a kind on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoDownload {
+    #[serde(default)]
+    pub roaming: AutoDownloadPreset,
+    #[serde(default)]
+    pub mobile: AutoDownloadPreset,
+    #[serde(default)]
+    pub wifi: AutoDownloadPreset,
+    /// Fetch a photo's full size when the active preset's photo cap allows it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fetch_full_photos: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub private_chats: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channels: bool,
+}
+
+impl Default for AutoDownload {
+    fn default() -> Self {
+        Self {
+            roaming: AutoDownloadPreset::default(),
+            mobile: AutoDownloadPreset::default(),
+            wifi: AutoDownloadPreset::default(),
+            fetch_full_photos: false,
+            private_chats: false,
+            groups: false,
+            channels: false,
+        }
+    }
+}
+
+/// Cached files one conversation is using, when those files can be attributed to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCache {
+    pub conversation: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    pub bytes: u64,
+}
+
 /// Which list of a network's home `Home` reads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

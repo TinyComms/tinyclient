@@ -703,6 +703,14 @@ pub enum Command {
         policy: protocol::PrivacyPolicy,
         reply: Reply<protocol::PrivacyPolicy>,
     },
+    /// Telegram auto-download presets and the local chat-kind gates.
+    GetAutoDownload {
+        reply: Reply<protocol::AutoDownload>,
+    },
+    SetAutoDownload {
+        settings: protocol::AutoDownload,
+        reply: Reply<protocol::AutoDownload>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -889,6 +897,8 @@ impl Command {
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1002,6 +1012,18 @@ impl Context {
 
     pub fn key(&self, id: &str) -> Key {
         Key::new(&self.account, id)
+    }
+
+    /// A stored on/off setting for this account. Absent is off.
+    pub fn account_switch(&self, key: &str) -> bool {
+        let scope = protocol::settings::account_scope(&self.account);
+        self.hub.store().settings().ok().is_some_and(|rows| rows.iter().any(|row| row.scope == scope && row.key == key && row.value == "on"))
+    }
+
+    /// Stores an on/off setting for this account.
+    pub fn set_account_switch(&self, key: &str, on: bool) {
+        let scope = protocol::settings::account_scope(&self.account);
+        let _ = self.hub.store().set_setting(&scope, key, Some(if on { "on" } else { "off" }));
     }
 
     /// Whether a conversation may appear where the user asked for what is listed: hidden

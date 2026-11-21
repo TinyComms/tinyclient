@@ -718,6 +718,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::CallHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetAutoDownload { reply } | Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
@@ -875,6 +876,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::SetPrivacy { key, policy, reply } => {
             let _ = reply.send(info::set_privacy(account, key, &policy).map_err(refused));
+        }
+        Command::GetAutoDownload { reply } => {
+            let _ = reply.send(info::get_auto_download(account).map_err(refused));
+        }
+        Command::SetAutoDownload { settings, reply } => {
+            let _ = reply.send(info::set_auto_download(account, &settings).map_err(refused));
         }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));

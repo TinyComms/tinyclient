@@ -550,6 +550,10 @@ struct World {
     privacy: HashMap<&'static str, Vec<tl::enums::PrivacyRule>>,
     /// The next `account.setPrivacy` returns `PREMIUM_ACCOUNT_REQUIRED` (`privacy-refuse`).
     privacy_refuse: bool,
+    /// `account.getAutoDownloadSettings` presets: roaming, mobile, Wi-Fi.
+    download: [tl::types::AutoDownloadSettings; 3],
+    /// The next `account.saveAutoDownloadSettings` returns `PREMIUM_ACCOUNT_REQUIRED`.
+    download_refuse: bool,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -638,6 +642,12 @@ impl World {
                 ("chat_invite", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
             ]),
             privacy_refuse: false,
+            download: [
+                download_preset(true, 0, 0, 0),
+                download_preset(false, 102_400, 512_000, 0),
+                download_preset(false, 1_048_576, 10_485_760, 1_048_576),
+            ],
+            download_refuse: false,
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -888,6 +898,22 @@ fn app_config() -> tl::enums::help::AppConfig {
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
     Fault::Rpc { code, name: name.to_owned(), value }
+}
+
+fn download_preset(disabled: bool, photo: i32, video: i64, file: i64) -> tl::types::AutoDownloadSettings {
+    tl::types::AutoDownloadSettings {
+        disabled,
+        video_preload_large: false,
+        audio_preload_next: false,
+        phonecalls_less_data: false,
+        stories_preload: false,
+        photo_size_max: photo,
+        video_size_max: video,
+        file_size_max: file,
+        video_upload_maxbitrate: 0,
+        small_queue_active_operations_max: 0,
+        large_queue_active_operations_max: 0,
+    }
 }
 
 /// Wire log name for an `account.getPrivacy` / `account.setPrivacy` key.
@@ -1549,6 +1575,10 @@ impl World {
             }
             "privacy-refuse" => {
                 self.privacy_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "autodownload-refuse" => {
+                self.download_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
                 Vec::new()
             }
             "transcribe-update" => {
@@ -2866,6 +2896,30 @@ impl World {
             self.privacy.insert(name, mapped.clone());
             let found = tl::types::account::PrivacyRules { rules: mapped, chats: chats(), users: users() };
             return answer(tl::enums::account::PrivacyRules::Rules(found));
+        }
+        if asked::<f::account::GetAutoDownloadSettings>(body).is_some() {
+            self.log("account.getAutoDownloadSettings");
+            let found = tl::types::account::AutoDownloadSettings {
+                low: tl::enums::AutoDownloadSettings::Settings(self.download[0].clone()),
+                medium: tl::enums::AutoDownloadSettings::Settings(self.download[1].clone()),
+                high: tl::enums::AutoDownloadSettings::Settings(self.download[2].clone()),
+            };
+            return answer(tl::enums::account::AutoDownloadSettings::Settings(found));
+        }
+        if let Some(request) = asked::<f::account::SaveAutoDownloadSettings>(body) {
+            if self.download_refuse {
+                self.log("account.saveAutoDownloadSettings refused");
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
+            let tl::enums::AutoDownloadSettings::Settings(settings) = &request.settings;
+            let slot = if request.low { 0 } else if request.high { 2 } else { 1 };
+            let which = ["low", "medium", "high"][slot];
+            self.log(&format!(
+                "account.saveAutoDownloadSettings {which} photo={} video={} file={}",
+                settings.photo_size_max, settings.video_size_max, settings.file_size_max
+            ));
+            self.download[slot] = settings.clone();
+            return answer(true);
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;

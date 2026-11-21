@@ -890,6 +890,95 @@ pub(super) fn set_privacy(
     Ok(map_privacy_rules(account, key, &got.rules))
 }
 
+fn preset_from(settings: &tl::enums::AutoDownloadSettings) -> protocol::AutoDownloadPreset {
+    let tl::enums::AutoDownloadSettings::Settings(settings) = settings;
+    protocol::AutoDownloadPreset {
+        disabled: settings.disabled,
+        photo_size_max: i64::from(settings.photo_size_max),
+        video_size_max: settings.video_size_max,
+        file_size_max: settings.file_size_max,
+    }
+}
+
+fn preset_to(preset: &protocol::AutoDownloadPreset) -> tl::enums::AutoDownloadSettings {
+    tl::enums::AutoDownloadSettings::Settings(tl::types::AutoDownloadSettings {
+        disabled: preset.disabled,
+        video_preload_large: false,
+        audio_preload_next: false,
+        phonecalls_less_data: false,
+        stories_preload: false,
+        photo_size_max: preset.photo_size_max.clamp(0, i64::from(i32::MAX)) as i32,
+        video_size_max: preset.video_size_max.max(0),
+        file_size_max: preset.file_size_max.max(0),
+        video_upload_maxbitrate: 0,
+        small_queue_active_operations_max: 0,
+        large_queue_active_operations_max: 0,
+    })
+}
+
+/// This desktop uses the Wi-Fi preset. Chat-kind gates stay local and default off.
+fn rules_of(settings: &protocol::AutoDownload) -> super::peers::DownloadRules {
+    let cap = |bytes: i64| if settings.wifi.disabled { 0 } else { bytes.max(0) as u64 };
+    super::peers::DownloadRules {
+        fetch_full_photos: settings.fetch_full_photos,
+        private_chats: settings.private_chats,
+        groups: settings.groups,
+        channels: settings.channels,
+        photo_max: cap(settings.wifi.photo_size_max),
+        video_max: cap(settings.wifi.video_size_max),
+        file_max: cap(settings.wifi.file_size_max),
+    }
+}
+
+fn local_gates(account: &Account) -> (bool, bool, bool, bool) {
+    use protocol::settings::{TELEGRAM_DOWNLOAD_CHANNELS, TELEGRAM_DOWNLOAD_GROUPS, TELEGRAM_DOWNLOAD_PHOTOS, TELEGRAM_DOWNLOAD_PRIVATE};
+    (
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_PHOTOS),
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_PRIVATE),
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_GROUPS),
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_CHANNELS),
+    )
+}
+
+fn remember_download(account: &Account, settings: &protocol::AutoDownload) {
+    account.dir().download = rules_of(settings);
+}
+
+/// Reads `account.getAutoDownloadSettings` and the local chat-kind gates.
+pub(super) fn get_auto_download(account: &Account) -> Result<protocol::AutoDownload, Fault> {
+    let tl::enums::account::AutoDownloadSettings::Settings(got) = account.ask(&tl::functions::account::GetAutoDownloadSettings {})?;
+    let (fetch_full_photos, private_chats, groups, channels) = local_gates(account);
+    let settings = protocol::AutoDownload {
+        roaming: preset_from(&got.low),
+        mobile: preset_from(&got.medium),
+        wifi: preset_from(&got.high),
+        fetch_full_photos,
+        private_chats,
+        groups,
+        channels,
+    };
+    remember_download(account, &settings);
+    Ok(settings)
+}
+
+/// Writes each preset with `account.saveAutoDownloadSettings` and stores the local gates.
+pub(super) fn set_auto_download(account: &Account, settings: &protocol::AutoDownload) -> Result<protocol::AutoDownload, Fault> {
+    let save = |low: bool, high: bool, preset: &protocol::AutoDownloadPreset| -> Result<(), Fault> {
+        let _: bool = account.ask(&tl::functions::account::SaveAutoDownloadSettings { low, high, settings: preset_to(preset) })?;
+        Ok(())
+    };
+    save(true, false, &settings.roaming)?;
+    save(false, false, &settings.mobile)?;
+    save(false, true, &settings.wifi)?;
+    use protocol::settings::{TELEGRAM_DOWNLOAD_CHANNELS, TELEGRAM_DOWNLOAD_GROUPS, TELEGRAM_DOWNLOAD_PHOTOS, TELEGRAM_DOWNLOAD_PRIVATE};
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_PHOTOS, settings.fetch_full_photos);
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_PRIVATE, settings.private_chats);
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_GROUPS, settings.groups);
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_CHANNELS, settings.channels);
+    remember_download(account, settings);
+    Ok(settings.clone())
+}
+
 fn tl_report_reason(reason: protocol::ReportReason) -> tl::enums::ReportReason {
     match reason {
         protocol::ReportReason::Spam => tl::enums::ReportReason::InputReportReasonSpam,

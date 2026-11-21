@@ -1653,6 +1653,10 @@ pub enum Request {
         key: PrivacyKey,
         policy: PrivacyPolicy,
     },
+    /// Telegram's auto-download presets and this device's chat-kind gates.
+    GetAutoDownload { account: AccountKey },
+    /// Writes the presets (`account.saveAutoDownloadSettings`) and the local chat-kind gates.
+    SetAutoDownload { account: AccountKey, settings: AutoDownload },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2925,6 +2929,9 @@ pub enum Response {
         key: PrivacyKey,
         policy: PrivacyPolicy,
     },
+    AutoDownload {
+        settings: AutoDownload,
+    },
     Folders {
         folders: Vec<Folder>,
     },
@@ -2992,6 +2999,9 @@ pub enum Response {
     Storage {
         messages: u64,
         files: u64,
+        /// Per-chat cache, largest first. Chats with nothing on disk are left out.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chats: Vec<ChatCache>,
     },
     /// What a shorter retention would delete: messages, and about how many bytes of them.
     Prunable {

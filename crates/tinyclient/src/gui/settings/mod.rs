@@ -391,7 +391,7 @@ pub struct SettingsWindow {
     /// The camera list is being read: each camera opens for a frame, which takes a moment.
     pub(super) cameras_reading: bool,
     /// Bytes on this Mac: messages, files.
-    pub(super) storage: Option<(u64, u64)>,
+    pub(super) storage: Option<(u64, u64, Vec<protocol::ChatCache>)>,
     /// The row whose value could not be stored, or whose action did not happen.
     pub(super) failed: Option<&'static str>,
     /// Why the last sound file could not be added (S13), in the picker's own words.
@@ -412,6 +412,9 @@ pub struct SettingsWindow {
     /// Never written back until loaded so existing exceptions are always preserved.
     pub(super) tg_privacy: HashMap<(protocol::AccountKey, protocol::PrivacyKey), protocol::PrivacyPolicy>,
     pub(super) tg_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Telegram auto-download presets and local chat-kind gates, once `GetAutoDownload` returns.
+    pub(super) tg_download: HashMap<protocol::AccountKey, protocol::AutoDownload>,
+    pub(super) tg_download_requested: std::collections::HashSet<protocol::AccountKey>,
     /// Drawn as the phone's page: a list of sections, then one section at a time.
     pub(super) phone: bool,
     /// On a phone: the list of sections is on show, not `section`.
@@ -556,6 +559,8 @@ impl SettingsWindow {
             tiny,
             tg_privacy: HashMap::new(),
             tg_privacy_requested: std::collections::HashSet::new(),
+            tg_download: HashMap::new(),
+            tg_download_requested: std::collections::HashSet::new(),
             phone,
             listing: phone,
             shown: phone,
@@ -891,8 +896,8 @@ impl SettingsWindow {
 
     pub(super) fn read_storage(&mut self, cx: &mut Context<Self>) {
         self.off_thread(cx, || crate::client::ask(&Request::Storage), |this, answer, cx| {
-            if let Ok(Response::Storage { messages, files }) = answer {
-                this.storage = Some((messages, files));
+            if let Ok(Response::Storage { messages, files, chats }) = answer {
+                this.storage = Some((messages, files, chats));
                 cx.notify();
             }
         });

@@ -1201,6 +1201,46 @@ impl Store {
         self.db.execute_batch(REMINDERS_TABLE)
     }
 
+    /// On-disk media attributed to a conversation through its cached messages.
+    /// A chat with nothing on disk is omitted. The same file in one chat counts once.
+    pub fn chat_cache(&self, limit: u32) -> rusqlite::Result<Vec<protocol::ChatCache>> {
+        let mut query = self.db.prepare(
+            "SELECT network, account, conversation, MAX(title), SUM(bytes) FROM (
+                SELECT DISTINCT r.network AS network, r.account AS account, r.conversation AS conversation,
+                       c.title AS title, r.fid AS fid, media.bytes AS bytes
+                  FROM (
+                    SELECT network, account, conversation, json_extract(j.value, '$.file.id') AS fid
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.file.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.thumb.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.thumb.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.preview.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.preview.id') IS NOT NULL
+                  ) r
+                  JOIN media ON media.network = r.network AND media.account = r.account AND media.id = r.fid
+                   AND media.path IS NOT NULL
+                  JOIN conversation c ON c.network = r.network AND c.account = r.account AND c.id = r.conversation
+             )
+             GROUP BY network, account, conversation
+             HAVING SUM(bytes) > 0
+             ORDER BY SUM(bytes) DESC
+             LIMIT ?1",
+        )?;
+        let rows = query.query_map(params![limit], |row| {
+            let bytes: i64 = row.get(4)?;
+            Ok(protocol::ChatCache {
+                conversation: Key { network: from_word(row.get(0)?)?, account: row.get(1)?, id: row.get(2)? },
+                title: row.get(3)?,
+                bytes: bytes.max(0) as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Every stored setting, the version row included.
     pub fn settings(&self) -> rusqlite::Result<Vec<protocol::settings::Setting>> {
         let mut query = self.db.prepare("SELECT scope, key, value FROM settings ORDER BY scope, key")?;
@@ -4608,6 +4648,32 @@ mod tests {
         let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         assert!(page.messages[0].deleted);
         assert!(page.messages[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn chat_cache_counts_only_files_on_disk_and_only_the_chat_that_shows_them() {
+        let (mut store, key) = store();
+        let mut message = said("1", "ridge", NOW);
+        let mut file = MediaFile::new("ridge-full", protocol::MediaKind::Image);
+        file.bytes = 9_000;
+        message.attachments.push(protocol::Attachment::new("ridge.jpg", file));
+        store.ingest(&key, &message, false).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, path, used) VALUES ('discord', 'me', 'ridge-full', 'image', 4096, 'ridge.jpg', 1)",
+            [],
+        ).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, used) VALUES ('discord', 'me', 'missing', 'image', 100, 1)",
+            [],
+        ).unwrap();
+        let mut other = said("2", "not on disk", NOW + 1);
+        other.attachments.push(protocol::Attachment::new("gone.jpg", MediaFile::new("missing", protocol::MediaKind::Image)));
+        store.ingest(&key, &other, false).unwrap();
+        let rows = store.chat_cache(40).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation, key);
+        assert_eq!(rows[0].title, "#general");
+        assert_eq!(rows[0].bytes, 4096);
     }
 
     #[test]

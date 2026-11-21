@@ -374,10 +374,58 @@ pub struct Learned {
     pub chats: Vec<Who>,
 }
 
+/// What kind of file an auto-download rule is deciding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadClass {
+    Photo,
+    Video,
+    Gif,
+    File,
+}
+
+/// Local gates plus the size caps of the preset this device uses (Wi-Fi).
+/// Every flag defaults off, so a full file stays held for the viewer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DownloadRules {
+    pub fetch_full_photos: bool,
+    pub private_chats: bool,
+    pub groups: bool,
+    pub channels: bool,
+    pub photo_max: u64,
+    pub video_max: u64,
+    pub file_max: u64,
+}
+
+impl DownloadRules {
+    /// Whether a full file that would otherwise wait for the viewer should be fetched now.
+    /// A zero size, a chat kind that is off, or a cap of zero stays held.
+    pub fn fetch_full(self, who: Who, class: DownloadClass, bytes: u64) -> bool {
+        if bytes == 0 {
+            return false;
+        }
+        let chat_on = match who {
+            Who::User(_) => self.private_chats,
+            Who::Group(_) => self.groups,
+            Who::Channel(_) => self.channels,
+        };
+        if !chat_on {
+            return false;
+        }
+        let cap = match class {
+            DownloadClass::Photo => self.fetch_full_photos.then_some(self.photo_max).unwrap_or(0),
+            DownloadClass::Video | DownloadClass::Gif => self.video_max,
+            DownloadClass::File => self.file_max,
+        };
+        cap > 0 && bytes <= cap
+    }
+}
+
 #[derive(Default)]
 pub struct Directory {
     map: HashMap<Who, Known>,
     pub me: i64,
+    /// Honored when a message's full file is classified. Off until settings are read.
+    pub download: DownloadRules,
 }
 
 pub fn note_key(who: Who) -> String {
@@ -386,7 +434,7 @@ pub fn note_key(who: Who) -> String {
 
 impl Directory {
     pub fn new(me: i64) -> Directory {
-        Directory { map: HashMap::new(), me }
+        Directory { map: HashMap::new(), me, download: DownloadRules::default() }
     }
 
     pub fn get(&self, who: Who) -> Option<&Known> {

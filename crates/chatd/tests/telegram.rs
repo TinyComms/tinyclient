@@ -3623,6 +3623,53 @@ fn privacy_last_seen_sets_contacts_with_one_exception_and_a_premium_refusal() {
 }
 
 #[test]
+fn auto_download_reads_wifi_limits_and_refuses_a_save() {
+    use protocol::{AutoDownload, AutoDownloadPreset, ErrorCode};
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::AutoDownload { settings } = world.ask(Request::GetAutoDownload { account: account() }) else {
+        panic!("expected AutoDownload");
+    };
+    assert!(settings.roaming.disabled);
+    assert_eq!(settings.wifi.photo_size_max, 1_048_576);
+    assert_eq!(settings.wifi.video_size_max, 10_485_760);
+    assert!(!settings.fetch_full_photos);
+    assert!(!settings.private_chats);
+    assert!(world.calls().iter().any(|c| c == "account.getAutoDownloadSettings"));
+
+    let mut next = settings;
+    next.fetch_full_photos = true;
+    next.private_chats = true;
+    next.wifi = AutoDownloadPreset { disabled: false, photo_size_max: 2_048, video_size_max: 8_192, file_size_max: 4_096 };
+    let Response::AutoDownload { settings: saved } = world.ask(Request::SetAutoDownload { account: account(), settings: next }) else {
+        panic!("expected AutoDownload after save");
+    };
+    assert!(saved.fetch_full_photos && saved.private_chats);
+    assert_eq!(saved.wifi.photo_size_max, 2_048);
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings high photo=2048 video=8192 file=4096")),
+        "expected the wifi preset on the wire, got: {:#?}",
+        world.calls()
+    );
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings low ")));
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings medium ")));
+
+    world.steer("autodownload-refuse");
+    let refused = world.ask(Request::SetAutoDownload {
+        account: account(),
+        settings: AutoDownload::default(),
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings refused")));
+}
+
+#[test]
 fn shared_contact_send_and_receive() {
     let world = World::signed_in();
     world.connected();
