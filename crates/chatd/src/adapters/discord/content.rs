@@ -718,6 +718,57 @@ pub struct Place<'a> {
     pub author: Option<String>,
 }
 
+fn build_call_note(
+    payload: Option<&model::CallPayload>,
+    caller_id: &str,
+    who: &str,
+    sent: i64,
+    outgoing: bool,
+    me: &str,
+) -> (protocol::CallNote, Option<String>) {
+    let (outcome, seconds, participants, text) = match payload {
+        Some(payload) => match payload.ended_timestamp.as_deref().and_then(model::iso_seconds) {
+            Some(ended) => {
+                let dur = u32::try_from((ended - sent).max(0)).ok().filter(|&s| s > 0);
+                // Missed: call ended, I did not start it, and I am not in `participants`.
+                let missed = !outgoing && !payload.participants.iter().any(|id| id == me);
+                let outcome = if missed { protocol::CallOutcome::Missed } else { protocol::CallOutcome::Ended };
+                let text = if missed {
+                    format!("Missed call from {who}")
+                } else if let Some(secs) = dur {
+                    let mins = secs / 60;
+                    if mins >= 60 {
+                        format!("Call with {who} · {} hr {} min", mins / 60, mins % 60)
+                    } else if mins >= 1 {
+                        format!("Call with {who} · {mins} min")
+                    } else {
+                        format!("Call with {who} · {secs} sec")
+                    }
+                } else {
+                    format!("Call with {who}")
+                };
+                (outcome, dur, payload.participants.clone(), Some(text))
+            }
+            None => (
+                protocol::CallOutcome::Live,
+                None,
+                payload.participants.clone(),
+                Some("Call in progress".to_owned()),
+            ),
+        },
+        None => (protocol::CallOutcome::Ended, None, Vec::new(), None),
+    };
+    (
+        protocol::CallNote {
+            outcome,
+            caller_id: caller_id.to_owned(),
+            seconds,
+            participants,
+        },
+        text,
+    )
+}
+
 /// A whole message object into the model, with every file it refers to. `mentions_me` is left
 /// false: it depends on the user's settings, which the caller knows.
 pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
@@ -826,40 +877,11 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let outgoing = !author.id.is_empty() && author.id == place.me;
     let sent = seconds(&posted.id);
     let call_note = if kind == 3 {
-        let (outcome, seconds) = match &posted.call {
-            Some(payload) => match payload.ended_timestamp.as_deref().and_then(model::iso_seconds) {
-                Some(ended) => {
-                    let dur = u32::try_from((ended - sent).max(0)).ok().filter(|&s| s > 0);
-                    let missed = payload.participants.len() <= 1 && !outgoing;
-                    let outcome = if missed { protocol::CallOutcome::Missed } else { protocol::CallOutcome::Ended };
-                    if missed {
-                        rich.text = format!("Missed call from {who}");
-                    } else if let Some(secs) = dur {
-                        let mins = secs / 60;
-                        rich.text = if mins >= 60 {
-                            format!("Call with {who} · {} hr {} min", mins / 60, mins % 60)
-                        } else if mins >= 1 {
-                            format!("Call with {who} · {mins} min")
-                        } else {
-                            format!("Call with {who} · {secs} sec")
-                        };
-                    } else {
-                        rich.text = format!("Call with {who}");
-                    }
-                    (outcome, dur)
-                }
-                None => {
-                    rich.text = "Call in progress".to_owned();
-                    (protocol::CallOutcome::Live, None)
-                }
-            },
-            None => (protocol::CallOutcome::Ended, None),
-        };
-        Some(protocol::CallNote {
-            outcome,
-            caller_id: author.id.clone(),
-            seconds,
-        })
+        let (note, text) = build_call_note(posted.call.as_ref(), &author.id, &who, sent, outgoing, place.me);
+        if let Some(text) = text {
+            rich.text = text;
+        }
+        Some(note)
     } else {
         None
     };
@@ -995,6 +1017,20 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     if update.edited_timestamp.is_some() {
         stored.edited = true;
         stored.edited_at = update.edited_timestamp.as_deref().and_then(model::iso_seconds).or(stored.edited_at);
+    }
+    if let Some(payload) = &update.call {
+        let (note, text) = build_call_note(
+            Some(payload),
+            &stored.sender.id,
+            &stored.sender.name,
+            stored.sent,
+            stored.outgoing,
+            place.me,
+        );
+        if let Some(text) = text {
+            stored.text = text;
+        }
+        stored.call = Some(note);
     }
     rich.files
 }
@@ -1148,18 +1184,46 @@ mod tests {
         missed.call = Some(model::CallPayload { participants: vec!["peer".into()], ended_timestamp: Some("2022-07-22T11:24:46Z".into()) });
         let (m, _) = message(&missed, &place);
         assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Missed));
+        assert_eq!(m.call.as_ref().map(|c| c.participants.as_slice()), Some(&["peer".to_owned()][..]));
         assert_eq!(m.text, "Missed call from Bea");
+
+        // Group call where two others joined, but I did not: still missed for me.
+        let mut group_missed = base.clone();
+        group_missed.call = Some(model::CallPayload {
+            participants: vec!["peer".into(), "other".into()],
+            ended_timestamp: Some("2022-07-22T11:30:00Z".into()),
+        });
+        let (m, _) = message(&group_missed, &place);
+        assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Missed));
+        assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
 
         let mut ended = base.clone();
         ended.call = Some(model::CallPayload { participants: vec!["peer".into(), "me".into()], ended_timestamp: Some("2022-07-22T11:34:59Z".into()) });
         let (m, _) = message(&ended, &place);
         assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Ended));
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
+        assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
 
         let mut live = base;
         live.call = Some(model::CallPayload { participants: vec!["peer".into()], ended_timestamp: None });
-        let (m, _) = message(&live, &place);
+        let (mut m, _) = message(&live, &place);
         assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Live));
+
+        // Partial MESSAGE_UPDATE when the call ends updates outcome, duration, participants and text.
+        let update = Posted {
+            id: "1000000000000000000".into(),
+            channel_id: "dm-1".into(),
+            call: Some(model::CallPayload {
+                participants: vec!["peer".into(), "me".into()],
+                ended_timestamp: Some("2022-07-22T11:34:59Z".into()),
+            }),
+            ..Default::default()
+        };
+        patch(&mut m, &update, &place);
+        assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Ended));
+        assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
+        assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
+        assert_eq!(m.text, "Call with Bea · 12 min");
     }
 }

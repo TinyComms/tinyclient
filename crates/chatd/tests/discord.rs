@@ -4466,3 +4466,63 @@ fn voice_state_member_avatar_reaches_participant_and_occupant() {
     assert_eq!(occ_avatars.0, "mavatar:4000:2006:srv_hash_1");
     assert_eq!(occ_avatars.1, "avatar:2007:usr_hash_2");
 }
+
+#[test]
+fn dm_call_message_updates_outcome_participants_and_unread_without_double_count() {
+    let world = World::start();
+    let dm = "3001";
+    let unread_before = world.conversation(dm).unread;
+    let call_msg_id = "1600000000000000801";
+    // Incoming ongoing type-3 call message in DM 3001 from Ada (2001).
+    world.discord.push(
+        "MESSAGE_CREATE",
+        json!({
+            "id": call_msg_id,
+            "channel_id": dm,
+            "type": 3,
+            "author": {"id": "2001", "username": "ada", "global_name": "Ada Lovelace"},
+            "content": "",
+            "timestamp": "2026-10-13T09:00:00.000000+00:00",
+            "mentions": [],
+            "attachments": [],
+            "embeds": [],
+            "call": {
+                "participants": ["2001"],
+                "ended_timestamp": null
+            }
+        }),
+    );
+    let live = wait("live call message stored", || {
+        world.messages(dm).into_iter().find(|m| m.id == call_msg_id)
+    });
+    assert_eq!(live.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Live));
+    assert_eq!(live.call.as_ref().map(|c| c.participants.as_slice()), Some(&["2001".to_owned()][..]));
+    let unread_after_create = world.conversation(dm).unread;
+    assert_eq!(unread_after_create, unread_before + 1, "incoming call message counts once as unread");
+
+    // Partial MESSAGE_UPDATE when the call ends unanswered (I am not in participants) -> Missed,
+    // without double-counting unread.
+    world.discord.push(
+        "MESSAGE_UPDATE",
+        json!({
+            "id": call_msg_id,
+            "channel_id": dm,
+            "call": {
+                "participants": ["2001"],
+                "ended_timestamp": "2026-10-13T09:00:45.000000+00:00"
+            }
+        }),
+    );
+    let missed = wait("call message updated to missed", || {
+        world
+            .messages(dm)
+            .into_iter()
+            .find(|m| m.id == call_msg_id && m.call.as_ref().is_some_and(|c| c.outcome == protocol::CallOutcome::Missed))
+    });
+    assert_eq!(missed.text, "Missed call from Mara O");
+    assert_eq!(world.conversation(dm).unread, unread_after_create, "MESSAGE_UPDATE must not double-count unread");
+
+    // MESSAGE_ACK clears the unread count.
+    world.discord.push("MESSAGE_ACK", json!({"channel_id": dm, "message_id": call_msg_id, "mention_count": 0}));
+    wait("unread cleared by MESSAGE_ACK", || (world.conversation(dm).unread == 0).then_some(()));
+}

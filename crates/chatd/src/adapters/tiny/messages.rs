@@ -4062,6 +4062,7 @@ fn record_call(
         outcome,
         caller_id: call.caller_id.clone(),
         seconds,
+        participants: Vec::new(),
     });
     let _ = ctx.quiet_line(direct_id, &message, outcome == protocol::CallOutcome::Missed && !outgoing);
 }
@@ -5414,7 +5415,7 @@ mod tests {
             "direct_id": "direct-1", "ring_id": "r-miss-in", "caller_id": PEER, "outcome": "missed", "ended_at": WHEN
         }));
         let m = ctx.stored_message("direct-1", "r-miss-in").unwrap().unwrap();
-        assert_eq!(m.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Missed, caller_id: PEER.into(), seconds: None }));
+        assert_eq!(m.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Missed, caller_id: PEER.into(), seconds: None, participants: Vec::new() }));
         assert_eq!(m.text, "Missed call from Bea");
         assert_eq!(ctx.known("direct-1").unwrap().unwrap().unread, 1);
 
@@ -5423,7 +5424,7 @@ mod tests {
             "direct_id": "direct-1", "ring_id": "r-miss-out", "caller_id": ME, "outcome": "missed", "ended_at": WHEN
         }));
         let m = ctx.stored_message("direct-1", "r-miss-out").unwrap().unwrap();
-        assert_eq!(m.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Missed, caller_id: ME.into(), seconds: None }));
+        assert_eq!(m.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Missed, caller_id: ME.into(), seconds: None, participants: Vec::new() }));
         assert_eq!(m.text, "You called Bea · no answer");
 
         // 3. Incoming declined
@@ -5457,7 +5458,7 @@ mod tests {
             "direct_id": "direct-1", "ring_id": "r-miss-in", "caller_id": PEER, "outcome": "ended", "duration_s": 720, "ended_at": WHEN
         }));
         let replaced = ctx.stored_message("direct-1", "r-miss-in").unwrap().unwrap();
-        assert_eq!(replaced.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Ended, caller_id: PEER.into(), seconds: Some(720) }));
+        assert_eq!(replaced.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Ended, caller_id: PEER.into(), seconds: Some(720), participants: Vec::new() }));
         assert_eq!(replaced.text, "Call with Bea · 12 min");
         assert_eq!(ctx.known("direct-1").unwrap().unwrap().unread, 1);
     }

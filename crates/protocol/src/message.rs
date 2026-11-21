@@ -644,6 +644,9 @@ pub struct CallNote {
     pub caller_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seconds: Option<u32>,
+    /// User ids who took part in the call, when the network names them (e.g. Discord).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<String>,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that
@@ -783,6 +786,12 @@ impl Message {
             clip(&mut delivery.failed, 200);
         }
         clip(&mut self.receipt_note, 200);
+        if let Some(call) = &mut self.call {
+            call.participants.truncate(32);
+            for id in &mut call.participants {
+                clip(id, 80);
+            }
+        }
         if let Some(effect) = &mut self.effect {
             clip(effect, 64);
         }
