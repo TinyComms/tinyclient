@@ -1,5 +1,4 @@
 //! What the shell's Enter asks of Slack's own search: one conversation, or the whole workspace.
-//! One request, never a crawl: only hits in conversations the sidebar already knows come back.
 
 use super::{seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{AccountFilesPage, SearchPage, SearchScope};
@@ -15,7 +14,7 @@ impl Slack {
     /// The messages Slack itself finds for the pane's words, mapped like the cache's hits.
     ///
     /// Supports paging (`page=N`), sort order (`timestamp` vs `score`), unjoined public channel
-    /// hits (when Slack describes a non-private channel object), and falls back to the web
+    /// hits (only when Slack sets `is_channel` and `is_private` false), and falls back to the web
     /// client's `search.modules` (`module=messages`) if `search.messages` refuses with
     /// `not_allowed_token_type`.
     pub(super) fn search_messages(
@@ -121,14 +120,15 @@ impl Slack {
             let (known_title, space_title) = match self.ctx.known(channel) {
                 Ok(Some(known)) => (known.title, known.space_title),
                 _ => {
-                    // Keep hits in unjoined public channels when Slack describes them so clicking
-                    // can open a read-only preview (`PreviewChannel`). Drop unknown/private ones.
+                    // Keep an unjoined hit only when Slack says it is a public channel.
+                    // A missing `is_private` is not public. Clicking opens a read-only preview.
                     let ch = &found["channel"];
                     let public_name = ch["name"]
                         .as_str()
                         .filter(|n| !n.is_empty())
                         .filter(|_| {
-                            ch["is_private"] != true
+                            ch["is_channel"] == true
+                                && ch["is_private"] == false
                                 && ch["is_im"] != true
                                 && ch["is_mpim"] != true
                                 && ch["is_group"] != true

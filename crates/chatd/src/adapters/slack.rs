@@ -228,6 +228,7 @@ fn reason(fault: Fault) -> String {
             "name_already_exists" => "A user group with that name already exists.",
             "paid_teams_only" | "paid_only" => "This feature requires a paid Slack plan.",
             "no_permission" => "You do not have permission to do that in this workspace.",
+            "section_not_found" => "That section is not in this workspace.",
             "restricted_action" => "This workspace does not let you do that.",
             error if error.starts_with("restricted_action_") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
@@ -290,6 +291,10 @@ struct State {
     groups_listed: bool,
     /// User groups I belong to, learned once per connection and kept current on the socket.
     my_groups: HashSet<String>,
+    /// Our workspace role from `users.info`, so an admin write does not ask Slack again.
+    role: Option<info::WorkspaceRole>,
+    /// `emoji_only_admins` from `team.info`, once that field has been seen.
+    emoji_only_admins: Option<bool>,
     /// Do Not Disturb state per user id (`dnd.info`, `dnd.teamInfo`, `dnd_updated`, `dnd_updated_user`).
     dnd: HashMap<String, people::DndState>,
     /// Underlying Slack presence (`Online`, `Idle`, `Offline`) before DND overlay.
@@ -2205,7 +2210,8 @@ impl Slack {
                     Err(fault) => SlashOutcome::Message(Err(reason(fault))),
                 }
             }
-            _ => SlashOutcome::Message(Err("Commands run in the official app.".to_owned())),
+            // Not a channel message: the pending row is dropped and the handoff is ephemeral.
+            _ => SlashOutcome::Done(Some("Commands run in the official app.".to_owned())),
         }
     }
 

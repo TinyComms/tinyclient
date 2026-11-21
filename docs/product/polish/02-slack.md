@@ -144,7 +144,7 @@ the networks differ, not one menu with greyed rows.
   pill (F11) becomes an icon button when no huddle is running.
 - Scheduled messages and Slack drafts: not shown (stories: no scheduled sends). A local draft
   marks the row with a pencil.
-- App home tabs are cut. An app DM opens its Messages tab, and an "Open app in Slack" line replaces Home.
+- App home tabs are shown (#551). Opening an app DM's Home tab loads its published view; About lists the app's commands and links.
 
 ## 10. Cost of each decision (under `07`)
 
@@ -176,7 +176,7 @@ the networks differ, not one menu with greyed rows.
 | S12 | P1 | I pause notifications or set my status from Slack's menu. | `dnd.setSnooze` / `users.profile.set` are sent once; the menu shows "Paused until 3:40 PM". |
 | S13 | P2 | Slack Connect channels show the other org; a live huddle shows on its row. | `is_ext_shared` → Connect glyph; huddle start event → glyph within 1 s. |
 | S14 | P2 | Docked channel details show topic, member count and shared orgs. | Details pane fields equal `conversations.info`. |
-| cut | — | Unreads view, Activity tabs, reactions-to-me, Later, Drafts & sent, Huddles list, Canvases, app home tabs, prefix grouping, all-workspaces-expanded home. | Each is an "Open in Slack" line where a user would look for it. |
+| cut | — | Activity tabs, reactions-to-me, Later, Drafts & sent, Huddles list, Canvases, prefix grouping, all-workspaces-expanded home. | Unreads (#606) and app home tabs (#551) are in the app. Each remaining item is an "Open in Slack" line where a user would look for it. |
 
 ## Open questions for the owner
 

@@ -33,6 +33,77 @@ const CONNECTED_TEAMS: usize = 4;
 pub(super) const EXTERNAL_EMAIL: &str =
     "A direct message with someone at another company starts as an invitation. Send it in Slack: Home, Directories, External. If Directories is not there, open External connections.";
 
+/// Workspace role from `users.info`, in the same order `space_info` shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkspaceRole {
+    PrimaryOwner,
+    Owner,
+    Admin,
+    SingleGuest,
+    MultiGuest,
+    Member,
+}
+
+impl WorkspaceRole {
+    fn from_user(user: &Value) -> Self {
+        if user["is_primary_owner"] == true {
+            Self::PrimaryOwner
+        } else if user["is_owner"] == true {
+            Self::Owner
+        } else if user["is_admin"] == true {
+            Self::Admin
+        } else if user["is_ultra_restricted"] == true {
+            Self::SingleGuest
+        } else if user["is_restricted"] == true {
+            Self::MultiGuest
+        } else {
+            Self::Member
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrimaryOwner => "Primary owner",
+            Self::Owner => "Owner",
+            Self::Admin => "Workspace admin",
+            Self::SingleGuest => "Single-channel guest",
+            Self::MultiGuest => "Multi-channel guest",
+            Self::Member => "Member",
+        }
+    }
+
+    fn is_workspace_admin(self) -> bool {
+        matches!(self, Self::PrimaryOwner | Self::Owner | Self::Admin)
+    }
+
+    fn is_guest(self) -> bool {
+        matches!(self, Self::SingleGuest | Self::MultiGuest)
+    }
+}
+
+/// `emoji_only_admins` once Slack has sent that field. Absent is not a yes.
+fn emoji_only_admins(team: &Value) -> Option<bool> {
+    team.get("prefs")
+        .and_then(|prefs| prefs.get("emoji_only_admins"))
+        .or_else(|| team.get("emoji_only_admins"))
+        .and_then(Value::as_bool)
+}
+
+/// PNG, GIF, JPEG, or WEBP, from the file bytes.
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 fn channel_of(conversation: &str) -> &str {
     thread_of(conversation).map_or(conversation, |(channel, _)| channel)
 }
@@ -1011,6 +1082,54 @@ impl Slack {
         Ok(())
     }
 
+    /// Cached `users.info` role, fetched once for this connection.
+    fn workspace_role(&self) -> Result<WorkspaceRole, Fault> {
+        if let Some(role) = self.state().role {
+            return Ok(role);
+        }
+        let Some(me) = self.me.get().filter(|id| !id.is_empty()) else {
+            return Err(Fault::Slack("no_permission".to_owned()));
+        };
+        let resp = self.api("users.info", &[("user", me.as_str())])?;
+        let role = WorkspaceRole::from_user(&resp["user"]);
+        self.state().role = Some(role);
+        Ok(role)
+    }
+
+    /// Owner or workspace admin. Guests and members are refused here, with no write call.
+    fn require_workspace_admin(&self) -> Result<(), Fault> {
+        if self.workspace_role()?.is_workspace_admin() {
+            Ok(())
+        } else {
+            Err(Fault::Slack("no_permission".to_owned()))
+        }
+    }
+
+    /// Members may upload only when Slack has said `emoji_only_admins` is false.
+    fn members_may_add_emoji(&self) -> Result<bool, Fault> {
+        if let Some(only_admins) = self.state().emoji_only_admins {
+            return Ok(!only_admins);
+        }
+        let info = self.api("team.info", &[])?;
+        let flag = emoji_only_admins(&info["team"]);
+        if let Some(flag) = flag {
+            self.state().emoji_only_admins = Some(flag);
+        }
+        Ok(flag == Some(false))
+    }
+
+    /// Admins may upload. Guests may not. Members may only when the workspace pref allows it.
+    fn require_emoji_upload(&self) -> Result<(), Fault> {
+        let role = self.workspace_role()?;
+        if role.is_workspace_admin() {
+            return Ok(());
+        }
+        if role.is_guest() || !self.members_may_add_emoji()? {
+            return Err(Fault::Slack("no_permission".to_owned()));
+        }
+        Ok(())
+    }
+
     /// Workspace info for `Request::SpaceInfo`: calls `team.info` for name/domain/email_domain
     /// and reads our own user record for workspace role (`Primary owner`, `Owner`, `Workspace admin`,
     /// `Guest`, or `Member`).
@@ -1036,6 +1155,9 @@ impl Slack {
                 .map(|u| u.trim_end_matches('/').to_owned())
                 .unwrap_or_default()
         };
+        if let Some(flag) = emoji_only_admins(team) {
+            self.state().emoji_only_admins = Some(flag);
+        }
         let email_domain = team["email_domain"].as_str().unwrap_or("").trim();
         let description = if email_domain.is_empty() {
             String::new()
@@ -1054,20 +1176,9 @@ impl Slack {
                     .or_else(|| u["name"].as_str())
                     .unwrap_or("")
                     .to_owned();
-                let role = if u["is_primary_owner"] == true {
-                    "Primary owner"
-                } else if u["is_owner"] == true {
-                    "Owner"
-                } else if u["is_admin"] == true {
-                    "Workspace admin"
-                } else if u["is_ultra_restricted"] == true {
-                    "Single-channel guest"
-                } else if u["is_restricted"] == true {
-                    "Multi-channel guest"
-                } else {
-                    "Member"
-                };
-                roles.push(role.to_owned());
+                let role = WorkspaceRole::from_user(u);
+                self.state().role = Some(role);
+                roles.push(role.label().to_owned());
             }
         }
         Ok(SpaceAbout {
@@ -1088,6 +1199,7 @@ impl Slack {
         if email.is_empty() || !email.contains('@') {
             return Err(Fault::Slack("invalid_email".to_owned()));
         }
+        self.require_workspace_admin()?;
         let channels_csv: String = channels
             .iter()
             .map(|c| c.trim())
@@ -1124,19 +1236,17 @@ impl Slack {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        let mime = match ext.as_str() {
-            "png" => "image/png",
-            "gif" => "image/gif",
-            "jpg" | "jpeg" => "image/jpeg",
-            "webp" => "image/webp",
-            _ => return Err(Fault::Slack("error_invalid_image".to_owned())),
-        };
+        if !matches!(ext.as_str(), "png" | "gif" | "jpg" | "jpeg" | "webp") {
+            return Err(Fault::Slack("error_invalid_image".to_owned()));
+        }
         let meta = std::fs::metadata(&real).map_err(|err| Fault::Net(format!("emoji: {err}")))?;
         const MAX_EMOJI_BYTES: u64 = 1024 * 1024;
         if meta.len() == 0 || meta.len() > MAX_EMOJI_BYTES {
             return Err(Fault::Slack("error_too_big".to_owned()));
         }
         let bytes = std::fs::read(&real).map_err(|err| Fault::Net(format!("emoji: {err}")))?;
+        let mime = image_mime(&bytes).ok_or_else(|| Fault::Slack("error_invalid_image".to_owned()))?;
+        self.require_emoji_upload()?;
         let filename = real
             .file_name()
             .and_then(|n| n.to_str())
@@ -1206,6 +1316,7 @@ impl Slack {
         if name.is_empty() || handle.is_empty() {
             return Err(Fault::Slack("invalid_arguments".to_owned()));
         }
+        self.require_workspace_admin()?;
         let mut params = vec![("name", name), ("handle", handle)];
         let description = description.trim();
         if !description.is_empty() {
@@ -1232,6 +1343,7 @@ impl Slack {
         if group_id.is_empty() {
             return Err(Fault::Slack("no_such_subteam".to_owned()));
         }
+        self.require_workspace_admin()?;
         let mut params = vec![("usergroup", group_id)];
         if let Some(n) = name.map(str::trim).filter(|s| !s.is_empty()) {
             params.push(("name", n));
@@ -1257,6 +1369,7 @@ impl Slack {
         if group_id.is_empty() {
             return Err(Fault::Slack("no_such_subteam".to_owned()));
         }
+        self.require_workspace_admin()?;
         let csv: String = users
             .iter()
             .map(|u| u.trim())
@@ -1337,7 +1450,7 @@ impl Slack {
 
         let valid_url = |s: &str| -> Option<String> {
             let trimmed = s.trim();
-            (trimmed.starts_with("https://") || trimmed.starts_with("http://")).then(|| trimmed.to_owned())
+            trimmed.starts_with("https://").then(|| trimmed.to_owned())
         };
 
         // 1. Try `apps.profile.get` when we know `app_id` (or `bot_id`).

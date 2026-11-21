@@ -142,6 +142,8 @@ struct Fake {
     sections_override: Mutex<Option<Value>>,
     /// Optional extra users for `users.info` / `edge:users/info`.
     extra_users: Mutex<Vec<Value>>,
+    /// Fields merged onto the signed-in user (`U0ME` / `U0ME2`) for `users.info`.
+    self_user: Mutex<Option<Value>>,
     /// Optional extra channels returned by `users.conversations`.
     extra_conversations: Mutex<Vec<Value>>,
     /// Optional override for `search.messages` (fn of page -> Value).
@@ -239,6 +241,7 @@ impl Fake {
             usergroups: Mutex::default(),
             sections_override: Mutex::default(),
             extra_users: Mutex::default(),
+            self_user: Mutex::default(),
             extra_conversations: Mutex::default(),
             search_override: Mutex::default(),
             search_pages: Mutex::default(),
@@ -279,10 +282,21 @@ impl Fake {
             }));
         }
         let users = self.fixture(token, "users")?;
-        if let Some(found) = users.as_array()?.iter().find(|user| user["id"] == id) {
-            return Some(found.clone());
+        let mut found = if let Some(user) = users.as_array()?.iter().find(|user| user["id"] == id) {
+            user.clone()
+        } else {
+            self.extra_users.lock().unwrap().iter().find(|user| user["id"] == id).cloned()?
+        };
+        if id == me(token) {
+            if let Some(over) = self.self_user.lock().unwrap().clone() {
+                if let (Some(base), Some(extra)) = (found.as_object_mut(), over.as_object()) {
+                    for (key, value) in extra {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
         }
-        self.extra_users.lock().unwrap().iter().find(|user| user["id"] == id).cloned()
+        Some(found)
     }
 
     // HTTP.
@@ -6120,7 +6134,15 @@ fn slack_follow_unfollow_thread_and_unread_reply_counting() {
 
 #[test]
 fn slack_workspace_info_invites_custom_emoji_and_user_groups() {
-    let world = World::start();
+    let world = World::start_with(|fake| {
+        *fake.self_user.lock().unwrap() = Some(json!({
+            "is_primary_owner": false,
+            "is_owner": false,
+            "is_admin": true,
+            "is_restricted": false,
+            "is_ultra_restricted": false
+        }));
+    });
     world.ready();
 
     // 1. SpaceInfo returns workspace domain, canonical HTTPS URL, and own user role.
@@ -6170,6 +6192,16 @@ fn slack_workspace_info_invites_custom_emoji_and_user_groups() {
         path: bad.to_string_lossy().into_owned(),
     });
     assert!(matches!(bad_resp, Response::Error { .. }), "non-image rejected: {bad_resp:?}");
+
+    let junk = dir.join("not_a_picture.png");
+    std::fs::write(&junk, b"not a png").unwrap();
+    let junk_resp = world.ask(Request::AddCustomEmoji {
+        account: acct.clone(),
+        name: "not_png".into(),
+        path: junk.to_string_lossy().into_owned(),
+    });
+    assert!(matches!(junk_resp, Response::Error { code: ErrorCode::Refused, .. }), "bytes that are not an image are refused: {junk_resp:?}");
+    assert!(world.fake.calls(ALPHA, "emoji.add").is_empty(), "emoji.add must not run for a non-image");
 
     assert_eq!(
         world.ask(Request::AddCustomEmoji {
@@ -6234,6 +6266,49 @@ fn slack_workspace_info_invites_custom_emoji_and_user_groups() {
     };
     assert_eq!(with_members.members, vec!["U0ME".to_owned(), "U0ANA".to_owned()]);
     assert_eq!(with_members.member_count, 2);
+}
+
+#[test]
+fn slack_guest_role_refuses_invite_emoji_upload_and_user_group_create() {
+    let world = World::start_with(|fake| {
+        *fake.self_user.lock().unwrap() = Some(json!({
+            "is_primary_owner": false,
+            "is_owner": false,
+            "is_admin": false,
+            "is_ultra_restricted": false,
+            "is_restricted": true
+        }));
+    });
+    world.ready();
+    let acct = alpha("T01ALPHA").account();
+    let dir = world.dir.with_extension("emoji-guest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("guest.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nguest").unwrap();
+
+    let invite = world.ask(Request::InviteMember {
+        account: acct.clone(),
+        email: "newcomer@acme.example".into(),
+        channels: vec!["C0GEN".into()],
+        real_name: "New Comer".into(),
+    });
+    let emoji = world.ask(Request::AddCustomEmoji {
+        account: acct.clone(),
+        name: "guest_pic".into(),
+        path: img.to_string_lossy().into_owned(),
+    });
+    let group = world.ask(Request::UserGroupCreate {
+        account: acct,
+        name: "Guests".into(),
+        handle: "guests".into(),
+        description: String::new(),
+    });
+    for (label, response) in [("invite", invite), ("emoji", emoji), ("group", group)] {
+        assert!(matches!(response, Response::Error { code: ErrorCode::Refused, .. }), "{label} refused: {response:?}");
+    }
+    assert!(world.fake.calls(ALPHA, "users.admin.invite").is_empty());
+    assert!(world.fake.calls(ALPHA, "emoji.add").is_empty());
+    assert!(world.fake.calls(ALPHA, "usergroups.create").is_empty());
 }
 
 #[test]
@@ -6468,6 +6543,94 @@ fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
     };
     assert!(!everywhere.is_empty());
     assert!(!not_searched.contains(&Network::Slack), "Slack should be searched globally: {not_searched:?}");
+
+    // The scoped search above already asked Slack for page 2. Everywhere keeps that page's
+    // cursor and asks for it once the local window of page 1 is shown.
+    let page2 = |world: &World| {
+        world
+            .fake
+            .calls(ALPHA, "search.messages")
+            .iter()
+            .filter(|call| call.params.get("page").map(String::as_str) == Some("2"))
+            .count()
+    };
+    let page2_before = page2(&world);
+    let mut cursor = None;
+    let mut saw_page2 = false;
+    for _ in 0..12 {
+        let Response::MessageHits { hits, cursor: next, not_searched } = world.ask(Request::SearchNetwork {
+            conversation: None,
+            space: None,
+            account: None,
+            network: None,
+            query: "release".into(),
+            filters: protocol::SearchFilters::default(),
+            cursor,
+        }) else {
+            panic!("expected Everywhere MessageHits");
+        };
+        assert!(!hits.is_empty(), "each everywhere page has hits");
+        assert!(!not_searched.contains(&Network::Slack), "Slack stays searched: {not_searched:?}");
+        if page2(&world) > page2_before {
+            saw_page2 = true;
+            break;
+        }
+        cursor = next;
+        assert!(cursor.is_some(), "page 2 should be requested before the cursor runs out");
+    }
+    assert!(saw_page2, "everywhere search should ask Slack for page 2");
+}
+
+#[test]
+fn slack_search_omits_a_named_private_channel() {
+    let world = World::start_with(|fake| {
+        *fake.search_override.lock().unwrap() = Some(json!({
+            "ok": true,
+            "messages": {
+                "paging": {"count": 20, "total": 3, "page": 1, "pages": 1},
+                "matches": [
+                    {
+                        "channel_id": "C0PRIV",
+                        "channel": {"id": "C0PRIV", "name": "secret-plans", "is_channel": true, "is_private": true},
+                        "user": "U0ANA",
+                        "ts": "1760004800.000100",
+                        "text": "hidden plans"
+                    },
+                    {
+                        "channel_id": "C0UNK",
+                        "channel": {"id": "C0UNK", "name": "maybe-public", "is_channel": true},
+                        "user": "U0ANA",
+                        "ts": "1760004801.000100",
+                        "text": "missing privacy flag"
+                    },
+                    {
+                        "channel_id": "C0PUB",
+                        "channel": {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false},
+                        "user": "U0ANA",
+                        "ts": "1760004802.000100",
+                        "text": "public watercooler note"
+                    }
+                ]
+            }
+        }));
+    });
+    world.ready();
+
+    let Response::MessageHits { hits, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        network: None,
+        query: "zzzz-not-in-the-text".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected MessageHits");
+    };
+    assert!(hits.iter().all(|hit| hit.conversation.id != "C0PRIV"), "a named private channel is omitted: {hits:?}");
+    assert!(hits.iter().all(|hit| hit.conversation.id != "C0UNK"), "a channel with no is_private is omitted: {hits:?}");
+    let public = hits.iter().find(|hit| hit.conversation.id == "C0PUB").expect("public unjoined hit");
+    assert_eq!(public.title, "#watercooler");
 }
 
 #[test]
@@ -6560,6 +6723,36 @@ fn slack_sidebar_sections_mixed_types_paging_crud_live_events_and_paid_gating() 
         panic!("expected Response::Section");
     };
     assert_eq!((created.id.as_str(), created.name.as_str(), created.emoji.as_str()), ("S0CUSTOM1", "Urgent", "🔥"));
+
+    let updates = || world.fake.calls(ALPHA, "users.channelSections.update").len();
+    let deletes = || world.fake.calls(ALPHA, "users.channelSections.delete").len();
+    let orders = || world.fake.calls(ALPHA, "users.channelSections.order").len();
+    let bulks = || world.fake.calls(ALPHA, "users.channelSections.channels.bulkUpdate").len();
+    let (updates_before, deletes_before, orders_before, bulks_before) = (updates(), deletes(), orders(), bulks());
+    let foreign_rename = world.ask(Request::SectionRename {
+        space: space.clone(),
+        section_id: "S0FOREIGN".into(),
+        name: "Nope".into(),
+        emoji: None,
+    });
+    let foreign_delete = world.ask(Request::SectionDelete {
+        space: space.clone(),
+        section_id: "S0NOPE".into(),
+    });
+    let foreign_order = world.ask(Request::SectionReorder {
+        space: space.clone(),
+        section_ids: vec!["S0BIG".into(), "S0FOREIGN".into()],
+    });
+    let foreign_move = world.ask(Request::SectionMoveChannel {
+        space: space.clone(),
+        conversation: alpha("C0GEN"),
+        from_section: Some("S0CHAN".into()),
+        to_section: "S0NOPE".into(),
+    });
+    for response in [foreign_rename, foreign_delete, foreign_order, foreign_move] {
+        assert!(matches!(response, Response::Error { code: ErrorCode::Refused, .. }), "{response:?}");
+    }
+    assert_eq!((updates(), deletes(), orders(), bulks()), (updates_before, deletes_before, orders_before, bulks_before));
 
     assert_eq!(
         world.ask(Request::SectionRename {
@@ -6676,14 +6869,46 @@ fn slack_slash_commands_builtins_unknown_handoff_completion_and_ephemeral() {
     let me_call = world.fake.calls(ALPHA, "chat.meMessage").pop().expect("chat.meMessage called");
     assert_eq!((me_call.params["channel"].as_str(), me_call.params["text"].as_str()), ("C0GEN", "waves"));
 
-    // 2. `/unknown x` is NOT sent as plain text and returns the hand-off wording.
+    // 2. `/unknown x` is not stored as a failed channel row. The handoff is ephemeral.
     let post_before = world.fake.calls(ALPHA, "chat.postMessage").len();
-    let unknown = world.send(&general, "slash-unk-1", "/unknown x");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock = world.dir.join("chat.sock");
+    let general_wait = general.clone();
+    std::thread::spawn(move || {
+        let ask_sock = |req: Request| -> Response {
+            let mut stream = ChatStream::connect(&sock).unwrap();
+            write_frame(&mut stream, &req).unwrap();
+            read_frame(&mut stream).unwrap()
+        };
+        let mut since = match ask_sock(Request::Status) {
+            Response::Status { seq, .. } => seq,
+            _ => 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Response::Changes { seq, changes, .. } = ask_sock(Request::Wait { since }) {
+                since = seq;
+                for change in changes {
+                    if let Change::Ephemeral { conversation, message } = change {
+                        if conversation == general_wait && message.text.contains("Commands run in the official app") {
+                            let _ = tx.send(*message);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    sleep(Duration::from_millis(100));
+    let _unknown = world.send(&general, "slash-unk-1", "/unknown x");
+    let got = rx.recv_timeout(Duration::from_secs(5)).expect("unknown command handoff is ephemeral");
+    assert!(got.ephemeral);
+    assert!(got.text.contains("Commands run in the official app"));
+    assert_eq!(got.id, "ephemeral:slash-unk-1");
     assert_eq!(world.fake.calls(ALPHA, "chat.postMessage").len(), post_before, "unknown command must not post as channel text");
-    match &unknown.state {
-        SendState::Failed { reason } => assert!(reason.contains("Commands run in the official app"), "{reason}"),
-        other => panic!("expected Failed handoff, got {other:?}"),
-    }
+    world.until("pending unknown command row is gone", || {
+        world.messages(&general).iter().all(|message| message.client_id.as_deref() != Some("slash-unk-1")).then_some(())
+    });
 
     // 3. `/shrug hello` posts `hello ¯\_(ツ)_/¯` via chat.postMessage.
     let shrug = world.send(&general, "slash-shrug-1", "/shrug hello");

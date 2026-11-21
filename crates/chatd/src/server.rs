@@ -129,6 +129,53 @@ fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> 
     }
 }
 
+/// One everywhere page: local offset `o`, and the account cursors `a` that produced this window.
+/// A missing cursor or a bare number means every account, each asked with no cursor.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EverywhereWindow {
+    o: usize,
+    a: Vec<EverywhereAccount>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EverywhereAccount {
+    n: Network,
+    id: String,
+    c: Option<String>,
+}
+
+fn decode_everywhere(cursor: Option<&str>) -> (usize, Option<Vec<(AccountKey, Option<String>)>>) {
+    let Some(cursor) = cursor else {
+        return (0, None);
+    };
+    if let Some(rest) = cursor.strip_prefix("e1:") {
+        if let Ok(parsed) = serde_json::from_str::<EverywhereWindow>(rest) {
+            let accounts = parsed
+                .a
+                .into_iter()
+                .map(|row| (AccountKey { network: row.n, account: row.id }, row.c))
+                .collect();
+            return (parsed.o, Some(accounts));
+        }
+    }
+    (cursor.parse().unwrap_or(0), None)
+}
+
+fn encode_everywhere(offset: usize, accounts: &[(AccountKey, Option<String>)]) -> Option<String> {
+    let body = EverywhereWindow {
+        o: offset,
+        a: accounts
+            .iter()
+            .map(|(key, cursor)| EverywhereAccount {
+                n: key.network,
+                id: key.account.clone(),
+                c: cursor.clone(),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&body).ok().map(|json| format!("e1:{json}"))
+}
+
 pub struct Chat {
     pub(crate) hub: Arc<Hub>,
     adapters: Adapters,
@@ -2797,7 +2844,7 @@ impl Chat {
                     // connected account whose adapter supports account-wide search, merge by time,
                     // and honestly list connected networks that were not asked.
                     const PAGE: usize = 25;
-                    let offset: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+                    let (offset, window) = decode_everywhere(cursor.as_deref());
                     let accounts: Vec<AccountKey> = match self.hub.store().accounts() {
                         Ok(rows) => rows
                             .into_iter()
@@ -2811,21 +2858,42 @@ impl Chat {
                     let mut merged: Vec<protocol::MessageHit> = Vec::new();
                     let mut not_searched: Vec<Network> = Vec::new();
                     let mut asked_networks: Vec<Network> = Vec::new();
-                    for acct in accounts {
-                        let can = self.hub.capabilities(&acct);
-                        if self.hub.link(&acct) == Link::Connected && can.search_global {
-                            if let Ok(page) = self.ask(&acct, |reply| Command::Search {
-                                query: query.clone(),
-                                scope: SearchScope::Account,
-                                filters: filters.clone(),
-                                cursor: None,
-                                at: std::time::Instant::now(),
-                                reply,
-                            }) {
+                    // Cursors sent on this ask. A later local slice repeats them instead of
+                    // dropping the rest of the page Slack already returned.
+                    let mut sent: Vec<(AccountKey, Option<String>)> = Vec::new();
+                    let mut next_remote: Vec<(AccountKey, Option<String>)> = Vec::new();
+                    for acct in &accounts {
+                        let can = self.hub.capabilities(acct);
+                        let connected = self.hub.link(acct) == Link::Connected && can.search_global;
+                        let planned = match &window {
+                            None => Some(None),
+                            Some(list) => list.iter().find(|(key, _)| key == acct).map(|(_, cursor)| cursor.clone()),
+                        };
+                        if connected {
+                            if let Some(cur) = planned {
+                                if let Ok(page) = self.ask(acct, |reply| Command::Search {
+                                    query: query.clone(),
+                                    scope: SearchScope::Account,
+                                    filters: filters.clone(),
+                                    cursor: cur.clone(),
+                                    at: std::time::Instant::now(),
+                                    reply,
+                                }) {
+                                    if !asked_networks.contains(&acct.network) {
+                                        asked_networks.push(acct.network);
+                                    }
+                                    sent.push((acct.clone(), cur));
+                                    if page.cursor.is_some() {
+                                        next_remote.push((acct.clone(), page.cursor));
+                                    }
+                                    merged.extend(page.hits);
+                                    continue;
+                                }
+                            } else {
+                                // This account already finished. It stays searched, and is not asked again.
                                 if !asked_networks.contains(&acct.network) {
                                     asked_networks.push(acct.network);
                                 }
-                                merged.extend(page.hits);
                                 continue;
                             }
                         }
@@ -2837,7 +2905,15 @@ impl Chat {
                     merged.sort_by(|a, b| b.sent.cmp(&a.sent).then_with(|| b.message_id.cmp(&a.message_id)));
                     let mut seen = std::collections::HashSet::new();
                     merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
-                    let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
+                    let shown = merged.len().saturating_sub(offset).min(PAGE);
+                    let more_in_window = offset + shown < merged.len();
+                    let next_cursor = if shown > 0 && more_in_window {
+                        encode_everywhere(offset + shown, &sent)
+                    } else if shown > 0 && !next_remote.is_empty() {
+                        encode_everywhere(0, &next_remote)
+                    } else {
+                        None
+                    };
                     let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
                     Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
                 }

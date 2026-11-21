@@ -496,6 +496,29 @@ impl Slack {
         Ok(group)
     }
 
+    /// Sections already stored for this workspace. The conversation page size does not drop groups.
+    fn known_sections(&self) -> Result<Vec<String>, Fault> {
+        let space = self.ctx.key(&self.ctx.account.account);
+        let tree = self
+            .ctx
+            .hub
+            .store()
+            .tree(&space, 0, 1)
+            .map_err(|err| Fault::Net(err.to_string()))?
+            .ok_or_else(|| Fault::Slack("section_not_found".to_owned()))?;
+        Ok(tree.groups.into_iter().map(|group| group.id).collect())
+    }
+
+    /// Refuses before the API unless every id is already in this workspace's section list.
+    fn require_sections(&self, ids: &[&str]) -> Result<(), Fault> {
+        let known = self.known_sections()?;
+        if ids.iter().all(|id| known.iter().any(|have| have == id)) {
+            Ok(())
+        } else {
+            Err(Fault::Slack("section_not_found".to_owned()))
+        }
+    }
+
     /// Renames or updates a custom sidebar section (`users.channelSections.update`).
     pub(super) fn section_rename(&self, section_id: &str, name: &str, emoji_raw: Option<&str>) -> Result<(), Fault> {
         let section_id = section_id.trim();
@@ -503,6 +526,7 @@ impl Slack {
         if section_id.is_empty() || name.is_empty() {
             return Err(Fault::Slack("invalid_arguments".to_owned()));
         }
+        self.require_sections(&[section_id])?;
         let mut params = vec![("channel_section_id", section_id), ("name", name)];
         let clean_emoji = emoji_raw.map(|e| e.trim().trim_matches(':'));
         if let Some(e) = clean_emoji {
@@ -512,22 +536,23 @@ impl Slack {
             self.check_paid_section_error(&err);
             return Err(err);
         }
-        let existing = self
+        if let Some(mut group) = self
             .ctx
             .hub
             .store()
             .tree(&self.ctx.key(&self.ctx.account.account), 0, 1)
             .ok()
             .flatten()
-            .and_then(|t| t.groups.into_iter().find(|g| g.id == section_id));
-        let mut group = existing.unwrap_or_else(|| Group::new(section_id, name, 0));
-        group.name = name.to_owned();
-        if let Some(e) = clean_emoji {
-            group.emoji = section_emoji((!e.is_empty()).then_some(e));
+            .and_then(|t| t.groups.into_iter().find(|g| g.id == section_id))
+        {
+            group.name = name.to_owned();
+            if let Some(e) = clean_emoji {
+                group.emoji = section_emoji((!e.is_empty()).then_some(e));
+            }
+            self.ctx
+                .group(&self.ctx.account.account, &group)
+                .map_err(|err| Fault::Net(err.to_string()))?;
         }
-        self.ctx
-            .group(&self.ctx.account.account, &group)
-            .map_err(|err| Fault::Net(err.to_string()))?;
         Ok(())
     }
 
@@ -537,6 +562,7 @@ impl Slack {
         if section_id.is_empty() {
             return Err(Fault::Slack("invalid_arguments".to_owned()));
         }
+        self.require_sections(&[section_id])?;
         if let Err(err) = self.api("users.channelSections.delete", &[("channel_section_id", section_id)]) {
             self.check_paid_section_error(&err);
             return Err(err);
@@ -552,6 +578,8 @@ impl Slack {
         if section_ids.is_empty() {
             return Err(Fault::Slack("invalid_arguments".to_owned()));
         }
+        let ids: Vec<&str> = section_ids.iter().map(String::as_str).collect();
+        self.require_sections(&ids)?;
         let ids_json = json!(section_ids).to_string();
         if let Err(err) = self.api("users.channelSections.order", &[("channel_section_ids", ids_json.as_str())]) {
             self.check_paid_section_error(&err);
@@ -575,6 +603,12 @@ impl Slack {
         if cid.is_empty() || to.is_empty() {
             return Err(Fault::Slack("invalid_arguments".to_owned()));
         }
+        let from = from_section.map(str::trim).filter(|section| !section.is_empty() && *section != to);
+        let mut ids = vec![to];
+        if let Some(from) = from {
+            ids.push(from);
+        }
+        self.require_sections(&ids)?;
         let insert = json!([{"channel_section_id": to, "channel_ids": [cid]}]).to_string();
         let remove = from_section
             .map(str::trim)
