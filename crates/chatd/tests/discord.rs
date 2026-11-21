@@ -5106,3 +5106,114 @@ fn forward_message_sends_type_1_reference_with_guild_id_content_note_and_refuses
     assert_eq!(dm_posts[0].body["message_reference"]["guild_id"], json!("4000"));
     assert_eq!(dm_posts[1].body["content"], json!("See above!"));
 }
+
+#[test]
+fn report_message_posts_once_and_does_not_retry_rate_limit_or_captcha() {
+    let world = World::start();
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap().can,
+        other => panic!("expected Status, got {other:?}"),
+    };
+    assert!(can.abuse_reports, "Discord must advertise Capabilities::abuse_reports");
+
+    let target = protocol::ReportTarget::Message {
+        conversation: world.key("3001"),
+        message_id: "1300000010000000010".into(),
+    };
+    match world.ask(Request::ReportReasons { target: target.clone() }) {
+        Response::ReportReasons { reasons } => {
+            assert_eq!(
+                reasons,
+                vec![
+                    protocol::ReportReason::Spam,
+                    protocol::ReportReason::Harassment,
+                    protocol::ReportReason::Violence,
+                    protocol::ReportReason::Illegal,
+                    protocol::ReportReason::Impersonation,
+                ],
+                "only reasons with a real Discord message-report path"
+            );
+        }
+        other => panic!("expected ReportReasons, got {other:?}"),
+    }
+
+    world.discord.script("/reporting/message", 200, json!({"report_id": "9001"}));
+    let reported = world.ask(Request::Report {
+        target: target.clone(),
+        reason: protocol::ReportReason::Spam,
+        note: "unsolicited links".into(),
+        block: false,
+    });
+    assert!(matches!(reported, Response::Ok), "expected Ok reporting a message, got {reported:?}");
+    let posts = world.discord.requests_to("POST", "/reporting/message");
+    assert_eq!(posts.len(), 1, "one report is one POST, got {posts:?}");
+    assert_eq!(
+        posts[0].body,
+        json!({
+            "version": "1.0",
+            "variant": "98",
+            "language": "en",
+            "breadcrumbs": [7, 98],
+            "elements": {},
+            "channel_id": "3001",
+            "message_id": "1300000010000000010",
+            "name": "message",
+        })
+    );
+
+    world.discord.script("/reporting/message", 200, json!({"report_id": "9002"}));
+    let reported = world.ask(Request::Report {
+        target: target.clone(),
+        reason: protocol::ReportReason::Impersonation,
+        note: String::new(),
+        block: false,
+    });
+    assert!(matches!(reported, Response::Ok), "expected Ok reporting impersonation, got {reported:?}");
+    let posts = world.discord.requests_to("POST", "/reporting/message");
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[1].body["variant"], json!("163"));
+    assert_eq!(posts[1].body["breadcrumbs"], json!([7, 80, 121, 163]));
+
+    // A captcha fails this report only. It is not retried, and the session stays usable.
+    let captcha = json!({"captcha_key": ["captcha-required"], "captcha_sitekey": "a9b5fb07", "captcha_service": "hcaptcha"});
+    world.discord.script("/reporting/message", 400, captcha);
+    match world.ask(Request::Report {
+        target: target.clone(),
+        reason: protocol::ReportReason::Spam,
+        note: String::new(),
+        block: false,
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(
+                detail.to_lowercase().contains("check") || detail.to_lowercase().contains("captcha"),
+                "expected a captcha refusal, got {detail}"
+            );
+        }
+        other => panic!("expected captcha refusal, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("POST", "/reporting/message").len(), 3, "captcha is not retried");
+    assert!(world.required().is_empty(), "a report captcha must not lock the session: {:?}", world.required());
+    world.send("3002", "1730000000000000099", "still here", None);
+    assert_eq!(world.outcome("3002", "1730000000000000099").state, SendState::Sent);
+
+    // A 429 is not waited out. A success queued behind it must stay unused.
+    let limited = json!({"message": "You are being rate limited.", "retry_after": 0.3, "global": false});
+    world.discord.script("/reporting/message", 429, limited);
+    world.discord.script("/reporting/message", 200, json!({"report_id": "should-not-be-used"}));
+    match world.ask(Request::Report {
+        target,
+        reason: protocol::ReportReason::Spam,
+        note: String::new(),
+        block: false,
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.to_lowercase().contains("rate"), "expected a rate-limit refusal, got {detail}");
+        }
+        other => panic!("expected rate-limit refusal, got {other:?}"),
+    }
+    assert_eq!(
+        world.discord.requests_to("POST", "/reporting/message").len(),
+        4,
+        "a 429 on a report must not be retried"
+    );
+}

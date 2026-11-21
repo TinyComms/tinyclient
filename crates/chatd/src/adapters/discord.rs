@@ -1390,6 +1390,30 @@ impl Discord {
         Ok(results)
     }
 
+    /// Files one message with Discord Trust & Safety. One try: a 429 or a captcha is the answer,
+    /// not a reason to ask again. A person or a server is left to Discord's own app.
+    fn file_report(&self, target: &protocol::ReportTarget, reason: protocol::ReportReason) -> Result<(), Refusal> {
+        let protocol::ReportTarget::Message { conversation, message_id } = target else {
+            return Err(Refusal::Unsupported);
+        };
+        let Some((variant, breadcrumbs)) = message_report(reason) else {
+            return Err(Refusal::Refused(
+                "Discord has no general report for this. Pick spam, harassment, violence, illegal content, or impersonation.".into(),
+            ));
+        };
+        let body = json!({
+            "version": "1.0",
+            "variant": variant,
+            "language": "en",
+            "breadcrumbs": breadcrumbs,
+            "elements": {},
+            "channel_id": conversation.id,
+            "message_id": message_id,
+            "name": "message",
+        });
+        self.rest.call_once_with("POST", "/reporting/message", Some(body), &[]).map(drop).map_err(refusal)
+    }
+
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
     /// managing friends is what Discord's anti-abuse system watches most closely.
     ///
@@ -2102,6 +2126,8 @@ impl Discord {
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
+            Command::Report { target, reason, note: _, block: _, reply } => answer(reply, self.file_report(&target, reason)),
+            Command::ReportReasons { target, reply } => answer(reply, report_reasons(&target)),
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
             }
@@ -2153,6 +2179,32 @@ impl Discord {
             }
             command => command.unsupported(&self.ctx),
         }
+    }
+}
+
+/// Message-menu node ids (`POST /reporting/message`). A path Discord does not have is a 400,
+/// so Other is refused. Illegal content uses the illicit-goods leaf, not a child-safety one.
+fn message_report(reason: protocol::ReportReason) -> Option<(&'static str, &'static [u64])> {
+    match reason {
+        protocol::ReportReason::Spam => Some(("98", &[7, 98])),
+        protocol::ReportReason::Harassment => Some(("101", &[7, 76, 101])),
+        protocol::ReportReason::Violence => Some(("117", &[7, 90, 117])),
+        protocol::ReportReason::Illegal => Some(("124", &[7, 80, 124])),
+        protocol::ReportReason::Impersonation => Some(("163", &[7, 80, 121, 163])),
+        protocol::ReportReason::Other => None,
+    }
+}
+
+fn report_reasons(target: &protocol::ReportTarget) -> Result<Vec<protocol::ReportReason>, Refusal> {
+    match target {
+        protocol::ReportTarget::Message { .. } => Ok(vec![
+            protocol::ReportReason::Spam,
+            protocol::ReportReason::Harassment,
+            protocol::ReportReason::Violence,
+            protocol::ReportReason::Illegal,
+            protocol::ReportReason::Impersonation,
+        ]),
+        _ => Err(Refusal::Unsupported),
     }
 }
 
