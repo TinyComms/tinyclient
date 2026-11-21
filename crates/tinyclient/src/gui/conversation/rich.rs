@@ -2,6 +2,7 @@
 //! text. No drawing here; `text.rs` turns a block into an element.
 
 use protocol::{MediaFile, MentionKind, Span, Style};
+use std::borrow::Cow;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -41,6 +42,8 @@ pub struct Run {
     pub spoiler: Option<u32>,
     /// A custom emoji. With its image on disk the text is [`EMOJI_SLOT`]; without, `:name:`.
     pub emoji: Option<MediaFile>,
+    /// A live timestamp chip (`Style::Time`): `(unix, form)`.
+    pub time: Option<(i64, char)>,
     /// "(edited)", after the last word.
     pub mark: bool,
     /// What the run stands for when it is copied: the `:name:` of an emoji drawn as its image.
@@ -54,7 +57,7 @@ impl Run {
 
     /// Drawn on a background that the padding belongs to.
     fn boxed(&self) -> bool {
-        self.code || self.mention.is_some()
+        self.code || self.mention.is_some() || self.time.is_some()
     }
 }
 
@@ -91,7 +94,7 @@ fn is_block(style: &Style) -> bool {
 }
 
 /// The styled runs of `text[range]`.
-fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
+fn inline(text: &str, spans: &[Span], range: Range<usize>, now: i64) -> Inline {
     let within = |span: &&Span| {
         !is_block(&span.style) && floor(text, span.start) < range.end && floor(text, span.end) > range.start
     };
@@ -108,7 +111,7 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
     for cut in cuts.windows(2) {
         let (start, end) = (cut[0], cut[1]);
         let mut run = Run::default();
-        let mut shown = &text[start..end];
+        let mut shown: Cow<'_, str> = Cow::Borrowed(&text[start..end]);
         for span in spans.iter().filter(|span| floor(text, span.start) <= start && floor(text, span.end) >= end) {
             match &span.style {
                 Style::Bold => run.bold = true,
@@ -122,16 +125,29 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
                 Style::Emoji { file } => {
                     if file.path.is_some() {
                         run.alt = Some(text[start..end].to_owned());
-                        shown = EMOJI_SLOT;
+                        shown = Cow::Borrowed(EMOJI_SLOT);
                     }
                     run.emoji = Some(file.clone());
+                }
+                Style::Time { unix, form } => {
+                    run.time = Some((*unix, *form));
+                    if start == floor(text, span.start).max(range.start) {
+                        shown = Cow::Owned(crate::gui::time::discord_timestamp(*unix, *form, now));
+                    } else {
+                        shown = Cow::Borrowed("");
+                    }
                 }
                 Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. } => {}
             }
         }
+        if run.time.is_some() && shown.is_empty() {
+            continue;
+        }
         match pieces.last_mut() {
-            Some((before, last)) if last.same_style(&run) && run.emoji.is_none() => before.push_str(shown),
-            _ => pieces.push((shown.to_owned(), run)),
+            Some((before, last)) if last.same_style(&run) && run.emoji.is_none() && run.time.is_none() => {
+                before.push_str(&shown);
+            }
+            _ => pieces.push((shown.into_owned(), run)),
         }
     }
 
@@ -149,7 +165,7 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
 
 impl Run {
     fn same_box(&self, other: &Run) -> bool {
-        self.code == other.code && self.mention == other.mention
+        self.code == other.code && self.mention == other.mention && self.time == other.time
     }
 }
 
@@ -162,6 +178,10 @@ fn trimmed(text: &str, range: Range<usize>) -> Range<usize> {
 }
 
 pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
+    blocks_at(text, spans, crate::view::now())
+}
+
+pub fn blocks_at(text: &str, spans: &[Span], now: i64) -> Vec<Block> {
     let mut whole: Vec<&Span> = spans.iter().filter(|span| is_block(&span.style)).collect();
     whole.sort_by_key(|span| span.start);
 
@@ -172,7 +192,7 @@ pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
     let paragraph = |out: &mut Vec<Block>, range: Range<usize>| {
         let range = trimmed(text, range);
         if !range.is_empty() {
-            out.push(Block::Text(inline(text, spans, range)));
+            out.push(Block::Text(inline(text, spans, range, now)));
         }
     };
     for span in whole {
@@ -195,7 +215,7 @@ pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
             Style::Quote => {
                 numbers = [0; 3];
                 // Consecutive quoted lines are one quote under one bar.
-                let more = inline(text, spans, body);
+                let more = inline(text, spans, body, now);
                 match out.last_mut() {
                     Some(Block::Quote(quote)) => {
                         quote.text.push('\n');
@@ -217,7 +237,7 @@ pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
                     ordered: *ordered,
                     depth,
                     number: numbers[depth as usize],
-                    text: inline(text, spans, body),
+                    text: inline(text, spans, body, now),
                 });
             }
             _ => {}
@@ -638,5 +658,24 @@ mod tests {
             Some(vec![Jumbo::Custom { file, name: ":parrot:".into() }, Jumbo::Unicode("🎉".into())])
         );
         assert_eq!(jumbo("🎉", &[span("🎉", "🎉", Style::Bold)]), None);
+    }
+
+    #[test]
+    fn relative_time_span_renders_differently_at_two_clock_values() {
+        let text = "Starts 20 April 2021 18:40 sharp";
+        let target_unix = 1_700_007_200;
+        let spans = [span(text, "20 April 2021 18:40", Style::Time { unix: target_unix, form: 'R' })];
+        let earlier = match blocks_at(text, &spans, target_unix - 7_200).as_slice() {
+            [Block::Text(inline)] => inline.clone(),
+            other => panic!("expected one block: {other:?}"),
+        };
+        let later = match blocks_at(text, &spans, target_unix + 180).as_slice() {
+            [Block::Text(inline)] => inline.clone(),
+            other => panic!("expected one block: {other:?}"),
+        };
+        assert_eq!(earlier.plain(0..earlier.text.len()), "Starts in 2 hours sharp");
+        assert_eq!(later.plain(0..later.text.len()), "Starts 3 minutes ago sharp");
+        assert_ne!(earlier.text, later.text);
+        assert!(earlier.runs.iter().any(|r| r.time == Some((target_unix, 'R'))));
     }
 }

@@ -68,6 +68,8 @@ pub struct Rich {
     images: Vec<(Range<usize>, Arc<RenderImage>)>,
     /// The runs that act on a click, by run index.
     hot: Vec<(Range<usize>, usize)>,
+    /// Runs that show a tooltip on hover without turning the cursor into a pointer (timestamps).
+    tips: Vec<(Range<usize>, usize)>,
     selection: Option<Range<usize>>,
     dragging: bool,
     /// The shown text, for telling a line that holds only a box's padding.
@@ -94,6 +96,7 @@ impl Rich {
         let mut boxes = Vec::new();
         let mut images = Vec::new();
         let mut hot = Vec::new();
+        let mut tips = Vec::new();
         for (ix, (range, run)) in inline.ranges().enumerate() {
             let mut face = font(if run.code { tokens::MONO } else { theme::FONT });
             let mut color = look.color;
@@ -112,6 +115,10 @@ impl Rich {
             }
             if run.code {
                 boxes.push((range.clone(), tokens::code_inline().into_color()));
+            }
+            if run.time.is_some() {
+                boxes.push((range.clone(), tokens::code_inline().into_color()));
+                tips.push((range.clone(), ix));
             }
             if run.link.is_some() {
                 color = tokens::link().into_color();
@@ -142,6 +149,7 @@ impl Rich {
                     underline = false;
                     boxes.push((range.clone(), tokens::spoiler().into_color()));
                     hot.retain(|(_, run)| *run != ix);
+                    tips.retain(|(_, run)| *run != ix);
                     hot.push((range.clone(), ix));
                 }
             }
@@ -175,6 +183,7 @@ impl Rich {
             boxes,
             images,
             hot,
+            tips,
             selection: look.selection.map(|range| range.start.min(inline.text.len())..range.end.min(inline.text.len())),
             handler: Rc::new(handler),
         }
@@ -429,6 +438,7 @@ impl Element for Rich {
             (pointer.clone(), pointer)
         });
         let hot: Rc<[(Range<usize>, usize)]> = std::mem::take(&mut self.hot).into();
+        let tips: Rc<[(Range<usize>, usize)]> = std::mem::take(&mut self.tips).into();
 
         window.on_mouse_event({
             let (pointer, hitbox, layout, handler) = (pointer.clone(), hitbox.clone(), layout.clone(), self.handler.clone());
@@ -443,7 +453,7 @@ impl Element for Rich {
         });
         window.on_mouse_event({
             let (pointer, hitbox, layout) = (pointer.clone(), hitbox.clone(), layout.clone());
-            let (hot, handler, dragging) = (hot.clone(), self.handler.clone(), self.dragging);
+            let (hot, tips, handler, dragging) = (hot.clone(), tips.clone(), self.handler.clone(), self.dragging);
             move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
@@ -460,7 +470,10 @@ impl Element for Rich {
                     }
                     return;
                 }
-                let now = hitbox.is_hovered(window).then(|| over(event.position, &layout, &hot)).flatten();
+                let now = hitbox
+                    .is_hovered(window)
+                    .then(|| over(event.position, &layout, &hot).or_else(|| over(event.position, &layout, &tips)))
+                    .flatten();
                 if pointer.hovered.replace(now) != now {
                     handler(TextEvent::Hover(now), window, cx);
                 }

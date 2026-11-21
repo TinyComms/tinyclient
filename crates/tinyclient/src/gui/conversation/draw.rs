@@ -1378,6 +1378,13 @@ impl Pane {
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
                 Block::Text(inline) => {
                     let marked = inline.runs.iter().any(|run| run.mark);
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| inline.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
                     let block = div()
                         .max_w(px(MEASURE))
                         .flex()
@@ -1385,39 +1392,65 @@ impl Pane {
                         .type_body()
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
-                    if marked {
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else if marked {
                         block.id(name_id("edited", &message.id)).tooltip(tip(edited_tip(message.edited_at), None)).into_any_element()
                     } else {
                         block.into_any_element()
                     }
                 }
-                Block::Quote(inline) => div()
-                    .max_w(px(MEASURE))
-                    .mt(px(3.))
-                    .flex()
-                    .child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong()))
-                    .child(
-                        div()
-                            .pl(px(12.))
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .type_body()
-                            .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
-                            .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
-                    )
-                    .into_any_element(),
+                Block::Quote(inline) => {
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| inline.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
+                    let block = div()
+                        .max_w(px(MEASURE))
+                        .mt(px(3.))
+                        .flex()
+                        .child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong()))
+                        .child(
+                            div()
+                                .pl(px(12.))
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .type_body()
+                                .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                                .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
+                        );
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else {
+                        block.into_any_element()
+                    }
+                }
                 Block::Item { ordered, depth, number, text } => {
                     let marker = if *ordered { format!("{number}.") } else { "•".to_owned() };
-                    div()
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| text.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
+                    let block = div()
                         .max_w(px(MEASURE))
                         .pl(px(22. * f32::from(*depth)))
                         .flex()
                         .type_body()
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
-                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)))
-                        .into_any_element()
+                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)));
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else {
+                        block.into_any_element()
+                    }
                 }
                 Block::Code { language, text } => self.code_block(message, ix, language, text, cx),
             };

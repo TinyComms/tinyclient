@@ -134,6 +134,18 @@ pub enum Style {
     Emoji {
         file: MediaFile,
     },
+    /// A timestamp token (e.g. Discord `<t:unix:form>`). The underlying text carries neutral
+    /// fallback words for search snippets and notifications; the shell formats `unix` in the
+    /// user's locale and ticks relative (`'R'`) timestamps while on screen.
+    Time {
+        unix: i64,
+        #[serde(default = "default_time_form")]
+        form: char,
+    },
+}
+
+fn default_time_form() -> char {
+    'f'
 }
 
 /// A styled range of [`Message::text`]. `start` and `end` are byte offsets into the UTF-8 text
@@ -1300,5 +1312,17 @@ mod tests {
         msg.announcement = true;
         let wire = serde_json::to_string(&msg).unwrap();
         assert!(serde_json::from_str::<Message>(&wire).unwrap().announcement);
+    }
+
+    #[test]
+    fn style_time_round_trips_and_defaults_form() {
+        let span = Span { start: 0, end: 10, style: Style::Time { unix: 1_618_953_630, form: 'R' } };
+        let wire = serde_json::to_string(&span).unwrap();
+        assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        let omitted = r#"{"start":0,"end":10,"style":{"style":"time","unix":1618953630}}"#;
+        assert_eq!(
+            serde_json::from_str::<Span>(omitted).unwrap().style,
+            Style::Time { unix: 1_618_953_630, form: 'f' }
+        );
     }
 }

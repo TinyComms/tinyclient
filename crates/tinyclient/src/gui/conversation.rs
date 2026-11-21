@@ -432,6 +432,9 @@ pub struct Pane {
     opening: bool,
     /// Where each row drawn this frame is, for knowing what is on screen.
     seen: Seen,
+    /// Coarse 60-second timer that redraws relative (`<t:unix:R>`) timestamp chips only while
+    /// at least one is visible on screen. Dropped as soon as none are visible.
+    relative_timer: Option<gpui::Task<()>>,
     #[cfg(feature = "gui-shot")]
     script: shot::Script,
 }
@@ -516,6 +519,7 @@ impl Pane {
             width: 0.,
             opening: false,
             seen: Rc::default(),
+            relative_timer: None,
             #[cfg(feature = "gui-shot")]
             script: if thread { shot::Script::default() } else { shot::Script::from_env() },
         }
@@ -648,6 +652,7 @@ impl Pane {
         let landing = self.landing.take();
         let around = self.around.take();
         self.revisions = None;
+        self.relative_timer = None;
         self.fetched_reactors.clear();
         self.reactors_loading = None;
         // Where the one being left was, for coming back to it.
@@ -1381,6 +1386,12 @@ impl Pane {
         #[cfg(feature = "gui-shot")]
         shot::drawn(self, window, cx);
         self.active = window.is_window_active();
+        let has_relative_time = seen
+            .iter()
+            .filter(|(_, bounds)| on_screen(bounds))
+            .filter_map(|(ix, _)| self.items.get(*ix).and_then(Item::message))
+            .any(|message| message.spans.iter().any(|span| matches!(span.style, protocol::Style::Time { form: 'R', .. })));
+        self.sync_relative_timer(has_relative_time, cx);
         let newest = seen
             .iter()
             .filter(|(_, bounds)| on_screen(bounds))
@@ -1394,6 +1405,23 @@ impl Pane {
                 self.saw(&newest, cx);
             }
         }
+    }
+
+    fn sync_relative_timer(&mut self, needed: bool, cx: &mut Context<Self>) {
+        if !needed || SCREENSHOTS {
+            self.relative_timer = None;
+            return;
+        }
+        if self.relative_timer.is_some() {
+            return;
+        }
+        self.relative_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(60)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.relative_timer = None;
+                cx.notify();
+            });
+        }));
     }
 
     /// A mark-unread holds until the list moves. The frame that sets it only records the place.

@@ -163,8 +163,24 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         rich.span(start, Style::Emoji { file: file.clone() });
         rich.files.push((file, url));
     } else if let Some(time) = inner.strip_prefix("t:") {
-        let (unix, style) = time.split_once(':').unwrap_or((time, "f"));
-        rich.text.push_str(&timestamp(unix.parse().ok()?, style));
+        let (unix_str, style_str) = time.split_once(':').unwrap_or((time, "f"));
+        let unix: i64 = unix_str.parse().ok()?;
+        let form = match style_str {
+            "t" => 't',
+            "T" => 'T',
+            "d" => 'd',
+            "D" => 'D',
+            "f" => 'f',
+            "F" => 'F',
+            "R" => 'R',
+            _ => 'f',
+        };
+        let fallback = timestamp(unix, style_str);
+        if fallback.is_empty() {
+            return None;
+        }
+        rich.text.push_str(&fallback);
+        rich.span(start, Style::Time { unix, form });
     } else if let Some(command) = inner.strip_prefix('/') {
         let (name, id) = command.rsplit_once(':')?;
         if !digits(id) {
@@ -1170,6 +1186,34 @@ mod tests {
     fn unclosed_markup_stays_as_typed() {
         assert_eq!(parsed("2 ** 3 and a_b and `open").text, "2 ** 3 and a_b and `open");
         assert_eq!(parsed("\\*not italic\\*").text, "*not italic*");
+    }
+
+    #[test]
+    fn timestamp_tokens_emit_time_spans_over_neutral_fallback_text() {
+        let rich = parsed("Starts <t:1618953630:R> (default <t:1618953630>, short <t:1618953630:t>, long <t:1618953630:F>)");
+        let times: Vec<(i64, char, &str)> = rich
+            .spans
+            .iter()
+            .filter_map(|span| match span.style {
+                Style::Time { unix, form } => Some((unix, form, &rich.text[span.start as usize..span.end as usize])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(times.len(), 4);
+        assert_eq!((times[0].0, times[0].1), (1_618_953_630, 'R'));
+        assert_eq!((times[1].0, times[1].1), (1_618_953_630, 'f'));
+        assert_eq!((times[2].0, times[2].1), (1_618_953_630, 't'));
+        assert_eq!((times[3].0, times[3].1), (1_618_953_630, 'F'));
+        // Fallback text is non-empty and neutral (never stale "ago"/"in " words for relative).
+        for (_, _, fallback) in &times {
+            assert!(!fallback.is_empty());
+        }
+        assert!(!times[0].2.contains("ago") && !times[0].2.starts_with("in "));
+
+        // Invalid timestamps stay literal.
+        let bad = parsed("<t:notanumber:R>");
+        assert_eq!(bad.text, "<t:notanumber:R>");
+        assert!(bad.spans.is_empty());
     }
 
     #[test]
