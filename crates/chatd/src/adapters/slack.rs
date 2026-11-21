@@ -232,6 +232,8 @@ struct State {
     searched: HashSet<String>,
     search_at: Option<Instant>,
     groups_listed: bool,
+    /// User groups I belong to, learned once per connection and kept current on the socket.
+    my_groups: HashSet<String>,
     partners_read: bool,
     /// When the followed threads were last asked for.
     threads_at: Option<Instant>,
@@ -826,6 +828,7 @@ impl Slack {
             state.watched.clear();
             state.expired = None;
             state.resync = true;
+            state.groups_listed = false;
             // What was whole may have a hole now: the socket was down.
             state.covered.clear();
         }
@@ -915,6 +918,18 @@ impl Slack {
             "star_added" | "star_removed" => self.star_heard(event),
             "emoji_changed" => {
                 self.emoji_changed(event);
+                Ok(())
+            }
+            "subteam_self_added" => {
+                self.subteam_self(event, true);
+                Ok(())
+            }
+            "subteam_self_removed" => {
+                self.subteam_self(event, false);
+                Ok(())
+            }
+            "subteam_created" | "subteam_updated" => {
+                self.subteam_updated(event);
                 Ok(())
             }
             "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
@@ -1410,6 +1425,7 @@ impl Slack {
         if connected {
             self.partners();
             self.tell_partners();
+            self.load_usergroups();
             return match self.ctx.note("tree") {
                 Some(_) => self.resync(),
                 None => self.load_tree(),

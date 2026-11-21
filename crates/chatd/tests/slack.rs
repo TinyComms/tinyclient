@@ -436,6 +436,14 @@ impl Fake {
                 }
                 Some(json!({"ok": true}))
             }
+            "usergroups.list" => Some(json!({
+                "ok": true,
+                "usergroups": [
+                    {"id": "S0MINE", "handle": "oncall", "name": "On Call", "date_delete": 0, "users": [me(token), "U0ANA"]},
+                    {"id": "S0OTHER", "handle": "design", "name": "Design", "date_delete": 0, "users": ["U0ANA", "U0BEN"]},
+                    {"id": "S0OFF", "handle": "legacy", "name": "Legacy", "date_delete": 1700000000, "users": [me(token)]},
+                ],
+            })),
             // A conversation star is the channel alone. A timestamp would star a message.
             "stars.add" | "stars.remove" => {
                 if channel.is_empty() || !param("timestamp").is_empty() {
@@ -2647,4 +2655,39 @@ fn closing_a_direct_or_leaving_a_group_dm_calls_conversations_close_and_drops_th
     assert_eq!(closed_ids, ["D0ANA", "G0GRP"]);
     world.until("closed DM to leave the tree", || world.conversation(&dm).is_none().then_some(()));
     world.until("left group DM to leave the tree", || world.conversation(&group).is_none().then_some(()));
+}
+
+#[test]
+fn usergroup_mention_counts_as_mention_only_for_my_active_groups_and_follows_subteam_events() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let push = |ts: &str, text: &str| {
+        world.fake.push(ALPHA, json!({
+            "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": text, "ts": ts,
+        }));
+        world.until("the usergroup message", || world.message(&general, ts))
+    };
+
+    let mine = push("1760000700.000100", "<!subteam^S0MINE> check");
+    assert!(mine.mentions_me, "a mention of a user group I belong to must set mentions_me");
+    assert_eq!(mine.text, "@oncall check");
+
+    let other = push("1760000700.000200", "<!subteam^S0OTHER> check");
+    assert!(!other.mentions_me, "a group I do not belong to must not set mentions_me");
+
+    let disabled = push("1760000700.000300", "<!subteam^S0OFF> check");
+    assert!(!disabled.mentions_me, "a disabled user group must be ignored");
+
+    // Joining S0OTHER via socket makes it count as a mention.
+    world.fake.push(ALPHA, json!({"type": "subteam_self_added", "subteam_id": "S0OTHER"}));
+    sleep(Duration::from_millis(200));
+    let now_mine = push("1760000700.000400", "<!subteam^S0OTHER> now mine");
+    assert!(now_mine.mentions_me, "subteam_self_added should add the group to my groups");
+
+    // Leaving S0MINE via socket stops it counting as a mention.
+    world.fake.push(ALPHA, json!({"type": "subteam_self_removed", "subteam_id": "S0MINE"}));
+    sleep(Duration::from_millis(200));
+    let no_longer = push("1760000700.000500", "<!subteam^S0MINE> no longer mine");
+    assert!(!no_longer.mentions_me, "subteam_self_removed should remove the group from my groups");
 }
