@@ -599,6 +599,11 @@ pub enum Command {
         action: RelateAction,
         reply: Reply<()>,
     },
+    /// Send a friend request by username (e.g. Discord `POST /users/@me/relationships`).
+    AddFriend {
+        username: String,
+        reply: Reply<()>,
+    },
     /// Report a message, person, or conversation to the network.
     Report {
         target: protocol::ReportTarget,
@@ -736,6 +741,7 @@ impl Command {
             | Command::Delete { reply, .. }
             | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
+            | Command::AddFriend { reply, .. }
             | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
             | Command::SetProfile { reply, .. }

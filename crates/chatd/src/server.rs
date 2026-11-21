@@ -1645,6 +1645,20 @@ impl Chat {
         }
     }
 
+    fn add_friend(&self, account: AccountKey, username: String) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let username = username.trim().to_owned();
+        if username.is_empty() {
+            return error(ErrorCode::Refused, "Enter a username.");
+        }
+        match self.ask(&account, |reply| Command::AddFriend { username, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn report(
         &self,
         target: protocol::ReportTarget,
@@ -3045,6 +3059,7 @@ impl Chat {
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
+            Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, clear_at } => self.set_presence(account, presence, status, clear_at),

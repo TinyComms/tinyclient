@@ -4414,3 +4414,46 @@ fn reactors_fetches_unicode_and_custom_emoji_with_paging() {
     assert_eq!(custom_reqs.len(), 1);
     assert!(custom_reqs[0].path.contains("type=1"), "burst=true must pass type=1, got {}", custom_reqs[0].path);
 }
+
+#[test]
+fn add_friend_by_username_sends_request_and_translates_refusals() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // 1. Pomelo username (with leading @ stripped) sends POST /users/@me/relationships with discriminator: null
+    world.discord.script("/users/@me/relationships", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::AddFriend { account: account.clone(), username: " @newfriend ".into() }),
+        Response::Ok
+    );
+    let reqs = world.discord.requests_to("POST", "/users/@me/relationships");
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].body, json!({"username": "newfriend", "discriminator": null}));
+    assert!(reqs[0].headers.contains_key("x-context-properties"), "must send X-Context-Properties");
+
+    // 2. Legacy username#1234 sends numeric discriminator
+    world.discord.script("/users/@me/relationships", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::AddFriend { account: account.clone(), username: "legacy#1234".into() }),
+        Response::Ok
+    );
+    let reqs = world.discord.requests_to("POST", "/users/@me/relationships");
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1].body, json!({"username": "legacy", "discriminator": 1234}));
+
+    // 3. Error translations: user not found (80004), already friends (80007), blocked (80002), disabled (80008)
+    for (code, expected) in [
+        (80004, "No Discord user"),
+        (80007, "already your friend"),
+        (80002, "blocked"),
+        (80008, "does not accept friend requests"),
+    ] {
+        world.discord.script("/users/@me/relationships", 400, json!({"code": code, "message": "err"}));
+        match world.ask(Request::AddFriend { account: account.clone(), username: "someone".into() }) {
+            Response::Error { detail, .. } => {
+                assert!(detail.contains(expected), "code {code} expected '{expected}', got '{detail}'");
+            }
+            other => panic!("expected error for code {code}, got {other:?}"),
+        }
+    }
+}

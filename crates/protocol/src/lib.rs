@@ -1581,6 +1581,12 @@ pub enum Request {
         person: Key,
         action: RelateAction,
     },
+    /// Send a friend request by typing a username (`username` or legacy `username#1234`).
+    /// The outgoing request arrives via `Change::People` once the network accepts it.
+    AddFriend {
+        account: AccountKey,
+        username: String,
+    },
     /// Report a message, person, or conversation to the network. Never sent without a confirm sheet.
     Report {
         target: ReportTarget,

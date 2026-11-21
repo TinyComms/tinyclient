@@ -589,6 +589,9 @@ pub struct Capabilities {
     /// This account supports blocking and unblocking people (`Request::Relate` with Block/Unblock).
     #[serde(default, skip_serializing_if = "is_false")]
     pub blocks: bool,
+    /// This account supports sending a friend request by typing a username (`Request::AddFriend`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_friend_by_username: bool,
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,

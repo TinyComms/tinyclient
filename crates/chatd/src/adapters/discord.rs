@@ -1258,6 +1258,21 @@ impl Discord {
         self.ctx.relation(person, becomes).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
+    /// Sends a friend request by username (`POST /users/@me/relationships`). Never retried
+    /// automatically; Discord's anti-abuse system watches friend requests closely.
+    fn add_friend(&self, raw: &str) -> Result<(), Refusal> {
+        let (username, discriminator) = parse_discord_username(raw).map_err(Refusal::Refused)?;
+        let body = match discriminator {
+            Some(disc) => json!({ "username": username, "discriminator": disc }),
+            None => json!({ "username": username, "discriminator": Value::Null }),
+        };
+        let context = base64::engine::general_purpose::STANDARD.encode(json!({"location": "Add Friend"}).to_string());
+        self.rest
+            .call_with("POST", "/users/@me/relationships", Some(body), &[("X-Context-Properties", &context)])
+            .map(drop)
+            .map_err(add_friend_refusal)
+    }
+
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
     /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
     /// does this.
@@ -1732,6 +1747,7 @@ impl Discord {
                 }
             }
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
+            Command::AddFriend { username, reply } => answer(reply, self.add_friend(&username)),
             Command::SetPresence { presence, status, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
@@ -1809,6 +1825,64 @@ fn ack_refused(refused: &Refused) -> bool {
     matches!(refused, Refused::Status { code: 50007 | 50001 | 50003, .. } | Refused::Status { status: 403, .. })
 }
 
+/// Parses a user-typed Discord username (`name`, `@name`, or legacy `name#1234`).
+fn parse_discord_username(raw: &str) -> Result<(String, Option<u16>), String> {
+    let trimmed = raw.trim().trim_start_matches('@').trim();
+    if trimmed.is_empty() {
+        return Err("Enter a Discord username.".to_owned());
+    }
+    if let Some((name, disc)) = trimmed.split_once('#') {
+        let name = name.trim();
+        let disc = disc.trim();
+        if name.is_empty() {
+            return Err("Enter a username like name or name#1234.".to_owned());
+        }
+        if disc == "0" || disc == "0000" {
+            return Ok((name.to_owned(), None));
+        }
+        if disc.len() == 4 && disc.bytes().all(|b| b.is_ascii_digit()) {
+            let parsed = disc.parse::<u16>().map_err(|_| "Enter a username like name or name#1234.".to_owned())?;
+            return Ok((name.to_owned(), Some(parsed)));
+        }
+        return Err("Enter a username like name or name#1234.".to_owned());
+    }
+    Ok((trimmed.to_owned(), None))
+}
+
+/// Translates Discord's refusal codes on `POST /users/@me/relationships` into clear words.
+fn add_friend_refusal(err: Refused) -> Refusal {
+    match err {
+        Refused::Challenge => Refusal::Refused(
+            "Discord asked for a captcha check tinyclient cannot complete. Send this friend request in Discord.".to_owned(),
+        ),
+        Refused::Limited(_) | Refused::Paused(_) | Refused::Status { status: 429, .. } => {
+            Refusal::Refused("Too many friend requests. Wait a moment and try again.".to_owned())
+        }
+        Refused::Status { code: 80000 | 80003, .. } => {
+            Refusal::Refused("You cannot send a friend request to yourself.".to_owned())
+        }
+        Refused::Status { code: 80001 | 80004, .. } => {
+            Refusal::Refused("No Discord user was found with that username. Check the spelling and try again.".to_owned())
+        }
+        Refused::Status { code: 80002, .. } => {
+            Refusal::Refused("You have blocked this user, or they have blocked you.".to_owned())
+        }
+        Refused::Status { code: 80007, .. } => Refusal::Refused("This person is already your friend.".to_owned()),
+        Refused::Status { code: 50007 | 80008, .. } => {
+            Refusal::Refused("This person does not accept friend requests.".to_owned())
+        }
+        Refused::Status { code: 30001 | 30002 | 80006, .. } => {
+            Refusal::Refused("You have reached Discord's friend limit.".to_owned())
+        }
+        Refused::Status { status: 400, ref message, .. } if message.to_ascii_lowercase().contains("captcha") => {
+            Refusal::Refused(
+                "Discord asked for a captcha check tinyclient cannot complete. Send this friend request in Discord.".to_owned(),
+            )
+        }
+        other => refusal(other),
+    }
+}
+
 /// Sends the answer to a command the shell is waiting on.
 fn answer<T>(reply: Reply<T>, outcome: Result<T, Refusal>) {
     let _ = reply.send(outcome);
@@ -1825,5 +1899,30 @@ mod tests {
         assert_eq!(found[0].account, "1000");
         // A token that does not start with an id still signs in.
         assert_eq!(accounts(r#"{"token":"opaque"}"#).unwrap()[0].account, "main");
+    }
+
+    #[test]
+    fn parse_discord_username_handles_pomelo_and_legacy_forms() {
+        assert_eq!(parse_discord_username("alice").unwrap(), ("alice".into(), None));
+        assert_eq!(parse_discord_username("  @alice  ").unwrap(), ("alice".into(), None));
+        assert_eq!(parse_discord_username("alice#0").unwrap(), ("alice".into(), None));
+        assert_eq!(parse_discord_username("alice#1234").unwrap(), ("alice".into(), Some(1234)));
+        assert!(parse_discord_username("   ").is_err());
+        assert!(parse_discord_username("alice#12").is_err());
+        assert!(parse_discord_username("#1234").is_err());
+    }
+
+    #[test]
+    fn add_friend_refusal_translates_discord_codes() {
+        let msg = |r: Refused| match add_friend_refusal(r) {
+            Refusal::Refused(m) => m,
+            Refusal::Unsupported => panic!("unexpected unsupported"),
+        };
+        assert!(msg(Refused::Status { status: 400, code: 80004, message: String::new(), retry_after: None }).contains("No Discord user"));
+        assert!(msg(Refused::Status { status: 400, code: 80007, message: String::new(), retry_after: None }).contains("already your friend"));
+        assert!(msg(Refused::Status { status: 400, code: 80002, message: String::new(), retry_after: None }).contains("blocked"));
+        assert!(msg(Refused::Status { status: 400, code: 80008, message: String::new(), retry_after: None }).contains("does not accept friend requests"));
+        assert!(msg(Refused::Challenge).contains("captcha"));
+        assert!(msg(Refused::Limited(10.0)).contains("Too many friend requests"));
     }
 }
