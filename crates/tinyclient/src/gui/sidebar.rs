@@ -1905,8 +1905,6 @@ impl Shell {
     pub(super) fn sidebar(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let people = self.sidebar_state.mode == Mode::People;
         let tiny = matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny));
-        // Messages has no StartDirect, so the compose button would open a switcher that cannot start a text.
-        let messages = matches!(self.sidebar_state.mode, Mode::Network(Network::Messages));
         if !matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
             self.sidebar_state.width.set(width);
         }
@@ -1932,7 +1930,7 @@ impl Shell {
             .when(!phone, |sidebar| sidebar.border_r_1().border_color(theme::hairline()))
             .when(phone, |sidebar| sidebar.pt(px(super::phone::tokens::safe_top())).pb(px(super::phone::tokens::safe_bottom())))
             .child(self.title_strip(&self.sidebar_state.mode, cx))
-            .when(!people && !tiny && !messages, |sidebar| sidebar.child(self.jump_strip(cx)))
+            .when(!people && !tiny, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
             .child(

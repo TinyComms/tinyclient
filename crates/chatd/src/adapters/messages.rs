@@ -157,6 +157,12 @@ trait Drive: Send + Sync {
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String>;
     /// The phone's address book contacts.
     fn contacts(&self) -> Result<Vec<bugle::ContactEntry>, String>;
+    /// Gets or creates a 1:1 or group conversation by phone number(s).
+    fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String>;
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String>;
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn delete_message(&self, message: &str) -> Result<(), String>;
@@ -233,6 +239,13 @@ impl Drive for LiveDrive {
     }
     fn contacts(&self) -> Result<Vec<bugle::ContactEntry>, String> {
         self.inner.contacts()
+    }
+    fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String> {
+        self.inner.get_or_create_conversation(numbers, group_name)
     }
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         self.inner.mark_read(conversation, message)
@@ -1826,6 +1839,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Profile { person_id, reply } => {
             let _ = reply.send(profile(account, &person_id));
         }
+        Command::StartDirect { person_id, reply } => {
+            let _ = reply.send(start_direct(account, &person_id));
+        }
         Command::SearchPeople(query) => search_people(account, &query),
         Command::ConversationInfo {
             conversation_id,
@@ -2974,6 +2990,114 @@ fn profile(account: &Account, person_id: &str) -> Result<super::About, Refusal> 
         });
     }
     Ok(about)
+}
+
+fn default_country_code(account: &Account) -> String {
+    let chats = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for chat in chats.values() {
+        for p in &chat.participants {
+            if p.is_me && p.number.starts_with('+') {
+                let digits: String = p.number.chars().filter(char::is_ascii_digit).collect();
+                if digits.len() == 11 && digits.starts_with('1') {
+                    return "+1".to_owned();
+                }
+            }
+        }
+    }
+    "+1".to_owned()
+}
+
+fn resolve_number(account: &Account, person_id: &str) -> Option<String> {
+    {
+        let chats = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for chat in chats.values() {
+            for p in &chat.participants {
+                if p.id == person_id && !p.number.is_empty() {
+                    return Some(p.number.clone());
+                }
+            }
+        }
+    }
+    let contacts = ensure_contacts(account);
+    if let Some(c) = contacts
+        .iter()
+        .find(|c| c.participant_id == person_id || c.id == person_id || c.number == person_id)
+    {
+        if !c.number.is_empty() {
+            return Some(c.number.clone());
+        }
+    }
+    Some(person_id.to_owned())
+}
+
+fn record_started_chat(account: &Account, chat: Chat) -> String {
+    let kept = remember(account, &[chat]);
+    let chat = &kept[0];
+    if !chat.peer.is_empty() {
+        account
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(chat.id.clone(), chat.peer.clone());
+    }
+    let _ = account.ctx.conversation(&row(chat));
+    let mut people = Vec::new();
+    for p in &chat.participants {
+        if p.is_me || p.id.is_empty() {
+            continue;
+        }
+        people.push(PersonRow {
+            id: p.id.clone(),
+            name: if !p.name.is_empty() { p.name.clone() } else { chat.title.clone() },
+            handle: String::new(),
+            avatar: account.ctx.avatar_of(&p.id),
+            bot: false,
+            status: String::new(),
+            link: String::new(),
+        });
+    }
+    if !people.is_empty() {
+        let _ = account.ctx.people(&people);
+    }
+    chat.id.clone()
+}
+
+fn start_direct(account: &Account, person_id: &str) -> Result<String, Refusal> {
+    // Check if an existing 1:1 chat already matches this chat id or participant id.
+    {
+        let chats = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(chat) = chats
+            .values()
+            .find(|c| !c.group && (c.id == person_id || c.peer == person_id))
+        {
+            if peer_is_emergency(chat) {
+                return Err(Refusal::Refused(EMERGENCY_REASON.to_owned()));
+            }
+            return Ok(chat.id.clone());
+        }
+    }
+    let raw = resolve_number(account, person_id)
+        .ok_or_else(|| Refusal::Refused("Enter a valid phone number.".into()))?;
+    if bugle::is_emergency_number(&raw) {
+        return Err(Refusal::Refused(EMERGENCY_REASON.to_owned()));
+    }
+    let cc = default_country_code(account);
+    let e164 = bugle::normalize_e164(&raw, &cc)
+        .ok_or_else(|| Refusal::Refused("Enter a valid phone number.".into()))?;
+    let chat = account
+        .drive
+        .get_or_create_conversation(&[e164], None)
+        .map_err(Refusal::Refused)?;
+    Ok(record_started_chat(account, chat))
 }
 
 fn conversation_info(

@@ -317,6 +317,40 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
     rows
 }
 
+/// When the user types a phone number (e.g. `(555) 010-0099` or `+15550100099`) and a
+/// Google Messages account is connected, offers a "Text <number>" row that calls `StartDirect`.
+/// Emergency numbers are never offered.
+pub fn text_number_hit(query: &str, accounts: &[AccountStatus]) -> Option<Hit> {
+    let (network, typed) = narrowed(query.trim());
+    if network.is_some_and(|n| n != Network::Messages) {
+        return None;
+    }
+    let raw = typed.trim_start_matches('@').trim();
+    if raw.is_empty()
+        || !raw
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' ' | '.'))
+    {
+        return None;
+    }
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if !(7..=15).contains(&digits.len()) {
+        return None;
+    }
+    let messages = accounts
+        .iter()
+        .find(|a| a.key.network == Network::Messages && a.link == Link::Connected)?;
+    let person = Person::new(Key::new(&messages.key, raw), raw.to_owned());
+    Some(Hit {
+        title: format!("Text {raw}"),
+        context: "Messages · Text a number".to_owned(),
+        matched: Vec::new(),
+        target: Target::Person(Box::new(person)),
+        section: Some("People"),
+        trailing: Some("New message"),
+    })
+}
+
 /// New rows from a later answer, with the ones down to the selected row kept where they were:
 /// what arrives goes in below what the user is aiming at.
 pub fn settle(old: &[Hit], selected: usize, new: Vec<Hit>) -> Vec<Hit> {
@@ -429,14 +463,18 @@ impl Shell {
             cx.notify();
             return;
         }
+        let accounts = self.snapshot.as_ref().map(|s| s.accounts.as_slice()).unwrap_or(&[]);
         let Some(switcher) = &mut self.sidebar_state.switcher else {
             return;
         };
-        let fresh = if narrowed(query.trim()).1.trim_start_matches(['#', '@']).is_empty() && !query.trim().starts_with('@') {
+        let mut fresh = if narrowed(query.trim()).1.trim_start_matches(['#', '@']).is_empty() && !query.trim().starts_with('@') {
             waiting_and_recent(&switcher.conversations, &switcher.recent, open.as_ref())
         } else {
             hits(&query, &switcher.conversations, &self.spaces, &switcher.people, &switcher.asking, can_search, now())
         };
+        if let Some(number_hit) = text_number_hit(&query, accounts) {
+            fresh.insert(0, number_hit);
+        }
         if keep {
             switcher.hits = settle(&switcher.hits, switcher.selected, fresh);
             switcher.selected = switcher.selected.min(switcher.hits.len().saturating_sub(1));
@@ -1122,5 +1160,30 @@ mod tests {
         let mut channel = (*row("news", ConversationKind::Channel, 0)).clone();
         channel.key.network = Network::Telegram;
         assert_eq!(context(&channel), "Channel");
+    }
+
+    #[test]
+    fn phone_number_query_offers_text_a_number_for_messages() {
+        let accounts = vec![AccountStatus {
+            key: AccountKey { network: Network::Messages, account: "phone-ada".into() },
+            name: "Ada".into(),
+            me: "phone-ada".into(),
+            avatar: None,
+            link: Link::Connected,
+            detail: String::new(),
+            attention: 0,
+            unread: false,
+            reconnecting: false,
+            required: String::new(),
+            presence: protocol::Presence::Unknown,
+            status: String::new(),
+            can: protocol::Capabilities::default(),
+        }];
+        let hit = text_number_hit("@(555) 010-0099", &accounts).expect("text a number hit");
+        assert_eq!(hit.title, "Text (555) 010-0099");
+        assert!(matches!(hit.target, Target::Person(ref p) if p.key.network == Network::Messages && p.key.id == "(555) 010-0099"));
+        assert!(text_number_hit("911", &accounts).is_none());
+        assert!(text_number_hit("Grace", &accounts).is_none());
+        assert!(text_number_hit("slack (555) 010-0099", &accounts).is_none());
     }
 }

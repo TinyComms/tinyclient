@@ -1866,3 +1866,42 @@ fn profile_shows_masked_number_open_group_fetches_member_avatars_and_contacts_se
     });
     assert_eq!(linnea.key.id, "participant-linnea");
 }
+
+#[test]
+fn start_direct_opens_a_chat_for_a_typed_number_or_contact_and_blocks_emergency() {
+    let world = World::linked();
+    world.connected();
+
+    // StartDirect with a typed phone number normalizes to E.164 and creates a row with RCS topic.
+    match world.ask(Request::StartDirect {
+        person: key("(555) 010-0099"),
+    }) {
+        Response::Conversation { conversation } => {
+            assert_eq!(conversation.kind, ConversationKind::Direct);
+            assert!(conversation.topic.contains("RCS message"), "{}", conversation.topic);
+            let stored = world.conversation(&conversation.key.id).expect("new row stored");
+            assert_eq!(stored.key, conversation.key);
+        }
+        other => panic!("expected Conversation, got {other:?}"),
+    }
+    world.heard("create +15550100099");
+
+    // StartDirect with a phone contact id resolves their number and creates a chat.
+    match world.ask(Request::StartDirect {
+        person: key("participant-linnea"),
+    }) {
+        Response::Conversation { conversation } => {
+            assert_eq!(conversation.title, "Linnea Sol");
+        }
+        other => panic!("expected Conversation for Linnea, got {other:?}"),
+    }
+    world.heard("create +15550100004");
+
+    // StartDirect with an emergency number is refused.
+    match world.ask(Request::StartDirect {
+        person: key("911"),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("phone"), "{detail}"),
+        other => panic!("expected emergency refusal, got {other:?}"),
+    }
+}

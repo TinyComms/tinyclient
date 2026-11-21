@@ -1166,6 +1166,49 @@ pub fn is_emergency_number(number: &str) -> bool {
     )
 }
 
+/// Normalises a user-typed phone number to E.164 using `default_cc` (e.g. `"+1"`).
+/// Refuses alphanumeric senders, emergency numbers, and too-short/too-long inputs.
+pub fn normalize_e164(input: &str, default_cc: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || is_alphanumeric_sender(trimmed) || is_emergency_number(trimmed) {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' ' | '.'))
+    {
+        return None;
+    }
+    let has_plus = trimmed.starts_with('+');
+    let digits: String = trimmed.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() < 7 || digits.len() > 15 {
+        return None;
+    }
+    if has_plus {
+        return Some(format!("+{digits}"));
+    }
+    if let Some(rest) = digits.strip_prefix("00") {
+        if (7..=15).contains(&rest.len()) {
+            return Some(format!("+{rest}"));
+        }
+    }
+    let cc: String = default_cc.chars().filter(char::is_ascii_digit).collect();
+    let cc = if cc.is_empty() { "1" } else { cc.as_str() };
+    if cc == "1" {
+        if digits.len() == 10 {
+            return Some(format!("+1{digits}"));
+        }
+        if digits.len() == 11 && digits.starts_with('1') {
+            return Some(format!("+{digits}"));
+        }
+    }
+    if digits.starts_with(cc) && digits.len() >= 10 {
+        Some(format!("+{digits}"))
+    } else {
+        Some(format!("+{cc}{digits}"))
+    }
+}
+
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
 #[derive(Clone, Default)]
 pub struct Piece {
@@ -2001,6 +2044,27 @@ impl Session {
         Ok(decode_contacts(&bytes))
     }
 
+    /// Gets or creates a 1:1 or group conversation (`GET_OR_CREATE_CONVERSATION`, action 11).
+    pub fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String> {
+        let bytes = self.rpc(
+            11,
+            &get_or_create_conversation_request(numbers, group_name),
+            2,
+        )?;
+        refused(&bytes)?;
+        let chats = decode_chats(&bytes);
+        let chat = chats
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Messages didn't return a conversation.".to_owned())?;
+        self.apply_chats(vec![chat.clone()]);
+        Ok(chat)
+    }
+
     fn upload(&self, packed: &[u8], mime: &str) -> Result<String, String> {
         let (payload, cookies) = {
             let live = self
@@ -2712,6 +2776,22 @@ fn list_contacts_request() -> Vec<u8> {
     req.int(1, 1);
     req.int(2, 1);
     req.int(3, 500);
+    req.0
+}
+
+fn get_or_create_conversation_request(numbers: &[String], group_name: Option<&str>) -> Vec<u8> {
+    let mut req = Buf::new();
+    for number in numbers {
+        let mut entry = Buf::new();
+        entry.text(1, number);
+        req.msg(2, &entry.0);
+    }
+    if let Some(name) = group_name.filter(|n| !n.trim().is_empty()) {
+        req.text(3, name.trim());
+    }
+    if numbers.len() > 1 {
+        req.int(4, 1);
+    }
     req.0
 }
 
@@ -3730,5 +3810,31 @@ mod tests {
         assert_eq!(decoded[0].number, "+15550100004");
         assert_eq!(decoded[0].formatted_number, "(555) 010-0004");
         assert_eq!(decoded[0].id, "contact-4");
+    }
+
+    #[test]
+    fn e164_normalization_and_get_or_create_request() {
+        assert_eq!(normalize_e164("(555) 010-0099", "+1").as_deref(), Some("+15550100099"));
+        assert_eq!(normalize_e164("+44 20 7946 0958", "+1").as_deref(), Some("+442079460958"));
+        assert_eq!(normalize_e164("1-555-010-0099", "+1").as_deref(), Some("+15550100099"));
+        assert_eq!(normalize_e164("911", "+1"), None);
+        assert_eq!(normalize_e164("BANKOTP", "+1"), None);
+        assert_eq!(normalize_e164("123", "+1"), None);
+
+        let single = fields(&get_or_create_conversation_request(&["+15550100099".into()], None));
+        let nums: Vec<String> = single
+            .iter()
+            .filter(|f| f.number == 2)
+            .map(|f| field_text(&fields(&f.bytes), 1))
+            .collect();
+        assert_eq!(nums, ["+15550100099"]);
+        assert_eq!(field_int(&single, 4), 0);
+
+        let group = fields(&get_or_create_conversation_request(
+            &["+15550100002".into(), "+15550100003".into()],
+            Some("Weekend"),
+        ));
+        assert_eq!(field_text(&group, 3), "Weekend");
+        assert_eq!(field_int(&group, 4), 1);
     }
 }

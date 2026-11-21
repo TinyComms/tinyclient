@@ -1041,6 +1041,84 @@ impl Drive for Fake {
             },
         ])
     }
+    fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        let line = match group_name.filter(|n| !n.trim().is_empty()) {
+            Some(name) => format!("create {} {}", numbers.join(","), name.trim()),
+            None => format!("create {}", numbers.join(",")),
+        };
+        record(&line);
+        let group = numbers.len() > 1;
+        let id = if !group && numbers.first().map(String::as_str) == Some("+15550100002") {
+            GRACE.to_owned()
+        } else if group {
+            format!("phone-group-{}", numbers.len())
+        } else {
+            format!("phone-new-{}", numbers.first().map(|s| s.trim_start_matches('+')).unwrap_or("x"))
+        };
+        let mut participants = vec![Participant {
+            id: ME.into(),
+            name: "Ada Quill".into(),
+            first_name: "Ada".into(),
+            number: "+15550100001".into(),
+            is_me: true,
+            color: Some(0x4285F4),
+        }];
+        let mut names = Vec::new();
+        for num in numbers {
+            let (pid, name) = match num.as_str() {
+                "+15550100002" => (GRACE_PARTICIPANT.to_owned(), "Grace Ombra".to_owned()),
+                "+15550100003" => ("participant-alan".to_owned(), "Alan Ferro".to_owned()),
+                "+15550100004" => ("participant-linnea".to_owned(), "Linnea Sol".to_owned()),
+                other => (format!("participant-{}", other.trim_start_matches('+')), other.to_owned()),
+            };
+            names.push(name.clone());
+            participants.push(Participant {
+                id: pid,
+                name,
+                first_name: String::new(),
+                number: num.clone(),
+                is_me: false,
+                color: None,
+            });
+        }
+        let title = if let Some(name) = group_name.filter(|n| !n.trim().is_empty()) {
+            name.trim().to_owned()
+        } else if names.len() == 1 {
+            names[0].clone()
+        } else {
+            names.join(", ")
+        };
+        let peer = if !group {
+            participants.iter().find(|p| !p.is_me).map(|p| p.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let chat = Chat {
+            id,
+            title,
+            group,
+            unread: false,
+            mine: ME.into(),
+            peer,
+            carrier: 2, // RCS reachable
+            updated: crate::hub::now(),
+            phones: false,
+            status: 1,
+            read_only: false,
+            verified: false,
+            participants,
+        };
+        let _ = self.events.send(Event::Chats(vec![chat.clone()]));
+        Ok(chat)
+    }
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         record(&format!("read {conversation} {message}"));
         Ok(())
