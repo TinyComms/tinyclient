@@ -648,7 +648,7 @@ impl Discord {
                 (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.can_invite)
             }));
             let listed = state.guilds.iter().map(|(id, info)| {
-                let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
+                let icon = info.icon.as_deref().and_then(|hash| model::guild_icon(id, hash));
                 let row = SpaceRow {
                     id: id.clone(),
                     name: info.name.clone(),
@@ -733,8 +733,7 @@ impl Discord {
                         }
                     }
                 }
-                if let Some(hash) = &channel.icon {
-                    let (file, url) = model::group_icon(&channel.id, hash);
+                if let Some((file, url)) = channel.icon.as_deref().and_then(|hash| model::group_icon(&channel.id, hash)) {
                     row.avatar = Some(file.id.clone());
                     files.push((file, url));
                 }
@@ -1007,7 +1006,7 @@ impl Discord {
             let quiet = settings.remove(&Some(guild.id.clone())).unwrap_or_default();
             let mut info = self.guild_info(guild, member, &me, position, quiet);
             self.plant(guild, &mut info, &me, &read)?;
-            icons.extend(info.icon.as_deref().map(|hash| model::guild_icon(&guild.id, hash)));
+            icons.extend(info.icon.as_deref().and_then(|hash| model::guild_icon(&guild.id, hash)));
             self.voice_states(Some(&guild.id), &guild.voice_states);
             self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         }

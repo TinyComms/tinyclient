@@ -190,7 +190,7 @@ fn moving(hash: &str) -> &'static str {
 
 pub fn avatar(user: &str, hash: Option<&str>, discriminator: &str) -> (MediaFile, String) {
     match hash {
-        Some(hash) if !hash.is_empty() => (
+        Some(hash) if cdn_token(hash) => (
             sized(format!("avatar:{user}:{hash}"), MediaKind::Avatar, 80),
             format!("{}/avatars/{user}/{hash}.webp?size=80{}", cdn(), moving(hash)),
         ),
@@ -214,17 +214,20 @@ pub fn avatar(user: &str, hash: Option<&str>, discriminator: &str) -> (MediaFile
 pub fn avatar_variants(file: &str) -> Option<Vec<(u32, String)>> {
     let mut parts = file.strip_prefix("avatar:")?.split(':');
     let (user, hash) = (parts.next()?, parts.next()?);
-    if user == "default" {
+    if user == "default" || !cdn_token(hash) {
         return None;
     }
     Some([128, 256].into_iter().map(|size| (size, format!("{}/avatars/{user}/{hash}.webp?size={size}{}", cdn(), moving(hash)))).collect())
 }
 
-pub fn member_avatar(guild: &str, user: &str, hash: &str) -> (MediaFile, String) {
-    (
+pub fn member_avatar(guild: &str, user: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         sized(format!("mavatar:{guild}:{user}:{hash}"), MediaKind::Avatar, 80),
         format!("{}/guilds/{guild}/users/{user}/avatars/{hash}.webp?size=80{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
 /// A Discord CDN hash or invite code: non-empty ASCII letters, digits, `_` and `-`.
@@ -375,20 +378,26 @@ pub fn connection_url(kind: &str, id: &str, name: &str) -> String {
     url.map(https_link).unwrap_or_default()
 }
 
-pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
-    (
+pub fn guild_icon(guild: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         sized(format!("icon:{guild}:{hash}"), MediaKind::Icon, 96),
         format!("{}/icons/{guild}/{hash}.webp?size=96{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
 /// A group direct message's own picture. The address is from the community documentation and
 /// unconfirmed against a real account.
-pub fn group_icon(channel: &str, hash: &str) -> (MediaFile, String) {
-    (
+pub fn group_icon(channel: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         sized(format!("gicon:{channel}:{hash}"), MediaKind::Avatar, 80),
         format!("{}/channel-icons/{channel}/{hash}.webp?size=80{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
 /// A custom emoji at 48 px; an animated one as an animated WebP of that size, not its GIF.
@@ -436,10 +445,12 @@ impl Member {
 
     /// Server avatar when set on this guild member, otherwise the user's global avatar.
     pub fn avatar(&self, guild: Option<&str>) -> Option<(MediaFile, String)> {
-        if let (Some(guild), Some(hash)) = (guild, self.avatar.as_deref().filter(|h| !h.is_empty())) {
+        if let (Some(guild), Some(hash)) = (guild, self.avatar.as_deref()) {
             let id = self.id();
             if !id.is_empty() {
-                return Some(member_avatar(guild, id, hash));
+                if let Some(picture) = member_avatar(guild, id, hash) {
+                    return Some(picture);
+                }
             }
         }
         self.user.as_ref().map(User::avatar)
@@ -1366,5 +1377,18 @@ mod tests {
         assert!(badge_icon("").is_none());
         assert!(!cdn_token("code/../admin"));
         assert!(cdn_token("fr1end"));
+        let (file, url) = avatar("2001", Some("../x"), "0");
+        assert!(url.contains("/embed/avatars/"), "{url}");
+        assert!(file.id.starts_with("avatar:default:"));
+        let (_, good) = avatar("2001", Some("a_goodhash"), "0");
+        assert!(good.contains("/avatars/2001/a_goodhash.webp"), "{good}");
+        assert!(avatar_variants("avatar:2001:../x").is_none());
+        assert!(avatar_variants("avatar:2001:a_goodhash").is_some());
+        assert!(member_avatar("4000", "2001", "../x").is_none());
+        assert!(member_avatar("4000", "2001", "memhash").is_some());
+        assert!(guild_icon("4000", "a/b").is_none());
+        assert!(guild_icon("4000", "iconhash").is_some());
+        assert!(group_icon("3001", "..").is_none());
+        assert!(group_icon("3001", "ghash").is_some());
     }
 }

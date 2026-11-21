@@ -1347,10 +1347,10 @@ impl Discord {
         let icon = space_id
             .as_deref()
             .zip(guild.and_then(|g| g.get("icon")).and_then(Value::as_str))
-            .map(|(gid, hash)| {
-                let (file, url) = model::guild_icon(gid, hash);
+            .and_then(|(gid, hash)| {
+                let (file, url) = model::guild_icon(gid, hash)?;
                 let _ = self.ctx.media(&[(file.clone(), url)]);
-                file
+                Some(file)
             });
         let channel_id = parsed
             .get("channel")
