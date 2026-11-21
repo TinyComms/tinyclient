@@ -1199,6 +1199,27 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
             let _ = changed(community);
             Some(Response::TinyChannelCreated { id, name })
         }
+        Request::TinyChannelUpdate { account, channel_id, channel: edit } if ours(account) => {
+            if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == *channel_id) {
+                if let Some(name) = &edit.name {
+                    ch.name = name.clone();
+                }
+                if let Some(topic) = &edit.topic {
+                    ch.topic = topic.clone();
+                }
+                if let Some(category_id) = &edit.category_id {
+                    ch.category_id = (!category_id.is_empty()).then(|| category_id.clone());
+                }
+                if let Some(position) = edit.position {
+                    ch.position = position;
+                }
+            }
+            changed(community)
+        }
+        Request::TinyChannelDelete { account, channel_id } if ours(account) => {
+            community.channels.retain(|ch| ch.id != *channel_id);
+            changed(community)
+        }
         Request::TinyRoomDelete { account, room_id } if ours(account) => {
             community.rooms.retain(|room| room.id != *room_id);
             changed(community)

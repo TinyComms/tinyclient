@@ -53,8 +53,12 @@ fn text_row(chat: &Conversation, open: Option<&Key>, cx: &mut Context<Shell>) ->
         .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(chat.title.clone()));
     let key = chat.key.clone();
     let title = chat.title.clone();
+    let menu_id = key.id.clone();
     list_row(SharedString::from(format!("tiny-chat-{}", key.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.select(key.clone(), &title, cx)))
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            this.tiny_open_float(Float::TextChannel { id: menu_id.clone(), at: event.position }, cx);
+        }))
 }
 
 /// What is drawn under the pointer while something is dragged.
@@ -210,7 +214,7 @@ impl Shell {
 
     /// Text channels in this server's space, in the tree's order. Direct messages are kept in
     /// the store for People and are not drawn here.
-    fn tiny_chats(&self) -> Vec<Rc<Conversation>> {
+    pub(super) fn tiny_chats(&self) -> Vec<Rc<Conversation>> {
         let Some(account) = self.tiny_state.account.as_ref() else {
             return Vec::new();
         };

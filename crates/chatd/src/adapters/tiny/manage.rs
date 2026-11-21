@@ -1135,6 +1135,33 @@ pub(crate) fn channel_create(account: AccountKey, channel: protocol::TinyChannel
     }
 }
 
+pub(crate) fn channel_update(account: AccountKey, channel_id: String, channel: protocol::TinyChannelEdit) -> Response {
+    if !safe_id(&channel_id) {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let (body, _) = match channel_body(&channel, false) {
+        Ok(parsed) => parsed,
+        Err(answer) => return answer,
+    };
+    // Never send `e2ee` on PATCH; the server refuses it.
+    sent(&saved, "PATCH", &format!("/v1/channels/{channel_id}"), Some(Value::Object(body)), Missing::Channel)
+}
+
+pub(crate) fn channel_delete(account: AccountKey, channel_id: String) -> Response {
+    if !safe_id(&channel_id) {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    sent(&saved, "DELETE", &format!("/v1/channels/{channel_id}"), None, Missing::Channel)
+}
+
 pub(crate) fn room_update(account: AccountKey, room_id: String, room: TinyRoomEdit) -> Response {
     if !safe_id(&room_id) {
         return refused(CHECK);

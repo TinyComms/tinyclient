@@ -2083,6 +2083,17 @@ pub enum Request {
         account: AccountKey,
         channel: TinyChannelEdit,
     },
+    /// Changes a text channel's name, topic, category or position. Never sends `e2ee`.
+    TinyChannelUpdate {
+        account: AccountKey,
+        channel_id: String,
+        channel: TinyChannelEdit,
+    },
+    /// Deletes a text channel and its messages for everyone.
+    TinyChannelDelete {
+        account: AccountKey,
+        channel_id: String,
+    },
     /// Changes a room's name, category, place, topic, limit, bitrate, push-to-talk or video.
     TinyRoomUpdate {
         account: AccountKey,

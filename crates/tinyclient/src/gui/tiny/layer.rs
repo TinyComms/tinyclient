@@ -92,6 +92,11 @@ impl Shell {
                 let menu = self.tiny_channel_menu(page, room_id, cx);
                 out.push(placed("tiny-channel-menu", Place::Pointer(*at), Layer::Menu, window, fade_in("tiny-channel-fade", 120, menu)));
             }
+            Float::TextChannel { id, at } => {
+                if let Some(menu) = self.tiny_text_channel_menu(page, id, cx) {
+                    out.push(placed("tiny-text-channel-menu", Place::Pointer(*at), Layer::Menu, window, fade_in("tiny-text-channel-fade", 120, menu)));
+                }
+            }
             Float::Category { key, at } => {
                 let menu = self.tiny_category_menu(page, key, cx);
                 out.push(placed("tiny-category-menu", Place::Pointer(*at), Layer::Menu, window, fade_in("tiny-category-fade", 120, menu)));

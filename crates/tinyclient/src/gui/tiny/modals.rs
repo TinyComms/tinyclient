@@ -117,6 +117,14 @@ impl Shell {
                     .children(self.modal_error())
                     .child(self.buttons("Delete channel", ButtonKind::Danger, cx, move |this, cx| this.tiny_delete_room(id.clone(), cx)))
             }
+            Modal::DeleteChannel(channel_id) => {
+                let (name, _) = self.tiny_text_channel_info(channel_id);
+                let id = channel_id.clone();
+                modal(format!("Delete #{name}?"))
+                    .child(words("Its messages and files are deleted for everyone. This can't be undone."))
+                    .children(self.modal_error())
+                    .child(self.buttons("Delete channel", ButtonKind::Danger, cx, move |this, cx| this.tiny_delete_channel(id.clone(), cx)))
+            }
             Modal::DeleteCategory(category_id) => {
                 let name = page.community.categories.iter().find(|category| category.id == *category_id).map(|category| category.name.clone()).unwrap_or_default();
                 let id = category_id.clone();
@@ -220,6 +228,16 @@ impl Shell {
                     .child(self.input_box(&self.tiny_state.name_input, window, cx))
                     .children(self.modal_error())
                     .child(self.buttons("Save", ButtonKind::Primary, cx, move |this, cx| this.tiny_rename_room(id.clone(), cx)))
+            }
+            Modal::EditChannel(channel_id) => {
+                let id = channel_id.clone();
+                modal("Edit channel")
+                    .child(label("Channel name"))
+                    .child(self.input_box(&self.tiny_state.name_input, window, cx))
+                    .child(label("Topic"))
+                    .child(self.input_box(&self.tiny_state.topic_input, window, cx))
+                    .children(self.modal_error())
+                    .child(self.buttons("Save", ButtonKind::Primary, cx, move |this, cx| this.tiny_update_channel(id.clone(), cx)))
             }
             Modal::NewCategory => modal("Create category")
                 .child(words("A category holds channels and folds away in the list."))

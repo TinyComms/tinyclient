@@ -846,3 +846,50 @@ fn channel_create_sends_position_e2ee_only_when_true_and_explains_refusals() {
         assert!(matches!(long_topic, Response::Error { detail, .. } if detail.contains("1024")));
     });
 }
+
+#[test]
+fn channel_update_never_sends_e2ee_and_clears_topic_and_delete_explains_404() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("PATCH /v1/channels/ch-1 ") {
+            return http(200, "OK", r#"{"id":"ch-1","name":"renamed"}"#);
+        }
+        if first.starts_with("DELETE /v1/channels/ch-1 ") {
+            return http(204, "No Content", "");
+        }
+        if first.starts_with("DELETE /v1/channels/gone ") || first.starts_with("PATCH /v1/channels/gone ") {
+            return http(404, "Not Found", r#"{"error":"not_found"}"#);
+        }
+        http(200, "OK", "{}")
+    });
+    with_session(&base, "owner", |account| {
+        // Rename + clear topic + e2ee set on struct must never serialize e2ee.
+        let res = channel_update(
+            account.clone(),
+            "ch-1".into(),
+            protocol::TinyChannelEdit {
+                name: Some("renamed".into()),
+                topic: Some(String::new()),
+                e2ee: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(res, Response::Ok);
+        let body = json_body(&last(&log, "PATCH /v1/channels/ch-1 "));
+        assert_eq!(body["name"], "renamed");
+        assert_eq!(body["topic"], "");
+        assert!(body.get("e2ee").is_none(), "PATCH must never send e2ee");
+
+        // Delete succeeds with 204.
+        assert_eq!(channel_delete(account.clone(), "ch-1".into()), Response::Ok);
+        // 404 says "That channel is gone."
+        assert_eq!(channel_delete(account.clone(), "gone".into()), said("That channel is gone."));
+        assert_eq!(
+            channel_update(account, "gone".into(), protocol::TinyChannelEdit { name: Some("x".into()), ..Default::default() }),
+            said("That channel is gone.")
+        );
+    });
+}

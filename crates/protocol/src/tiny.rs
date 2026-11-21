@@ -780,6 +780,8 @@ fn tiny_bits(id: &str) -> Option<u64> {
         | "community.rooms.delete"
         | "community.rooms.edit"
         | "community.channels.create"
+        | "community.channels.edit"
+        | "community.channels.delete"
         | "community.categories.manage" => {
             TINY_MANAGE_CHANNELS
         }
@@ -1526,7 +1528,13 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
         "account.name.edit" | "account.sessions.end" | "community.calls.join" => {
             matches!(role, "owner" | "admin" | "member")
         }
-        "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.channels.create" | "community.calls.kick" => {
+        "community.rooms.create"
+        | "community.rooms.rename"
+        | "community.rooms.delete"
+        | "community.channels.create"
+        | "community.channels.edit"
+        | "community.channels.delete"
+        | "community.calls.kick" => {
             matches!(role, "owner" | "admin")
         }
         _ => false,

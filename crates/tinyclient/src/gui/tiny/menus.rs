@@ -324,6 +324,30 @@ impl Shell {
         items
     }
 
+    pub(super) fn tiny_text_channel_menu(&self, page: &Page, channel_id: &str, cx: &mut Context<Self>) -> Option<Div> {
+        let (name, _) = self.tiny_text_channel_info(channel_id);
+        let title = if name.is_empty() { channel_id.to_owned() } else { format!("#{name}") };
+        let can_manage = self.tiny_text_channel_can_manage(page, channel_id);
+        if !can_manage {
+            return None;
+        }
+        let edit_id = channel_id.to_owned();
+        let delete_id = channel_id.to_owned();
+        let items = menu()
+            .w(px(220.))
+            .child(menu_label(title))
+            .child(
+                self.plain(menu_item("tiny-text-channel-edit", Some("icons/pencil.svg"), "Edit channel…", None), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::EditChannel(edit_id.clone()), window, cx))),
+            )
+            .child(menu_separator())
+            .child(
+                self.plain(menu_item_danger("tiny-text-channel-delete", Some("icons/trash-2.svg"), "Delete channel…"), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::DeleteChannel(delete_id.clone()), window, cx))),
+            );
+        Some(items)
+    }
+
     pub(super) fn tiny_category_menu(&self, page: &Page, key: &str, cx: &mut Context<Self>) -> Div {
         let may = page.may;
         let category = page.community.categories.iter().find(|category| category.id == key);

@@ -60,6 +60,7 @@ pub(super) enum Float {
     Header,
     Person { user_id: String, at: Point<Pixels> },
     Channel { room_id: String, at: Point<Pixels> },
+    TextChannel { id: String, at: Point<Pixels> },
     /// A category's header; `key` is its id, or empty for the rooms in none.
     Category { key: String, at: Point<Pixels> },
     /// The connection's numbers, over the user panel.
@@ -90,6 +91,7 @@ pub(super) enum Modal {
     Kick(String),
     Ban(String),
     DeleteRoom(String),
+    DeleteChannel(String),
     DeleteCategory(String),
     /// A new channel (text or voice), in this category.
     NewChannel {
@@ -98,6 +100,7 @@ pub(super) enum Modal {
         e2ee: bool,
     },
     RenameRoom(String),
+    EditChannel(String),
     NewCategory,
     Profile(String),
     /// Signing out of the server: the encrypted history kept on this device (the default) or
@@ -701,6 +704,18 @@ impl Shell {
 
     /// A fresh read of the page. What it no longer has goes from the panes and menus with it.
     fn tiny_loaded(&mut self, community: TinyCommunity, cx: &mut Context<Self>) {
+        let had_channel = |id: &str| {
+            self.tiny_state
+                .community
+                .as_ref()
+                .is_some_and(|prev| prev.channels.iter().any(|ch| ch.id == id))
+        };
+        let channel_gone = |id: &String| community.channels.iter().all(|ch| &ch.id != id);
+        if let (Some(account), Some(open)) = (self.tiny_state.account.as_ref(), self.open.as_ref()) {
+            if open.network == Network::Tiny && open.account == account.account && had_channel(&open.id) && channel_gone(&open.id) {
+                self.open = None;
+            }
+        }
         let state = &mut self.tiny_state;
         let room_gone = |id: &String| community.rooms.iter().all(|room| &room.id != id);
         let person_gone = |id: &String| community.members.iter().all(|member| &member.user_id != id);
@@ -711,6 +726,7 @@ impl Shell {
         let stale = match &state.float {
             Some(Float::Person { user_id, .. }) => person_gone(user_id),
             Some(Float::Channel { room_id, .. }) => room_gone(room_id),
+            Some(Float::TextChannel { id, .. }) => !community.channels.is_empty() && channel_gone(id),
             _ => false,
         };
         if stale {
@@ -720,6 +736,7 @@ impl Shell {
         let stale = match &state.modal {
             Some(Modal::Kick(id) | Modal::Ban(id) | Modal::Profile(id)) => person_gone(id),
             Some(Modal::DeleteRoom(id) | Modal::RenameRoom(id)) => room_gone(id),
+            Some(Modal::DeleteChannel(id) | Modal::EditChannel(id)) => !community.channels.is_empty() && channel_gone(id),
             _ => false,
         };
         if stale {
@@ -1357,6 +1374,7 @@ impl Shell {
             Some(Modal::NewChannel { category, kind: NewChannelKind::Voice, .. }) => self.tiny_create_room(category, cx),
             Some(Modal::NewChannel { category, kind: NewChannelKind::Text, e2ee }) => self.tiny_create_channel(category, e2ee, cx),
             Some(Modal::RenameRoom(room_id)) => self.tiny_rename_room(room_id, cx),
+            Some(Modal::EditChannel(channel_id)) => self.tiny_update_channel(channel_id, cx),
             Some(Modal::NewCategory) => self.tiny_create_category(cx),
             _ => {}
         }
@@ -1465,6 +1483,65 @@ impl Shell {
         self.act(Request::TinyRoomRename { account, room_id, name }, cx);
     }
 
+    pub(super) fn tiny_update_channel(&mut self, channel_id: String, cx: &mut Context<Self>) {
+        let (Some(account), Some(name)) = (self.with_account(), self.typed_name(cx)) else {
+            return;
+        };
+        let topic = self.tiny_state.topic_input.read(cx).text().trim().to_owned();
+        if topic.chars().count() > protocol::TINY_CHANNEL_TOPIC_MAX {
+            self.tiny_state.modal_error = Some("A topic is at most 1024 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.act(
+            Request::TinyChannelUpdate {
+                account,
+                channel_id,
+                channel: protocol::TinyChannelEdit {
+                    name: Some(name),
+                    topic: Some(topic),
+                    ..Default::default()
+                },
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn tiny_delete_channel(&mut self, channel_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.with_account() else {
+            return;
+        };
+        if self.open.as_ref().is_some_and(|key| key.network == Network::Tiny && key.account == account.account && key.id == channel_id) {
+            self.open = None;
+        }
+        self.act(Request::TinyChannelDelete { account, channel_id }, cx);
+    }
+
+    pub(super) fn tiny_text_channel_can_manage(&self, page: &Page, channel_id: &str) -> bool {
+        if let (Some(access), Some(channel)) = (
+            page.community.access.as_ref(),
+            page.community.channels.iter().find(|ch| ch.id == channel_id),
+        ) {
+            return access.has_in_channel(channel, protocol::TINY_MANAGE_CHANNELS);
+        }
+        page.may.edit_room
+    }
+
+    pub(super) fn tiny_text_channel_info(&self, channel_id: &str) -> (String, String) {
+        if let Some(ch) = self
+            .tiny_state
+            .community
+            .as_ref()
+            .and_then(|c| c.channels.iter().find(|ch| ch.id == channel_id))
+        {
+            return (ch.name.clone(), ch.topic.clone());
+        }
+        if let Some(chat) = self.tiny_chats().into_iter().find(|c| c.key.id == channel_id) {
+            return (chat.title.clone(), chat.topic.clone());
+        }
+        (String::new(), String::new())
+    }
+
     pub(super) fn tiny_create_category(&mut self, cx: &mut Context<Self>) {
         let (Some(account), Some(name)) = (self.with_account(), self.typed_name(cx)) else {
             return;
@@ -1500,6 +1577,12 @@ impl Shell {
             Modal::RenameRoom(room_id) => {
                 let now = self.tiny_state.community.as_ref().and_then(|community| community.rooms.iter().find(|room| room.id == *room_id)).map(|room| room.name.clone()).unwrap_or_default();
                 self.tiny_state.name_input.update(cx, |input, cx| input.set_text(&now, cx));
+                Some(self.tiny_state.name_input.clone())
+            }
+            Modal::EditChannel(channel_id) => {
+                let (name_now, topic_now) = self.tiny_text_channel_info(channel_id);
+                self.tiny_state.name_input.update(cx, |input, cx| input.set_text(&name_now, cx));
+                self.tiny_state.topic_input.update(cx, |input, cx| input.set_text(&topic_now, cx));
                 Some(self.tiny_state.name_input.clone())
             }
             Modal::Transfer(_) | Modal::RevokeInvites { typed: true } => {

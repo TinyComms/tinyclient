@@ -3118,6 +3118,8 @@ impl Chat {
             Request::TinyLayout { account, groups } => adapters::tiny::manage::layout(account, groups),
             Request::TinyRoomCreateWith { account, room } => adapters::tiny::manage::room_create(account, room),
             Request::TinyChannelCreate { account, channel } => adapters::tiny::manage::channel_create(account, channel),
+            Request::TinyChannelUpdate { account, channel_id, channel } => adapters::tiny::manage::channel_update(account, channel_id, channel),
+            Request::TinyChannelDelete { account, channel_id } => adapters::tiny::manage::channel_delete(account, channel_id),
             Request::TinyRoomUpdate { account, room_id, room } => adapters::tiny::manage::room_update(account, room_id, room),
             Request::TinyOverrideSet { account, room_id, role_id, allow, deny } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
             Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),
