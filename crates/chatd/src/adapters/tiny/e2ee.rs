@@ -3607,6 +3607,7 @@ impl Device {
         for user in met {
             status.people.push(self.person_known(&user, names));
         }
+        status.community = community::read_status(&self.saved, &self.dir);
         status
     }
 
@@ -3984,6 +3985,16 @@ pub(crate) fn answer(
         | E2eeAsk::ExportBackup { .. }
         | E2eeAsk::ImportBackup { .. } => Response::Ok,
         E2eeAsk::Repair { .. } => unreachable!("repair starts before taking the device lock"),
+        E2eeAsk::PublishCommunityPolicy { policy, replace } => {
+            let dir = device.dir.clone();
+            drop(device);
+            done(community::publish_policy(saved, &dir, &policy, replace))
+        }
+        E2eeAsk::AcceptCommunityRoot => {
+            let dir = device.dir.clone();
+            drop(device);
+            done(community::accept_root(saved, &dir))
+        }
     }
 }
 
@@ -4094,6 +4105,7 @@ pub fn prove_encrypted_reaction() -> Result<(), String> {
 mod backup;
 mod linking;
 mod approval;
+mod community;
 mod repair;
 mod cache_auth;
 use cache_auth::Authentication;
