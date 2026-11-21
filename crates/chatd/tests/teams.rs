@@ -2032,14 +2032,20 @@ fn unread_count_from_horizon_and_mark_unread_sync() {
     });
     assert!(unread_call.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;"));
 
-    // 3. Another device moving consumptionhorizon backwards via ConversationUpdate rewinds last_read and unread count.
+    // 3. Another device moving consumptionhorizon backwards via ConversationUpdate rewinds last_read and unread count
+    //    (with a clientTimestamp newer than our local MarkRead write).
     assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
     assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    let newer_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
     world.fake.push(
         "ConversationUpdate",
         json!({
             "id": "19:grp1@thread.v2",
-            "properties": {"consumptionhorizon": "1759500000300;1759500000900;1759500000300"},
+            "properties": {"consumptionhorizon": format!("1759500000300;{newer_ts};1759500000300")},
             "lastMessage": {"id": "1759500000800"}
         }),
         false,
