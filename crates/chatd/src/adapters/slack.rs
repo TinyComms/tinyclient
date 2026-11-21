@@ -916,7 +916,6 @@ impl Slack {
             state.expired = None;
             state.resync = true;
             state.groups_listed = false;
-            state.drafts_loaded = false;
             // What was whole may have a hole now: the socket was down.
             state.covered.clear();
         }
