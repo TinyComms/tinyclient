@@ -1707,6 +1707,35 @@ impl Chat {
         }
     }
 
+    fn discover(&self, account: AccountKey, query: String, category: u32, offset: u32, limit: u32) -> Response {
+        if account.network != Network::Discord {
+            return error(ErrorCode::Refused, "Discovery is a Discord list.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::Discover { query, category, offset, limit, reply }) {
+            Ok((guilds, total)) => Response::Discovered { guilds, total },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn join_discovered(&self, account: AccountKey, guild_id: String) -> Response {
+        if account.network != Network::Discord || !discovery_snowflake(&guild_id) {
+            return error(ErrorCode::Refused, "That is not a server you can join from Discovery.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::JoinDiscovered { guild_id, reply }) {
+            Ok((space_id, channel_id)) => Response::InviteJoined {
+                space: space_id.filter(|id| discovery_snowflake(id)).map(|id| Key::new(&account, id)),
+                conversation: channel_id.filter(|id| discovery_snowflake(id)).map(|id| Key::new(&account, id)),
+            },
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -3462,6 +3491,8 @@ impl Chat {
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
+            Request::Discover { account, query, category, offset, limit } => self.discover(account, query, category, offset, limit),
+            Request::JoinDiscovered { account, guild_id } => self.join_discovered(account, guild_id),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
@@ -4110,6 +4141,11 @@ impl Chat {
             }
         }
     }
+}
+
+/// A Discord snowflake: digits only, short enough to be an id and not a URL.
+fn discovery_snowflake(id: &str) -> bool {
+    (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Tiny keeps every server in the one item. A second sign-in is folded in before anything is

@@ -168,6 +168,8 @@ pub struct State {
     pub join_server: Option<JoinServerModal>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
+    /// The search field on Discord's Discover list.
+    discover_input: Option<Entity<crate::gui::input::TextInput>>,
 }
 
 pub struct JoinServerModal {
@@ -300,6 +302,7 @@ impl State {
             create_channel: None,
             join_server: None,
             leave_space: None,
+            discover_input: None,
         }
     }
 
@@ -1745,7 +1748,9 @@ impl Shell {
                 home::Drill::Calls => "Calls".to_owned(),
                 home::Drill::Requests => "Message requests".to_owned(),
                 home::Drill::Topics(forum) => forum.title.clone(),
+                home::Drill::Discover => "Discover".to_owned(),
             };
+            let field = matches!(drill, home::Drill::Discover).then(|| self.sidebar_state.discover_input.clone()).flatten();
             let place = match drill {
                 home::Drill::Threads(space) | home::Drill::Drafts(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
                 _ => None,
@@ -1754,7 +1759,21 @@ impl Shell {
                 .pl(px(10.))
                 .child(back("drill-up", "Back".into(), cx))
                 .child(pane_title(title))
-                .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)));
+                .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)))
+                .when_some(field, |strip, input| {
+                    strip.child(
+                        div()
+                            .w(px(180.))
+                            .flex_none()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::canvas())
+                            .border_1()
+                            .border_color(theme::border())
+                            .child(input),
+                    )
+                });
         }
         match mode {
             Mode::Inbox => {

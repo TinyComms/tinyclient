@@ -356,6 +356,8 @@ struct State {
     /// Friends' status emoji and what they are doing, as their presence last said, so a voice
     /// state can be told beside it.
     doing: HashMap<String, (String, Option<protocol::Activity>)>,
+    /// Vanity codes from Discovery, by server id. A code only, never a URL.
+    discovered_vanity: HashMap<String, String>,
     /// When the last profile was asked for: the route is watched, so one per 3 s at most.
     profiled: Option<Instant>,
     /// How many profiles have been asked for: one still waiting its turn that is not the newest
@@ -1376,6 +1378,85 @@ impl Discord {
         Ok((space_id, channel_id))
     }
 
+    /// Public servers (`GET /discoverable-guilds`, or `/search` when there is a query).
+    /// A URL in the listing is never requested and never stored as a join target.
+    fn discover(&self, query: &str, category: u32, offset: u32, limit: u32) -> Result<(Vec<protocol::DiscoveredGuild>, u32), Refusal> {
+        let query: String = query.trim().chars().take(100).collect();
+        let limit = if limit == 0 { 24 } else { limit.min(48) };
+        let path = if query.is_empty() {
+            let mut path = format!("/discoverable-guilds?limit={limit}&offset={offset}");
+            if category != 0 {
+                path.push_str(&format!("&categories={category}"));
+            }
+            path
+        } else {
+            let mut path = format!("/discoverable-guilds/search?query={}&limit={limit}&offset={offset}", escaped(&query));
+            if category != 0 {
+                path.push_str(&format!("&category_id={category}"));
+            }
+            path
+        };
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let total = parsed.get("total").and_then(Value::as_u64).unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let mut guilds = Vec::new();
+        let mut vanity = Vec::new();
+        for row in parsed.get("guilds").and_then(Value::as_array).into_iter().flatten() {
+            let Some(id) = row.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) else {
+                continue;
+            };
+            let Some(name) = row.get("name").and_then(Value::as_str).map(str::trim).filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            // The route is already the public list. A features list that names something else is not.
+            let listed = row.get("features").and_then(Value::as_array);
+            if listed.is_some_and(|list| !list.is_empty() && !list.iter().any(|flag| flag.as_str() == Some("DISCOVERABLE"))) {
+                continue;
+            }
+            let icon = row.get("icon").and_then(Value::as_str).filter(|hash| icon_hash(hash)).unwrap_or("").to_owned();
+            let description: String = row.get("description").and_then(Value::as_str).unwrap_or("").chars().take(300).collect();
+            if let Some(code) = row.get("vanity_url_code").and_then(Value::as_str).filter(|code| discovery_code(code)) {
+                vanity.push((id.to_owned(), code.to_owned()));
+            }
+            let count = |key: &str| row.get(key).and_then(Value::as_u64).unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+            guilds.push(protocol::DiscoveredGuild {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                description,
+                icon,
+                members: count("approximate_member_count"),
+                online: count("approximate_presence_count"),
+            });
+        }
+        if !vanity.is_empty() {
+            let mut state = crate::hub::lock(&self.state);
+            if state.discovered_vanity.len() > 128 {
+                state.discovered_vanity.clear();
+            }
+            for (id, code) in vanity {
+                state.discovered_vanity.insert(id, code);
+            }
+        }
+        Ok((guilds, total))
+    }
+
+    /// Joins a public server by its id (`PUT /guilds/{id}/members/@me`). A vanity code stored
+    /// from that listing is the only fallback, and only when it is a code.
+    fn join_discovered(&self, guild_id: &str) -> Result<(Option<String>, Option<String>), Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server you can join from Discovery.".to_owned()));
+        }
+        let vanity = crate::hub::lock(&self.state).discovered_vanity.get(guild_id).cloned().filter(|code| discovery_code(code));
+        let path = format!("/guilds/{guild_id}/members/@me");
+        match self.rest.call_once_with("PUT", &path, Some(json!({})), &[]) {
+            Ok(_) => Ok((Some(guild_id.to_owned()), None)),
+            Err(err) => match vanity {
+                Some(code) => self.invite_join(&code),
+                None => Err(refusal(err)),
+            },
+        }
+    }
+
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
     /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
     /// does this.
@@ -1861,6 +1942,10 @@ impl Discord {
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
             Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
+            Command::Discover { query, category, offset, limit, reply } => {
+                answer(reply, self.discover(&query, category, offset, limit))
+            }
+            Command::JoinDiscovered { guild_id, reply } => answer(reply, self.join_discovered(&guild_id)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
@@ -2031,6 +2116,21 @@ fn add_friend_refusal(err: Refused) -> Refusal {
         }
         other => refusal(other),
     }
+}
+
+/// Digits only. A URL is not a server id.
+fn discovery_snowflake(id: &str) -> bool {
+    (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A vanity code from a listing: letters, digits, and hyphens. Never a URL.
+fn discovery_code(code: &str) -> bool {
+    (2..=32).contains(&code.len()) && code.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Discord's icon hash. A slash or a colon means it is a URL, which is dropped.
+fn icon_hash(hash: &str) -> bool {
+    (1..=64).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Extracts a Discord invite code from `discord.gg/<code>`, `discord.com/invite/<code>`,

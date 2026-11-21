@@ -5,6 +5,7 @@ use super::home::{self, Act, Drill, Item};
 use super::{joins_from_list, on_screen, respliced, Mode};
 use crate::client::ask;
 use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, Avatar, Shape};
+use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -29,6 +30,9 @@ struct Read {
     calls: Vec<protocol::CallLogEntry>,
     calls_next: Option<String>,
     calls_more: bool,
+    discover: Vec<protocol::DiscoveredGuild>,
+    discover_total: u32,
+    discover_error: String,
 }
 
 fn conversations(request: &Request) -> std::io::Result<(Vec<Conversation>, u32)> {
@@ -62,15 +66,28 @@ impl Shell {
             Mode::Space(space) if space.network == Network::Discord => Network::Discord,
             _ => return,
         };
+        // Discover is its own list. Mapping it onto the main shelf would draw the home's chats.
+        let discovering = matches!(self.sidebar_state.drill, Some(Drill::Discover));
+        let discover_query = self.sidebar_state.home.discover_query.clone();
+        let discord_account = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Discord && a.link == protocol::Link::Connected))
+            .map(|a| a.key.clone());
         // Keys only: the read runs off this thread.
-        let drill = self.sidebar_state.drill.as_ref().map(|drill| match drill {
-            Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false),
-            Drill::Drafts(_) => (Shelf::Main, None, None, false),
-            Drill::Archive => (Shelf::Archive, None, None, false),
-            Drill::Calls => (Shelf::Main, None, None, true),
-            Drill::Requests => (Shelf::Requests, None, None, false),
-            Drill::Topics(forum) => (Shelf::Main, None, Some(forum.key.clone()), false),
-        });
+        let drill = if discovering {
+            None
+        } else {
+            self.sidebar_state.drill.as_ref().map(|drill| match drill {
+                Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false),
+                Drill::Drafts(_) => (Shelf::Main, None, None, false),
+                Drill::Archive => (Shelf::Archive, None, None, false),
+                Drill::Calls => (Shelf::Main, None, None, true),
+                Drill::Requests => (Shelf::Requests, None, None, false),
+                Drill::Topics(forum) => (Shelf::Main, None, Some(forum.key.clone()), false),
+                Drill::Discover => unreachable!("Discover is read on its own"),
+            })
+        };
         let tg_account = self
             .snapshot
             .as_ref()
@@ -82,6 +99,18 @@ impl Shell {
         let epoch = self.sidebar_state.home.epoch;
         let read = move || -> std::io::Result<Read> {
             let mut read = Read::default();
+            if discovering {
+                if let Some(account) = discord_account {
+                    match ask(&Request::Discover { account, query: discover_query, category: 0, offset: 0, limit: 24 })? {
+                        Response::Discovered { guilds, total } => {
+                            read.discover = guilds;
+                            read.discover_total = total;
+                        }
+                        Response::Error { detail, .. } => read.discover_error = detail,
+                        _ => read.discover_error = crate::client::OTHER_ANSWER.to_owned(),
+                    }
+                }
+            }
             match drill {
                 Some((_, _, _, true)) => {
                     if let Some(account) = tg_account {
@@ -146,6 +175,11 @@ impl Shell {
                 home.calls_next = read.calls_next;
                 home.calls_more = read.calls_more;
             }
+            if matches!(this.sidebar_state.drill, Some(Drill::Discover)) {
+                home.discover = read.discover;
+                home.discover_total = read.discover_total;
+                home.discover_error = read.discover_error;
+            }
             home.loaded = true;
             home.loaded_once = true;
             this.rebuild_home(cx);
@@ -160,6 +194,52 @@ impl Shell {
                     this.sidebar_state.friend_requests = requests;
                     cx.notify();
                 }
+            }
+        });
+    }
+
+    /// Opens Discord's public-server list and the field that searches it.
+    fn open_discover(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.sidebar_state.mode, Mode::Space(_)) {
+            self.go(Mode::Network(Network::Discord), cx);
+        }
+        if self.sidebar_state.discover_input.is_none() {
+            let input = cx.new(|cx| TextInput::new("Search public servers", cx));
+            cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Submit) {
+                    let words = this
+                        .sidebar_state
+                        .discover_input
+                        .as_ref()
+                        .map(|field| field.read(cx).text().trim().to_owned())
+                        .unwrap_or_default();
+                    this.sidebar_state.home.discover_query = words;
+                    this.load_home(cx);
+                }
+            })
+            .detach();
+            self.sidebar_state.discover_input = Some(input);
+        }
+        self.drill(Drill::Discover, cx);
+    }
+
+    /// Joins one server from the list. The id has to be a snowflake before anything is asked.
+    fn join_discovered(&mut self, guild_id: String, cx: &mut Context<Self>) {
+        let snowflake = (1..=20).contains(&guild_id.len()) && guild_id.bytes().all(|byte| byte.is_ascii_digit());
+        if !snowflake {
+            return;
+        }
+        let Some(account) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Discord && a.link == protocol::Link::Connected))
+            .map(|a| a.key.clone())
+        else {
+            return;
+        };
+        self.off_thread(cx, move || ask(&Request::JoinDiscovered { account, guild_id }), |this, answer, cx| {
+            if let Ok(Response::InviteJoined { space: Some(space), .. }) = answer {
+                this.go(Mode::Space(space), cx);
             }
         });
     }
@@ -224,6 +304,18 @@ impl Shell {
                 }
                 out
             }
+            (Mode::Network(_), Some(Drill::Discover)) => state
+                .home
+                .discover
+                .iter()
+                .map(|guild| Item::Action {
+                    act: Act::JoinFound(guild.id.clone()),
+                    icon: "icons/hash.svg",
+                    words: guild.name.clone(),
+                    after: if guild.members == 0 { String::new() } else { guild.members.to_string() },
+                    dot: None,
+                })
+                .collect(),
             (Mode::Network(_), Some(Drill::Drafts(space))) => self
                 .trees
                 .get(space)
@@ -365,6 +457,8 @@ impl Shell {
                         home.hidden_shown.insert(id);
                     }
                 }
+                Act::Discover => return self.open_discover(cx),
+                Act::JoinFound(id) => return self.join_discovered(id, cx),
             },
             Item::Folder { id, .. } => {
                 if !home.opened.remove(&id) {
@@ -508,7 +602,7 @@ impl Shell {
                     _ => Some(faint_words(after.clone())),
                 };
                 // Message requests is a mail glyph and a count. Archive is the row that drills.
-                let chevron = matches!(act, Act::Archive).then(|| glyph("icons/chevron-right.svg", 12., theme::text_faint()));
+                let chevron = matches!(act, Act::Archive | Act::Discover).then(|| glyph("icons/chevron-right.svg", 12., theme::text_faint()));
                 let trailing = match (trailing, chevron) {
                     (Some(trailing), Some(chevron)) => Some(div().flex().items_center().gap(px(6.)).child(trailing).child(chevron)),
                     (None, chevron) => chevron.map(|chevron| div().child(chevron)),
@@ -777,6 +871,10 @@ impl Shell {
             (_, Some(Drill::Calls)) => ("icons/phone.svg", "No recent calls".into(), "Your Telegram calls show up here.".into()),
             (_, Some(Drill::Requests)) => ("icons/mail.svg", "No message requests".into(), "Messages from people you don't know wait here.".into()),
             (_, Some(Drill::Topics(_))) => ("icons/messages-square.svg", "No topics yet".into(), "Topics of this group show up here.".into()),
+            (_, Some(Drill::Discover)) if !state.home.discover_error.is_empty() => {
+                ("icons/search.svg", "Discovery isn't available".into(), state.home.discover_error.clone())
+            }
+            (_, Some(Drill::Discover)) => ("icons/search.svg", "No public servers".into(), "Search finds servers Discord lists as public.".into()),
             (Some(Network::Discord), None) if state.home_unread => ("icons/check.svg", "Nothing unread".into(), String::new()),
             (Some(Network::Discord), None) => ("icons/hash.svg", "No servers yet".into(), "Servers you join in Discord show up here.".into()),
             (Some(Network::Telegram), None) => match state.home.folder.as_ref().and_then(|id| state.home.folders.iter().find(|f| &f.key.id == id)) {

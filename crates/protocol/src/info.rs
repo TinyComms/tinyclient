@@ -683,6 +683,22 @@ pub struct Capabilities {
     pub follow_threads: bool,
 }
 
+/// One public server from Discord Discovery (`Request::Discover`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredGuild {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Discord's icon hash. Never a URL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub members: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub online: u32,
+}
+
 /// Preview of a Space invite (`Request::InvitePreview`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvitePreview {
@@ -1498,5 +1514,25 @@ mod tests {
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&e_resp).unwrap()).unwrap(), e_resp);
         let s_resp = Response::SpaceSticker { sticker: Box::new(sticker) };
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&s_resp).unwrap()).unwrap(), s_resp);
+    }
+
+    #[test]
+    fn discover_requests_round_trip_and_default_the_new_fields() {
+        use crate::Response;
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let listed = Request::Discover { account: account.clone(), query: String::new(), category: 0, offset: 0, limit: 0 };
+        let wire = serde_json::to_string(&listed).unwrap();
+        assert!(!wire.contains("\"query\"") && !wire.contains("category"), "{wire}");
+        assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), listed);
+        let account_json = serde_json::to_string(&account).unwrap();
+        let bare = format!(r#"{{"op":"discover","account":{account_json}}}"#);
+        assert_eq!(serde_json::from_str::<Request>(&bare).unwrap(), listed);
+        let searched = Request::Discover { account: account.clone(), query: "lichen".into(), category: 1, offset: 24, limit: 24 };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&searched).unwrap()).unwrap(), searched);
+        let join = Request::JoinDiscovered { account, guild_id: "5000".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&join).unwrap()).unwrap(), join);
+        let guild = DiscoveredGuild { id: "5000".into(), name: "Lichen".into(), description: String::new(), icon: String::new(), members: 12, online: 3 };
+        let resp = Response::Discovered { guilds: vec![guild], total: 1 };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
     }
 }

@@ -3825,6 +3825,93 @@ fn home_search_asks_every_direct_message_and_drops_text_the_user_cannot_read() {
     assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
 }
 
+#[test]
+fn discovery_lists_public_servers_and_refuses_a_url_join() {
+    let world = polished();
+    let account = world.account();
+    world.discord.script("/discoverable-guilds", 200, json!({
+        "guilds": [
+            {"id": "5001", "name": "Hidden", "description": "hidden-blurb", "features": ["COMMUNITY"]},
+            {"id": "https://evil.example/join", "name": "Do not open", "features": ["DISCOVERABLE"], "vanity_url_code": "https://evil.example/join"},
+            {
+                "id": "5000", "name": "Lichen", "description": "Crabs", "features": ["DISCOVERABLE"],
+                "approximate_member_count": 12, "approximate_presence_count": 3,
+                "icon": "https://evil.example/icon.png", "vanity_url_code": "https://evil.example/join",
+            },
+            {"id": "5002", "name": "Moss", "features": ["DISCOVERABLE"], "vanity_url_code": "moss-hang", "approximate_member_count": 4},
+        ],
+        "total": 2,
+    }));
+    let found = match world.ask(Request::Discover { account: account.clone(), query: String::new(), category: 0, offset: 0, limit: 0 }) {
+        Response::Discovered { guilds, total } => {
+            assert_eq!(total, 2);
+            guilds
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].id, "5000");
+    assert_eq!(found[0].name, "Lichen");
+    assert_eq!(found[0].members, 12);
+    assert_eq!(found[0].online, 3);
+    assert!(found[0].icon.is_empty(), "a URL is not an icon hash");
+    let shown = format!("{found:?}");
+    assert!(!shown.contains("hidden-blurb") && !shown.contains("Do not open") && !shown.contains("evil.example"), "{shown}");
+    let listed = world.discord.requests_to("GET", "/discoverable-guilds");
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].path.starts_with("/discoverable-guilds?") && !listed[0].path.contains("evil.example"), "{}", listed[0].path);
+
+    world.discord.script("/discoverable-guilds/search", 200, json!({
+        "guilds": [{"id": "5000", "name": "Lichen", "features": ["DISCOVERABLE"], "approximate_member_count": 12}],
+        "total": 1,
+    }));
+    let searched = world.ask(Request::Discover { account: account.clone(), query: "lichen".into(), category: 0, offset: 0, limit: 0 });
+    assert!(matches!(searched, Response::Discovered { guilds, .. } if guilds.len() == 1), "{searched:?}");
+    let search = world.discord.requests_to("GET", "/discoverable-guilds/search");
+    assert_eq!(search.len(), 1);
+    assert!(search[0].path.contains("query=lichen") && !search[0].path.contains("guild_ids"), "{}", search[0].path);
+
+    // The listing's vanity was a URL, so a refused join does not follow it.
+    world.discord.script("/guilds/5000/members/@me", 403, json!({"message": "Missing Access", "code": 50001}));
+    let blocked = world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "5000".into() });
+    assert!(matches!(blocked, Response::Error { .. }), "{blocked:?}");
+    assert!(world.discord.requests_to("POST", "/invites/").is_empty());
+    assert!(world.discord.asked().iter().all(|path| !path.contains("evil.example")), "{:?}", world.discord.asked());
+
+    world.discord.script("/guilds/5000/members/@me", 200, json!({"user": {"id": "1000"}, "roles": []}));
+    match world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "5000".into() }) {
+        Response::InviteJoined { space, .. } => assert_eq!(space, Some(world.key("5000"))),
+        other => panic!("{other:?}"),
+    }
+    let joined = world.discord.requests_to("PUT", "/guilds/5000/members/@me");
+    assert_eq!(joined.len(), 2);
+    assert!(world.discord.requests_to("POST", "/invites/").is_empty());
+
+    let puts = world.discord.requests_to("PUT", "/guilds/").len();
+    let url = world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "https://evil.example/join".into() });
+    assert!(matches!(url, Response::Error { .. }), "{url:?}");
+    assert_eq!(world.discord.requests_to("PUT", "/guilds/").len(), puts, "a URL is refused before any request");
+    assert!(world.discord.asked().iter().all(|path| !path.contains("evil.example")));
+
+    // A refused join falls back only to a vanity code stored from the listing.
+    world.discord.script("/guilds/5002/members/@me", 403, json!({"message": "Missing Access", "code": 50001}));
+    world.discord.script("/invites/moss-hang", 200, json!({"guild": {"id": "5002"}, "channel": {"id": "5102"}}));
+    match world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "5002".into() }) {
+        Response::InviteJoined { space, conversation } => {
+            assert_eq!(space, Some(world.key("5002")));
+            assert_eq!(conversation, Some(world.key("5102")));
+        }
+        other => panic!("{other:?}"),
+    }
+    let fallback = world.discord.requests_to("POST", "/invites/moss-hang");
+    assert_eq!(fallback.len(), 1, "{:?}", world.discord.asked());
+    assert_eq!(fallback[0].path, "/invites/moss-hang");
+
+    world.discord.script("/discoverable-guilds", 403, json!({"message": "Missing Access", "code": 50001}));
+    let refused = world.ask(Request::Discover { account, query: String::new(), category: 0, offset: 0, limit: 0 });
+    assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
+}
+
 /// A file of `size` bytes beside the world's directory: chatd never sends from its own.
 fn staged(world: &World, name: &str, size: usize) -> String {
     let dir = world.dir.with_extension("files");

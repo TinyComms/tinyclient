@@ -1746,6 +1746,23 @@ pub enum Request {
         account: AccountKey,
         code: String,
     },
+    /// Browse or search Discord's public servers. `query` empty is the listing.
+    Discover {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        category: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        limit: u32,
+    },
+    /// Join a server from Discovery by its id. Not a URL and not an invite link.
+    JoinDiscovered {
+        account: AccountKey,
+        guild_id: String,
+    },
     /// Read a Space's webhooks, followed channels, and installed bots/integrations.
     SpaceIntegrations {
         space: Key,
@@ -3020,6 +3037,12 @@ pub enum Response {
         space: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
+    },
+    /// Answers `Discover`: public servers, and how many the listing says there are.
+    Discovered {
+        guilds: Vec<DiscoveredGuild>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        total: u32,
     },
     Pinned {
         conversation: Key,
