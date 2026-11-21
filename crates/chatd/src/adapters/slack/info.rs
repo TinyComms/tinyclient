@@ -75,10 +75,6 @@ impl WorkspaceRole {
     fn is_workspace_admin(self) -> bool {
         matches!(self, Self::PrimaryOwner | Self::Owner | Self::Admin)
     }
-
-    fn is_guest(self) -> bool {
-        matches!(self, Self::SingleGuest | Self::MultiGuest)
-    }
 }
 
 /// PNG, GIF, JPEG, or WEBP, from the file bytes.

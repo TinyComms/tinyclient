@@ -2028,7 +2028,8 @@ impl Pane {
                                     protocol::ControlStyle::Default => super::components::ButtonKind::Secondary,
                                 };
                                 let label = if ctrl.label.is_empty() { "Action".to_owned() } else { ctrl.label.clone() };
-                                if let Some(link) = url.clone() {
+                                if !url.is_empty() {
+                                    let link = url.clone();
                                     row = row.child(
                                         super::components::button_with_icon(
                                             ("app-home-btn", ix),
