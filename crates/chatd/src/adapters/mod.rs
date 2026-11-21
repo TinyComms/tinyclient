@@ -685,6 +685,17 @@ pub enum Command {
     ResetNotifyDefaults {
         reply: Reply<protocol::NotifyDefaults>,
     },
+    /// Lists Saved Messages grouped by source peer plus reaction tags (Telegram).
+    SavedDialogs {
+        reply: Reply<(Vec<protocol::SavedDialog>, Vec<protocol::SavedTag>)>,
+    },
+    /// Fetches Saved Messages filtered by source peer and/or reaction tag (Telegram).
+    SavedHistory {
+        peer_id: Option<String>,
+        tag: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<protocol::Message>>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -916,6 +927,8 @@ impl Command {
             Command::GetNotifyDefaults { reply }
             | Command::SetNotifyDefault { reply, .. }
             | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

@@ -1105,6 +1105,154 @@ pub(super) fn reset_notify_defaults(account: &std::sync::Arc<Account>) -> Result
     get_notify_defaults(account)
 }
 
+/// List Saved Messages sub-dialogs (`messages.getSavedDialogs`) and reaction tags
+/// (`messages.getSavedReactionTags`).
+pub(super) fn saved_dialogs(account: &Account) -> Result<(Vec<protocol::SavedDialog>, Vec<protocol::SavedTag>), Fault> {
+    let raw = account.ask(&tl::functions::messages::GetSavedDialogs {
+        exclude_pinned: false,
+        parent_peer: None,
+        offset_date: 0,
+        offset_id: 0,
+        offset_peer: tl::enums::InputPeer::Empty,
+        limit: 100,
+        hash: 0,
+    })?;
+    let (dialogs_raw, messages_raw) = match raw {
+        tl::enums::messages::SavedDialogs::Dialogs(d) => {
+            account.learn(&d.users, &d.chats);
+            (d.dialogs, d.messages)
+        }
+        tl::enums::messages::SavedDialogs::Slice(d) => {
+            account.learn(&d.users, &d.chats);
+            (d.dialogs, d.messages)
+        }
+        tl::enums::messages::SavedDialogs::NotModified(_) => (Vec::new(), Vec::new()),
+    };
+    let mut top_by_id: std::collections::HashMap<i32, (String, i64)> = std::collections::HashMap::new();
+    for msg in &messages_raw {
+        if let tl::enums::Message::Message(m) = msg {
+            top_by_id.insert(m.id, (m.message.clone(), i64::from(m.date)));
+        }
+    }
+    let dir = account.dir();
+    let mut dialogs = Vec::new();
+    for item in dialogs_raw {
+        if let tl::enums::SavedDialog::Dialog(d) = item {
+            let who = Who::of(&d.peer);
+            let title = if who == Who::User(account.me) {
+                "My Notes".to_owned()
+            } else {
+                dir.name(who)
+            };
+            let (preview, updated) = top_by_id.get(&d.top_message).cloned().unwrap_or_default();
+            dialogs.push(protocol::SavedDialog {
+                peer_id: who.text(),
+                title,
+                pinned: d.pinned,
+                preview,
+                updated,
+            });
+        }
+    }
+    let mut tags = Vec::new();
+    if let Ok(tl::enums::messages::SavedReactionTags::Tags(found)) = account.ask(
+        &tl::functions::messages::GetSavedReactionTags { peer: None, hash: 0 },
+    ) {
+        for tl::enums::SavedReactionTag::Tag(t) in found.tags {
+            let emoji = match t.reaction {
+                tl::enums::Reaction::Emoji(e) => e.emoticon,
+                tl::enums::Reaction::CustomEmoji(c) => format!("custom:{}", c.document_id),
+                tl::enums::Reaction::Paid => "⭐".to_owned(),
+                tl::enums::Reaction::Empty => continue,
+            };
+            tags.push(protocol::SavedTag {
+                emoji,
+                title: t.title.unwrap_or_default(),
+                count: t.count.max(0) as u32,
+            });
+        }
+    }
+    Ok((dialogs, tags))
+}
+
+/// Fetch Saved Messages filtered by source peer (`messages.getSavedHistory`) and/or reaction tag
+/// (`messages.search` with `saved_reaction`).
+pub(super) fn saved_history(
+    account: &Account,
+    peer_id: Option<&str>,
+    tag: Option<&str>,
+    limit: u32,
+) -> Result<Vec<Message>, Fault> {
+    let limit = (limit.clamp(1, protocol::PAGE_LIMIT)) as i32;
+    let saved_peer = match peer_id.filter(|s| !s.is_empty()) {
+        Some(pid) => {
+            let (who, _) = Who::parse(pid).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+            Some(account.input(who)?)
+        }
+        None => None,
+    };
+    let raw = if let Some(emoji) = tag.filter(|s| !s.is_empty()) {
+        let reaction = if let Some(id_str) = emoji.strip_prefix("custom:") {
+            let doc_id: i64 = id_str.parse().map_err(|_| invalid("REACTION_INVALID"))?;
+            tl::enums::Reaction::CustomEmoji(tl::types::ReactionCustomEmoji { document_id: doc_id })
+        } else {
+            tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: emoji.to_owned() })
+        };
+        account.ask(&tl::functions::messages::Search {
+            peer: tl::enums::InputPeer::PeerSelf,
+            q: String::new(),
+            from_id: None,
+            saved_peer_id: saved_peer,
+            saved_reaction: Some(vec![reaction]),
+            top_msg_id: None,
+            filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+            min_date: 0,
+            max_date: 0,
+            offset_id: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        })?
+    } else {
+        account.ask(&tl::functions::messages::GetSavedHistory {
+            parent_peer: None,
+            peer: saved_peer.unwrap_or(tl::enums::InputPeer::PeerSelf),
+            offset_id: 0,
+            offset_date: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        })?
+    };
+    let messages_raw = match raw {
+        tl::enums::messages::Messages::Messages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::Slice(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::ChannelMessages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::NotModified(_) => Vec::new(),
+    };
+    let dir = account.dir();
+    let mut out = Vec::new();
+    for raw_msg in &messages_raw {
+        if let Some(mapped) = super::content::map(&dir, raw_msg) {
+            out.push(mapped.message);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

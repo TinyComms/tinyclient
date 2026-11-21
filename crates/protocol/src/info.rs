@@ -693,6 +693,9 @@ pub struct Capabilities {
     /// This account supports reading/updating account-wide notification defaults and exceptions (Telegram).
     #[serde(default, skip_serializing_if = "is_false")]
     pub notify_defaults: bool,
+    /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub saved_subdialogs: bool,
 }
 
 /// Scope of an account-wide notification default (Telegram `InputNotifyUsers` / `Chats` / `Broadcasts`).
@@ -725,6 +728,31 @@ pub struct NotifyDefaults {
     pub channels_muted: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exceptions: Vec<NotifyException>,
+}
+
+/// One sub-view of Saved Messages grouped by source peer (`messages.getSavedDialogs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedDialog {
+    /// Peer id (e.g. `"u7002"`, `"c9001"`, or `"u7001"` for My Notes).
+    pub peer_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
+    #[serde(default)]
+    pub updated: i64,
+}
+
+/// One reaction tag applied to Saved Messages (`messages.getSavedReactionTags`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTag {
+    pub emoji: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub count: u32,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

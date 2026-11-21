@@ -3940,3 +3940,65 @@ fn notify_defaults_read_update_exceptions_and_reset() {
         world.calls()
     );
 }
+
+#[test]
+fn saved_messages_dialogs_history_and_reaction_tags() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.saved_subdialogs, "Telegram must advertise saved_subdialogs capability");
+
+    // Fetch Saved Messages sub-dialogs (by source peer) and reaction tags.
+    let (dialogs, tags) = match world.ask(Request::SavedDialogs { account: account() }) {
+        Response::SavedDialogs { dialogs, tags } => (dialogs, tags),
+        other => panic!("expected SavedDialogs, got {other:?}"),
+    };
+    assert!(
+        dialogs.iter().any(|d| d.peer_id == "u7002" && d.title.contains("Odalys")),
+        "expected Odalys saved dialog, got {dialogs:?}"
+    );
+    assert!(
+        dialogs.iter().any(|d| d.peer_id == "c9001" && d.title.contains("Field Notes")),
+        "expected Field Notes saved dialog, got {dialogs:?}"
+    );
+    assert!(
+        tags.iter().any(|t| t.emoji == "⭐" && t.title == "Gear" && t.count == 2),
+        "expected ⭐ Gear tag, got {tags:?}"
+    );
+
+    // Fetch Saved Messages history for a specific source peer (`messages.getSavedHistory`).
+    let peer_msgs = match world.ask(Request::SavedHistory {
+        account: account(),
+        peer_id: Some("u7002".into()),
+        tag: None,
+        limit: 20,
+    }) {
+        Response::SavedHistory { messages } => messages,
+        other => panic!("expected SavedHistory, got {other:?}"),
+    };
+    assert_eq!(peer_msgs.len(), 1);
+    assert!(peer_msgs[0].text.contains("Trailhead"), "got: {:?}", peer_msgs[0].text);
+    assert!(
+        world.calls().iter().any(|c| c == "GetSavedHistory u7002"),
+        "expected GetSavedHistory u7002 on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Fetch Saved Messages filtered by reaction tag (`messages.search` with `saved_reaction`).
+    let tag_msgs = match world.ask(Request::SavedHistory {
+        account: account(),
+        peer_id: None,
+        tag: Some("⭐".into()),
+        limit: 20,
+    }) {
+        Response::SavedHistory { messages } => messages,
+        other => panic!("expected SavedHistory, got {other:?}"),
+    };
+    assert_eq!(tag_msgs.len(), 1);
+    assert!(tag_msgs[0].text.contains("Packing list"), "got: {:?}", tag_msgs[0].text);
+    assert!(
+        world.calls().iter().any(|c| c == "SearchSavedTag ⭐"),
+        "expected SearchSavedTag ⭐ on wire, got: {:#?}",
+        world.calls()
+    );
+}

@@ -2206,6 +2206,58 @@ impl World {
             self.notify_exceptions.clear();
             return answer(true);
         }
+        if asked::<f::messages::GetSavedDialogs>(body).is_some() {
+            self.log("GetSavedDialogs");
+            let m_odalys = message(Who::User(ME), 201, ME, t0() - 50, "Trailhead at seven.");
+            let m_notes = message(Who::User(ME), 202, ME, t0() - 90, "Snow line is at 1,900 m this week.");
+            let d1 = tl::types::SavedDialog {
+                pinned: true,
+                peer: Who::User(ODALYS).peer(),
+                top_message: 201,
+            }
+            .into();
+            let d2 = tl::types::SavedDialog {
+                pinned: false,
+                peer: Who::Channel(NOTES).peer(),
+                top_message: 202,
+            }
+            .into();
+            let found = tl::types::messages::SavedDialogs {
+                dialogs: vec![d1, d2],
+                messages: vec![m_odalys.into(), m_notes.into()],
+                chats: chats(),
+                users: users(),
+            };
+            return answer(tl::enums::messages::SavedDialogs::Dialogs(found));
+        }
+        if asked::<f::messages::GetSavedReactionTags>(body).is_some() {
+            self.log("GetSavedReactionTags");
+            let tag = tl::types::SavedReactionTag {
+                reaction: tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: "⭐".to_owned() }),
+                title: Some("Gear".to_owned()),
+                count: 2,
+            }
+            .into();
+            return answer(tl::enums::messages::SavedReactionTags::Tags(tl::types::messages::SavedReactionTags {
+                tags: vec![tag],
+                hash: 1,
+            }));
+        }
+        if let Some(request) = asked::<f::messages::GetSavedHistory>(body) {
+            let who = input_who(&request.peer);
+            self.log(&format!("GetSavedHistory {}", who.text()));
+            let msgs = match who {
+                Who::User(ODALYS) => vec![message(Who::User(ME), 201, ME, t0() - 50, "Trailhead at seven.").into()],
+                Who::Channel(NOTES) => vec![message(Who::User(ME), 202, ME, t0() - 90, "Snow line is at 1,900 m this week.").into()],
+                _ => vec![message(Who::User(ME), 2, ME, t0() - 100_000, "Packing list: stove, map, headlamp.").into()],
+            };
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages: msgs,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
+        }
         if asked::<f::account::UpdateStatus>(body).is_some() {
             self.log("UpdateStatus");
             return answer(true);
@@ -2975,6 +3027,21 @@ impl World {
     fn panes(&mut self, body: &[u8], events: &Sender<Event>) -> Option<Result<Vec<u8>, Fault>> {
         use tl::functions as f;
         if let Some(request) = asked::<f::messages::Search>(body) {
+            if let Some(reactions) = request.saved_reaction.as_ref().filter(|r| !r.is_empty()) {
+                let emoji = match &reactions[0] {
+                    tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
+                    tl::enums::Reaction::CustomEmoji(c) => format!("custom:{}", c.document_id),
+                    _ => String::new(),
+                };
+                self.log(&format!("SearchSavedTag {emoji}"));
+                let msgs = vec![message(Who::User(ME), 2, ME, t0() - 100_000, "Packing list: stove, map, headlamp.").into()];
+                return Some(answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                    messages: msgs,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                })));
+            }
             if let tl::enums::MessagesFilter::InputMessagesFilterPhoneCalls(filter) = &request.filter {
                 self.log(&format!("Search calls missed={} offset={}", filter.missed, request.offset_id));
                 let mut calls: Vec<tl::enums::Message> = self

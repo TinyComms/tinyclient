@@ -725,6 +725,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::GetNotifyDefaults { reply }
         | Command::SetNotifyDefault { reply, .. }
         | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(down()))),
+        Command::SavedDialogs { reply } => drop(reply.send(Err(down()))),
+        Command::SavedHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -896,6 +898,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ResetNotifyDefaults { reply } => {
             let _ = reply.send(info::reset_notify_defaults(account).map_err(refused));
+        }
+        Command::SavedDialogs { reply } => {
+            let _ = reply.send(info::saved_dialogs(account).map_err(refused));
+        }
+        Command::SavedHistory { peer_id, tag, limit, reply } => {
+            let _ = reply.send(info::saved_history(account, peer_id.as_deref(), tag.as_deref(), limit).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {

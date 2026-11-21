@@ -3992,6 +3992,19 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::SavedDialogs { account } => {
+                match self.ask(&account, |reply| Command::SavedDialogs { reply }) {
+                    Ok((dialogs, tags)) => Response::SavedDialogs { dialogs, tags },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SavedHistory { account, peer_id, tag, limit } => {
+                let limit = limit.clamp(1, protocol::PAGE_LIMIT);
+                match self.ask(&account, |reply| Command::SavedHistory { peer_id, tag, limit, reply }) {
+                    Ok(messages) => Response::SavedHistory { messages },
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

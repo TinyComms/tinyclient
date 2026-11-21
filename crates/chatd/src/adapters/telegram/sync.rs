@@ -380,6 +380,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         share_contact: true,
         save_gif: true,
         notify_defaults: true,
+        saved_subdialogs: true,
         ..Capabilities::default()
     }
 }

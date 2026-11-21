@@ -2680,6 +2680,22 @@ pub enum Request {
     ResetNotifyDefaults {
         account: AccountKey,
     },
+    /// List Saved Messages sub-dialogs (by source peer) and reaction tags (Telegram).
+    /// Answers `Response::SavedDialogs`.
+    SavedDialogs {
+        account: AccountKey,
+    },
+    /// Fetch Saved Messages filtered by source peer (`saved_peer_id`) and/or reaction tag (Telegram).
+    /// Answers `Response::SavedHistory`.
+    SavedHistory {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3204,6 +3220,16 @@ pub enum Response {
     /// Account-wide notification defaults and per-chat exceptions.
     NotifyDefaults {
         defaults: NotifyDefaults,
+    },
+    /// Saved Messages sub-dialogs and reaction tags (`Request::SavedDialogs`).
+    SavedDialogs {
+        dialogs: Vec<SavedDialog>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<SavedTag>,
+    },
+    /// Saved Messages filtered by source peer or reaction tag (`Request::SavedHistory`).
+    SavedHistory {
+        messages: Vec<Message>,
     },
 }
 
