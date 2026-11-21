@@ -915,7 +915,7 @@ impl Demo {
             // The demo's topics are what its store holds: nothing to fetch, and the landing
             // reads it from there.
             Command::OpenForum { reply, .. } => {
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(Ok(None));
             }
             Command::AnswerMessageRequest { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));

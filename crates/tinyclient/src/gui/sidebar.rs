@@ -1204,20 +1204,32 @@ impl Shell {
         if row.key.network == Network::Discord && row.kind.is_direct() && matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
             self.go(Mode::Network(Network::Discord), cx);
         }
-        if row.kind == ConversationKind::Forum && matches!(row.key.network, Network::Telegram | Network::Discord) {
+        if row.kind == ConversationKind::Forum && row.key.network == Network::Discord {
+            // The main pane is the post list. The sidebar still drills into the posts.
+            self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
+            self.select(row.key.clone(), &row.title, cx);
+            return;
+        }
+        if row.kind == ConversationKind::Forum && row.key.network == Network::Telegram {
             self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
             // The topics drill reads what the store holds; opening the forum asks once for
             // the landing. Telegram lists its topics only on demand, and lands on the newest
-            // unread topic, else General (`03` §2); Discord's posts came on the socket, so
-            // the ask is answered from the store and lands on the newest activity post
-            // (`01` §3, N14). The network catching up behind a later open cannot loop a
-            // change back into a request.
+            // unread topic, else General (`03` §2). The network catching up behind a later
+            // open cannot loop a change back into a request.
             let forum = row.key.clone();
             // Only this visit may choose the landing. Opening another forum (including this
             // same one again), picking a topic, or leaving the drill supersedes its reply.
             let navigation = self.sidebar_state.navigation;
             let requested_forum = forum.clone();
-            let landing = move || ask(&Request::Topics { forum, offset: 0, limit: 1, landing: true });
+            let landing = move || ask(&Request::Topics {
+                forum,
+                offset: 0,
+                limit: 1,
+                landing: true,
+                sort: protocol::TopicSort::Activity,
+                tag: None,
+                query: None,
+            });
             self.off_thread(cx, landing, move |this, answer, cx| {
                 let Ok(Response::Conversations { conversations, .. }) = answer else {
                     return;

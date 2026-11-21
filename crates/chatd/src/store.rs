@@ -184,6 +184,14 @@ const TABLES: &str = "
         can_pin INTEGER NOT NULL DEFAULT 0,
         joined INTEGER NOT NULL DEFAULT 1,
         call_video INTEGER NOT NULL DEFAULT 0,
+        -- A forum post's card: tag ids as ',a,b,', counts, the first message's picture, its
+        -- strongest reaction, and who started it. Written by the post list, not by a thread row.
+        tags TEXT NOT NULL DEFAULT '',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        total_message_sent INTEGER NOT NULL DEFAULT 0,
+        thumbnail TEXT NOT NULL DEFAULT '',
+        reaction TEXT NOT NULL DEFAULT '',
+        owner TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -303,9 +311,12 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video,
+           c.tags, c.message_count, c.total_message_sent, c.reaction, c.owner,
+           th.id, th.kind, th.width, th.height, th.bytes, th.path, th.failed
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
+    LEFT JOIN media th ON th.network = c.network AND th.account = c.account AND th.id = c.thumbnail AND c.thumbnail != ''
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
     LEFT JOIN section g ON g.network = c.network AND g.account = c.account AND g.space = c.space
                        AND g.id = c.section";
@@ -426,6 +437,19 @@ pub struct Filing {
     pub pin: Option<i32>,
     pub hidden: bool,
     pub followed: bool,
+}
+
+/// What a forum post's card shows beyond the conversation row. The post list writes it. A thread
+/// update that does not know these leaves them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostCard {
+    pub tags: Vec<String>,
+    pub message_count: u32,
+    pub total_message_sent: u32,
+    /// A media id already registered, or empty.
+    pub thumbnail: String,
+    pub reaction: String,
+    pub owner: String,
 }
 
 /// One folder as an adapter reports it. chatd counts what is in it.
@@ -754,6 +778,12 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         can_pin: row.get(57)?,
         joined: row.get(58)?,
         call_video: row.get(59)?,
+        tags: from_id_list(&row.get::<_, String>(60)?),
+        message_count: row.get(61)?,
+        total_message_sent: row.get(62)?,
+        reaction: row.get(63)?,
+        owner: row.get(64)?,
+        thumbnail: file_at(row, 65)?,
     })
 }
 
@@ -1073,7 +1103,32 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "call_video")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
     }
+    ensure_post_columns(db)?;
     Ok(true)
+}
+
+/// Forum-post columns on a cache that is already at [`SCHEMA`]. Adding them does not bump the
+/// version: a bump would drop a schema-11 cache, and these have defaults.
+fn ensure_post_columns(db: &Connection) -> rusqlite::Result<()> {
+    if !column(db, "conversation", "tags")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN tags TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "message_count")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "total_message_sent")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN total_message_sent INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "thumbnail")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN thumbnail TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "reaction")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN reaction TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "owner")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN owner TEXT NOT NULL DEFAULT ''")?;
+    }
+    Ok(())
 }
 
 fn column(db: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
@@ -1147,6 +1202,7 @@ impl Store {
         if !column(&store.db, "conversation", "call_video")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
         }
+        ensure_post_columns(&store.db)?;
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
         }
@@ -2112,6 +2168,35 @@ impl Store {
                 filing.pin,
                 filing.hidden,
                 filing.followed,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// A forum post's tags, counts, picture, reaction, and owner. True if a row changed.
+    pub fn set_post(&mut self, conversation: &Key, card: &PostCard) -> rusqlite::Result<bool> {
+        let tags = id_list(&card.tags, 20);
+        let mut reaction = card.reaction.clone();
+        clip(&mut reaction, 80);
+        let mut owner = card.owner.clone();
+        clip(&mut owner, 80);
+        let thumbnail = card.thumbnail.replace(',', "");
+        let changed = self.db.execute(
+            "UPDATE conversation SET tags = ?4, message_count = ?5, total_message_sent = ?6,
+                    thumbnail = ?7, reaction = ?8, owner = ?9
+              WHERE network = ?1 AND account = ?2 AND id = ?3
+                AND (tags != ?4 OR message_count != ?5 OR total_message_sent != ?6
+                     OR thumbnail != ?7 OR reaction != ?8 OR owner != ?9)",
+            params![
+                word(&conversation.network),
+                conversation.account,
+                conversation.id,
+                tags,
+                card.message_count,
+                card.total_message_sent,
+                thumbnail,
+                reaction,
+                owner,
             ],
         )?;
         Ok(changed == 1)

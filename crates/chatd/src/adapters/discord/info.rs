@@ -3,14 +3,15 @@
 //! the server-side search for what was shared. Each is one request at most, and only because
 //! the user opened or clicked something.
 
-use super::super::{About, ConversationAbout, Refusal, Reply, SearchPage, SearchScope, SharedPage, SpaceAbout};
+use super::super::{About, ConversationAbout, Failure, ForumPosts, Refusal, Reply, SearchPage, SearchScope, SharedPage, SpaceAbout};
 use super::model::{self, number, GuildSettings, Posted};
 use super::rest::Refused;
 use super::{escaped, refusal, Discord};
 use crate::hub::now;
+use crate::store::{PostCard, PreviewLine};
 use protocol::{
     ConversationKind, MediaKind, Message, MessageHit, Notify, SearchFilters, SearchHas, SearchSort,
-    SharedItem, SharedKind, Style,
+    SharedItem, SharedKind, Style, TopicSort,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -23,6 +24,10 @@ const PROFILE_EVERY: Duration = Duration::from_secs(3);
 static PROFILE_TURN: Mutex<()> = Mutex::new(());
 /// Discord's search answers 25 messages a page at most.
 const SEARCH_PAGE: u32 = 25;
+/// Discord's forum thread search answers 25 posts a page at most.
+const FORUM_PAGE: u32 = 25;
+/// Most characters Discord's forum search accepts in `name`.
+const FORUM_NAME_MAX: usize = 100;
 /// Most characters Discord's message search accepts in `content`.
 const SEARCH_MAX_CHARS: usize = 1024;
 /// Recent message searches kept in memory per account, so the same scope and words are not
@@ -122,6 +127,74 @@ fn build_search_path(
 
 fn refused(why: impl std::fmt::Display) -> Refusal {
     Refusal::Refused(why.to_string())
+}
+
+fn failure_words(failed: Failure) -> Refusal {
+    let why = match failed {
+        Failure::SignedOut(why) | Failure::Dropped(why) => why,
+    };
+    refused(why)
+}
+
+fn forum_search_failed(failed: Refused, plain: bool) -> Result<Option<ForumPosts>, Refusal> {
+    let denied = matches!(failed, Refused::Status { status: 403, .. } | Refused::Status { code: 50001, .. });
+    if denied || !plain {
+        return Err(refusal(failed));
+    }
+    Ok(None)
+}
+
+/// `GET /channels/{id}/threads/search`. `name` is the documented text query. `archived` is left
+/// off so both active and archived posts come back. Nothing pages past this one request.
+fn forum_search_path(channel: &str, sort: TopicSort, tag: &str, query: &str, offset: u32) -> String {
+    let sort_by = match sort {
+        TopicSort::Activity => "last_message_time",
+        TopicSort::Created => "creation_time",
+    };
+    let mut params = vec![format!("sort_by={sort_by}"), "sort_order=desc".to_owned(), format!("limit={FORUM_PAGE}")];
+    if !tag.is_empty() {
+        params.push(format!("tag={}", escaped(tag)));
+    }
+    let name: String = query.chars().take(FORUM_NAME_MAX).collect();
+    if !name.is_empty() {
+        params.push(format!("name={}", escaped(&name)));
+    }
+    if offset > 0 {
+        params.push(format!("offset={offset}"));
+    }
+    format!("/channels/{}/threads/search?{}", escaped(channel), params.join("&"))
+}
+
+fn post_thumb(message: &Message) -> String {
+    let pictured = |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Gif | MediaKind::Video);
+    message
+        .attachments
+        .iter()
+        .find(|attachment| !attachment.spoiler && (pictured(attachment.file.kind) || attachment.thumb.is_some()))
+        .map(|attachment| attachment.thumb.as_ref().map(|thumb| thumb.id.clone()).unwrap_or_else(|| attachment.file.id.clone()))
+        .unwrap_or_default()
+}
+
+fn top_reaction(message: &Message) -> String {
+    message
+        .reactions
+        .iter()
+        .max_by_key(|reaction| reaction.count.saturating_add(reaction.burst))
+        .filter(|reaction| reaction.count.saturating_add(reaction.burst) > 0)
+        .map(|reaction| reaction.emoji.clone())
+        .unwrap_or_default()
+}
+
+#[derive(Deserialize)]
+struct ThreadSearch {
+    #[serde(default)]
+    threads: Vec<model::Channel>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    total_results: Option<u32>,
+    #[serde(default)]
+    first_messages: Vec<Posted>,
 }
 
 #[derive(Deserialize)]
@@ -328,6 +401,92 @@ impl Discord {
             media: kept.kind == model::MEDIA_FORUM,
             default_slowmode: kept.default_thread_rate_limit_per_user,
         })
+    }
+
+    /// One page of a forum's posts. Archived posts are in this search; nothing walks every page.
+    /// `Ok(None)` is an unfiltered first page Discord did not answer, so the cache can.
+    pub(super) fn forum_posts(
+        &self,
+        channel: &str,
+        sort: TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+        offset: u32,
+    ) -> Result<Option<ForumPosts>, Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("You cannot read this channel."))?;
+        if known.kind != ConversationKind::Forum {
+            return Err(refused("This is not a forum."));
+        }
+        let tag = tag.unwrap_or_default();
+        let query = query.unwrap_or_default();
+        let plain = offset == 0 && sort == TopicSort::Activity && tag.trim().is_empty() && query.trim().is_empty();
+        let path = forum_search_path(channel, sort, tag.trim(), query.trim(), offset);
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(failed) => return forum_search_failed(failed, plain),
+        };
+        let parsed: ThreadSearch = match serde_json::from_str(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                if plain {
+                    return Ok(None);
+                }
+                return Err(refused(err));
+            }
+        };
+        let guild = self.guild_of(&known);
+        let wanted = tag.trim();
+        let ThreadSearch { threads, has_more, total_results, first_messages } = parsed;
+        let mut ids = Vec::new();
+        for thread in threads.into_iter().take(FORUM_PAGE as usize) {
+            if thread.parent_id.as_deref() != Some(channel) {
+                continue;
+            }
+            if !wanted.is_empty() && !thread.applied_tags.iter().any(|have| have == wanted) {
+                continue;
+            }
+            self.thread_changed(thread.clone(), false).map_err(failure_words)?;
+            if self.ctx.known(&thread.id).map_err(refused)?.is_none() {
+                continue;
+            }
+            let (thumbnail, reaction) = match first_messages.iter().find(|posted| posted.channel_id == thread.id) {
+                Some(posted) => self.record_starter(&thread, posted, guild.as_deref()),
+                None => (String::new(), String::new()),
+            };
+            let _ = self.ctx.post_card(&thread.id, &PostCard {
+                tags: thread.applied_tags.clone(),
+                message_count: thread.message_count.unwrap_or(0),
+                total_message_sent: thread.total_message_sent.unwrap_or(0),
+                thumbnail,
+                reaction,
+                owner: thread.owner_id.clone().unwrap_or_default(),
+            });
+            ids.push(thread.id);
+        }
+        let kept = ids.len() as u32;
+        let total = total_results.unwrap_or_else(|| {
+            if has_more { offset.saturating_add(kept).saturating_add(1) } else { offset.saturating_add(kept) }
+        });
+        Ok(Some(ForumPosts { ids, total }))
+    }
+
+    /// The starter message, its picture, and its strongest reaction. A failure here keeps the post.
+    fn record_starter(&self, thread: &model::Channel, posted: &Posted, guild: Option<&str>) -> (String, String) {
+        let (message, files) = self.convert(posted, guild, ConversationKind::Thread);
+        let _ = files.register(&self.ctx);
+        let _ = self.ctx.history(&thread.id, std::slice::from_ref(&message));
+        if !message.text.is_empty() {
+            let sent = thread.last_message_id.as_deref().map(model::seconds).filter(|sent| *sent > 0).unwrap_or(message.sent);
+            let _ = self.ctx.preview(&thread.id, &PreviewLine {
+                id: message.id.clone(),
+                text: message.text.clone(),
+                sender: message.sender.name.clone(),
+                mine: message.outgoing,
+                sent,
+                expires_at: message.expires_at,
+            });
+        }
+        (post_thumb(&message), top_reaction(&message))
     }
 
     /// A server's info: its description and counts in one request, our nickname, roles and the

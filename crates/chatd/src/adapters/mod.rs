@@ -56,7 +56,7 @@ pub mod tiny_bots;
 use crate::hub::{lock, now, Hub};
 use crate::session;
 use crate::store::{
-    ConversationRow, Filing, FolderRow, PersonDetails, PersonRow, PreviewLine, SpaceRow, Stored,
+    ConversationRow, Filing, FolderRow, PersonDetails, PersonRow, PostCard, PreviewLine, SpaceRow, Stored,
     KEEP_MESSAGES,
 };
 use protocol::{
@@ -279,6 +279,13 @@ pub enum Picture {
     Share(bool),
     /// Whose share to watch. `None` stops watching.
     Watch(Option<String>),
+}
+
+/// One page of a forum's posts, in the network's order. `None` from [`Command::OpenForum`] means
+/// the cache still answers an unfiltered first page.
+pub struct ForumPosts {
+    pub ids: Vec<String>,
+    pub total: u32,
 }
 
 /// What chatd asks of an adapter. Ids are the network's own; the account is the adapter's.
@@ -751,9 +758,16 @@ pub enum Command {
     /// The user opened a Space's Threads list: fetch the network's list of followed threads
     /// once, and record them with `Filing::followed`.
     OpenThreads(String),
-    /// The user opened a forum: fetch its topics once and answer, so the landing topic the
-    /// shell then reads from the store is named on what the network says now.
-    OpenForum { conversation_id: String, reply: Reply<()> },
+    /// The user opened a forum, or asked for another page of its posts. Discord answers with
+    /// the page (`Some`); a cache-only network answers `None`. `offset` is the existing cursor.
+    OpenForum {
+        conversation_id: String,
+        sort: protocol::TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+        offset: u32,
+        reply: Reply<Option<ForumPosts>>,
+    },
     /// The user answered, withdrew or ended a friendship, or blocked someone. Report the new
     /// relationship through [`Context::relation`] before answering.
     Relate {
@@ -1288,6 +1302,15 @@ impl Context {
             if line.expires_at.is_some() {
                 self.hub.expiring();
             }
+        }
+        Ok(())
+    }
+
+    /// Tags, counts, picture, reaction, and owner of one forum post.
+    pub fn post_card(&self, conversation_id: &str, card: &PostCard) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_post(&conversation, card)? {
+            self.hub.changed(Change::Conversation { conversation });
         }
         Ok(())
     }

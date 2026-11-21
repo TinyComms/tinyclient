@@ -1012,6 +1012,12 @@ mod tests {
             moderate: false,
             can_pin: false,
             joined: true,
+            tags: Vec::new(),
+            message_count: 0,
+            total_message_sent: 0,
+            thumbnail: None,
+            reaction: String::new(),
+            owner: String::new(),
         }
     }
 

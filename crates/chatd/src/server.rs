@@ -1,4 +1,4 @@
-use crate::adapters::{self, About, Adapter, Command, Picture, Refusal, Reply, SearchScope};
+use crate::adapters::{self, About, Adapter, Command, ForumPosts, Picture, Refusal, Reply, SearchScope};
 use crate::blobs::Blobs;
 use crate::hub::{lock, now, Hub, KEYCHAIN_PROMPT};
 use crate::media::CallError;
@@ -7,7 +7,7 @@ use crate::store::Store;
 use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
-    Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
+    Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key, TopicSort,
     Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Sender, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
@@ -958,15 +958,84 @@ impl Chat {
     /// open lands on. The landing's topics are asked of the network once first, and the
     /// answer waits for them, so it is named on what Telegram says now and not on what an
     /// earlier open left in the cache.
-    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool) -> Response {
+    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool, sort: TopicSort, tag: Option<String>, query: Option<String>) -> Response {
         if !self.shows(&forum.account()) {
             // Same refusal as Tree. An empty Conversations page looks like a real empty forum.
             return hidden_list();
         }
-        if landing && offset == 0 {
-            let _ = self.ask(&forum.account(), |reply| Command::OpenForum { conversation_id: forum.id.clone(), reply });
+        if forum.network == Network::Discord {
+            return self.discord_topics(forum, offset, limit, landing, sort, tag, query);
         }
-        let read = if landing { self.hub.store().landing(&forum) } else { self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) };
+        if landing && offset == 0 {
+            let _ = self.ask(&forum.account(), |reply| Command::OpenForum {
+                conversation_id: forum.id.clone(),
+                sort,
+                tag,
+                query,
+                offset,
+                reply,
+            });
+        }
+        self.cached_topics(&forum, offset, limit, landing)
+    }
+
+    /// Discord's post list is one search page. A refusal is returned. An unfiltered first page
+    /// that Discord did not answer falls back to the cache; a filtered or older page does not.
+    fn discord_topics(
+        &self,
+        forum: Key,
+        offset: u32,
+        limit: u32,
+        landing: bool,
+        sort: TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+    ) -> Response {
+        let plain = offset == 0
+            && sort == TopicSort::Activity
+            && tag.as_deref().unwrap_or("").trim().is_empty()
+            && query.as_deref().unwrap_or("").trim().is_empty();
+        let asked = self.ask(&forum.account(), |reply| Command::OpenForum {
+            conversation_id: forum.id.clone(),
+            sort,
+            tag: tag.clone(),
+            query,
+            offset,
+            reply,
+        });
+        match asked {
+            Err(refused) => *refused,
+            Ok(Some(page)) => self.forum_page(&forum, page, limit, tag.as_deref()),
+            Ok(None) if plain => self.cached_topics(&forum, offset, limit, landing),
+            Ok(None) => error(ErrorCode::Offline, "Couldn't load posts."),
+        }
+    }
+
+    /// The posts Discord named, still inside this forum and this tag, pins first, at most one page.
+    fn forum_page(&self, forum: &Key, page: ForumPosts, limit: u32, tag: Option<&str>) -> Response {
+        let cap = limit.min(25) as usize;
+        let wanted = tag.map(str::trim).filter(|tag| !tag.is_empty());
+        let mut indexed = Vec::new();
+        for (index, id) in page.ids.into_iter().enumerate() {
+            let key = Key::new(&forum.account(), id);
+            let Ok(Some(row)) = self.hub.store().conversation(&key) else {
+                continue;
+            };
+            if row.parent.as_deref() != Some(forum.id.as_str()) {
+                continue;
+            }
+            if wanted.is_some_and(|tag| !row.tags.iter().any(|have| have == tag)) {
+                continue;
+            }
+            indexed.push((index, row));
+        }
+        indexed.sort_by_key(|(index, row)| (row.pin.is_none(), row.pin.unwrap_or(0), *index));
+        let conversations: Vec<_> = indexed.into_iter().take(cap).map(|(_, row)| row).collect();
+        Response::Conversations { conversations: self.rows(conversations), total: page.total, counts: InboxCounts::default() }
+    }
+
+    fn cached_topics(&self, forum: &Key, offset: u32, limit: u32, landing: bool) -> Response {
+        let read = if landing { self.hub.store().landing(forum) } else { self.hub.store().topics(forum, offset, limit.min(PAGE_LIMIT)) };
         match read {
             Ok((conversations, total)) => Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() },
             Err(err) => internal(err),
@@ -2739,7 +2808,7 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
+            Request::Topics { forum, offset, limit, landing, sort, tag, query } => self.topics(forum, offset, limit, landing, sort, tag, query),
             Request::ForumInfo { forum } => {
                 if !self.shows(&forum.account()) {
                     return error(ErrorCode::NotFound, "no such conversation");

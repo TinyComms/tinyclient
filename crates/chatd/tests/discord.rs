@@ -1115,7 +1115,15 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     // lands on the post with the newest activity, read or not — here the read "Iterating",
     // though "Sorting" still sits unread. Telegram's own rule (newest unread, else General)
     // would have picked the other post.
-    let landing = || Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let landing = || Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 1,
+        landing: true,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations, .. } = world.ask(landing()) else {
         panic!("no landing");
     };
@@ -1125,11 +1133,25 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
         ("4602", "Iterating a Vec in place", Some("4106")),
         "the landing is the newest activity, not the newest unread"
     );
-    // Opening the forum asked Discord nothing: its posts arrive on the socket as threads.
-    assert!(world.discord.requests_to("GET", "/channels/4106/").is_empty());
+    // Opening asks Discord for one page. This fake has no search answer, so the cache names
+    // the landing. The only ask under the forum is that search.
+    let searched = world.discord.requests_to("GET", "/channels/4106/");
+    assert_eq!(searched.len(), 1, "{searched:?}");
+    let path = searched[0].path.as_str();
+    assert!(path.starts_with("/channels/4106/threads/search"), "{path}");
+    assert!(path.contains("sort_by=last_message_time") && path.contains("sort_order=desc"), "{path}");
+    assert!(!path.contains("offset="), "{path}");
 
     // What the topics drill lists: the posts by their activity, a count on the unread one.
-    let drill = Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false };
+    let drill = Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 10,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations: posts, total, .. } = world.ask(drill) else {
         panic!("no posts");
     };
@@ -1145,6 +1167,202 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     // something that needs me (`polish/01` §2): read up to 600, its posts have gone past it.
     let forum = rows.iter().find(|row| row.key.id == "4106").unwrap();
     assert_eq!((forum.unread, forum.mentions), (1, 0), "{forum:?}");
+}
+
+fn forum_thread(id: &str, parent: &str, name: &str, tags: &[&str], flags: u64, last: &str, owner: &str, messages: u64, sent: u64) -> Value {
+    json!({
+        "id": id,
+        "type": 11,
+        "guild_id": "4000",
+        "parent_id": parent,
+        "name": name,
+        "owner_id": owner,
+        "flags": flags,
+        "applied_tags": tags,
+        "message_count": messages,
+        "total_message_sent": sent,
+        "last_message_id": last,
+    })
+}
+
+fn thread_search(threads: Vec<Value>, messages: Vec<Value>, total: u32, has_more: bool) -> Value {
+    json!({
+        "threads": threads,
+        "members": [],
+        "has_more": has_more,
+        "total_results": total,
+        "first_messages": messages,
+    })
+}
+
+fn forum_topics(world: &World, sort: protocol::TopicSort, tag: Option<&str>, query: Option<&str>, offset: u32) -> Response {
+    world.ask(Request::Topics {
+        forum: world.key("4106"),
+        offset,
+        limit: 25,
+        landing: false,
+        sort,
+        tag: tag.map(str::to_owned),
+        query: query.map(str::to_owned),
+    })
+}
+
+fn no_conversation(world: &World, id: &str) -> bool {
+    matches!(world.ask(Request::Conversation { conversation: world.key(id) }), Response::Error { code: ErrorCode::NotFound, .. })
+}
+
+/// True once CHANNEL_CREATE has written this channel into the guild note. That write happens
+/// before the view check, in the same call that stores a channel the account can read.
+fn forum_kept(world: &World, id: &str) -> bool {
+    let Ok(db) = rusqlite::Connection::open(world.dir.join("chat.sqlite")) else {
+        return false;
+    };
+    let Ok(value) = db.query_row(
+        "SELECT value FROM name WHERE network = 'discord' AND account = '1000' AND id = 'kept:4000'",
+        [],
+        |row| row.get::<_, String>(0),
+    ) else {
+        return false;
+    };
+    value.contains(&format!("\"i\":\"{id}\""))
+}
+
+#[test]
+fn a_forum_lists_a_tagged_page_then_a_sort_then_an_older_page_and_refuses_one_that_cannot_be_read() {
+    let world = World::start();
+    let search = "/channels/4106/threads/search";
+    let starter = json!({
+        "id": "1300000000000001001",
+        "channel_id": "4701",
+        "content": "lichen on the north plank",
+        "author": {"id": "2001", "username": "ada", "discriminator": "0"},
+        "attachments": [{
+            "id": "att1",
+            "filename": "lichen.jpg",
+            "size": 1200,
+            "url": "https://cdn.discordapp.com/attachments/4701/att1/lichen.jpg",
+            "proxy_url": "https://media.discordapp.net/attachments/4701/att1/lichen.jpg",
+            "width": 640,
+            "height": 480,
+            "content_type": "image/jpeg"
+        }],
+        "reactions": [{"count": 3, "emoji": {"id": null, "name": "👍"}}]
+    });
+    world.discord.script(search, 200, thread_search(
+        vec![
+            forum_thread("4701", "4106", "Lichen on the bench", &["9001"], 2, "1300080000000002000", "2001", 4, 6),
+            forum_thread("4799", "4101", "Not this forum", &["9001"], 0, "1300000000000000100", "2002", 1, 1),
+            forum_thread("4798", "4106", "Wrong tag", &["9002"], 0, "1300000000000000200", "2002", 1, 1),
+        ],
+        vec![starter],
+        1,
+        false,
+    ));
+    world.discord.script(search, 200, thread_search(
+        vec![
+            forum_thread("4702", "4106", "Older growth", &[], 0, "1300000000000000500", "2002", 1, 1),
+            forum_thread("4701", "4106", "Lichen on the bench", &["9001"], 0, "1300080000000002000", "2001", 4, 6),
+        ],
+        Vec::new(),
+        2,
+        false,
+    ));
+    world.discord.script(search, 200, thread_search(
+        vec![forum_thread("4703", "4106", "South plank", &["9001"], 0, "1300000000000000100", "2006", 2, 2)],
+        Vec::new(),
+        40,
+        true,
+    ));
+
+    let Response::Conversations { conversations, total, .. } = forum_topics(&world, protocol::TopicSort::Activity, Some("9001"), None, 0) else {
+        panic!("no tagged page");
+    };
+    assert_eq!(total, 1);
+    assert_eq!(ids(&conversations), ["4701"]);
+    let post = &conversations[0];
+    assert_eq!(post.tags, ["9001"]);
+    assert!(post.preview.contains("lichen"), "{post:?}");
+    assert_eq!((post.message_count, post.total_message_sent), (4, 6));
+    assert_eq!(post.pin, Some(0));
+    assert_eq!(post.reaction, "👍");
+    assert_eq!(post.owner, "2001");
+    assert_eq!(post.thumbnail.as_ref().map(|file| file.id.as_str()), Some("att:att1:thumb"));
+    assert_eq!(post.parent.as_deref(), Some("4106"));
+    assert!(no_conversation(&world, "4799"), "a post from another channel is not kept");
+    assert!(no_conversation(&world, "4798"), "a post that lacks the tag is not kept");
+    let asked = world.discord.requests_to("GET", "/channels/4106/");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let path = asked[0].path.as_str();
+    assert!(path.starts_with(search), "{path}");
+    assert!(path.contains("sort_by=last_message_time") && path.contains("sort_order=desc") && path.contains("tag=9001"), "{path}");
+    assert!(!path.contains("offset=") && !path.contains("name=") && !path.contains("archived"), "{path}");
+
+    // 4702's last message is older, so a cache ordered by activity would put 4701 first.
+    // Discord's creation order is what comes back, and flags 0 clears the pin from the page above.
+    let Response::Conversations { conversations, total, .. } = forum_topics(&world, protocol::TopicSort::Created, None, None, 0) else {
+        panic!("no sorted page");
+    };
+    assert_eq!(total, 2);
+    assert_eq!(ids(&conversations), ["4702", "4701"]);
+    assert_eq!(world.conversation("4701").pin, None);
+    let asked = world.discord.requests_to("GET", "/channels/4106/threads/search");
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    let path = asked[1].path.as_str();
+    assert!(path.contains("sort_by=creation_time") && path.contains("sort_order=desc"), "{path}");
+    assert!(!path.contains("offset=") && !path.contains("tag=") && !path.contains("name="), "{path}");
+
+    let Response::Conversations { conversations, total, .. } = forum_topics(&world, protocol::TopicSort::Activity, None, Some("lichen"), 25) else {
+        panic!("no older page");
+    };
+    assert_eq!(total, 40);
+    assert_eq!(ids(&conversations), ["4703"]);
+    let asked = world.discord.requests_to("GET", "/channels/4106/threads/search");
+    assert_eq!(asked.len(), 3, "{asked:?}");
+    let path = asked[2].path.as_str();
+    assert!(path.contains("sort_by=last_message_time") && path.contains("name=lichen") && path.contains("offset=25"), "{path}");
+    assert!(path.starts_with(search) && !path.contains("archived"), "{path}");
+
+    // A forum the account cannot see is kept in the note and never stored. The search is
+    // scripted to succeed, so a fetch would come back as posts rather than a refusal.
+    world.discord.script("/channels/4109/threads/search", 200, thread_search(
+        vec![forum_thread("4710", "4109", "Should not load", &[], 0, "1300000000000003000", "2001", 1, 1)],
+        Vec::new(),
+        1,
+        false,
+    ));
+    world.discord.push("CHANNEL_CREATE", json!({
+        "id": "4109", "type": 15, "guild_id": "4000", "name": "sealed", "position": 9, "parent_id": "4100",
+        "permission_overwrites": [{"id": "4000", "type": 0, "allow": "0", "deny": "1024"}]
+    }));
+    let seen = std::cell::Cell::new(false);
+    wait("the sealed forum settled", || {
+        if !forum_kept(&world, "4109") {
+            seen.set(false);
+            return None;
+        }
+        if !seen.get() {
+            seen.set(true);
+            return None;
+        }
+        Some(())
+    });
+    assert!(no_conversation(&world, "4109"), "a forum the account cannot read is not stored");
+    match world.ask(Request::Topics {
+        forum: world.key("4109"),
+        offset: 0,
+        limit: 25,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    }) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert!(detail.contains("cannot read"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/channels/4109/").is_empty());
 }
 
 #[test]
@@ -1208,6 +1426,9 @@ fn a_forum_post_is_created_with_a_tag_and_a_file_and_a_media_channel_needs_one()
         offset: 0,
         limit: 10,
         landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
     }) else {
         panic!("no posts");
     };
@@ -1274,13 +1495,29 @@ fn a_post_arriving_while_connected_is_recorded_under_its_forum_never_as_a_row() 
 
     // It is read under the forum: the topics drill lists it by its activity, and the landing
     // is its own newest activity, though the tree never grows a row for it (`polish/01` §3).
-    let drill = || world.ask(Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false });
+    let drill = || world.ask(Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 10,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    });
     let posts = wait("the post recorded under the forum", || match drill() {
         Response::Conversations { conversations, total, .. } if conversations.len() == 3 && total == 3 => Some(conversations),
         _ => None,
     });
     assert_eq!(ids(&posts), ["4603", "4602", "4601"], "{posts:?}");
-    let landing = Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let landing = Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 1,
+        landing: true,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations, .. } = world.ask(landing) else {
         panic!("no landing");
     };

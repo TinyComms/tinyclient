@@ -95,7 +95,18 @@ impl Shell {
                     }
                 }
                 Some((_, Some(space), _, false)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
-                Some((_, _, Some(forum), false)) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
+                Some((_, _, Some(forum), false)) => {
+                    read.drilled = conversations(&Request::Topics {
+                        forum,
+                        offset: 0,
+                        limit: PAGE_LIMIT,
+                        landing: false,
+                        sort: protocol::TopicSort::Activity,
+                        tag: None,
+                        query: None,
+                    })?
+                    .0
+                }
                 Some((shelf, None, None, false)) => read.drilled = whole(network, None, shelf)?.0,
                 None => {}
             }

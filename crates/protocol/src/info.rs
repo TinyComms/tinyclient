@@ -255,6 +255,16 @@ pub enum Warning {
     Spam,
 }
 
+/// How a forum's posts are ordered. Activity is Discord's `last_message_time`; Created is
+/// `creation_time`. Both are asked newest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicSort {
+    #[default]
+    Activity,
+    Created,
+}
+
 /// One tag defined on a forum or media channel (`ForumInfo::tags`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForumTag {

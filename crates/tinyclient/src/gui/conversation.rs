@@ -7,6 +7,7 @@
 
 mod actions;
 mod draw;
+mod forum;
 mod emoji;
 mod header;
 mod icons;
@@ -44,7 +45,7 @@ use gpui::{
 use images::Images;
 use pages::PAGE;
 use protocol::{
-    Change, Conversation, ConversationKind, Key, MediaFile, Message, Page, Request, Response, SendState, Special,
+    Change, Conversation, ConversationKind, Key, MediaFile, Message, Network, Page, Request, Response, SendState, Special,
     PAGE_LIMIT,
 };
 use rows::Item;
@@ -59,6 +60,8 @@ use tokens::Metrics;
 #[derive(Default)]
 pub struct State {
     pane: OnceCell<Entity<Pane>>,
+    /// A Discord forum's post list, drawn in place of the message pane.
+    forum: OnceCell<Entity<forum::Board>>,
     /// The thread in the right pane, while the pane's stack holds one.
     thread: RefCell<Option<Entity<Pane>>>,
     listening: OnceCell<Subscription>,
@@ -2198,6 +2201,16 @@ impl Shell {
         pane
     }
 
+    fn forum_board(&self, cx: &mut Context<Self>) -> Entity<forum::Board> {
+        self.conversation_state
+            .forum
+            .get_or_init(|| {
+                let shell = cx.weak_entity();
+                cx.new(|cx| forum::Board::new(shell, cx))
+            })
+            .clone()
+    }
+
     /// My own id on the account a conversation belongs to.
     fn me(&self, conversation: &Key) -> String {
         let account = conversation.account();
@@ -2286,26 +2299,31 @@ impl Shell {
         #[cfg(feature = "gui-shot")]
         let open = staged.as_ref().unwrap_or(open);
         let link = snapshot.account_link(&open.key);
-        let pane = self.pane(cx);
+        let forum_board = open.kind == ConversationKind::Forum && open.key.network == Network::Discord;
+        let pane = (!forum_board).then(|| self.pane(cx));
+        let board = forum_board.then(|| self.forum_board(cx));
         let me = self.me(&open.key);
         let can = snapshot.account(&open.key.account()).map(|status| status.can).unwrap_or_default();
         let picture = self.conversation_picture(open, cx);
         // With no composer to type in, the messages take the keys after an open.
         let typing = open.special != Special::Service;
-        pane.update(cx, |pane, cx| pane.show(open, &me, can, picture, typing, cx));
+        if let Some(pane) = &pane {
+            pane.update(cx, |pane, cx| pane.show(open, &me, can, picture, typing, cx));
+        }
+        if let Some(board) = &board {
+            board.update(cx, |board, cx| board.show(open, cx));
+        }
         let keys = pane.clone();
         let phone = super::phone::active();
-        let mut view = div()
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            // Paging keys reach the messages from the composer too.
-            .on_key_down(move |event: &KeyDownEvent, window, cx| {
+        let mut view = div().relative().size_full().flex().flex_col();
+        // Paging keys reach the messages from the composer too.
+        if let Some(keys) = keys.clone() {
+            view = view.on_key_down(move |event: &KeyDownEvent, window, cx| {
                 if matches!(event.keystroke.key.as_str(), "pageup" | "pagedown") {
                     keys.update(cx, |pane, cx| pane.key_down(event, window, cx));
                 }
             });
+        }
         if phone {
             // The back gesture: a drag that began in the left 20 pt and passed 60 pops, as
             // iOS's edge swipe does (`01-ia-navigation.md` §5.2).
@@ -2322,8 +2340,12 @@ impl Shell {
         } else {
             self.strip(open, link, window, cx)
         })
-        .children((!phone).then(|| self.call_conversation_picture(snapshot, open, cx)).flatten())
-        .child(div().flex_1().min_h_0().child(pane))
+        .children((!phone && !forum_board).then(|| self.call_conversation_picture(snapshot, open, cx)).flatten())
+        .child(match (board, pane) {
+            (Some(board), _) => div().flex_1().min_h_0().child(board),
+            (_, Some(pane)) => div().flex_1().min_h_0().child(pane),
+            _ => div().flex_1(),
+        })
         .child(match open.special {
             Special::Service => self.no_composer(open, cx),
             _ => self.composer(open, link, cx),

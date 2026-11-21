@@ -91,6 +91,10 @@ pub(crate) fn is_zero_i64(value: &i64) -> bool {
     *value == 0
 }
 
+pub(crate) fn is_activity(sort: &TopicSort) -> bool {
+    matches!(sort, TopicSort::Activity)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
@@ -573,6 +577,24 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
+    /// Tag ids applied to a forum post.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Messages in a forum post that the network still counts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub message_count: u32,
+    /// Messages ever sent in a forum post, including ones since deleted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_message_sent: u32,
+    /// The first message's picture, for a post card and a media gallery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<MediaFile>,
+    /// The emoji of the post's strongest reaction.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reaction: String,
+    /// Who started the forum post.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -642,6 +664,12 @@ impl Conversation {
             moderate: false,
             can_pin: false,
             joined: true,
+            tags: Vec::new(),
+            message_count: 0,
+            total_message_sent: 0,
+            thumbnail: None,
+            reaction: String::new(),
+            owner: String::new(),
         }
     }
 
@@ -1426,12 +1454,20 @@ pub enum Request {
     /// With `landing`, not a page but the one topic opening the forum lands on: the newest
     /// unread, else General. Asking for the landing is also what makes chatd read the
     /// topics from the network first, so the answer names the landing on Telegram's word now.
+    /// Discord pages archived posts with `offset` (25 a page), and `sort`, `tag`, and `query`
+    /// stay inside that forum.
     Topics {
         forum: Key,
         offset: u32,
         limit: u32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         landing: bool,
+        #[serde(default, skip_serializing_if = "is_activity")]
+        sort: TopicSort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
     },
     /// Reads a forum or media channel's posting rules: guidelines, available tags, whether a
     /// tag or attachment is required, and default post slowmode.
@@ -3756,5 +3792,62 @@ mod sock_path_tests {
         };
         let response = Response::ForumInfo { info };
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(), response);
+    }
+
+    #[test]
+    fn forum_topics_request_keeps_old_json_and_post_fields() {
+        let forum = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4106");
+        let req = Request::Topics {
+            forum: forum.clone(),
+            offset: 25,
+            limit: 25,
+            landing: false,
+            sort: TopicSort::Created,
+            tag: Some("9001".into()),
+            query: Some("lichen".into()),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&req).unwrap()).unwrap(), req);
+        let mut bare = serde_json::to_value(&Request::Topics {
+            forum: forum.clone(),
+            offset: 0,
+            limit: 10,
+            landing: false,
+            sort: TopicSort::Activity,
+            tag: None,
+            query: None,
+        })
+        .unwrap();
+        for key in ["sort", "tag", "query", "landing"] {
+            bare.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(
+            serde_json::from_value::<Request>(bare).unwrap(),
+            Request::Topics {
+                forum: forum.clone(),
+                offset: 0,
+                limit: 10,
+                landing: false,
+                sort: TopicSort::Activity,
+                tag: None,
+                query: None,
+            }
+        );
+        let mut row = Conversation::new(forum, ConversationKind::Thread, "Lichen");
+        row.tags = vec!["9001".into()];
+        row.message_count = 4;
+        row.total_message_sent = 6;
+        row.reaction = "👍".into();
+        row.owner = "2001".into();
+        row.thumbnail = Some(MediaFile::new("att:1:thumb", MediaKind::Image));
+        assert_eq!(serde_json::from_value::<Conversation>(serde_json::to_value(&row).unwrap()).unwrap(), row);
+        let mut old = serde_json::to_value(&Conversation::new(row.key.clone(), ConversationKind::Thread, "Lichen")).unwrap();
+        for key in ["tags", "message_count", "total_message_sent", "thumbnail", "reaction", "owner"] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let decoded = serde_json::from_value::<Conversation>(old).unwrap();
+        assert!(decoded.tags.is_empty());
+        assert_eq!((decoded.message_count, decoded.total_message_sent), (0, 0));
+        assert!(decoded.thumbnail.is_none());
+        assert!(decoded.reaction.is_empty() && decoded.owner.is_empty());
     }
 }
