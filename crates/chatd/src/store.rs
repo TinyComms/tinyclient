@@ -845,6 +845,14 @@ fn preview_of(message: &Message) -> String {
         return without_spoilers(&message.text, &message.spans).chars().take(120).collect();
     }
     let Some(first) = message.attachments.first() else {
+        if let Some(contact) = message.contacts.first() {
+            let label = if contact.name.trim().is_empty() {
+                "Contact".to_owned()
+            } else {
+                format!("Contact: {}", contact.name.trim())
+            };
+            return label.chars().take(120).collect();
+        }
         return match &message.card {
             Some(card) if !card.title.is_empty() => card.title.chars().take(120).collect(),
             _ => String::new(),

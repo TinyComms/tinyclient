@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -59,6 +59,7 @@ use std::sync::{Arc, Mutex};
 pub const ME: &str = "a1a1a1a1-0000-4000-8000-000000000001";
 pub const GRACE: &str = "b2b2b2b2-0000-4000-8000-000000000002";
 pub const ALAN: &str = "c3c3c3c3-0000-4000-8000-000000000003";
+pub const STRANGER: &str = "d4d4d4d4-0000-4000-8000-000000000004";
 pub const CLUB: &str = "5a175a175a175a175a175a175a175a175a175a175a175a175a175a175a175a17";
 /// What the fake keeps as the key to a state it does not have.
 const VAULT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -114,6 +115,7 @@ impl Fake {
             members: 3,
             member: true,
             member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+            admins: vec![ME.into(), GRACE.into()],
             timer_secs: 0,
         };
         let _ = events.send(Event::Groups(vec![club]));
@@ -397,6 +399,199 @@ fn steer(line: &str) -> Vec<Event> {
             left: false,
             rejoined: true,
         }],
+        "chat-state" => {
+            let target = next();
+            let peer = if target == "club" {
+                club()
+            } else if let Some((id, _)) = who(target) {
+                direct(id)
+            } else {
+                return Vec::new();
+            };
+            let mut state = ChatState {
+                peer,
+                muted_until: 0,
+                dont_notify_for_mentions_if_muted: false,
+                archived: false,
+                marked_unread: false,
+                blocked: false,
+                whitelisted: true,
+            };
+            for token in words {
+                if let Some((k, v)) = token.split_once('=') {
+                    match k {
+                        "muted" => state.muted_until = v.parse().unwrap_or(0),
+                        "dont_notify_mentions" => state.dont_notify_for_mentions_if_muted = v == "true" || v == "1",
+                        "archived" => state.archived = v == "true" || v == "1",
+                        "unread" => state.marked_unread = v == "true" || v == "1",
+                        "blocked" => state.blocked = v == "true" || v == "1",
+                        "whitelisted" => state.whitelisted = v == "true" || v == "1",
+                        _ => {}
+                    }
+                }
+            }
+            vec![Event::ChatStates { chats: vec![state], pinned: None, keep_muted_archived: None }]
+        }
+        "pin" => {
+            let mut pinned = Vec::new();
+            for target in words {
+                if target == "club" {
+                    pinned.push(club());
+                } else if let Some((id, _)) = who(target) {
+                    pinned.push(direct(id));
+                }
+            }
+            vec![Event::ChatStates { chats: Vec::new(), pinned: Some(pinned), keep_muted_archived: None }]
+        }
+        "keep-muted-archived" => {
+            let on = next() == "on";
+            vec![Event::ChatStates { chats: Vec::new(), pinned: None, keep_muted_archived: Some(on) }]
+        }
+        "folders" => {
+            // Format: folders id:Name:opts... ; id2:Name2:opts...
+            // Where opts are comma-separated key=val: include=grace+club,exclude=alan,all_dm=1,all_group=1,only_unread=1,show_muted=0
+            let spec = line.strip_prefix("folders ").unwrap_or("");
+            let parse_peer = |tok: &str| -> Option<Peer> {
+                if tok == "club" {
+                    Some(club())
+                } else {
+                    who(tok).map(|(id, _)| direct(id))
+                }
+            };
+            let mut list = Vec::new();
+            for (pos, entry) in spec.split(';').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+                let mut parts = entry.splitn(3, ':');
+                let id = parts.next().unwrap_or("").trim().to_owned();
+                let name = parts.next().unwrap_or("").trim().to_owned();
+                let opts = parts.next().unwrap_or("");
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let mut folder = ChatFolder {
+                    id,
+                    name,
+                    position: pos as u32,
+                    show_only_unread: false,
+                    show_muted: true,
+                    include_all_individual: false,
+                    include_all_groups: false,
+                    included: Vec::new(),
+                    excluded: Vec::new(),
+                };
+                for kv in opts.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        match k {
+                            "include" => folder.included = v.split('+').filter_map(parse_peer).collect(),
+                            "exclude" => folder.excluded = v.split('+').filter_map(parse_peer).collect(),
+                            "all_dm" => folder.include_all_individual = v == "1" || v == "true",
+                            "all_group" => folder.include_all_groups = v == "1" || v == "true",
+                            "only_unread" => folder.show_only_unread = v == "1" || v == "true",
+                            "show_muted" => folder.show_muted = v == "1" || v == "true",
+                            _ => {}
+                        }
+                    }
+                }
+                list.push(folder);
+            }
+            vec![Event::Folders(list)]
+        }
+        "contact" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let spec = rest(line, 3);
+            let mut parts = spec.split('|').map(|p| p.trim().to_owned());
+            let card_name = parts.next().unwrap_or_default();
+            let phone = parts.next().unwrap_or_default();
+            let email = parts.next().unwrap_or_default();
+            let org = parts.next().unwrap_or_default();
+            let contact = protocol::SharedContact {
+                name: card_name,
+                phones: if phone.is_empty() { Vec::new() } else { vec![phone] },
+                emails: if email.is_empty() { Vec::new() } else { vec![email] },
+                organization: org,
+                avatar: None,
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                contacts: vec![contact],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "stranger" => {
+            let sent = next().parse().unwrap_or(T0);
+            let text = Text {
+                author: STRANGER.into(),
+                name: "Sam Stranger".into(),
+                sent,
+                text: rest(line, 2),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(STRANGER), text, outgoing: false }]
+        }
+        "blocked" => {
+            let mut people = Vec::new();
+            let mut groups = Vec::new();
+            for token in words {
+                if token == "club" {
+                    groups.push(CLUB.to_owned());
+                } else if token == "stranger" {
+                    people.push(STRANGER.to_owned());
+                } else if let Some((id, _)) = who(token) {
+                    people.push(id.to_owned());
+                } else if super::wire::is_aci(token) {
+                    people.push(token.to_owned());
+                }
+            }
+            vec![Event::Blocked { people, groups }]
+        }
+        "request-response" => {
+            let target = next();
+            let peer = if target == "club" {
+                club()
+            } else if target == "stranger" {
+                direct(STRANGER)
+            } else if let Some((id, _)) = who(target) {
+                direct(id)
+            } else if super::wire::is_aci(target) {
+                direct(target)
+            } else {
+                return Vec::new();
+            };
+            let action = match next() {
+                "accept" => MessageRequestAction::Accept,
+                "delete" => MessageRequestAction::Delete,
+                "block" => MessageRequestAction::Block,
+                "block-delete" => MessageRequestAction::BlockAndDelete,
+                "spam" => MessageRequestAction::Spam,
+                "block-spam" => MessageRequestAction::BlockAndSpam,
+                _ => return Vec::new(),
+            };
+            vec![Event::MessageRequestResponse { peer, action }]
+        }
+        "group-admins" => {
+            let admins: Vec<String> = words
+                .filter_map(|w| match w {
+                    "me" => Some(ME.to_owned()),
+                    other => who(other).map(|(id, _)| id.to_owned()),
+                })
+                .collect();
+            let club = GroupInfo {
+                id: CLUB.into(),
+                title: "Bridge club".into(),
+                description: "Tuesdays, 7 pm".into(),
+                members: 3,
+                member: true,
+                member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+                admins,
+                timer_secs: 0,
+            };
+            vec![Event::Groups(vec![club])]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -459,6 +654,7 @@ impl Wire for Fake {
                 format!("send {} vote {target}-{author} {picked} serial={serial}", describe(to))
             }
             Body::PollEnd { target } => format!("send {} endpoll {target}", describe(to)),
+            Body::Contact { contact, timer } => format!("send {} contact {}{}", describe(to), contact.name, exp(*timer)),
         };
         record(&line);
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
@@ -527,6 +723,83 @@ impl Wire for Fake {
         record(&format!("lookup {username}"));
         let found = self.lookups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&username.to_ascii_lowercase()).cloned();
         Ok(found)
+    }
+
+    fn set_mute(&self, to: &Peer, until_ms: u64) -> Result<(), Fault> {
+        record(&format!("mute {} {until_ms}", describe(to)));
+        Ok(())
+    }
+
+    fn set_archived(&self, to: &Peer, archived: bool) -> Result<(), Fault> {
+        record(&format!("archive {} {archived}", describe(to)));
+        Ok(())
+    }
+
+    fn set_pinned(&self, to: &Peer, pinned: bool) -> Result<(), Fault> {
+        record(&format!("pin {} {pinned}", describe(to)));
+        Ok(())
+    }
+
+    fn set_marked_unread(&self, to: &Peer, unread: bool) -> Result<(), Fault> {
+        record(&format!("mark-unread {} {unread}", describe(to)));
+        Ok(())
+    }
+
+    fn set_blocked(&self, peer: &Peer, blocked: bool) -> Result<(), Fault> {
+        record(&format!("{} {}", if blocked { "block" } else { "unblock" }, describe(peer)));
+        Ok(())
+    }
+
+    fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault> {
+        let label = match action {
+            MessageRequestAction::Accept => "accept",
+            MessageRequestAction::Delete => "delete",
+            MessageRequestAction::Block => "block",
+            MessageRequestAction::BlockAndDelete => "block-delete",
+            MessageRequestAction::Spam => "spam",
+            MessageRequestAction::BlockAndSpam => "block-spam",
+        };
+        record(&format!("request-response {} {label}", describe(peer)));
+        Ok(())
+    }
+
+    fn create_group(&self, title: &str, members: &[String]) -> Result<GroupInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("create-group {title} | {}", members.join(",")));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        let seq = self.clock.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{seq:064x}");
+        let mut member_ids = vec![ME.to_owned()];
+        for aci in members {
+            if !member_ids.contains(aci) {
+                member_ids.push(aci.clone());
+            }
+        }
+        Ok(GroupInfo {
+            id,
+            title: title.to_owned(),
+            description: String::new(),
+            members: member_ids.len() as u32,
+            member: true,
+            member_ids,
+            admins: vec![ME.to_owned()],
+            timer_secs: 0,
+        })
+    }
+
+    fn leave_group(&self, group_id: &str) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("leave-group {group_id}"));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        Ok(())
     }
 
     fn close(&self) {

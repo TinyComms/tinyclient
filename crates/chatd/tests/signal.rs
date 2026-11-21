@@ -1370,3 +1370,359 @@ fn sending_with_a_mention_span_sends_a_signal_mention_range() {
     );
     world.heard(&format!("send {CLUB} text hi \u{FFFC}! ranges=Mention({GRACE}):3+1"));
 }
+
+#[test]
+fn mute_archive_pin_and_mark_unread_sync_and_serve_commands() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|status| status.key == account()).expect("Signal account");
+    assert!(signal.can.pin_chats > 0, "Signal should advertise pin_chats");
+    assert!(signal.can.archive, "Signal should advertise archive");
+
+    // Create direct chats with Grace and Alan.
+    world.steer(&format!("incoming grace {} Hey", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer(&format!("incoming alan {} Yo", T0 + 2_000));
+    world.arrived(ALAN, &id(T0 + 2_000, ALAN));
+
+    // Sync from phone: Grace is muted, archived, and marked unread; CLUB is pinned.
+    world.steer("chat-state grace muted=9999999999999 archived=true unread=true");
+    world.steer("pin club");
+    world.until("Grace muted and archived", || {
+        let row = world.conversation(GRACE)?;
+        (row.muted && row.archived && row.unread > 0).then_some(())
+    });
+    world.until("Club pinned", || world.conversation(CLUB)?.pin.map(|p| p == 0).filter(|&ok| ok));
+
+    // Archive shelf contains Grace; Main shelf does not contain Grace and puts pinned CLUB first.
+    let Response::Conversations { conversations: archive_rows, .. } = world.ask(Request::Home {
+        network: Network::Signal,
+        account: Some(account()),
+        folder: None,
+        shelf: protocol::Shelf::Archive,
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Archive conversations");
+    };
+    assert!(archive_rows.iter().any(|c| c.key.id == GRACE), "Grace should be on Archive shelf");
+
+    let Response::Conversations { conversations: main_rows, .. } = world.ask(Request::Home {
+        network: Network::Signal,
+        account: Some(account()),
+        folder: None,
+        shelf: protocol::Shelf::Main,
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Main conversations");
+    };
+    assert!(!main_rows.iter().any(|c| c.key.id == GRACE), "Grace should not be on Main shelf");
+    assert_eq!(main_rows.first().map(|c| c.key.id.as_str()), Some(CLUB), "Pinned CLUB should sort first");
+
+    // Keep muted chats archived: with setting ON, a new message from muted Grace keeps her archived.
+    world.steer("keep-muted-archived on");
+    world.steer(&format!("incoming grace {} Still muted", T0 + 3_000));
+    world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    assert!(world.conversation(GRACE).unwrap().archived, "muted archived chat stays archived when keep_muted_archived is on");
+
+    // With setting OFF, a new message unarchives Grace back to Main.
+    world.steer("keep-muted-archived off");
+    world.steer(&format!("incoming grace {} Wake up", T0 + 4_000));
+    world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    world.until("Grace unarchived on new message", || (!world.conversation(GRACE)?.archived).then_some(()));
+
+    // Muted group with dont_notify_mentions suppresses mentions_me.
+    world.steer("chat-state club muted=9999999999999 dont_notify_mentions=true");
+    world.until("Club muted", || world.conversation(CLUB)?.muted.then_some(()));
+    world.steer(&format!("mention grace {} quiet ping", T0 + 5_000));
+    let quiet_mention = world.arrived(CLUB, &id(T0 + 5_000, GRACE));
+    assert!(!quiet_mention.mentions_me, "muted group with dontNotifyForMentionsIfMuted should suppress mentions_me");
+
+    // Serve SetMute, File (archive + pin), and MarkUnread from tinyclient.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(ALAN), notify: protocol::Notify::Nothing, until: None }),
+        Response::Ok
+    );
+    world.until("Alan muted", || world.conversation(ALAN)?.muted.then_some(()));
+    assert!(world.calls().iter().any(|c| c.starts_with(&format!("mute {ALAN} "))));
+
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(ALAN), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    world.until("Alan unmuted", || (!world.conversation(ALAN)?.muted).then_some(()));
+    world.heard(&format!("mute {ALAN} 0"));
+
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key(ALAN),
+            pinned: Some(true),
+            archived: Some(true),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    world.until("Alan archived and pinned", || {
+        let row = world.conversation(ALAN)?;
+        (row.archived && row.pin.is_some()).then_some(())
+    });
+    world.heard(&format!("archive {ALAN} true"));
+    world.heard(&format!("pin {ALAN} true"));
+
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(ALAN), message_id: id(T0 + 2_000, ALAN) }), Response::Ok);
+    assert_eq!(world.ask(Request::MarkUnread { conversation: key(ALAN), message_id: String::new() }), Response::Ok);
+    world.until("Alan marked unread", || (world.conversation(ALAN)?.unread > 0).then_some(()));
+    world.heard(&format!("mark-unread {ALAN} true"));
+}
+
+#[test]
+fn chat_folders_from_phone_filter_chats_and_react_to_mute_and_unread() {
+    let world = World::linked();
+    world.connected();
+
+    world.steer(&format!("incoming grace {} Dinner?", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer(&format!("incoming alan {} Cards?", T0 + 2_000));
+    world.arrived(ALAN, &id(T0 + 2_000, ALAN));
+
+    // Sync two folders from the phone: Family (Grace + Club) and Unread (all non-muted unread, excluding Alan).
+    world.steer("folders fam:Family:include=grace+club ; unr:Unread:all_dm=1,all_group=1,only_unread=1,show_muted=0,exclude=alan");
+
+    let folders = world.until("Signal folders", || match world.ask(Request::Folders { network: Network::Signal }) {
+        Response::Folders { folders } if folders.len() == 2 => Some(folders),
+        _ => None,
+    });
+    assert_eq!(folders[0].name, "Family");
+    assert_eq!(folders[1].name, "Unread");
+
+    // Family contains Grace and Bridge club, not Alan.
+    let fam_rows = world.until("Family folder rows", || {
+        let Response::Conversations { conversations, .. } = world.ask(Request::Home {
+            network: Network::Signal,
+            account: Some(account()),
+            folder: Some("fam".into()),
+            shelf: protocol::Shelf::Main,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return None;
+        };
+        (conversations.len() == 2).then_some(conversations)
+    });
+    let fam_ids: Vec<&str> = fam_rows.iter().map(|c| c.key.id.as_str()).collect();
+    assert!(fam_ids.contains(&GRACE) && fam_ids.contains(&CLUB) && !fam_ids.contains(&ALAN));
+
+    // Unread contains Grace (unread, unmuted), not Alan (excluded), not Club (0 unread).
+    let unread_ids = || -> Vec<String> {
+        let Response::Conversations { conversations, .. } = world.ask(Request::Home {
+            network: Network::Signal,
+            account: Some(account()),
+            folder: Some("unr".into()),
+            shelf: protocol::Shelf::Main,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return Vec::new();
+        };
+        conversations.into_iter().map(|c| c.key.id).collect()
+    };
+    world.until("Grace in Unread folder", || (unread_ids() == vec![GRACE.to_owned()]).then_some(()));
+
+    // Muting Grace removes her from Unread (show_muted=0).
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(GRACE), notify: protocol::Notify::Nothing, until: None }),
+        Response::Ok
+    );
+    world.until("Grace leaves Unread when muted", || unread_ids().is_empty().then_some(()));
+
+    // Unmuting brings her back; marking her read removes her again.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(GRACE), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    world.until("Grace returns to Unread when unmuted", || (unread_ids() == vec![GRACE.to_owned()]).then_some(()));
+
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 1_000, GRACE) }), Response::Ok);
+    world.until("Grace leaves Unread when read", || unread_ids().is_empty().then_some(()));
+}
+
+#[test]
+fn message_requests_from_strangers_and_blocking_work_end_to_end() {
+    const STRANGER: &str = "d4d4d4d4-0000-4000-8000-000000000004";
+    let world = World::linked();
+    world.connected();
+
+    // A stranger not in contacts writes first -> lands on Requests shelf with Special::Request.
+    world.steer(&format!("stranger {} Who is this?", T0 + 1_000));
+    world.arrived(STRANGER, &id(T0 + 1_000, STRANGER));
+    let req_row = world.conversation(STRANGER).expect("stranger row");
+    assert_eq!(req_row.special, protocol::Special::Request);
+
+    let Response::Conversations { conversations: reqs, .. } = world.ask(Request::Home {
+        network: Network::Signal,
+        account: Some(account()),
+        folder: None,
+        shelf: protocol::Shelf::Requests,
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Requests shelf");
+    };
+    assert!(reqs.iter().any(|c| c.key.id == STRANGER), "stranger must appear on Requests shelf");
+
+    // MarkRead and Typing on an unaccepted request send NO receipt and NO typing.
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(STRANGER), message_id: id(T0 + 1_000, STRANGER) }), Response::Ok);
+    world.ask(Request::Typing { conversation: key(STRANGER), activity: protocol::Compose::Typing });
+    sleep(Duration::from_millis(300));
+    assert!(world.calls().iter().all(|c| !c.starts_with("read ") && !c.starts_with("typing ")), "no read or typing should go to an unaccepted stranger");
+
+    // Accept moves the stranger to the main list and sends the response sync.
+    assert_eq!(world.ask(Request::AnswerMessageRequest { conversation: key(STRANGER), accept: true }), Response::Ok);
+    world.heard(&format!("request-response {STRANGER} accept"));
+    world.until("stranger promoted to normal chat", || {
+        (world.conversation(STRANGER)?.special == protocol::Special::None).then_some(())
+    });
+
+    // Block Grace via Relate: wire hears it, relation becomes Blocked, and her next message is dropped.
+    assert_eq!(world.ask(Request::Relate { person: key(GRACE), action: protocol::RelateAction::Block }), Response::Ok);
+    world.heard(&format!("block {GRACE}"));
+    world.until("Grace marked Blocked", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return None;
+        };
+        people.iter().any(|p| p.key.id == GRACE).then_some(())
+    });
+
+    world.steer(&format!("incoming grace {} Blocked msg", T0 + 2_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(GRACE).is_empty(), "messages from blocked sender must be dropped");
+
+    // Unblock Grace via Relate: wire hears it and her next message arrives.
+    assert_eq!(world.ask(Request::Relate { person: key(GRACE), action: protocol::RelateAction::Unblock }), Response::Ok);
+    world.heard(&format!("unblock {GRACE}"));
+    world.steer(&format!("incoming grace {} Back now", T0 + 3_000));
+    world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+
+    // Phone syncs block list: blocking Alan from the phone drops his message.
+    world.steer("blocked alan");
+    world.until("Alan blocked from phone", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return None;
+        };
+        people.iter().any(|p| p.key.id == ALAN).then_some(())
+    });
+    world.steer(&format!("incoming alan {} Should drop", T0 + 4_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(ALAN).is_empty(), "messages from phone-blocked sender must be dropped");
+}
+
+#[test]
+fn shared_contact_arrives_as_structured_card_and_can_be_sent() {
+    let world = World::linked();
+    world.connected();
+
+    // Incoming shared contact arrives as a Normal message with structured SharedContact fields, not "Contact" Unsupported.
+    world.steer(&format!("contact grace {} Ada Lovelace | +44 7700 900142 | ada@example.org | Analytical Engine", T0 + 1_000));
+    let msg = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    assert_eq!(msg.kind, MessageKind::Normal, "shared contact must not be Unsupported");
+    assert_eq!(msg.contacts.len(), 1);
+    let card = &msg.contacts[0];
+    assert_eq!(card.name, "Ada Lovelace");
+    assert_eq!(card.phones, vec!["+44 7700 900142"]);
+    assert_eq!(card.emails, vec!["ada@example.org"]);
+    assert_eq!(card.organization, "Analytical Engine");
+    assert_eq!(world.conversation(GRACE).unwrap().preview, "Contact: Ada Lovelace");
+
+    // Sending a shared contact card reaches the wire and stores the card.
+    let shared = protocol::SharedContact {
+        name: "Alan Turing".into(),
+        phones: vec!["+44 7700 900199".into()],
+        emails: vec!["alan@bletchley.example".into()],
+        organization: String::new(),
+        avatar: None,
+    };
+    let asked = Request::Send {
+        conversation: key(GRACE),
+        client_id: "contact-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing { contact: Some(shared.clone()), ..Outgoing::default() },
+    };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    world.heard(&format!("send {GRACE} contact Alan Turing"));
+    let sent = world.until("sent contact card", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("contact-1") && m.id != "contact-1")
+    });
+    assert_eq!(sent.contacts, vec![shared]);
+}
+
+#[test]
+fn creating_a_new_signal_group_reaches_the_wire_and_creates_the_row() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|status| status.key == account()).expect("Signal account");
+    assert!(signal.can.groups > 0, "Signal should advertise group creation capability");
+
+    let Response::Conversation { conversation: group } = world.ask(Request::StartGroup {
+        account: account(),
+        people: vec![key(GRACE), key(ALAN)],
+        title: Some("Friday Bridge".into()),
+    }) else {
+        panic!("expected Conversation from StartGroup");
+    };
+    assert_eq!(group.kind, ConversationKind::Group);
+    assert_eq!(group.title, "Friday Bridge");
+    assert!(group.key.id.starts_with("g."), "group id should use g. prefix: {}", group.key.id);
+    world.heard(&format!("create-group Friday Bridge | {GRACE},{ALAN}"));
+
+    // The new group is stored and can be messaged.
+    let stored = world.conversation(&group.key.id).expect("new group should be stored");
+    assert_eq!(stored.title, "Friday Bridge");
+    world.send(&group.key.id, "grp-1", "Welcome everyone!", None);
+    world.heard(&format!("send {} text Welcome everyone!", group.key.id));
+}
+
+#[test]
+fn leaving_a_signal_group_checks_sole_admin_and_removes_the_row() {
+    let world = World::linked();
+    world.connected();
+
+    // When we are the sole admin and others remain, Leave refuses with "Choose a new admin first."
+    world.steer("group-admins me");
+    sleep(Duration::from_millis(200));
+    let refused = world.ask(Request::Leave { conversation: key(CLUB) });
+    assert!(
+        matches!(&refused, Response::Error { detail, .. } if detail.contains("Choose a new admin first")),
+        "expected sole-admin refusal, got {refused:?}"
+    );
+    assert!(world.conversation(CLUB).is_some(), "group row must remain after refusal");
+
+    // Once another admin exists, Leave succeeds, reaches the wire, and removes the row.
+    world.steer("group-admins me grace");
+    sleep(Duration::from_millis(200));
+    assert_eq!(world.ask(Request::Leave { conversation: key(CLUB) }), Response::Ok);
+    let hex_id = CLUB.strip_prefix("g.").unwrap();
+    world.heard(&format!("leave-group {hex_id}"));
+    world.until("Club row removed", || world.conversation(CLUB).is_none().then_some(()));
+}
