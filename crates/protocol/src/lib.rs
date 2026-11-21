@@ -33,6 +33,7 @@ pub mod quarantine;
 mod react;
 pub mod settings;
 mod signin;
+pub mod telegram_call_emoji;
 mod tiny;
 pub mod web_sign_in;
 
@@ -46,6 +47,7 @@ pub use play::*;
 pub use react::*;
 pub use record::*;
 pub use signin::*;
+pub use telegram_call_emoji::*;
 pub use tiny::*;
 
 pub const CHAT_SOCK_NAME: &str = "chat.sock";
@@ -348,6 +350,8 @@ pub enum CallSupport {
     Native,
     /// The official app does: ask `Handoff` for the link and open it.
     Handoff,
+    /// The other person's privacy settings restrict calls from this account.
+    Restricted,
 }
 
 /// Someone in a voice channel, as its row in the tree shows them.
@@ -459,6 +463,9 @@ pub struct Conversation {
     pub last_read: Option<String>,
     #[serde(default)]
     pub call: CallSupport,
+    /// The other side supports video calls (Telegram's `video_calls_available`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub call_video: bool,
     /// Who is in it, for a voice channel someone is in. `None` when it is empty or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupants: Option<Occupants>,
@@ -603,6 +610,7 @@ impl Conversation {
             updated: 0,
             last_read: None,
             call: CallSupport::None,
+            call_video: false,
             occupants: None,
             limit: 0,
             read_only: false,
@@ -1585,6 +1593,36 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         search: bool,
     },
+    /// Recent calls across all chats on an account, newest first. `missed` filters to missed
+    /// incoming calls only; `before` continues below a message id already listed.
+    CallHistory {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "is_false")]
+        missed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        limit: u32,
+    },
+    /// Delete one or more entries from an account's recent calls list. `revoke` removes for both
+    /// sides when the network supports it.
+    DeleteCallEntries {
+        account: AccountKey,
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        revoke: bool,
+    },
+    /// Read an account's network privacy policy for `key` (e.g. Telegram Calls, P2P, VoiceMessages).
+    GetPrivacy {
+        account: AccountKey,
+        key: PrivacyKey,
+    },
+    /// Write an account's network privacy policy for `key`. Callers must read the current policy
+    /// first and send the full updated policy so existing exceptions are never wiped.
+    SetPrivacy {
+        account: AccountKey,
+        key: PrivacyKey,
+        policy: PrivacyPolicy,
+    },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -1605,13 +1643,16 @@ pub enum Request {
         target: ReportTarget,
     },
     /// Our own presence on one account, and the status text beside it: `None` leaves the text
-    /// as it is, empty clears it. `clear_at`, when given, is a Unix timestamp (seconds) when
-    /// the status text expires.
+    /// as it is, empty clears it. `status_emoji`, when given, sets the status emoji (empty
+    /// clears it; `None` preserves the current emoji when updating text). `clear_at`, when given,
+    /// is a Unix timestamp (seconds) when the status expires.
     SetPresence {
         account: AccountKey,
         presence: Presence,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_emoji: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clear_at: Option<i64>,
     },
@@ -2750,6 +2791,17 @@ pub enum Response {
         /// The exact total, only where the network counted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total: Option<u32>,
+    },
+    CallHistory {
+        entries: Vec<CallLogEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
+    },
+    Privacy {
+        key: PrivacyKey,
+        policy: PrivacyPolicy,
     },
     Folders {
         folders: Vec<Folder>,

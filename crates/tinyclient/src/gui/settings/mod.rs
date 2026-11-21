@@ -408,6 +408,10 @@ pub struct SettingsWindow {
     pub(super) highlight: Option<&'static str>,
     /// The Tiny server account's name field.
     tiny: tiny::TinyAccount,
+    /// Loaded Telegram account privacy rules (`GetPrivacy`), keyed by `(account, key)`.
+    /// Never written back until loaded so existing exceptions are always preserved.
+    pub(super) tg_privacy: HashMap<(protocol::AccountKey, protocol::PrivacyKey), protocol::PrivacyPolicy>,
+    pub(super) tg_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
     /// Drawn as the phone's page: a list of sections, then one section at a time.
     pub(super) phone: bool,
     /// On a phone: the list of sections is on show, not `section`.
@@ -550,6 +554,8 @@ impl SettingsWindow {
             tested: None,
             highlight: None,
             tiny,
+            tg_privacy: HashMap::new(),
+            tg_privacy_requested: std::collections::HashSet::new(),
             phone,
             listing: phone,
             shown: phone,

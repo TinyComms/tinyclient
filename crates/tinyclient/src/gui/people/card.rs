@@ -436,23 +436,40 @@ impl Floating {
         if let Some(call) = &actions.call {
             let (who, direct) = (person.clone(), self.direct.as_ref().map(|row| row.key.clone()));
             let handoff = matches!(call, Call::Handoff(_));
+            let restricted = matches!(call, Call::Restricted);
             let network = person.key.network;
-            let icon = if handoff && network == protocol::Network::Slack { "icons/headphones.svg" } else { "icons/phone.svg" };
-            let button = draw::action("card-call", ButtonKind::Secondary, icon, facts::call_label(call, network, actions.message), handoff);
-            let button = match call {
-                Call::Handoff(full) => button.tooltip(crate::gui::components::tip(full.clone(), None)),
-                Call::Native => button,
+            let icon = if restricted {
+                "icons/phone-off.svg"
+            } else if handoff && network == protocol::Network::Slack {
+                "icons/headphones.svg"
+            } else {
+                "icons/phone.svg"
             };
-            row = row.child(button.on_click(cx.listener(move |this, _, _, cx| {
-                let (who, direct) = (who.clone(), direct.clone());
-                this.shell_do(cx, move |shell, cx| match (handoff, direct) {
-                    (true, Some(direct)) => shell.call_handoff(direct, cx),
-                    // No DM held yet: open it; its header hands the call off.
-                    (true, None) => shell.open_person(&who, cx),
-                    _ if !only_draws() => shell.call_person(&who, cx),
-                    _ => {}
-                });
-            })));
+            let button = draw::action("card-call", ButtonKind::Secondary, icon, facts::call_label(call, network, actions.message), handoff);
+            row = row.child(match call {
+                Call::Restricted => button
+                    .opacity(0.4)
+                    .cursor_default()
+                    .tooltip(crate::gui::components::tip(format!("{} restricts calls", person.name), None)),
+                Call::Handoff(full) => button
+                    .tooltip(crate::gui::components::tip(full.clone(), None))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let (who, direct) = (who.clone(), direct.clone());
+                        this.shell_do(cx, move |shell, cx| match direct {
+                            Some(direct) => shell.call_handoff(direct, cx),
+                            // No DM held yet: open it; its header hands the call off.
+                            None => shell.open_person(&who, cx),
+                        });
+                    })),
+                Call::Native => button.on_click(cx.listener(move |this, _, _, cx| {
+                    let who = who.clone();
+                    this.shell_do(cx, move |shell, cx| {
+                        if !only_draws() {
+                            shell.call_person(&who, cx);
+                        }
+                    });
+                })),
+            });
         }
         row
     }

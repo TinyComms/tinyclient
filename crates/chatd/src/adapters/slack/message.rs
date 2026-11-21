@@ -622,7 +622,7 @@ impl Slack {
     }
 
     /// Where the official app shows this message.
-    fn permalink(&self, channel: &str, ts: &str, thread: Option<&str>) -> String {
+    pub(super) fn permalink(&self, channel: &str, ts: &str, thread: Option<&str>) -> String {
         let link = format!("{}archives/{channel}/p{}", self.session.url, ts.replace('.', ""));
         match thread {
             Some(thread) => format!("{link}?thread_ts={thread}&cid={channel}"),
@@ -914,15 +914,20 @@ impl Slack {
         }
     }
 
-    /// A message shared from elsewhere ("Share message"): where it came from, and what it said
-    /// as the message's own text and files.
-    // CONTRACT: `Forwarded` keeps no place for what the forwarder wrote themselves, apart from
-    // what was forwarded: both are the message's text, the forwarder's words first.
+    /// A message shared from elsewhere ("Share message"): where it came from, and what it said.
+    /// When the forwarder also wrote a note (`rich.text` is non-empty), the note stays in
+    /// `Message::text` and the forwarded message's body sits in `Forwarded::text` so both stay distinct.
     fn forwarded(&self, card: &Value, rich: &mut Rich, media: &mut Registered, variants: &mut Sizes, attachments: &mut Vec<Attachment>) -> Forwarded {
-        rich.line();
+        let mut quoted = Rich::new(self);
         let blocks = card["message_blocks"][0]["message"]["blocks"].as_array();
-        if !blocks.is_some_and(|blocks| rich.blocks(blocks)) {
-            rich.mrkdwn(first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
+        if !blocks.is_some_and(|blocks| quoted.blocks(blocks)) {
+            quoted.mrkdwn(first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
+        }
+        quoted.finish();
+        let has_note = !rich.text.trim().is_empty();
+        if !has_note && !quoted.text.is_empty() {
+            rich.text = quoted.text.clone();
+            rich.spans = quoted.spans;
         }
         for file in card["files"].as_array().into_iter().flatten() {
             attachments.extend(self.file(file, media, variants));
@@ -941,6 +946,8 @@ impl Slack {
             // worth a lookup, and Slack does not send the workspace's name.
             from_space: first(&[&card["from_url"]]).and_then(|url| self.workspace_named(url)).unwrap_or_default(),
             link: first(&[&card["from_url"]]).unwrap_or("").to_owned(),
+            author: first(&[&card["author_name"]]).unwrap_or("").to_owned(),
+            text: quoted.text,
         }
     }
 
@@ -1017,7 +1024,7 @@ impl Slack {
             self.block_media(blocks, &mut media, &mut attachments, &mut previews);
         }
         for card in event["attachments"].as_array().into_iter().flatten() {
-            if card["is_share"] == true && forwarded.is_none() {
+            if (card["is_share"] == true || card["is_msg_unfurl"] == true) && forwarded.is_none() {
                 forwarded = Some(Box::new(self.forwarded(card, &mut rich, &mut media, &mut variants, &mut attachments)));
                 continue;
             }
@@ -1121,8 +1128,14 @@ impl Slack {
         });
 
         let mut message = Message::plain(ts, "", "", seconds(ts), outgoing);
-        let muted = self.state().muted.contains(channel);
-        message.mentions_me = !outgoing && (rich.mentioned || (rich.broadcast && !muted));
+        let (suppress_broadcast, keyword_hit) = {
+            let state = self.state();
+            let muted = state.muted.contains(channel);
+            let suppress = muted || state.suppress_at_channel.contains(channel);
+            let kw = !muted && !outgoing && super::tree::matches_keyword(&rich.text, &state.highlight_words);
+            (suppress, kw)
+        };
+        message.mentions_me = !outgoing && (rich.mentioned || (rich.broadcast && !suppress_broadcast) || keyword_hit);
         let empty = rich.text.is_empty() && attachments.is_empty() && previews.is_empty() && framed.is_none();
         // What Slack leaves of a deleted message that a thread still hangs off.
         let tombstone = subtype == Some("tombstone");
@@ -1132,12 +1145,13 @@ impl Slack {
             // Never blank, never dropped: one line and the way to the real thing.
             let what = if rich.undrawn { "An interactive message" } else { "A message tinyclient cannot show yet" };
             rich.text = format!("{what} from {}", sender.name);
-            MessageKind::Unsupported { link }
+            MessageKind::Unsupported { link: link.clone() }
         } else if system || event["room"].is_object() {
             MessageKind::System
         } else {
             MessageKind::Normal
         };
+        message.permalink = link;
         message.text = rich.text;
         message.spans = rich.spans;
         message.sender = sender;

@@ -139,8 +139,10 @@ pub struct Can {
     pub delete_everyone: bool,
     /// May delete this message on this user's side only (Telegram DM/group, Signal, Google Messages).
     pub delete_me: bool,
-    /// Google Messages: message can be starred/unstarred.
+    /// Google Messages / Slack Later: message can be starred or saved for later.
     pub star: bool,
+    /// Slack Later: message can have a reminder set on it.
+    pub remind: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
     /// May report this message to the server's moderators (Tiny `abuse_reports`, other people's messages).
@@ -304,7 +306,8 @@ pub fn can_with_network_topic(
         forward: act && caps.forward,
         delete_everyone,
         delete_me,
-        star: act && network == Network::Messages,
+        star: act && (network == Network::Messages || caps.save_messages),
+        remind: act && caps.save_messages,
         unsent,
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
     }
@@ -363,8 +366,10 @@ enum MenuAct {
     Unread,
     /// Enter multi-message selection mode with this message ticked.
     Select,
-    /// Star or unstar a message (Google Messages).
+    /// Star or unstar a message (Google Messages) / Save for later (Slack).
     Star,
+    /// Set a reminder on a message ("Remind me…").
+    Remind,
     /// Report another person's message on a Tiny server.
     Report,
     /// A sent message: ask, unless the click held Shift.
@@ -552,6 +557,9 @@ fn menu_acts(
     }
     if can.star {
         acts.push(MenuAct::Star);
+    }
+    if can.remind {
+        acts.push(MenuAct::Remind);
     }
     if can.report {
         acts.push(MenuAct::Report);
@@ -1119,7 +1127,8 @@ impl Pane {
             _ => None,
         };
         let link = match act {
-            MenuAct::Link | MenuAct::Open => self.link_of(&message, cx),
+            MenuAct::Link => self.link_of(&message, cx),
+            MenuAct::Open => self.open_link_of(&message, cx),
             _ => None,
         };
         self.close_menu(cx);
@@ -1185,6 +1194,17 @@ impl Pane {
                     cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
                 }
             }
+            MenuAct::Remind => {
+                if let Some(conversation) = self.key().cloned() {
+                    let due = crate::view::now().saturating_add(3600);
+                    let request = Request::Remind {
+                        conversation,
+                        message_id: message.id.clone(),
+                        remind_at: Some(due),
+                    };
+                    cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
+                }
+            }
             MenuAct::Report => {
                 if let Some(open) = self.open.as_ref() {
                     let account = open.key.account();
@@ -1224,6 +1244,17 @@ impl Pane {
             return super::links::message_link(key, origin.as_deref(), message);
         }
         super::links::message_link_for(self.open.as_ref().map(|mine| &mine.key), open, message)
+    }
+
+    fn open_link_of(&self, message: &Message, cx: &Context<Self>) -> Option<String> {
+        let shell = self.shell.upgrade()?;
+        let shell = shell.read(cx);
+        let open = shell.snapshot.as_ref()?.open.as_ref()?;
+        let key = match (&self.open, open.key.network) {
+            (Some(mine), protocol::Network::Discord) => &mine.key,
+            _ => &open.key,
+        };
+        super::links::open_in_app_link(key, open.space.as_deref(), message)
     }
 
     /// A phone's message menu: a sheet from the bottom with the message it is about, the quick
@@ -1627,11 +1658,24 @@ impl Pane {
                 );
             }
             if can.star {
-                let label = if message.starred { "Unstar message" } else { "Star message" };
+                let is_slack = self.open.as_ref().is_some_and(|o| o.key.network == Network::Slack);
+                let label = match (is_slack, message.starred) {
+                    (true, true) => "Remove from Later",
+                    (true, false) => "Save for later",
+                    (false, true) => "Unstar message",
+                    (false, false) => "Star message",
+                };
                 items = items.child(
                     menu_item("star", Some("icons/star.svg"), label, None)
                         .when(lit(MenuAct::Star), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Star)),
+                );
+            }
+            if can.remind {
+                items = items.child(
+                    menu_item("remind", Some("icons/clock.svg"), "Remind me in 1 hour", None)
+                        .when(lit(MenuAct::Remind), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Remind)),
                 );
             }
             if can.report {

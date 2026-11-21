@@ -94,6 +94,17 @@ pub const DEAFEN_KEY: &str = "deafen_key";
 /// The value is the percent, 0 to [`crate::GAIN_MAX`], then ` muted` when I muted them; 100
 /// and heard is the default and is not stored.
 pub const GAIN_PREFIX: &str = "gain:";
+/// Local switch: always relay Telegram calls through Telegram servers, never offering a direct
+/// peer-to-peer path regardless of the account's peer-to-peer setting.
+pub const TELEGRAM_ALWAYS_RELAY: &str = "telegram_always_relay";
+
+/// Whether a Telegram call's media must run relay-only (no host or reflexive ICE candidates).
+/// Obeys both the per-call server promise (`p2p_allowed == false`) and the local always-relay
+/// switch (`always_relay == true`).
+pub fn telegram_relay_only(p2p_allowed: bool, always_relay: bool) -> bool {
+    !p2p_allowed || always_relay
+}
+
 /// P1, per account. Off: the adapter sends no typing signal.
 pub const TYPING: &str = "typing";
 /// P2, per Teams or Signal account. Off: nothing is sent that others would read as a receipt.
@@ -274,6 +285,7 @@ fn kind(key: &str) -> Option<Kind> {
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
         TYPING | RECEIPTS => Kind::Switch(true),
+        TELEGRAM_ALWAYS_RELAY => Kind::Switch(false),
         LOG_LEVEL => Kind::Word(&LOG_LEVEL_CHOICES, "info"),
         LOG_RING | LOG_EXPORT => Kind::Switch(true),
         CUSTOM_SOUND => Kind::CustomSound,
@@ -301,6 +313,7 @@ fn scoped(key: &str, scope: &str) -> bool {
     match key {
         TYPING => account_of(scope).is_some_and(|account| typing_choice(account.network)),
         RECEIPTS => account_of(scope).is_some_and(|account| matches!(account.network, Network::Teams | Network::Signal | Network::Tiny)),
+        TELEGRAM_ALWAYS_RELAY => account_of(scope).is_some_and(|account| account.network == Network::Telegram),
         _ if gain_user(key).is_some() => account_of(scope).is_some(),
         NOTIFY_ABOUT => scope == GLOBAL || account_of(scope).is_some() || conversation_of(scope).is_some(),
         SOUND => account_of(scope).is_some() || conversation_of(scope).is_some(),
@@ -1214,5 +1227,20 @@ mod tests {
             values.proxy().custom_url(Some("s3cret")).unwrap().as_deref(),
             Some("socks5://alice:s3cret@127.0.0.1:1080")
         );
+    }
+
+    #[test]
+    fn telegram_always_relay_switch_and_p2p_promise() {
+        let tg = account_scope(&account(Network::Telegram));
+        let dc = account_scope(&account(Network::Discord));
+        assert!(valid(&tg, TELEGRAM_ALWAYS_RELAY, "on"));
+        assert!(valid(&tg, TELEGRAM_ALWAYS_RELAY, "off"));
+        assert!(!valid(&dc, TELEGRAM_ALWAYS_RELAY, "on"));
+        assert!(!valid(GLOBAL, TELEGRAM_ALWAYS_RELAY, "on"));
+        // Media must run relay-only when Telegram says p2p_allowed=false OR local always_relay=true.
+        assert!(telegram_relay_only(false, false));
+        assert!(telegram_relay_only(false, true));
+        assert!(telegram_relay_only(true, true));
+        assert!(!telegram_relay_only(true, false));
     }
 }

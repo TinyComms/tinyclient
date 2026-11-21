@@ -124,6 +124,14 @@ pub enum SearchScope {
     Account,
 }
 
+/// One page of recent calls across all chats on an account (`Command::CallHistory`).
+#[derive(Debug, Clone, Default)]
+pub struct CallHistoryPage {
+    pub entries: Vec<protocol::CallLogEntry>,
+    pub next: Option<String>,
+    pub more: bool,
+}
+
 /// One window of a member list.
 #[derive(Debug, Clone)]
 pub struct Members {
@@ -508,11 +516,24 @@ pub enum Command {
         folder_remove: Option<String>,
         reply: Reply<()>,
     },
-    /// Star or unstar one message on the network (Google Messages).
+    /// Star or unstar one message on the network (Google Messages, Slack Later).
     StarMessage {
         conversation_id: String,
         message_id: String,
         starred: bool,
+        reply: Reply<()>,
+    },
+    /// Saved / starred messages across the account (or one conversation when set), newest first.
+    StarredMessages {
+        conversation_id: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<Message>>,
+    },
+    /// Set or cancel a network reminder on one message (Slack `reminders.add` / `reminders.delete`).
+    Remind {
+        conversation_id: String,
+        message_id: String,
+        remind_at: Option<i64>,
         reply: Reply<()>,
     },
     /// Accept or decline/ignore a message request (Discord).
@@ -551,6 +572,30 @@ pub enum Command {
         before: Option<String>,
         limit: u32,
         reply: Reply<SharedPage>,
+    },
+    /// Recent calls across all chats on an account, newest first.
+    CallHistory {
+        missed: bool,
+        before: Option<String>,
+        limit: u32,
+        reply: Reply<CallHistoryPage>,
+    },
+    /// Delete one or more call log entries by message id (`revoke` for both sides).
+    DeleteCallEntries {
+        message_ids: Vec<String>,
+        revoke: bool,
+        reply: Reply<()>,
+    },
+    /// Read an account's network privacy policy for `key`.
+    GetPrivacy {
+        key: protocol::PrivacyKey,
+        reply: Reply<protocol::PrivacyPolicy>,
+    },
+    /// Write an account's network privacy policy for `key`.
+    SetPrivacy {
+        key: protocol::PrivacyKey,
+        policy: protocol::PrivacyPolicy,
+        reply: Reply<protocol::PrivacyPolicy>,
     },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
@@ -600,6 +645,7 @@ pub enum Command {
     SetPresence {
         presence: Presence,
         status: Option<String>,
+        status_emoji: Option<String>,
         clear_at: Option<i64>,
         reply: Reply<()>,
     },
@@ -702,13 +748,19 @@ impl Command {
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
             | Command::File { reply, .. }
-            | Command::StarMessage { reply, .. } => {
+            | Command::StarMessage { reply, .. }
+            | Command::Remind { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

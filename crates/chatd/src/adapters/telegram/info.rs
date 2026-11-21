@@ -50,6 +50,18 @@ pub(super) fn birthday_line(day: i32, month: i32, year: Option<i32>) -> Option<S
     })
 }
 
+/// Records call capability flags from `users.getFullUser` and refreshes the DM row when changed.
+fn record_call_flags(account: &Account, who: Who, user: &tl::types::UserFull) {
+    let flags = peers::CallFlags {
+        phone_available: user.phone_calls_available,
+        phone_private: user.phone_calls_private,
+        video_available: user.video_calls_available,
+    };
+    if account.dir().set_call_flags(who, flags) {
+        sync::refresh_row(account, who);
+    }
+}
+
 /// A person's card: what `users.getFullUser` says, with what is already known of them.
 pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault> {
     let Some((who @ Who::User(user_id), None)) = Who::parse(person_id) else {
@@ -60,6 +72,7 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
     let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id: id.clone() })?;
     account.learn(&full.users, &full.chats);
     let tl::enums::UserFull::Full(user) = full.full_user;
+    record_call_flags(account, who, &user);
     if user.blocked {
         account.set_user_blocked(user_id, true);
         let _ = account.ctx.relation(person_id, protocol::Relation::Blocked);
@@ -186,6 +199,7 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
             let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
             account.learn(&full.users, &full.chats);
             let tl::enums::UserFull::Full(user) = full.full_user;
+            record_call_flags(account, who, &user);
             about.description = user.about.unwrap_or_default();
             about.members = Some(2);
             about.disappearing = user.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
@@ -554,4 +568,198 @@ pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, be
         }
     }
     Ok(SharedPage { items, more, total })
+}
+
+/// Recent calls across all chats on this Telegram account via `messages.search` with an empty
+/// peer and `inputMessagesFilterPhoneCalls`, paged by `offset_id`.
+pub(super) fn call_history(
+    account: &Account,
+    missed: bool,
+    before: Option<&str>,
+    limit: u32,
+) -> Result<crate::adapters::CallHistoryPage, Fault> {
+    let limit = limit.clamp(1, 100);
+    let offset_id = before.and_then(|id| id.parse::<i32>().ok()).unwrap_or(0);
+    let request = tl::functions::messages::Search {
+        peer: tl::enums::InputPeer::Empty,
+        q: String::new(),
+        from_id: None,
+        saved_peer_id: None,
+        saved_reaction: None,
+        top_msg_id: None,
+        filter: tl::types::InputMessagesFilterPhoneCalls { missed }.into(),
+        min_date: 0,
+        max_date: 0,
+        offset_id,
+        add_offset: 0,
+        limit: limit as i32,
+        max_id: 0,
+        min_id: 0,
+        hash: 0,
+    };
+    let answer = account.ask(&request)?;
+    let (raw, users, chats) = match answer {
+        tl::enums::messages::Messages::Messages(list) => (list.messages, list.users, list.chats),
+        tl::enums::messages::Messages::Slice(list) => (list.messages, list.users, list.chats),
+        tl::enums::messages::Messages::ChannelMessages(list) => (list.messages, list.users, list.chats),
+        tl::enums::messages::Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new()),
+    };
+    account.learn(&users, &chats);
+    let raw_len = raw.len() as u32;
+    let dir = account.dir();
+    let mut entries = Vec::with_capacity(raw.len());
+    for item in &raw {
+        let Some(mapped) = super::content::map(&dir, item) else {
+            continue;
+        };
+        let Some(note) = mapped.message.call else {
+            continue;
+        };
+        let peer_id = mapped.peer.text();
+        let name = dir.name(mapped.peer);
+        let person_id = match mapped.peer {
+            Who::User(_) => peer_id.clone(),
+            _ => String::new(),
+        };
+        entries.push(protocol::CallLogEntry {
+            conversation: protocol::Key::new(&account.ctx.account, peer_id),
+            person_id,
+            name,
+            message_id: mapped.message.id,
+            outgoing: mapped.message.outgoing,
+            note,
+            time: mapped.message.sent,
+        });
+    }
+    let next = entries.last().map(|e| e.message_id.clone());
+    let more = raw_len >= limit && next.is_some();
+    Ok(crate::adapters::CallHistoryPage { entries, next, more })
+}
+
+/// Deletes call entries from the account's call log via `messages.deleteMessages`.
+pub(super) fn delete_call_entries(account: &Account, message_ids: &[String], revoke: bool) -> Result<(), Fault> {
+    let ids: Vec<i32> = message_ids.iter().filter_map(|id| id.parse::<i32>().ok()).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    account.ask(&tl::functions::messages::DeleteMessages { revoke, id: ids })?;
+    Ok(())
+}
+
+fn tl_privacy_key(key: protocol::PrivacyKey) -> tl::enums::InputPrivacyKey {
+    match key {
+        protocol::PrivacyKey::PhoneCall => tl::enums::InputPrivacyKey::PhoneCall,
+        protocol::PrivacyKey::PhoneP2p => tl::enums::InputPrivacyKey::PhoneP2P,
+        protocol::PrivacyKey::VoiceMessages => tl::enums::InputPrivacyKey::VoiceMessages,
+    }
+}
+
+fn map_privacy_rules(
+    account: &Account,
+    key: protocol::PrivacyKey,
+    rules: &[tl::enums::PrivacyRule],
+) -> protocol::PrivacyPolicy {
+    use protocol::{PrivacyAudience, PrivacyException, PrivacyPolicy};
+    use tl::enums::PrivacyRule as R;
+    let dir = account.dir();
+    let mut audience = PrivacyAudience::Nobody;
+    let mut always_allow = Vec::new();
+    let mut never_allow = Vec::new();
+    for rule in rules {
+        match rule {
+            R::PrivacyValueAllowAll => audience = PrivacyAudience::Everybody,
+            R::PrivacyValueAllowContacts => audience = PrivacyAudience::Contacts,
+            R::PrivacyValueDisallowAll => audience = PrivacyAudience::Nobody,
+            R::PrivacyValueAllowUsers(u) => {
+                for id in &u.users {
+                    let who = Who::User(*id);
+                    always_allow.push(PrivacyException { id: who.text(), name: dir.name(who), chat: false });
+                }
+            }
+            R::PrivacyValueAllowChatParticipants(c) => {
+                for id in &c.chats {
+                    let who = if dir.get(Who::Channel(*id)).is_some() { Who::Channel(*id) } else { Who::Group(*id) };
+                    always_allow.push(PrivacyException { id: who.text(), name: dir.name(who), chat: true });
+                }
+            }
+            R::PrivacyValueDisallowUsers(u) => {
+                for id in &u.users {
+                    let who = Who::User(*id);
+                    never_allow.push(PrivacyException { id: who.text(), name: dir.name(who), chat: false });
+                }
+            }
+            R::PrivacyValueDisallowChatParticipants(c) => {
+                for id in &c.chats {
+                    let who = if dir.get(Who::Channel(*id)).is_some() { Who::Channel(*id) } else { Who::Group(*id) };
+                    never_allow.push(PrivacyException { id: who.text(), name: dir.name(who), chat: true });
+                }
+            }
+            _ => {}
+        }
+    }
+    let is_premium = dir.get(Who::User(account.me)).is_some_and(|k| k.premium);
+    let premium_only = key == protocol::PrivacyKey::VoiceMessages && !is_premium;
+    PrivacyPolicy { audience, always_allow, never_allow, premium_only }
+}
+
+/// Reads an account privacy rule list (`account.getPrivacy`).
+pub(super) fn get_privacy(account: &Account, key: protocol::PrivacyKey) -> Result<protocol::PrivacyPolicy, Fault> {
+    let tl::enums::account::PrivacyRules::Rules(got) =
+        account.ask(&tl::functions::account::GetPrivacy { key: tl_privacy_key(key) })?;
+    account.learn(&got.users, &got.chats);
+    Ok(map_privacy_rules(account, key, &got.rules))
+}
+
+/// Writes an account privacy rule list (`account.setPrivacy`), preserving per-user and per-chat
+/// exceptions in Telegram's expected rule order (specific exceptions before the base rule).
+pub(super) fn set_privacy(
+    account: &Account,
+    key: protocol::PrivacyKey,
+    policy: &protocol::PrivacyPolicy,
+) -> Result<protocol::PrivacyPolicy, Fault> {
+    use protocol::PrivacyAudience;
+    use tl::enums::InputPrivacyRule as IR;
+    let mut rules: Vec<IR> = Vec::new();
+    let split = |list: &[protocol::PrivacyException]| -> (Vec<tl::enums::InputUser>, Vec<i64>) {
+        let dir = account.dir();
+        let mut users = Vec::new();
+        let mut chats = Vec::new();
+        for ex in list {
+            let Some((who, None)) = Who::parse(&ex.id) else {
+                continue;
+            };
+            match who {
+                Who::User(_) => {
+                    if let Some(input) = dir.input_user(who) {
+                        users.push(input);
+                    }
+                }
+                Who::Group(id) | Who::Channel(id) => chats.push(id),
+            }
+        }
+        (users, chats)
+    };
+    let (allow_users, allow_chats) = split(&policy.always_allow);
+    if !allow_users.is_empty() {
+        rules.push(tl::types::InputPrivacyValueAllowUsers { users: allow_users }.into());
+    }
+    if !allow_chats.is_empty() {
+        rules.push(tl::types::InputPrivacyValueAllowChatParticipants { chats: allow_chats }.into());
+    }
+    let (deny_users, deny_chats) = split(&policy.never_allow);
+    if !deny_users.is_empty() {
+        rules.push(tl::types::InputPrivacyValueDisallowUsers { users: deny_users }.into());
+    }
+    if !deny_chats.is_empty() {
+        rules.push(tl::types::InputPrivacyValueDisallowChatParticipants { chats: deny_chats }.into());
+    }
+    rules.push(match policy.audience {
+        PrivacyAudience::Everybody => IR::InputPrivacyValueAllowAll,
+        PrivacyAudience::Contacts => IR::InputPrivacyValueAllowContacts,
+        PrivacyAudience::Nobody => IR::InputPrivacyValueDisallowAll,
+    });
+    let tl::enums::account::PrivacyRules::Rules(got) =
+        account.ask(&tl::functions::account::SetPrivacy { key: tl_privacy_key(key), rules })?;
+    account.learn(&got.users, &got.chats);
+    Ok(map_privacy_rules(account, key, &got.rules))
 }
