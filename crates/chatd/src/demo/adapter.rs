@@ -1028,6 +1028,7 @@ impl Demo {
             }
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AddFriend { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetNote { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

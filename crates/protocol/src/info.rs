@@ -714,6 +714,9 @@ pub struct Capabilities {
     /// This account supports creating a friend-invite link (`Request::CreateInvite` with `account` only).
     #[serde(default, skip_serializing_if = "is_false")]
     pub create_friend_invite: bool,
+    /// This account supports reading and writing private notes on people (`Request::SetNote`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub person_notes: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

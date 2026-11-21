@@ -134,6 +134,14 @@ struct RequiredAction {
     required_action: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct NoteUpdate {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
 impl Discord {
     pub(super) fn dispatch(&self, event: &str, data: &str) -> Result<(), Failure> {
         match event {
@@ -186,6 +194,17 @@ impl Discord {
                 }
             }
             "USER_SETTINGS_PROTO_UPDATE" => self.settings_proto(from_str(data)?)?,
+            "USER_NOTE_UPDATE" => {
+                let update: NoteUpdate = from_str(data)?;
+                if !update.id.is_empty() {
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .notes
+                        .insert(update.id.clone(), update.note.unwrap_or_default());
+                    self.ctx.profile_stale(&update.id);
+                }
+            }
             // Discord wants a phone number, an email check or a captcha: nothing more is asked of
             // it until the user has dealt with that in Discord's own app.
             "USER_REQUIRED_ACTION_UPDATE" => {

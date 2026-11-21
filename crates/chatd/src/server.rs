@@ -1662,6 +1662,21 @@ impl Chat {
         }
     }
 
+    fn set_note(&self, person: Key, text: String) -> Response {
+        let account = person.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let person_id = person.id.clone();
+        match self.ask(&account, |reply| Command::SetNote { person_id, text, reply }) {
+            Ok(()) => {
+                self.hub.profiles.forget_where(|(key, _)| *key == person);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     fn set_friend_nickname(&self, person: Key, nickname: Option<String>) -> Response {
         let account = person.account();
         if let Err(refused) = self.online(&account) {
@@ -3347,6 +3362,7 @@ impl Chat {
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
+            Request::SetNote { person, text } => self.set_note(person, text),
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),

@@ -17,7 +17,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
     KeyDownEvent, Pixels, Point, WeakEntity, Window,
 };
-use protocol::{Conversation, Key, Link, Notify, Person, Profile, RelateAction, Request, Response};
+use protocol::{AccountKey, Conversation, Key, Link, Notify, Person, Profile, RelateAction, Request, Response};
 
 const CARD_WIDTH: f32 = 300.;
 const CONFIRM_WIDTH: f32 = 360.;
@@ -145,6 +145,12 @@ pub struct Floating {
     /// One-line input for setting a friend's private nickname (`Float::FriendNickname`).
     nick_input: Option<Entity<TextInput>>,
     nick_error: Option<String>,
+    /// Editable private note on the person whose card is open (`Capabilities::person_notes`).
+    note_input: Option<(Key, Entity<TextInput>)>,
+    note_baseline: String,
+    note_saving: bool,
+    note_saved: bool,
+    note_error: Option<String>,
 }
 
 impl Floating {
@@ -162,6 +168,11 @@ impl Floating {
             direct: None,
             nick_input: None,
             nick_error: None,
+            note_input: None,
+            note_baseline: String::new(),
+            note_saving: false,
+            note_saved: false,
+            note_error: None,
         }
     }
 
@@ -228,6 +239,7 @@ impl Floating {
                     let _ = weak.update(cx, |this, cx| {
                         if this.profile_asked == asked {
                             this.hub.learn(std::slice::from_ref(&profile.person));
+                            this.sync_note_input(&profile.person.key, &profile.note, cx);
                             this.profile = Some(*profile);
                             cx.notify();
                         }
@@ -236,6 +248,113 @@ impl Floating {
             });
         })
         .detach();
+    }
+
+    fn can_note(&self, person: &Key) -> bool {
+        self.scene.accounts.iter().any(|own| own.key == person.account() && own.can.person_notes)
+    }
+
+    fn sync_note_input(&mut self, person: &Key, note: &str, cx: &mut Context<Self>) {
+        if !self.can_note(person) {
+            self.note_input = None;
+            return;
+        }
+        let same = self.note_input.as_ref().is_some_and(|(k, _)| k == person);
+        if same {
+            let current = self.note_input.as_ref().map(|(_, e)| e.read(cx).text().to_owned()).unwrap_or_default();
+            if current == self.note_baseline {
+                if let Some((_, input)) = &self.note_input {
+                    input.update(cx, |i, cx| i.set_text(note, cx));
+                }
+                self.note_baseline = note.to_owned();
+            }
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut field = TextInput::new("Add a note…", cx);
+            field.set_text(note, cx);
+            field
+        });
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Changed => {
+                this.note_saved = false;
+                this.note_error = None;
+                cx.notify();
+            }
+            InputEvent::Submit => this.save_note(cx),
+        })
+        .detach();
+        self.note_input = Some((person.clone(), input));
+        self.note_baseline = note.to_owned();
+        self.note_saving = false;
+        self.note_saved = false;
+        self.note_error = None;
+    }
+
+    fn save_note(&mut self, cx: &mut Context<Self>) {
+        let Some((person, input)) = self.note_input.clone() else {
+            return;
+        };
+        let text = input.read(cx).text().to_owned();
+        if text == self.note_baseline || self.note_saving || only_draws() {
+            return;
+        }
+        if text.chars().count() > 256 {
+            self.note_error = Some("Notes can be at most 256 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.note_saving = true;
+        self.note_saved = false;
+        self.note_error = None;
+        cx.notify();
+        let this = cx.weak_entity();
+        let saved_text = text.clone();
+        super::ask_later(cx, Request::SetNote { person: person.clone(), text }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.note_saving = false;
+                match answer {
+                    Ok(Response::Ok) => {
+                        this.note_baseline = saved_text.clone();
+                        this.note_saved = true;
+                        this.note_error = None;
+                        if let Some(profile) = this.profile.as_mut().filter(|p| p.person.key == person) {
+                            profile.note = saved_text;
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.note_error = Some(detail),
+                    Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
+                    Err(err) => this.note_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Re-fetches the open card's profile when `Change::People` signals a live update (e.g. `USER_NOTE_UPDATE`).
+    pub fn refresh_profile(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
+        let Some((Float::Card(person), _)) = self.open.as_ref() else {
+            return;
+        };
+        if person.account() != *account || self.note_saving {
+            return;
+        }
+        let person = person.clone();
+        let space = self.place.as_ref().map(|(key, _)| key.clone());
+        let asked = self.profile_asked;
+        let weak = cx.weak_entity();
+        super::ask_later(cx, Request::Profile { person, space }, move |answer, cx| {
+            let Ok(Response::Profile { profile }) = answer else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                if this.profile_asked == asked {
+                    this.sync_note_input(&profile.person.key, &profile.note, cx);
+                    this.profile = Some(*profile);
+                    cx.notify();
+                }
+            });
+        });
     }
 
     /// Swaps what floats for something else in the same place.
@@ -248,6 +367,7 @@ impl Floating {
 
     /// The shell is told after this update: a float may be closed from inside the shell's own.
     fn close(&mut self, cx: &mut Context<Self>) {
+        self.save_note(cx);
         if self.open.take().is_some() {
             self.hub.watch("profile", [], cx);
             let shell = self.shell.clone();
@@ -406,6 +526,49 @@ impl Floating {
                     conns = conns.child(row);
                 }
                 body = body.child(conns);
+            }
+            if let Some((_, input)) = self.note_input.as_ref().filter(|(k, _)| *k == person.key) {
+                any = true;
+                let focused = input.focus_handle(cx).is_focused(window);
+                let dirty = input.read(cx).text() != self.note_baseline;
+                let status = if self.note_saving {
+                    Some("Saving…")
+                } else if self.note_saved && !dirty {
+                    Some("Saved")
+                } else {
+                    None
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().type_micro().text_color(theme::text_faint()).child("Note · only you see this"))
+                                .children(status.map(|s| div().type_micro().text_color(theme::text_faint()).child(s))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(input.clone()))
+                                .when(dirty && !self.note_saving, |row| {
+                                    row.child(
+                                        button("card-note-save", ButtonKind::Secondary, "Save")
+                                            .h(px(24.))
+                                            .px(px(8.))
+                                            .type_small()
+                                            .on_click(cx.listener(|this, _, _, cx| this.save_note(cx))),
+                                    )
+                                }),
+                        )
+                        .children(self.note_error.as_ref().map(|err| div().type_micro().text_color(theme::danger()).child(err.clone()))),
+                );
             }
         }
         let max = f32::from(window.viewport_size().height) - 16.;
@@ -1117,9 +1280,10 @@ impl Render for Floating {
             }
             _ => return div(),
         };
-        // Escape goes to whatever has the keys, so the float takes them while it is up.
+        // Escape goes to whatever has the keys, so the float takes them while it is up,
+        // without stealing focus away from an inline input (like the note or nickname field).
         let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
-        if !focus.is_focused(window) {
+        if !focus.contains_focused(window, cx) {
             window.focus(&focus, cx);
         }
         let surface = surface.track_focus(&focus).on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {

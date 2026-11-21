@@ -778,6 +778,12 @@ pub enum Command {
         nickname: Option<String>,
         reply: Reply<()>,
     },
+    /// Set or clear the user's private note on a person (Discord `PUT /users/@me/notes/{id}`).
+    SetNote {
+        person_id: String,
+        text: String,
+        reply: Reply<()>,
+    },
     /// Set (or clear, when `None` or empty) a private nickname for a friend.
     SetFriendNickname {
         person_id: String,
@@ -917,6 +923,7 @@ impl Command {
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }
+            | Command::SetNote { reply, .. }
             | Command::SetFriendNickname { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1639,6 +1646,13 @@ impl Context {
     /// The info pane's cached count is no longer true.
     pub fn info_stale(&self, conversation_id: &str) {
         self.hub.infos.forget(&self.key(conversation_id));
+    }
+
+    /// Cached profiles for `person_id` are no longer current (e.g. a private note changed).
+    pub fn profile_stale(&self, person_id: &str) {
+        let person = self.key(person_id);
+        self.hub.profiles.forget_where(|(key, _)| *key == person);
+        self.hub.changed(Change::People { account: self.account.clone() });
     }
 
     /// What is held about a person's presence now, for a member row built here.

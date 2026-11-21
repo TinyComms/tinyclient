@@ -403,6 +403,12 @@ impl Shell {
                 if let Some(list) = state.list.get() {
                     list.update(cx, |list, cx| list.people_changed(account, cx));
                 }
+                if let Some(floating) = state.floating.get() {
+                    floating.update(cx, |floating, cx| floating.refresh_profile(account, cx));
+                }
+                if let Some(info) = state.info.get() {
+                    info.update(cx, |info, cx| info.refresh_profile(account, cx));
+                }
             }
             Change::Members { conversation } => {
                 if let Some(members) = state.members.get() {

@@ -1741,6 +1741,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nickname: Option<String>,
     },
+    /// Sets or clears the user's private note on a person (Discord `/users/@me/notes/{id}`).
+    SetNote {
+        person: Key,
+        text: String,
+    },
     /// Sets (or clears, when `None` or empty) a private nickname for a friend (Discord).
     SetFriendNickname {
         person: Key,

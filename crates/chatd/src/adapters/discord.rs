@@ -362,6 +362,8 @@ struct State {
     /// Friends' status emoji and what they are doing, as their presence last said, so a voice
     /// state can be told beside it.
     doing: HashMap<String, (String, Option<protocol::Activity>)>,
+    /// Cached private notes on people (`user_id -> note`), updated on fetch, write, and `USER_NOTE_UPDATE`.
+    notes: HashMap<String, String>,
     /// When the last profile was asked for: the route is watched, so one per 3 s at most.
     profiled: Option<Instant>,
     /// How many profiles have been asked for: one still waiting its turn that is not the newest
@@ -2200,6 +2202,7 @@ impl Discord {
             }
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
             Command::AddFriend { username, reply } => answer(reply, self.add_friend(&username)),
+            Command::SetNote { person_id, text, reply } => answer(reply, self.set_note(&person_id, &text)),
             Command::SetFriendNickname { person_id, nickname, reply } => {
                 answer(reply, self.set_friend_nickname(&person_id, nickname))
             }

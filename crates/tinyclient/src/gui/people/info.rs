@@ -11,16 +11,17 @@ pub(in crate::gui) mod profile;
 use super::card::Float;
 use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
-use crate::gui::components::{button, glyph, icon_button, tip, ButtonKind};
+use crate::gui::components::{button, glyph, icon_button, search_field, tip, ButtonKind};
+use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, MouseButton, WeakEntity, Window};
+use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, WeakEntity, Window};
 use profile::draw;
 use profile::facts::{self, Act, Call, Seen, Surface};
 use profile::shared::{self, Shared};
 use protocol::{
-    Contact, ContactKind, Conversation, ConversationInfo, Key, Link, Network, Notify, Person, Profile, RelateAction,
+    AccountKey, Contact, ContactKind, Conversation, ConversationInfo, Key, Link, Network, Notify, Person, Profile, RelateAction,
     Request, Response, Space, SpaceInfo,
 };
 use std::time::{Duration, Instant};
@@ -90,6 +91,12 @@ pub struct InfoPane {
     width: f32,
     /// The shell's Spaces, for In common and Details' icons.
     spaces: Vec<Space>,
+    /// Editable private note on the person on show (`Capabilities::person_notes`).
+    note_input: Option<(Key, Entity<TextInput>)>,
+    note_baseline: String,
+    note_saving: bool,
+    note_saved: bool,
+    note_error: Option<String>,
 }
 
 /// The Space a person is seen from, when the open conversation is in one: what the network
@@ -140,6 +147,11 @@ impl InfoPane {
             pending_remove: None,
             width: 268.,
             spaces: Vec::new(),
+            note_input: None,
+            note_baseline: String::new(),
+            note_saving: false,
+            note_saved: false,
+            note_error: None,
         }
     }
 
@@ -222,6 +234,7 @@ impl InfoPane {
         let entity = cx.entity();
         self.shared.show(self.row.as_ref().map(|row| row.key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
         if let Some(profile) = given {
+            self.sync_note_input(&profile.person.key, &profile.note, cx);
             self.profile = Answer::Got(profile);
             cx.notify();
             return;
@@ -229,6 +242,9 @@ impl InfoPane {
         // The same person again keeps the answer; chatd holds it five minutes in any case.
         let held = self.profile.got().is_some_and(|profile| profile.person.key == person);
         if same && held {
+            if let Some(profile) = self.profile.got().cloned() {
+                self.sync_note_input(&profile.person.key, &profile.note, cx);
+            }
             cx.notify();
             return;
         }
@@ -247,6 +263,7 @@ impl InfoPane {
                 this.profile = match answer {
                     Ok(Response::Profile { profile }) => {
                         this.hub.learn(std::slice::from_ref(&profile.person));
+                        this.sync_note_input(&profile.person.key, &profile.note, cx);
                         Answer::Got(*profile)
                     }
                     _ => Answer::Failed,
@@ -254,6 +271,100 @@ impl InfoPane {
                 cx.notify();
             });
         });
+    }
+
+    fn can_note(&self, person: &Key) -> bool {
+        self.scene.accounts.iter().any(|own| own.key == person.account() && own.can.person_notes)
+    }
+
+    fn sync_note_input(&mut self, person: &Key, note: &str, cx: &mut Context<Self>) {
+        if !self.can_note(person) {
+            self.note_input = None;
+            return;
+        }
+        let same = self.note_input.as_ref().is_some_and(|(k, _)| k == person);
+        if same {
+            let current = self.note_input.as_ref().map(|(_, e)| e.read(cx).text().to_owned()).unwrap_or_default();
+            if current == self.note_baseline {
+                if let Some((_, input)) = &self.note_input {
+                    input.update(cx, |i, cx| i.set_text(note, cx));
+                }
+                self.note_baseline = note.to_owned();
+            }
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut field = TextInput::new("Add a note…", cx);
+            field.set_text(note, cx);
+            field
+        });
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Changed => {
+                this.note_saved = false;
+                this.note_error = None;
+                cx.notify();
+            }
+            InputEvent::Submit => this.save_note(cx),
+        })
+        .detach();
+        self.note_input = Some((person.clone(), input));
+        self.note_baseline = note.to_owned();
+        self.note_saving = false;
+        self.note_saved = false;
+        self.note_error = None;
+    }
+
+    fn save_note(&mut self, cx: &mut Context<Self>) {
+        let Some((person, input)) = self.note_input.clone() else {
+            return;
+        };
+        let text = input.read(cx).text().to_owned();
+        if text == self.note_baseline || self.note_saving || only_draws() {
+            return;
+        }
+        if text.chars().count() > 256 {
+            self.note_error = Some("Notes can be at most 256 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.note_saving = true;
+        self.note_saved = false;
+        self.note_error = None;
+        cx.notify();
+        let this = cx.weak_entity();
+        let saved_text = text.clone();
+        super::ask_later(cx, Request::SetNote { person: person.clone(), text }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.note_saving = false;
+                match answer {
+                    Ok(Response::Ok) => {
+                        this.note_baseline = saved_text.clone();
+                        this.note_saved = true;
+                        this.note_error = None;
+                        if let Answer::Got(profile) = &mut this.profile {
+                            if profile.person.key == person {
+                                profile.note = saved_text;
+                            }
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.note_error = Some(detail),
+                    Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
+                    Err(err) => this.note_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Re-fetches the open person's profile when `Change::People` signals a live update (e.g. `USER_NOTE_UPDATE`).
+    pub fn refresh_profile(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
+        let Some(Subject::Person { key, space }) = self.subject.clone() else {
+            return;
+        };
+        if key.account() != *account || self.note_saving {
+            return;
+        }
+        self.ask_profile(key, space.map(|(k, _)| k), cx);
     }
 
     /// A new subject: counts the ask, and repaints at 150 ms (skeletons) and 1 s (Shared).
@@ -374,6 +485,7 @@ impl InfoPane {
 
     /// The pane was closed: nobody in it is drawn any more.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.save_note(cx);
         self.hub.watch("info", [], cx);
         self.subject = None;
     }
@@ -671,10 +783,55 @@ impl InfoPane {
                 sections = sections.child(draw::role(&role, icon, None));
             }
             let shown = facts::sections(person, profile, place, crate::view::now(), ours);
-            if shown.about {
+            let editable_note = self.note_input.as_ref().filter(|(k, _)| *k == person.key);
+            if shown.about && (editable_note.is_none() || !profile.bio.trim().is_empty()) {
                 sections = sections.child(draw::label("About", !any));
                 any = true;
-                sections = sections.child(self.about(profile, cx));
+                sections = sections.child(self.about(profile, editable_note.is_none(), cx));
+            }
+            if let Some((_, input)) = editable_note {
+                sections = sections.child(draw::label("Note", !any));
+                any = true;
+                let focused = input.focus_handle(cx).is_focused(window);
+                let dirty = input.read(cx).text() != self.note_baseline;
+                let status = if self.note_saving {
+                    Some("Saving…")
+                } else if self.note_saved && !dirty {
+                    Some("Saved")
+                } else {
+                    None
+                };
+                sections = sections.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().type_micro().text_color(theme::text_faint()).child("Only you see this"))
+                                .children(status.map(|s| div().type_micro().text_color(theme::text_faint()).child(s))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(input.clone()))
+                                .when(dirty && !self.note_saving, |row| {
+                                    row.child(
+                                        button("info-note-save", ButtonKind::Secondary, "Save")
+                                            .h(px(24.))
+                                            .px(px(8.))
+                                            .type_small()
+                                            .on_click(cx.listener(|this, _, _, cx| this.save_note(cx))),
+                                    )
+                                }),
+                        )
+                        .children(self.note_error.as_ref().map(|err| div().type_micro().text_color(theme::danger()).child(err.clone()))),
+                );
             }
             if shown.contact {
                 let contacts = facts::contacts(person, profile);
@@ -871,7 +1028,7 @@ impl InfoPane {
         row.children(more)
     }
 
-    fn about(&self, profile: &Profile, cx: &mut Context<Self>) -> Div {
+    fn about(&self, profile: &Profile, show_note: bool, cx: &mut Context<Self>) -> Div {
         let bio = profile.bio.trim().to_owned();
         let long = bio.chars().count() > 180 || bio.lines().count() > 4;
         let folded = long && !self.about_open;
@@ -894,7 +1051,7 @@ impl InfoPane {
                     )
                 })
             })
-            .when(!profile.note.trim().is_empty(), |about| {
+            .when(show_note && !profile.note.trim().is_empty(), |about| {
                 about
                     .child(div().mt(px(8.)).type_micro().text_color(theme::text_faint()).child("Note · only you see this"))
                     .child(div().type_ui().text_color(theme::text_soft()).child(profile.note.trim().to_owned()))

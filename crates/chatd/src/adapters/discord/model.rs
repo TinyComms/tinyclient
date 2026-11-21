@@ -1221,6 +1221,8 @@ pub struct Profile {
     pub premium_since: Option<String>,
     #[serde(default)]
     pub premium_guild_since: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl Profile {

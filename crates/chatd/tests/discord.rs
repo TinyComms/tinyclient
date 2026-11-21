@@ -5783,3 +5783,113 @@ fn profile_parses_banner_badges_connections_nitro_and_server_tag() {
     // All parsed from the single existing GET /users/2001/profile request — zero extra HTTP calls.
     assert_eq!(world.discord.requests_to("GET", "/users/2001/profile").len(), 1);
 }
+
+#[test]
+fn person_note_reads_writes_clears_validates_and_updates_live() {
+    let world = World::start();
+    let account = world.account();
+
+    // 1. Capabilities advertise person_notes: true.
+    let can_notes = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account")
+            .can
+            .person_notes,
+        other => panic!("{other:?}"),
+    };
+    assert!(can_notes);
+
+    // 2. Profile without inline note fetches GET /users/@me/notes/2001.
+    world.discord.script(
+        "/users/2001/profile",
+        200,
+        json!({
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+            "user_profile": {"bio": "hi"}
+        }),
+    );
+    world.discord.script("/users/@me/notes/2001", 200, json!({"note": "Met at RustConf"}));
+    match world.ask(Request::Profile { person: world.key("2001"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, "Met at RustConf"),
+        other => panic!("expected Profile, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/notes/2001").len(), 1);
+
+    // 3. 404 on GET /users/@me/notes/2002 resolves cleanly to an empty note.
+    world.discord.script(
+        "/users/2002/profile",
+        200,
+        json!({
+            "user": {"id": "2002", "username": "dev", "global_name": "Dev Patel"},
+            "user_profile": {"bio": ""}
+        }),
+    );
+    world.discord.script("/users/@me/notes/2002", 404, json!({"message": "Unknown Note"}));
+    match world.ask(Request::Profile { person: world.key("2002"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, ""),
+        other => panic!("expected Profile with empty note on 404, got {other:?}"),
+    }
+
+    // 4. Inline note on profile payload skips GET /users/@me/notes/2003.
+    world.discord.script(
+        "/users/2003/profile",
+        200,
+        json!({
+            "user": {"id": "2003", "username": "asker", "global_name": "Asker"},
+            "user_profile": {"bio": ""},
+            "note": "Inline note"
+        }),
+    );
+    match world.ask(Request::Profile { person: world.key("2003"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, "Inline note"),
+        other => panic!("expected Profile with inline note, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/users/@me/notes/2003").is_empty());
+
+    // 5. Over 256 chars is refused locally with zero PUT HTTP calls.
+    let too_long = "x".repeat(257);
+    match world.ask(Request::SetNote { person: world.key("2001"), text: too_long }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("256"), "expected 256 char error, got: {detail}");
+        }
+        other => panic!("expected Refused over 256 chars, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PUT", "/users/@me/notes/2001").is_empty());
+
+    // 6. Write and clear private note via PUT /users/@me/notes/2001.
+    world.discord.script("/users/@me/notes/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetNote { person: world.key("2001"), text: "Updated note".into() }),
+        Response::Ok
+    );
+    world.discord.script("/users/@me/notes/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetNote { person: world.key("2001"), text: String::new() }),
+        Response::Ok
+    );
+    let puts = world.discord.requests_to("PUT", "/users/@me/notes/2001");
+    assert_eq!(puts.len(), 2);
+    assert_eq!(puts[0].body, json!({"note": "Updated note"}));
+    assert_eq!(puts[1].body, json!({"note": ""}));
+
+    // 7. Live gateway USER_NOTE_UPDATE updates cache & invalidates cached profiles.
+    world.discord.push("USER_NOTE_UPDATE", json!({"id": "2001", "note": "From phone"}));
+    world.discord.script(
+        "/users/2001/profile",
+        200,
+        json!({
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+            "user_profile": {"bio": "hi"}
+        }),
+    );
+    wait("USER_NOTE_UPDATE applied to cached note", || {
+        match world.ask(Request::Profile { person: world.key("2001"), space: None }) {
+            Response::Profile { profile } if profile.note == "From phone" => Some(()),
+            _ => None,
+        }
+    });
+    // Still only 1 GET /users/@me/notes/2001 total (USER_NOTE_UPDATE updated state.notes directly).
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/notes/2001").len(), 1);
+}

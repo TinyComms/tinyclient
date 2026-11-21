@@ -64,6 +64,8 @@ pub struct Ready {
     #[serde(default)]
     user_settings_proto: Option<String>,
     #[serde(default)]
+    notes: HashMap<String, String>,
+    #[serde(default)]
     presences: Vec<PresenceUpdate>,
 }
 
@@ -876,6 +878,7 @@ impl Discord {
             groups: 9,
             create_friend_invite: true,
             rich_status: true,
+            person_notes: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -946,6 +949,7 @@ impl Discord {
             state.groups.clear();
             state.presence.clear();
             state.doing.clear();
+            state.notes = ready.notes.clone();
             state.guilds.clear();
             state.quiet_directs = settings.remove(&None).unwrap_or_default();
             // Whatever happened between the sessions was not heard: nothing fetched before

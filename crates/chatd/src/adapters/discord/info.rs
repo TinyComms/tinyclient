@@ -24,6 +24,15 @@ static PROFILE_TURN: Mutex<()> = Mutex::new(());
 const SEARCH_PAGE: u32 = 25;
 /// Most characters Discord's message search accepts in `content`.
 const SEARCH_MAX_CHARS: usize = 1024;
+/// Most characters Discord accepts in a private note on a user.
+const NOTE_MAX_CHARS: usize = 256;
+
+#[derive(Deserialize)]
+struct NotePayload {
+    #[serde(default)]
+    note: Option<String>,
+}
+
 /// Recent message searches kept in memory per account, so the same scope and words are not
 /// asked twice in a session.
 const REMEMBERED_SEARCHES: usize = 32;
@@ -244,6 +253,32 @@ impl Discord {
             fields.push(("Boosting since".to_owned(), date));
         }
 
+        let note = if let Some(inline) = profile.note.clone() {
+            crate::hub::lock(&self.state).notes.insert(person.to_owned(), inline.clone());
+            inline
+        } else if let Some(cached) = crate::hub::lock(&self.state).notes.get(person).cloned() {
+            cached
+        } else {
+            match self.call("GET", &format!("/users/@me/notes/{person}"), None) {
+                Ok(raw) => {
+                    let text = serde_json::from_str::<NotePayload>(&raw)
+                        .ok()
+                        .and_then(|p| p.note)
+                        .unwrap_or_default();
+                    crate::hub::lock(&self.state).notes.insert(person.to_owned(), text.clone());
+                    text
+                }
+                Err(Refused::Status { status: 404, .. }) => {
+                    crate::hub::lock(&self.state).notes.insert(person.to_owned(), String::new());
+                    String::new()
+                }
+                Err(other) => {
+                    self.log("note", other);
+                    String::new()
+                }
+            }
+        };
+
         let state = crate::hub::lock(&self.state);
         let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
         let mut about = About {
@@ -257,6 +292,7 @@ impl Discord {
             connections,
             server_tag,
             fields,
+            note,
             // An id carries the moment it was made: the day they joined Discord.
             since: Some(model::seconds(person)).filter(|since| *since > 1_420_070_400),
             ..About::default()
@@ -537,6 +573,19 @@ impl Discord {
         }
         self.ctx.info_stale(channel);
         self.ctx.members_changed(channel);
+        Ok(())
+    }
+
+    /// Writes or clears the user's private note on `person` (`PUT /users/@me/notes/{person}`).
+    /// Refuses notes longer than 256 characters locally before hitting Discord.
+    pub(super) fn set_note(&self, person: &str, text: &str) -> Result<(), Refusal> {
+        if text.chars().count() > NOTE_MAX_CHARS {
+            return Err(refused(format!("Discord notes can be at most {NOTE_MAX_CHARS} characters.")));
+        }
+        self.call("PUT", &format!("/users/@me/notes/{person}"), Some(json!({ "note": text })))
+            .map_err(refusal)?;
+        crate::hub::lock(&self.state).notes.insert(person.to_owned(), text.to_owned());
+        self.ctx.profile_stale(person);
         Ok(())
     }
 
