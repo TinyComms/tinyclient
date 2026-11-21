@@ -456,9 +456,9 @@ impl Discord {
         answer(reply, Ok(Members { pending, sections: self.sections(&guild, &roster), members }));
     }
 
-    fn person(&self, member: &Member, files: &mut Vec<(MediaFile, String)>) -> Option<(Person, Presence, String)> {
+    fn person(&self, guild: &str, member: &Member, files: &mut Vec<(MediaFile, String)>) -> Option<(Person, Presence, String)> {
         let user = member.user.as_ref()?;
-        let (avatar, url) = user.avatar();
+        let (avatar, url) = member.avatar(Some(guild)).unwrap_or_else(|| user.avatar());
         files.push((avatar.clone(), url));
         let presence = member.presence.as_ref();
         let (shown, status) = presence.map_or((Presence::Unknown, ""), |presence| (presence.presence(), presence.status()));
@@ -484,7 +484,7 @@ impl Discord {
         let mut seen = Vec::new();
         let shown;
         let changed;
-        let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| self.person(member, &mut files)) {
+        let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| self.person(&update.guild_id, member, &mut files)) {
             Some((person, presence, status)) => {
                 seen.push((person.key.id.clone(), presence, status));
                 Entry::Member(Box::new(person))

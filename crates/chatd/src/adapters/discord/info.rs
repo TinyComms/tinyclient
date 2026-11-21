@@ -157,15 +157,93 @@ impl Discord {
                 let _ = self.ctx.media_variants(&id, &sizes);
             }
         }
+        let member_profile = space.and_then(|_| profile.guild_member_profile.as_ref());
+        let mut server_profile = false;
+        let mut server_avatar = None;
+        if let Some((guild_id, hash)) = space.zip(
+            profile
+                .guild_member
+                .as_ref()
+                .and_then(|m| m.avatar.as_deref())
+                .filter(|h| !h.is_empty()),
+        ) {
+            let (file, url) = model::member_avatar(guild_id, person, hash);
+            let sizes = model::avatar_variants(&file.id);
+            let id = file.id.clone();
+            let registered = self.ctx.media(&[(file.clone(), url)]);
+            if let (Ok(()), Some(sizes)) = (registered, sizes) {
+                let _ = self.ctx.media_variants(&id, &sizes);
+            }
+            server_avatar = Some(file);
+            server_profile = true;
+        }
+        let member_banner_hash = space.and_then(|_| {
+            member_profile
+                .and_then(|p| p.banner.as_deref())
+                .filter(|h| !h.is_empty())
+                .or_else(|| {
+                    profile
+                        .guild_member
+                        .as_ref()
+                        .and_then(|m| m.banner.as_deref())
+                        .filter(|h| !h.is_empty())
+                })
+        });
+        let global_banner_hash = profile
+            .user_profile
+            .as_ref()
+            .and_then(|p| p.banner.as_deref())
+            .filter(|h| !h.is_empty())
+            .or_else(|| profile.user.as_ref().and_then(|u| u.banner.as_deref()).filter(|h| !h.is_empty()));
+        let banner = if let (Some(guild_id), Some(hash)) = (space, member_banner_hash) {
+            let (file, url) = model::member_banner(guild_id, person, hash);
+            let _ = self.ctx.media(&[(file.clone(), url)]);
+            server_profile = true;
+            Some(file)
+        } else if let Some(hash) = global_banner_hash {
+            let (file, url) = model::user_banner(person, hash);
+            let _ = self.ctx.media(&[(file.clone(), url)]);
+            Some(file)
+        } else {
+            None
+        };
         let state = crate::hub::lock(&self.state);
         let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
         let text = profile.user_profile.as_ref();
+        let bio = match member_profile.map(|p| p.bio.as_str()).filter(|b| !b.is_empty()) {
+            Some(server_bio) => {
+                server_profile = true;
+                let mut bio = server_bio.to_owned();
+                protocol::clip(&mut bio, 1_000);
+                bio
+            }
+            None => profile.bio(),
+        };
+        let pronouns = match member_profile.map(|p| p.pronouns.as_str()).filter(|p| !p.is_empty()) {
+            Some(server_pronouns) => {
+                server_profile = true;
+                server_pronouns.to_owned()
+            }
+            None => text.map(|text| text.pronouns.clone()).unwrap_or_default(),
+        };
+        let accent = match member_profile.and_then(|p| p.accent_color) {
+            Some(color) => {
+                server_profile = true;
+                Some(color)
+            }
+            None => text
+                .and_then(|text| text.accent_color)
+                .or_else(|| profile.user.as_ref().and_then(|u| u.accent_color)),
+        };
         let mut about = About {
-            bio: profile.bio(),
+            bio,
             mutual_spaces: shared.map(|guild| guild.name.clone()).take(protocol::MUTUAL_SPACES).collect(),
             mutual_total: profile.mutual_guilds.len() as u32,
-            pronouns: text.map(|text| text.pronouns.clone()).unwrap_or_default(),
-            accent: text.and_then(|text| text.accent_color),
+            pronouns,
+            accent,
+            banner,
+            avatar: server_avatar,
+            server_profile,
             // An id carries the moment it was made: the day they joined Discord.
             since: Some(model::seconds(person)).filter(|since| *since > 1_420_070_400),
             ..About::default()

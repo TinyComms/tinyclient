@@ -875,7 +875,15 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         last: thread.last_message_id.as_deref().map_or(0, seconds),
     });
 
-    let (avatar, avatar_url) = author.avatar();
+    let (avatar, avatar_url) = match (
+        place.guild,
+        posted.member.as_ref().and_then(|member| member.avatar.as_deref()).filter(|hash| !hash.is_empty()),
+    ) {
+        (Some(guild), Some(hash)) if !author.id.is_empty() && posted.webhook_id.is_none() => {
+            model::member_avatar(guild, &author.id, hash)
+        }
+        _ => author.avatar(),
+    };
     rich.files.push((avatar.clone(), avatar_url));
     let outgoing = !author.id.is_empty() && author.id == place.me;
     let sent = seconds(&posted.id);
@@ -1236,5 +1244,25 @@ mod tests {
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
         assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
+    }
+
+    #[test]
+    fn message_in_guild_uses_server_avatar_while_dm_keeps_global_avatar() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "test".into() };
+        let posted: Posted = serde_json::from_value(serde_json::json!({
+            "id": "100", "channel_id": "4101", "type": 0, "content": "hi",
+            "author": {"id": "2001", "username": "mara", "global_name": "Mara", "avatar": "global1"},
+            "member": {"nick": "MaraGuild", "avatar": "guild1"}
+        }))
+        .unwrap();
+        let guild_place = Place { account: &account, me: "1000", guild: Some("4000"), names: &Nobody, author: None };
+        let (in_guild, files) = message(&posted, &guild_place);
+        assert_eq!(in_guild.sender.avatar.as_ref().map(|a| a.id.as_str()), Some("mavatar:4000:2001:guild1"));
+        assert!(files.files.iter().any(|(f, u)| f.id == "mavatar:4000:2001:guild1" && u.contains("/guilds/4000/users/2001/avatars/guild1.webp")));
+
+        let dm_place = Place { account: &account, me: "1000", guild: None, names: &Nobody, author: None };
+        let (in_dm, dm_files) = message(&posted, &dm_place);
+        assert_eq!(in_dm.sender.avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2001:global1"));
+        assert!(dm_files.files.iter().any(|(f, u)| f.id == "avatar:2001:global1" && u.contains("/avatars/2001/global1.webp")));
     }
 }

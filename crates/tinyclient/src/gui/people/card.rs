@@ -297,18 +297,33 @@ impl Floating {
         let actions = facts::actions(person, &seen, Surface::Card);
         let place = self.place.as_ref().map(|(_, name)| name.as_str());
         let ring = Ring::on(theme::overlay());
+        let shown_person = profile.map(|p| &p.person).unwrap_or(person);
+        let banner_path = profile
+            .and_then(|p| p.banner.as_ref())
+            .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
         let head = div()
             .relative()
             .h(px(16. + draw::AVATAR))
             .children(profile.and_then(|profile| profile.accent).map(|color| {
                 div().absolute().top_0().left_0().right_0().h(px(draw::BAND)).bg(draw::band(color, theme::overlay()))
             }))
-            .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, person, draw::AVATAR, &ring, calling, cx)));
+            .children(banner_path.map(|path| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(draw::BAND))
+                    .overflow_hidden()
+                    .child(gpui::img(std::path::PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover))
+            }))
+            .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, shown_person, draw::AVATAR, &ring, calling, cx)));
         let mut top = div()
             .px(px(16.))
             .flex()
             .flex_col()
             .child(draw::name_line(person.name.clone(), draw::mark_of(person)).mt(px(12.)))
+            .children(profile.filter(|p| p.server_profile).and_then(|_| draw::soft_line("Server profile".to_owned())))
             .children(draw::soft_line(facts::handle_line(person, profile)))
             .children(draw::presence_row(&line, theme::overlay(), 2))
             .when(actions.message || actions.request || actions.call.is_some(), |top| {

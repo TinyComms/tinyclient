@@ -5045,3 +5045,96 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
 }
+
+#[test]
+fn per_server_avatar_and_server_profile() {
+    let world = World::start();
+
+    // 1. Member list uses guild-scoped mavatar: when member.avatar is present and global avatar: otherwise.
+    let _ = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+    world.discord.push(
+        "GUILD_MEMBER_LIST_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "id": "everyone",
+            "member_count": 2,
+            "online_count": 2,
+            "groups": [{"id": "online", "count": 2}],
+            "ops": [{"op": "SYNC", "range": [0, 99], "items": [
+                {"group": {"id": "online", "count": 2}},
+                {"member": {
+                    "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "g_mara"},
+                    "nick": "mara-srv",
+                    "avatar": "srv_mara",
+                    "roles": [],
+                    "presence": {"user": {"id": "2001"}, "status": "online", "activities": [], "client_status": {}}
+                }},
+                {"member": {
+                    "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                    "nick": null,
+                    "avatar": null,
+                    "roles": [],
+                    "presence": {"user": {"id": "2006"}, "status": "online", "activities": [], "client_status": {}}
+                }}
+            ]}]
+        }),
+    );
+    let delivered = wait("the member list with server avatar", || {
+        let response = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+        matches!(response, Response::Members { pending: false, ref members, .. } if members.len() == 2).then_some(response)
+    });
+    match delivered {
+        Response::Members { members, .. } => {
+            assert_eq!(members[0].avatar.as_ref().map(|a| a.id.as_str()), Some("mavatar:4000:2001:srv_mara"));
+            assert_eq!(members[1].avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2006:s4m"));
+        }
+        other => panic!("expected Members, got {other:?}"),
+    }
+
+    // 2. Guild message sender uses mavatar:, while a DM message keeps the global avatar:.
+    let guild_msg_id = world.incoming(
+        "4101",
+        Some("4000"),
+        "hi from server",
+        json!({"member": {"nick": "SamGuild", "avatar": "srv_sam", "roles": []}}),
+    );
+    let guild_msg = wait("guild message with server avatar", || {
+        world.messages("4101").into_iter().find(|m| m.id == guild_msg_id)
+    });
+    assert_eq!(guild_msg.sender.avatar.as_ref().map(|a| a.id.as_str()), Some("mavatar:4000:2006:srv_sam"));
+
+    let dm_msg_id = world.incoming("3001", None, "hi from dm", json!({}));
+    let dm_msg = wait("dm message with global avatar", || {
+        world.messages("3001").into_iter().find(|m| m.id == dm_msg_id)
+    });
+    assert_eq!(dm_msg.sender.avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2006:s4m"));
+
+    // 3. Server profile (space: Some) overrides avatar, banner, bio, pronouns, accent and marks server_profile = true.
+    let profile_payload = json!({
+        "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m", "banner": "glob_ban", "accent_color": 1118481},
+        "user_profile": {"bio": "Global bio", "pronouns": "he/him", "accent_color": 1118481, "banner": "glob_ban"},
+        "guild_member": {"nick": "SamGuild", "avatar": "srv_sam", "banner": "srv_ban", "roles": ["4010"], "joined_at": "2023-03-01T12:00:00+00:00"},
+        "guild_member_profile": {"bio": "Server bio", "pronouns": "they/them", "accent_color": 2236962, "banner": "srv_ban"},
+        "mutual_guilds": [{"id": "4000"}]
+    });
+    world.discord.script("/users/2006/profile", 200, profile_payload.clone());
+    let srv_profile = match world.ask(Request::Profile { person: world.key("2006"), space: Some(world.key("4000")) }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected server profile, got {other:?}"),
+    };
+    assert!(srv_profile.server_profile);
+    assert_eq!(srv_profile.person.avatar.as_ref().map(|a| a.id.as_str()), Some("mavatar:4000:2006:srv_sam"));
+    assert_eq!(srv_profile.banner.as_ref().map(|b| b.id.as_str()), Some("mbanner:4000:2006:srv_ban"));
+    assert_eq!((srv_profile.bio.as_str(), srv_profile.pronouns.as_str(), srv_profile.accent), ("Server bio", "they/them", Some(2236962)));
+
+    // 4. Global profile (space: None) keeps global avatar, banner, bio, pronouns, accent and server_profile = false.
+    world.discord.script("/users/2006/profile", 200, profile_payload);
+    let global_profile = match world.ask(Request::Profile { person: world.key("2006"), space: None }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected global profile, got {other:?}"),
+    };
+    assert!(!global_profile.server_profile);
+    assert_eq!(global_profile.person.avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2006:s4m"));
+    assert_eq!(global_profile.banner.as_ref().map(|b| b.id.as_str()), Some("banner:2006:glob_ban"));
+    assert_eq!((global_profile.bio.as_str(), global_profile.pronouns.as_str(), global_profile.accent), ("Global bio", "he/him", Some(1118481)));
+}

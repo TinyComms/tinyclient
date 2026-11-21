@@ -182,6 +182,10 @@ pub struct About {
     pub away_until: Option<i64>,
     pub note: String,
     pub warning: Option<Warning>,
+    /// Space-scoped avatar override (e.g. Discord server avatar), kept out of global People storage.
+    pub avatar: Option<protocol::MediaFile>,
+    /// True when this profile carries per-Space overrides (server avatar, banner, bio, pronouns).
+    pub server_profile: bool,
 }
 
 /// What a conversation's info pane says beyond its row, as the network tells it.

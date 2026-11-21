@@ -112,6 +112,10 @@ pub struct User {
     pub global_name: Option<String>,
     #[serde(default)]
     pub avatar: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub accent_color: Option<u32>,
     #[serde(default, deserialize_with = "nullable")]
     pub discriminator: String,
     #[serde(default, deserialize_with = "nullable")]
@@ -195,8 +199,26 @@ pub fn avatar(user: &str, hash: Option<&str>, discriminator: &str) -> (MediaFile
 
 /// A registered avatar at the sizes a profile card draws it (80 pt, so 160 px on a 2x screen;
 /// the CDN serves powers of two). `None` for a default avatar, which has one size, and for an
-/// id that is not an avatar's.
+/// id that is not an avatar's. Supports both global (`avatar:`) and per-server (`mavatar:`).
 pub fn avatar_variants(file: &str) -> Option<Vec<(u32, String)>> {
+    if let Some(rest) = file.strip_prefix("mavatar:") {
+        let mut parts = rest.split(':');
+        let (guild, user, hash) = (parts.next()?, parts.next()?, parts.next()?);
+        if guild.is_empty() || user.is_empty() || hash.is_empty() {
+            return None;
+        }
+        return Some(
+            [128, 256]
+                .into_iter()
+                .map(|size| {
+                    (
+                        size,
+                        format!("{}/guilds/{guild}/users/{user}/avatars/{hash}.webp?size={size}{}", cdn(), moving(hash)),
+                    )
+                })
+                .collect(),
+        );
+    }
     let mut parts = file.strip_prefix("avatar:")?.split(':');
     let (user, hash) = (parts.next()?, parts.next()?);
     if user == "default" {
@@ -209,6 +231,28 @@ pub fn member_avatar(guild: &str, user: &str, hash: &str) -> (MediaFile, String)
     (
         sized(format!("mavatar:{guild}:{user}:{hash}"), MediaKind::Avatar, 80),
         format!("{}/guilds/{guild}/users/{user}/avatars/{hash}.webp?size=80{}", cdn(), moving(hash)),
+    )
+}
+
+pub fn user_banner(user: &str, hash: &str) -> (MediaFile, String) {
+    (
+        MediaFile {
+            width: 600,
+            height: 240,
+            ..MediaFile::new(format!("banner:{user}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/banners/{user}/{hash}.webp?size=600{}", cdn(), moving(hash)),
+    )
+}
+
+pub fn member_banner(guild: &str, user: &str, hash: &str) -> (MediaFile, String) {
+    (
+        MediaFile {
+            width: 600,
+            height: 240,
+            ..MediaFile::new(format!("mbanner:{guild}:{user}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/guilds/{guild}/users/{user}/banners/{hash}.webp?size=600{}", cdn(), moving(hash)),
     )
 }
 
@@ -246,6 +290,8 @@ pub struct Member {
     pub nick: Option<String>,
     #[serde(default)]
     pub avatar: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
     #[serde(default)]
     pub roles: Vec<String>,
     #[serde(default)]
@@ -1052,6 +1098,8 @@ pub struct ProfileText {
     pub pronouns: String,
     #[serde(default)]
     pub accent_color: Option<u32>,
+    #[serde(default)]
+    pub banner: Option<String>,
 }
 
 /// Their membership of the server asked about (`guild_id` on the profile request).
@@ -1059,6 +1107,10 @@ pub struct ProfileText {
 pub struct ProfileMember {
     #[serde(default)]
     pub nick: Option<String>,
+    #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
     pub roles: Vec<String>,
     #[serde(default)]
@@ -1081,6 +1133,8 @@ pub struct Profile {
     pub mutual_guilds: Vec<MutualGuild>,
     #[serde(default)]
     pub guild_member: Option<ProfileMember>,
+    #[serde(default)]
+    pub guild_member_profile: Option<ProfileText>,
 }
 
 impl Profile {
@@ -1136,5 +1190,36 @@ mod tests {
         let index = (175_928_847_299_117_063u64 >> 22) % 6;
         assert_eq!(url, format!("{}/embed/avatars/{index}.png", cdn()));
         assert_eq!(file.id, format!("avatar:default:{index}"));
+    }
+
+    #[test]
+    fn server_avatar_and_banner_yield_guild_cdn_urls_and_variants() {
+        let (file, url) = member_avatar("4000", "2001", "srvhash");
+        assert_eq!(file.id, "mavatar:4000:2001:srvhash");
+        assert_eq!(url, format!("{}/guilds/4000/users/2001/avatars/srvhash.webp?size=80", cdn()));
+        let variants = avatar_variants(&file.id).expect("member avatar variants");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0], (128, format!("{}/guilds/4000/users/2001/avatars/srvhash.webp?size=128", cdn())));
+        assert_eq!(variants[1], (256, format!("{}/guilds/4000/users/2001/avatars/srvhash.webp?size=256", cdn())));
+
+        let (anim, anim_url) = member_avatar("4000", "2001", "a_spin");
+        assert!(anim_url.ends_with("&animated=true"));
+        assert!(avatar_variants(&anim.id).unwrap()[0].1.ends_with("&animated=true"));
+
+        let (mban, mban_url) = member_banner("4000", "2001", "bhash");
+        assert_eq!(mban.id, "mbanner:4000:2001:bhash");
+        assert_eq!(mban_url, format!("{}/guilds/4000/users/2001/banners/bhash.webp?size=600", cdn()));
+
+        let (uban, uban_url) = user_banner("2001", "ubhash");
+        assert_eq!(uban.id, "banner:2001:ubhash");
+        assert_eq!(uban_url, format!("{}/banners/2001/ubhash.webp?size=600", cdn()));
+
+        let member: Member = serde_json::from_str(
+            r#"{"user":{"id":"2001","username":"mara","avatar":"ghash"},"avatar":"srvhash","banner":"bhash"}"#,
+        )
+        .unwrap();
+        assert_eq!(member.avatar(Some("4000")).unwrap().0.id, "mavatar:4000:2001:srvhash");
+        assert_eq!(member.avatar(None).unwrap().0.id, "avatar:2001:ghash");
+        assert_eq!(member.banner.as_deref(), Some("bhash"));
     }
 }

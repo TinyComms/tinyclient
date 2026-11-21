@@ -490,6 +490,26 @@ impl Hub {
                 self.set_presence(&person.key, person.presence, &person.status);
             }
             let mut inner = self.0.borrow_mut();
+            let scoped_avatar = person.avatar.as_ref().is_some_and(|a| a.id.starts_with("mavatar:"));
+            if scoped_avatar {
+                // Keep People, DMs, and the quick switcher on the global avatar & name
+                // when a server-scoped member row or server profile arrives.
+                if let Some(existing) = inner.people.get_mut(&person.key) {
+                    if person.presence != Presence::Unknown {
+                        existing.presence = person.presence;
+                    }
+                    if !person.status.is_empty() {
+                        existing.status = person.status.clone();
+                    }
+                    if !person.emoji.is_empty() {
+                        existing.emoji = person.emoji.clone();
+                    }
+                    if person.activity.is_some() {
+                        existing.activity = person.activity.clone();
+                    }
+                    continue;
+                }
+            }
             if inner.people.insert(person.key.clone(), person.clone()).is_none() {
                 inner.people_order.push_back(person.key.clone());
                 if inner.people_order.len() > PEOPLE_LIMIT {

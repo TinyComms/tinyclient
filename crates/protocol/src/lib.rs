@@ -871,6 +871,9 @@ pub struct Profile {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<Warning>,
+    /// True when the profile shows per-Space overrides (e.g. Discord server avatar, banner, bio, pronouns).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_profile: bool,
 }
 
 impl Profile {
@@ -902,6 +905,7 @@ impl Profile {
             away_until: None,
             note: String::new(),
             warning: None,
+            server_profile: false,
         }
     }
 }

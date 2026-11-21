@@ -1900,7 +1900,11 @@ impl Chat {
         };
         let cached = (person.clone(), space.clone());
         if let Some(mut profile) = self.hub.profiles.get(&cached) {
+            let scoped_avatar = profile.person.avatar.clone().filter(|a| a.id.starts_with("mavatar:"));
             profile.person = self.with_presence(vec![known]).remove(0);
+            if let Some(avatar) = scoped_avatar {
+                profile.person.avatar = Some(avatar);
+            }
             return Response::Profile { profile: Box::new(profile) };
         }
         let account = person.account();
@@ -4144,6 +4148,10 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.away_until = about.away_until;
     profile.note = about.note;
     profile.warning = about.warning;
+    if let Some(avatar) = about.avatar {
+        profile.person.avatar = Some(avatar);
+    }
+    profile.server_profile = about.server_profile;
     profile
 }
 

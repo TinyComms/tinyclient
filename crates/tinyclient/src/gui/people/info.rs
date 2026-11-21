@@ -492,12 +492,15 @@ impl InfoPane {
         let lone = actions.more && !actions.message && !actions.request && actions.call.is_none();
         let more = actions.more.then(|| self.more_button(person, &seen));
         let (more_in_head, more_in_row) = if lone { (more, None) } else { (None, more) };
-        let head = self.head(person, accent, calling, more_in_head, cx);
+        let shown_person = profile.map(|p| &p.person).unwrap_or(person);
+        let banner = profile.and_then(|p| p.banner.as_ref());
+        let head = self.head(shown_person, accent, banner, calling, more_in_head, cx);
         let mut top = div()
             .px(px(theme::PANE_PAD))
             .flex()
             .flex_col()
             .child(draw::name_line(person.name.clone(), draw::mark_of(person)).mt(px(12.)))
+            .children(profile.filter(|p| p.server_profile).and_then(|_| draw::soft_line("Server profile".to_owned())))
             .children(draw::soft_line(facts::handle_line(person, profile)))
             .children(draw::presence_row(&line, theme::sidebar(), 2));
         if !lone && (actions.more || actions.message || actions.request || actions.call.is_some()) {
@@ -670,13 +673,24 @@ impl InfoPane {
         body
     }
 
-    fn head(&self, person: &Person, accent: Option<u32>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
+    fn head(&self, person: &Person, accent: Option<u32>, banner: Option<&protocol::MediaFile>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
         let ring = Ring::on(theme::sidebar());
+        let banner_path = banner.and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
         // The band's slot is kept with or without a colour, so nothing below moves.
         div()
             .relative()
             .h(px(16. + draw::AVATAR))
             .children(accent.map(|color| div().absolute().top_0().left_0().right_0().h(px(draw::BAND)).bg(draw::band(color, theme::sidebar()))))
+            .children(banner_path.map(|path| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(draw::BAND))
+                    .overflow_hidden()
+                    .child(gpui::img(std::path::PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover))
+            }))
             .child(
                 div()
                     .absolute()
