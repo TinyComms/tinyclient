@@ -213,6 +213,12 @@ pub struct SpaceAbout {
     pub boost_level: u8,
     pub boosts: u32,
     pub mark: Option<protocol::Mark>,
+    pub system_channel_id: Option<String>,
+    pub afk_channel_id: Option<String>,
+    pub afk_timeout: u32,
+    pub default_notify: Option<Notify>,
+    pub vanity_url: Option<String>,
+    pub invites_disabled: bool,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -557,6 +563,44 @@ pub enum Command {
         on: bool,
         reply: Reply<()>,
     },
+    /// Edit a Space's overview settings (`PATCH /guilds/{id}`).
+    EditSpace {
+        space_id: String,
+        edit: protocol::SpaceEdit,
+        reply: Reply<()>,
+    },
+    /// Delete an owned Space (`POST /guilds/{id}/delete`).
+    DeleteSpace {
+        space_id: String,
+        mfa_code: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Transfer ownership of an owned Space (`PATCH /guilds/{id}`).
+    TransferSpace {
+        space_id: String,
+        new_owner_id: String,
+        mfa_code: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Create a scheduled event in a Space.
+    CreateEvent {
+        space_id: String,
+        event: protocol::SpaceEventEdit,
+        reply: Reply<protocol::SpaceEvent>,
+    },
+    /// Edit a scheduled event in a Space.
+    EditEvent {
+        space_id: String,
+        event_id: String,
+        event: protocol::SpaceEventEdit,
+        reply: Reply<protocol::SpaceEvent>,
+    },
+    /// Delete / cancel a scheduled event in a Space.
+    DeleteEvent {
+        space_id: String,
+        event_id: String,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -871,7 +915,14 @@ impl Command {
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::EventInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. }
+            | Command::EditSpace { reply, .. }
+            | Command::DeleteSpace { reply, .. }
+            | Command::TransferSpace { reply, .. }
+            | Command::DeleteEvent { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
@@ -1255,6 +1306,15 @@ impl Context {
         if self.hub.store().set_space_flags(&space, muted, hide_muted)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
             self.hub.changed(Change::Tree { space });
+        }
+        Ok(())
+    }
+
+    /// Management permissions held by the signed-in user in a Space.
+    pub fn space_rights(&self, space_id: &str, rights: protocol::SpaceRights) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_rights(&space, rights)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())
     }

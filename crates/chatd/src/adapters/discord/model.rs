@@ -39,6 +39,7 @@ pub const MEDIA_FORUM: u8 = 16;
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
+pub const MANAGE_GUILD: u64 = 1 << 5;
 pub const ADD_REACTIONS: u64 = 1 << 6;
 #[allow(dead_code)]
 pub const STREAM: u64 = 1 << 9;
@@ -52,6 +53,7 @@ pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;
 pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const MANAGE_EVENTS: u64 = 1 << 33;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
@@ -475,6 +477,14 @@ pub struct GuildProperties {
     pub features: Option<Vec<String>>,
     #[serde(default)]
     pub vanity_url_code: Option<String>,
+    #[serde(default)]
+    pub system_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_timeout: Option<u32>,
+    #[serde(default)]
+    pub default_message_notifications: Option<u8>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -500,6 +510,14 @@ pub struct Guild {
     pub features: Option<Vec<String>>,
     #[serde(default)]
     pub vanity_url_code: Option<String>,
+    #[serde(default)]
+    pub system_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_timeout: Option<u32>,
+    #[serde(default)]
+    pub default_message_notifications: Option<u8>,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -674,6 +692,26 @@ impl Guild {
     pub fn vanity_url_code(&self) -> Option<&str> {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.vanity_url_code.as_deref());
         wrapped.or(self.vanity_url_code.as_deref()).filter(|c| !c.is_empty())
+    }
+
+    pub fn system_channel_id(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.system_channel_id.as_deref());
+        wrapped.or(self.system_channel_id.as_deref()).filter(|id| !id.is_empty())
+    }
+
+    pub fn afk_channel_id(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.afk_channel_id.as_deref());
+        wrapped.or(self.afk_channel_id.as_deref()).filter(|id| !id.is_empty())
+    }
+
+    pub fn afk_timeout(&self) -> Option<u32> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.afk_timeout);
+        wrapped.or(self.afk_timeout)
+    }
+
+    pub fn default_message_notifications(&self) -> Option<u8> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.default_message_notifications);
+        wrapped.or(self.default_message_notifications)
     }
 }
 
@@ -1227,6 +1265,29 @@ pub fn iso_seconds(text: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
+/// Formats Unix seconds as an ISO-8601 UTC timestamp (`2026-10-13T08:15:00Z`), the exact inverse
+/// of [`iso_seconds`].
+pub fn format_iso_utc(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,5 +1378,30 @@ mod tests {
 
         let settings: GuildSettings = serde_json::from_str(r#"{"guild_id":"4000","mute_scheduled_events":true}"#).unwrap();
         assert!(settings.mute_scheduled_events);
+    }
+
+    #[test]
+    fn format_iso_utc_inverts_iso_seconds_and_guild_overview_fields_parse() {
+        for ts in [1_462_015_105, 1_700_000_000, 1_760_356_800, 1_800_000_000] {
+            let formatted = format_iso_utc(ts);
+            assert_eq!(iso_seconds(&formatted), Some(ts), "round-trip failed for {ts} ({formatted})");
+        }
+        let guild: Guild = serde_json::from_str(
+            r#"{
+                "id": "4000",
+                "properties": {
+                    "name": "Rustaceans",
+                    "system_channel_id": "4101",
+                    "afk_channel_id": "4201",
+                    "afk_timeout": 900,
+                    "default_message_notifications": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(guild.system_channel_id(), Some("4101"));
+        assert_eq!(guild.afk_channel_id(), Some("4201"));
+        assert_eq!(guild.afk_timeout(), Some(900));
+        assert_eq!(guild.default_message_notifications(), Some(1));
     }
 }

@@ -636,6 +636,7 @@ fn build() -> Fixture {
         muted: false,
         hide_muted: false,
         can_create_channels: false,
+        rights: protocol::SpaceRights::default(),
     };
     let spaces = vec![
         space(&t, premier, "Premier", Some(picture("icon-premier", MediaKind::Icon, "icon-night-shift.webp", 192, 192)), 0, 0),
@@ -1212,6 +1213,12 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     boost_level: 0,
                     boosts: 0,
                     mark: None,
+                    system_channel_id: None,
+                    afk_channel_id: None,
+                    afk_timeout: 0,
+                    default_notify: None,
+                    vanity_url: None,
+                    invites_disabled: false,
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },

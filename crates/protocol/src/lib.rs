@@ -237,6 +237,49 @@ pub enum Media {
     Running,
 }
 
+/// Server management permissions the signed-in user holds in a Space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRights {
+    /// Manage Server (`MANAGE_GUILD` on Discord): overview settings and invites.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_space: bool,
+    /// Manage Roles (`MANAGE_ROLES` on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_roles: bool,
+    /// Manage Events (`MANAGE_EVENTS` on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_events: bool,
+    /// Server owner (transfer ownership / delete server).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owner: bool,
+}
+
+impl SpaceRights {
+    pub fn is_empty(&self) -> bool {
+        !self.manage_space && !self.manage_roles && !self.manage_events && !self.owner
+    }
+
+    pub fn any_settings(&self) -> bool {
+        self.manage_space || self.manage_roles || self.manage_events || self.owner
+    }
+
+    pub fn to_bits(self) -> u32 {
+        u32::from(self.manage_space)
+            | (u32::from(self.manage_roles) << 1)
+            | (u32::from(self.manage_events) << 2)
+            | (u32::from(self.owner) << 3)
+    }
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            manage_space: bits & 1 != 0,
+            manage_roles: bits & 2 != 0,
+            manage_events: bits & 4 != 0,
+            owner: bits & 8 != 0,
+        }
+    }
+}
+
 /// A server, workspace or team. Every account also has its direct conversations, which belong to
 /// no Space.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +305,9 @@ pub struct Space {
     /// The user has permission to create channels in this Space (`Request::CreateChannel`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_channels: bool,
+    /// Management permissions held by the signed-in user in this Space.
+    #[serde(default, skip_serializing_if = "SpaceRights::is_empty")]
+    pub rights: SpaceRights,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1751,6 +1797,40 @@ pub enum Request {
         event: Key,
         on: bool,
     },
+    /// Edit a Space's overview settings (e.g. Discord `PATCH /guilds/{id}`).
+    EditSpace {
+        space: Key,
+        edit: SpaceEdit,
+    },
+    /// Permanently delete a Space you own (e.g. Discord `POST /guilds/{id}/delete`).
+    DeleteSpace {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Transfer ownership of a Space you own to another member (e.g. Discord `PATCH /guilds/{id}`).
+    TransferSpace {
+        space: Key,
+        new_owner: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Create a scheduled event in a Space (e.g. Discord `POST /guilds/{id}/scheduled-events`).
+    CreateEvent {
+        space: Key,
+        event: SpaceEventEdit,
+    },
+    /// Edit an existing scheduled event in a Space (e.g. Discord `PATCH /guilds/{id}/scheduled-events/{event_id}`).
+    EditEvent {
+        space: Key,
+        event_id: String,
+        event: SpaceEventEdit,
+    },
+    /// Cancel / delete a scheduled event in a Space (e.g. Discord `DELETE /guilds/{id}/scheduled-events/{event_id}`).
+    DeleteEvent {
+        space: Key,
+        event_id: String,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
@@ -2962,6 +3042,10 @@ pub enum Response {
     Events {
         space: Key,
         events: Vec<SpaceEvent>,
+    },
+    /// Answers `CreateEvent` / `EditEvent`: the created or updated event.
+    Event {
+        event: SpaceEvent,
     },
     Pinned {
         conversation: Key,

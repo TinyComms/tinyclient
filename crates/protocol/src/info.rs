@@ -345,6 +345,73 @@ pub struct SpaceInfo {
     /// Verified or partnered server mark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<Mark>,
+    /// System messages channel id, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_channel_id: Option<String>,
+    /// AFK voice channel id, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afk_channel_id: Option<String>,
+    /// AFK timeout in seconds (0 when unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub afk_timeout: u32,
+    /// Server-wide default notification level (`All` or `Mentions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_notify: Option<Notify>,
+    /// Vanity invite code, if the server has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vanity_url: Option<String>,
+    /// Whether invites are currently paused (`INVITES_DISABLED` feature).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invites_disabled: bool,
+}
+
+/// Fields to update on a Space's overview (`Request::EditSpace`).
+/// `icon` / `banner`: `None` = unchanged, `Some("")` = clear, `Some(path)` = upload image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    /// `Some("")` clears the system channel; `Some(id)` sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_channel_id: Option<String>,
+    /// `Some("")` clears the AFK channel; `Some(id)` sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afk_channel_id: Option<String>,
+    /// AFK timeout in seconds (Discord accepts 60, 300, 900, 1800, 3600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afk_timeout: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_notify: Option<Notify>,
+}
+
+/// Fields to create or edit a Space's scheduled event (`Request::CreateEvent` / `EditEvent`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEventEdit {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Start time in Unix seconds.
+    pub start: i64,
+    /// End time in Unix seconds (required by Discord for external events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
+    #[serde(default)]
+    pub place_kind: EventPlaceKind,
+    /// Voice or stage channel id (for Voice/Stage events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// External location string (for External events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Local path to cover image (`Some("")` removes cover on edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// Lifecycle status of a Space's scheduled event (Discord `guild_scheduled_events`).
@@ -1295,6 +1362,7 @@ mod tests {
             muted: false,
             hide_muted: false,
             can_create_channels: false,
+            rights: crate::SpaceRights::default(),
         };
         let legacy = serde_json::json!({
             "space": space,
@@ -1383,5 +1451,55 @@ mod tests {
         let change = Change::Events { space: space.clone() };
         assert!(change.same_scope(&Change::Events { space }));
         assert!(!change.is_ephemeral());
+    }
+
+    #[test]
+    fn space_edit_rights_and_event_admin_round_trip() {
+        use crate::SpaceRights;
+        let rights = SpaceRights {
+            manage_space: true,
+            manage_roles: false,
+            manage_events: true,
+            owner: true,
+        };
+        assert_eq!(SpaceRights::from_bits(rights.to_bits()), rights);
+        assert!(rights.any_settings());
+        assert!(SpaceRights::default().is_empty());
+
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4000");
+        let edit = SpaceEdit {
+            name: Some("New Name".into()),
+            description: Some("Fresh description".into()),
+            afk_timeout: Some(900),
+            default_notify: Some(Notify::Mentions),
+            ..SpaceEdit::default()
+        };
+        let ev_edit = SpaceEventEdit {
+            name: "Town Hall".into(),
+            description: "Monthly sync".into(),
+            start: 1_760_000_000,
+            end: Some(1_760_003_600),
+            place_kind: EventPlaceKind::External,
+            channel_id: None,
+            location: Some("https://example.com/hall".into()),
+            image: None,
+        };
+        let reqs = [
+            Request::EditSpace { space: space.clone(), edit },
+            Request::DeleteSpace { space: space.clone(), mfa_code: Some("123456".into()) },
+            Request::TransferSpace {
+                space: space.clone(),
+                new_owner: Key::new(&account, "2001"),
+                mfa_code: None,
+            },
+            Request::CreateEvent { space: space.clone(), event: ev_edit.clone() },
+            Request::EditEvent { space: space.clone(), event_id: "9001".into(), event: ev_edit },
+            Request::DeleteEvent { space, event_id: "9001".into() },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
     }
 }

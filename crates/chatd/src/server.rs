@@ -1752,6 +1752,91 @@ impl Chat {
         }
     }
 
+    fn edit_space(&self, space: Key, edit: protocol::SpaceEdit) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::EditSpace { space_id, edit, reply }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn delete_space(&self, space: Key, mfa_code: Option<String>) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::DeleteSpace { space_id, mfa_code, reply }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn transfer_space(&self, space: Key, new_owner: Key, mfa_code: Option<String>) -> Response {
+        let account = space.account();
+        if new_owner.account() != account {
+            return error(ErrorCode::Refused, "new owner belongs to another account");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        let new_owner_id = new_owner.id.clone();
+        match self.ask(&account, |reply| Command::TransferSpace { space_id, new_owner_id, mfa_code, reply }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn create_event(&self, space: Key, event: protocol::SpaceEventEdit) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::CreateEvent { space_id, event, reply }) {
+            Ok(event) => Response::Event { event },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn edit_event(&self, space: Key, event_id: String, event: protocol::SpaceEventEdit) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::EditEvent { space_id, event_id, event, reply }) {
+            Ok(event) => Response::Event { event },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn delete_event(&self, space: Key, event_id: String) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::DeleteEvent { space_id, event_id, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -2039,6 +2124,12 @@ impl Chat {
             boost_level: about.boost_level,
             boosts: about.boosts,
             mark: about.mark,
+            system_channel_id: about.system_channel_id,
+            afk_channel_id: about.afk_channel_id,
+            afk_timeout: about.afk_timeout,
+            default_notify: about.default_notify,
+            vanity_url: about.vanity_url,
+            invites_disabled: about.invites_disabled,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
@@ -3332,6 +3423,12 @@ impl Chat {
             Request::CreateSpace { account, name, icon, template } => self.create_space(account, name, icon, template),
             Request::Events { space } => self.events(space),
             Request::EventInterest { space, event, on } => self.event_interest(space, event, on),
+            Request::EditSpace { space, edit } => self.edit_space(space, edit),
+            Request::DeleteSpace { space, mfa_code } => self.delete_space(space, mfa_code),
+            Request::TransferSpace { space, new_owner, mfa_code } => self.transfer_space(space, new_owner, mfa_code),
+            Request::CreateEvent { space, event } => self.create_event(space, event),
+            Request::EditEvent { space, event_id, event } => self.edit_event(space, event_id, event),
+            Request::DeleteEvent { space, event_id } => self.delete_event(space, event_id),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

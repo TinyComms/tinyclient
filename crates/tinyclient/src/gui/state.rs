@@ -241,6 +241,8 @@ pub struct Shell {
     pub(super) playing_state: super::playing::State,
     /// The Tiny server on show.
     pub(super) tiny_state: super::tiny::State,
+    /// Discord server settings overlay, when open.
+    pub(super) discord_settings: super::discord_settings::State,
 
     /// chatd as the shell sees it: starting, live, reconnecting, given up; the keychain.
     pub(super) service: Service,
@@ -324,6 +326,7 @@ impl Shell {
             call_state: call::State::default(),
             playing_state: super::playing::State::default(),
             tiny_state: super::tiny::State::new(cx),
+            discord_settings: super::discord_settings::State::default(),
             service: Service::new(!cfg!(feature = "gui-shot") || std::env::args().any(|arg| arg == "--start-chatd")),
             crashed: app::crash::relaunched_after(),
             restore: Some((prefs.open.clone(), prefs.mode.clone())),

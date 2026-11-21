@@ -239,6 +239,14 @@ struct GuildInfo {
     features: Vec<String>,
     /// Server vanity invite code, if any.
     vanity_url_code: Option<String>,
+    /// System messages channel id.
+    system_channel_id: Option<String>,
+    /// AFK voice channel id.
+    afk_channel_id: Option<String>,
+    /// AFK timeout in seconds.
+    afk_timeout: u32,
+    /// Default server notification level (0 all, 1 mentions).
+    default_message_notifications: u8,
     /// Unix seconds until our own server timeout ends, if timed out.
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
@@ -1895,6 +1903,20 @@ impl Discord {
             Command::Events { space_id, reply } => answer(reply, self.events(&space_id)),
             Command::EventInterest { space_id, event_id, on, reply } => {
                 answer(reply, self.event_interest(&space_id, &event_id, on))
+            }
+            Command::EditSpace { space_id, edit, reply } => answer(reply, self.edit_space(&space_id, &edit)),
+            Command::DeleteSpace { space_id, mfa_code, reply } => {
+                answer(reply, self.delete_space(&space_id, mfa_code.as_deref()))
+            }
+            Command::TransferSpace { space_id, new_owner_id, mfa_code, reply } => {
+                answer(reply, self.transfer_space(&space_id, &new_owner_id, mfa_code.as_deref()))
+            }
+            Command::CreateEvent { space_id, event, reply } => answer(reply, self.create_event(&space_id, &event)),
+            Command::EditEvent { space_id, event_id, event, reply } => {
+                answer(reply, self.edit_event(&space_id, &event_id, &event))
+            }
+            Command::DeleteEvent { space_id, event_id, reply } => {
+                answer(reply, self.delete_event(&space_id, &event_id))
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),

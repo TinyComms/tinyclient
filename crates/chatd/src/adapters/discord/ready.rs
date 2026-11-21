@@ -5,7 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    KICK_MEMBERS, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES, SEND_MESSAGES, VIEW_CHANNEL,
+    KICK_MEMBERS, MANAGE_EVENTS, MANAGE_GUILD, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES,
+    SEND_MESSAGES, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -210,6 +211,31 @@ impl GuildInfo {
         self.timeout_until.filter(|until| *until > now)
     }
 
+    /// Guild-level base permissions across `@everyone` and our assigned roles (without channel overwrites).
+    pub(super) fn base_permissions(&self, guild: &str) -> u64 {
+        if self.owner {
+            return u64::MAX;
+        }
+        let everyone = number(guild);
+        let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
+        let allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
+        if allowed & ADMINISTRATOR != 0 {
+            return u64::MAX;
+        }
+        allowed
+    }
+
+    /// Management rights advertised to the shell on `protocol::Space`.
+    pub(super) fn space_rights(&self, guild: &str) -> protocol::SpaceRights {
+        let perms = self.base_permissions(guild);
+        protocol::SpaceRights {
+            manage_space: self.owner || perms & MANAGE_GUILD != 0,
+            manage_roles: self.owner || perms & MANAGE_ROLES != 0,
+            manage_events: self.owner || perms & MANAGE_EVENTS != 0,
+            owner: self.owner,
+        }
+    }
+
     /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
     /// overwrites for everyone, for our roles, and for us.
     pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
@@ -339,6 +365,10 @@ impl Discord {
             description: guild.description().unwrap_or_default().to_owned(),
             features: guild.features().to_vec(),
             vanity_url_code: guild.vanity_url_code().map(str::to_owned),
+            system_channel_id: guild.system_channel_id().map(str::to_owned),
+            afk_channel_id: guild.afk_channel_id().map(str::to_owned),
+            afk_timeout: guild.afk_timeout().unwrap_or(300),
+            default_message_notifications: guild.default_message_notifications().unwrap_or(0),
             timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
@@ -586,9 +616,12 @@ impl Discord {
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
-        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted));
-        if let Some((muted, hide)) = flags {
+        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| {
+            (info.quiet.server_muted(now()), info.quiet.hide_muted, info.space_rights(guild_id))
+        });
+        if let Some((muted, hide, rights)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
+            self.ctx.space_rights(guild_id, rights)?;
         }
         Ok(())
     }
@@ -655,7 +688,9 @@ impl Discord {
         let mut flags = Vec::new();
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
-            flags.extend(state.guilds.iter().map(|(id, info)| (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted)));
+            flags.extend(state.guilds.iter().map(|(id, info)| {
+                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.space_rights(id))
+            }));
             let mut rows = Vec::with_capacity(state.guilds.len());
             let mut files = Vec::new();
             for (id, info) in &state.guilds {
@@ -682,9 +717,10 @@ impl Discord {
         };
         self.ctx.media(&files)?;
         self.ctx.spaces(&rows)?;
-        // A server's own mute and "hide muted channels", once its Space exists to hold them.
-        for (id, muted, hide) in flags {
+        // A server's own mute, "hide muted channels", and management rights once its Space exists.
+        for (id, muted, hide, rights) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
+            self.ctx.space_rights(&id, rights)?;
         }
         Ok(())
     }
@@ -1160,6 +1196,7 @@ impl Discord {
 
     /// A server renamed or given a new icon. The payload names only what it wants shown.
     pub(super) fn guild_updated(&self, guild: Guild) -> Result<(), Failure> {
+        let me = self.me();
         let tier_changed = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(&guild.id) else {
@@ -1181,6 +1218,21 @@ impl Discord {
             }
             if let Some(code) = guild.vanity_url_code() {
                 info.vanity_url_code = Some(code.to_owned());
+            }
+            if let Some(ch) = guild.system_channel_id() {
+                info.system_channel_id = Some(ch.to_owned());
+            }
+            if let Some(ch) = guild.afk_channel_id() {
+                info.afk_channel_id = Some(ch.to_owned());
+            }
+            if let Some(timeout) = guild.afk_timeout() {
+                info.afk_timeout = timeout;
+            }
+            if let Some(level) = guild.default_message_notifications() {
+                info.default_message_notifications = level;
+            }
+            if !guild.owner().is_empty() {
+                info.owner = guild.owner() == me;
             }
             match guild.premium_tier() {
                 Some(tier) if tier != info.premium_tier => {

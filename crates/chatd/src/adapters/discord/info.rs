@@ -37,6 +37,90 @@ fn refused(why: impl std::fmt::Display) -> Refusal {
     Refusal::Refused(why.to_string())
 }
 
+/// Translates refusals for owner-only sensitive guild operations (delete / transfer), including
+/// Discord's 2FA requirement (`code == 60003` or `60008`).
+fn sensitive_guild_refusal(err: Refused, action: &str) -> Refusal {
+    match err {
+        Refused::Status { code: 60003, .. } => Refusal::Refused(format!(
+            "Discord requires your 2FA code to {action}. Enter your 6-digit authenticator code and try again, or do it in Discord."
+        )),
+        Refused::Status { code: 60008, .. } => {
+            Refusal::Refused("That 2FA code was rejected. Check your authenticator and try again.".to_owned())
+        }
+        Refused::Challenge => Refusal::Refused(format!(
+            "Discord asked for an extra verification step tinyclient cannot complete. Complete this in Discord to {action}."
+        )),
+        other => refusal(other),
+    }
+}
+
+/// Builds the JSON payload for `POST`/`PATCH /guilds/{id}/scheduled-events`.
+fn build_event_body(edit: &protocol::SpaceEventEdit) -> Result<serde_json::Value, Refusal> {
+    let name = edit.name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        return Err(refused("Event name must be between 1 and 100 characters."));
+    }
+    if edit.start <= 0 {
+        return Err(refused("Choose a valid start time for the event."));
+    }
+    let entity_type: u8 = match edit.place_kind {
+        protocol::EventPlaceKind::Stage => 1,
+        protocol::EventPlaceKind::Voice => 2,
+        protocol::EventPlaceKind::External => 3,
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("name".into(), json!(name));
+    body.insert("privacy_level".into(), json!(2));
+    body.insert("entity_type".into(), json!(entity_type));
+    body.insert("scheduled_start_time".into(), json!(model::format_iso_utc(edit.start)));
+    if !edit.description.trim().is_empty() {
+        let desc = edit.description.trim();
+        if desc.chars().count() > 1000 {
+            return Err(refused("Event description can be at most 1000 characters."));
+        }
+        body.insert("description".into(), json!(desc));
+    }
+    match edit.place_kind {
+        protocol::EventPlaceKind::Voice | protocol::EventPlaceKind::Stage => {
+            let ch = edit
+                .channel_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| refused("Choose a voice or stage channel for this event."))?;
+            body.insert("channel_id".into(), json!(ch));
+            if let Some(end) = edit.end.filter(|e| *e > edit.start) {
+                body.insert("scheduled_end_time".into(), json!(model::format_iso_utc(end)));
+            }
+        }
+        protocol::EventPlaceKind::External => {
+            let loc = edit
+                .location
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| refused("Enter a location for an external event."))?;
+            let end = edit
+                .end
+                .filter(|e| *e > edit.start)
+                .ok_or_else(|| refused("External events require an end time after the start time."))?;
+            body.insert("channel_id".into(), serde_json::Value::Null);
+            body.insert("entity_metadata".into(), json!({"location": loc}));
+            body.insert("scheduled_end_time".into(), json!(model::format_iso_utc(end)));
+        }
+    }
+    if let Some(img) = &edit.image {
+        let trimmed = img.trim();
+        if trimmed.is_empty() {
+            body.insert("image".into(), serde_json::Value::Null);
+        } else {
+            let uri = super::read_image_data_uri(trimmed, super::DISCORD_IMAGE_MAX)?;
+            body.insert("image".into(), json!(uri));
+        }
+    }
+    Ok(serde_json::Value::Object(body))
+}
+
 #[derive(Deserialize)]
 struct GuildCounts {
     #[serde(default)]
@@ -49,6 +133,16 @@ struct GuildCounts {
     premium_subscription_count: Option<u32>,
     #[serde(default)]
     features: Vec<String>,
+    #[serde(default)]
+    vanity_url_code: Option<String>,
+    #[serde(default)]
+    system_channel_id: Option<String>,
+    #[serde(default)]
+    afk_channel_id: Option<String>,
+    #[serde(default)]
+    afk_timeout: Option<u32>,
+    #[serde(default)]
+    default_message_notifications: Option<u8>,
     #[serde(default)]
     approximate_member_count: Option<u32>,
     #[serde(default)]
@@ -233,7 +327,22 @@ impl Discord {
         }
         let answer = self.call("GET", &format!("/guilds/{guild}?with_counts=true"), None).map_err(refusal)?;
         let counts: GuildCounts = serde_json::from_str(&answer).map_err(refused)?;
-        let (description, banner_hash, boost_level, boosts, mark, nickname, roles, notify) = {
+        let (
+            description,
+            banner_hash,
+            boost_level,
+            boosts,
+            mark,
+            nickname,
+            roles,
+            notify,
+            system_channel_id,
+            afk_channel_id,
+            afk_timeout,
+            default_notify,
+            vanity_url,
+            invites_disabled,
+        ) = {
             let state = crate::hub::lock(&self.state);
             let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
             let roles = info
@@ -259,7 +368,40 @@ impl Discord {
             let boosts = counts.premium_subscription_count.unwrap_or(info.premium_subscription_count);
             let features = if counts.features.is_empty() { &info.features } else { &counts.features };
             let mark = model::guild_mark(features);
-            (description, banner_hash, boost_level, boosts, mark, info.nick.clone(), roles, notify)
+            let invites_disabled = features.iter().any(|f| f == "INVITES_DISABLED");
+            let system_channel_id = counts
+                .system_channel_id
+                .filter(|s| !s.is_empty())
+                .or_else(|| info.system_channel_id.clone());
+            let afk_channel_id = counts
+                .afk_channel_id
+                .filter(|s| !s.is_empty())
+                .or_else(|| info.afk_channel_id.clone());
+            let afk_timeout = counts.afk_timeout.unwrap_or(info.afk_timeout);
+            let default_notify = Some(match counts.default_message_notifications.unwrap_or(info.default_message_notifications) {
+                1 => Notify::Mentions,
+                _ => Notify::All,
+            });
+            let vanity_url = counts
+                .vanity_url_code
+                .filter(|s| !s.is_empty())
+                .or_else(|| info.vanity_url_code.clone());
+            (
+                description,
+                banner_hash,
+                boost_level,
+                boosts,
+                mark,
+                info.nick.clone(),
+                roles,
+                notify,
+                system_channel_id,
+                afk_channel_id,
+                afk_timeout,
+                default_notify,
+                vanity_url,
+                invites_disabled,
+            )
         };
         let banner = match banner_hash.as_deref() {
             Some(hash) => {
@@ -280,6 +422,12 @@ impl Discord {
             boost_level,
             boosts,
             mark,
+            system_channel_id,
+            afk_channel_id,
+            afk_timeout,
+            default_notify,
+            vanity_url,
+            invites_disabled,
         })
     }
 
@@ -479,6 +627,340 @@ impl Discord {
                     let count = stored.event.user_count.unwrap_or(0);
                     stored.event.user_count = Some(if on { count.saturating_add(1) } else { count.saturating_sub(1) });
                 }
+            }
+        }
+        self.ctx.events_changed(guild);
+        Ok(())
+    }
+
+    fn space_event_of(&self, guild: &str, ev: model::ScheduledEvent, interested: bool) -> protocol::SpaceEvent {
+        let place_kind = match ev.entity_type {
+            1 => protocol::EventPlaceKind::Stage,
+            3 => protocol::EventPlaceKind::External,
+            _ => protocol::EventPlaceKind::Voice,
+        };
+        let conversation = ev.channel_id.as_deref().filter(|s| !s.is_empty()).map(|id| self.ctx.key(id));
+        let place = match place_kind {
+            protocol::EventPlaceKind::External => ev
+                .entity_metadata
+                .as_ref()
+                .and_then(|m| m.location.clone())
+                .unwrap_or_default(),
+            protocol::EventPlaceKind::Voice | protocol::EventPlaceKind::Stage => ev
+                .channel_id
+                .as_deref()
+                .and_then(|ch| self.ctx.known(ch).ok().flatten())
+                .map(|row| row.title)
+                .unwrap_or_default(),
+        };
+        let status = match ev.status {
+            2 => protocol::EventStatus::Active,
+            3 => protocol::EventStatus::Completed,
+            4 => protocol::EventStatus::Canceled,
+            _ => protocol::EventStatus::Scheduled,
+        };
+        let cover = ev
+            .image
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map(|h| model::event_cover(&ev.id, h).0);
+        protocol::SpaceEvent {
+            key: self.ctx.key(&ev.id),
+            space: self.ctx.key(guild),
+            name: ev.name,
+            description: ev.description.unwrap_or_default(),
+            start: ev.scheduled_start_time.as_deref().and_then(model::iso_seconds).unwrap_or(0),
+            end: ev.scheduled_end_time.as_deref().and_then(model::iso_seconds),
+            place_kind,
+            place,
+            conversation,
+            status,
+            interested,
+            count: ev.user_count.unwrap_or(0),
+            cover,
+        }
+    }
+
+    /// Edits a Discord server's overview settings (`PATCH /guilds/{guild}`).
+    /// Checks `MANAGE_GUILD` locally before hitting Discord.
+    pub(super) fn edit_space(&self, guild: &str, edit: &protocol::SpaceEdit) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild).manage_space {
+                return Err(refused("You need the Manage Server permission to edit server settings."));
+            }
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(name) = &edit.name {
+            let trimmed = name.trim();
+            if !(2..=100).contains(&trimmed.chars().count()) {
+                return Err(refused("Server name must be between 2 and 100 characters."));
+            }
+            body.insert("name".into(), json!(trimmed));
+        }
+        if let Some(desc) = &edit.description {
+            let trimmed = desc.trim();
+            if trimmed.chars().count() > 120 {
+                return Err(refused("Server description can be at most 120 characters."));
+            }
+            body.insert(
+                "description".into(),
+                if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) },
+            );
+        }
+        if let Some(icon) = &edit.icon {
+            let trimmed = icon.trim();
+            if trimmed.is_empty() {
+                body.insert("icon".into(), serde_json::Value::Null);
+            } else {
+                let uri = super::read_image_data_uri(trimmed, super::DISCORD_IMAGE_MAX)?;
+                body.insert("icon".into(), json!(uri));
+            }
+        }
+        if let Some(banner) = &edit.banner {
+            let trimmed = banner.trim();
+            if trimmed.is_empty() {
+                body.insert("banner".into(), serde_json::Value::Null);
+            } else {
+                let uri = super::read_image_data_uri(trimmed, super::DISCORD_IMAGE_MAX)?;
+                body.insert("banner".into(), json!(uri));
+            }
+        }
+        if let Some(sys) = &edit.system_channel_id {
+            let trimmed = sys.trim();
+            body.insert(
+                "system_channel_id".into(),
+                if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) },
+            );
+        }
+        if let Some(afk) = &edit.afk_channel_id {
+            let trimmed = afk.trim();
+            body.insert(
+                "afk_channel_id".into(),
+                if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) },
+            );
+        }
+        if let Some(timeout) = edit.afk_timeout {
+            if !matches!(timeout, 60 | 300 | 900 | 1800 | 3600) {
+                return Err(refused("AFK timeout must be 1, 5, 15, 30, or 60 minutes."));
+            }
+            body.insert("afk_timeout".into(), json!(timeout));
+        }
+        if let Some(notify) = edit.default_notify {
+            let level = match notify {
+                Notify::All => 0u8,
+                Notify::Mentions | Notify::Nothing => 1u8,
+            };
+            body.insert("default_message_notifications".into(), json!(level));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        let raw = self
+            .call("PATCH", &format!("/guilds/{guild}"), Some(serde_json::Value::Object(body)))
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<model::Guild>(&raw) {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                if updated.name.is_some() {
+                    info.name = updated.name().to_owned();
+                }
+                if edit.icon.is_some() {
+                    info.icon = updated.icon().map(str::to_owned);
+                }
+                if edit.banner.is_some() {
+                    info.banner = updated.banner().map(str::to_owned);
+                }
+                if edit.description.is_some() {
+                    info.description = updated.description().unwrap_or_default().to_owned();
+                }
+                if edit.system_channel_id.is_some() {
+                    info.system_channel_id = updated.system_channel_id().map(str::to_owned);
+                }
+                if edit.afk_channel_id.is_some() {
+                    info.afk_channel_id = updated.afk_channel_id().map(str::to_owned);
+                }
+                if let Some(t) = updated.afk_timeout() {
+                    info.afk_timeout = t;
+                }
+                if let Some(n) = updated.default_message_notifications() {
+                    info.default_message_notifications = n;
+                }
+            }
+        }
+        self.ctx.space_info_stale(guild);
+        self.spaces().map_err(refused)
+    }
+
+    /// Deletes a Discord server we own (`POST /guilds/{guild}/delete`).
+    pub(super) fn delete_space(&self, guild: &str, mfa_code: Option<&str>) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.owner {
+                return Err(refused("Only the server owner can delete this server."));
+            }
+        }
+        let code = mfa_code.map(str::trim).filter(|c| !c.is_empty());
+        let body = match code {
+            Some(c) => json!({"code": c}),
+            None => json!({}),
+        };
+        let path = format!("/guilds/{guild}/delete");
+        self.rest
+            .call_once_with("POST", &path, Some(body), &[])
+            .map_err(|err| sensitive_guild_refusal(err, "delete this server"))?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.voice.states.retain(|_, voice| voice.guild.as_deref() != Some(guild));
+            if state.members.on_screen.as_deref() == Some(guild) {
+                state.members = Default::default();
+            }
+            state.guilds.remove(guild);
+        }
+        self.spaces().map_err(refused)
+    }
+
+    /// Transfers ownership of a Discord server we own (`PATCH /guilds/{guild}` with `owner_id`).
+    pub(super) fn transfer_space(
+        &self,
+        guild: &str,
+        new_owner_id: &str,
+        mfa_code: Option<&str>,
+    ) -> Result<(), Refusal> {
+        let new_owner_id = new_owner_id.trim();
+        if new_owner_id.is_empty() {
+            return Err(refused("Choose a member to transfer ownership to."));
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.owner {
+                return Err(refused("Only the server owner can transfer ownership."));
+            }
+            if new_owner_id == state.me {
+                return Err(refused("You already own this server."));
+            }
+        }
+        let mut body = json!({"owner_id": new_owner_id});
+        if let Some(code) = mfa_code.map(str::trim).filter(|c| !c.is_empty()) {
+            body["code"] = json!(code);
+        }
+        let path = format!("/guilds/{guild}");
+        self.rest
+            .call_once_with("PATCH", &path, Some(body), &[])
+            .map_err(|err| sensitive_guild_refusal(err, "transfer ownership"))?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                info.owner = false;
+            }
+        }
+        self.ctx.space_info_stale(guild);
+        self.spaces().map_err(refused)
+    }
+
+    /// Creates a scheduled event (`POST /guilds/{guild}/scheduled-events`).
+    pub(super) fn create_event(
+        &self,
+        guild: &str,
+        edit: &protocol::SpaceEventEdit,
+    ) -> Result<protocol::SpaceEvent, Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild).manage_events {
+                return Err(refused("You need the Manage Events permission to create events."));
+            }
+        }
+        let body = build_event_body(edit)?;
+        let raw = self
+            .call("POST", &format!("/guilds/{guild}/scheduled-events"), Some(body))
+            .map_err(refusal)?;
+        let mut ev: model::ScheduledEvent = serde_json::from_str(&raw).map_err(refused)?;
+        if ev.guild_id.is_empty() {
+            ev.guild_id = guild.to_owned();
+        }
+        if let Some(hash) = ev.image.as_deref().filter(|h| !h.is_empty()) {
+            let _ = self.ctx.media(&[model::event_cover(&ev.id, hash)]);
+        }
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                info.events.insert(ev.id.clone(), super::StoredEvent { event: ev.clone(), interested: true });
+            }
+        }
+        self.ctx.events_changed(guild);
+        Ok(self.space_event_of(guild, ev, true))
+    }
+
+    /// Edits a scheduled event (`PATCH /guilds/{guild}/scheduled-events/{event_id}`).
+    pub(super) fn edit_event(
+        &self,
+        guild: &str,
+        event_id: &str,
+        edit: &protocol::SpaceEventEdit,
+    ) -> Result<protocol::SpaceEvent, Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild).manage_events {
+                return Err(refused("You need the Manage Events permission to edit events."));
+            }
+        }
+        let body = build_event_body(edit)?;
+        let raw = self
+            .call("PATCH", &format!("/guilds/{guild}/scheduled-events/{event_id}"), Some(body))
+            .map_err(refusal)?;
+        let mut ev: model::ScheduledEvent = serde_json::from_str(&raw).map_err(refused)?;
+        if ev.guild_id.is_empty() {
+            ev.guild_id = guild.to_owned();
+        }
+        if let Some(hash) = ev.image.as_deref().filter(|h| !h.is_empty()) {
+            let _ = self.ctx.media(&[model::event_cover(&ev.id, hash)]);
+        }
+        let interested = {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                let was = info.events.get(&ev.id).is_some_and(|s| s.interested);
+                info.events.insert(ev.id.clone(), super::StoredEvent { event: ev.clone(), interested: was });
+                was
+            } else {
+                false
+            }
+        };
+        self.ctx.events_changed(guild);
+        Ok(self.space_event_of(guild, ev, interested))
+    }
+
+    /// Deletes or cancels a scheduled event (`DELETE /guilds/{guild}/scheduled-events/{event_id}`).
+    pub(super) fn delete_event(&self, guild: &str, event_id: &str) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild).manage_events {
+                return Err(refused("You need the Manage Events permission to delete events."));
+            }
+        }
+        self.call("DELETE", &format!("/guilds/{guild}/scheduled-events/{event_id}"), None)
+            .map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                info.events.remove(event_id);
             }
         }
         self.ctx.events_changed(guild);

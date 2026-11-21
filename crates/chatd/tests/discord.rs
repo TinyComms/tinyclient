@@ -5338,3 +5338,150 @@ fn scheduled_events_list_interest_and_gateway_updates() {
         other => panic!("expected Response::Changes, got {other:?}"),
     }
 }
+
+#[test]
+fn server_overview_edit_delete_transfer_and_event_admin_enforce_permissions() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Guild 4000: user 1000 is not owner and lacks MANAGE_GUILD/MANAGE_EVENTS.
+    // Add guild 4999: user 1000 is owner (full management rights).
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4999",
+        "properties": {
+            "id": "4999",
+            "name": "Owned Guild",
+            "owner_id": "1000",
+            "icon": null,
+            "description": "Original bio",
+            "afk_timeout": 300,
+            "default_message_notifications": 0
+        },
+        "roles": [{"id": "4999", "name": "@everyone", "permissions": "1071698529857"}],
+        "channels": [
+            {"id": "4991", "type": 0, "name": "general", "position": 0, "permission_overwrites": []},
+            {"id": "4992", "type": 2, "name": "Lounge", "position": 1, "permission_overwrites": []}
+        ],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Spaces advertise rights accurately: 4000 has none, 4999 has owner + manage flags.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let s4000 = spaces.iter().find(|s| s.key.id == "4000").expect("4000");
+            assert!(!s4000.rights.manage_space && !s4000.rights.owner);
+            let s4999 = spaces.iter().find(|s| s.key.id == "4999").expect("4999");
+            assert!(s4999.rights.owner && s4999.rights.manage_space && s4999.rights.manage_events && s4999.rights.manage_roles);
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+
+    // 1. Non-manager on guild 4000 is refused locally before hitting Discord.
+    match world.ask(Request::EditSpace {
+        space: world.key("4000"),
+        edit: protocol::SpaceEdit { name: Some("Hijack".into()), ..Default::default() },
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Manage Server"), "got: {detail}"),
+        other => panic!("expected permission refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PATCH", "/guilds/4000").is_empty());
+
+    // 2. Owner edits guild 4999 name, description, AFK timeout, default notifications, and icon.
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let icon_path = outbox.join("guild-icon.png");
+    std::fs::write(&icon_path, b"\x89PNG\r\n\x1a\npixeldata").unwrap();
+    world.discord.script(
+        "/guilds/4999",
+        200,
+        json!({
+            "id": "4999",
+            "name": "Renamed Guild",
+            "description": "Updated bio",
+            "afk_channel_id": "4992",
+            "afk_timeout": 900,
+            "default_message_notifications": 1
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::EditSpace {
+            space: world.key("4999"),
+            edit: protocol::SpaceEdit {
+                name: Some("Renamed Guild".into()),
+                description: Some("Updated bio".into()),
+                icon: Some(icon_path.to_string_lossy().into_owned()),
+                afk_channel_id: Some("4992".into()),
+                afk_timeout: Some(900),
+                default_notify: Some(protocol::Notify::Mentions),
+                ..Default::default()
+            },
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/guilds/4999");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["name"], "Renamed Guild");
+    assert_eq!(patches[0].body["description"], "Updated bio");
+    assert_eq!(patches[0].body["afk_channel_id"], "4992");
+    assert_eq!(patches[0].body["afk_timeout"], 900);
+    assert_eq!(patches[0].body["default_message_notifications"], 1);
+    assert!(patches[0].body["icon"].as_str().unwrap().starts_with("data:image/png;base64,"));
+
+    // 3. Create, edit, and delete a scheduled event on owned guild 4999.
+    world.discord.script(
+        "/guilds/4999/scheduled-events",
+        200,
+        json!({
+            "id": "9500",
+            "guild_id": "4999",
+            "channel_id": "4992",
+            "name": "Launch Party",
+            "description": "Come hang out",
+            "scheduled_start_time": "2026-11-01T18:00:00Z",
+            "status": 1,
+            "entity_type": 2,
+            "user_count": 1
+        }),
+    );
+    let created = world.ask(Request::CreateEvent {
+        space: world.key("4999"),
+        event: protocol::SpaceEventEdit {
+            name: "Launch Party".into(),
+            description: "Come hang out".into(),
+            start: 1_793_556_000,
+            end: None,
+            place_kind: protocol::EventPlaceKind::Voice,
+            channel_id: Some("4992".into()),
+            location: None,
+            image: None,
+        },
+    });
+    assert!(matches!(created, Response::Event { ref event } if event.key.id == "9500"), "{created:?}");
+
+    world.discord.script("/guilds/4999/scheduled-events/9500", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteEvent { space: world.key("4999"), event_id: "9500".into() }),
+        Response::Ok
+    );
+
+    // 4. Delete requires owner; non-owner on 4000 is refused locally; 60003 surfaces 2FA prompt; success removes Space.
+    match world.ask(Request::DeleteSpace { space: world.key("4000"), mfa_code: None }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Only the server owner"), "got: {detail}"),
+        other => panic!("expected owner refusal, got {other:?}"),
+    }
+    world.discord.script("/guilds/4999/delete", 401, json!({"code": 60003, "message": "Two factor is required"}));
+    match world.ask(Request::DeleteSpace { space: world.key("4999"), mfa_code: None }) {
+        Response::Error { detail, .. } => assert!(detail.contains("2FA code"), "got: {detail}"),
+        other => panic!("expected 2FA refusal, got {other:?}"),
+    }
+    world.discord.script("/guilds/4999/delete", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteSpace { space: world.key("4999"), mfa_code: Some("123456".into()) }),
+        Response::Ok
+    );
+    let dels = world.discord.requests_to("POST", "/guilds/4999/delete");
+    assert_eq!(dels.last().unwrap().body["code"], "123456");
+}

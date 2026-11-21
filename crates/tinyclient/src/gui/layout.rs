@@ -849,10 +849,24 @@ impl Shell {
             // link to open it in the network's app, so those items are left out.
             Menu::Space(space) => {
                 let pinned = self.sidebar_state.pins.contains(space);
-                let can_create = self.spaces.iter().any(|s| &s.key == space && s.can_create_channels);
+                let found_space = self.spaces.iter().find(|s| &s.key == space);
+                let can_create = found_space.is_some_and(|s| s.can_create_channels);
+                let can_settings = space.network == Network::Discord
+                    && found_space.is_some_and(|s| s.rights.any_settings());
                 let key = space.clone();
                 let shown = space.clone();
                 let read = space.clone();
+                if can_settings {
+                    let settings_space = space.clone();
+                    items.push(
+                        menu_item("space-settings", Some("icons/settings.svg"), "Server settings…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_discord_settings(settings_space.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 if can_create {
                     let create_space = space.clone();
                     items.push(
@@ -1620,6 +1634,7 @@ impl Render for Shell {
             .children(self.create_server_modal(cx))
             .children(self.events_modal(cx))
             .children(self.leave_space_modal(cx))
+            .children(self.discord_settings_layer(window, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
