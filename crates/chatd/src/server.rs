@@ -2722,6 +2722,30 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Transcribe { conversation, message_id } => {
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::Transcribe {
+                    conversation_id: conversation.id,
+                    message_id,
+                    reply,
+                }) {
+                    Ok(transcript) => Response::Transcript { transcript },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RateTranscript { conversation, message_id, transcription_id, good } => {
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::RateTranscript {
+                    conversation_id: conversation.id,
+                    message_id,
+                    transcription_id,
+                    good,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {

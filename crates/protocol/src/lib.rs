@@ -2604,6 +2604,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         values: Vec<String>,
     },
+    /// Transcribe a voice or round video message on the network (`messages.transcribeAudio`).
+    /// Never called automatically. Answers `Response::Transcript`.
+    Transcribe {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Rate a transcription good (`true`) or bad (`false`) (`messages.rateTranscribedAudio`).
+    RateTranscript {
+        conversation: Key,
+        message_id: String,
+        transcription_id: i64,
+        good: bool,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3116,6 +3129,10 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Answers `Request::Transcribe`: the transcript state returned by the network.
+    Transcript {
+        transcript: Transcript,
     },
 }
 

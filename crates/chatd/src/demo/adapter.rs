@@ -1005,6 +1005,8 @@ impl Demo {
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
             | Command::DeleteFile { reply, .. }

@@ -111,6 +111,18 @@ pub fn along(bounds: Bounds<Pixels>, at: Point<Pixels>) -> f32 {
     (f32::from(at.x - bounds.origin.x) / width).clamp(0., 1.)
 }
 
+/// Human-readable trial quota line for non-Premium accounts when Telegram reports it.
+pub fn transcript_quota_line(trial_remains: Option<u32>) -> Option<String> {
+    let n = trial_remains?;
+    if n == 0 {
+        None
+    } else if n == 1 {
+        Some("1 free transcription left this week".to_owned())
+    } else {
+        Some(format!("{n} free transcriptions left this week"))
+    }
+}
+
 /// Play or pause, as one glyph.
 pub(in crate::gui) fn glyph(playing: bool, size: f32, color: impl IntoColor<Hsla>) -> gpui::Svg {
     icon(if playing { Icon::Pause } else { Icon::Play }, size, color)
@@ -247,6 +259,180 @@ impl Pane {
             .on_mouse_up_out(MouseButton::Left, cx.listener(move |this, _, _, cx| this.scrubbed(&out.0, out.1, duration, cx)))
     }
 
+    /// The "A→" transcription trigger button for a voice message or round video message.
+    pub(super) fn transcribe_button(&self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let can_transcribe = self.open.as_ref().is_some_and(|open| open.can.transcribe);
+        let attachment = message.attachments.get(index)?;
+        if !can_transcribe && attachment.transcript.is_none() {
+            return None;
+        }
+        let slot = (message.id.clone(), index);
+        let busy = self.transcribing.contains(&slot)
+            || attachment.transcript.as_ref().is_some_and(|t| t.pending);
+        let has_ready = attachment
+            .transcript
+            .as_ref()
+            .is_some_and(|t| !t.pending && t.failed.is_none() && !t.text.is_empty());
+        let collapsed = self.transcript_collapsed.contains(&slot);
+        let label = if busy {
+            "…"
+        } else if has_ready && !collapsed {
+            "A↑"
+        } else {
+            "A→"
+        };
+        let tip_words = if busy {
+            "Transcribing…"
+        } else if has_ready && !collapsed {
+            "Hide transcript"
+        } else if has_ready {
+            "Show transcript"
+        } else {
+            "Transcribe to text"
+        };
+        let msg_id = message.id.clone();
+        Some(
+            div()
+                .id(SharedString::from(format!("transcribe-{}-{index}", message.id)))
+                .flex_none()
+                .h(px(20.))
+                .min_w(px(26.))
+                .px(px(5.))
+                .rounded(px(4.))
+                .bg(if has_ready && !collapsed { theme::accent_soft() } else { theme::hover() })
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .type_micro()
+                .font_weight(theme::SEMIBOLD)
+                .text_color(if has_ready && !collapsed { theme::accent_text() } else { theme::text_soft() })
+                .tooltip(tip(tip_words, None))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if has_ready {
+                        this.toggle_transcript(msg_id.clone(), index, cx);
+                    } else if !busy {
+                        this.transcribe(msg_id.clone(), index, cx);
+                    }
+                })),
+        )
+    }
+
+    /// Collapsible transcript panel rendered under a voice player or round video circle.
+    pub(super) fn transcript_block(&self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> Option<Div> {
+        let attachment = message.attachments.get(index)?;
+        let slot = (message.id.clone(), index);
+        let inflight = self.transcribing.contains(&slot);
+        let transcript = attachment.transcript.as_ref();
+        if !inflight && transcript.is_none() {
+            return None;
+        }
+        if !inflight && self.transcript_collapsed.contains(&slot) {
+            return None;
+        }
+        let mut box_div = div()
+            .w(px(360.))
+            .max_w_full()
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::hairline())
+            .flex()
+            .flex_col()
+            .gap(px(4.));
+        if inflight && transcript.is_none() {
+            return Some(
+                box_div.child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child("Transcribing…"),
+                ),
+            );
+        }
+        if let Some(tr) = transcript {
+            if let Some(failed) = &tr.failed {
+                box_div = box_div.child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child(failed.clone()),
+                );
+                return Some(box_div);
+            }
+            if tr.pending {
+                let words = if tr.text.trim().is_empty() {
+                    "Transcribing…".to_owned()
+                } else {
+                    format!("{} …", tr.text)
+                };
+                box_div = box_div.child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child(words),
+                );
+            } else if !tr.text.is_empty() {
+                box_div = box_div.child(
+                    div()
+                        .type_ui()
+                        .text_color(theme::text())
+                        .child(tr.text.clone()),
+                );
+            }
+            let quota = transcript_quota_line(tr.trial_remains);
+            let show_rate = !tr.pending && tr.id != 0 && !tr.text.is_empty();
+            if quota.is_some() || show_rate {
+                let msg_up = message.id.clone();
+                let msg_down = message.id.clone();
+                let tr_id = tr.id;
+                let rated = tr.rated;
+                let mut foot = div().flex().items_center().justify_between().gap(px(8.));
+                foot = foot.child(
+                    div()
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .child(quota.unwrap_or_default()),
+                );
+                if show_rate {
+                    let up = div()
+                        .id(SharedString::from(format!("tr-up-{}-{index}", message.id)))
+                        .px(px(4.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .type_micro()
+                        .text_color(if rated == Some(true) { theme::accent_text() } else { theme::text_faint() })
+                        .tooltip(tip("Good transcription", None))
+                        .child("👍")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.rate_transcript(msg_up.clone(), tr_id, true, cx);
+                        }));
+                    let down = div()
+                        .id(SharedString::from(format!("tr-down-{}-{index}", message.id)))
+                        .px(px(4.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .type_micro()
+                        .text_color(if rated == Some(false) { theme::danger() } else { theme::text_faint() })
+                        .tooltip(tip("Poor transcription", None))
+                        .child("👎")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.rate_transcript(msg_down.clone(), tr_id, false, cx);
+                        }));
+                    foot = foot.child(div().flex().items_center().gap(px(4.)).child(up).child(down));
+                }
+                box_div = box_div.child(foot);
+            }
+        }
+        Some(box_div)
+    }
+
     /// A voice message (`voice`, with its waveform) or an audio file (its name over a bar).
     pub(super) fn player_row(&mut self, message: &Rc<Message>, index: usize, voice: bool, cx: &mut Context<Self>) -> AnyElement {
         let attachment = &message.attachments[index];
@@ -327,6 +513,8 @@ impl Pane {
             .items_center()
             .gap(px(10.))
             .when_some(reason, |row, reason| row.tooltip(tip(format!("{reason} Click play to try again."), None)));
+        let transcribe_btn = if voice { self.transcribe_button(message, index, cx) } else { None };
+        let transcript = if voice { self.transcript_block(message, index, cx) } else { None };
         let row = if voice {
             let bars = media::waveform(&attachment.waveform, BARS);
             let wave = self.scrubbable(&file.id, message, index, duration, cx).flex_1().min_w_0().h(px(28.)).flex().items_center().justify_between().overflow_hidden().children(
@@ -335,7 +523,7 @@ impl Pane {
                     div().w(px(2.)).h(px(tall)).flex_none().rounded(px(1.)).bg(if reached { theme::accent() } else { theme::text_faint() })
                 }),
             );
-            row.h(px(48.)).child(button).child(wave).child(time).child(speed)
+            row.h(px(48.)).child(button).child(wave).child(time).child(speed).children(transcribe_btn)
         } else {
             let track = self.scrubbable(&file.id, message, index, duration, cx).flex_1().min_w_0().h(px(14.)).flex().items_center().child(
                 div()
@@ -355,7 +543,10 @@ impl Pane {
                 .child(div().flex().items_center().gap(px(8.)).child(track).child(time));
             row.h(px(56.)).child(button).child(lines).child(speed)
         };
-        row.into_any_element()
+        match transcript {
+            Some(block) => div().flex().flex_col().gap(px(4.)).child(row).child(block).into_any_element(),
+            None => row.into_any_element(),
+        }
     }
 }
 
@@ -407,5 +598,13 @@ mod tests {
         assert_eq!(along(bounds, gpui::point(px(150.), px(5.))), 0.25);
         assert_eq!(along(bounds, gpui::point(px(400.), px(5.))), 1., "past the end is the end");
         assert_eq!(along(bounds, gpui::point(px(10.), px(5.))), 0.);
+    }
+
+    #[test]
+    fn transcript_quota_line_formats_remaining_free_uses() {
+        assert_eq!(transcript_quota_line(None), None);
+        assert_eq!(transcript_quota_line(Some(0)), None);
+        assert_eq!(transcript_quota_line(Some(1)).as_deref(), Some("1 free transcription left this week"));
+        assert_eq!(transcript_quota_line(Some(2)).as_deref(), Some("2 free transcriptions left this week"));
     }
 }

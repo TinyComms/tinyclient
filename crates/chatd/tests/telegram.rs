@@ -3923,3 +3923,86 @@ fn voice_messages_forbidden_disables_mic_and_refused_send_returns_plain_words() 
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_exhausted() {
+    let mut world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.transcribe, "Telegram must advertise transcribe capability");
+
+    // Incoming voice message (id 15 in u7002 via `steer("voice")`).
+    world.steer("voice");
+    let voice_msg = world.until("incoming voice message", || {
+        world.messages("u7002").into_iter().find(|m| m.attachments.iter().any(|a| !a.waveform.is_empty()))
+    });
+    assert!(voice_msg.attachments[0].transcript.is_none(), "never transcribe automatically");
+    assert_eq!(world.called("TranscribeAudio"), 0, "no automatic transcription call");
+
+    // 1. Pending transcription response followed by `updateTranscribedAudio` completing the text.
+    world.steer("transcribe-mode pending 2");
+    let resp = world.ask(Request::Transcribe {
+        conversation: key("u7002"),
+        message_id: voice_msg.id.clone(),
+    });
+    let pending = match resp {
+        Response::Transcript { transcript } => transcript,
+        other => panic!("expected Transcript, got {other:?}"),
+    };
+    assert!(pending.pending);
+    assert_eq!(pending.id, 901);
+    assert_eq!(pending.text, "Meet at the");
+    assert_eq!(pending.trial_remains, Some(1));
+    assert!(pending.trial_resets_at.is_some());
+    assert_eq!(world.called(&format!("TranscribeAudio u7002 {}", voice_msg.id)), 1);
+
+    // Final part arrives via updateTranscribedAudio.
+    world.steer(&format!("transcribe-update u7002 {} 0 Meet at the trailhead at seven.", voice_msg.id));
+    let completed = world.until("transcript completed by update", || {
+        let msg = world.message("u7002", &voice_msg.id)?;
+        let tr = msg.attachments.first()?.transcript.clone()?;
+        (!tr.pending && tr.text == "Meet at the trailhead at seven.").then_some(tr)
+    });
+    assert_eq!(completed.id, 901);
+    assert_eq!(completed.trial_remains, Some(1));
+
+    // Rate thumbs up via messages.rateTranscribedAudio.
+    assert_eq!(
+        world.ask(Request::RateTranscript {
+            conversation: key("u7002"),
+            message_id: voice_msg.id.clone(),
+            transcription_id: 901,
+            good: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called(&format!("RateTranscribedAudio u7002 {} 901 true", voice_msg.id)), 1);
+
+    // Persisted in store across chatd restart.
+    world.restart();
+    world.connected();
+    let after_restart = world.until("transcript survives restart", || {
+        let msg = world.message("u7002", &voice_msg.id)?;
+        let tr = msg.attachments.first()?.transcript.clone()?;
+        (tr.text == "Meet at the trailhead at seven." && tr.rated == Some(true)).then_some(tr)
+    });
+    assert!(!after_restart.pending);
+
+    // 2. Trial exhausted (PREMIUM_ACCOUNT_REQUIRED) records the Premium explanation.
+    world.steer("transcribe-mode exhausted 0");
+    let resp = world.ask(Request::Transcribe {
+        conversation: key("u7002"),
+        message_id: voice_msg.id.clone(),
+    });
+    let exhausted = match resp {
+        Response::Transcript { transcript } => transcript,
+        other => panic!("expected Transcript on exhausted trial, got {other:?}"),
+    };
+    assert!(!exhausted.pending);
+    assert_eq!(exhausted.trial_remains, Some(0));
+    assert!(
+        exhausted.failed.as_deref().unwrap_or("").contains("Telegram Premium"),
+        "expected Premium explanation, got: {:?}",
+        exhausted.failed
+    );
+}

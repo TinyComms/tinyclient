@@ -656,6 +656,20 @@ pub enum Command {
         unsave: bool,
         reply: Reply<()>,
     },
+    /// Transcribe a voice or round video message on the network (`messages.transcribeAudio`).
+    Transcribe {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<protocol::Transcript>,
+    },
+    /// Rate a completed transcription (`messages.rateTranscribedAudio`).
+    RateTranscript {
+        conversation_id: String,
+        message_id: String,
+        transcription_id: i64,
+        good: bool,
+        reply: Reply<()>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -868,6 +882,8 @@ impl Command {
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

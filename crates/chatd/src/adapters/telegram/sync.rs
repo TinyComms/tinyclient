@@ -391,6 +391,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         blocks: true,
         share_contact: true,
         save_gif: true,
+        transcribe: true,
         ..Capabilities::default()
     }
 }
@@ -1275,6 +1276,18 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
     }
     // A pin names the message it points at. The words are filled once that message is known.
     content::quote_pin(&mut mapped.message);
+    // Preserve any previously saved speech-to-text transcripts across history refreshes.
+    if !mapped.message.attachments.is_empty() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
+            for att in &mut mapped.message.attachments {
+                if att.transcript.is_none() {
+                    if let Some(prev) = stored.attachments.iter().find(|old| old.file.id == att.file.id) {
+                        att.transcript = prev.transcript.clone();
+                    }
+                }
+            }
+        }
+    }
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
     for want in &mapped.wants {

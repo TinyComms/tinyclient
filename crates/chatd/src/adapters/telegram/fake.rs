@@ -566,6 +566,10 @@ struct World {
     noforwards: HashSet<Who>,
     /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
     saved_gifs: Vec<i64>,
+    /// Next `messages.transcribeAudio` response mode: `"pending"`, `"exhausted"`, or immediate.
+    transcribe_mode: String,
+    /// Remaining free trial transcriptions reported by `messages.transcribeAudio`.
+    transcribe_trial: Option<i32>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -637,6 +641,8 @@ impl World {
             large_broke: false,
             noforwards: HashSet::new(),
             saved_gifs: vec![6_200],
+            transcribe_mode: String::new(),
+            transcribe_trial: Some(2),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1512,6 +1518,30 @@ impl World {
                     }
                 }
                 Vec::new()
+            }
+            "transcribe-mode" => {
+                self.transcribe_mode = words.next().unwrap_or("").to_owned();
+                if let Some(trial) = words.next().and_then(|v| v.parse::<i32>().ok()) {
+                    self.transcribe_trial = Some(trial);
+                }
+                Vec::new()
+            }
+            "transcribe-update" => {
+                // transcribe-update <peer> <msg_id> <pending:0|1> <text...>
+                let peer = words.next().and_then(Who::parse).map(|(w, _)| w).unwrap_or(odalys);
+                let msg_id = words.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(20);
+                let pending = words.next().is_some_and(|v| v == "1" || v == "true");
+                let text = words.collect::<Vec<_>>().join(" ");
+                vec![update(
+                    tl::types::UpdateTranscribedAudio {
+                        pending,
+                        peer: peer.peer(),
+                        msg_id,
+                        transcription_id: 901,
+                        text,
+                    }
+                    .into(),
+                )]
             }
             "call-event" => {
                 // call-event <out|in> <missed|busy|hangup|disconnect|none|group-live|group-end|conf-live|conf-missed> [video] [duration]
@@ -3421,6 +3451,49 @@ impl World {
             }
             self.log(&format!("SendMultiMedia {} {}", peer.text(), kinds.join(",")));
             return Some(self.deliver(events, peer, None, None, items, request.schedule_date));
+        }
+        if let Some(request) = asked::<f::messages::TranscribeAudio>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("TranscribeAudio {} {}", peer.text(), request.msg_id));
+            if self.transcribe_mode == "exhausted" {
+                return Some(Err(Fault::Rpc {
+                    code: 403,
+                    name: "PREMIUM_ACCOUNT_REQUIRED".to_owned(),
+                    value: None,
+                }));
+            }
+            let pending = self.transcribe_mode == "pending";
+            let text = if pending {
+                "Meet at the".to_owned()
+            } else {
+                "Meet at the trailhead at seven.".to_owned()
+            };
+            let trial_remains_num = self.transcribe_trial.map(|n| {
+                let next = (n - 1).max(0);
+                self.transcribe_trial = Some(next);
+                next
+            });
+            let trial_remains_until_date = trial_remains_num.map(|_| t0() + 7 * 86_400);
+            return Some(answer(tl::enums::messages::TranscribedAudio::Audio(
+                tl::types::messages::TranscribedAudio {
+                    pending,
+                    transcription_id: 901,
+                    text,
+                    trial_remains_num,
+                    trial_remains_until_date,
+                },
+            )));
+        }
+        if let Some(request) = asked::<f::messages::RateTranscribedAudio>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!(
+                "RateTranscribedAudio {} {} {} {}",
+                peer.text(),
+                request.msg_id,
+                request.transcription_id,
+                request.good
+            ));
+            return Some(answer(true));
         }
         None
     }

@@ -423,6 +423,10 @@ pub struct Pane {
     scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// A file the user pressed play on before it was on disk: file, message, attachment, from.
     play_after: Option<(String, String, usize, Option<u32>)>,
+    /// Transcripts currently collapsed by the user, keyed by `(message_id, attachment_index)`.
+    transcript_collapsed: HashSet<(String, usize)>,
+    /// Transcriptions currently awaiting the initial RPC reply, keyed by `(message_id, attachment_index)`.
+    transcribing: HashSet<(String, usize)>,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -513,6 +517,8 @@ impl Pane {
             scrub: None,
             scrub_bounds: Rc::default(),
             play_after: None,
+            transcript_collapsed: HashSet::new(),
+            transcribing: HashSet::new(),
             width: 0.,
             opening: false,
             seen: Rc::default(),
@@ -537,6 +543,80 @@ impl Pane {
             self.revealed_contacts.insert(key);
         }
         cx.notify();
+    }
+
+    pub(super) fn toggle_transcript(&mut self, message_id: String, index: usize, cx: &mut Context<Self>) {
+        let key = (message_id, index);
+        if !self.transcript_collapsed.remove(&key) {
+            self.transcript_collapsed.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// Requests server-side transcription for one voice or round video message (explicit user action only).
+    pub(super) fn transcribe(&mut self, message_id: String, index: usize, cx: &mut Context<Self>) {
+        if SCREENSHOTS {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        let slot = (message_id.clone(), index);
+        self.transcript_collapsed.remove(&slot);
+        if !self.transcribing.insert(slot.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move { ask(&Request::Transcribe { conversation, message_id }) })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                this.transcribing.remove(&slot);
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Sends thumbs-up / thumbs-down feedback for a completed transcription.
+    pub(super) fn rate_transcript(&mut self, message_id: String, transcription_id: i64, good: bool, cx: &mut Context<Self>) {
+        if SCREENSHOTS || transcription_id == 0 {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::RateTranscript {
+                        conversation,
+                        message_id,
+                        transcription_id,
+                        good,
+                    })
+                })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn vote_poll(&mut self, message_id: String, votes: Option<Vec<u32>>, cx: &mut Context<Self>) {

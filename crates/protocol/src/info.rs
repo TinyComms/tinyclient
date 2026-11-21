@@ -681,6 +681,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports on-demand server transcription of voice and round video messages (`Request::Transcribe`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcribe: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

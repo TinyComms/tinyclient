@@ -1133,6 +1133,8 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::SaveGif { .. } => Response::Ok,
+        Request::Transcribe { .. } => Response::Transcript { transcript: protocol::Transcript::default() },
+        Request::RateTranscript { .. } => Response::Ok,
         Request::Watch(watching) => {
             let people = watching
                 .people

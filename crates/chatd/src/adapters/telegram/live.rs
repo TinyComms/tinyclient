@@ -605,6 +605,14 @@ pub(super) fn apply(account: &Account, update: &Update) {
             let message = written_id(account, reacted.msg_id).unwrap_or(reacted.msg_id);
             reactions(account, &conversation, message, &reacted.reactions);
         }
+        Update::TranscribedAudio(tr) => {
+            let who = Who::of(&tr.peer);
+            let conversation = account
+                .placed(Some(who), tr.msg_id)
+                .or_else(|| (!matches!(who, Who::Channel(_))).then(|| account.placed(None, tr.msg_id)).flatten())
+                .unwrap_or_else(|| who.text());
+            super::info::apply_transcript_update(account, &conversation, tr.msg_id, tr.transcription_id, &tr.text, tr.pending);
+        }
         // A full poll replaces the card. Counts alone name each option by its bytes, which the
         // stored card does not keep, so a results-only update is left as it is.
         Update::MessagePoll(changed) => {

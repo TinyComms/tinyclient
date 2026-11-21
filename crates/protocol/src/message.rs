@@ -145,6 +145,33 @@ pub struct Span {
     pub style: Style,
 }
 
+/// Server-side transcription of a voice or round video message (Telegram).
+/// Stored inside [`Attachment::transcript`] so it survives restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcript {
+    /// Network transcription id (used for rating feedback).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub id: i64,
+    /// Transcribed text so far (may stream in chunks while `pending` is true).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// True while the network is still generating the transcript.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    /// Plain-words failure or quota message (e.g. Premium required when trial is used up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
+    /// Free trial transcriptions remaining this period (non-Premium), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_remains: Option<u32>,
+    /// Unix seconds when the free trial resets, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_resets_at: Option<i64>,
+    /// User's rating (`Some(true)` = good, `Some(false)` = bad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub name: String,
@@ -181,6 +208,9 @@ pub struct Attachment {
     /// View-once media (Signal, Telegram): hidden until explicitly viewed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub view_once: bool,
+    /// Server-side speech-to-text transcript for a voice or round video message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Transcript>,
 }
 
 impl Attachment {
@@ -198,6 +228,7 @@ impl Attachment {
             waveform: Vec::new(),
             round: false,
             view_once: false,
+            transcript: None,
         }
     }
 }

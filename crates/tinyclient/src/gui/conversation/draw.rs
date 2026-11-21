@@ -1897,7 +1897,26 @@ impl Pane {
                 let attachment = &message.attachments[*only];
                 let (wide, tall) = natural(attachment);
                 let single = media::single(wide, tall, width);
-                out.push(self.tile(message, *only, single.width, single.height, single.fit, None, window, cx));
+                let tile = self.tile(message, *only, single.width, single.height, single.fit, None, window, cx);
+                if attachment.round {
+                    let btn = self.transcribe_button(message, *only, cx);
+                    let block = self.transcript_block(message, *only, cx);
+                    if btn.is_some() || block.is_some() {
+                        out.push(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .child(div().flex().items_end().gap(px(6.)).child(tile).children(btn))
+                                .children(block)
+                                .into_any_element(),
+                        );
+                    } else {
+                        out.push(tile);
+                    }
+                } else {
+                    out.push(tile);
+                }
             }
             many => {
                 let (tiles, height) = media::grid(many.len(), width);
