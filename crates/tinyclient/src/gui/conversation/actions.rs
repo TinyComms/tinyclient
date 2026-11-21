@@ -1379,21 +1379,28 @@ impl Pane {
         };
         // shortcut: the system language fills `to` until a settings row does.
         let to = time::system_language();
+        let watched = conversation.clone();
         let request = Request::Translate { conversation, message_ids, to };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-            let _ = this.update(cx, |this, cx| match answer {
-                Ok(Response::Translated { items }) => {
-                    for item in items {
-                        if !item.text.is_empty() {
-                            this.translations.insert(item.message_id, item.text);
-                        }
-                    }
-                    cx.notify();
+            let _ = this.update(cx, |this, cx| {
+                // The chat changed while Telegram answered. Those ids belong to the chat that asked.
+                if this.key() != Some(&watched) {
+                    return;
                 }
-                Ok(Response::Error { detail, .. }) => this.say(detail, cx),
-                Err(err) => this.say(crate::client::trouble_words("translate", &err), cx),
-                _ => {}
+                match answer {
+                    Ok(Response::Translated { items }) => {
+                        for item in items {
+                            if !item.text.is_empty() {
+                                this.translations.insert(item.message_id, item.text);
+                            }
+                        }
+                        cx.notify();
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("translate", &err), cx),
+                    _ => {}
+                }
             });
         })
         .detach();

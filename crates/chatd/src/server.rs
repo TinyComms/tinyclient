@@ -2262,27 +2262,23 @@ impl Chat {
     /// A `t.me` link the cache does not have. One connected Telegram account may preview it.
     /// Nothing here joins the chat. No connected account, or no such username, is "not here".
     fn preview_telegram_link(&self, url: &str) -> Response {
-        let accounts: Vec<AccountKey> = self
+        let Some(account) = self
             .hub
             .links()
             .into_iter()
-            .filter(|linked| linked.account.network == Network::Telegram && linked.link == Link::Connected)
+            .find(|linked| linked.account.network == Network::Telegram && linked.link == Link::Connected)
             .map(|linked| linked.account)
-            .collect();
-        for account in accounts {
-            match self.ask(&account, |reply| Command::OpenLink { url: url.to_owned(), reply }) {
-                Ok(Some(opened)) => {
-                    return Response::Resolved {
-                        conversation: Some(Key::new(&account, opened.conversation_id)),
-                        message_id: opened.message_id,
-                        title: opened.title,
-                    };
-                }
-                Ok(None) => continue,
-                Err(_) => continue,
-            }
+        else {
+            return Response::Resolved { conversation: None, message_id: None, title: String::new() };
+        };
+        match self.ask(&account, |reply| Command::OpenLink { url: url.to_owned(), reply }) {
+            Ok(Some(opened)) => Response::Resolved {
+                conversation: Some(Key::new(&account, opened.conversation_id)),
+                message_id: opened.message_id,
+                title: opened.title,
+            },
+            _ => Response::Resolved { conversation: None, message_id: None, title: String::new() },
         }
-        Response::Resolved { conversation: None, message_id: None, title: String::new() }
     }
 
     fn source(&self, conversation: Key, message_id: String) -> Response {
