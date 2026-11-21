@@ -465,6 +465,12 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             on,
             reply,
         } => pin(ctx, saved, &conversation_id, &message_id, on, reply),
+        Command::Search {
+            query,
+            scope,
+            reply,
+            ..
+        } => search(ctx, saved, &query, scope, reply),
         Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
@@ -1915,6 +1921,145 @@ fn pin(
     }
 }
 
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct WireSearchHit {
+    conversation_id: String,
+    message: WireMessage,
+}
+
+#[derive(Deserialize)]
+struct WireSearchResponse {
+    #[serde(default)]
+    hits: Vec<WireSearchHit>,
+    #[serde(default)]
+    skipped_encrypted: bool,
+}
+
+fn search(
+    ctx: &Context,
+    saved: &Saved,
+    query: &str,
+    scope: crate::adapters::SearchScope,
+    reply: crate::adapters::Reply<Vec<protocol::MessageHit>>,
+) {
+    let trimmed = query.trim();
+    if trimmed.len() < 2 {
+        let _ = reply.send(Ok(Vec::new()));
+        return;
+    }
+    let mut path = format!("/v1/search?q={}&limit=25", percent_encode(trimmed));
+    match &scope {
+        crate::adapters::SearchScope::Conversation(conv_id) => {
+            if !super::safe_id(conv_id) {
+                let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+                return;
+            }
+            // Encrypted conversations cannot be searched on the server; answer from local cache only.
+            if sealed_here(ctx, saved, conv_id) == Ok(true) {
+                let key = ctx.key(conv_id);
+                let hits = ctx
+                    .hub
+                    .store()
+                    .search_messages(Some(&key), None, None, trimmed, 25)
+                    .unwrap_or_default();
+                let _ = reply.send(Ok(hits));
+                return;
+            }
+            path.push_str("&conversation_id=");
+            path.push_str(conv_id);
+        }
+        crate::adapters::SearchScope::Space(_) => {}
+    }
+    match super::asked("GET", saved, &path, None) {
+        Ok((200, body)) => {
+            let Ok(parsed) = serde_json::from_value::<WireSearchResponse>(body) else {
+                let _ = reply.send(Err(Refusal::Refused(super::UNREADABLE.to_owned())));
+                return;
+            };
+            let names = member_names(saved);
+            let space_title = join_host(&saved.base_url);
+            let mut hits = Vec::with_capacity(parsed.hits.len());
+            let mut seen = HashSet::new();
+            for item in parsed.hits {
+                if !super::safe_id(&item.conversation_id) || !super::safe_id(&item.message.id) {
+                    continue;
+                }
+                let conv_key = ctx.key(&item.conversation_id);
+                let title = ctx
+                    .known(&item.conversation_id)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.title)
+                    .unwrap_or_default();
+                let snippet: String = item
+                    .message
+                    .body
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(200)
+                    .collect();
+                let sent = rfc3339(&item.message.created_at).unwrap_or(0);
+                let sender = name_of(&names, saved, &item.message.author_id);
+                seen.insert((conv_key.clone(), item.message.id.clone()));
+                hits.push(protocol::MessageHit {
+                    conversation: conv_key,
+                    message_id: item.message.id,
+                    sent,
+                    sender,
+                    outgoing: item.message.author_id == saved.user_id,
+                    snippet,
+                    title,
+                    space_title: space_title.clone(),
+                });
+            }
+            // If the server skipped encrypted conversations in a space-wide search, merge cached hits
+            // from encrypted conversations on this device.
+            if parsed.skipped_encrypted && matches!(scope, crate::adapters::SearchScope::Space(_)) {
+                let space_key = ctx.key(SPACE);
+                if let Ok(local) = ctx
+                    .hub
+                    .store()
+                    .search_messages(None, None, Some(&space_key), trimmed, 25)
+                {
+                    for hit in local {
+                        if seen.insert((hit.conversation.clone(), hit.message_id.clone())) {
+                            hits.push(hit);
+                        }
+                    }
+                    hits.sort_by(|a, b| b.sent.cmp(&a.sent));
+                }
+            }
+            let _ = reply.send(Ok(hits));
+        }
+        Ok((404, _)) => {
+            let _ = reply.send(Err(Refusal::Unsupported));
+        }
+        Ok((status, body)) => {
+            let _ = reply.send(Err(Refusal::Refused(
+                super::explain(status, &body, super::Missing::Plain).to_owned(),
+            )));
+        }
+        Err(detail) => {
+            let _ = reply.send(Err(Refusal::Refused(detail.to_owned())));
+        }
+    }
+}
+
 fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
     if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
         return;
@@ -2268,6 +2413,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
         file_scan: scans,
         allow_archives: scans && limits.archives,
         pins: caps.has(protocol::TINY_FEATURE_PINS),
+        search: caps.has(protocol::TINY_FEATURE_MESSAGE_SEARCH),
         ..Capabilities::default()
     }
 }

@@ -106,7 +106,7 @@ fn network_searches(can: &Capabilities, network: Network, scope: Scope) -> bool 
         return false;
     }
     match network {
-        Network::Discord | Network::Slack => scope != Scope::Everywhere,
+        Network::Discord | Network::Slack | Network::Tiny => scope != Scope::Everywhere,
         Network::Telegram => scope == Scope::Conversation,
         _ => false,
     }
@@ -1339,6 +1339,21 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         }
         crate::gui::components::scroll::scroll_page("search-scroll-frame", rows).into_any_element()
     };
+    let is_e2ee = |enc: protocol::Encryption| {
+        matches!(enc, protocol::Encryption::EndToEnd | protocol::Encryption::EndToEndAfterPlain)
+    };
+    let encrypted_note = !page.words.trim().is_empty()
+        && match page.scope {
+            Scope::Conversation => shell.open_key().is_some_and(|key| {
+                key.network == Network::Tiny
+                    && shell.held_rows().any(|r| r.key == *key && is_e2ee(r.encryption))
+            }),
+            Scope::Space => shell.open_key().is_some_and(|key| {
+                key.network == Network::Tiny
+                    && shell.held_rows().any(|r| r.key.account() == key.account() && is_e2ee(r.encryption))
+            }),
+            Scope::Everywhere => false,
+        };
     div()
         .size_full()
         .flex()
@@ -1348,6 +1363,17 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         .child(chips)
         .children(said.map(|line| div().flex_none().px(px(12.)).pb(px(4.)).type_small().text_color(theme::text_soft()).child(line)))
         .child(body)
+        .children(encrypted_note.then(|| {
+            div()
+                .flex_none()
+                .px(px(12.))
+                .py(px(8.))
+                .border_t_1()
+                .border_color(theme::hairline())
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("Encrypted conversations are searched on this device only. Messages this device hasn't loaded aren't included.")
+        }))
         .into_any_element()
 }
 
@@ -1462,6 +1488,9 @@ mod tests {
         assert!(network_searches(&searching, Network::Slack, Scope::Conversation));
         assert!(network_searches(&searching, Network::Slack, Scope::Space));
         assert!(network_searches(&searching, Network::Discord, Scope::Space));
+        assert!(network_searches(&searching, Network::Tiny, Scope::Conversation));
+        assert!(network_searches(&searching, Network::Tiny, Scope::Space));
+        assert!(!network_searches(&searching, Network::Tiny, Scope::Everywhere));
         assert!(network_searches(&searching, Network::Telegram, Scope::Conversation));
         assert!(!network_searches(&searching, Network::Telegram, Scope::Space), "Telegram searches one conversation at a time");
         assert!(!network_searches(&searching, Network::Teams, Scope::Space), "Teams is not asked yet");
