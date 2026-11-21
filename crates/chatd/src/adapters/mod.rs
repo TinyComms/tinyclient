@@ -450,12 +450,15 @@ pub enum Command {
         name: Option<String>,
         reply: Reply<String>,
     },
-    /// The id of the thread a channel message starts. Discord only: create the thread channel,
-    /// record it, and answer with its id. `name` is already one line, at most 100 characters.
+    /// Creates a Discord thread, attached to `message_id` when `Some` or standalone when `None`,
+    /// records it, and answers with its id. `name` is already one line, at most 100 characters.
     StartThread {
         conversation_id: String,
-        message_id: String,
+        message_id: Option<String>,
         name: String,
+        private: bool,
+        auto_archive_minutes: Option<u32>,
+        first_message: String,
         reply: Reply<String>,
     },
     /// One person's card. One request to the network, and only because the user opened it.

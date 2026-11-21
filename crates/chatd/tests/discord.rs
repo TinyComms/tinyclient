@@ -406,6 +406,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         ("POST", ["channels", channel, "messages", _message, "threads"]) => {
             let id = shared.snowflake();
             let name = seen.body["name"].as_str().unwrap_or("Thread");
+            let auto_archive = seen.body["auto_archive_duration"].as_u64().unwrap_or(1440);
             (
                 200,
                 json!({
@@ -417,11 +418,39 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                     "owner_id": "1000",
                     "message_count": 0,
                     "member_count": 1,
-                    "thread_metadata": {"archived": false, "locked": false},
+                    "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": auto_archive},
                     "newly_created": true,
                 }),
             )
         }
+        ("POST", ["channels", channel, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            let kind = seen.body["type"].as_u64().unwrap_or(11);
+            let auto_archive = seen.body["auto_archive_duration"].as_u64().unwrap_or(1440);
+            let invitable = seen.body["invitable"].as_bool().unwrap_or(true);
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": kind,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 0,
+                    "member_count": 1,
+                    "thread_metadata": {
+                        "archived": false,
+                        "locked": false,
+                        "auto_archive_duration": auto_archive,
+                        "invitable": invitable
+                    },
+                    "newly_created": true,
+                }),
+            )
+        }
+        ("PUT", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["read-states", "ack-bulk"]) => (200, json!({})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
@@ -1364,12 +1393,26 @@ fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
 
     // One that already has a thread answers with it and does not create another.
     let existing = "1300000000000000100";
-    let opened = world.ask(Request::StartThread { conversation: world.key("4101"), message: existing.to_owned() });
+    let opened = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: Some(existing.to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
+    });
     let Response::Conversation { conversation } = opened else { panic!("{opened:?}") };
     assert_eq!(conversation.key.id, "4500");
     assert!(world.discord.requests_to("POST", "/channels/4101/messages/1300000000000000100/threads").is_empty());
 
-    let started = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let started = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: Some(starter.to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
+    });
     let Response::Conversation { conversation } = started else { panic!("{started:?}") };
     assert_eq!(conversation.kind, ConversationKind::Thread);
     assert_eq!((conversation.parent.as_deref(), conversation.root.as_deref()), (Some("4101"), Some(starter)));
@@ -1381,21 +1424,36 @@ fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
     assert_eq!(hung.thread.as_ref().map(|thread| thread.id.as_str()), Some(conversation.key.id.as_str()));
 
     // The same click again is the thread that now exists, not a second channel.
-    let again = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let again = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: Some(starter.to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
+    });
     let Response::Conversation { conversation: again } = again else { panic!("{again:?}") };
     assert_eq!(again.key.id, conversation.key.id);
     assert_eq!(world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads")).len(), 1);
 
     let system = world.ask(Request::StartThread {
         conversation: world.key("4101"),
-        message: "1300000000000000095".to_owned(),
+        message: Some("1300000000000000095".to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
     });
     assert!(matches!(system, Response::Error { code: ErrorCode::Refused, .. }), "{system:?}");
 
     wait("the direct conversation", || Some(world.messages("3001")).filter(|messages| !messages.is_empty()));
     let direct = world.ask(Request::StartThread {
         conversation: world.key("3001"),
-        message: "1300000010000000010".to_owned(),
+        message: Some("1300000010000000010".to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
     });
     assert!(matches!(direct, Response::Error { code: ErrorCode::Refused, .. }), "{direct:?}");
     assert!(world.discord.requests_to("POST", "/channels/3001/messages/").iter().all(|seen| !seen.path.contains("/threads")));
@@ -5307,4 +5365,106 @@ fn slowmode_reports_interval_exemption_and_cooldown() {
     wait("slowmode exempt for moderator", || {
         (world.conversation("4101").slowmode_seconds == 0).then_some(())
     });
+}
+
+#[test]
+fn standalone_public_private_and_announcement_threads_with_first_message_and_invites() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("channel rights populated", || {
+        world.conversation("4101").rights.create_public_threads.then_some(())
+    });
+    // Without CREATE_PRIVATE_THREADS, private thread creation is refused without hitting Discord.
+    assert!(!world.conversation("4101").rights.create_private_threads);
+    let denied = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: None,
+        name: "Secret Plan".into(),
+        private: true,
+        auto_archive_minutes: Some(1440),
+        first_message: String::new(),
+    });
+    assert!(matches!(denied, Response::Error { code: ErrorCode::Refused, .. }), "{denied:?}");
+    assert!(world.discord.requests_to("POST", "/channels/4101/threads").is_empty());
+
+    // Standalone public thread with custom auto_archive_duration and first message.
+    let public = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: None,
+        name: "Release Checklist".into(),
+        private: false,
+        auto_archive_minutes: Some(4320),
+        first_message: "Let's track launch items here.".into(),
+    });
+    let Response::Conversation { conversation: pub_thread } = public else { panic!("{public:?}") };
+    assert_eq!(pub_thread.kind, ConversationKind::Thread);
+    assert_eq!(pub_thread.title, "Release Checklist");
+    assert!(!pub_thread.private);
+    assert!(pub_thread.followed);
+    let created_posts = world.discord.requests_to("POST", "/channels/4101/threads");
+    assert_eq!(created_posts.len(), 1);
+    assert_eq!(created_posts[0].body["type"], json!(11));
+    assert_eq!(created_posts[0].body["auto_archive_duration"], json!(4320));
+    let first_posts = world.discord.requests_to("POST", &format!("/channels/{}/messages", pub_thread.key.id));
+    assert_eq!(first_posts.len(), 1);
+    assert_eq!(first_posts[0].body["content"], json!("Let's track launch items here."));
+
+    // Announcement channel standalone thread uses type 10 (NEWS_THREAD).
+    let news = world.ask(Request::StartThread {
+        conversation: world.key("4102"),
+        message: None,
+        name: "Changelog Discussion".into(),
+        private: false,
+        auto_archive_minutes: Some(60),
+        first_message: String::new(),
+    });
+    let Response::Conversation { conversation: news_thread } = news else { panic!("{news:?}") };
+    assert_eq!(news_thread.kind, ConversationKind::Thread);
+    let news_posts = world.discord.requests_to("POST", "/channels/4102/threads");
+    assert_eq!(news_posts.len(), 1);
+    assert_eq!(news_posts[0].body["type"], json!(10));
+    assert_eq!(news_posts[0].body["auto_archive_duration"], json!(60));
+
+    // Grant CREATE_PRIVATE_THREADS to role 4010 and create a private thread (type 12), then invite a user.
+    let create_private: u64 = 1 << 36;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": create_private.to_string()}
+    }));
+    wait("create_private_threads granted", || {
+        world.conversation("4101").rights.create_private_threads.then_some(())
+    });
+    let priv_res = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: None,
+        name: "Incident Room".into(),
+        private: true,
+        auto_archive_minutes: Some(10080),
+        first_message: String::new(),
+    });
+    let Response::Conversation { conversation: priv_thread } = priv_res else { panic!("{priv_res:?}") };
+    assert!(priv_thread.private);
+    assert!(priv_thread.rights.add_members);
+    let priv_posts = world.discord.requests_to("POST", "/channels/4101/threads");
+    assert_eq!(priv_posts.len(), 2);
+    assert_eq!(priv_posts[1].body["type"], json!(12));
+    assert_eq!(priv_posts[1].body["invitable"], json!(true));
+    assert_eq!(priv_posts[1].body["auto_archive_duration"], json!(10080));
+
+    // Invite a member into the private thread via MembersAdd -> PUT /channels/{thread}/thread-members/{user}.
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: priv_thread.key.clone(),
+            people: vec!["2001".into(), "2002".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("PUT", &format!("/channels/{}/thread-members/2001", priv_thread.key.id)).len(),
+        1
+    );
+    assert_eq!(
+        world.discord.requests_to("PUT", &format!("/channels/{}/thread-members/2002", priv_thread.key.id)).len(),
+        1
+    );
 }

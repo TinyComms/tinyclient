@@ -1532,12 +1532,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
-    /// The thread a channel message starts. Discord only: its thread is a new channel, so this
-    /// creates it and answers with that conversation. Slack and Teams name a thread from the
-    /// message, and opening or sending there is enough.
+    /// Start a Discord thread — attached to `message` when `Some`, or standalone from the channel
+    /// when `None` (public, announcement, or private). Answers with the created thread conversation.
     StartThread {
         conversation: Key,
-        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        private: bool,
+        /// Auto-archive duration in minutes: 60 (1 h), 1440 (24 h), 4320 (3 d), or 10080 (1 w).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_archive_minutes: Option<u32>,
+        /// Optional first message posted into a newly created standalone thread.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        first_message: String,
     },
     /// One person's card, asked of the network when the card opens and kept five minutes.
     /// `space` is where it was opened from, for the nickname, roles and join date there.
@@ -3600,6 +3610,10 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            create_public_threads: true,
+            create_private_threads: true,
+            send_in_threads: true,
+            manage_threads: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }

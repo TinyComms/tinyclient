@@ -911,14 +911,27 @@ impl Chat {
         Ok(())
     }
 
-    /// Discord creates the thread channel. The name comes from the message, so the click does
-    /// not ask for one. The adapter records the conversation before it answers.
-    fn start_thread(&self, conversation: Key, message: String) -> Response {
+    /// Discord creates the thread channel (attached to a message or standalone). The adapter
+    /// records the conversation before answering.
+    fn start_thread(
+        &self,
+        conversation: Key,
+        message: Option<String>,
+        name: String,
+        private: bool,
+        auto_archive_minutes: Option<u32>,
+        first_message: String,
+    ) -> Response {
         if conversation.network != Network::Discord {
             return error(ErrorCode::Unsupported, format!("{} cannot do this yet", conversation.network.label()));
         }
         if let Err(refused) = self.online(&conversation.account()) {
             return *refused;
+        }
+        if let Some(minutes) = auto_archive_minutes {
+            if !matches!(minutes, 60 | 1440 | 4320 | 10080) {
+                return error(ErrorCode::Refused, "Unsupported auto-archive duration.");
+            }
         }
         let parent = match self.hub.store().conversation(&conversation) {
             Ok(Some(parent)) => parent,
@@ -926,22 +939,43 @@ impl Chat {
             Err(err) => return internal(err),
         };
         if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
-            return error(ErrorCode::Refused, "A thread starts from a channel message.");
+            return error(ErrorCode::Refused, "A thread can only be started in a channel.");
         }
-        let stored = match self.hub.store().message(&conversation, &message) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
-            Err(err) => return internal(err),
+        let message = message.filter(|id| !id.trim().is_empty());
+        let name = if let Some(ref message_id) = message {
+            if private {
+                return error(ErrorCode::Refused, "A thread started from a message cannot be private.");
+            }
+            let stored = match self.hub.store().message(&conversation, message_id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+                Err(err) => return internal(err),
+            };
+            if stored.deleted || matches!(stored.kind, MessageKind::System) {
+                return error(ErrorCode::Refused, "That message cannot start a thread.");
+            }
+            if !name.trim().is_empty() {
+                thread_name(&name)
+            } else {
+                thread_name(&stored.text)
+            }
+        } else {
+            if name.trim().is_empty() {
+                return error(ErrorCode::Refused, "Enter a name for the thread.");
+            }
+            if private && parent.kind == ConversationKind::Announcement {
+                return error(ErrorCode::Refused, "Private threads cannot be created in an announcement channel.");
+            }
+            thread_name(&name)
         };
-        if stored.deleted || matches!(stored.kind, MessageKind::System) {
-            return error(ErrorCode::Refused, "That message cannot start a thread.");
-        }
-        let name = thread_name(&stored.text);
         let conversation_id = conversation.id.clone();
         let started = self.ask(&conversation.account(), |reply| Command::StartThread {
             conversation_id,
             message_id: message,
             name,
+            private,
+            auto_archive_minutes,
+            first_message,
             reply,
         });
         let id = match started {
@@ -3214,7 +3248,14 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::StartThread { conversation, message } => self.start_thread(conversation, message),
+            Request::StartThread {
+                conversation,
+                message,
+                name,
+                private,
+                auto_archive_minutes,
+                first_message,
+            } => self.start_thread(conversation, message, name, private, auto_archive_minutes, first_message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),

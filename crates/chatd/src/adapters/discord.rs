@@ -645,6 +645,15 @@ impl Discord {
         answer
     }
 
+    /// One-shot request (never retried on 429; wakes socket on 401).
+    fn call_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
+        let answer = self.rest.call_once_with(method, path, body, &[]);
+        if matches!(answer, Err(Refused::Expired)) {
+            self.wake();
+        }
+        answer
+    }
+
     /// A message object into the model. Its files are returned for registering.
     fn convert(&self, posted: &Posted, guild: Option<&str>, kind: ConversationKind) -> (Message, Files) {
         let me = self.me();
@@ -1643,9 +1652,17 @@ impl Discord {
         Ok(channel.id)
     }
 
-    /// The thread a channel message starts. One request, and only when the user asked: Discord
-    /// watches thread creation. A message that already has a thread answers with that channel.
-    fn start_thread(&self, channel: &str, message_id: &str, name: &str) -> Result<String, Refusal> {
+    /// Creates a Discord thread, attached to `message_id` when `Some` or standalone when `None`.
+    /// Never retried automatically: Discord watches thread creation closely.
+    fn start_thread(
+        &self,
+        channel: &str,
+        message_id: Option<&str>,
+        name: &str,
+        private: bool,
+        auto_archive_minutes: Option<u32>,
+        first_message: &str,
+    ) -> Result<String, Refusal> {
         let refuse = |why: String| Refusal::Refused(why);
         let parent = self
             .ctx
@@ -1653,62 +1670,158 @@ impl Discord {
             .map_err(|err| refuse(err.to_string()))?
             .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
         if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
-            return Err(refuse("A thread starts from a channel message.".to_owned()));
+            return Err(refuse("A thread can only be started in a channel.".to_owned()));
         }
-        let stored = self
-            .ctx
-            .stored_message(channel, message_id)
-            .map_err(|err| refuse(err.to_string()))?
-            .ok_or_else(|| refuse("That message is not here.".to_owned()))?;
-        if stored.deleted || matches!(stored.kind, MessageKind::System) {
-            return Err(refuse("That message cannot start a thread.".to_owned()));
+        if private && !parent.rights.create_private_threads {
+            return Err(refuse("You do not have permission to create private threads here.".to_owned()));
+        }
+        if !private && !parent.rights.create_public_threads {
+            return Err(refuse("You do not have permission to create threads here.".to_owned()));
         }
         let name = thread_name(name);
-        if let Some(existing) = stored.thread.as_ref() {
-            self.record_thread(&parent, &existing.id, message_id, &name)?;
-            return Ok(existing.id.clone());
+        if let Some(message_id) = message_id {
+            if private {
+                return Err(refuse("A thread started from a message cannot be private.".to_owned()));
+            }
+            let stored = self
+                .ctx
+                .stored_message(channel, message_id)
+                .map_err(|err| refuse(err.to_string()))?
+                .ok_or_else(|| refuse("That message is not here.".to_owned()))?;
+            if stored.deleted || matches!(stored.kind, MessageKind::System) {
+                return Err(refuse("That message cannot start a thread.".to_owned()));
+            }
+            if let Some(existing) = stored.thread.as_ref() {
+                self.record_thread(&parent, &existing.id, Some(message_id), &name, false)?;
+                return Ok(existing.id.clone());
+            }
+            let mut body = json!({ "name": name });
+            if let Some(minutes) = auto_archive_minutes {
+                body["auto_archive_duration"] = json!(minutes);
+            }
+            let created = self
+                .call_once("POST", &format!("/channels/{channel}/messages/{message_id}/threads"), Some(body))
+                .map_err(refusal)?;
+            let thread: model::Channel = serde_json::from_str(&created)
+                .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+            let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| name.clone());
+            self.record_thread(&parent, &thread.id, Some(message_id), &title, false)?;
+            self.remember_starter(&thread, channel, message_id);
+            let unread = self.ctx.known(&thread.id).ok().flatten().map(|row| row.unread).unwrap_or(0);
+            let mut message = stored;
+            message.thread = Some(ThreadSummary {
+                id: thread.id.clone(),
+                replies: thread.message_count.unwrap_or(0),
+                last: thread.last_message_id.as_deref().map_or(0, seconds),
+                participants: Vec::new(),
+                unread,
+            });
+            self.ctx.history(channel, &[message]).map_err(|err| refuse(err.to_string()))?;
+            return Ok(thread.id);
+        }
+
+        // Standalone thread from the channel/composer.
+        if private && parent.kind == ConversationKind::Announcement {
+            return Err(refuse("Private threads cannot be created in an announcement channel.".to_owned()));
+        }
+        let thread_type = if parent.kind == ConversationKind::Announcement {
+            model::NEWS_THREAD
+        } else if private {
+            model::PRIVATE_THREAD
+        } else {
+            model::PUBLIC_THREAD
+        };
+        let mut body = json!({
+            "name": name,
+            "type": thread_type,
+        });
+        if let Some(minutes) = auto_archive_minutes {
+            body["auto_archive_duration"] = json!(minutes);
+        }
+        if private {
+            body["invitable"] = json!(true);
         }
         let created = self
-            .call(
-                "POST",
-                &format!("/channels/{channel}/messages/{message_id}/threads"),
-                Some(json!({ "name": name })),
-            )
+            .call_once("POST", &format!("/channels/{channel}/threads"), Some(body))
             .map_err(refusal)?;
         let thread: model::Channel = serde_json::from_str(&created)
             .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
         let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| name.clone());
-        self.record_thread(&parent, &thread.id, message_id, &title)?;
-        self.remember_starter(&thread, channel, message_id);
-        let unread = self.ctx.known(&thread.id).ok().flatten().map(|row| row.unread).unwrap_or(0);
-        let mut message = stored;
-        message.thread = Some(ThreadSummary {
-            id: thread.id.clone(),
-            replies: thread.message_count.unwrap_or(0),
-            last: thread.last_message_id.as_deref().map_or(0, seconds),
-            participants: Vec::new(),
-            unread,
-        });
-        self.ctx.history(channel, &[message]).map_err(|err| refuse(err.to_string()))?;
+        let is_private = private || thread.kind == model::PRIVATE_THREAD;
+        self.record_thread(&parent, &thread.id, None, &title, is_private)?;
+        if !first_message.trim().is_empty() {
+            let nonce = format!("{}", crate::hub::now().unsigned_abs().saturating_mul(1000).saturating_add(1));
+            match self.send(&thread.id, &nonce, first_message.trim(), None) {
+                Ok(message) => {
+                    let _ = self.ctx.message(&thread.id, &message);
+                }
+                Err(why) => self.log("thread first message", why),
+            }
+        }
         Ok(thread.id)
     }
 
+    /// Adds one or more users to a Discord thread (`PUT /channels/{thread}/thread-members/{user}`).
+    fn add_members(&self, channel: &str, people: &[String]) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
+        if known.kind != ConversationKind::Thread {
+            return Err(Refusal::Unsupported);
+        }
+        for person in people {
+            let person = person.trim();
+            if person.is_empty() {
+                continue;
+            }
+            self.call("PUT", &format!("/channels/{channel}/thread-members/{}", escaped(person)), None)
+                .map_err(refusal)?;
+        }
+        self.ctx.info_stale(channel);
+        self.ctx.members_changed(channel);
+        Ok(())
+    }
+
     /// The thread's conversation, when it is not recorded yet. Its root is the message it hangs
-    /// off. A thread kept outside the tree still needs its server, which `guild_of` reads back.
-    fn record_thread(&self, parent: &Conversation, thread_id: &str, root: &str, title: &str) -> Result<(), Refusal> {
+    /// off (when attached to one). A thread kept outside the tree still needs its server, which
+    /// `guild_of` reads back.
+    fn record_thread(
+        &self,
+        parent: &Conversation,
+        thread_id: &str,
+        root: Option<&str>,
+        title: &str,
+        private: bool,
+    ) -> Result<(), Refusal> {
         let refuse = |err: rusqlite::Error| Refusal::Refused(err.to_string());
         if self.ctx.known(thread_id).map_err(refuse)?.is_some() {
             return Ok(());
         }
         if let Some(guild) = self.guild_of(parent) {
             self.ctx.set_note(&format!("guild:{thread_id}"), &guild);
+            let note = format!("threads:{guild}");
+            let before = self.ctx.note(&note).unwrap_or_default();
+            let mut listed: Vec<&str> = before.split(',').filter(|id| !id.is_empty() && *id != thread_id).collect();
+            listed.push(thread_id);
+            self.ctx.set_note(&note, &listed.join(","));
         }
         let mut row = ConversationRow::new(thread_id, ConversationKind::Thread, title);
         row.parent = Some(parent.key.id.clone());
-        row.root = Some(root.to_owned());
-        row.private = parent.private;
+        row.root = root.map(str::to_owned);
+        row.space = parent.space.clone();
+        row.group = parent.group.clone();
+        row.position = parent.position + 1;
+        row.private = private || parent.private;
         row.read_only = parent.read_only;
         row.rights = parent.rights;
+        row.rights.add_members = parent.rights.send_in_threads || parent.rights.manage_threads;
+        row.filing = Some(crate::store::Filing {
+            followed: true,
+            ..crate::store::Filing::default()
+        });
         self.ctx.conversation(&row).map_err(refuse)
     }
 
@@ -1954,10 +2067,26 @@ impl Discord {
             Command::Members { conversation_id, offset, limit, reply } => {
                 self.members(conversation_id, offset, limit, reply)
             }
-            Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
-            Command::StartThread { conversation_id, message_id, name, reply } => {
-                drop(reply.send(self.start_thread(&conversation_id, &message_id, &name)))
+            Command::MembersAdd { conversation_id, people, reply } => {
+                answer(reply, self.add_members(&conversation_id, &people))
             }
+            Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
+            Command::StartThread {
+                conversation_id,
+                message_id,
+                name,
+                private,
+                auto_archive_minutes,
+                first_message,
+                reply,
+            } => drop(reply.send(self.start_thread(
+                &conversation_id,
+                message_id.as_deref(),
+                &name,
+                private,
+                auto_archive_minutes,
+                &first_message,
+            ))),
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),

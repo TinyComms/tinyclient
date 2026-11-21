@@ -116,7 +116,7 @@
         "features": ["COMMUNITY"]
       },
       "roles": [
-        {"id": "4000", "name": "@everyone", "permissions": "36769344", "position": 0, "color": 0},
+        {"id": "4000", "name": "@everyone", "permissions": "309274414656", "position": 0, "color": 0},
         {"id": "4010", "name": "mods", "permissions": "0", "position": 2, "color": 15105570},
         {"id": "4011", "name": "core", "permissions": "0", "position": 3, "color": 0}
       ],

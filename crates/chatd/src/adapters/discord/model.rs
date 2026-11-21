@@ -54,6 +54,9 @@ pub const MOVE_MEMBERS: u64 = 1 << 24;
 pub const USE_VAD: u64 = 1 << 25;
 pub const MANAGE_ROLES: u64 = 1 << 28;
 pub const MANAGE_THREADS: u64 = 1 << 34;
+pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
+pub const CREATE_PRIVATE_THREADS: u64 = 1 << 36;
+pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.

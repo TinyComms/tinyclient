@@ -5,8 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_THREADS, PIN_MESSAGES,
-    SEND_MESSAGES, VIEW_CHANNEL,
+    CREATE_PRIVATE_THREADS, CREATE_PUBLIC_THREADS, KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_MESSAGES,
+    MANAGE_ROLES, MANAGE_THREADS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -277,6 +277,10 @@ impl GuildInfo {
             pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
             delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
             manage_members: timed_out.is_none() && (perms & (KICK_MEMBERS | BAN_MEMBERS | MANAGE_ROLES) != 0),
+            create_public_threads: timed_out.is_none() && written && (perms & CREATE_PUBLIC_THREADS != 0),
+            create_private_threads: timed_out.is_none() && kind == ConversationKind::Channel && (perms & CREATE_PRIVATE_THREADS != 0),
+            send_in_threads: timed_out.is_none() && (perms & SEND_MESSAGES_IN_THREADS != 0),
+            manage_threads: timed_out.is_none() && (perms & MANAGE_THREADS != 0),
             ..protocol::ConversationRights::default()
         };
         let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
@@ -432,13 +436,16 @@ impl Discord {
             let name = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
             let clock = now();
             let timed_out = info.timed_out(clock);
+            let mut thread_rights = *parent_rights;
+            thread_rights.add_members = timed_out.is_none() && (thread_rights.send_in_threads || thread_rights.manage_threads);
             let row = ConversationRow {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
                 root: Some(thread.id.clone()),
+                private: thread.kind == model::PRIVATE_THREAD,
                 read_only: timed_out.is_some(),
                 read_only_reason: timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default(),
-                rights: *parent_rights,
+                rights: thread_rights,
                 slowmode_seconds: if slowmode_exempt(*parent_perms, true) { 0 } else { thread.rate_limit_per_user },
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
@@ -1317,10 +1324,13 @@ impl Discord {
             .as_deref()
             .and_then(|guild| self.channel_permissions(guild, &parent.key.id))
             .map_or(parent.rights.delete_others, |perms| slowmode_exempt(perms, true));
+        let mut thread_rights = parent.rights;
+        thread_rights.add_members = thread_rights.send_in_threads || thread_rights.manage_threads;
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
-            rights: parent.rights,
+            private: thread.kind == model::PRIVATE_THREAD,
+            rights: thread_rights,
             slowmode_seconds: if exempt { 0 } else { thread.rate_limit_per_user },
             // Joined, or our membership came with it: followed. Otherwise left as it was.
             filing: (joined || thread.member.is_some()).then(|| Filing {

@@ -576,7 +576,14 @@ impl Shell {
     /// Asks Discord to create the thread, then opens it. The layer waits until the channel id
     /// is known: opening before that finds nothing to mount and would ask again.
     fn start_discord_thread(&mut self, conversation: Key, root: Rc<Message>, cx: &mut Context<Self>) {
-        let request = Request::StartThread { conversation: conversation.clone(), message: root.id.clone() };
+        let request = Request::StartThread {
+            conversation: conversation.clone(),
+            message: Some(root.id.clone()),
+            name: String::new(),
+            private: false,
+            auto_archive_minutes: None,
+            first_message: String::new(),
+        };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |shell, cx| {
