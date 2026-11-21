@@ -155,6 +155,7 @@ struct Open {
     moderate: bool,
     /// This account may pin and unpin messages in this conversation.
     can_pin: bool,
+    call: protocol::CallSupport,
     /// Conversation topic (e.g. "RCS message" / "Text message" for Google Messages).
     topic: String,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
@@ -541,6 +542,7 @@ impl Pane {
                 || open.rights != conversation.rights
                 || open.moderate != conversation.moderate
                 || open.can_pin != conversation.can_pin
+                || open.call != conversation.call
                 || open.topic != conversation.topic
             {
                 open.title.clone_from(&conversation.title);
@@ -550,6 +552,7 @@ impl Pane {
                 open.rights = conversation.rights;
                 open.moderate = conversation.moderate;
                 open.can_pin = conversation.can_pin;
+            open.call = conversation.call;
                 open.topic.clone_from(&conversation.topic);
                 cx.notify();
             }
@@ -569,6 +572,7 @@ impl Pane {
             open.rights = conversation.rights;
             open.moderate = conversation.moderate;
             open.can_pin = conversation.can_pin;
+            open.call = conversation.call;
             open.topic.clone_from(&conversation.topic);
         }
     }
@@ -621,6 +625,7 @@ impl Pane {
             rights,
             moderate: false,
             can_pin: false,
+            call: protocol::CallSupport::None,
             topic: String::new(),
             started: Instant::now(),
         });

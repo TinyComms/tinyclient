@@ -540,6 +540,10 @@ struct World {
     topic_reads: HashMap<(Who, i32), i32>,
     /// Users `contacts.block` has blocked. `getBlocked` and `userFull.blocked` read this.
     blocked: HashSet<i64>,
+    /// Per-user `(phone_calls_available, phone_calls_private, video_calls_available)` for `GetFullUser`.
+    call_flags: HashMap<i64, (bool, bool, bool)>,
+    /// Stored privacy rules by key name (`phone_call`, `phone_p2p`, `voice_messages`).
+    privacy: HashMap<&'static str, Vec<tl::enums::PrivacyRule>>,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -607,6 +611,12 @@ impl World {
             as_other: false,
             topic_reads: HashMap::new(),
             blocked: HashSet::new(),
+            call_flags: HashMap::new(),
+            privacy: HashMap::from([
+                ("phone_call", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("phone_p2p", vec![tl::enums::PrivacyRule::PrivacyValueAllowContacts]),
+                ("voice_messages", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+            ]),
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -1455,6 +1465,97 @@ impl World {
                 message.edit_date = Some(t0() + 30);
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "call-flags" => {
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
+                let avail = words.next().is_some_and(|v| v == "1" || v == "true");
+                let priv_ = words.next().is_some_and(|v| v == "1" || v == "true");
+                let video = words.next().is_some_and(|v| v == "1" || v == "true");
+                self.call_flags.insert(id, (avail, priv_, video));
+                Vec::new()
+            }
+            "call-event" => {
+                // call-event <out|in> <missed|busy|hangup|disconnect|none|group-live|group-end|conf-live|conf-missed> [video] [duration]
+                let out = words.next() == Some("out");
+                let kind = words.next().unwrap_or("missed");
+                let video = words.next() == Some("video");
+                let duration: Option<i32> = words.next().and_then(|d| d.parse().ok());
+                let (peer, action): (Who, tl::enums::MessageAction) = match kind {
+                    "group-live" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionGroupCall {
+                            call: tl::types::InputGroupCall { id: 501, access_hash: 502 }.into(),
+                            duration: None,
+                        }
+                        .into(),
+                    ),
+                    "group-end" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionGroupCall {
+                            call: tl::types::InputGroupCall { id: 501, access_hash: 502 }.into(),
+                            duration: Some(duration.unwrap_or(185)),
+                        }
+                        .into(),
+                    ),
+                    "conf-live" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionConferenceCall {
+                            missed: false,
+                            active: true,
+                            video,
+                            call_id: 601,
+                            duration: None,
+                            other_participants: None,
+                        }
+                        .into(),
+                    ),
+                    "conf-missed" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionConferenceCall {
+                            missed: true,
+                            active: false,
+                            video,
+                            call_id: 602,
+                            duration: None,
+                            other_participants: None,
+                        }
+                        .into(),
+                    ),
+                    other => {
+                        let reason = match other {
+                            "missed" => Some(tl::enums::PhoneCallDiscardReason::Missed),
+                            "busy" => Some(tl::enums::PhoneCallDiscardReason::Busy),
+                            "hangup" => Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                            "disconnect" => Some(tl::enums::PhoneCallDiscardReason::Disconnect),
+                            _ => None,
+                        };
+                        (
+                            odalys,
+                            tl::types::MessageActionPhoneCall {
+                                video,
+                                call_id: i64::from(self.next) + 900,
+                                reason,
+                                duration,
+                            }
+                            .into(),
+                        )
+                    }
+                };
+                self.next += 1;
+                let id = self.next;
+                let from_id = if out { Some(Who::User(ME).peer()) } else { Some(Who::User(ODALYS).peer()) };
+                let mut svc: tl::types::MessageService = blank(&[
+                    &put(0u32),
+                    &put(id),
+                    &put(peer.peer()),
+                    &put(t0() + id),
+                    &put(action),
+                ]);
+                svc.out = out;
+                svc.from_id = from_id;
+                let raw: tl::enums::Message = svc.into();
+                self.messages.entry(key(peer, None)).or_default().insert(id, raw.clone());
+                vec![update(tl::types::UpdateNewMessage { message: raw, pts: 0, pts_count: 0 }.into())]
             }
             "peer-blocked" => {
                 let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
@@ -2575,6 +2676,10 @@ impl World {
             let mut full: tl::types::UserFull = blank(&[&put(0u32), &put(0u32), &put(id), &put(tl::enums::PeerSettings::from(peer_settings)), &put(settings(None)), &put(1i32)]);
             full.about = Some("Maps, mostly.".to_owned());
             full.blocked = self.blocked.contains(&id);
+            let (phone_avail, phone_priv, video_avail) = self.call_flags.get(&id).copied().unwrap_or((true, false, false));
+            full.phone_calls_available = phone_avail;
+            full.phone_calls_private = phone_priv;
+            full.video_calls_available = video_avail;
             let mut people = users();
             if id == TOBIN {
                 full.birthday = Some(tl::types::Birthday { day: 14, month: 3, year: None }.into());
@@ -2605,6 +2710,73 @@ impl World {
         if asked::<f::help::GetAppConfig>(body).is_some() {
             self.log("GetAppConfig");
             return answer(app_config());
+        }
+        if let Some(request) = asked::<f::account::GetPrivacy>(body) {
+            let name = match request.key {
+                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
+                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
+                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
+                _ => "other",
+            };
+            self.log(&format!("account.getPrivacy {name}"));
+            let rules = self.privacy.get(name).cloned().unwrap_or_else(|| vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]);
+            let found = tl::types::account::PrivacyRules { rules, chats: chats(), users: users() };
+            return answer(tl::enums::account::PrivacyRules::Rules(found));
+        }
+        if let Some(request) = asked::<f::account::SetPrivacy>(body) {
+            let name = match request.key {
+                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
+                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
+                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
+                _ => "other",
+            };
+            let mut mapped: Vec<tl::enums::PrivacyRule> = Vec::new();
+            let mut tags: Vec<String> = Vec::new();
+            for rule in request.rules {
+                match rule {
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowAll => {
+                        tags.push("allow_all".into());
+                        mapped.push(tl::enums::PrivacyRule::PrivacyValueAllowAll);
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowContacts => {
+                        tags.push("allow_contacts".into());
+                        mapped.push(tl::enums::PrivacyRule::PrivacyValueAllowContacts);
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueDisallowAll => {
+                        tags.push("disallow_all".into());
+                        mapped.push(tl::enums::PrivacyRule::PrivacyValueDisallowAll);
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowUsers(u) => {
+                        let ids: Vec<i64> = u.users.iter().filter_map(|u| match u {
+                            tl::enums::InputUser::User(u) => Some(u.user_id),
+                            _ => None,
+                        }).collect();
+                        tags.push(format!("allow_users:{ids:?}"));
+                        mapped.push(tl::types::PrivacyValueAllowUsers { users: ids }.into());
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueDisallowUsers(u) => {
+                        let ids: Vec<i64> = u.users.iter().filter_map(|u| match u {
+                            tl::enums::InputUser::User(u) => Some(u.user_id),
+                            _ => None,
+                        }).collect();
+                        tags.push(format!("disallow_users:{ids:?}"));
+                        mapped.push(tl::types::PrivacyValueDisallowUsers { users: ids }.into());
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowChatParticipants(c) => {
+                        tags.push(format!("allow_chats:{:?}", c.chats));
+                        mapped.push(tl::types::PrivacyValueAllowChatParticipants { chats: c.chats }.into());
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueDisallowChatParticipants(c) => {
+                        tags.push(format!("disallow_chats:{:?}", c.chats));
+                        mapped.push(tl::types::PrivacyValueDisallowChatParticipants { chats: c.chats }.into());
+                    }
+                    _ => {}
+                }
+            }
+            self.log(&format!("account.setPrivacy {name} {}", tags.join(",")));
+            self.privacy.insert(name, mapped.clone());
+            let found = tl::types::account::PrivacyRules { rules: mapped, chats: chats(), users: users() };
+            return answer(tl::enums::account::PrivacyRules::Rules(found));
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;
@@ -2696,6 +2868,55 @@ impl World {
     fn panes(&mut self, body: &[u8], events: &Sender<Event>) -> Option<Result<Vec<u8>, Fault>> {
         use tl::functions as f;
         if let Some(request) = asked::<f::messages::Search>(body) {
+            if let tl::enums::MessagesFilter::InputMessagesFilterPhoneCalls(filter) = &request.filter {
+                self.log(&format!("Search calls missed={} offset={}", filter.missed, request.offset_id));
+                let mut calls: Vec<tl::enums::Message> = self
+                    .messages
+                    .values()
+                    .flat_map(|held| held.values())
+                    .filter(|msg| match msg {
+                        tl::enums::Message::Service(svc) => match &svc.action {
+                            tl::enums::MessageAction::PhoneCall(call) => {
+                                if request.offset_id > 0 && svc.id >= request.offset_id {
+                                    return false;
+                                }
+                                if filter.missed {
+                                    !svc.out
+                                        && matches!(
+                                            (&call.reason, call.duration),
+                                            (Some(tl::enums::PhoneCallDiscardReason::Missed), _) | (None, None)
+                                        )
+                                } else {
+                                    true
+                                }
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                calls.sort_by_key(|msg| {
+                    std::cmp::Reverse(match msg {
+                        tl::enums::Message::Service(svc) => svc.id,
+                        _ => 0,
+                    })
+                });
+                let total = calls.len() as i32;
+                calls.truncate(request.limit.max(0) as usize);
+                let slice = tl::types::messages::MessagesSlice {
+                    inexact: false,
+                    count: total,
+                    next_rate: None,
+                    offset_id_offset: None,
+                    search_flood: None,
+                    messages: calls,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                };
+                return Some(answer(tl::enums::messages::Messages::Slice(slice)));
+            }
             let peer = input_who(&request.peer);
             let (name, count, ids): (&str, i32, Vec<i32>) = match request.filter {
                 tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, vec![12]),

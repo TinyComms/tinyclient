@@ -26,6 +26,9 @@ struct Read {
     archive: Vec<Conversation>,
     archive_total: u32,
     drilled: Vec<Conversation>,
+    calls: Vec<protocol::CallLogEntry>,
+    calls_next: Option<String>,
+    calls_more: bool,
 }
 
 fn conversations(request: &Request) -> std::io::Result<(Vec<Conversation>, u32)> {
@@ -61,20 +64,38 @@ impl Shell {
         };
         // Keys only: the read runs off this thread.
         let drill = self.sidebar_state.drill.as_ref().map(|drill| match drill {
-            Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None),
-            Drill::Archive => (Shelf::Archive, None, None),
-            Drill::Requests => (Shelf::Requests, None, None),
-            Drill::Topics(forum) => (Shelf::Main, None, Some(forum.key.clone())),
+            Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false),
+            Drill::Archive => (Shelf::Archive, None, None, false),
+            Drill::Calls => (Shelf::Main, None, None, true),
+            Drill::Requests => (Shelf::Requests, None, None, false),
+            Drill::Topics(forum) => (Shelf::Main, None, Some(forum.key.clone()), false),
         });
+        let tg_account = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Telegram && a.link == protocol::Link::Connected))
+            .map(|a| a.key.clone());
+        let calls_missed = self.sidebar_state.home.calls_missed;
         let folder = self.sidebar_state.home.folder.clone();
         self.sidebar_state.home.epoch += 1;
         let epoch = self.sidebar_state.home.epoch;
         let read = move || -> std::io::Result<Read> {
             let mut read = Read::default();
             match drill {
-                Some((_, Some(space), _)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
-                Some((_, _, Some(forum))) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
-                Some((shelf, None, None)) => read.drilled = whole(network, None, shelf)?.0,
+                Some((_, _, _, true)) => {
+                    if let Some(account) = tg_account {
+                        if let Response::CallHistory { entries, next, more } =
+                            ask(&Request::CallHistory { account, missed: calls_missed, before: None, limit: 30 })?
+                        {
+                            read.calls = entries;
+                            read.calls_next = next;
+                            read.calls_more = more;
+                        }
+                    }
+                }
+                Some((_, Some(space), _, false)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
+                Some((_, _, Some(forum), false)) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
+                Some((shelf, None, None, false)) => read.drilled = whole(network, None, shelf)?.0,
                 None => {}
             }
             match network {
@@ -119,6 +140,11 @@ impl Shell {
             home.archive = rows(read.archive);
             home.archive_total = read.archive_total;
             home.drilled = rows(read.drilled);
+            if matches!(this.sidebar_state.drill, Some(Drill::Calls)) {
+                home.calls = read.calls;
+                home.calls_next = read.calls_next;
+                home.calls_more = read.calls_more;
+            }
             home.loaded = true;
             home.loaded_once = true;
             this.rebuild_home(cx);
@@ -165,6 +191,28 @@ impl Shell {
                 if !spam.is_empty() {
                     out.push(Item::Header { label: "Spam", first: out.is_empty() });
                     out.extend(spam);
+                }
+                out
+            }
+            (Mode::Network(_), Some(Drill::Calls)) => {
+                let mut out = Vec::new();
+                let filter_words = if state.home.calls_missed { "Showing missed · show all" } else { "Showing all · filter missed" };
+                out.push(Item::Action {
+                    act: Act::CallsMissedToggle,
+                    icon: "icons/phone-missed.svg",
+                    words: filter_words.into(),
+                    after: String::new(),
+                    dot: None,
+                });
+                out.extend(home::collapse_call_entries(&state.home.calls).into_iter().map(Item::Call));
+                if state.home.calls_more {
+                    out.push(Item::Action {
+                        act: Act::CallsMore,
+                        icon: "icons/chevron-down.svg",
+                        words: "Load more calls".into(),
+                        after: String::new(),
+                        dot: None,
+                    });
                 }
                 out
             }
@@ -221,6 +269,19 @@ impl Shell {
         let home = &mut self.sidebar_state.home;
         match item {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => return self.pick_row(&c, cx),
+            Item::Call(group) => {
+                let key = group.latest.conversation.clone();
+                let msg_id = group.latest.message_id.clone();
+                let title = group.latest.name.clone();
+                let pane = self.pane(cx);
+                if self.open.as_ref() == Some(&key) {
+                    pane.update(cx, |pane, cx| pane.jump_to(&msg_id, cx));
+                } else {
+                    pane.update(cx, |pane, _| pane.land_next(msg_id));
+                    self.select(key, &title, cx);
+                }
+                return;
+            }
             Item::Header { .. } => return,
             Item::Action { act, .. } => match act {
                 Act::Friends => {
@@ -235,6 +296,46 @@ impl Shell {
                     return self.drill(Drill::Requests, cx);
                 },
                 Act::Archive => return self.drill(Drill::Archive, cx),
+                Act::Calls => return self.drill(Drill::Calls, cx),
+                Act::CallsMissedToggle => {
+                    home.calls_missed = !home.calls_missed;
+                    home.calls.clear();
+                    home.calls_next = None;
+                    home.calls_more = false;
+                    home.loaded = false;
+                    self.rebuild_home(cx);
+                    self.load_home(cx);
+                    return;
+                }
+                Act::CallsMore => {
+                    let before = home.calls_next.clone();
+                    let missed = home.calls_missed;
+                    let account = self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Telegram && a.link == protocol::Link::Connected))
+                        .map(|a| a.key.clone());
+                    if let Some(account) = account {
+                        let epoch = home.epoch;
+                        self.off_thread(
+                            cx,
+                            move || ask(&Request::CallHistory { account, missed, before, limit: 30 }),
+                            move |this, answer, cx| {
+                                let home = &mut this.sidebar_state.home;
+                                if home.epoch != epoch {
+                                    return;
+                                }
+                                if let Ok(Response::CallHistory { entries, next, more }) = answer {
+                                    home.calls.extend(entries);
+                                    home.calls_next = next;
+                                    home.calls_more = more;
+                                    this.rebuild_home(cx);
+                                }
+                            },
+                        );
+                    }
+                    return;
+                }
                 Act::MoreDms => home.dms_all = true,
                 Act::MoreVoice => home.voice_all = true,
                 Act::MoreChats => home.chats_all = true,
@@ -291,6 +392,78 @@ impl Shell {
                 self.chat_row("home", &c, look, focused, cx).into_any_element()
             }
             Item::Voice(c) => self.voice_row(&c, focused, cx).into_any_element(),
+            Item::Call(group) => {
+                let entry = &group.latest;
+                let missed = entry.note.outcome == protocol::CallOutcome::Missed && !entry.outgoing;
+                let icon_path = if missed {
+                    "icons/phone-missed.svg"
+                } else if entry.note.video {
+                    "icons/video.svg"
+                } else if entry.outgoing {
+                    "icons/phone-outgoing.svg"
+                } else {
+                    "icons/phone-incoming.svg"
+                };
+                let title = if group.count > 1 { format!("{} ({})", entry.name, group.count) } else { entry.name.clone() };
+                let subtitle = match (entry.note.outcome, entry.outgoing, entry.note.seconds) {
+                    (protocol::CallOutcome::Missed, false, _) => "Missed".to_owned(),
+                    (protocol::CallOutcome::Declined, _, _) => "Declined".to_owned(),
+                    (protocol::CallOutcome::Cancelled, _, _) => "Cancelled".to_owned(),
+                    (protocol::CallOutcome::Busy, _, _) => "Line busy".to_owned(),
+                    (_, true, Some(s)) if s > 0 => format!("Outgoing · {}s", s),
+                    (_, false, Some(s)) if s > 0 => format!("Incoming · {}s", s),
+                    (_, true, _) => "Outgoing".to_owned(),
+                    (_, false, _) => "Incoming".to_owned(),
+                };
+                let conv_key = entry.conversation.clone();
+                let call_support = self
+                    .sidebar_state
+                    .home
+                    .chats
+                    .iter()
+                    .find(|c| c.key == conv_key)
+                    .map_or(protocol::CallSupport::Handoff, |c| c.call);
+                let call_btn = (!matches!(call_support, protocol::CallSupport::None | protocol::CallSupport::Restricted)).then(|| {
+                    let key = conv_key.clone();
+                    let handoff = call_support == protocol::CallSupport::Handoff;
+                    icon_button(("call-log-dial", ix), "icons/phone.svg", false).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            if handoff {
+                                this.call_handoff(key.clone(), cx);
+                            } else {
+                                this.call_start(key.clone(), cx);
+                            }
+                        }),
+                    )
+                });
+                let del_ids = group.message_ids.clone();
+                let del_account = conv_key.account();
+                let del_btn = icon_button(("call-log-del", ix), "icons/trash-2.svg", false)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let ids = del_ids.clone();
+                        let account = del_account.clone();
+                        this.sidebar_state.home.calls.retain(|c| !ids.contains(&c.message_id));
+                        this.rebuild_home(cx);
+                        this.off_thread(cx, move || ask(&Request::DeleteCallEntries { account, message_ids: ids, revoke: false }), |_, _, _| {});
+                    }));
+                let fg = if missed { theme::danger() } else { theme::text() };
+                let content = div()
+                    .gap(px(8.))
+                    .child(glyph(icon_path, 16., if missed { theme::danger() } else { theme::text_soft() }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().type_ui().text_color(fg).truncate().child(title))
+                            .child(div().type_small().text_color(theme::text_faint()).truncate().child(subtitle)),
+                    )
+                    .children(call_btn)
+                    .child(del_btn);
+                click(list_row(("home-call", ix), theme::row_height(48.), false, focused, content), cx).into_any_element()
+            }
             Item::Action { act: Act::Meetings, icon, words, after, .. } => {
                 // The subjects use the row that remains after the label. The chevron says the fold is open.
                 let open = self.sidebar_state.home.meetings_open;
@@ -580,6 +753,7 @@ impl Shell {
         let (icon, title, detail): (&'static str, String, String) = match (&state.home.network, &state.drill) {
             (_, Some(Drill::Threads(_))) => ("icons/messages-square.svg", "No new replies".into(), "Threads you follow show here when someone replies.".into()),
             (_, Some(Drill::Archive)) => ("icons/inbox.svg", "Nothing archived".into(), "Chats you archive in Telegram show up here.".into()),
+            (_, Some(Drill::Calls)) => ("icons/phone.svg", "No recent calls".into(), "Your Telegram calls show up here.".into()),
             (_, Some(Drill::Requests)) => ("icons/mail.svg", "No message requests".into(), "Messages from people you don't know wait here.".into()),
             (_, Some(Drill::Topics(_))) => ("icons/messages-square.svg", "No topics yet".into(), "Topics of this group show up here.".into()),
             (Some(Network::Discord), None) if state.home_unread => ("icons/check.svg", "Nothing unread".into(), String::new()),

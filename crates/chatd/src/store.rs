@@ -183,6 +183,7 @@ const TABLES: &str = "
         moderate INTEGER NOT NULL DEFAULT 0,
         can_pin INTEGER NOT NULL DEFAULT 0,
         joined INTEGER NOT NULL DEFAULT 1,
+        call_video INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -302,7 +303,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -364,6 +365,8 @@ pub struct ConversationRow {
     pub avatar: Option<String>,
     pub peer: Option<String>,
     pub call: CallSupport,
+    /// The other side supports video calls (Telegram's `video_calls_available`).
+    pub call_video: bool,
     /// The most who may be in a voice channel at once, 0 when it has none.
     pub limit: u32,
     /// Show it in the Inbox even though it is a channel nobody mentioned me in.
@@ -485,6 +488,7 @@ impl ConversationRow {
             avatar: None,
             peer: None,
             call: CallSupport::None,
+            call_video: false,
             limit: 0,
             listed: false,
             topic: String::new(),
@@ -749,6 +753,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         moderate: row.get(56)?,
         can_pin: row.get(57)?,
         joined: row.get(58)?,
+        call_video: row.get(59)?,
     })
 }
 
@@ -912,9 +917,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -933,6 +938,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              moderate = excluded.moderate,
              can_pin = excluded.can_pin,
              joined = excluded.joined,
+             call_video = excluded.call_video,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -978,6 +984,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.moderate,
             row.can_pin,
             row.joined,
+            row.call_video,
         ],
     )?;
     Ok(())
@@ -1062,6 +1069,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "joined")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN joined INTEGER NOT NULL DEFAULT 1")?;
     }
+    if !column(db, "conversation", "call_video")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(true)
 }
 
@@ -1132,6 +1142,9 @@ impl Store {
         }
         if !column(&store.db, "conversation", "joined")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN joined INTEGER NOT NULL DEFAULT 1")?;
+        }
+        if !column(&store.db, "conversation", "call_video")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
         }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
@@ -1797,7 +1810,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1849,6 +1862,7 @@ impl Store {
                         moderate: row.get(26)?,
                         can_pin: row.get(27)?,
                         joined: row.get(28)?,
+                        call_video: row.get(29)?,
                     },
                 ))
             })?

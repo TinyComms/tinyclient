@@ -2137,6 +2137,53 @@ impl Chat {
         }
     }
 
+    fn call_history(&self, account: AccountKey, missed: bool, before: Option<String>, limit: u32) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let limit = limit.clamp(1, PAGE_LIMIT);
+        match self.ask(&account, |reply| Command::CallHistory { missed, before, limit, reply }) {
+            Ok(mut page) => {
+                page.entries.truncate(limit as usize);
+                Response::CallHistory { entries: page.entries, next: page.next, more: page.more }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn delete_call_entries(&self, account: AccountKey, message_ids: Vec<String>, revoke: bool) -> Response {
+        if message_ids.is_empty() {
+            return Response::Ok;
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::DeleteCallEntries { message_ids, revoke, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn get_privacy(&self, account: AccountKey, key: protocol::PrivacyKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetPrivacy { key, reply }) {
+            Ok(policy) => Response::Privacy { key, policy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_privacy(&self, account: AccountKey, key: protocol::PrivacyKey, policy: protocol::PrivacyPolicy) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetPrivacy { key, policy, reply }) {
+            Ok(policy) => Response::Privacy { key, policy },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Drops an unsent row locally. A queued send is cancelled this way: the adapter never had it.
     fn drop_unsent(&self, conversation: Key, client_id: &str, message: &Message) -> Response {
         match self.hub.store().delete_message(&conversation, client_id) {
@@ -2371,6 +2418,9 @@ impl Chat {
             Ok(Some(row)) if row.call == CallSupport::Native => {}
             Ok(Some(row)) if row.call == CallSupport::Handoff => {
                 return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
+            }
+            Ok(Some(row)) if row.call == CallSupport::Restricted => {
+                return error(ErrorCode::Refused, "This person's privacy settings don't allow calls.")
             }
             Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
             Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
@@ -3010,6 +3060,10 @@ impl Chat {
                 }
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
+            Request::CallHistory { account, missed, before, limit } => self.call_history(account, missed, before, limit),
+            Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
+            Request::GetPrivacy { account, key } => self.get_privacy(account, key),
+            Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::Relate { person, action } => self.relate(person, action),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),

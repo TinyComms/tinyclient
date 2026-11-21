@@ -68,6 +68,9 @@ impl Fault {
                     "Telegram no longer lets this account reach that chat.".to_owned()
                 }
                 "PARTICIPANTS_HIDDEN" => "This group hides its member list.".to_owned(),
+                "USER_PRIVACY_RESTRICTED" => "This person's privacy settings don't allow calls.".to_owned(),
+                "CALL_PROTOCOL_COMPAT_LAYER_INVALID" => "This call protocol version isn't supported.".to_owned(),
+                "PARTICIPANT_VERSION_OUTDATED" => "The other person's Telegram app needs an update for this call.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.
@@ -198,5 +201,15 @@ mod tests {
     fn a_secret_chat_says_it_only_works_in_the_phone_apps() {
         let fault = Fault::Rpc { code: 400, name: "SECRET_CHAT".into(), value: None };
         assert!(fault.words().contains("phone apps"), "{}", fault.words());
+    }
+
+    #[test]
+    fn call_refusal_rpc_errors_map_to_plain_words() {
+        let privacy = Fault::Rpc { code: 403, name: "USER_PRIVACY_RESTRICTED".into(), value: None };
+        assert!(privacy.words().contains("privacy"), "{}", privacy.words());
+        let compat = Fault::Rpc { code: 400, name: "CALL_PROTOCOL_COMPAT_LAYER_INVALID".into(), value: None };
+        assert!(compat.words().contains("protocol"), "{}", compat.words());
+        let outdated = Fault::Rpc { code: 400, name: "PARTICIPANT_VERSION_OUTDATED".into(), value: None };
+        assert!(outdated.words().contains("update"), "{}", outdated.words());
     }
 }

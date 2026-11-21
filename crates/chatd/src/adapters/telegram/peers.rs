@@ -73,6 +73,15 @@ pub fn thread_id(forum: Who, topic: i32) -> String {
     format!("{}_{topic}", forum.text())
 }
 
+/// Call capability flags from `users.getFullUser`. `None` on [`Known`] means the full profile
+/// has not been fetched yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallFlags {
+    pub phone_available: bool,
+    pub phone_private: bool,
+    pub video_available: bool,
+}
+
 /// What is remembered of one peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Known {
@@ -103,6 +112,8 @@ pub struct Known {
     /// Rough last-seen words ("last seen recently"). Empty when Telegram gave an exact time,
     /// or none. Never shown on our own row.
     pub seen: String,
+    /// Call availability and privacy flags from `users.getFullUser`.
+    pub call_flags: Option<CallFlags>,
 }
 
 /// The tag Telegram's flags give: a warning wins over a tick.
@@ -367,6 +378,7 @@ impl Directory {
             let who = Who::User(user.id);
             let mut known = of_user(user);
             let before = self.map.get(&who);
+            known.call_flags = before.and_then(|before| before.call_flags);
             if known.hash.is_none() {
                 known.hash = before.and_then(|before| before.hash);
                 // A user seen in passing may come without its picture.
@@ -392,6 +404,7 @@ impl Directory {
                 continue;
             };
             let before = self.map.get(&who);
+            known.call_flags = before.and_then(|before| before.call_flags);
             if known.hash.is_none() {
                 known.hash = before.and_then(|before| before.hash);
             }
@@ -414,6 +427,15 @@ impl Directory {
             self.map.insert(who, known);
         }
         learned
+    }
+
+    pub fn set_call_flags(&mut self, who: Who, flags: CallFlags) -> bool {
+        let known = self.map.entry(who).or_default();
+        if known.call_flags == Some(flags) {
+            return false;
+        }
+        known.call_flags = Some(flags);
+        true
     }
 
     pub fn left(&mut self, who: Who) {

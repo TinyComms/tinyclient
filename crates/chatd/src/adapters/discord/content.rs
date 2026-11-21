@@ -765,6 +765,7 @@ fn build_call_note(
             caller_id: caller_id.to_owned(),
             seconds,
             participants,
+            video: false,
         },
         text,
     )

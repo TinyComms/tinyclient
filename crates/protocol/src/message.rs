@@ -672,6 +672,7 @@ pub enum CallOutcome {
     Missed,
     Declined,
     Cancelled,
+    Busy,
     Ended,
     Live,
 }
@@ -687,6 +688,8 @@ pub struct CallNote {
     /// User ids who took part in the call, when the network names them (e.g. Discord).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that

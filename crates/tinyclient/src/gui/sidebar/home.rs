@@ -26,6 +26,8 @@ pub enum Drill {
     Threads(Key),
     /// Telegram's archive.
     Archive,
+    /// Telegram's recent calls across all chats.
+    Calls,
     /// Discord's message requests.
     Requests,
     /// A forum's topics.
@@ -40,10 +42,44 @@ pub enum Act {
     MoreDms,
     MoreVoice,
     Archive,
+    Calls,
+    CallsMissedToggle,
+    CallsMore,
     Meetings,
     MoreChats,
     /// Show or hide a team's opted-out channels. The id is the team's.
     Hidden(String),
+}
+
+/// Consecutive calls with the same person collapsed into one row with a count.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CollapsedCall {
+    pub latest: protocol::CallLogEntry,
+    pub count: u32,
+    pub message_ids: Vec<String>,
+}
+
+/// Collapses consecutive entries with the same conversation and missedness into one row,
+/// matching the official Telegram Calls list.
+pub fn collapse_call_entries(entries: &[protocol::CallLogEntry]) -> Vec<CollapsedCall> {
+    let mut out: Vec<CollapsedCall> = Vec::new();
+    for entry in entries {
+        let is_missed = entry.note.outcome == protocol::CallOutcome::Missed && !entry.outgoing;
+        if let Some(last) = out.last_mut() {
+            let last_missed = last.latest.note.outcome == protocol::CallOutcome::Missed && !last.latest.outgoing;
+            if last.latest.conversation == entry.conversation && last_missed == is_missed {
+                last.count += 1;
+                last.message_ids.push(entry.message_id.clone());
+                continue;
+            }
+        }
+        out.push(CollapsedCall {
+            latest: entry.clone(),
+            count: 1,
+            message_ids: vec![entry.message_id.clone()],
+        });
+    }
+    out
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -52,6 +88,8 @@ pub enum Item {
     Chat(Rc<Conversation>),
     /// A voice channel or DM call with friends in it.
     Voice(Rc<Conversation>),
+    /// A collapsed recent-calls entry in the Telegram Calls list.
+    Call(CollapsedCall),
     /// A 28 row that does something: `words` and the faint words or number after them.
     Action { act: Act, icon: &'static str, words: String, after: String, dot: Option<bool> },
     /// A server or team. `child`: inside a folder, on its spine.
@@ -65,7 +103,7 @@ impl Item {
     pub fn height(&self) -> f32 {
         match self {
             Item::Header { first: true, .. } => 24.,
-            Item::Chat(_) | Item::Voice(_) => 48.,
+            Item::Chat(_) | Item::Voice(_) | Item::Call(_) => 48.,
             _ => 28.,
         }
     }
@@ -80,6 +118,7 @@ impl Item {
     pub fn anchor(&self) -> Option<String> {
         match self {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => Some(format!("c/{}", c.key.id)),
+            Item::Call(c) => Some(format!("call/{}", c.latest.message_id)),
             Item::Folder { id, .. } => Some(format!("f/{id}")),
             Item::Header { label, .. } => Some(format!("h/{label}")),
             _ => None,
@@ -105,6 +144,11 @@ pub struct Home {
     pub archive_total: u32,
     /// The rows of the list drilled into.
     pub drilled: Vec<Rc<Conversation>>,
+    /// Recent calls loaded for `Drill::Calls`, newest first.
+    pub calls: Vec<protocol::CallLogEntry>,
+    pub calls_missed: bool,
+    pub calls_next: Option<String>,
+    pub calls_more: bool,
     /// The Telegram folder chosen, by id.
     pub folder: Option<String>,
     pub loaded: bool,
@@ -274,6 +318,9 @@ pub fn servers(spaces: &[Space], folders: &[Folder], opened: &HashSet<String>, o
 /// then newest; chatd's order), each once.
 pub fn telegram(home: &Home) -> Vec<Item> {
     let mut out = Vec::new();
+    if home.folder.is_none() {
+        out.push(Item::Action { act: Act::Calls, icon: "icons/phone.svg", words: "Calls".into(), after: String::new(), dot: None });
+    }
     if home.folder.is_none() && home.archive_total > 0 {
         let names: Vec<&str> = home.archive.iter().take(3).map(|c| c.title.as_str()).collect();
         let mention = home.archive.iter().any(|c| c.mentions > 0);
@@ -397,6 +444,7 @@ mod tests {
                 Item::Action { words, .. } => format!("<{words}>"),
                 Item::Space { index, child, .. } => format!("{}{}", if child.is_some() { "." } else { "" }, spaces[*index].name),
                 Item::Folder { name, open, lit, .. } => format!("{}{name}{}", if *open { "v" } else { ">" }, if *lit { "*" } else { "" }),
+                Item::Call(c) => format!("call:{}", c.latest.name),
             })
             .collect()
     }
@@ -561,5 +609,30 @@ mod tests {
         let home = Home { chats: vec![Rc::new(notes), Rc::new(ana)], ..Home::for_network(Network::Teams) };
         let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
         assert_eq!(got, ["[Chats]", "ana", "notes"]);
+    }
+
+    #[test]
+    fn telegram_calls_collapse_consecutive_same_person_entries() {
+        let entry = |id: &str, peer: &str, outgoing: bool, outcome: protocol::CallOutcome| protocol::CallLogEntry {
+            conversation: Key { network: Network::Telegram, account: "7001".into(), id: peer.into() },
+            person_id: peer.into(),
+            name: peer.into(),
+            message_id: id.into(),
+            outgoing,
+            note: protocol::CallNote { outcome, caller_id: peer.into(), seconds: None, video: false },
+            time: 100,
+        };
+        let list = vec![
+            entry("10", "u7002", false, protocol::CallOutcome::Missed),
+            entry("9", "u7002", false, protocol::CallOutcome::Missed),
+            entry("8", "u7002", true, protocol::CallOutcome::Ended),
+            entry("7", "u7003", true, protocol::CallOutcome::Ended),
+        ];
+        let collapsed = collapse_call_entries(&list);
+        assert_eq!(collapsed.len(), 3);
+        assert_eq!(collapsed[0].count, 2);
+        assert_eq!(collapsed[0].message_ids, vec!["10", "9"]);
+        assert_eq!(collapsed[1].count, 1);
+        assert_eq!(collapsed[2].latest.conversation.id, "u7003");
     }
 }

@@ -1011,6 +1011,10 @@ impl Demo {
             Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
+            Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

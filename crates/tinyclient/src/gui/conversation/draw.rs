@@ -316,11 +316,14 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
             pill: None,
         };
     };
+    let video = note.video;
+    let noun = if video { "video call" } else { "call" };
+    let cap_noun = if video { "Video call" } else { "Call" };
     match (note.outcome, message.outgoing) {
         (protocol::CallOutcome::Missed, false) => CallRowSpec {
             icon: "icons/phone-missed.svg",
             missed: true,
-            label: format!("Missed call from {other}"),
+            label: format!("Missed {noun} from {other}"),
             pill: Some("Call back"),
         },
         (protocol::CallOutcome::Missed, true) => CallRowSpec {
@@ -332,43 +335,55 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
         (protocol::CallOutcome::Declined, false) => CallRowSpec {
             icon: "icons/phone-off.svg",
             missed: false,
-            label: format!("You declined a call from {other}"),
+            label: format!("You declined a {noun} from {other}"),
             pill: None,
         },
         (protocol::CallOutcome::Declined, true) => CallRowSpec {
             icon: "icons/phone-off.svg",
             missed: false,
-            label: format!("{other} declined the call"),
+            label: format!("{other} declined the {noun}"),
             pill: Some("Call again"),
         },
         (protocol::CallOutcome::Cancelled, false) => CallRowSpec {
             icon: "icons/phone-off.svg",
             missed: false,
-            label: format!("{other} cancelled the call"),
+            label: format!("{other} cancelled the {noun}"),
             pill: None,
         },
         (protocol::CallOutcome::Cancelled, true) => CallRowSpec {
             icon: "icons/phone-off.svg",
             missed: false,
-            label: "You cancelled the call".to_owned(),
+            label: format!("You cancelled the {noun}"),
+            pill: Some("Call again"),
+        },
+        (protocol::CallOutcome::Busy, _) => CallRowSpec {
+            icon: "icons/phone-off.svg",
+            missed: false,
+            label: format!("{other}'s line was busy"),
             pill: Some("Call again"),
         },
         (protocol::CallOutcome::Ended, _) => {
             let label = match note.seconds.filter(|&s| s > 0) {
-                Some(secs) => format!("Call with {other} · {}", format_call_duration(secs)),
-                None => format!("Call with {other}"),
+                Some(secs) => format!("{cap_noun} with {other} · {}", format_call_duration(secs)),
+                None => format!("{cap_noun} with {other}"),
             };
             CallRowSpec {
-                icon: if message.outgoing { "icons/phone-outgoing.svg" } else { "icons/phone-incoming.svg" },
+                icon: if video {
+                    "icons/video.svg"
+                } else if message.outgoing {
+                    "icons/phone-outgoing.svg"
+                } else {
+                    "icons/phone-incoming.svg"
+                },
                 missed: false,
                 label,
-                pill: None,
+                pill: Some("Call back"),
             }
         }
         (protocol::CallOutcome::Live, _) => CallRowSpec {
-            icon: "icons/phone.svg",
+            icon: if video { "icons/video.svg" } else { "icons/phone.svg" },
             missed: false,
-            label: format!("Call in progress with {other}"),
+            label: format!("{cap_noun} in progress with {other}"),
             pill: Some("Join"),
         },
     }
@@ -505,9 +520,15 @@ impl Pane {
                 .collect();
             Some(div().flex_none().flex().items_center().gap(px(3.)).children(shown))
         });
+        let call_support = self.open.as_ref().map_or(protocol::CallSupport::None, |open| open.call);
         let shell = self.shell.clone();
         let pill = spec.pill.and_then(|words| {
             let key = open_key?;
+            let handoff = match call_support {
+                protocol::CallSupport::Native => false,
+                protocol::CallSupport::Handoff => true,
+                protocol::CallSupport::None | protocol::CallSupport::Restricted => return None,
+            };
             Some(
                 div()
                     .id(SharedString::from(format!("call-row-act-{}", message.id)))
@@ -524,7 +545,13 @@ impl Pane {
                     .type_micro()
                     .font_weight(theme::SEMIBOLD)
                     .on_click(cx.listener(move |_, _, _, cx| {
-                        let _ = shell.update(cx, |shell, cx| shell.call_start(key.clone(), cx));
+                        let _ = shell.update(cx, |shell, cx| {
+                            if handoff {
+                                shell.call_handoff(key.clone(), cx);
+                            } else {
+                                shell.call_start(key.clone(), cx);
+                            }
+                        });
                     }))
                     .child(words),
             )
@@ -3285,7 +3312,7 @@ mod tests {
         let make = |outcome, outgoing, seconds| {
             let mut m = Message::plain("r1", "Bea", "fallback", 100, outgoing);
             m.kind = MessageKind::System;
-            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new() });
+            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new(), video: false });
             m
         };
         let missed_in = call_line_spec(&make(protocol::CallOutcome::Missed, false, None), "Bea");
@@ -3315,6 +3342,18 @@ mod tests {
         assert_eq!(ended_dur.label, "Call with Bea · 12 min");
         let ended_plain = call_line_spec(&make(protocol::CallOutcome::Ended, true, None), "Bea");
         assert_eq!(ended_plain.label, "Call with Bea");
+        assert_eq!(ended_plain.pill, Some("Call back"));
+
+        let busy = call_line_spec(&make(protocol::CallOutcome::Busy, true, None), "Bea");
+        assert_eq!(busy.label, "Bea's line was busy");
+        assert_eq!(busy.pill, Some("Call again"));
+
+        let mut video_missed = make(protocol::CallOutcome::Missed, false, None);
+        video_missed.call.as_mut().unwrap().video = true;
+        let vm = call_line_spec(&video_missed, "Bea");
+        assert!(vm.missed);
+        assert_eq!(vm.label, "Missed video call from Bea");
+        assert_eq!(vm.pill, Some("Call back"));
     }
 
     #[test]
