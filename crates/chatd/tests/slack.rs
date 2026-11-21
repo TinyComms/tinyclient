@@ -144,6 +144,14 @@ struct Fake {
     extra_users: Mutex<Vec<Value>>,
     /// Optional extra channels returned by `users.conversations`.
     extra_conversations: Mutex<Vec<Value>>,
+    /// Optional override for `search.messages` (fn of page -> Value).
+    search_override: Mutex<Option<Value>>,
+    /// Optional paged `search.messages` pages (1-indexed).
+    search_pages: Mutex<Vec<Value>>,
+    /// Optional response for `search.files`.
+    search_files: Mutex<Option<Value>>,
+    /// Optional response for `search.modules`.
+    search_modules: Mutex<Option<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -232,6 +240,10 @@ impl Fake {
             sections_override: Mutex::default(),
             extra_users: Mutex::default(),
             extra_conversations: Mutex::default(),
+            search_override: Mutex::default(),
+            search_pages: Mutex::default(),
+            search_files: Mutex::default(),
+            search_modules: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -810,6 +822,59 @@ impl Fake {
                     }))
                 } else {
                     return refused("not_found");
+                }
+            }
+            "search.messages" => {
+                let page_idx = param("page").parse::<usize>().unwrap_or(1).saturating_sub(1);
+                let pages = self.search_pages.lock().unwrap();
+                if !pages.is_empty() {
+                    pages.get(page_idx).cloned().or_else(|| pages.last().cloned())
+                } else if let Some(over) = self.search_override.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    self.fixture(token, "search.messages")
+                }
+            }
+            "search.files" => {
+                if let Some(over) = self.search_files.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    Some(json!({
+                        "ok": true,
+                        "files": {
+                            "paging": {"count": 50, "total": 2, "page": 1, "pages": 1},
+                            "matches": [
+                                {
+                                    "id": "F0SRCH1",
+                                    "name": "architecture.pdf",
+                                    "title": "Architecture Spec",
+                                    "created": 1760000400,
+                                    "user": "U0ANA",
+                                    "mimetype": "application/pdf",
+                                    "size": 4096,
+                                    "url_private": format!("{}/files/F0SRCH1/architecture.pdf", self.base),
+                                    "permalink": "https://acme.slack.com/files/U0ANA/F0SRCH1/architecture.pdf"
+                                },
+                                {
+                                    "id": "F0SRCH2",
+                                    "name": "roadmap.docx",
+                                    "title": "Q4 Roadmap",
+                                    "created": 1760000390,
+                                    "user": "U0BEN",
+                                    "mode": "external",
+                                    "url_private": "https://docs.google.com/document/d/roadmap",
+                                    "permalink": "https://acme.slack.com/files/U0BEN/F0SRCH2/roadmap.docx"
+                                }
+                            ]
+                        }
+                    }))
+                }
+            }
+            "search.modules" => {
+                if let Some(over) = self.search_modules.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    return refused("not_allowed_token_type");
                 }
             }
             "dnd.info" => self.dnd_info.lock().unwrap().clone().or_else(|| Some(json!({
@@ -5852,6 +5917,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         before: Some(1_767_225_600),
         after: Some(1_735_689_600),
         mentions_me: false,
+        sort: protocol::SearchSort::Newest,
     };
     let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
         conversation: Some(general.clone()),
@@ -6195,4 +6261,185 @@ fn slack_app_home_about_and_recent_apps_sidebar_group() {
     let container: Value = serde_json::from_str(&act.params["container"]).unwrap();
     assert_eq!(container["type"], "view");
     assert_eq!(container["view_id"], "V0HOME1");
+}
+
+#[test]
+fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
+    let world = World::start_with(|fake| {
+        // 150 matching messages across 2 pages (100 on page 1, 50 on page 2), including an
+        // unjoined public channel `C0PUB` (#watercooler) with public channel metadata.
+        let mut p1: Vec<Value> = (0..99)
+            .map(|i| {
+                let ts = format!("{}.000100", 1760005000 - i);
+                json!({
+                    "iid": format!("p1-{i}"),
+                    "team_id": "T01ALPHA",
+                    "channel_id": "C0GEN",
+                    "type": "message",
+                    "user": "U0ANA",
+                    "ts": ts,
+                    "text": format!("release checklist item {i}")
+                })
+            })
+            .collect();
+        p1.push(json!({
+            "iid": "p1-pub",
+            "team_id": "T01ALPHA",
+            "channel_id": "C0PUB",
+            "channel": {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false},
+            "type": "message",
+            "user": "U0ANA",
+            "ts": "1760004900.000100",
+            "text": "release party in unjoined watercooler"
+        }));
+        let p2: Vec<Value> = (0..50)
+            .map(|i| {
+                let ts = format!("{}.000100", 1760004000 - i);
+                json!({
+                    "iid": format!("p2-{i}"),
+                    "team_id": "T01ALPHA",
+                    "channel_id": "C0DEP",
+                    "type": "message",
+                    "user": "U0BEN",
+                    "ts": ts,
+                    "text": format!("release archive item {i}")
+                })
+            })
+            .collect();
+        *fake.search_pages.lock().unwrap() = vec![
+            json!({
+                "ok": true,
+                "messages": {
+                    "paging": {"count": 100, "total": 150, "page": 1, "pages": 2},
+                    "matches": p1,
+                }
+            }),
+            json!({
+                "ok": true,
+                "messages": {
+                    "paging": {"count": 100, "total": 150, "page": 2, "pages": 2},
+                    "matches": p2,
+                }
+            }),
+        ];
+    });
+    world.ready();
+
+    // 1. Slack advertises search_global so Everywhere asks it too.
+    assert!(world.account("T01ALPHA").can.search_global);
+
+    // 2. Page 1 returns 100 hits (including unjoined public #watercooler) + cursor "2".
+    let Response::MessageHits { hits: page1, cursor: c1, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        network: None,
+        query: "release".into(),
+        filters: protocol::SearchFilters { sort: protocol::SearchSort::Relevance, ..Default::default() },
+        cursor: None,
+    }) else {
+        panic!("expected MessageHits page 1");
+    };
+    assert_eq!(page1.len(), 100);
+    assert_eq!(c1.as_deref(), Some("2"));
+    let pub_hit = page1.iter().find(|h| h.conversation.id == "C0PUB").expect("unjoined public channel hit");
+    assert_eq!(pub_hit.title, "#watercooler");
+    assert!(pub_hit.snippet.contains("release party"));
+    let first_call = world.fake.calls(ALPHA, "search.messages").pop().unwrap();
+    assert_eq!(first_call.params["sort"], "score");
+    assert_eq!(first_call.params["page"], "1");
+
+    // Clicking the unjoined channel hit opens via PreviewChannel.
+    let Response::Conversation { conversation: previewed } = world.ask(Request::PreviewChannel {
+        conversation: alpha("C0PUB"),
+    }) else {
+        panic!("expected PreviewChannel conversation");
+    };
+    assert!(!previewed.joined && previewed.read_only);
+
+    // 3. Page 2 returns the remaining 50 hits + cursor None.
+    let Response::MessageHits { hits: page2, cursor: c2, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        network: None,
+        query: "release".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: c1,
+    }) else {
+        panic!("expected MessageHits page 2");
+    };
+    assert_eq!(page2.len(), 50);
+    assert_eq!(c2, None);
+    let second_call = world.fake.calls(ALPHA, "search.messages").pop().unwrap();
+    assert_eq!(second_call.params["sort"], "timestamp");
+    assert_eq!(second_call.params["page"], "2");
+
+    // 4. Files search returns 2 matching files (hosted + external).
+    let Response::AccountFiles { items: files, more, .. } = world.ask(Request::SearchFiles {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        query: "roadmap".into(),
+        sort: protocol::SearchSort::Relevance,
+        cursor: None,
+    }) else {
+        panic!("expected AccountFiles for SearchFiles");
+    };
+    assert_eq!(files.len(), 2);
+    assert!(!more);
+    assert_eq!(files[0].title, "Architecture Spec");
+    assert_eq!(files[1].title, "Q4 Roadmap");
+    let files_call = world.fake.calls(ALPHA, "search.files").pop().unwrap();
+    assert_eq!(files_call.params["sort"], "score");
+
+    // 5. Everywhere search (conversation: None, space: None) asks Slack too.
+    let Response::MessageHits { hits: everywhere, not_searched, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: None,
+        network: None,
+        query: "release".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected Everywhere MessageHits");
+    };
+    assert!(!everywhere.is_empty());
+    assert!(!not_searched.contains(&Network::Slack), "Slack should be searched globally: {not_searched:?}");
+}
+
+#[test]
+fn slack_search_falls_back_to_search_modules_when_search_messages_is_refused() {
+    let world = World::start_with(|fake| {
+        fake.refusing.lock().unwrap().insert("search.messages".into(), "not_allowed_token_type".into());
+        *fake.search_modules.lock().unwrap() = Some(json!({
+            "ok": true,
+            "pagination": {"page": 1, "page_count": 1},
+            "items": [{
+                "messages": [{
+                    "channel_id": "C0GEN",
+                    "user": "U0ANA",
+                    "ts": "1760000330.000330",
+                    "text": "deploy via search.modules"
+                }]
+            }]
+        }));
+    });
+    world.ready();
+
+    let Response::MessageHits { hits, .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(alpha("C0GEN")),
+        space: None,
+        account: None,
+        network: None,
+        query: "deploy".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected MessageHits from search.modules fallback");
+    };
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].snippet.contains("search.modules"));
+    assert_eq!(world.fake.calls(ALPHA, "search.modules").len(), 1);
 }

@@ -2789,7 +2789,7 @@ impl Chat {
                         at: std::time::Instant::now(),
                         reply,
                     }) {
-                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
+                        Ok(page) => Response::MessageHits { hits: page.hits, cursor: page.cursor, not_searched: Vec::new() },
                         Err(refused) => *refused,
                     }
                 } else {
@@ -2814,7 +2814,7 @@ impl Chat {
                     for acct in accounts {
                         let can = self.hub.capabilities(&acct);
                         if self.hub.link(&acct) == Link::Connected && can.search_global {
-                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
+                            if let Ok(page) = self.ask(&acct, |reply| Command::Search {
                                 query: query.clone(),
                                 scope: SearchScope::Account,
                                 filters: filters.clone(),
@@ -2825,7 +2825,7 @@ impl Chat {
                                 if !asked_networks.contains(&acct.network) {
                                     asked_networks.push(acct.network);
                                 }
-                                merged.extend(hits);
+                                merged.extend(page.hits);
                                 continue;
                             }
                         }
@@ -3984,6 +3984,33 @@ impl Chat {
                 let conversation_id = conversation.id;
                 match self.ask(&account, |reply| Command::AppView { conversation_id, include_home, reply }) {
                     Ok(view) => Response::AppView { view: Box::new(view) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SearchFiles { conversation, space, account, query, sort, cursor } => {
+                let query = query.trim().to_owned();
+                if query.is_empty() {
+                    return Response::AccountFiles { items: Vec::new(), cursor: None, more: false };
+                }
+                let (target_account, scope) = match (&conversation, &space, &account) {
+                    (Some(key), ..) => (key.account(), SearchScope::Conversation(key.id.clone())),
+                    (None, Some(key), _) => (key.account(), SearchScope::Space(key.id.clone())),
+                    (None, None, Some(acct)) => (acct.clone(), SearchScope::Account),
+                    (None, None, None) => {
+                        return Response::AccountFiles { items: Vec::new(), cursor: None, more: false };
+                    }
+                };
+                if let Err(refused) = self.online(&target_account) {
+                    return *refused;
+                }
+                match self.ask(&target_account, |reply| Command::SearchFiles { query, scope, sort, cursor, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.title, 256);
+                            clip(&mut item.url, 2_000);
+                        }
+                        Response::AccountFiles { items: page.items, cursor: page.cursor, more: page.more }
+                    }
                     Err(refused) => *refused,
                 }
             }

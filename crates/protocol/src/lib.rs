@@ -2647,6 +2647,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         include_home: bool,
     },
+    /// Search files on a network (`search.files` on Slack). Answers `Response::AccountFiles`.
+    SearchFiles {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        query: String,
+        #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+        sort: SearchSort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their

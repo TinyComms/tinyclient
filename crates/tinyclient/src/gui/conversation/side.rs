@@ -18,7 +18,7 @@ use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
-use protocol::{Capabilities, ConversationKind, Key, Link, Message, MessageHit, Network, Request, Response, ThreadSummary};
+use protocol::{BrowsedChannel, Capabilities, ConversationKind, Key, Link, Message, MessageHit, Network, Person, Request, Response, SearchSort, SharedItem, ThreadSummary};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -57,10 +57,32 @@ pub struct Side {
     room: std::cell::Cell<f32>,
 }
 
+/// Active result tab in the Search pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchTab {
+    #[default]
+    Messages,
+    Files,
+    Channels,
+    People,
+}
+
+impl SearchTab {
+    fn label(self) -> &'static str {
+        match self {
+            SearchTab::Messages => "Messages",
+            SearchTab::Files => "Files",
+            SearchTab::Channels => "Channels",
+            SearchTab::People => "People",
+        }
+    }
+}
+
 /// One message search's page: the scope asked, what was typed, and what the cache holds for it.
 #[derive(Default)]
 pub struct SearchPage {
     pub scope: Scope,
+    pub tab: SearchTab,
     pub words: String,
     /// What the cache answered: `None` while the read is outstanding or failed.
     pub hits: Option<Vec<MessageHit>>,
@@ -87,6 +109,17 @@ pub struct SearchPage {
     pub network_cursor: Option<String>,
     /// Connected networks that could not be asked during an everywhere search.
     pub not_searched: Vec<Network>,
+    /// Files tab results (`Request::SearchFiles`).
+    pub files: Option<Vec<SharedItem>>,
+    pub files_cursor: Option<String>,
+    pub files_loading: bool,
+    pub files_error: Option<String>,
+    /// Channels tab results (`Request::BrowseChannels` / `Request::Find`).
+    pub channels: Option<Vec<BrowsedChannel>>,
+    pub channels_loading: bool,
+    /// People tab results (`Request::People`).
+    pub people: Option<Vec<Person>>,
+    pub people_loading: bool,
 }
 
 /// What the network said on Enter: where that was, and its hits, or its word for why not.
@@ -200,6 +233,14 @@ impl SearchPage {
         self.network_asked = 0;
         self.network_cursor = None;
         self.not_searched.clear();
+        self.files = None;
+        self.files_cursor = None;
+        self.files_loading = false;
+        self.files_error = None;
+        self.channels = None;
+        self.channels_loading = false;
+        self.people = None;
+        self.people_loading = false;
     }
 
     /// Moves the keyboard pick up or down in the merged list. Up from row 0 clears the pick so
@@ -829,6 +870,23 @@ impl Shell {
     /// Enter in the field: with a hit picked, open it; otherwise the network itself is asked
     /// when it can search here, or the first hit opens.
     fn enter_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.conversation_state.side.search.as_ref().map(|p| p.tab) {
+            match tab {
+                SearchTab::Files => {
+                    self.ask_files(None, cx);
+                    return;
+                }
+                SearchTab::Channels => {
+                    self.ask_channels(cx);
+                    return;
+                }
+                SearchTab::People => {
+                    self.ask_people(cx);
+                    return;
+                }
+                SearchTab::Messages => {}
+            }
+        }
         let (scope, first, picked) = match self.conversation_state.side.search.as_ref() {
             Some(page) => {
                 let listed = page.listed();
@@ -877,6 +935,244 @@ impl Shell {
             page.reset_network();
         }
         cx.notify();
+    }
+
+    fn toggle_search_sort(&mut self, cx: &mut Context<Self>) {
+        let tab = {
+            let Some(page) = self.conversation_state.side.search.as_mut() else {
+                return;
+            };
+            page.filters.sort = match page.filters.sort {
+                SearchSort::Newest => SearchSort::Relevance,
+                SearchSort::Relevance => SearchSort::Newest,
+            };
+            page.reset_network();
+            page.tab
+        };
+        match tab {
+            SearchTab::Messages => self.ask_network(None, cx),
+            SearchTab::Files => self.ask_files(None, cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn select_search_tab(&mut self, tab: SearchTab, cx: &mut Context<Self>) {
+        if let Some(page) = self.conversation_state.side.search.as_mut() {
+            page.tab = tab;
+        }
+        match tab {
+            SearchTab::Files => self.ask_files(None, cx),
+            SearchTab::Channels => self.ask_channels(cx),
+            SearchTab::People => self.ask_people(cx),
+            SearchTab::Messages => {}
+        }
+        cx.notify();
+    }
+
+    fn ask_files(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
+        let Some(page) = self.conversation_state.side.search.as_ref() else {
+            return;
+        };
+        let query = page.words.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let sort = page.filters.sort;
+        let scope = page.scope;
+        let load_more = cursor.is_some();
+        let open = self.open_with_space();
+        let (conversation, space, account) = match scope {
+            Scope::Conversation => (open.as_ref().map(|(k, _)| k.clone()), None, None),
+            Scope::Space => (
+                None,
+                open.as_ref().and_then(|(k, sp)| {
+                    sp.as_ref().map(|id| Key {
+                        network: k.network,
+                        account: k.account.clone(),
+                        id: id.clone(),
+                    })
+                }),
+                None,
+            ),
+            Scope::Everywhere => (
+                None,
+                None,
+                open.as_ref().map(|(k, _)| k.account()).or_else(|| {
+                    self.snapshot
+                        .as_ref()
+                        .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Slack && a.link == Link::Connected))
+                        .map(|a| a.key.clone())
+                }),
+            ),
+        };
+        let asked = {
+            let side = &mut self.conversation_state.side;
+            side.search_asks += 1;
+            if let Some(page) = side.search.as_mut() {
+                page.network_asked = side.search_asks;
+                page.files_loading = true;
+                page.files_error = None;
+            }
+            side.search_asks
+        };
+        let request = Request::SearchFiles { conversation, space, account, query, sort, cursor };
+        self.off_thread(
+            cx,
+            move || ask(&request),
+            move |this, answer, cx| {
+                let Some(page) = this.conversation_state.side.search.as_mut().filter(|p| p.network_asked == asked) else {
+                    return;
+                };
+                page.files_loading = false;
+                match answer {
+                    Ok(Response::AccountFiles { items, cursor, .. }) => {
+                        page.files_cursor = cursor;
+                        if load_more {
+                            page.files.get_or_insert_with(Vec::new).extend(items);
+                        } else {
+                            page.files = Some(items);
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => page.files_error = Some(detail),
+                    Ok(_) => page.files_error = Some(crate::client::OTHER_ANSWER.to_owned()),
+                    Err(err) => page.files_error = Some(crate::client::trouble_words("search files", &err)),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn ask_channels(&mut self, cx: &mut Context<Self>) {
+        let Some(page) = self.conversation_state.side.search.as_ref() else {
+            return;
+        };
+        let query = page.words.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let open = self.open_with_space();
+        let space = open
+            .as_ref()
+            .and_then(|(k, sp)| {
+                sp.as_ref().map(|id| Key {
+                    network: k.network,
+                    account: k.account.clone(),
+                    id: id.clone(),
+                })
+            })
+            .or_else(|| self.spaces.iter().find(|s| s.key.network == Network::Slack).map(|s| s.key.clone()));
+        let asked = {
+            let side = &mut self.conversation_state.side;
+            side.search_asks += 1;
+            if let Some(page) = side.search.as_mut() {
+                page.network_asked = side.search_asks;
+                page.channels_loading = true;
+            }
+            side.search_asks
+        };
+        if let Some(space) = space {
+            let request = Request::BrowseChannels { space, query, cursor: None, limit: 50 };
+            self.off_thread(
+                cx,
+                move || ask(&request),
+                move |this, answer, cx| {
+                    let Some(page) = this.conversation_state.side.search.as_mut().filter(|p| p.network_asked == asked) else {
+                        return;
+                    };
+                    page.channels_loading = false;
+                    if let Ok(Response::BrowsedChannels { channels, .. }) = answer {
+                        page.channels = Some(channels);
+                    } else {
+                        page.channels = Some(Vec::new());
+                    }
+                    cx.notify();
+                },
+            );
+        } else {
+            let request = Request::Find { network: None, query, limit: 50 };
+            self.off_thread(
+                cx,
+                move || ask(&request),
+                move |this, answer, cx| {
+                    let Some(page) = this.conversation_state.side.search.as_mut().filter(|p| p.network_asked == asked) else {
+                        return;
+                    };
+                    page.channels_loading = false;
+                    if let Ok(Response::Conversations { conversations, .. }) = answer {
+                        page.channels = Some(
+                            conversations
+                                .into_iter()
+                                .map(|c| BrowsedChannel {
+                                    key: c.key,
+                                    name: c.title,
+                                    topic: c.topic,
+                                    members: 0,
+                                    joined: c.joined,
+                                    private: c.private,
+                                    archived: c.archived,
+                                })
+                                .collect(),
+                        );
+                    } else {
+                        page.channels = Some(Vec::new());
+                    }
+                    cx.notify();
+                },
+            );
+        }
+    }
+
+    fn ask_people(&mut self, cx: &mut Context<Self>) {
+        let Some(page) = self.conversation_state.side.search.as_ref() else {
+            return;
+        };
+        let query = page.words.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let network = if page.scope == Scope::Everywhere {
+            None
+        } else {
+            self.open_key().map(|k| k.network)
+        };
+        let asked = {
+            let side = &mut self.conversation_state.side;
+            side.search_asks += 1;
+            if let Some(page) = side.search.as_mut() {
+                page.network_asked = side.search_asks;
+                page.people_loading = true;
+            }
+            side.search_asks
+        };
+        let request = Request::People { network, relation: None, query: Some(query), offset: 0, limit: 50 };
+        self.off_thread(
+            cx,
+            move || ask(&request),
+            move |this, answer, cx| {
+                let Some(page) = this.conversation_state.side.search.as_mut().filter(|p| p.network_asked == asked) else {
+                    return;
+                };
+                page.people_loading = false;
+                if let Ok(Response::People { people, .. }) = answer {
+                    page.people = Some(people);
+                } else {
+                    page.people = Some(Vec::new());
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn preview_and_open_channel(&mut self, key: Key, title: String, message_id: Option<String>, cx: &mut Context<Self>) {
+        let req_key = key.clone();
+        self.off_thread(
+            cx,
+            move || ask(&Request::PreviewChannel { conversation: req_key }),
+            move |this, _, cx| {
+                this.open_resolved_link(key.clone(), message_id.clone(), &title, cx);
+            },
+        );
     }
 
     fn apply_search_suggestion(&mut self, insert: &str, cx: &mut Context<Self>) {
@@ -1032,9 +1328,14 @@ impl Shell {
     }
 
     /// A search hit was clicked: its conversation opens on the message, or, being open already,
-    /// jumps to it.
+    /// jumps to it. An unjoined Slack channel hit opens as a read-only preview (`PreviewChannel`).
     pub(in crate::gui) fn open_search_hit(&mut self, hit: &MessageHit, cx: &mut Context<Self>) {
         let key = hit.conversation.clone();
+        let title = if hit.title.is_empty() { hit.conversation.id.clone() } else { hit.title.clone() };
+        if key.network == Network::Slack && !self.held_rows().any(|r| r.key == key) {
+            self.preview_and_open_channel(key, title, Some(hit.message_id.clone()), cx);
+            return;
+        }
         // The pane may never have been built: nothing may have opened yet. It is made here, so
         // the landing reaches it before the conversation is told to open.
         let pane = self.pane(cx);
@@ -1043,7 +1344,6 @@ impl Shell {
             return;
         }
         pane.update(cx, |pane, _| pane.land_next(hit.message_id.clone()));
-        let title = if hit.title.is_empty() { hit.conversation.id.clone() } else { hit.title.clone() };
         self.select(key, &title, cx);
     }
 
@@ -1585,30 +1885,244 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         None
     };
 
-    let load_more = page.network_cursor.clone().map(|cursor| {
+    let mut tabs_bar = div().flex_none().px(px(8.)).pt(px(4.)).pb(px(2.)).flex().gap(px(4.));
+    for tab in [SearchTab::Messages, SearchTab::Files, SearchTab::Channels, SearchTab::People] {
+        let lit = page.tab == tab;
+        tabs_bar = tabs_bar.child(
+            div()
+                .id(("search-tab", tab as usize))
+                .px(px(8.))
+                .h(px(22.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .type_small()
+                .cursor_pointer()
+                .text_color(if lit { theme::text() } else { theme::text_soft() })
+                .when(lit, |chip| chip.bg(theme::selected()))
+                .hover(|style| style.bg(theme::hover()))
+                .on_click(cx.listener(move |this, _, _, cx| this.select_search_tab(tab, cx)))
+                .child(tab.label()),
+        );
+    }
+
+    let body = match page.tab {
+        SearchTab::Files => {
+            if page.words.trim().is_empty() {
+                empty_state("icons/file.svg", "Search files.", "Type a filename or keyword.").into_any_element()
+            } else if page.files_loading && page.files.is_none() {
+                empty_state("icons/file.svg", "Searching files…", "Asking the network.").into_any_element()
+            } else if let Some(err) = &page.files_error {
+                empty_state("icons/file.svg", "Couldn't search files.", err).into_any_element()
+            } else {
+                let items = page.files.as_deref().unwrap_or_default();
+                if items.is_empty() {
+                    empty_state("icons/file.svg", "No matching files.", "Try another query.").into_any_element()
+                } else {
+                    let mut rows = div().id("search-files").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().p(px(4.));
+                    for (ix, item) in items.iter().enumerate() {
+                        let url = item.url.clone();
+                        rows = rows.child(
+                            div()
+                                .id(("search-file", ix))
+                                .flex_none()
+                                .px(px(10.))
+                                .py(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::hover()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if !url.is_empty() {
+                                        this.open_external_link(&url, window, cx);
+                                    }
+                                }))
+                                .child(div().truncate().type_small().text_color(theme::text()).child(item.title.clone()))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .type_micro()
+                                        .text_color(theme::text_soft())
+                                        .child(item.sender.clone())
+                                        .child(age(now(), item.sent)),
+                                ),
+                        );
+                    }
+                    crate::gui::components::scroll::scroll_page("search-files-scroll", rows).into_any_element()
+                }
+            }
+        }
+        SearchTab::Channels => {
+            if page.words.trim().is_empty() {
+                empty_state("icons/hash.svg", "Search channels.", "Type a channel name or topic.").into_any_element()
+            } else if page.channels_loading && page.channels.is_none() {
+                empty_state("icons/hash.svg", "Searching channels…", "").into_any_element()
+            } else {
+                let items = page.channels.as_deref().unwrap_or_default();
+                if items.is_empty() {
+                    empty_state("icons/hash.svg", "No matching channels.", "").into_any_element()
+                } else {
+                    let mut rows = div().id("search-channels").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().p(px(4.));
+                    for (ix, ch) in items.iter().enumerate() {
+                        let key = ch.key.clone();
+                        let name = ch.name.clone();
+                        let joined = ch.joined;
+                        rows = rows.child(
+                            div()
+                                .id(("search-ch", ix))
+                                .flex_none()
+                                .px(px(10.))
+                                .py(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::hover()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if joined {
+                                        this.select(key.clone(), &name, cx);
+                                    } else {
+                                        this.preview_and_open_channel(key.clone(), name.clone(), None, cx);
+                                    }
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(div().flex_1().truncate().type_small().text_color(theme::text()).child(ch.name.clone()))
+                                        .when(!ch.joined, |row| {
+                                            row.child(div().type_micro().text_color(theme::text_faint()).child("Preview"))
+                                        }),
+                                )
+                                .when(!ch.topic.is_empty(), |row| {
+                                    row.child(div().truncate().type_micro().text_color(theme::text_soft()).child(ch.topic.clone()))
+                                }),
+                        );
+                    }
+                    crate::gui::components::scroll::scroll_page("search-ch-scroll", rows).into_any_element()
+                }
+            }
+        }
+        SearchTab::People => {
+            if page.words.trim().is_empty() {
+                empty_state("icons/users.svg", "Search people.", "Type a name or handle.").into_any_element()
+            } else if page.people_loading && page.people.is_none() {
+                empty_state("icons/users.svg", "Searching people…", "").into_any_element()
+            } else {
+                let items = page.people.as_deref().unwrap_or_default();
+                if items.is_empty() {
+                    empty_state("icons/users.svg", "No matching people.", "").into_any_element()
+                } else {
+                    let mut rows = div().id("search-people").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().p(px(4.));
+                    for (ix, person) in items.iter().enumerate() {
+                        let key = person.key.clone();
+                        rows = rows.child(
+                            div()
+                                .id(("search-person", ix))
+                                .flex_none()
+                                .px(px(10.))
+                                .py(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::hover()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.details_person(key.clone(), None, cx);
+                                }))
+                                .child(div().truncate().type_small().text_color(theme::text()).child(person.name.clone()))
+                                .when(!person.title.is_empty() || !person.handle.is_empty(), |row| {
+                                    let sub = if !person.title.is_empty() { person.title.clone() } else { format!("@{}", person.handle) };
+                                    row.child(div().truncate().type_micro().text_color(theme::text_soft()).child(sub))
+                                }),
+                        );
+                    }
+                    crate::gui::components::scroll::scroll_page("search-people-scroll", rows).into_any_element()
+                }
+            }
+        }
+        SearchTab::Messages => body,
+    };
+
+    let sort_label = match page.filters.sort {
+        SearchSort::Newest => "Sort: Newest",
+        SearchSort::Relevance => "Sort: Relevance",
+    };
+    filter_chips = filter_chips.child(
         div()
-            .flex_none()
-            .px(px(12.))
-            .py(px(6.))
-            .border_t_1()
-            .border_color(theme::hairline())
+            .id("sf-sort")
+            .px(px(8.))
+            .h(px(22.))
+            .rounded(px(theme::R_CONTROL))
             .flex()
-            .justify_center()
-            .child(
-                div()
-                    .id("search-load-more")
-                    .px(px(12.))
-                    .py(px(4.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::raised())
-                    .type_small()
-                    .text_color(theme::accent_text())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.ask_network(Some(cursor.clone()), cx)))
-                    .child("Load more"),
-            )
-    });
+            .items_center()
+            .type_micro()
+            .cursor_pointer()
+            .text_color(theme::text_soft())
+            .bg(theme::raised())
+            .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_search_sort(cx)))
+            .child(sort_label),
+    );
+
+    let load_more = match page.tab {
+        SearchTab::Messages => page.network_cursor.clone().map(|cursor| {
+            div()
+                .flex_none()
+                .px(px(12.))
+                .py(px(6.))
+                .border_t_1()
+                .border_color(theme::hairline())
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("search-load-more")
+                        .px(px(12.))
+                        .py(px(4.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::raised())
+                        .type_small()
+                        .text_color(theme::accent_text())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.ask_network(Some(cursor.clone()), cx)))
+                        .child("Load more"),
+                )
+        }),
+        SearchTab::Files => page.files_cursor.clone().map(|cursor| {
+            div()
+                .flex_none()
+                .px(px(12.))
+                .py(px(6.))
+                .border_t_1()
+                .border_color(theme::hairline())
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("search-files-load-more")
+                        .px(px(12.))
+                        .py(px(4.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::raised())
+                        .type_small()
+                        .text_color(theme::accent_text())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.ask_files(Some(cursor.clone()), cx)))
+                        .child("Load more"),
+                )
+        }),
+        SearchTab::Channels | SearchTab::People => None,
+    };
 
     let footer = (!page.not_searched.is_empty()).then(|| {
         let names: Vec<&'static str> = page.not_searched.iter().map(|n| n.label()).collect();
@@ -1644,6 +2158,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         .flex_col()
         .bg(theme::canvas())
         .child(head)
+        .child(tabs_bar)
         .child(chips)
         .child(filter_chips)
         .children(slack_suggestions)

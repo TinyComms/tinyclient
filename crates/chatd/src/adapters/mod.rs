@@ -231,6 +231,13 @@ pub struct AccountFilesPage {
     pub more: bool,
 }
 
+/// One page of network message search hits (`Command::Search`).
+#[derive(Debug, Clone, Default)]
+pub struct SearchPage {
+    pub hits: Vec<MessageHit>,
+    pub cursor: Option<String>,
+}
+
 /// A page of a picker's catalog, and where the next one starts.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogPage {
@@ -783,7 +790,15 @@ pub enum Command {
         filters: protocol::SearchFilters,
         cursor: Option<String>,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<SearchPage>,
+    },
+    /// Search files on the network (e.g. Slack `search.files`).
+    SearchFiles {
+        query: String,
+        scope: SearchScope,
+        sort: protocol::SearchSort,
+        cursor: Option<String>,
+        reply: Reply<AccountFilesPage>,
     },
     /// The shell asked for these files and the media cache knows none of them, or knows them
     /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
@@ -963,6 +978,7 @@ impl Command {
             Command::AppView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {
                 ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
             }

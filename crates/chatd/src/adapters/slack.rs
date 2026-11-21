@@ -360,6 +360,8 @@ fn per_minute(method: &str) -> f64 {
         | "bots.info"
         | "views.get"
         | "apps.home.get"
+        | "search.files"
+        | "search.modules"
         | "dnd.setSnooze"
         | "dnd.endSnooze"
         | "stars.add"
@@ -1698,12 +1700,15 @@ impl Slack {
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
-            Command::Search { query, scope, filters, at, reply, .. } => {
+            Command::Search { query, scope, filters, cursor, at, reply } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
-                    answer(reply, self.search_messages(&query, &scope, &filters));
+                    answer(reply, self.search_messages(&query, &scope, &filters, cursor.as_deref()));
                 }
+            }
+            Command::SearchFiles { query, scope, sort, cursor, reply } => {
+                answer(reply, self.search_files(&query, &scope, sort, cursor.as_deref()));
             }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 match self.search_shared(&conversation_id, kind, before.as_deref(), limit) {
@@ -3075,6 +3080,7 @@ fn capabilities() -> protocol::Capabilities {
         schedule: true,
         suppress_embeds: true,
         search: true,
+        search_global: true,
         close_direct: true,
         reply: false,
         edit: true,

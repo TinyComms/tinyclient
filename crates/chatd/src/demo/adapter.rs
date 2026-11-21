@@ -831,9 +831,11 @@ impl Demo {
                     .hub
                     .store()
                     .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
+                    .map(|hits| crate::adapters::SearchPage { hits, cursor: None })
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }
+            Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { kind, query, cursor, reply, .. } => drop(reply.send(Ok(demo.catalog(kind, &query, cursor.as_deref())))),
             Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(demo.reaction_rules(&conversation_id)))),
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {

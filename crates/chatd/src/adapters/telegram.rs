@@ -858,7 +858,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                 super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
                 super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
-            let _ = reply.send(result);
+            let _ = reply.send(result.map(|hits| super::SearchPage { hits, cursor: None }));
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));

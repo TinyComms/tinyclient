@@ -902,6 +902,21 @@ pub enum SearchHas {
     Images,
 }
 
+/// Sort order for network search (`SearchFilters::sort`, `Request::SearchFiles`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    #[default]
+    Newest,
+    Relevance,
+}
+
+impl SearchSort {
+    pub fn is_newest(&self) -> bool {
+        *self == SearchSort::Newest
+    }
+}
+
 /// Optional filters on `Request::SearchNetwork`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchFilters {
@@ -915,6 +930,8 @@ pub struct SearchFilters {
     pub after: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
+    #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+    pub sort: SearchSort,
 }
 
 impl SearchFilters {

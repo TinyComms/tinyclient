@@ -394,11 +394,14 @@ impl Discord {
         query: String,
         scope: SearchScope,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<super::super::SearchPage>,
     ) {
         let searching = discord.clone();
         let run = move || {
-            let _ = reply.send(searching.search_messages(&query, &scope, at));
+            let page = searching
+                .search_messages(&query, &scope, at)
+                .map(|hits| super::super::SearchPage { hits, cursor: None });
+            let _ = reply.send(page);
         };
         if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
             tracing::warn!("chatd: Discord: no thread for a search: {err}");
