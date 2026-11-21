@@ -249,6 +249,7 @@ impl Shell {
                 empty_state_with("icons/check.svg", "You're all caught up", last.as_deref().unwrap_or(""), open)
             }
             InboxFilter::Mentions => empty_state("icons/at-sign.svg", "No one's waiting on you", "Mentions from the last 30 days show here."),
+            InboxFilter::Activity => empty_state("icons/bell.svg", "No recent activity", "Reactions to your messages, replies in followed threads and keyword hits show here."),
             InboxFilter::All | InboxFilter::Directs => empty_state("icons/inbox.svg", "No conversations yet", "Sign in to a network to see your chats."),
         }
         .px(px(24.))

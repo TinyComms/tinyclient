@@ -116,11 +116,12 @@ impl std::fmt::Debug for SealedFile {
     }
 }
 
-/// What the search's ask names: a Space's own search, or one conversation's.
+/// What the search's ask names: a Space's own search, one conversation's, or the whole account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Space(String),
     Conversation(String),
+    Account,
 }
 
 /// One window of a member list.
@@ -187,6 +188,7 @@ pub struct ConversationAbout {
     pub pinned: Option<u32>,
     pub external: String,
     pub link: String,
+    pub disappearing: Option<u32>,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -280,6 +282,7 @@ pub enum Command {
         message_id: String,
         emoji: String,
         on: bool,
+        burst: bool,
         reply: Reply<()>,
     },
     /// What reactions a conversation takes from this account, from what the network says of
@@ -303,10 +306,19 @@ pub enum Command {
         message_id: String,
         reply: Reply<String>,
     },
-    /// Delete a message for everyone. Report it through [`Context::deleted`] before answering.
+    /// Delete a message (`Everyone` or `Me`). Report it through [`Context::deleted`] before answering.
     Delete {
         conversation_id: String,
         message_id: String,
+        scope: protocol::DeleteScope,
+        reply: Reply<()>,
+    },
+    /// Vote on a poll, retract a vote (`Some(vec![])`), or end a poll (`None`). Report the
+    /// updated message through [`Context::message`] before answering.
+    Vote {
+        conversation_id: String,
+        message_id: String,
+        votes: Option<Vec<u32>>,
         reply: Reply<()>,
     },
     /// The user's draft is changing. Pace it: at most one typing signal per 8 s per
@@ -330,10 +342,51 @@ pub enum Command {
         limit: u32,
         reply: Reply<Members>,
     },
+    /// Add or invite people to a group or channel.
+    MembersAdd {
+        conversation_id: String,
+        people: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Remove one person from a group or channel.
+    MembersRemove {
+        conversation_id: String,
+        person: String,
+        reply: Reply<()>,
+    },
+    /// Rename a conversation or update its topic or description.
+    ConversationUpdate {
+        conversation_id: String,
+        title: Option<String>,
+        topic: Option<String>,
+        description: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set or clear a conversation's picture from a local file path.
+    ConversationPicture {
+        conversation_id: String,
+        path: String,
+        reply: Reply<()>,
+    },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
     /// Tiny call setup can create encrypted text history without enrolling a text device.
     StartDirectCall { person_id: String, reply: Reply<String> },
+    /// Start a group conversation with several people; record it and answer with its id.
+    StartGroup {
+        people: Vec<String>,
+        title: Option<String>,
+        reply: Reply<String>,
+    },
+    /// Create a channel in a Space; record it and answer with its id.
+    CreateChannel {
+        space_id: String,
+        name: String,
+        kind: protocol::ConversationKind,
+        private: bool,
+        group: Option<String>,
+        reply: Reply<String>,
+    },
     /// The id of the thread a channel message starts. Discord only: create the thread channel,
     /// record it, and answer with its id. `name` is already one line, at most 100 characters.
     StartThread {
@@ -360,10 +413,27 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Set or clear a conversation's disappearing-messages timer (`seconds == 0` turns it off).
+    /// Report the new timer through [`Context::disappearing`] before answering.
+    SetDisappearing {
+        conversation_id: String,
+        seconds: u32,
+        reply: Reply<()>,
+    },
     /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
     Star { conversation_id: String, starred: bool, reply: Reply<()> },
+    /// File a conversation on the network: pin/unpin, archive/unarchive, or add/remove a folder.
+    /// Report the new filing through [`Context::filing`] before answering.
+    File {
+        conversation_id: String,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        folder_add: Option<String>,
+        folder_remove: Option<String>,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -374,6 +444,24 @@ pub enum Command {
     ClearHistory { conversation_id: String, delete_chat: bool, revoke: bool, reply: Reply<()> },
     /// The messages pinned in a conversation, newest first, at most 50.
     Pinned { conversation_id: String, reply: Reply<Vec<Message>> },
+    /// Pins or unpins a message on the network.
+    Pin {
+        conversation_id: String,
+        message_id: String,
+        pinned: bool,
+        notify: bool,
+        me_only: bool,
+        reply: Reply<()>,
+    },
+    /// Forwards one or more messages to target conversations on the same account.
+    /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
+    Forward {
+        from_conversation_id: String,
+        message_ids: Vec<String>,
+        to_conversation_ids: Vec<String>,
+        note: String,
+        reply: Reply<Vec<(String, Result<(), String>)>>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -413,11 +501,42 @@ pub enum Command {
         action: RelateAction,
         reply: Reply<()>,
     },
+    /// Report a message, person, or conversation to the network.
+    Report {
+        target: protocol::ReportTarget,
+        reason: protocol::ReportReason,
+        note: String,
+        block: bool,
+        reply: Reply<()>,
+    },
+    /// Ask the network's supported report reasons for `target`.
+    ReportReasons {
+        target: protocol::ReportTarget,
+        reply: Reply<Vec<protocol::ReportReason>>,
+    },
     /// The user set their own presence, and their status text unless it is `None` (empty clears
     /// it). The hub already shows it; answer `Err` and it is put back.
     SetPresence {
         presence: Presence,
         status: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Edit our own profile fields on the network. `None` leaves a field unchanged.
+    SetProfile {
+        name: Option<String>,
+        about: Option<String>,
+        pronouns: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set (or clear, when `path` is empty) our own profile picture from a local file path.
+    SetAvatar {
+        path: String,
+        reply: Reply<()>,
+    },
+    /// Set (or clear, when `None` or empty) our per-space nickname.
+    SetNickname {
+        space_id: String,
+        nickname: Option<String>,
         reply: Reply<()>,
     },
     /// A registered file is wanted: answer with where and how to fetch it now.
@@ -428,6 +547,8 @@ pub enum Command {
     Search {
         query: String,
         scope: SearchScope,
+        filters: protocol::SearchFilters,
+        cursor: Option<String>,
         at: Instant,
         reply: Reply<Vec<MessageHit>>,
     },
@@ -466,20 +587,33 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::StartDirectCall { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::MembersAdd { reply, .. }
+            | Command::MembersRemove { reply, .. }
+            | Command::ConversationUpdate { reply, .. }
+            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartDirect { reply, .. }
+            | Command::StartDirectCall { reply, .. }
+            | Command::StartGroup { reply, .. }
+            | Command::CreateChannel { reply, .. }
+            | Command::StartThread { reply, .. }
+            | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
-            | Command::Star { reply, .. } => {
+            | Command::Star { reply, .. }
+            | Command::File { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -490,11 +624,17 @@ impl Command {
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
+            | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
+            | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::SetProfile { reply, .. }
+            | Command::SetAvatar { reply, .. }
+            | Command::SetNickname { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -763,6 +903,24 @@ impl Context {
         Ok(())
     }
 
+    /// Per-conversation moderation and management rights for this account.
+    pub fn rights(&self, conversation_id: &str, rights: protocol::ConversationRights) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_rights(&conversation, rights)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    /// The network's disappearing-messages timer for a conversation (seconds; `None` or `Some(0)` means off).
+    pub fn disappearing(&self, conversation_id: &str, seconds: Option<u32>) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_disappearing(&conversation, seconds)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
     /// Where the network files one conversation: its folders, archive, pin, hidden, followed.
     /// One call for one change; never a re-read of every row.
     pub fn filing(&self, conversation_id: &str, filing: &Filing) -> Stores {
@@ -954,6 +1112,15 @@ impl Context {
         self.hub.store().ids_between(&self.key(conversation_id), oldest, newest, limit.min(KEEP_MESSAGES))
     }
 
+    /// A message was pinned or unpinned on the network.
+    pub fn pinned(&self, conversation_id: &str, message_id: &str, pinned: bool) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_pinned(&conversation, message_id, pinned)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
     /// A message is gone. One with a thread hanging off it stays as a tombstone, and replies to
     /// it say their original was deleted.
     pub fn deleted(&self, conversation_id: &str, message_id: &str) -> Stores {
@@ -966,9 +1133,35 @@ impl Context {
 
     /// One person added or removed one reaction. Set `reaction.mine` when it was us.
     pub fn reacted(&self, conversation_id: &str, message_id: &str, reaction: &Reaction, added: bool) -> Stores {
+        self.reacted_by(conversation_id, message_id, reaction, added, None)
+    }
+
+    /// Like [`reacted`], with the reactor's display name when the network reports who reacted.
+    pub fn reacted_by(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        reaction: &Reaction,
+        added: bool,
+        reactor: Option<&str>,
+    ) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().react(&conversation, message_id, reaction, added)? {
-            self.hub.changed(Change::Messages { conversation });
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            if added && !reaction.mine {
+                if let Ok(Some(target)) = self.hub.store().message(&conversation, message_id) {
+                    if target.outgoing {
+                        let snippet = crate::store::preview_text(&target);
+                        self.hub.notify(crate::notify::Event::Reaction {
+                            conversation,
+                            emoji: reaction.emoji.clone(),
+                            reactor: reactor.map(str::to_owned),
+                            snippet,
+                            outgoing_target: true,
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }

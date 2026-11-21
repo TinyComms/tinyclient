@@ -1152,7 +1152,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!((edited.text.as_str(), edited.edited), ("hello Ana", true));
 
     // React and take it back, under Teams' name for the emoji.
-    let react = |emoji: &str, on: bool| Request::React { conversation: ana.clone(), message_id: "1760000500500".to_owned(), emoji: emoji.to_owned(), on };
+    let react = |emoji: &str, on: bool| Request::React { conversation: ana.clone(), message_id: "1760000500500".to_owned(), emoji: emoji.to_owned(), on , burst: false };
     assert_eq!(world.ask(react("👍", true)), Response::Ok);
     let given = world.until("the reaction to reach Teams", || world.fake.calls("PUT", &path("/messages/1760000500500/properties")).pop());
     assert_eq!((given.query.as_str(), given.json()["emotions"]["key"].as_str()), ("name=emotions", Some("like")));
@@ -1219,7 +1219,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(typed[0].json(), json!({"content": "", "contenttype": "Application/Message", "messagetype": "Control/Typing"}));
 
     // Delete: gone here once Teams agreed.
-    assert_eq!(world.ask(Request::Delete { conversation: ana.clone(), message_id: sent.id.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Delete { conversation: ana.clone(), message_id: sent.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     let deleted = world.fake.calls("DELETE", &path("/messages/1760001000000")).pop().expect("the delete reached Teams");
     assert_eq!(deleted.query, "behavior=softDelete");
     assert!(world.message(&ana, &sent.id).is_none());
@@ -1438,7 +1438,7 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     let path = staged.join("notes.txt");
     std::fs::write(&path, b"standup notes").unwrap();
     let with = protocol::Outgoing {
-        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, media: None }],
+        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
         ..Default::default()
     };
     let asked = Request::Send { conversation: key(CHAT_ANA), client_id: "88001".into(), text: "notes attached".into(), reply_to: None, with };

@@ -266,6 +266,7 @@ fn staged(path: &Path, name: &str) -> OutgoingFile {
         spoiler: false,
         as_file: false,
         original: false,
+        view_once: false,
         media: None,
     }
 }

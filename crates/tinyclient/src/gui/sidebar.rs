@@ -77,6 +77,14 @@ pub struct Location {
     tiny_channel: Option<String>,
 }
 
+pub struct CreateChannelModal {
+    pub space: Key,
+    pub group: Option<String>,
+    pub name: gpui::Entity<crate::gui::input::TextInput>,
+    pub kind: ConversationKind,
+    pub private: bool,
+}
+
 pub struct State {
     pub mode: Mode,
     pub filter: InboxFilter,
@@ -149,6 +157,7 @@ pub struct State {
     /// A read of Spaces is on its way, coalesced the same way.
     pub spaces_pending: bool,
     pub switcher: Option<switcher::Switcher>,
+    pub create_channel: Option<CreateChannelModal>,
 }
 
 fn list_state() -> ListState {
@@ -265,6 +274,7 @@ impl State {
             inbox_pending: false,
             spaces_pending: false,
             switcher: None,
+            create_channel: None,
         }
     }
 
@@ -775,6 +785,29 @@ impl Shell {
         });
     }
 
+    /// Pins/unpins, archives/unarchives, or files a conversation in a folder on the network.
+    pub(super) fn file_conversation(
+        &mut self,
+        conversation: Key,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        folder_add: Option<String>,
+        folder_remove: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let request = Request::File { conversation, pinned, archived, folder_add, folder_remove };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+            if this.sidebar_state.home.network.is_some() {
+                this.load_home(cx);
+            }
+        });
+    }
+
     pub(super) fn pin(&mut self, space: Key, pinned: bool, cx: &mut Context<Self>) {
         let pins = &mut self.sidebar_state.pins;
         pins.retain(|pin| pin != &space);
@@ -1242,11 +1275,33 @@ impl Shell {
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
-            Row::Group { id, name, collapsed, rollup, depth, .. } => {
+            Row::Group { space, id, name, collapsed, rollup, depth, .. } => {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
                 let dot = rollup_badge(rollup.attention, rollup.unread).filter(|_| *collapsed);
                 let chevron = if *collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" };
                 let group = SharedString::from(format!("group-{id}"));
+                let can_create = self.spaces.iter().any(|s| &s.key == space && s.can_create_channels);
+                let add_space = space.clone();
+                let add_group = id.clone();
+                let add_btn = can_create.then(|| {
+                    div()
+                        .id((gpui::ElementId::from("group-add"), id.clone()))
+                        .size(px(18.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .invisible()
+                        .group_hover(group.clone(), |s| s.visible())
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(tip("Create channel…", None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_create_channel(add_space.clone(), Some(add_group.clone()), cx);
+                        }))
+                        .child(glyph("icons/plus.svg", 12., theme::text_faint()))
+                });
                 let content = div()
                     .group(group.clone())
                     .children(indent(*depth, 4.))
@@ -1254,6 +1309,7 @@ impl Shell {
                     .child(div().min_w_0().truncate().type_micro().text_color(if lit { theme::text() } else { theme::text_faint() }).child(name.clone()))
                     .child(glyph(chevron, 12., theme::text_faint()).when(!*collapsed, |chevron| chevron.invisible().group_hover(group, |style| style.visible())))
                     .child(div().flex_1())
+                    .children(add_btn)
                     .children(dot);
                 list_row((gpui::ElementId::from("group"), id.clone()), height, false, focused, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
@@ -1539,9 +1595,10 @@ impl Shell {
                     ("filter-all", "All", 0, filter == InboxFilter::All),
                     ("filter-unread", "Unread", counts.unread, filter == InboxFilter::Unread),
                     ("filter-mentions", "Mentions", counts.mentions, filter == InboxFilter::Mentions),
+                    ("filter-activity", "Activity", counts.activity, filter == InboxFilter::Activity),
                 ];
                 let pick = |this: &mut Shell, ix: usize, cx: &mut Context<Shell>| {
-                    this.set_filter([InboxFilter::All, InboxFilter::Unread, InboxFilter::Mentions][ix], cx);
+                    this.set_filter([InboxFilter::All, InboxFilter::Unread, InboxFilter::Mentions, InboxFilter::Activity][ix], cx);
                 };
                 let has_unread = counts.unread > 0 || counts.mentions > 0;
                 let fit = inbox_strip_fit(
@@ -1872,6 +1929,157 @@ impl Shell {
                 .size_full()).keyboard(false)
                 .into_any_element(),
         }
+    }
+
+    /// Open the "Create channel…" modal for a Space (optionally inside a section/group).
+    pub(super) fn open_create_channel(&mut self, space: Key, group: Option<String>, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| crate::gui::input::TextInput::new("channel-name", cx));
+        self.sidebar_state.create_channel = Some(CreateChannelModal {
+            space,
+            group,
+            name,
+            kind: ConversationKind::Channel,
+            private: false,
+        });
+        cx.notify();
+    }
+
+    fn submit_create_channel(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.create_channel.take() else {
+            return;
+        };
+        let name = modal.name.read(cx).text().trim().to_owned();
+        if name.is_empty() {
+            self.sidebar_state.create_channel = Some(modal);
+            return;
+        }
+        cx.notify();
+        let req = Request::CreateChannel {
+            space: modal.space,
+            name,
+            kind: modal.kind,
+            private: modal.private,
+            group: modal.group,
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Conversation { conversation }) => {
+                    this.open_now(conversation.key, &conversation.title, cx);
+                }
+                Ok(Response::Error { detail, .. }) => this.toast(None, detail, cx),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn create_channel_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.create_channel.as_ref()?;
+        let ready = !modal.name.read(cx).text().trim().is_empty();
+        let is_voice = modal.kind == ConversationKind::Voice;
+        let is_private = modal.private;
+        let card = div()
+            .id("create-channel-card")
+            .w(px(360.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Create channel"))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.name.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .id("create-chan-kind")
+                            .type_small()
+                            .text_color(theme::accent_text())
+                            .cursor_pointer()
+                            .hover(|s| s.underline())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(m) = this.sidebar_state.create_channel.as_mut() {
+                                    m.kind = if m.kind == ConversationKind::Voice {
+                                        ConversationKind::Channel
+                                    } else {
+                                        ConversationKind::Voice
+                                    };
+                                    cx.notify();
+                                }
+                            }))
+                            .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
+                    )
+                    .child(
+                        div()
+                            .id("create-chan-private")
+                            .type_small()
+                            .text_color(if is_private { theme::accent_text() } else { theme::text_faint() })
+                            .cursor_pointer()
+                            .hover(|s| s.underline())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(m) = this.sidebar_state.create_channel.as_mut() {
+                                    m.private = !m.private;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(if is_private { "☑ Private channel" } else { "☐ Private channel" }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        crate::gui::components::button("create-chan-cancel", crate::gui::components::ButtonKind::Ghost, "Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_state.create_channel = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        crate::gui::components::button(
+                            "create-chan-submit",
+                            if ready { crate::gui::components::ButtonKind::Primary } else { crate::gui::components::ButtonKind::Ghost },
+                            "Create",
+                        )
+                        .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_create_channel(cx)))),
+                    ),
+            );
+        Some(
+            div()
+                .id("create-channel-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.create_channel = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
     }
 
     /// The persistent Discord parent column, using the same home list and scroll state.

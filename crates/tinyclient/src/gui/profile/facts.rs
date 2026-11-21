@@ -558,6 +558,7 @@ pub enum Item {
     UnignoreUser,
     Block,
     Unblock,
+    Report,
     Leave,
 }
 
@@ -625,6 +626,9 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     } else if person.relation == Relation::Blocked && matches!(person.key.network, Network::Discord | Network::Telegram) {
         items.push(Item::Unblock);
     }
+    if !person.bot && (block || matches!(person.key.network, Network::Signal | Network::Messages | Network::Teams)) {
+        items.push(Item::Report);
+    }
     tidy(items)
 }
 
@@ -636,6 +640,61 @@ pub fn can_close_direct(conversation: &Conversation, can: &protocol::Capabilitie
 /// A conversation whose account serves `ClearHistory` (Telegram) and is not read-only.
 pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
     can.clear_history && !conversation.read_only
+}
+
+/// A conversation whose account lets the user pin/unpin it on the network (`Request::File`).
+pub fn can_pin_on_network(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.pin_chats > 0 && conversation.space.is_none()
+}
+
+/// A conversation whose account lets the user archive/unarchive it on the network (`Request::File`).
+pub fn can_archive(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.archive && conversation.space.is_none()
+}
+
+/// A conversation whose account lets the user add/remove it from network folders (`Request::File`).
+pub fn can_edit_folders(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.folders_edit && conversation.space.is_none()
+}
+
+/// Menu label for the network-side pin action, kept distinct from Inbox Star.
+pub fn network_pin_label(conversation: &Conversation) -> String {
+    let label = conversation.key.network.label();
+    if conversation.pin.is_some() {
+        format!("Unpin on {label}")
+    } else {
+        format!("Pin on {label}")
+    }
+}
+
+/// Whether this account may add people to this group or channel.
+pub fn can_add_members(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.add_members
+}
+
+/// Whether this account may remove a person from this group or channel.
+pub fn can_remove_members(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.remove_members
+}
+
+/// Whether this account may rename this group or channel.
+pub fn can_rename(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.rename
+}
+
+/// Whether this account may edit this conversation's topic or description.
+pub fn can_edit_topic(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.edit_topic
+}
+
+/// Whether this account may change this conversation's picture.
+pub fn can_edit_picture(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.edit_picture
+}
+
+/// Confirmation sentence for removing a member; names the person explicitly.
+pub fn remove_member_confirm_text(person_name: &str, group_title: &str) -> String {
+    format!("Remove {person_name} from {group_title}? Others in the conversation may see this.")
 }
 
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
@@ -908,6 +967,8 @@ mod tests {
             max_file_bytes: 0,
             read_only_reason: String::new(),
             spam: false,
+            rights: Default::default(),
+            disappearing: None,
         }
     }
 
@@ -1071,11 +1132,11 @@ mod tests {
         let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
-            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]
+            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block, Item::Report]
         );
         // In their DM: no Mute (the switch has it), Close DM instead, Copy ID only with ⌥. The
         // pane's foot opens them in the app, so its menu does not.
-        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]);
+        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block, Item::Report]);
         let nadia = person(Network::Telegram, Relation::Contact);
         let telegram_dm = Seen { in_their_dm: true, direct: Some((CallSupport::Handoff, false)), online: true, ..Seen::default() };
         assert!(!person_menu(&nadia, &telegram_dm, false, true).contains(&Item::CloseDirect), "Telegram does not serve CloseDirect");
@@ -1103,6 +1164,36 @@ mod tests {
         assert!(can_close_direct(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
         assert!(can_clear_history(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
         assert!(!can_clear_history(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
+
+        let tg_file = protocol::Capabilities { pin_chats: 5, archive: true, folders_edit: true, ..Default::default() };
+        let tg_dm = row(Network::Telegram, ConversationKind::Direct);
+        let mut tg_pinned = tg_dm.clone();
+        tg_pinned.pin = Some(0);
+        let mut dc_chan = row(Network::Discord, ConversationKind::Channel);
+        dc_chan.space = Some("srv".into());
+        assert!(can_pin_on_network(&tg_dm, &tg_file));
+        assert!(can_archive(&tg_dm, &tg_file));
+        assert!(can_edit_folders(&tg_dm, &tg_file));
+        assert!(!can_pin_on_network(&tg_dm, &dc_caps));
+        assert!(!can_archive(&dc_chan, &tg_file), "channel inside a space is not archived via home filing");
+        assert_eq!(network_pin_label(&tg_dm), "Pin on Telegram");
+        assert_eq!(network_pin_label(&tg_pinned), "Unpin on Telegram");
+
+        let mut grp = row(Network::Slack, ConversationKind::Group);
+        assert!(!can_add_members(&grp) && !can_remove_members(&grp) && !can_rename(&grp) && !can_edit_topic(&grp) && !can_edit_picture(&grp));
+        grp.rights = protocol::ConversationRights {
+            add_members: true,
+            remove_members: true,
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+            ..Default::default()
+        };
+        assert!(can_add_members(&grp) && can_remove_members(&grp) && can_rename(&grp) && can_edit_topic(&grp) && can_edit_picture(&grp));
+        let mut dm_with_rights = row(Network::Slack, ConversationKind::Direct);
+        dm_with_rights.rights = grp.rights;
+        assert!(!can_add_members(&dm_with_rights) && !can_rename(&dm_with_rights), "direct chats are not managed as groups");
+        assert!(remove_member_confirm_text("Mina", "Design").contains("Mina"));
     }
 
     #[test]
@@ -1118,6 +1209,7 @@ mod tests {
             pinned: None,
             external: String::new(),
             link: "https://t.me/riverbend_news".into(),
+            disappearing: None,
         };
         let channel = info.conversation.clone();
         assert_eq!(conversation_line(&channel, Some(&info)), "@riverbend_news · Channel · 12,408 subscribers");

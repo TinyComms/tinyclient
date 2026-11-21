@@ -430,7 +430,7 @@ fn files_go_from_their_paths_with_progress_within_the_account_s_limits_and_can_b
     let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
     let photo = chatd.pick("trail.png", 900 * 1024);
     let with = |path: &std::path::Path| Outgoing {
-        files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: true, as_file: false, original: false, media: None }],
+        files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: true, as_file: false, original: false, view_once: false, media: None }],
         ..Outgoing::default()
     };
     let send = |client_id: &str, with: Outgoing| {
@@ -504,13 +504,13 @@ fn the_pickers_are_answered_on_demand_by_page_and_what_an_account_may_send_is_in
     assert_eq!(can(Network::Discord).max_file_bytes, 10 << 20);
     assert!(can(Network::Telegram).as_file && can(Network::Telegram).silent);
     assert!(!can(Network::Teams).gifs && can(Network::Teams).max_file_bytes > 0);
-    // The demo serves no search of the network itself: its adapter refuses one.
-    assert!(!can(Network::Telegram).search && !can(Network::Discord).search && !can(Network::Slack).search && !can(Network::Teams).search);
+    // Demo serves network search on Telegram, Discord, and Slack (#794); Teams stays unsearched.
+    assert!(can(Network::Telegram).search && can(Network::Discord).search && can(Network::Slack).search && !can(Network::Teams).search);
 }
 
 fn with_file(path: &std::path::Path) -> Outgoing {
     Outgoing {
-        files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, media: None }],
+        files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
         ..Outgoing::default()
     }
 }
@@ -616,7 +616,7 @@ fn a_pending_send_shows_my_cached_identity_before_the_network_acks() {
             spoiler: false,
             as_file: false,
             original: false,
-            media: None,
+            view_once: false, media: None,
         }],
         ..Outgoing::default()
     };

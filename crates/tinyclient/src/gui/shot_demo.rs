@@ -139,7 +139,19 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
         avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")),
         presence,
         status: String::new(),
-        can: Capabilities { max_file_bytes: 25 * 1024 * 1024, max_files: 10, ..Capabilities::default() },
+        can: Capabilities {
+            max_file_bytes: 25 * 1024 * 1024,
+            max_files: 10,
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: true,
+            forward: true,
+            polls: Some(protocol::PollCapabilities::default()),
+            reactions: true,
+            ..Capabilities::default()
+        },
     }
 }
 
@@ -622,6 +634,7 @@ fn build() -> Fixture {
         folder: None,
         muted: false,
         hide_muted: false,
+        can_create_channels: false,
     };
     let spaces = vec![
         space(&t, premier, "Premier", Some(picture("icon-premier", MediaKind::Icon, "icon-night-shift.webp", 192, 192)), 0, 0),
@@ -685,6 +698,7 @@ fn counts_of(rows: &[Conversation]) -> InboxCounts {
         unread: rows.iter().filter(|r| r.unread > 0 && !r.muted).count() as u32,
         mentions: rows.iter().filter(|r| r.mentions > 0).count() as u32,
         apps: 0,
+        activity: rows.iter().filter(|r| !r.muted && (r.mentions > 0 || (r.followed && r.unread > 0))).count() as u32,
     }
 }
 
@@ -705,6 +719,7 @@ fn inbox(network: Option<Network>, filter: InboxFilter) -> Vec<Conversation> {
             InboxFilter::All => true,
             InboxFilter::Unread => (row.unread > 0 && !row.muted) || row.mentions > 0,
             InboxFilter::Mentions => row.mentions > 0,
+            InboxFilter::Activity => !row.muted && (row.mentions > 0 || (row.followed && row.unread > 0)),
             InboxFilter::Directs => row.kind.is_direct(),
         })
         .cloned()
@@ -1098,9 +1113,9 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::Topics { .. } | Request::InVoice { .. } => conversations(Vec::new(), 0, 1),
         Request::Folders { .. } => Response::Folders { folders: Vec::new() },
         Request::SearchMessages { conversation, query, limit, .. } => {
-            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect() }
+            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new() }
         }
-        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()) },
+        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new() },
         Request::Messages { conversation, page: at, limit } => page(conversation, at, *limit),
         Request::Pinned { conversation } => Response::Pinned {
             conversation: conversation.clone(),
@@ -1171,6 +1186,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     pinned: Some(1),
                     external: String::new(),
                     link: String::new(),
+                    disappearing: row.disappearing,
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },

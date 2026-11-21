@@ -401,6 +401,115 @@ pub(super) fn facts_changed(account: &Account, who: Who, change: impl FnOnce(&mu
     }
 }
 
+/// Pins/unpins, archives/unarchives, or adds/removes a Telegram dialog from a folder.
+pub(super) fn file(
+    account: &Account,
+    conversation: &str,
+    pinned: Option<bool>,
+    archived: Option<bool>,
+    folder_add: Option<&str>,
+    folder_remove: Option<&str>,
+) -> Result<(), Fault> {
+    let Some((who, None)) = Who::parse(conversation) else {
+        return Err(Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None });
+    };
+    let peer = account.input(who)?;
+
+    if let Some(archive) = archived {
+        account.ask(&tl::functions::folders::EditPeerFolders {
+            folder_peers: vec![tl::enums::InputFolderPeer::Peer(tl::types::InputFolderPeer {
+                peer: peer.clone(),
+                folder_id: i32::from(archive),
+            })],
+        })?;
+        let moved = {
+            let mut live = account.live();
+            let entry = live.filed.facts.entry(who).or_default();
+            entry.archived = archive;
+            let other = usize::from(!archive);
+            let mut affected = live.filed.pins[other].clone();
+            live.filed.pins[other].retain(|held| *held != who);
+            affected.push(who);
+            affected
+        };
+        refile(account, moved);
+    }
+
+    if let Some(pin) = pinned {
+        account.ask(&tl::functions::messages::ToggleDialogPin {
+            pinned: pin,
+            peer: tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer: peer.clone() }),
+        })?;
+        let moved = {
+            let mut live = account.live();
+            let list = usize::from(live.filed.facts.get(&who).is_some_and(|f| f.archived));
+            let pins = &mut live.filed.pins[list];
+            let before = pins.clone();
+            pins.retain(|held| *held != who);
+            if pin {
+                pins.insert(0, who);
+            }
+            before.into_iter().chain(std::iter::once(who)).collect::<Vec<_>>()
+        };
+        refile(account, moved);
+    }
+
+    for (target, add) in [(folder_add, true), (folder_remove, false)] {
+        let Some(folder_str) = target else {
+            continue;
+        };
+        let folder_id: i32 = folder_str
+            .parse()
+            .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?;
+        let tl::enums::messages::DialogFilters::Filters(found) = account.ask(&tl::functions::messages::GetDialogFilters {})?;
+        let mut updated = None;
+        for filter in found.filters {
+            match filter {
+                tl::enums::DialogFilter::Filter(mut f) if f.id == folder_id => {
+                    if add {
+                        f.exclude_peers.retain(|p| input_who(p, account.me) != Some(who));
+                        if !f.include_peers.iter().any(|p| input_who(p, account.me) == Some(who)) {
+                            f.include_peers.push(peer.clone());
+                        }
+                    } else {
+                        f.include_peers.retain(|p| input_who(p, account.me) != Some(who));
+                        f.pinned_peers.retain(|p| input_who(p, account.me) != Some(who));
+                    }
+                    updated = Some(tl::enums::DialogFilter::Filter(f));
+                    break;
+                }
+                tl::enums::DialogFilter::Chatlist(mut c) if c.id == folder_id => {
+                    if add {
+                        if !c.include_peers.iter().any(|p| input_who(p, account.me) == Some(who)) {
+                            c.include_peers.push(peer.clone());
+                        }
+                    } else {
+                        c.include_peers.retain(|p| input_who(p, account.me) != Some(who));
+                        c.pinned_peers.retain(|p| input_who(p, account.me) != Some(who));
+                    }
+                    updated = Some(tl::enums::DialogFilter::Chatlist(c));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(new_filter) = updated else {
+            return Err(Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None });
+        };
+        account.ask(&tl::functions::messages::UpdateDialogFilter { id: folder_id, filter: Some(new_filter.clone()) })?;
+        if let Some(new_rule) = rule(&new_filter, account.me) {
+            let mut live = account.live();
+            if let Some(slot) = live.filed.rules.iter_mut().find(|r| r.id == folder_id) {
+                *slot = new_rule;
+            }
+        }
+        report(account);
+        refile(account, [who]);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

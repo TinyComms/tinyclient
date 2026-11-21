@@ -147,6 +147,10 @@ struct Open {
     reactions: Option<protocol::ReactionRules>,
     /// What became of my newest message, from the conversation's row.
     receipt: Option<protocol::Receipt>,
+    /// What this account may do on messages (`Capabilities`).
+    can: protocol::Capabilities,
+    /// Per-conversation moderation and management rights for this account.
+    rights: protocol::ConversationRights,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -307,6 +311,8 @@ pub struct Pane {
     revealed: HashSet<(String, u32)>,
     /// Spoilered pictures opened, by file.
     shown: HashSet<String>,
+    /// Polls where the user toggled "Show results" before voting, by message id.
+    poll_results: HashSet<String>,
     /// Long code blocks opened, by message and block.
     expanded: HashSet<(String, usize)>,
     /// Coloured code, by message and block, so a scroll does not colour the same block again.
@@ -334,6 +340,10 @@ pub struct Pane {
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
+    /// The message being forwarded (or copied to another conversation).
+    forward: Option<actions::Forwarding>,
+    /// Multi-message selection mode state (#795).
+    multi_select: actions::MultiSelect,
     /// The link a click asked about, until the person opens it or does not.
     link_ask: Option<links::LinkAsk>,
     /// Earlier wordings of one message, opened from its edited mark.
@@ -416,6 +426,7 @@ impl Pane {
             then: HashMap::new(),
             revealed: HashSet::new(),
             shown: HashSet::new(),
+            poll_results: HashSet::new(),
             expanded: HashSet::new(),
             code_colors: HashMap::new(),
             code_coloring: HashSet::new(),
@@ -431,6 +442,8 @@ impl Pane {
             menu: None,
             picker: None,
             confirm: None,
+            forward: None,
+            multi_select: actions::MultiSelect::default(),
             link_ask: None,
             revisions: None,
             hold: None,
@@ -456,16 +469,63 @@ impl Pane {
         self.thread
     }
 
+    pub(super) fn toggle_poll_results(&mut self, message_id: String, cx: &mut Context<Self>) {
+        if !self.poll_results.remove(&message_id) {
+            self.poll_results.insert(message_id);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn vote_poll(&mut self, message_id: String, votes: Option<Vec<u32>>, cx: &mut Context<Self>) {
+        if SCREENSHOTS {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move { ask(&Request::Poll { conversation, message_id, votes }) })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Shows this conversation. The same one again only takes its new title, picture and the
     /// mark on my newest message.
     /// `typing`: it has a composer, which takes the focus; otherwise the messages do.
-    fn show(&mut self, conversation: &Conversation, me: &str, picture: Option<MediaFile>, typing: bool, cx: &mut Context<Self>) {
+    fn show(
+        &mut self,
+        conversation: &Conversation,
+        me: &str,
+        can: protocol::Capabilities,
+        picture: Option<MediaFile>,
+        typing: bool,
+        cx: &mut Context<Self>,
+    ) {
         let receipt = conversation.receipt();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
-            if open.title != conversation.title || open.picture != picture || open.receipt != receipt {
+            if open.title != conversation.title
+                || open.picture != picture
+                || open.receipt != receipt
+                || open.can != can
+                || open.rights != conversation.rights
+            {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
                 open.receipt = receipt;
+                open.can = can;
+                open.rights = conversation.rights;
                 cx.notify();
             }
             return;
@@ -476,17 +536,27 @@ impl Pane {
         if self.landing.is_none() {
             self.around = around;
         }
-        self.start(conversation.key.clone(), &conversation.title, conversation.kind, me, None, cx);
+        self.start(conversation.key.clone(), &conversation.title, conversation.kind, me, can, conversation.rights, None, cx);
         self.wants_focus = !typing;
         if let Some(open) = self.open.as_mut() {
             open.picture = picture;
             open.receipt = receipt;
+            open.rights = conversation.rights;
         }
     }
 
-    fn show_thread(&mut self, key: Key, title: &str, me: &str, root: Rc<Message>, cx: &mut Context<Self>) {
+    fn show_thread(
+        &mut self,
+        key: Key,
+        title: &str,
+        me: &str,
+        can: protocol::Capabilities,
+        rights: protocol::ConversationRights,
+        root: Rc<Message>,
+        cx: &mut Context<Self>,
+    ) {
         let replies = root.thread.as_ref().map_or(0, |thread| thread.replies);
-        self.start(key, title, ConversationKind::Thread, me, Some((root, replies)), cx);
+        self.start(key, title, ConversationKind::Thread, me, can, rights, Some((root, replies)), cx);
     }
 
     fn start(
@@ -495,6 +565,8 @@ impl Pane {
         title: &str,
         kind: ConversationKind,
         me: &str,
+        can: protocol::Capabilities,
+        rights: protocol::ConversationRights,
         root: Option<(Rc<Message>, u32)>,
         cx: &mut Context<Self>,
     ) {
@@ -517,6 +589,8 @@ impl Pane {
             root,
             reactions: None,
             receipt: None,
+            can,
+            rights,
             started: Instant::now(),
         });
         self.window = pages::Window::default();
@@ -543,6 +617,7 @@ impl Pane {
         self.shown.clear();
         self.expanded.clear();
         self.code_colors.clear();
+        self.multi_select.clear();
         self.code_coloring.clear();
         self.copied = None;
         self.hovered = None;
@@ -554,6 +629,7 @@ impl Pane {
         self.menu = None;
         self.picker = None;
         self.confirm = None;
+        self.forward = None;
         self.link_ask = None;
         self.hold = None;
         self.land = false;
@@ -1623,6 +1699,7 @@ impl Render for Pane {
             .children(self.live_call_row(cx))
             .children(self.history_banner(cx))
             .children(self.away.then(|| self.jump_button(cx)))
+            .children(self.selection_bar(cx))
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }
@@ -1734,10 +1811,11 @@ impl Shell {
         let link = snapshot.account_link(&open.key);
         let pane = self.pane(cx);
         let me = self.me(&open.key);
+        let can = snapshot.account(&open.key.account()).map(|status| status.can).unwrap_or_default();
         let picture = self.conversation_picture(open, cx);
         // With no composer to type in, the messages take the keys after an open.
         let typing = open.special != Special::Service;
-        pane.update(cx, |pane, cx| pane.show(open, &me, picture, typing, cx));
+        pane.update(cx, |pane, cx| pane.show(open, &me, can, picture, typing, cx));
         let keys = pane.clone();
         let phone = super::phone::active();
         let mut view = div()

@@ -430,7 +430,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         session.client_id = CLIENT.to_owned();
     }
     let api = address("TINYCLIENT_TEAMS_API", TEAMS).trim_end_matches('/').to_owned();
-    let agent = ureq::Agent::config_builder()
+    let agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
@@ -880,7 +880,20 @@ impl Teams {
         // Files are off until they can be shared with the chat's members only. The OneDrive path
         // below made an organization-wide link, which is not what the Teams app does and shows
         // up in a company's audit logs.
-        self.ctx.capabilities(protocol::Capabilities { max_file_bytes: 0, max_files: 0, ..protocol::Capabilities::default() });
+        self.ctx.capabilities(protocol::Capabilities {
+            max_file_bytes: 0,
+            max_files: 0,
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: false,
+            forward: false,
+            reactions: true,
+            mention_format: protocol::MentionFormat::Teams,
+            mention_spans: true,
+            ..protocol::Capabilities::default()
+        });
         {
             let mut state = self.state();
             state.watched.clear();
@@ -910,15 +923,19 @@ impl Teams {
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 self.post(&conversation_id, &client_id, &text, reply_to.as_deref())
             }
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
             Command::Edit { conversation_id, message_id, text, spans, reply } => {
                 let _ = reply.send(self.edit(&conversation_id, &message_id, &text, &spans).map_err(refuse));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
-                let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
+            Command::Delete { conversation_id, message_id, scope, reply } => {
+                if scope == protocol::DeleteScope::Me {
+                    let _ = reply.send(Err(Refusal::Refused("Teams only supports deleting for everyone.".to_owned())));
+                } else {
+                    let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
+                }
             }
             Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.report(self.watch().map_err(Failure::from)),

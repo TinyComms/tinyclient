@@ -415,7 +415,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             send_with(ctx, saved, conversation_id, client_id, text, reply_to, *with);
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
-        Command::React { conversation_id, message_id, emoji, on, reply } => react(ctx, saved, &conversation_id, &message_id, &emoji, on, reply),
+        Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => react(ctx, saved, &conversation_id, &message_id, &emoji, on, reply),
         Command::ReactionRules { reply, .. } => {
             let _ = reply.send(Ok(ReactionRules::default()));
         }
@@ -429,8 +429,15 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         Command::Delete {
             conversation_id,
             message_id,
+            scope,
             reply,
-        } => delete(ctx, saved, &conversation_id, &message_id, reply),
+        } => {
+            if scope == protocol::DeleteScope::Me {
+                let _ = reply.send(Err(Refusal::Refused("Tiny only supports deleting for everyone.".to_owned())));
+            } else {
+                delete(ctx, saved, &conversation_id, &message_id, reply);
+            }
+        }
         Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
@@ -438,6 +445,27 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         }
         Command::StartDirect { person_id, reply } => start_direct(ctx, saved, &person_id, reply),
         Command::StartDirectCall { person_id, reply } => start_direct_intent(ctx, saved, &person_id, true, reply),
+        Command::MembersRemove { person, reply, .. } => {
+            let answer = match super::manage::kick(ctx.account.clone(), person, String::new()) {
+                protocol::Response::Ok => Ok(()),
+                protocol::Response::Error { detail, .. } => Err(Refusal::Refused(detail)),
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
+        Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+            let edit = protocol::TinyRoomEdit {
+                name: title,
+                topic: topic.or(description),
+                ..protocol::TinyRoomEdit::default()
+            };
+            let answer = match super::manage::room_update(ctx.account.clone(), conversation_id, edit) {
+                protocol::Response::Ok => Ok(()),
+                protocol::Response::Error { detail, .. } => Err(Refusal::Refused(detail)),
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
         Command::Catalog { kind, reply, .. } => match kind {
             CatalogKind::Emoji | CatalogKind::Gifs => {
                 let _ = reply.send(Ok(CatalogPage::default()));
@@ -2149,6 +2177,13 @@ fn account_caps(saved: &Saved) -> Capabilities {
         direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
+        reply: true,
+        edit: true,
+        delete: true,
+        pins: false,
+        reactions: true,
+        gif_file: true,
+        profile_avatar: true,
         ..Capabilities::default()
     }
 }
@@ -4485,6 +4520,7 @@ mod tests {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                view_once: false,
                 media: None,
             }],
             ..Outgoing::default()

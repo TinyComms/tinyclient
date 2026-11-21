@@ -1,0 +1,12 @@
+{
+  "id": "wave-3-app",
+  "title": "Wave 3B App enhancements across core, polish, features, and rich lanes",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 3B App enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 3B App enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

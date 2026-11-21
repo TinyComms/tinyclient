@@ -795,7 +795,9 @@ impl Pane {
         // The message in the composer for editing is marked, so it is plain which one is changing.
         let editing = self.shell.upgrade().and_then(|shell| shell.read(cx).composer_editing(cx));
         let editing = !self.is_thread() && editing.as_deref() == Some(message.id.as_str());
-        let bar = if editing { Some(theme::accent()) } else { bar };
+        let selecting = self.multi_select.active;
+        let ticked = selecting && self.multi_select.contains(&message.id);
+        let bar = if editing || ticked { Some(theme::accent()) } else { bar };
         let owns = self.owns_overlay(&message.id);
 
         let gutter: Option<AnyElement> = Some(if head {
@@ -836,7 +838,48 @@ impl Pane {
                 ),
                 None => sent.children(said).children(attached),
             };
-            sent = sent.children(message.card.as_deref().map(|card| self.app_card(card))).children(self.cards(message, window, cx));
+            sent = sent
+                .children((message.importance != protocol::Importance::Normal).then(|| {
+                    let (label, color) = match message.importance {
+                        protocol::Importance::Urgent => ("URGENT", theme::danger()),
+                        protocol::Importance::Important => ("IMPORTANT", theme::warning()),
+                        protocol::Importance::Normal => ("", theme::text_faint()),
+                    };
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(color)
+                                .type_micro()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(color)
+                                .child(label),
+                        )
+                }))
+                .children(message.effect.as_ref().map(|effect| {
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .type_micro()
+                                .text_color(theme::accent())
+                                .child(format!("✨ {effect}")),
+                        )
+                }))
+                .children(message.card.as_deref().map(|card| self.app_card(card)))
+                .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
+                .children(self.cards(message, window, cx));
         }
         if pending {
             sent = sent.opacity(0.55);
@@ -896,9 +939,39 @@ impl Pane {
                 div()
                     .flex()
                     .gap(px(metrics.gap))
+                    .when(selecting, |row| {
+                        let sel_id = message.id.clone();
+                        row.child(
+                            div()
+                                .id(name_id("sel-tick", &message.id))
+                                .w(px(18.))
+                                .h(px(18.))
+                                .mt(px(2.))
+                                .flex_none()
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(if ticked { theme::accent() } else { tokens::border_strong() })
+                                .when(ticked, |box_| box_.bg(theme::accent()))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .when(ticked, |box_| box_.child(glyph("icons/check.svg", 12., gpui::rgb(0xffffff))))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                    this.toggle_selected_row(&sel_id, event.modifiers().shift, cx);
+                                })),
+                        )
+                    })
                     .children(gutter)
                     .child(column),
             )
+            .when(selecting, |row| {
+                let sel_id = message.id.clone();
+                row.cursor_pointer().on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    this.toggle_selected_row(&sel_id, event.modifiers().shift, cx);
+                }))
+            })
             .children(at_edge.map(|receipt| {
                 div().absolute().top(px(1.)).right(px(metrics.inset)).h(px(20.)).flex().items_center().child(receipt_mark(&message.id, receipt))
             }))
@@ -1170,6 +1243,24 @@ impl Pane {
         if edited_alone {
             out.push(self.edited_mark(message, cx));
         }
+        if let Some(expires_at) = message.expires_at {
+            if let Some(label) = expiry_label(expires_at, crate::view::now()) {
+                out.push(
+                    div()
+                        .id(name_id("expires", &message.id))
+                        .h(px(16.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .tooltip(tip(format!("Disappears in {label}"), None))
+                        .child(glyph("icons/clock.svg", 11., theme::text_faint()))
+                        .child(label)
+                        .into_any_element(),
+                );
+            }
+        }
         out
     }
 
@@ -1324,7 +1415,7 @@ impl Pane {
                     cx.notify();
                 }
             }
-            TextEvent::Click(run) => {
+            TextEvent::Click(run, alt) => {
                 let Some(message) = self.find(id) else {
                     return;
                 };
@@ -1357,7 +1448,7 @@ impl Pane {
                             cx.background_executor().spawn(async move { ask(&request) }).detach();
                         }
                     }
-                    self.open_link(url, window, cx);
+                    self.open_link(url, alt, window, cx);
                 } else if let Some((MentionKind::User, person)) = &run.mention {
                     let (Some(person), at) = (self.person(person), window.mouse_position()) else {
                         return;
@@ -1970,6 +2061,171 @@ impl Pane {
         div().pt(px(5.)).flex().child(framed).into_any_element()
     }
 
+    /// Interactive poll card: question, choices with bar & count, my selection, Show results, End poll.
+    fn poll_card(&self, message: &Rc<Message>, poll: &protocol::Poll, cx: &mut Context<Self>) -> AnyElement {
+        let total = poll.total_votes();
+        let show_results = poll.closed || !poll.mine.is_empty() || self.poll_results.contains(&message.id);
+        let subtitle = {
+            let mut parts: Vec<String> = Vec::new();
+            if poll.closed {
+                parts.push("Poll closed".to_owned());
+            } else if poll.multiple {
+                parts.push("Select one or more".to_owned());
+            } else {
+                parts.push("Select one".to_owned());
+            }
+            if poll.anonymous {
+                parts.push("Anonymous".to_owned());
+            }
+            if !poll.closed {
+                if let Some(closes_at) = poll.closes_at {
+                    let left = closes_at.saturating_sub(crate::view::now());
+                    if left <= 0 {
+                        parts.push("Closing soon".to_owned());
+                    } else if left < 3600 {
+                        parts.push(format!("Closes in {}m", (left / 60).max(1)));
+                    } else if left < 86_400 {
+                        parts.push(format!("Closes in {}h", left / 3600));
+                    } else {
+                        parts.push(format!("Closes in {}d", left / 86_400));
+                    }
+                }
+            }
+            parts.join(" · ")
+        };
+
+        let mut rows = div().mt(px(6.)).flex().flex_col().gap(px(5.));
+        for (idx, choice) in poll.choices.iter().enumerate() {
+            let idx_u32 = idx as u32;
+            let picked = poll.mine.contains(&idx_u32);
+            let pct = if total > 0 { ((choice.count as f32 / total as f32) * 100.).round() as u32 } else { 0 };
+            let next = poll.next_votes(idx_u32);
+            let msg_id = message.id.clone();
+            let clickable = !poll.closed;
+
+            let row = div()
+                .id(name_id(&format!("poll-{}-{}", message.id, idx), ""))
+                .relative()
+                .overflow_hidden()
+                .rounded(px(theme::R_CONTROL))
+                .border_1()
+                .border_color(if picked { theme::accent() } else { theme::hairline() })
+                .bg(theme::canvas())
+                .px(px(10.))
+                .py(px(7.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .when(clickable, |el| {
+                    el.cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.vote_poll(msg_id.clone(), Some(next.clone()), cx);
+                        }))
+                })
+                .when(show_results && pct > 0, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .bottom_0()
+                            .w(gpui::relative(pct as f32 / 100.))
+                            .bg(if picked { theme::selected() } else { theme::hover() }),
+                    )
+                })
+                .child(
+                    div()
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .min_w_0()
+                        .flex_1()
+                        .when(picked, |el| {
+                            el.child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::accent()).child("✓"))
+                        })
+                        .child(div().type_ui().truncate().text_color(theme::text()).child(choice.text.clone())),
+                )
+                .when(show_results, |el| {
+                    el.child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .type_small()
+                            .text_color(if picked { theme::accent() } else { theme::text_faint() })
+                            .child(format!("{} ({pct}%)", choice.count)),
+                    )
+                });
+            rows = rows.child(row);
+        }
+
+        let vote_label = if total == 1 { "1 vote".to_owned() } else { format!("{total} votes") };
+        let mut footer = div()
+            .mt(px(6.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .child(div().type_small().text_color(theme::text_faint()).child(vote_label));
+
+        let mut actions = div().flex().items_center().gap(px(8.));
+        if !poll.closed && poll.mine.is_empty() {
+            let msg_id = message.id.clone();
+            let toggle_label = if show_results { "Hide results" } else { "Show results" };
+            actions = actions.child(
+                div()
+                    .id(name_id("poll-results", &message.id))
+                    .type_small()
+                    .text_color(theme::accent())
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_poll_results(msg_id.clone(), cx)))
+                    .child(toggle_label),
+            );
+        }
+        if message.outgoing && !poll.closed {
+            let msg_id = message.id.clone();
+            actions = actions.child(
+                div()
+                    .id(name_id("poll-end", &message.id))
+                    .type_small()
+                    .text_color(theme::danger())
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_click(cx.listener(move |this, _, _, cx| this.vote_poll(msg_id.clone(), None, cx)))
+                    .child("End poll"),
+            );
+        }
+        footer = footer.child(actions);
+
+        let body = div()
+            .flex_1()
+            .min_w_0()
+            .py(px(10.))
+            .px(px(12.))
+            .flex()
+            .flex_col()
+            .child(div().type_body().font_weight(theme::SEMIBOLD).child(poll.question.clone()))
+            .child(div().type_small().text_color(theme::text_faint()).child(subtitle))
+            .child(rows)
+            .child(footer);
+
+        let framed = div()
+            .w(px(if self.metrics == Metrics::PHONE { self.media_width() } else { 440. }))
+            .max_w_full()
+            .rounded(px(theme::R_FLOAT))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::hairline())
+            .overflow_hidden()
+            .flex()
+            .child(div().w(px(3.)).flex_none().bg(theme::accent()))
+            .child(body);
+        div().pt(px(5.)).flex().child(framed).into_any_element()
+    }
+
     // Link cards.
 
     fn cards(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -2032,7 +2288,7 @@ impl Pane {
             .border_1()
             .border_color(theme::hairline())
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| this.open_link(&url, window, cx)));
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)));
         let Some(image) = image.cloned() else {
             return card.child(words).into_any_element();
         };
@@ -2336,7 +2592,7 @@ impl Pane {
             .w(px(240.))
             .h(px(4.))
             .rounded(px(2.))
-            .bg(gpui::rgba(0xffffff1a))
+            .bg(theme::border())
             .child(div().h_full().w(px(240. * done)).rounded(px(2.)).bg(theme::accent()));
         let cancel = div()
             .id("cancel-upload")
@@ -2729,5 +2985,31 @@ mod tests {
         assert_eq!(ended_dur.label, "Call with Bea · 12 min");
         let ended_plain = call_line_spec(&make(protocol::CallOutcome::Ended, true, None), "Bea");
         assert_eq!(ended_plain.label, "Call with Bea");
+    }
+
+    #[test]
+    fn expiry_label_formats_countdown_cleanly() {
+        assert_eq!(expiry_label(100, 100), Some("expiring".into()));
+        assert_eq!(expiry_label(125, 100), Some("25s".into()));
+        assert_eq!(expiry_label(400, 100), Some("5m".into()));
+        assert_eq!(expiry_label(7_300, 100), Some("2h".into()));
+        assert_eq!(expiry_label(172_900, 100), Some("2d".into()));
+    }
+}
+
+/// Short remaining-time label for a disappearing message's `expires_at` timestamp.
+pub(crate) fn expiry_label(expires_at: i64, now: i64) -> Option<String> {
+    let left = expires_at - now;
+    if left <= 0 {
+        return Some("expiring".to_owned());
+    }
+    if left >= 86_400 {
+        Some(format!("{}d", left / 86_400))
+    } else if left >= 3_600 {
+        Some(format!("{}h", left / 3_600))
+    } else if left >= 60 {
+        Some(format!("{}m", left / 60))
+    } else {
+        Some(format!("{left}s"))
     }
 }

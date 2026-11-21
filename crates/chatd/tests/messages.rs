@@ -487,6 +487,7 @@ fn a_reaction_is_shown_and_one_we_send_is_asked_of_the_phone() {
         message_id: message.id.clone(),
         emoji: "😂".into(),
         on: true,
+        burst: false,
     }) {
         Response::Ok => {}
         other => panic!("{other:?}"),
@@ -497,6 +498,7 @@ fn a_reaction_is_shown_and_one_we_send_is_asked_of_the_phone() {
         message_id: message.id.clone(),
         emoji: "😂".into(),
         on: false,
+        burst: false,
     }) {
         Response::Ok => {}
         other => panic!("{other:?}"),
@@ -577,7 +579,7 @@ fn a_file_we_send_is_read_and_shown_back() {
                 spoiler: false,
                 as_file: false,
                 original: false,
-                media: None,
+                view_once: false, media: None,
             }],
             ..Outgoing::default()
         },
@@ -622,7 +624,7 @@ fn a_file_we_send_is_read_and_shown_back() {
                 spoiler: false,
                 as_file: false,
                 original: false,
-                media: None,
+                view_once: false, media: None,
             }],
             ..Outgoing::default()
         },
@@ -673,7 +675,7 @@ fn a_mov_is_sent_as_a_video() {
                 spoiler: false,
                 as_file: false,
                 original: false,
-                media: None,
+                view_once: false, media: None,
             }],
             ..Outgoing::default()
         },
@@ -729,7 +731,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
             spoiler: false,
             as_file: false,
             original: false,
-            media: None,
+            view_once: false, media: None,
         });
     }
     let too_many = vec![files[0].clone(); 11];
@@ -809,7 +811,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
                 spoiler: false,
                 as_file: false,
                 original: false,
-                media: None,
+                view_once: false, media: None,
             }],
             ..Outgoing::default()
         },
@@ -1056,7 +1058,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
                 spoiler: false,
                 as_file: false,
                 original: false,
-                media: None,
+                view_once: false, media: None,
             }],
             ..Outgoing::default()
         },
@@ -1243,7 +1245,7 @@ fn an_rcs_reply_quotes_the_original_and_an_sms_reply_stays_plain() {
                 spoiler: false,
                 as_file: false,
                 original: false,
-                media: None,
+                view_once: false, media: None,
             }],
             ..Outgoing::default()
         },
@@ -1400,6 +1402,7 @@ fn a_text_deleted_on_the_phone_leaves_and_delete_reaches_the_phone() {
     match world.ask(Request::Delete {
         conversation: key(GRACE),
         message_id: mine.id.clone(),
+        scope: protocol::DeleteScope::Me,
     }) {
         Response::Ok => {}
         other => panic!("{other:?}"),
@@ -1541,7 +1544,7 @@ fn an_older_line_is_found_without_opening_the_chat() {
         query: query.into(),
         limit: 10,
     }) {
-        Response::MessageHits { hits } => hits.into_iter().any(|hit| hit.message_id == "m-0011"),
+        Response::MessageHits { hits, .. } => hits.into_iter().any(|hit| hit.message_id == "m-0011"),
         _ => false,
     };
     world.until("the 90th-newest line", || {

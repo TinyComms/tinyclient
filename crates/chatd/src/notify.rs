@@ -144,18 +144,27 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
     let level = level(values, key);
     // Bots and the archive raise nothing but mentions anywhere (`Conversation::badge`).
     let quiet_row = conversation.bot || conversation.archived;
+    let followed_thread =
+        conversation.kind == ConversationKind::Thread && conversation.followed && values.on(settings::NOTIFY_THREADS);
+    let keyword_hit = !quiet_row && settings::keyword_matches(&message.text, &values.keywords());
     let wanted = match level {
         "off" => false,
-        "all" => mention || !quiet_row,
+        "all" => mention || followed_thread || keyword_hit || !quiet_row,
         // Direct messages and mentions; a conversation set to mentions only means it.
-        _ if values.stored(&settings::conversation_scope(key), settings::NOTIFY_ABOUT).is_some() => mention,
-        _ => mention || (conversation.kind.is_direct() && !quiet_row),
+        _ if values.stored(&settings::conversation_scope(key), settings::NOTIFY_ABOUT).is_some() => {
+            mention || followed_thread || keyword_hit
+        }
+        _ => mention || followed_thread || keyword_hit || (conversation.kind.is_direct() && !quiet_row),
     };
-    let kind_on = match conversation.kind {
-        ConversationKind::Direct => values.on(settings::NOTIFY_DIRECT),
-        ConversationKind::Group => values.on(settings::NOTIFY_GROUPS),
-        _ if mention => values.on(settings::NOTIFY_MENTIONS),
-        _ => true,
+    let kind_on = if followed_thread || keyword_hit {
+        true
+    } else {
+        match conversation.kind {
+            ConversationKind::Direct => values.on(settings::NOTIFY_DIRECT),
+            ConversationKind::Group => values.on(settings::NOTIFY_GROUPS),
+            _ if mention => values.on(settings::NOTIFY_MENTIONS),
+            _ => true,
+        }
     };
     let tiny_on = key.network != Network::Tiny || conversation.kind.is_direct() || values.on(settings::NOTIFY_TINY);
     if !wanted || !kind_on || !tiny_on {
@@ -174,8 +183,57 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
         || moment.watching.focused
         || moment.sounded_here
         || moment.sounded_any;
-    let sound = Some(sound_word(values, key, mention)).filter(|word| !silent && word != "none");
-    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention })
+    let sound = Some(sound_word(values, key, mention || keyword_hit)).filter(|word| !silent && word != "none");
+    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention: mention || keyword_hit })
+}
+
+/// Whether a reaction to one of my messages notifies. Respects mutes, focus, quiet hours,
+/// Do Not Disturb, and the `notify_reactions` scope (`off` / `direct` / `everywhere`).
+pub fn decide_reaction(
+    values: &Values,
+    conversation: &Conversation,
+    outgoing_target: bool,
+    moment: &Moment,
+) -> Option<Verdict> {
+    if !outgoing_target {
+        return None;
+    }
+    let key = &conversation.key;
+    if moment.watching.focused && moment.watching.conversation.as_ref() == Some(key) {
+        return None;
+    }
+    if !values.on(settings::NOTIFY)
+        || conversation.muted
+        || conversation.hidden
+        || conversation.special == Special::Request
+    {
+        return None;
+    }
+    if level(values, key) == "off" {
+        return None;
+    }
+    let allowed = match values.word(GLOBAL, settings::NOTIFY_REACTIONS) {
+        "everywhere" => true,
+        "direct" => conversation.kind.is_direct(),
+        _ => false,
+    };
+    if !allowed {
+        return None;
+    }
+    if hushed(values, moment) || moment.dnd {
+        return None;
+    }
+    let in_call = values.word(GLOBAL, settings::IN_CALL);
+    if moment.in_call && in_call == "nothing" {
+        return None;
+    }
+    let silent = !values.on(settings::SOUNDS)
+        || (moment.in_call && in_call != "sounds")
+        || moment.watching.focused
+        || moment.sounded_here
+        || moment.sounded_any;
+    let sound = Some(sound_word(values, key, false)).filter(|word| !silent && word != "none");
+    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention: false })
 }
 
 /// Whether a ring posts (N5, N9, N3) and whether it is heard. `None`: nothing at all.
@@ -338,6 +396,57 @@ impl Notes {
             tracing::warn!("chatd: notification not shown: {err}");
             return None;
         }
+        self.ids.insert(id, key.clone());
+        let sound = verdict.sound.clone()?;
+        group.sounded = Some(at);
+        self.sounded = Some(at);
+        (!system_plays(&sound)).then_some(sound)
+    }
+
+    /// A reaction to one of my messages: posts `"Ines reacted 👍 to: <snippet>"` under the
+    /// conversation's note id so opening the conversation withdraws it.
+    pub fn reaction(
+        &mut self,
+        conversation: &Conversation,
+        reactor: Option<&str>,
+        emoji: &str,
+        snippet: &str,
+        verdict: &Verdict,
+        at: Instant,
+    ) -> Option<String> {
+        let key = &conversation.key;
+        let who = reactor.filter(|s| !s.trim().is_empty()).unwrap_or("Someone");
+        let full_body = if snippet.is_empty() {
+            format!("{who} reacted {emoji}")
+        } else {
+            format!("{who} reacted {emoji} to: {snippet}")
+        };
+        let (title, subtitle, body) = match verdict.preview {
+            Preview::Full => (who.to_owned(), place(conversation), full_body),
+            Preview::Sender => (who.to_owned(), place(conversation), format!("Reacted {emoji}")),
+            Preview::Nothing => (key.network.label().to_owned(), String::new(), "New reaction".to_owned()),
+        };
+        let locked = app_locked();
+        let (title, subtitle, body, _) = redact_for_app_lock(title, subtitle, body, false, locked);
+        let id = note_id(key);
+        let note = Note {
+            id: id.clone(),
+            title,
+            subtitle,
+            body,
+            kind: Kind::Plain,
+            reply_hint: String::new(),
+            sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
+            locked_body: "New reaction".to_owned(),
+        };
+        if let Err(err) = self.sink.post(&note) {
+            tracing::warn!("chatd: reaction notification not shown: {err}");
+            return None;
+        }
+        let group = self
+            .groups
+            .entry(key.clone())
+            .or_insert_with(|| Group { lines: VecDeque::new(), mention: false, sounded: None });
         self.ids.insert(id, key.clone());
         let sound = verdict.sound.clone()?;
         group.sounded = Some(at);
@@ -562,6 +671,14 @@ pub enum Event {
         conversation: Key,
         message: Box<Message>,
     },
+    /// Someone else reacted to one of my messages.
+    Reaction {
+        conversation: Key,
+        emoji: String,
+        reactor: Option<String>,
+        snippet: String,
+        outgoing_target: bool,
+    },
     /// A conversation's row changed: it may have been read.
     Row(Key),
     Call(Option<Call>),
@@ -758,6 +875,29 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     continue;
                 };
                 if let Some(word) = notes.message(&row, &message, &verdict, at) {
+                    playing.extend(play(&word, volume, None, 0));
+                }
+            }
+            Event::Reaction {
+                conversation,
+                emoji,
+                reactor,
+                snippet,
+                outgoing_target,
+            } => {
+                let Ok(Some(row)) = hub.store().conversation(&conversation) else {
+                    continue;
+                };
+                let at = Instant::now();
+                let mut moment = moment(hub, &conversation, &notes, at);
+                if decide_reaction(&values, &row, outgoing_target, &moment).is_none() {
+                    continue;
+                }
+                moment.dnd = dnd(hub, &conversation);
+                let Some(verdict) = decide_reaction(&values, &row, outgoing_target, &moment) else {
+                    continue;
+                };
+                if let Some(word) = notes.reaction(&row, reactor.as_deref(), &emoji, &snippet, &verdict, at) {
                     playing.extend(play(&word, volume, None, 0));
                 }
             }

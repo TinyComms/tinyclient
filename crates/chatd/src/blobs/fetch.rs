@@ -118,7 +118,7 @@ pub fn cap(file: &MediaFile, cache: u64) -> u64 {
 }
 
 pub fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(30)))

@@ -80,7 +80,7 @@ fn a_recorded_opus_note_can_be_uploaded_and_private_cache_files_stay_blocked() {
     let file = OutgoingFile {
         path: path.to_string_lossy().into_owned(),
         name: path.file_name().unwrap().to_string_lossy().into_owned(),
-        spoiler: false, as_file: false, original: false, media: None,
+        spoiler: false, as_file: false, original: false, view_once: false, media: None,
     };
     let up = Upload::with_progress(&key.account(), "voice-upload", &[file.clone()], |_, _| {}).unwrap();
     assert_eq!(up.files()[0].mime, "audio/ogg");

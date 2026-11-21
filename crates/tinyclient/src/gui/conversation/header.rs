@@ -135,7 +135,7 @@ impl Shell {
             .truncate()
             .type_title()
             .tooltip(tip(title_tip, direct.then_some("⌘.")))
-            .when_some(role.as_ref().and_then(|role| role.color), |title, color| title.text_color(gpui::rgb(color)))
+            .when_some(role.as_ref().and_then(|role| role.color), |title, color| title.text_color(theme::role_color(color)))
             .child(open.title.clone());
         let title = if direct {
             title
@@ -202,6 +202,7 @@ impl Shell {
                     .children(mark(open))
                     .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
+                    .children(self.disappearing_chip(open, cx))
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
@@ -240,6 +241,34 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&conversation, sealed, window, cx)))
                 .child(glyph(icon, 12., tone))
                 .child(open.encryption.words()),
+        )
+    }
+
+    /// Shows the conversation's active disappearing-messages timer in the header.
+    fn disappearing_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        let secs = open.disappearing.filter(|&s| s > 0)?;
+        let label = protocol::format_disappearing(secs);
+        Some(
+            div()
+                .id("conversation-disappearing")
+                .flex_none()
+                .self_center()
+                .h(px(18.))
+                .px(px(6.))
+                .rounded(px(999.))
+                .bg(theme::raised())
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .cursor_pointer()
+                .type_small()
+                .text_color(theme::text_soft())
+                .hover(|style| style.text_color(theme::text()))
+                .tooltip(tip(format!("Disappearing messages: {label}"), None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
+                .child(glyph("icons/clock.svg", 12., theme::text_soft()))
+                .child(label),
         )
     }
 

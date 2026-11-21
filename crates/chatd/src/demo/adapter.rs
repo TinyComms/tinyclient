@@ -125,6 +125,23 @@ impl Demo {
     /// Files "upload" from their paths in quarters, read from disk in parts as a real upload
     /// streams them, telling the progress as they go. A cancel stops them before the next part.
     fn send_with(demo: &Arc<Demo>, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, with: Outgoing) {
+        if let Some(draft) = with.poll {
+            let question = draft.question.trim().to_owned();
+            let options: Vec<String> = draft.options.into_iter().map(|o| o.trim().to_owned()).filter(|o| !o.is_empty()).collect();
+            if question.is_empty() || options.len() < 2 {
+                demo.ctx.sent(&conversation_id, &client_id, Err("A poll needs a question and at least two options.".to_owned()));
+                return;
+            }
+            let mut poll = protocol::Poll::open(question.clone(), options, draft.multiple);
+            poll.anonymous = draft.anonymous;
+            if let Some(secs) = draft.duration_secs.filter(|&s| s > 0) {
+                poll.closes_at = Some(now() + i64::from(secs));
+            }
+            let mut message = demo.accepted(&conversation_id, format!("Poll: {question}"), reply_to, Vec::new());
+            message.poll = Some(Box::new(poll));
+            demo.ctx.sent(&conversation_id, &client_id, Ok(message));
+            return;
+        }
         let demo = demo.clone();
         let spawned = std::thread::Builder::new().name("demo-upload".into()).stack_size(256 * 1024).spawn(move || {
             use std::io::Read;
@@ -194,10 +211,14 @@ impl Demo {
                     }
                     let mut attached = Attachment::new(name, MediaFile { bytes, path: Some(path), ..MediaFile::new(id, kind) });
                     attached.spoiler = file.spoiler;
+                    attached.view_once = file.view_once;
                     attached
                 })
                 .collect();
-            let message = demo.accepted(&conversation_id, text, reply_to, attachments);
+            let mut message = demo.accepted(&conversation_id, text, reply_to, attachments);
+            message.importance = with.importance;
+            message.effect = with.effect.clone();
+            message.spans = with.spans.clone();
             demo.ctx.sent(&conversation_id, &client_id, Ok(message));
             crate::blobs::upload::discard(&with.files);
         });
@@ -356,6 +377,7 @@ impl Demo {
             pinned: Some((pick % 4) as u32),
             external: if self.ctx.account.network == Network::Slack && row.title == "customer-voice" { "Northwind Traders".to_owned() } else { String::new() },
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
+            disappearing: row.disappearing,
         })
     }
 
@@ -626,16 +648,39 @@ impl Demo {
     fn serve(demo: &Arc<Demo>, command: Command) {
         match command {
             Command::Send { conversation_id, client_id, text, reply_to } => demo.send(&conversation_id, &client_id, text, reply_to),
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji), on);
                 let _ = reply.send(reacted.map_err(|err| Refusal::Refused(err.to_string())));
             }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
+            Command::Delete { conversation_id, message_id, scope: _, reply } => {
                 let deleted = demo.ctx.deleted(&conversation_id, &message_id);
                 let _ = reply.send(deleted.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            Command::Vote { conversation_id, message_id, votes, reply } => {
+                let outcome = (|| -> Result<(), Refusal> {
+                    let stored = demo.ctx.stored_message(&conversation_id, &message_id).ok().flatten();
+                    let mut message = stored.ok_or_else(|| Refusal::Refused("That message is gone.".to_owned()))?;
+                    let poll = message.poll.as_deref_mut().ok_or_else(|| Refusal::Refused("That is not a poll.".to_owned()))?;
+                    match votes {
+                        None => {
+                            if !message.outgoing {
+                                return Err(Refusal::Refused("Only the person who started this poll can end it.".to_owned()));
+                            }
+                            poll.closed = true;
+                        }
+                        Some(choices) => {
+                            if poll.closed {
+                                return Err(Refusal::Refused("This poll has ended.".to_owned()));
+                            }
+                            poll.apply_vote(&demo.me.id, choices, &demo.me.id);
+                        }
+                    }
+                    demo.ctx.message(&conversation_id, &message).map_err(|err| Refusal::Refused(err.to_string()))
+                })();
+                let _ = reply.send(outcome);
             }
             Command::Relate { person_id, action, reply } => {
                 let relation = match action {
@@ -650,9 +695,44 @@ impl Demo {
                 let related = demo.ctx.relation(&person_id, relation);
                 let _ = reply.send(related.map_err(|err| Refusal::Refused(err.to_string())));
             }
+            Command::Report { target, reason: _, note: _, block, reply } => {
+                if block {
+                    let person_id = match &target {
+                        protocol::ReportTarget::Person(key) => Some(key.id.clone()),
+                        protocol::ReportTarget::Message { conversation, message_id } => demo
+                            .hub
+                            .store()
+                            .message(conversation, message_id)
+                            .ok()
+                            .flatten()
+                            .map(|m| m.sender.id),
+                        protocol::ReportTarget::Conversation(_) => None,
+                    };
+                    if let Some(id) = person_id {
+                        let _ = demo.ctx.relation(&id, Relation::Blocked);
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Command::ReportReasons { reply, .. } => {
+                let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
+            }
             Command::SetPresence { presence, status, reply } => {
                 let (_, old) = demo.hub.shown(&demo.key(&demo.me.id));
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetProfile { name: _, about, pronouns: _, reply } => {
+                if let Some(about) = about {
+                    let (presence, _) = demo.hub.shown(&demo.key(&demo.me.id));
+                    demo.ctx.presence(&demo.me.id, presence, &about, true);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetAvatar { path: _, reply } => {
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetNickname { space_id: _, nickname: _, reply } => {
                 let _ = reply.send(Ok(()));
             }
             Command::Profile { person_id, reply } => drop(reply.send(Ok(demo.about(&person_id, None)))),
@@ -686,11 +766,67 @@ impl Demo {
                 let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
             }
             Command::Pinned { conversation_id, reply } => drop(reply.send(Ok(demo.pinned(&conversation_id)))),
+            Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+                let done = demo.ctx.pinned(&conversation_id, &message_id, pinned);
+                let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+                let from_key = demo.key(&from_conversation_id);
+                let (from_title, from_space) = demo
+                    .hub
+                    .store()
+                    .conversation(&from_key)
+                    .ok()
+                    .flatten()
+                    .map(|c| (c.title, c.space_title))
+                    .unwrap_or_default();
+                let originals: Vec<Message> = message_ids
+                    .iter()
+                    .filter_map(|id| demo.hub.store().message(&from_key, id).ok().flatten())
+                    .collect();
+                let mut results = Vec::with_capacity(to_conversation_ids.len());
+                let note = note.trim();
+                for target in to_conversation_ids {
+                    let mut err: Option<String> = None;
+                    for orig in &originals {
+                        let mut fwd = demo.accepted(&target, orig.text.clone(), None, orig.attachments.clone());
+                        fwd.spans = orig.spans.clone();
+                        fwd.forwarded = Some(Box::new(protocol::Forwarded {
+                            from_title: from_title.clone(),
+                            from_space: from_space.clone(),
+                            link: String::new(),
+                        }));
+                        if let Err(e) = demo.ctx.message(&target, &fwd) {
+                            err = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    if err.is_none() && !note.is_empty() {
+                        let note_msg = demo.accepted(&target, note.to_owned(), None, Vec::new());
+                        if let Err(e) = demo.ctx.message(&target, &note_msg) {
+                            err = Some(e.to_string());
+                        }
+                    }
+                    results.push((target, err.map_or(Ok(()), Err)));
+                }
+                let _ = reply.send(Ok(results));
+            }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));
             }
-            // The demo's words are all in the cache: its network is not asked.
-            Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Search { query, scope, filters, reply, .. } => {
+                let (conv, space) = match &scope {
+                    crate::adapters::SearchScope::Conversation(id) => (Some(id.as_str()), None),
+                    crate::adapters::SearchScope::Space(id) => (None, Some(id.as_str())),
+                    crate::adapters::SearchScope::Account => (None, None),
+                };
+                let found = demo
+                    .hub
+                    .store()
+                    .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
+                    .map_err(|err| Refusal::Refused(err.to_string()));
+                let _ = reply.send(found);
+            }
             Command::Catalog { kind, query, cursor, reply, .. } => drop(reply.send(Ok(demo.catalog(kind, &query, cursor.as_deref())))),
             Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(demo.reaction_rules(&conversation_id)))),
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -702,6 +838,43 @@ impl Demo {
             Command::Previews(ids) => demo.previews(&ids),
             Command::Members { conversation_id, offset, limit, reply } => drop(reply.send(demo.members(&conversation_id, offset, limit))),
             Command::StartDirect { person_id, reply } | Command::StartDirectCall { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
+            Command::StartGroup { people, title, reply } => {
+                let outcome = (|| -> Result<String, Refusal> {
+                    let id = format!("group-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
+                    let names: Vec<String> = people
+                        .iter()
+                        .map(|pid| {
+                            demo.hub
+                                .store()
+                                .person(&demo.key(pid))
+                                .ok()
+                                .flatten()
+                                .map(|p| p.name)
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or_else(|| pid.clone())
+                        })
+                        .collect();
+                    let label = title.unwrap_or_else(|| names.join(", "));
+                    let row = ConversationRow::new(id.clone(), ConversationKind::Group, label);
+                    demo.ctx.conversation(&row).map_err(|err| Refusal::Refused(err.to_string()))?;
+                    Ok(id)
+                })();
+                let _ = reply.send(outcome);
+            }
+            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+                let outcome = (|| -> Result<String, Refusal> {
+                    let id = format!("chan-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
+                    let row = ConversationRow {
+                        space: Some(space_id),
+                        group,
+                        private,
+                        ..ConversationRow::new(id.clone(), kind, name)
+                    };
+                    demo.ctx.conversation(&row).map_err(|err| Refusal::Refused(err.to_string()))?;
+                    Ok(id)
+                })();
+                let _ = reply.send(outcome);
+            }
             Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new(), sealed: None }))),
@@ -740,6 +913,80 @@ impl Demo {
             }
             Command::Source { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::SetDisappearing { conversation_id, seconds, reply } => {
+                let outcome = demo
+                    .ctx
+                    .disappearing(&conversation_id, (seconds > 0).then_some(seconds))
+                    .map_err(|err| Refusal::Refused(err.to_string()));
+                if outcome.is_ok() {
+                    let line = if seconds == 0 {
+                        "Disappearing messages are off".to_owned()
+                    } else {
+                        format!("Disappearing messages are set to {}", protocol::format_disappearing(seconds))
+                    };
+                    let now = crate::hub::now();
+                    let mut msg = Message::plain(format!("demo-ttl-{now}"), String::new(), line, now, false);
+                    msg.kind = protocol::MessageKind::System;
+                    let _ = demo.ctx.message(&conversation_id, &msg);
+                }
+                let _ = reply.send(outcome);
+            }
+            Command::MembersAdd { reply, .. } | Command::MembersRemove { reply, .. } | Command::ConversationPicture { reply, .. } => {
+                let _ = reply.send(Ok(()));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                let outcome = match demo.ctx.known(&conversation_id) {
+                    Ok(Some(row)) => {
+                        let mut updated = crate::store::ConversationRow::new(
+                            conversation_id.clone(),
+                            row.kind,
+                            title.unwrap_or(row.title),
+                        );
+                        updated.space = row.space;
+                        updated.group = row.group;
+                        updated.position = row.position;
+                        updated.peer = row.peer;
+                        updated.call = row.call;
+                        updated.topic = topic.or(description).unwrap_or(row.topic);
+                        updated.read_only = row.read_only;
+                        updated.private = row.private;
+                        updated.rights = row.rights;
+                        updated.disappearing = row.disappearing;
+                        demo.ctx.conversation(&updated).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused("no such conversation".to_owned())),
+                };
+                let _ = reply.send(outcome);
+            }
+            Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
+                let outcome = match demo.ctx.known(&conversation_id) {
+                    Ok(Some(row)) => {
+                        let mut folders = row.folders;
+                        if let Some(f) = folder_add {
+                            if !folders.contains(&f) {
+                                folders.push(f);
+                            }
+                        }
+                        if let Some(f) = folder_remove {
+                            folders.retain(|x| x != &f);
+                        }
+                        let filing = crate::store::Filing {
+                            folders,
+                            archived: archived.unwrap_or(row.archived),
+                            pin: match pinned {
+                                Some(true) => Some(0),
+                                Some(false) => None,
+                                None => row.pin,
+                            },
+                            hidden: row.hidden,
+                            followed: row.followed,
+                        };
+                        demo.ctx.filing(&conversation_id, &filing).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused("no such conversation".to_owned())),
+                };
+                let _ = reply.send(outcome);
             }
             // Nothing is behind these: what is stored is all there is.
             Command::Backfill(_)

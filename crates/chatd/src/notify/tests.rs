@@ -593,3 +593,54 @@ fn a_due_reminder_posts_silent_and_is_taken_out_but_waits_out_a_hush() {
     assert!(hub.store().reminders(&conversation).unwrap().is_empty(), "a fired reminder is gone");
     assert_eq!(hub.store().next_reminder_due().unwrap(), None);
 }
+
+#[test]
+fn reactions_to_my_messages_notify_according_to_scope_and_withdraw_when_read() {
+    let mut values = Values::default();
+    let now = moment();
+    // Default is off.
+    assert!(decide_reaction(&values, &dm(), true, &now).is_none());
+    // "direct" notifies in DMs only, never in channels or on muted chats or on others' messages.
+    set(&mut values, GLOBAL, settings::NOTIFY_REACTIONS, "direct");
+    assert!(decide_reaction(&values, &dm(), true, &now).is_some());
+    assert!(decide_reaction(&values, &dm(), false, &now).is_none());
+    assert!(decide_reaction(&values, &channel(), true, &now).is_none());
+    assert!(decide_reaction(&values, &Conversation { muted: true, ..dm() }, true, &now).is_none());
+    // "everywhere" notifies in channels too, unless muted.
+    set(&mut values, GLOBAL, settings::NOTIFY_REACTIONS, "everywhere");
+    assert!(decide_reaction(&values, &channel(), true, &now).is_some());
+    assert!(decide_reaction(&values, &Conversation { muted: true, ..channel() }, true, &now).is_none());
+
+    // Posting formats "Ines reacted 👍 to: <snippet>" and reading withdraws it.
+    set(&mut values, GLOBAL, settings::PREVIEW, "full");
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let verdict = decide_reaction(&values, &dm(), true, &now).expect("reaction verdict");
+    notes.reaction(&dm(), Some("Ines"), "👍", "looks good", &verdict, Instant::now());
+    assert_eq!(fake.log().posted.len(), 1);
+    assert_eq!(fake.log().posted[0].body, "Ines reacted 👍 to: looks good");
+    assert!(notes.has(&dm().key));
+    notes.read(&dm().key);
+    assert!(!notes.has(&dm().key));
+    assert!(fake.log().shown.is_empty());
+}
+
+#[test]
+fn followed_thread_replies_and_keyword_hits_notify_unless_muted() {
+    let mut values = Values::default();
+    let now = moment();
+    let mut thread = row(Network::Slack, "T1", ConversationKind::Thread, "release-notes");
+    thread.followed = true;
+    assert!(posts(&values, &thread, &message("Tom", "shipped it"), &now));
+    // Muted thread never notifies.
+    assert!(!posts(&values, &Conversation { muted: true, ..thread.clone() }, &message("Tom", "shipped it"), &now));
+    // Turning off NOTIFY_THREADS silences unmentioned followed thread replies.
+    set(&mut values, GLOBAL, settings::NOTIFY_THREADS, "off");
+    assert!(!posts(&values, &thread, &message("Tom", "shipped it"), &now));
+
+    // Keywords match on word boundaries in channels, case-insensitively, and respect mutes.
+    set(&mut values, GLOBAL, settings::NOTIFY_KEYWORDS, "outage, deploy");
+    assert!(posts(&values, &channel(), &message("Tom", "Production OUTAGE alert"), &now));
+    assert!(!posts(&values, &channel(), &message("Tom", "redeploying soon"), &now));
+    assert!(!posts(&values, &Conversation { muted: true, ..channel() }, &message("Tom", "deploy now"), &now));
+}

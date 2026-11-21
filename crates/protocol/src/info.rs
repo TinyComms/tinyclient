@@ -240,6 +240,9 @@ pub struct ConversationInfo {
     /// The public link (`t.me/name`), where there is one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub link: String,
+    /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disappearing: Option<u32>,
 }
 
 /// A Space's info: opened from its name, never from a conversation.
@@ -280,9 +283,123 @@ impl EmojiScope {
     }
 }
 
-/// What an account may send, as the session says (the plan, the workspace's settings). A
-/// control the account lacks is absent in the shell, never disabled. Nothing is allowed until
-/// the adapter reports it (`Context::capabilities`).
+/// How an account encodes inline mentions in outgoing wire text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionFormat {
+    /// Mentions stay as their plain display label (Telegram, Signal, Messages, Tiny).
+    #[default]
+    Plain,
+    /// `<@id>`, `<@&id>`, `<#id>`, `<:name:id>` / `<a:name:id>`.
+    Discord,
+    /// `<@id>`, `<!subteam^id>`, `<#id>`; custom emoji stay `:name:`.
+    Slack,
+    /// `<@id|label>`, `<@&id|label>`, `<#id|label>`; custom emoji stay `:name:`.
+    Teams,
+}
+
+impl MentionFormat {
+    pub fn is_plain(&self) -> bool {
+        *self == MentionFormat::Plain
+    }
+}
+
+/// What this account may do in one conversation beyond its own messages.
+/// Posting follows `Conversation::read_only` (`Conversation::can_post()`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRights {
+    /// May pin or unpin messages in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pin: bool,
+    /// May delete other people's messages in this conversation (Discord
+    /// `MANAGE_MESSAGES`, Slack admin, Telegram `delete_messages`, Signal group admin,
+    /// Teams owner).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_others: bool,
+    /// May add, remove, or manage members in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_members: bool,
+    /// May add/invite people to this conversation (`Request::MembersAdd`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_members: bool,
+    /// May remove people from this conversation (`Request::MembersRemove`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remove_members: bool,
+    /// May rename this conversation (`Request::ConversationUpdate`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rename: bool,
+    /// May edit this conversation's topic or description (`Request::ConversationUpdate`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_topic: bool,
+    /// May change this conversation's picture (`Request::ConversationPicture`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_picture: bool,
+}
+
+impl ConversationRights {
+    const PIN: i64 = 1 << 0;
+    const DELETE_OTHERS: i64 = 1 << 1;
+    const MANAGE_MEMBERS: i64 = 1 << 2;
+    const ADD_MEMBERS: i64 = 1 << 3;
+    const REMOVE_MEMBERS: i64 = 1 << 4;
+    const RENAME: i64 = 1 << 5;
+    const EDIT_TOPIC: i64 = 1 << 6;
+    const EDIT_PICTURE: i64 = 1 << 7;
+
+    pub fn is_none(&self) -> bool {
+        *self == ConversationRights::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.is_none()
+    }
+
+    pub fn to_bits(self) -> i64 {
+        let mut bits = 0i64;
+        if self.pin {
+            bits |= Self::PIN;
+        }
+        if self.delete_others {
+            bits |= Self::DELETE_OTHERS;
+        }
+        if self.manage_members {
+            bits |= Self::MANAGE_MEMBERS;
+        }
+        if self.add_members {
+            bits |= Self::ADD_MEMBERS;
+        }
+        if self.remove_members {
+            bits |= Self::REMOVE_MEMBERS;
+        }
+        if self.rename {
+            bits |= Self::RENAME;
+        }
+        if self.edit_topic {
+            bits |= Self::EDIT_TOPIC;
+        }
+        if self.edit_picture {
+            bits |= Self::EDIT_PICTURE;
+        }
+        bits
+    }
+
+    pub fn from_bits(bits: i64) -> Self {
+        Self {
+            pin: (bits & Self::PIN) != 0,
+            delete_others: (bits & Self::DELETE_OTHERS) != 0,
+            manage_members: (bits & Self::MANAGE_MEMBERS) != 0,
+            add_members: (bits & Self::ADD_MEMBERS) != 0,
+            remove_members: (bits & Self::REMOVE_MEMBERS) != 0,
+            rename: (bits & Self::RENAME) != 0,
+            edit_topic: (bits & Self::EDIT_TOPIC) != 0,
+            edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+        }
+    }
+}
+
+/// What an account may send and do on messages, as the session says (the plan, the workspace's
+/// settings). A control the account lacks is absent in the shell, never disabled. Nothing is
+/// allowed until the adapter reports it (`Context::capabilities`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     /// This Tiny account can ring a member before a direct conversation exists.
@@ -308,12 +425,19 @@ pub struct Capabilities {
     /// The network has a GIF search tinyclient can ask (`Catalog` with `Gifs`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub gifs: bool,
+    /// The GIF button picks a `.gif` file through the attachment path when `max_file_bytes > 0` (Tiny).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gif_file: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stickers: bool,
     /// The network searches its own messages (`SearchNetwork`), which the search pane's Enter
-    /// asks. Everywhere stays the cache alone.
+    /// asks. Everywhere stays the cache alone unless `search_global` is also set.
     #[serde(default, skip_serializing_if = "is_false")]
     pub search: bool,
+    /// The network supports account-wide search (Slack `search.messages`, Telegram
+    /// `messages.searchGlobal`), so Search Everywhere fans out to this account on Enter.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub search_global: bool,
     #[serde(default)]
     pub custom_emoji: EmojiScope,
     /// `Outgoing::silent`, `Outgoing::schedule`, `Outgoing::suppress_embeds` and
@@ -351,11 +475,186 @@ pub struct Capabilities {
     /// (`Request::ClearHistory`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub clear_history: bool,
+    /// This account supports inline replies on messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reply: bool,
+    /// This account supports editing own messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit: bool,
+    /// This account supports deleting messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete: bool,
+    /// This account supports starting threads on channel / announcement messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub threads: bool,
+    /// This account also supports starting threads in direct / group conversations (e.g. Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub direct_threads: bool,
+    /// This account supports pinning and unpinning messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pins: bool,
+    /// This account supports forwarding messages natively.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forward: bool,
+    /// This account supports creating and voting in polls, with its limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polls: Option<PollCapabilities>,
+    /// This account supports message reactions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reactions: bool,
+    /// How inline mentions are formatted on the wire for this account.
+    #[serde(default, skip_serializing_if = "MentionFormat::is_plain")]
+    pub mention_format: MentionFormat,
+    /// Whether this account carries structured mention spans out-of-band on outgoing messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mention_spans: bool,
+    /// Per-field own-profile edit capabilities (`Request::SetProfile`, `Request::SetAvatar`,
+    /// `Request::SetNickname`). The shell shows only the fields the network accepts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_name: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_about: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_pronouns: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_avatar: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_nickname: bool,
+    /// Most chats this account may pin on the network (`Request::File`). 0: cannot pin.
+    /// Telegram allows 5 without Premium and 10 with Premium.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pin_chats: u32,
+    /// This account supports archiving and unarchiving conversations on the network (`Request::File`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archive: bool,
+    /// This account supports adding and removing conversations from folders (`Request::File`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub folders_edit: bool,
+    /// This account supports setting a conversation's disappearing-messages timer (`Request::SetDisappearing`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disappearing: bool,
+    /// Maximum members in a group chat this account can create (`Request::StartGroup`). 0: unsupported.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub groups: u32,
+    /// This account supports marking messages as Important or Urgent (`Outgoing::importance`, Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub importance: bool,
+    /// This account supports broadcasting a thread reply to the channel (`Outgoing::broadcast`, Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thread_broadcast: bool,
+    /// This account supports Telegram-style message effects (`Outgoing::effect`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub effects: bool,
+    /// This account supports view-once media attachments (`OutgoingFile::view_once`, Signal/Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
+    /// This account supports super / burst reactions (`Request::React { burst: true }`, Discord Nitro).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub burst_reactions: bool,
+}
+
+/// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.
+pub fn disappearing_presets(network: Network) -> &'static [u32] {
+    match network {
+        Network::Signal => &[0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200],
+        Network::Telegram => &[0, 86_400, 604_800, 2_678_400],
+        _ => &[0, 30, 300, 3_600, 86_400, 604_800],
+    }
+}
+
+/// Short human-readable label for a disappearing-messages timer in seconds.
+pub fn format_disappearing(seconds: u32) -> String {
+    if seconds == 0 {
+        return "Off".to_owned();
+    }
+    if seconds % 604_800 == 0 {
+        format!("{}w", seconds / 604_800)
+    } else if seconds % 86_400 == 0 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds % 3_600 == 0 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Content-type filter for network message search (`SearchFilters::has`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchHas {
+    Files,
+    Links,
+    Images,
+}
+
+/// Optional filters on `Request::SearchNetwork`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has: Option<SearchHas>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_me: bool,
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        *self == SearchFilters::default()
+    }
+}
+
+/// Message urgency level (Teams: Normal, Important, Urgent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Importance {
+    #[default]
+    Normal,
+    Important,
+    Urgent,
+}
+
+impl Importance {
+    pub fn is_normal(&self) -> bool {
+        *self == Importance::Normal
+    }
+}
+
+/// What a network allows when creating a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PollCapabilities {
+    /// Maximum number of options (e.g. 10).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub max_options: u8,
+    /// Longest duration in seconds. 0 means no duration setting / network default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_duration_secs: u32,
+    /// Whether multi-select polls are supported.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiple: bool,
+    /// Whether anonymous polls are supported.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Capabilities {
     pub fn is_none(&self) -> bool {
         *self == Capabilities::default()
+    }
+
+    /// True if any own-profile field (name, about, pronouns, avatar) can be edited on this network.
+    pub fn can_edit_profile(&self) -> bool {
+        self.profile_name || self.profile_about || self.profile_pronouns || self.profile_avatar
     }
 }
 
@@ -398,6 +697,9 @@ pub struct OutgoingFile {
     /// Send the file as it is (a HEIC rather than the JPEG made at staging).
     #[serde(default, skip_serializing_if = "is_false")]
     pub original: bool,
+    /// View-once media (Signal, Telegram): hidden until opened and cannot be kept.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
     /// Optional video/audio metadata and poster thumbnail path staged by the shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<OutgoingMedia>,
@@ -434,12 +736,18 @@ pub struct VoiceNote {
 
 /// A poll the user is starting. Signal: a question of 1 to 100 characters and 2 to 10 choices,
 /// each at most 100 characters. `multiple` lets a person pick more than one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollDraft {
     pub question: String,
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub multiple: bool,
+    /// Optional duration in seconds before the poll closes automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u32>,
+    /// Whether votes are anonymous.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
 }
 
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
@@ -476,6 +784,15 @@ pub struct Outgoing {
     /// true for text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<PollDraft>,
+    /// Message importance (Teams: Normal / Important / Urgent).
+    #[serde(default, skip_serializing_if = "Importance::is_normal")]
+    pub importance: Importance,
+    /// Also send a thread reply to the parent channel (Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcast: bool,
+    /// Optional message effect identifier from the account's catalog (Telegram).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -490,6 +807,9 @@ impl Default for Outgoing {
             voice: None,
             spans: Vec::new(),
             poll: None,
+            importance: Importance::Normal,
+            broadcast: false,
+            effect: None,
         }
     }
 }
@@ -539,5 +859,68 @@ pub struct Keychain {
 impl Keychain {
     pub fn is_settled(&self) -> bool {
         *self == Keychain::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AccountKey, Key, Network, Request};
+
+    #[test]
+    fn profile_edit_capabilities_and_requests_round_trip() {
+        let mut can = Capabilities::default();
+        assert!(!can.can_edit_profile());
+        can.profile_about = true;
+        assert!(can.can_edit_profile());
+        let json = serde_json::to_string(&can).unwrap();
+        let back: Capabilities = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, can);
+
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let reqs = [
+            Request::SetProfile {
+                account: account.clone(),
+                name: Some("Ada".into()),
+                about: Some("Builder".into()),
+                pronouns: Some("she/her".into()),
+                emoji: None,
+                username: None,
+                photo: false,
+            },
+            Request::SetAvatar { account: account.clone(), path: "/tmp/avatar.png".into() },
+            Request::SetNickname { space: Key::new(&account, "guild-1"), nickname: Some("Ada!".into()) },
+        ];
+        for req in reqs {
+            let s = serde_json::to_string(&req).unwrap();
+            let got: Request = serde_json::from_str(&s).unwrap();
+            assert_eq!(got, req);
+        }
+    }
+
+    #[test]
+    fn report_requests_and_reasons_round_trip() {
+        use crate::{ReportReason, ReportTarget, Response};
+        let account = AccountKey { network: Network::Telegram, account: "1".into() };
+        let conv = Key::new(&account, "c1");
+        let target = ReportTarget::Message { conversation: conv.clone(), message_id: "m42".into() };
+        assert_eq!(target.account(), account);
+        let req = Request::Report {
+            target: target.clone(),
+            reason: ReportReason::Spam,
+            note: "unsolicited links".into(),
+            block: true,
+        };
+        let got: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(got, req);
+
+        let reasons_req = Request::ReportReasons { target };
+        let got_r: Request = serde_json::from_str(&serde_json::to_string(&reasons_req).unwrap()).unwrap();
+        assert_eq!(got_r, reasons_req);
+
+        let resp = Response::ReportReasons { reasons: ReportReason::ALL.to_vec() };
+        let got_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(got_resp, resp);
+        assert_eq!(ReportReason::ALL.len(), 6);
     }
 }

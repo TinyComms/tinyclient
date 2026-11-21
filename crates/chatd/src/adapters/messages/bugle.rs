@@ -1380,7 +1380,7 @@ struct Waiter {
 fn agent(timeout: Duration) -> ureq::Agent {
     // The same system TLS as the rest of chatd. ureq's default is rustls, which this crate does
     // not enable, and asking for it panics before a pairing code exists.
-    ureq::Agent::config_builder()
+    crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(timeout))
         .http_status_as_error(false)

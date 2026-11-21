@@ -394,6 +394,7 @@ impl Discord {
                 }
                 format!("/guilds/{space}/messages/search?content={}", escaped(query))
             }
+            SearchScope::Account => return Err(Refusal::Unsupported),
             SearchScope::Conversation(channel) => {
                 let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
                 match self.guild_of(&known) {
@@ -441,6 +442,7 @@ impl Discord {
             SearchScope::Conversation(channel) => {
                 self.ctx.known(channel).ok().flatten().and_then(|known| self.guild_of(&known))
             }
+            SearchScope::Account => None,
         };
         let mut found_hits = Vec::new();
         for posted in hits.iter().filter_map(|hit| hit.first()) {

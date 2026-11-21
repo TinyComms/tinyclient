@@ -1782,7 +1782,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     world.general();
     let shipping = "1760000300.000300";
     let reaction = |emoji: &str| world.message(&general, shipping).unwrap().reactions.into_iter().find(|have| have.emoji == emoji);
-    let react = |emoji: &str, on: bool| world.ask(Request::React { conversation: general.clone(), message_id: shipping.to_owned(), emoji: emoji.to_owned(), on });
+    let react = |emoji: &str, on: bool| world.ask(Request::React { conversation: general.clone(), message_id: shipping.to_owned(), emoji: emoji.to_owned(), on , burst: false });
 
     // A reaction is asked of Slack by name, shows at once, and Slack's own word of it on the
     // socket is the same reaction, not a second one.
@@ -1845,7 +1845,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     assert_eq!(world.fake.calls(ALPHA, "chat.update").len(), 1);
 
     // A delete, likewise.
-    assert_eq!(world.ask(Request::Delete { conversation: general.clone(), message_id: mine.to_owned() }), Response::Ok);
+    assert_eq!(world.ask(Request::Delete { conversation: general.clone(), message_id: mine.to_owned(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     assert!(world.message(&general, mine).is_none());
     let deleted = world.fake.calls(ALPHA, "chat.delete").pop().unwrap();
     assert_eq!((said(&deleted, "channel"), said(&deleted, "ts")), ("C0GEN".to_owned(), mine.to_owned()));
@@ -1855,7 +1855,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
 
     // Slack says no to an edit: nothing changed, and the answer is its reason.
     world.fake.refusing.lock().unwrap().insert("chat.delete".to_owned(), "cant_delete_message".to_owned());
-    let refused = world.ask(Request::Delete { conversation: general.clone(), message_id: shipping.to_owned() });
+    let refused = world.ask(Request::Delete { conversation: general.clone(), message_id: shipping.to_owned(), scope: protocol::DeleteScope::Everyone });
     assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "Slack does not let you delete this message.".to_owned() });
     assert!(world.message(&general, shipping).is_some());
 
@@ -2311,8 +2311,8 @@ fn a_search_asks_slacks_own_search_once_and_maps_hits_to_their_conversations() {
 
     // One conversation: Slack's own search, narrowed to it, and the hit mapped like the
     // cache's. A channel the sidebar does not know is not a hit we can open.
-    let asked = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into() });
-    let Response::MessageHits { hits } = asked else { panic!("{asked:?}") };
+    let asked = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let Response::MessageHits { hits, .. } = asked else { panic!("{asked:?}") };
     assert_eq!(hits.len(), 1, "{hits:?}");
     let hit = &hits[0];
     assert_eq!(hit.conversation, alpha("C0GEN"));
@@ -2328,8 +2328,8 @@ fn a_search_asks_slacks_own_search_once_and_maps_hits_to_their_conversations() {
 
     // The workspace's own search: no channel filter, and every hit in a conversation the
     // sidebar knows, newest first.
-    let asked = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "deploy".into() });
-    let Response::MessageHits { hits } = asked else { panic!("{asked:?}") };
+    let asked = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let Response::MessageHits { hits, .. } = asked else { panic!("{asked:?}") };
     let mapped: Vec<(&str, &str)> = hits.iter().map(|hit| (hit.conversation.id.as_str(), hit.title.as_str())).collect();
     assert_eq!(mapped, [("C0GEN", "#general"), ("C0DEP", "#deploys")]);
     let calls = world.fake.calls(ALPHA, "search.messages");
@@ -2343,7 +2343,7 @@ fn a_search_slack_will_not_do_is_refused_in_words_rather_than_faked() {
     });
     world.ready();
     // The web session cannot reach Slack's search: the user is told, and no hit is invented.
-    let refused = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into() });
+    let refused = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail == "Slack's own search isn't reachable with this session."), "{refused:?}");
 }
 
@@ -2357,7 +2357,7 @@ fn files_go_up_from_their_paths_and_the_socket_names_the_message() {
     let path = dir.join("notes.txt");
     std::fs::write(&path, b"abc").unwrap();
     let with = protocol::Outgoing {
-        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, media: None }],
+        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
         ..Default::default()
     };
     let asked = Request::Send { conversation: alpha("C0GEN"), client_id: "71".into(), text: "the notes".into(), reply_to: None, with };

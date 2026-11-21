@@ -641,6 +641,8 @@ fn connect(
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
         close_direct: true,
+        delete: true,
+        reactions: true,
         ..Capabilities::default()
     });
     let _ = ctx.describe(
@@ -1165,6 +1167,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
             sticker: false,
             waveform,
             round: false,
+            view_once: false,
         });
     }
     message.attachments = shown;
@@ -1674,12 +1677,18 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Delete {
             conversation_id,
             message_id,
+            scope,
             reply,
         } => {
-            let answer = account.drive.delete_message(&message_id).map_err(Refusal::Refused);
-            if answer.is_ok() {
-                let _ = ctx.deleted(&conversation_id, &message_id);
-            }
+            let answer = if scope == protocol::DeleteScope::Everyone {
+                Err(Refusal::Refused("Google Messages can only delete messages for you.".to_owned()))
+            } else {
+                let res = account.drive.delete_message(&message_id).map_err(Refusal::Refused);
+                if res.is_ok() {
+                    let _ = ctx.deleted(&conversation_id, &message_id);
+                }
+                res
+            };
             let _ = reply.send(answer);
         }
         // Leave stays unsupported. Closing the chat is what deletes it on the phone.
@@ -1924,6 +1933,7 @@ fn deliver_files(
             sticker: false,
             waveform,
             round: false,
+            view_once: false,
         });
     }
     message.attachments = attachments;

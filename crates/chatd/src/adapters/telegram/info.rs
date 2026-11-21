@@ -188,12 +188,16 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
             let tl::enums::UserFull::Full(user) = full.full_user;
             about.description = user.about.unwrap_or_default();
             about.members = Some(2);
+            about.disappearing = user.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
+            let _ = account.ctx.disappearing(conversation, about.disappearing);
         }
         Who::Group(chat_id) => {
             let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::Full(chat) = full.full_chat {
                 about.description = chat.about;
+                about.disappearing = chat.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
+                let _ = account.ctx.disappearing(conversation, about.disappearing);
                 if let tl::enums::ChatParticipants::Participants(list) = chat.participants {
                     about.members = Some(list.participants.len() as u32);
                     about.creator = list
@@ -215,10 +219,31 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
                 about.description = channel.about;
                 about.members = channel.participants_count.map(|count| count.max(0) as u32);
                 about.online = channel.online_count.map(|count| count.max(0) as u32);
+                about.disappearing = channel.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
+                let _ = account.ctx.disappearing(conversation, about.disappearing);
             }
         }
     }
     Ok(about)
+}
+
+/// Sets or clears Telegram's auto-delete timer (`messages.setHistoryTTL`).
+pub(super) fn set_disappearing(account: &Account, conversation: &str, seconds: u32) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    account.ask(&tl::functions::messages::SetHistoryTtl { peer, period: seconds as i32 })?;
+    let timer = (seconds > 0).then_some(seconds);
+    let _ = account.ctx.disappearing(conversation, timer);
+    let line = if seconds == 0 {
+        "Disappearing messages are off".to_owned()
+    } else {
+        format!("Disappearing messages are set to {}", protocol::format_disappearing(seconds))
+    };
+    let now = crate::hub::now();
+    let mut msg = Message::plain(format!("tg-ttl-{now}"), String::new(), line, now, false);
+    msg.kind = protocol::MessageKind::System;
+    let _ = account.ctx.message(conversation, &msg);
+    Ok(())
 }
 
 /// The network's own mute. Telegram has no "mentions only" for a chat: a muted chat still
@@ -380,6 +405,114 @@ pub(super) fn search_messages(account: &Account, conversation: &str, query: &str
 /// The pinned messages, newest first.
 pub(super) fn pinned(account: &Account, conversation: &str) -> Result<Vec<Message>, Fault> {
     Ok(search(account, conversation, "", tl::enums::MessagesFilter::InputMessagesFilterPinned, 0, protocol::PINNED_LIMIT as i32)?.0)
+}
+
+pub(super) fn pin(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    pinned: bool,
+    notify: bool,
+    me_only: bool,
+) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let id = message_id.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    account.ask(&tl::functions::messages::UpdatePinnedMessage {
+        silent: !notify,
+        unpin: !pinned,
+        pm_oneside: me_only,
+        peer,
+        id,
+    })?;
+    let _ = account.ctx.pinned(conversation, message_id, pinned);
+    Ok(())
+}
+
+pub(super) fn forward(
+    account: &Account,
+    from: &str,
+    message_ids: &[String],
+    targets: &[String],
+    note: &str,
+) -> Result<Vec<(String, Result<(), String>)>, Fault> {
+    let (from_who, _) = Who::parse(from).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let from_peer = account.input(from_who)?;
+    let ids: Vec<i32> = message_ids
+        .iter()
+        .filter_map(|id| id.parse::<i32>().ok())
+        .collect();
+    if ids.is_empty() {
+        return Err(invalid("MESSAGE_ID_INVALID"));
+    }
+    let note = note.trim();
+    let mut results = Vec::with_capacity(targets.len());
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos() as i64);
+    for (t_ix, target) in targets.iter().enumerate() {
+        let res: Result<(), Fault> = (|| {
+            let (to_who, top_msg_id) = Who::parse(target).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+            let to_peer = account.input(to_who)?;
+            let random_id: Vec<i64> = ids
+                .iter()
+                .enumerate()
+                .map(|(m_ix, _)| base.wrapping_add(((t_ix as i64) << 16) + m_ix as i64 + 1))
+                .collect();
+            account.ask(&tl::functions::messages::ForwardMessages {
+                silent: false,
+                background: false,
+                with_my_score: false,
+                drop_author: false,
+                drop_media_captions: false,
+                noforwards: false,
+                allow_paid_floodskip: false,
+                from_peer: from_peer.clone(),
+                id: ids.clone(),
+                random_id,
+                to_peer: to_peer.clone(),
+                top_msg_id,
+                reply_to: None,
+                schedule_date: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                video_timestamp: None,
+                effect: None,
+                schedule_repeat_period: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            })?;
+            if !note.is_empty() {
+                account.ask(&tl::functions::messages::SendMessage {
+                    no_webpage: false,
+                    silent: false,
+                    background: false,
+                    clear_draft: false,
+                    noforwards: false,
+                    update_stickersets_order: false,
+                    invert_media: false,
+                    allow_paid_floodskip: false,
+                    rich_message: None,
+                    peer: to_peer,
+                    reply_to: None,
+                    message: note.to_owned(),
+                    random_id: base.wrapping_add(((t_ix as i64) << 16) + 9999),
+                    reply_markup: None,
+                    entities: None,
+                    schedule_date: None,
+                    schedule_repeat_period: None,
+                    send_as: None,
+                    quick_reply_shortcut: None,
+                    effect: None,
+                    allow_paid_stars: None,
+                    suggested_post: None,
+                })?;
+            }
+            Ok(())
+        })();
+        results.push((target.clone(), res.map_err(|e| format!("{e:?}"))));
+    }
+    Ok(results)
 }
 
 /// What was shared, from Telegram's own search, with Telegram's count of it as the total.

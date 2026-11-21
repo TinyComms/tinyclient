@@ -498,7 +498,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             session.user_agent = browser().to_owned();
         }
         let moved = api != session.url;
-        let agent = ureq::Agent::config_builder()
+        let agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
             .tls_config(crate::tls::config())
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
@@ -1362,7 +1362,13 @@ impl Slack {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
-            Command::Search { query, scope, at, reply } => {
+            Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+                answer(reply, self.pin(&conversation_id, &message_id, pinned))
+            }
+            Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+                answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
+            }
+            Command::Search { query, scope, at, reply, .. } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
@@ -1382,14 +1388,18 @@ impl Slack {
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
             Command::Edit { conversation_id, message_id, text, spans, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text, &spans));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
-                answer(reply, self.delete(&conversation_id, &message_id));
+            Command::Delete { conversation_id, message_id, scope, reply } => {
+                if scope == protocol::DeleteScope::Me {
+                    let _ = reply.send(Err(Refusal::Refused("Slack only supports deleting for everyone.".to_owned())));
+                } else {
+                    answer(reply, self.delete(&conversation_id, &message_id));
+                }
             }
             Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
@@ -1676,6 +1686,52 @@ impl Slack {
         self.api("chat.delete", &[("channel", channel), ("ts", ts)])?;
         let gone = self.ctx.deleted(channel, ts).and_then(|()| self.ctx.deleted(&thread_id(channel, root), ts));
         gone.map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    fn pin(&self, conversation: &str, ts: &str, pinned: bool) -> Result<(), Fault> {
+        let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
+        let method = if pinned { "pins.add" } else { "pins.remove" };
+        self.api(method, &[("channel", channel), ("timestamp", ts)])?;
+        self.ctx.pinned(channel, ts, pinned).map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    fn forward(
+        &self,
+        from: &str,
+        message_ids: &[String],
+        targets: &[String],
+        note: &str,
+    ) -> Result<Vec<(String, Result<(), String>)>, Fault> {
+        let from_channel = thread_of(from).map_or(from, |(channel, _)| channel);
+        let from_key = self.ctx.key(from);
+        let mut snippets = Vec::new();
+        for mid in message_ids {
+            let permalink = self
+                .api("chat.getPermalink", &[("channel", from_channel), ("message_ts", mid)])
+                .ok()
+                .and_then(|v| v["permalink"].as_str().map(str::to_owned));
+            if let Some(link) = permalink {
+                snippets.push(link);
+            } else if let Ok(Some(msg)) = self.ctx.hub.store().message(&from_key, mid) {
+                snippets.push(format!("> {}", msg.text));
+            }
+        }
+        let note = note.trim();
+        let mut text = String::new();
+        if !note.is_empty() {
+            text.push_str(note);
+            if !snippets.is_empty() {
+                text.push('\n');
+            }
+        }
+        text.push_str(&snippets.join("\n"));
+        let mut results = Vec::with_capacity(targets.len());
+        for target in targets {
+            let channel = thread_of(target).map_or(target.as_str(), |(c, _)| c);
+            let res = self.api("chat.postMessage", &[("channel", channel), ("text", text.as_str())]);
+            results.push((target.clone(), res.map(|_| ()).map_err(|e| reason(e))));
+        }
+        Ok(results)
     }
 
     /// Our own presence, and the status text when one is given (empty clears it).
@@ -1967,6 +2023,17 @@ fn capabilities() -> protocol::Capabilities {
         suppress_embeds: true,
         search: true,
         close_direct: true,
+        reply: false,
+        edit: true,
+        delete: true,
+        threads: true,
+        direct_threads: true,
+        pins: true,
+        forward: true,
+        polls: None,
+        reactions: true,
+        mention_format: protocol::MentionFormat::Slack,
+        mention_spans: false,
         ..protocol::Capabilities::default()
     }
 }

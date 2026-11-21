@@ -20,9 +20,13 @@ pub const TRACK: f32 = 200.;
 pub const METER: f32 = 238.;
 pub const SEGMENTS: usize = 20;
 
-/// White 16 %: a switch that is off, a slider's empty side, an unlit segment.
+/// A switch that is off, a slider's empty side, an unlit segment.
 pub fn switch_off() -> Rgba {
-    gpui::rgba(0xffffff29)
+    if theme::is_light() {
+        gpui::rgba(0x00000029)
+    } else {
+        gpui::rgba(0xffffff29)
+    }
 }
 
 fn knob() -> Rgba {

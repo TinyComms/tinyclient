@@ -156,8 +156,10 @@ pub(super) enum Confirm {
     /// A shorter retention, with what it would delete when chatd said.
     Retention { days: u32, prunable: Option<(u64, u64)> },
     Clear,
+    ExportAll,
     Reset,
     TinyEverywhere(Box<AccountStatus>),
+    EditProfile(Box<AccountStatus>),
 }
 
 /// Which device menu is open.
@@ -429,6 +431,15 @@ pub struct SettingsWindow {
     pub(super) loopback: bool,
     /// Shared by the page, scrollbar, and screenshot harness.
     pane_scroll: gpui::ScrollHandle,
+    /// Comma-separated keywords for Settings › Notifications › Keywords (NK).
+    pub(super) notify_keywords: Entity<TextInput>,
+    /// Custom proxy host and port for Settings › General › Network (GN2).
+    pub(super) proxy_host: Entity<TextInput>,
+    pub(super) proxy_port: Entity<TextInput>,
+    /// Own-profile edit fields for Settings › Accounts › Edit profile modal.
+    pub(super) profile_name: Entity<TextInput>,
+    pub(super) profile_about: Entity<TextInput>,
+    pub(super) profile_pronouns: Entity<TextInput>,
     /// The Linux passphrase for the screen lock. Other systems use the device prompt.
     #[cfg(target_os = "linux")]
     lock_phrase: Entity<TextInput>,
@@ -438,6 +449,42 @@ pub struct SettingsWindow {
 impl SettingsWindow {
     fn new(shell: WeakEntity<Shell>, section: Section, phone: bool, window: &mut Window, cx: &mut Context<Self>) -> SettingsWindow {
         let search = cx.new(|cx| TextInput::new("Search settings", cx));
+        let initial_kw = prefs::values()
+            .stored(protocol::settings::GLOBAL, protocol::settings::NOTIFY_KEYWORDS)
+            .unwrap_or("")
+            .to_owned();
+        let notify_keywords = cx.new(|cx| {
+            let mut input = TextInput::new("deploy, incident, your name", cx);
+            if !initial_kw.is_empty() {
+                input.insert(&initial_kw, cx);
+            }
+            input
+        });
+        let initial_host = prefs::values()
+            .stored(protocol::settings::GLOBAL, protocol::settings::PROXY_HOST)
+            .unwrap_or("")
+            .to_owned();
+        let initial_port = prefs::values()
+            .stored(protocol::settings::GLOBAL, protocol::settings::PROXY_PORT)
+            .unwrap_or("")
+            .to_owned();
+        let proxy_host = cx.new(|cx| {
+            let mut input = TextInput::new("127.0.0.1", cx);
+            if !initial_host.is_empty() {
+                input.insert(&initial_host, cx);
+            }
+            input
+        });
+        let proxy_port = cx.new(|cx| {
+            let mut input = TextInput::new("1080", cx);
+            if !initial_port.is_empty() {
+                input.insert(&initial_port, cx);
+            }
+            input
+        });
+        let profile_name = cx.new(|cx| TextInput::new("Display name", cx));
+        let profile_about = cx.new(|cx| TextInput::new("About me", cx));
+        let profile_pronouns = cx.new(|cx| TextInput::new("Pronouns", cx));
         #[cfg(target_os = "linux")]
         let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
@@ -452,6 +499,11 @@ impl SettingsWindow {
             cx.subscribe_in(&search, window, |this, _, event: &InputKey, window, cx| {
                 if *event == InputKey::Escape {
                     this.dismiss(window, cx);
+                }
+            }),
+            cx.subscribe_in(&notify_keywords, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::Submit = event {
+                    this.save_keywords(cx);
                 }
             }),
         ];
@@ -511,6 +563,12 @@ impl SettingsWindow {
             chord_clash: None,
             loopback: false,
             pane_scroll: gpui::ScrollHandle::new(),
+            notify_keywords,
+            proxy_host,
+            proxy_port,
+            profile_name,
+            profile_about,
+            profile_pronouns,
             #[cfg(target_os = "linux")]
             lock_phrase,
             _subscriptions: subscriptions,

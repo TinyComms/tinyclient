@@ -81,6 +81,7 @@ const TABLES: &str = "
         position INTEGER NOT NULL DEFAULT 0,
         muted    INTEGER NOT NULL DEFAULT 0,
         hide_muted INTEGER NOT NULL DEFAULT 0,
+        can_create_channels INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     -- A folder: of chats (Telegram, membership on the conversation) or of Spaces (Discord,
@@ -177,6 +178,8 @@ const TABLES: &str = "
         max_file_bytes INTEGER NOT NULL DEFAULT 0,
         read_only_reason TEXT NOT NULL DEFAULT '',
         spam INTEGER NOT NULL DEFAULT 0,
+        rights INTEGER NOT NULL DEFAULT 0,
+        disappearing INTEGER,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -296,7 +299,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -317,6 +320,7 @@ const IN_INBOX: &str = "(NOT c.hidden AND c.special != 'request'
 const IS_UNREAD: &str = "(((c.unread > 0 AND NOT c.bot AND NOT c.archived) OR c.mentions > 0) AND NOT c.muted)";
 const IS_MENTION: &str = "(c.mentions > 0)";
 const IS_APP: &str = "(c.bot AND c.unread > 0)";
+const IS_ACTIVITY: &str = "(NOT c.muted AND (c.mentions > 0 OR (c.kind = 'thread' AND c.followed AND c.unread > 0) OR EXISTS (SELECT 1 FROM message m WHERE m.network = c.network AND m.account = c.account AND m.conversation = c.id AND json_extract(m.body, '$.outgoing') = 1 AND json_array_length(json_extract(m.body, '$.reactions')) > 0)))";
 
 const PERSON: &str = "
     SELECT p.network, p.account, p.id, p.name, p.handle, p.bot, p.relation, p.status, p.link,
@@ -390,6 +394,10 @@ pub struct ConversationRow {
     pub read_only_reason: String,
     /// Flagged as spam by the network (e.g. Discord spam message request).
     pub spam: bool,
+    /// Per-conversation moderation and management rights for this account.
+    pub rights: protocol::ConversationRights,
+    /// Disappearing-messages timer in seconds (`None` leaves stored value unchanged on upsert).
+    pub disappearing: Option<u32>,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -486,6 +494,8 @@ impl ConversationRow {
             max_file_bytes: 0,
             read_only_reason: String::new(),
             spam: false,
+            rights: protocol::ConversationRights::default(),
+            disappearing: None,
         }
     }
 }
@@ -722,6 +732,8 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         max_file_bytes: row.get::<_, i64>(51)? as u64,
         read_only_reason: row.get(52)?,
         spam: row.get(53)?,
+        rights: protocol::ConversationRights::from_bits(row.get(54)?),
+        disappearing: row.get::<_, Option<i64>>(55)?.and_then(|v| (v > 0).then_some(v as u32)),
     })
 }
 
@@ -731,6 +743,7 @@ fn counts_from(row: &Row) -> rusqlite::Result<InboxCounts> {
         unread: row.get(1)?,
         mentions: row.get(2)?,
         apps: row.get(3)?,
+        activity: row.get(4)?,
     })
 }
 
@@ -876,9 +889,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -892,6 +905,8 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              max_file_bytes = excluded.max_file_bytes,
              read_only_reason = excluded.read_only_reason,
              spam = excluded.spam,
+             rights = CASE WHEN excluded.rights = 0 THEN rights ELSE excluded.rights END,
+             disappearing = COALESCE(excluded.disappearing, disappearing),
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -932,6 +947,8 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.max_file_bytes as i64,
             row.read_only_reason,
             row.spam,
+            row.rights.to_bits(),
+            row.disappearing.map(i64::from),
         ],
     )?;
     Ok(())
@@ -1001,6 +1018,12 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "spam")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN spam INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !column(db, "conversation", "rights")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN rights INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "disappearing")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN disappearing INTEGER")?;
+    }
     Ok(true)
 }
 
@@ -1057,6 +1080,15 @@ impl Store {
         store.migrate_reminders()?;
         // The revision table is new and must not wipe a cache that is already at this schema.
         store.ensure_revisions()?;
+        if !column(&store.db, "conversation", "rights")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN rights INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "disappearing")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN disappearing INTEGER")?;
+        }
+        if !column(&store.db, "space", "can_create_channels")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(store)
     }
 
@@ -1267,7 +1299,7 @@ impl Store {
                     (SELECT f.id FROM folder f
                       WHERE f.network = s.network AND f.account = s.account
                         AND instr(f.spaces, ',' || s.id || ',') > 0 LIMIT 1),
-                    s.muted, s.hide_muted
+                    s.muted, s.hide_muted, s.can_create_channels
              FROM space s
              LEFT JOIN media m ON m.network = s.network AND m.account = s.account AND m.id = s.icon
              WHERE ?1 IS NULL OR s.network = ?1
@@ -1284,6 +1316,7 @@ impl Store {
                 folder: row.get(14)?,
                 muted: row.get(15)?,
                 hide_muted: row.get(16)?,
+                can_create_channels: row.get(17)?,
             })
         })?;
         rows.collect()
@@ -1510,6 +1543,152 @@ impl Store {
             .optional()
     }
 
+    /// Lists cached conversations matching `scope` for local export. Never touches any network
+    /// and never includes member lists.
+    pub fn export_conversations(&self, scope: &protocol::ExportScope) -> rusqlite::Result<Vec<Conversation>> {
+        match scope {
+            protocol::ExportScope::Conversation { conversation } => {
+                Ok(self.conversation(conversation)?.into_iter().collect())
+            }
+            protocol::ExportScope::Account { account } => {
+                let mut stmt = self.db.prepare(&format!(
+                    "{CONVERSATION} WHERE c.network = ?1 AND c.account = ?2 ORDER BY c.updated DESC, c.id"
+                ))?;
+                let rows = stmt.query_map(params![word(&account.network), account.account], conversation_from)?;
+                rows.collect()
+            }
+            protocol::ExportScope::All => {
+                let mut stmt = self.db.prepare(&format!(
+                    "{CONVERSATION} ORDER BY c.network, c.account, c.updated DESC, c.id"
+                ))?;
+                let rows = stmt.query_map([], conversation_from)?;
+                rows.collect()
+            }
+        }
+    }
+
+    /// Reads all cached, non-expired messages of `conversation` in chronological order,
+    /// filtered by optional `since` / `until` unix seconds. Never pages any network.
+    pub fn export_messages(
+        &self,
+        conversation: &Key,
+        since: Option<i64>,
+        until: Option<i64>,
+        now: i64,
+    ) -> rusqlite::Result<Vec<Message>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3
+                AND (expires IS NULL OR expires > ?4)
+              {OLDEST_FIRST}"
+        ))?;
+        let mut rows: Vec<Message> = stmt
+            .query_map(
+                params![word(&conversation.network), conversation.account, conversation.id, now],
+                message_from,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.retain(|m| {
+            if let Some(s) = since {
+                if m.sent < s {
+                    return false;
+                }
+            }
+            if let Some(u) = until {
+                if m.sent > u {
+                    return false;
+                }
+            }
+            if m.expires_at.is_some_and(|at| at <= now) {
+                return false;
+            }
+            true
+        });
+        let account = conversation.account();
+        for msg in &mut rows {
+            for att in &mut msg.attachments {
+                if att.file.path.is_none() {
+                    att.file.path = self.cached_media_path(&account, &att.file.id)?;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// On-disk path of a cached media file, if present.
+    pub fn cached_media_path(&self, account: &AccountKey, id: &str) -> rusqlite::Result<Option<String>> {
+        let path: Option<String> = self
+            .db
+            .query_row(
+                "SELECT path FROM media WHERE network = ?1 AND account = ?2 AND id = ?3 AND path != ''",
+                params![word(&account.network), account.account, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
+    /// Resolves a parsed network message/channel link against cached conversations across
+    /// signed-in accounts. Never creates or joins a conversation.
+    pub fn resolve_link(&self, link: &protocol::link::NetworkLink) -> rusqlite::Result<Option<Conversation>> {
+        let net = word(&link.network);
+        let mut stmt = self.db.prepare(&format!(
+            "{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 ORDER BY c.updated DESC LIMIT 16"
+        ))?;
+        let candidates: Vec<Conversation> = stmt
+            .query_map(params![net, link.channel], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        if !candidates.is_empty() {
+            if let Some(space) = &link.space {
+                let lower = space.to_ascii_lowercase();
+                if let Some(hit) = candidates.iter().find(|c| {
+                    c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space))
+                        || c.space_title.to_ascii_lowercase().contains(&lower)
+                        || c.key.account.to_ascii_lowercase().contains(&lower)
+                }) {
+                    return Ok(Some(hit.clone()));
+                }
+            }
+            return Ok(Some(candidates.into_iter().next().unwrap()));
+        }
+        if let Some(thread_id) = &link.thread_id {
+            let threaded = format!("{}:{thread_id}", link.channel);
+            if let Some(hit) = self
+                .db
+                .query_row(
+                    &format!("{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 LIMIT 1"),
+                    params![net, threaded],
+                    conversation_from,
+                )
+                .optional()?
+            {
+                return Ok(Some(hit));
+            }
+        }
+        if link.network == Network::Telegram {
+            let bare = link.channel.trim_start_matches('@');
+            let at = format!("@{bare}");
+            if let Some(hit) = self
+                .db
+                .query_row(
+                    &format!(
+                        "{CONVERSATION}
+                         LEFT JOIN person p ON p.network = c.network AND p.account = c.account AND p.id = c.peer
+                         WHERE c.network = 'telegram'
+                           AND (lower(p.handle) = lower(?1) OR lower(p.handle) = lower(?2) OR lower(c.title) = lower(?1))
+                         ORDER BY c.updated DESC LIMIT 1"
+                    ),
+                    params![bare, at],
+                    conversation_from,
+                )
+                .optional()?
+            {
+                return Ok(Some(hit));
+            }
+        }
+        Ok(None)
+    }
+
     /// Cached Telegram channels and supergroups still contributing unread counts. The adapter verifies
     /// membership for rows its paged dialog list did not confirm.
     pub(crate) fn unread_telegram_channels(&self, account: &AccountKey, after: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
@@ -1571,7 +1750,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1618,6 +1797,8 @@ impl Store {
                         max_file_bytes: row.get::<_, i64>(21)?.max(0) as u64,
                         read_only_reason: row.get(22)?,
                         spam: row.get(23)?,
+                        rights: protocol::ConversationRights::from_bits(row.get(24)?),
+                        disappearing: row.get::<_, Option<i64>>(25)?.and_then(|v| (v > 0).then_some(v as u32)),
                     },
                 ))
             })?
@@ -1658,11 +1839,12 @@ impl Store {
             InboxFilter::All => "1",
             InboxFilter::Unread => IS_UNREAD,
             InboxFilter::Mentions => IS_MENTION,
+            InboxFilter::Activity => IS_ACTIVITY,
             InboxFilter::Directs => "c.kind IN ('direct', 'group')",
         };
         let belongs = format!("{IN_INBOX} AND (?1 IS NULL OR c.network = ?1) AND {narrowed}{}", not_these(hidden));
         let first = match filter {
-            InboxFilter::Unread | InboxFilter::Mentions => "c.mentions > 0",
+            InboxFilter::Unread | InboxFilter::Mentions | InboxFilter::Activity => "c.mentions > 0",
             InboxFilter::All | InboxFilter::Directs => "c.starred",
         };
         let network = network.map(|network| word(&network));
@@ -1688,7 +1870,7 @@ impl Store {
         self.db.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM({IS_UNREAD}), 0), COALESCE(SUM({IS_MENTION}), 0),
-                        COALESCE(SUM({IS_APP}), 0)
+                        COALESCE(SUM({IS_APP}), 0), COALESCE(SUM({IS_ACTIVITY}), 0)
                    FROM conversation c WHERE {IN_INBOX} AND (?1 IS NULL OR c.network = ?1){}",
                 not_these(hidden)
             ),
@@ -1737,7 +1919,7 @@ impl Store {
         let counts = self.db.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM({IS_UNREAD}), 0), COALESCE(SUM({IS_MENTION}), 0),
-                        COALESCE(SUM({IS_APP}), 0)
+                        COALESCE(SUM({IS_APP}), 0), COALESCE(SUM({IS_ACTIVITY}), 0)
                    FROM conversation c WHERE {belongs}"
             ),
             key,
@@ -1863,6 +2045,28 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Per-conversation moderation and management rights. True if anything changed.
+    pub fn set_rights(&mut self, conversation: &Key, rights: protocol::ConversationRights) -> rusqlite::Result<bool> {
+        let bits = rights.to_bits();
+        let changed = self.db.execute(
+            "UPDATE conversation SET rights = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND rights != ?4",
+            params![word(&conversation.network), conversation.account, conversation.id, bits],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Disappearing-messages timer for a conversation (seconds; `None` or `Some(0)` means off).
+    pub fn set_disappearing(&mut self, conversation: &Key, seconds: Option<u32>) -> rusqlite::Result<bool> {
+        let value = seconds.filter(|&s| s > 0).map(i64::from);
+        let changed = self.db.execute(
+            "UPDATE conversation SET disappearing = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND disappearing IS NOT ?4",
+            params![word(&conversation.network), conversation.account, conversation.id, value],
+        )?;
+        Ok(changed == 1)
+    }
+
     // Folders.
 
     /// The account's folders, all of them, in the network's order. A folder no longer listed goes.
@@ -1925,6 +2129,15 @@ impl Store {
             "UPDATE space SET muted = ?4, hide_muted = ?5
               WHERE network = ?1 AND account = ?2 AND id = ?3 AND (muted != ?4 OR hide_muted != ?5)",
             params![word(&space.network), space.account, space.id, muted, hide_muted],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_space_can_create_channels(&mut self, space: &Key, can: bool) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE space SET can_create_channels = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND can_create_channels != ?4",
+            params![word(&space.network), space.account, space.id, can],
         )?;
         Ok(changed == 1)
     }
@@ -2005,6 +2218,104 @@ impl Store {
             ))?
             .query_map(params![network.map(|network| word(&network)), pattern, limit], conversation_from)?
             .collect()
+    }
+
+    /// Filtered search within one account's cached messages, used by the Demo adapter and
+    /// filtered network search. Applies `from`, `has` (Files/Links/Images), `before`, `after`,
+    /// and `mentions_me`.
+    pub fn search_account_filtered(
+        &self,
+        account: &AccountKey,
+        conversation: Option<&str>,
+        space: Option<&str>,
+        query: &str,
+        filters: &protocol::SearchFilters,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<MessageHit>> {
+        let pattern = format!("%{}%", like_prefix(query));
+        let mut stmt = self.db.prepare(
+            "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
+                    COALESCE(s.name, '')
+               FROM message m
+               JOIN conversation c ON c.network = m.network AND c.account = m.account
+                  AND c.id = m.conversation
+               LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
+               WHERE m.pending = 0
+                 AND m.network = ?1 AND m.account = ?2
+                 AND (?3 = '' OR m.text LIKE ?3 ESCAPE '\\')
+                 AND (?4 IS NULL OR m.conversation = ?4)
+                 AND (?5 IS NULL OR c.space = ?5)
+                 AND (?6 IS NULL OR m.sent < ?6)
+                 AND (?7 IS NULL OR m.sent > ?7)
+                 AND (m.expires IS NULL OR m.expires > ?8)
+                 AND NOT c.hidden AND c.special != 'request'
+               ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                word(&account.network),
+                account.account,
+                if query.is_empty() { "" } else { pattern.as_str() },
+                conversation,
+                space,
+                filters.before,
+                filters.after,
+                crate::hub::now(),
+            ],
+            |row| {
+                let text: String = row.get(5)?;
+                let body: String = row.get(6)?;
+                let message: Message = serde_json::from_str(&body).map_err(broken)?;
+                Ok((
+                    MessageHit {
+                        conversation: key_at(row)?,
+                        message_id: row.get(3)?,
+                        sent: row.get(4)?,
+                        sender: message.sender.name.clone(),
+                        snippet: snippet(&text, query),
+                        title: row.get(7)?,
+                        space_title: row.get(8)?,
+                        outgoing: message.outgoing,
+                    },
+                    message,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for item in rows {
+            let (hit, msg) = item?;
+            if let Some(from) = &filters.from {
+                if msg.sender.id != from.id {
+                    continue;
+                }
+            }
+            if filters.mentions_me && !msg.mentions_me {
+                continue;
+            }
+            if let Some(has) = filters.has {
+                let ok = match has {
+                    protocol::SearchHas::Files => !msg.attachments.is_empty(),
+                    protocol::SearchHas::Images => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Image | protocol::MediaKind::Gif)),
+                    protocol::SearchHas::Links => {
+                        !msg.previews.is_empty()
+                            || msg.text.contains("http://")
+                            || msg.text.contains("https://")
+                            || msg.spans.iter().any(|s| matches!(s.style, protocol::Style::Link { .. }))
+                    }
+                };
+                if !ok {
+                    continue;
+                }
+            }
+            out.push(hit);
+            if out.len() >= limit as usize {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Cached messages whose text contains `query`, newest first. Hidden conversations and
@@ -3052,6 +3363,20 @@ impl Store {
     /// True if it was there. A message with a thread hanging off it stays as a tombstone, and
     /// every stored reply to the message says its original is gone. The preview is left to the
     /// next message.
+    /// Updates a stored message's `pinned` flag in place. Returns true if the message existed
+    /// and its flag changed.
+    pub fn set_pinned(&mut self, conversation: &Key, id: &str, pinned: bool) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        if message.pinned == pinned {
+            return Ok(false);
+        }
+        message.pinned = pinned;
+        self.ingest(conversation, &message, false)?;
+        Ok(true)
+    }
+
     pub fn delete_message(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
         let Some(mut message) = self.message(conversation, id)? else {
             return Ok(false);

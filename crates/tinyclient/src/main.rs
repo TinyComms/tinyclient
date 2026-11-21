@@ -96,7 +96,7 @@ fn print_status() -> io::Result<()> {
 fn print_search(query: &str) -> io::Result<()> {
     let request = Request::SearchMessages { conversation: None, network: None, space: None, query: query.to_owned(), limit: PAGE_LIMIT };
     let hits = match ask(&request)? {
-        Response::MessageHits { hits } => hits,
+        Response::MessageHits { hits, .. } => hits,
         other => return Err(unexpected(other)),
     };
     let now = view::now();
@@ -110,6 +110,70 @@ fn print_search(query: &str) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parses `--export <target>` into an `ExportScope`: `"all"` exports everything cached on this
+/// device, and `<network>:<account>:<conversation_id>` exports one conversation.
+fn parse_export_scope(target: &str) -> Result<protocol::ExportScope, String> {
+    let trimmed = target.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(protocol::ExportScope::All);
+    }
+    let mut parts = trimmed.splitn(3, ':');
+    let net_str = parts.next().unwrap_or("");
+    let account = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    if account.is_empty() || id.is_empty() {
+        return Err("expected `all` or `<network>:<account>:<conversation_id>`".to_owned());
+    }
+    let network = match net_str.to_ascii_lowercase().as_str() {
+        "discord" => protocol::Network::Discord,
+        "slack" => protocol::Network::Slack,
+        "telegram" => protocol::Network::Telegram,
+        "teams" => protocol::Network::Teams,
+        "signal" => protocol::Network::Signal,
+        "messages" => protocol::Network::Messages,
+        "tiny" => protocol::Network::Tiny,
+        _ => return Err(format!("unknown network `{net_str}`")),
+    };
+    Ok(protocol::ExportScope::Conversation {
+        conversation: protocol::Key { network, account: account.to_owned(), id: id.to_owned() },
+    })
+}
+
+/// `--text --export <conversation|all>`: writes an unencrypted local cache export to disk.
+fn run_export(target: &str, out_dir: Option<&str>, include_files: bool) -> io::Result<()> {
+    let scope = parse_export_scope(target).map_err(|why| io::Error::new(ErrorKind::InvalidInput, why))?;
+    let destination = match out_dir {
+        Some(dir) => dir.to_owned(),
+        None => {
+            let now = view::now();
+            protocol::support_dir()
+                .join("exports")
+                .join(format!("export-{now}"))
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let request = Request::Export {
+        scope,
+        destination,
+        since: None,
+        until: None,
+        include_files,
+    };
+    match ask(&request)? {
+        Response::Exported { path, conversations, messages, files, earliest, latest } => {
+            println!("Exported {messages} cached messages and {files} files across {conversations} conversation(s) to {path}");
+            if let (Some(a), Some(b)) = (earliest, latest) {
+                println!("Cached range: {a}..={b} (unix seconds)");
+            }
+            println!("Warning: this export is unencrypted on disk (including messages that were end-to-end encrypted in transit).");
+            Ok(())
+        }
+        Response::Error { detail, .. } => Err(io::Error::other(detail)),
+        other => Err(unexpected(other)),
+    }
 }
 
 /// `--notify-test`: asks chatd to post the test notification (N13) and says what came of it.
@@ -160,8 +224,20 @@ fn main() -> ExitCode {
         },
         None => None,
     };
+    let export_target = match args.iter().position(|arg| arg == "--export") {
+        Some(at) => match args.get(at + 1) {
+            Some(target) => Some(target.as_str()),
+            None => {
+                tracing::warn!("tinyclient: --export needs a conversation (<network>:<account>:<id>) or `all`");
+                return ExitCode::from(64);
+            }
+        },
+        None => None,
+    };
+    let export_out = args.iter().position(|arg| arg == "--out").and_then(|at| args.get(at + 1)).map(String::as_str);
+    let export_files = !args.iter().any(|arg| arg == "--no-files");
     #[cfg(all(windows, feature = "gui"))]
-    if args.iter().any(|arg| arg == "--version" || arg == "--text" || arg == "--notify-test") || query.is_some() {
+    if args.iter().any(|arg| arg == "--version" || arg == "--text" || arg == "--notify-test") || query.is_some() || export_target.is_some() {
         borrow_console();
     }
     // Before the window opens: it is how an installed package proves it runs, with no display.
@@ -367,7 +443,7 @@ fn main() -> ExitCode {
     }
     let _log = protocol::log_policy::install("tinyclient", protocol::log_policy::LogPolicy::from_env());
     #[cfg(feature = "gui")]
-    if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {
+    if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() && export_target.is_none() {
         let invite = launch_invite(&args);
         let action = quick::launch_action(&args);
         // A second launch hands the first one its invite, or a quick action, and exits.
@@ -392,10 +468,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let done = match query {
-        Some(query) => print_search(query),
-        None if args.iter().any(|arg| arg == "--notify-test") => notify_test(),
-        None => print_status(),
+    let done = match (export_target, query) {
+        (Some(target), _) => run_export(target, export_out, export_files),
+        (None, Some(query)) => print_search(query),
+        (None, None) if args.iter().any(|arg| arg == "--notify-test") => notify_test(),
+        (None, None) => print_status(),
     };
     match done {
         Ok(()) => ExitCode::SUCCESS,
@@ -423,5 +500,18 @@ mod invite_launch_tests {
         let room = protocol::room_link("https://example.org", "lounge").unwrap();
         assert_eq!(launch_invite(&[room.clone()]), Some(room));
         assert_eq!(launch_invite(&[link, "tinyclient://join#broken".into(), "tinyclient://room?server=example.org&id=..".into()]), None);
+    }
+
+    #[test]
+    fn parses_export_cli_targets() {
+        assert_eq!(parse_export_scope("all"), Ok(protocol::ExportScope::All));
+        assert_eq!(
+            parse_export_scope("discord:acct1:chan9"),
+            Ok(protocol::ExportScope::Conversation {
+                conversation: protocol::Key { network: protocol::Network::Discord, account: "acct1".into(), id: "chan9".into() },
+            })
+        );
+        assert!(parse_export_scope("bad").is_err());
+        assert!(parse_export_scope("bogus:acct:chan").is_err());
     }
 }

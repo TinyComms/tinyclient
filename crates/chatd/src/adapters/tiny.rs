@@ -425,26 +425,32 @@ fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
 /// connect and the TLS handshake, slow on Windows) is made once and kept for the next request.
 /// The pool is per host inside it, and an idle connection is let go after [`IDLE`].
 fn agent() -> ureq::Agent {
-    static SHARED: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    SHARED
-        .get_or_init(|| {
-            ureq::Agent::config_builder()
-                .tls_config(crate::tls::config())
-                .timeout_global(Some(TIMEOUT))
-                .max_idle_age(IDLE)
-                .http_status_as_error(false)
-                .max_redirects(0)
-                .max_redirects_will_error(false)
-                .user_agent("tinyclient")
-                .build()
-                .into()
-        })
-        .clone()
+    static SHARED: std::sync::Mutex<Option<(protocol::settings::ProxyConfig, ureq::Agent)>> =
+        std::sync::Mutex::new(None);
+    let cfg = crate::adapters::net::proxy_config();
+    let mut guard = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((saved, agent)) = guard.as_ref() {
+        if *saved == cfg {
+            return agent.clone();
+        }
+    }
+    let built: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+        .tls_config(crate::tls::config())
+        .timeout_global(Some(TIMEOUT))
+        .max_idle_age(IDLE)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .user_agent("tinyclient")
+        .build()
+        .into();
+    *guard = Some((cfg, built.clone()));
+    built
 }
 
 /// A bespoke agent for a request with its own long timeout (an upload). It keeps no pool.
 fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
