@@ -5045,3 +5045,64 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
 }
+
+#[test]
+fn forward_message_sends_type_1_reference_with_guild_id_content_note_and_refuses_read_only() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add a read-only channel 4199 in guild 4000 (SEND_MESSAGES = 2048 denied for @everyone).
+    ready["guilds"][0]["channels"].as_array_mut().unwrap().push(json!({
+        "id": "4199",
+        "type": 0,
+        "name": "readonly-log",
+        "position": 9,
+        "parent_id": "4100",
+        "permission_overwrites": [
+            {"id": "4000", "type": 0, "allow": "0", "deny": "2048"}
+        ]
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Advertises Capabilities::forward.
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap().can,
+        other => panic!("expected Status, got {other:?}"),
+    };
+    assert!(caps.forward, "Discord must advertise Capabilities::forward");
+
+    // Forward from guild channel 4101 to DM 3001 and read-only channel 4199 with an optional note.
+    let resp = world.ask(Request::Forward {
+        from: world.key("4101"),
+        message_ids: vec!["1300000000000000100".into()],
+        to: vec![world.key("3001"), world.key("4199")],
+        note: "See above!".into(),
+    });
+    match resp {
+        Response::Forwarded { results } => {
+            assert_eq!(results.len(), 2);
+            assert!(results[0].ok, "DM forward should succeed: {:?}", results[0]);
+            assert!(!results[1].ok, "read-only channel forward must be refused: {:?}", results[1]);
+            assert!(
+                results[1].error.as_deref().unwrap_or("").to_ascii_lowercase().contains("read-only"),
+                "expected read-only error, got {:?}",
+                results[1].error
+            );
+        }
+        other => panic!("expected Response::Forwarded, got {other:?}"),
+    }
+
+    // No HTTP POST should have been sent to read-only channel 4199.
+    assert!(world.discord.requests_to("POST", "/channels/4199/messages").is_empty());
+
+    // DM 3001 receives native forward (type: 1, content: "", guild_id: "4000") + follow-up note.
+    let dm_posts = world.discord.requests_to("POST", "/channels/3001/messages");
+    assert_eq!(dm_posts.len(), 2, "expected forward + note POSTs, got {dm_posts:?}");
+    assert_eq!(dm_posts[0].body["content"], json!(""));
+    assert_eq!(dm_posts[0].body["message_reference"]["type"], json!(1));
+    assert_eq!(dm_posts[0].body["message_reference"]["channel_id"], json!("4101"));
+    assert_eq!(dm_posts[0].body["message_reference"]["message_id"], json!("1300000000000000100"));
+    assert_eq!(dm_posts[0].body["message_reference"]["guild_id"], json!("4000"));
+    assert_eq!(dm_posts[1].body["content"], json!("See above!"));
+}

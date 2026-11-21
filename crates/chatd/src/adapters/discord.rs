@@ -1348,15 +1348,25 @@ impl Discord {
     ) -> Result<Vec<(String, Result<(), String>)>, Refusal> {
         let mut results = Vec::with_capacity(targets.len());
         let note = note.trim();
+        let from_guild = self.ctx.known(from).ok().flatten().and_then(|c| self.guild_of(&c));
         for target in targets {
+            if self.ctx.known(target).ok().flatten().is_some_and(|c| c.read_only) {
+                results.push((target.clone(), Err("This conversation is read-only.".to_owned())));
+                continue;
+            }
             let mut err: Option<String> = None;
             for mid in message_ids {
+                let mut reference = serde_json::json!({
+                    "type": 1,
+                    "channel_id": from,
+                    "message_id": mid,
+                });
+                if let Some(guild) = &from_guild {
+                    reference["guild_id"] = serde_json::json!(guild);
+                }
                 let body = serde_json::json!({
-                    "message_reference": {
-                        "type": 1,
-                        "channel_id": from,
-                        "message_id": mid,
-                    }
+                    "content": "",
+                    "message_reference": reference,
                 });
                 if let Err(e) = self.call("POST", &format!("/channels/{target}/messages"), Some(body)) {
                     err = Some(match refusal(e) {
