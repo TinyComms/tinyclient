@@ -1773,7 +1773,7 @@ impl Pane {
                             this.say(text, cx);
                         }
                         if let Some(url) = answer.url.filter(|s| !s.is_empty()) {
-                            let _ = crate::host::open_url(&url);
+                            cx.open_url(&url);
                         }
                     }
                     Ok(Response::Error { detail, .. }) => this.say(detail, cx),
@@ -2122,9 +2122,9 @@ impl Pane {
             .right_0()
             .px(px(12.))
             .py(px(6.))
-            .bg(theme::bar())
+            .bg(theme::raised())
             .border_b_1()
-            .border_color(theme::rule())
+            .border_color(theme::hairline())
             .flex()
             .flex_col()
             .gap(px(4.))

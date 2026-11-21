@@ -2497,7 +2497,7 @@ impl Pane {
                     .justify_center()
                     .type_small()
                     .font_weight(theme::MEDIUM)
-                    .text_color(if muted { theme::muted() } else { theme::text() })
+                    .text_color(if muted { theme::text_disabled() } else { theme::text() })
                     .cursor_pointer()
                     .when(pending, |d| d.opacity(0.6))
                     .hover(|s| s.bg(theme::hover()))
