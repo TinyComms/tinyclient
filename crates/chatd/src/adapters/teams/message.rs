@@ -1166,7 +1166,7 @@ impl Teams {
     /// Records a page. In a channel the posts are its own and each reply goes to its chain; a
     /// chain, a chat and anything else holds every message itself. `more_before` is true when
     /// Teams gave a cursor for a still older page.
-    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<(), Fault> {
+    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<Vec<Message>, Fault> {
         let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
         let (mut own, mut replies): (Vec<Message>, Vec<(String, Message)>) = (Vec::new(), Vec::new());
         for raw in raws {
@@ -1217,7 +1217,7 @@ impl Teams {
                 self.bump(conversation, root, &of(root), false)?;
             }
         }
-        Ok(())
+        Ok(own)
     }
 
     /// The newest page. A reply chain keeps the cursor, the same way a chat does, so scrolling
@@ -1230,18 +1230,19 @@ impl Teams {
             self.chain_known(channel, root)?;
             let (messages, older) = self.page(conversation, CHAIN, "startTime=1")?;
             self.remember_cursor(conversation, &messages, &older);
-            return self.record(conversation, &messages, !older.is_empty());
+            self.record(conversation, &messages, !older.is_empty())?;
+            return Ok(());
         }
         let (messages, older) = self.page(conversation, PAGE, "startTime=1")?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages, !older.is_empty())?;
-        self.recount_unread(conversation, &messages)?;
+        let own = self.record(conversation, &messages, !older.is_empty())?;
+        self.recount_unread(conversation, &own)?;
         self.seen_by(conversation)
     }
 
     /// Counts actual unread messages newer than the consumption horizon on a freshly fetched
     /// newest page (capped at [`PAGE`]), replacing Teams' boolean "1" from the initial list.
-    fn recount_unread(&self, conversation: &str, raws: &[Value]) -> Result<(), Fault> {
+    fn recount_unread(&self, conversation: &str, own: &[Message]) -> Result<(), Fault> {
         if chain_of(conversation).is_some() {
             return Ok(());
         }
@@ -1252,19 +1253,7 @@ impl Teams {
             return Ok(());
         }
         let read_ms = row.last_read.as_deref().map(millis).unwrap_or(0);
-        let channel = row.kind == ConversationKind::Channel;
-        let mut page_msgs = Vec::new();
-        for raw in raws {
-            let root = placed(raw).and_then(|(_, root)| root);
-            if let Read::Message(message) = self.read(conversation, raw) {
-                if channel && root.as_deref().is_some_and(|r| r != message.id) {
-                    continue;
-                }
-                if message.kind != MessageKind::System {
-                    page_msgs.push(*message);
-                }
-            }
-        }
+        let page_msgs: Vec<&Message> = own.iter().filter(|m| m.kind != MessageKind::System).collect();
         let cutoff_ms = if read_ms > 0 {
             read_ms
         } else {
@@ -1352,7 +1341,7 @@ impl Teams {
         let note = self.ctx.note(&format!("older:{conversation}")).unwrap_or_default();
         let (messages, older) = self.page(conversation, history_limit(conversation), &older_window(&note, before))?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages, !older.is_empty())
+        self.record(conversation, &messages, !older.is_empty()).map(|_| ())
     }
 
     /// True when a reply older than `before` is already stored, so this scroll was fetched.
@@ -1373,7 +1362,7 @@ impl Teams {
             return Ok(());
         }
         let (messages, _) = self.page(conversation, PAGE, &format!("startTime={}", millis(after)))?;
-        self.record(conversation, &messages, true)
+        self.record(conversation, &messages, true).map(|_| ())
     }
 
     /// The page that ends just after `around`; what follows it is asked for as it is read.
@@ -1390,7 +1379,7 @@ impl Teams {
         if chain {
             self.remember_cursor(conversation, &messages, &older);
         }
-        self.record(conversation, &messages, !older.is_empty())
+        self.record(conversation, &messages, !older.is_empty()).map(|_| ())
     }
 
     // Acting on messages.

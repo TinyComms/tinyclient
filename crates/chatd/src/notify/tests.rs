@@ -724,5 +724,5 @@ fn urgent_messages_bypass_conversation_mute_and_prefix_notifications() {
 
     let imp_verdict = decide(&values, &dm(), &important, &now).expect("important verdict");
     notes.message(&dm(), &important, &imp_verdict, Instant::now());
-    assert_eq!(fake.log().posted.last().unwrap().body, "IMPORTANT: need review");
+    assert_eq!(fake.log().posted.last().unwrap().body, "URGENT: prod outage\nIMPORTANT: need review");
 }

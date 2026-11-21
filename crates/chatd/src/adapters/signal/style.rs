@@ -241,6 +241,44 @@ pub fn parse_with_inline_mentions(
     (built.text, built.ranges)
 }
 
+/// Expands inline `<@aci>` tokens into plain `@Name` text without emitting `\u{FFFC}` or
+/// `MentionAci` body ranges (for 1:1 DMs where official Signal clients do not support mentions).
+pub fn parse_plain_inline_mentions(
+    source: &str,
+    resolve: impl Fn(&str) -> String,
+) -> (String, Vec<Range>) {
+    if !source.contains("<@") {
+        return parse(source);
+    }
+    let mut expanded = String::with_capacity(source.len());
+    let mut at = 0;
+    while at < source.len() {
+        let rest = &source[at..];
+        if let Some(after) = rest.strip_prefix("<@") {
+            if let Some(close) = after.find('>') {
+                let aci = &after[..close];
+                if super::wire::is_aci(aci) {
+                    let resolved = resolve(aci);
+                    if resolved.is_empty() {
+                        expanded.push_str("@Signal user");
+                    } else if resolved.starts_with('@') {
+                        expanded.push_str(&resolved);
+                    } else {
+                        expanded.push('@');
+                        expanded.push_str(&resolved);
+                    }
+                    at += 2 + close + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        expanded.push(ch);
+        at += ch.len_utf8();
+    }
+    parse(&expanded)
+}
+
 /// Byte spans for `ranges` on `text`, which has no mention placeholders left.
 pub fn spans(text: &str, ranges: &[Range]) -> Vec<Span> {
     apply(text, ranges, "").spans

@@ -1069,9 +1069,9 @@ impl Wire for Fake {
             Body::Text { text, quote: None, ranges, timer, previews } => {
                 format!("send {} text {text}{}{}{}", describe(to), noted(ranges), exp(*timer), prev(previews))
             }
-            Body::Files { text, quote, files, timer } => {
+            Body::Files { text, quote, ranges, files, timer } => {
                 let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
-                format!("{}{}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), exp(*timer))
+                format!("{}{}{}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), noted(ranges), exp(*timer))
             }
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
             Body::Edit { target, text, ranges, timer } => format!("send {} edit {target} {text}{}{}", describe(to), noted(ranges), exp(*timer)),

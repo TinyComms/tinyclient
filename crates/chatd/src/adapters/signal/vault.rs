@@ -275,14 +275,18 @@ impl Vault {
     }
 
     /// Returns the stored serialized 33-byte identity key for a contact ACI, if known.
+    /// When an unapproved key change is pending (e.g. a send-side rotation), prefers the new key
+    /// recorded in `identity_state.{aci}` over the stale `aci.trusted.{aci}` entry so the user
+    /// sees and approves the new safety number rather than the old one.
     pub fn peer_identity_key(&self, aci: &str) -> Option<Vec<u8>> {
+        let rec = self.identity_record(aci);
+        if rec.unapproved_change && !rec.key.is_empty() {
+            return Some(rec.key);
+        }
         self.get(&format!("aci.trusted.{aci}"))
             .ok()
             .flatten()
-            .or_else(|| {
-                let rec = self.identity_record(aci);
-                (!rec.key.is_empty()).then_some(rec.key)
-            })
+            .or_else(|| (!rec.key.is_empty()).then_some(rec.key))
     }
 
     /// Updates a contact's verification state, optionally updating their stored key and clearing any
@@ -294,7 +298,8 @@ impl Vault {
             rec.key = key.to_vec();
             let _ = self.put(&format!("aci.trusted.{aci}"), key);
         } else if let Some(stored) = self.peer_identity_key(aci) {
-            rec.key = stored;
+            rec.key = stored.clone();
+            let _ = self.put(&format!("aci.trusted.{aci}"), &stored);
         }
         if clear_change {
             rec.unapproved_change = false;
@@ -313,11 +318,9 @@ impl Vault {
         rec.state = state;
         if !key.is_empty() {
             rec.key = key.to_vec();
-            if self.get(&format!("aci.trusted.{aci}")).ok().flatten().is_none() {
-                let _ = self.put(&format!("aci.trusted.{aci}"), key);
-            }
+            let _ = self.put(&format!("aci.trusted.{aci}"), key);
         }
-        if state == IdentityState::Verified && (key.is_empty() || rec.key.as_slice() == key) {
+        if state == IdentityState::Verified && !key.is_empty() && rec.key.as_slice() == key {
             rec.unapproved_change = false;
         }
         let _ = self.put_identity_record(aci, &rec);

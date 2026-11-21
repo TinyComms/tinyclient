@@ -2003,9 +2003,20 @@ fn apply(account: &Account, event: Event) {
             let _ = ctx.details(&[(aci, PersonDetails { mark, ..PersonDetails::default() })]);
         }
         Event::Pinned { peer, by, author, target, duration_secs } => {
-            let conv = peer.conversation();
-            if account.live().blocked.contains(&conv) {
+            if target == 0 || author.is_empty() {
                 return;
+            }
+            let conv = peer.conversation();
+            {
+                let live = account.live();
+                if live.blocked.contains(&conv) {
+                    return;
+                }
+                if matches!(peer, Peer::Group(_))
+                    && live.group_info.get(&conv).is_some_and(|g| !group_rights(g, &by).pin)
+                {
+                    return;
+                }
             }
             let msg_id = wire::message_id(target, &author);
             let now = crate::hub::now();
@@ -2030,8 +2041,16 @@ fn apply(account: &Account, event: Event) {
             sys.kind = MessageKind::System;
             let _ = ctx.message(&conv, &sys);
         }
-        Event::Unpinned { peer, by: _, author, target } => {
+        Event::Unpinned { peer, by, author, target } => {
+            if target == 0 || author.is_empty() {
+                return;
+            }
             let conv = peer.conversation();
+            if matches!(peer, Peer::Group(_))
+                && account.live().group_info.get(&conv).is_some_and(|g| !group_rights(g, &by).pin)
+            {
+                return;
+            }
             let msg_id = wire::message_id(target, &author);
             account.live().remove_pin(&conv, &msg_id);
             let _ = ctx.pinned(&conv, &msg_id, false);
@@ -2042,7 +2061,10 @@ fn apply(account: &Account, event: Event) {
                 let _ = ctx.message(&conv, &stored);
             }
         }
-        Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
+        Event::Caught => {
+            prune_expired_pins(account);
+        }
+        Event::Closed(_) | Event::Ended(_) => {}
     }
 }
 
@@ -3727,7 +3749,8 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
     let quote = quote_of(account, conversation, reply_to)?;
     let attachment = show_file(account, client_id, 0, &gif_file);
     let timer = account.live().timer_of(conversation);
-    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: vec![gif_file], timer }) {
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, &[]);
+    let sent = match account.wire.send(&to, Body::Files { text: wire_body, quote: quote.clone(), ranges, files: vec![gif_file], timer }) {
         Ok(sent) => sent,
         Err(fault) => {
             forget_landed(&[attachment]);
@@ -3736,7 +3759,15 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
     };
     account.live().echoed(sent);
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        text: shown.text,
+        spans: shown.spans,
+        quote,
+        ..Text::default()
+    };
     let mut message = message(account, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
@@ -3818,6 +3849,30 @@ fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Re
     })
 }
 
+/// Formats outgoing text for Signal: GroupsV2 encode mentions as `\u{FFFC}` + UTF-16 `MentionAci`
+/// ranges, while 1:1 DMs expand any `<@aci>` tokens into plain `@Name` text so official clients
+/// never display a literal object-replacement glyph (`￼`).
+fn format_outgoing_body(
+    account: &Account,
+    to: &Peer,
+    text: &str,
+    mention_spans: &[Span],
+) -> (String, Vec<style::Range>, style::Styled) {
+    let resolve = |aci: &str| {
+        if aci == account.me {
+            "you".to_owned()
+        } else {
+            account.live().known_name(aci)
+        }
+    };
+    let (wire_body, ranges) = match to {
+        Peer::Group(_) => style::parse_with_inline_mentions(text, mention_spans, resolve),
+        Peer::Direct(_) => style::parse_plain_inline_mentions(text, resolve),
+    };
+    let shown = style::apply(&wire_body, &ranges, &account.me);
+    (wire_body, ranges, shown)
+}
+
 fn send_text(
     account: &Account,
     conversation: &str,
@@ -3827,14 +3882,7 @@ fn send_text(
     suppress_embeds: bool,
 ) -> Result<Message, Fault> {
     let to = peer(conversation)?;
-    let (wire_body, ranges) = style::parse_with_inline_mentions(text, mention_spans, |aci| {
-        if aci == account.me {
-            "you".to_owned()
-        } else {
-            account.live().known_name(aci)
-        }
-    });
-    let shown = style::apply(&wire_body, &ranges, &account.me);
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, mention_spans);
     let quote = quote_of(account, conversation, reply_to)?;
     let (timer, previews_enabled) = {
         let live = account.live();
@@ -3949,7 +3997,8 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     // would keep every payload in memory a second time for the whole upload.
     let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
     let timer = account.live().timer_of(conversation);
-    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared, timer }) {
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, &[]);
+    let sent = match account.wire.send(&to, Body::Files { text: wire_body, quote: quote.clone(), ranges, files: prepared, timer }) {
         Ok(sent) => sent,
         Err(fault) => {
             forget_landed(&attachments);
@@ -3958,7 +4007,15 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     };
     account.live().echoed(sent);
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        text: shown.text,
+        spans: shown.spans,
+        quote,
+        ..Text::default()
+    };
     let mut message = message(account, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
@@ -4030,14 +4087,7 @@ fn edit(account: &Account, conversation: &str, message_id: &str, text: &str, men
     if !can(sent, now_ms(), true, conversation == account.me).edit {
         return Err(Fault::Refused("This message can no longer be edited.".to_owned()));
     }
-    let (wire_body, ranges) = style::parse_with_inline_mentions(text, mention_spans, |aci| {
-        if aci == account.me {
-            "you".to_owned()
-        } else {
-            account.live().known_name(aci)
-        }
-    });
-    let shown = style::apply(&wire_body, &ranges, &account.me);
+    let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, mention_spans);
     let timer = account.live().timer_of(conversation);
     account.wire.send(&to, Body::Edit { target: sent, text: wire_body, ranges, timer })?;
     if let Ok(Some(mut message)) = account.ctx.stored_message(conversation, message_id) {

@@ -227,14 +227,17 @@ impl Teams {
         };
         let read_ms = super::millis(read);
         let prev_ms = row.last_read.as_deref().map(super::millis).unwrap_or(0);
-        let newest = match conversation["lastMessage"]["id"].as_str() {
-            Some(newest) => Some(newest.to_owned()),
-            None => self.ctx.newest(id)?,
+        let newest = match super::id_of(&conversation["lastMessage"]) {
+            newest if !newest.is_empty() => Some(newest),
+            _ => self.ctx.newest(id)?,
         };
         let behind = newest.as_deref().is_some_and(|newest| super::millis(newest) > read_ms);
-        if read_ms < prev_ms || behind {
+        let rolled_back = read_ms < prev_ms;
+        if rolled_back || behind {
             self.ctx.manual_ack(id, read, None)?;
-            if behind && self.ctx.known(id)?.is_some_and(|after| after.unread == 0) {
+            if (behind || (rolled_back && newest.is_none()))
+                && self.ctx.known(id)?.is_some_and(|after| after.unread == 0)
+            {
                 self.ctx.mark_unread(id)?;
             }
         } else {

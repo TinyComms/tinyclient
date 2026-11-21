@@ -507,13 +507,38 @@ pub struct LinkPreview {
 }
 
 /// Returns true only when `url` is a valid `http://` or `https://` URL that actually appears
-/// in the message `body` (matching Signal Desktop/Android/iOS validation).
+/// as a complete URL token in the message `body` (matching Signal Desktop/Android/iOS validation
+/// and preventing prefix-domain spoofing such as `https://example.co` matching `https://example.com`).
 pub fn preview_url_in_body(body: &str, url: &str) -> bool {
     let url = url.trim();
     if url.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
         return false;
     }
-    body.contains(url)
+    let mut offset = 0;
+    while let Some(rel) = body[offset..].find(url) {
+        let start = offset + rel;
+        let end = start + url.len();
+        let before_ok = body[..start].chars().next_back().is_none_or(|ch| {
+            ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '<' | '"' | '\'' | ',' | ';')
+        });
+        let tail = &body[end..];
+        let after_ok = match tail.chars().next() {
+            None => true,
+            Some(ch) if ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '>' | '"' | '\'' | ',' | ';' | '!') => true,
+            Some('.') => tail[1..].chars().next().is_none_or(|next| {
+                next.is_whitespace() || matches!(next, ')' | ']' | '}' | '>' | '"' | '\'')
+            }),
+            Some(_) => false,
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        offset = start + 1;
+        while offset < body.len() && !body.is_char_boundary(offset) {
+            offset += 1;
+        }
+    }
+    false
 }
 
 /// One message's words.
@@ -820,8 +845,8 @@ pub struct File {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
     Text { text: String, quote: Option<Quote>, ranges: Vec<Range>, timer: Timer, previews: Vec<LinkPreview> },
-    /// Files, with the caption in `text` (empty when there is none).
-    Files { text: String, quote: Option<Quote>, files: Vec<File>, timer: Timer },
+    /// Files, with the caption in `text` (empty when there is none) and optional body `ranges`.
+    Files { text: String, quote: Option<Quote>, ranges: Vec<Range>, files: Vec<File>, timer: Timer },
     React { author: String, target: u64, emoji: String, remove: bool },
     Edit { target: u64, text: String, ranges: Vec<Range>, timer: Timer },
     /// Delete for everyone.

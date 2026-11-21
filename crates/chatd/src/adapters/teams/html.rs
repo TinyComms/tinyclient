@@ -458,7 +458,7 @@ impl Builder<'_> {
             return;
         }
         if let Some(forward) = &mut self.forward {
-            element.field = match attr(attrs, "itemprop") {
+            element.field = match attr(attrs, "itemprop").to_ascii_lowercase().as_str() {
                 "mri" => {
                     let mri = attr(attrs, "itemid");
                     if !mri.is_empty() {

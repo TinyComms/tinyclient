@@ -21,7 +21,6 @@ use presage::libsignal_service::groups_v2::{AccessControl, AccessRequired, Membe
 use presage::libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use presage::libsignal_service::master_key::StorageServiceKey;
 use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, MasterKey, ProfileKey, PushService, ServiceCredentials, ServiceError, Uuid};
-use presage::libsignal_service::profile_cipher::ProfileCipher;
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::{AttachmentSpec, AttachmentUploadError, MessageSenderError};
@@ -1276,11 +1275,17 @@ impl Session {
             return;
         }
         if let Some(pin) = &message.pin_message {
-            let target_author = pin
+            let Some(target_author) = pin
                 .target_author_aci_binary
                 .as_deref()
                 .and_then(aci_bytes)
-                .unwrap_or_default();
+                .filter(|a| !a.is_empty())
+            else {
+                return;
+            };
+            let Some(target) = pin.target_sent_timestamp.filter(|&ts| ts > 0) else {
+                return;
+            };
             let duration_secs = match pin.pin_duration {
                 Some(data_message::pin_message::PinDuration::PinDurationSeconds(secs)) if secs > 0 => Some(secs),
                 _ => None,
@@ -1289,22 +1294,28 @@ impl Session {
                 peer,
                 by: author.to_owned(),
                 author: target_author,
-                target: pin.target_sent_timestamp.unwrap_or(0),
+                target,
                 duration_secs,
             });
             return;
         }
         if let Some(unpin) = &message.unpin_message {
-            let target_author = unpin
+            let Some(target_author) = unpin
                 .target_author_aci_binary
                 .as_deref()
                 .and_then(aci_bytes)
-                .unwrap_or_default();
+                .filter(|a| !a.is_empty())
+            else {
+                return;
+            };
+            let Some(target) = unpin.target_sent_timestamp.filter(|&ts| ts > 0) else {
+                return;
+            };
             self.tell(Event::Unpinned {
                 peer,
                 by: author.to_owned(),
                 author: target_author,
-                target: unpin.target_sent_timestamp.unwrap_or(0),
+                target,
             });
             return;
         }
@@ -1748,34 +1759,9 @@ impl Session {
         let Some(key) = self.manager.store().profile_key(&id).await.ok().flatten() else {
             return Ok(PersonProfile { key_known: false, ..PersonProfile::default() });
         };
-        // Prefer the raw SignalServiceProfile over websocket so we can also read visible badges.
-        if let Ok(credentials) = self.credentials() {
-            let mut push = PushService::new(SignalServers::Production, Some(credentials.clone()), "tinyclient");
-            if let Ok(mut socket) = push.ws::<Identified>("/v1/websocket/", "/v1/keepalive", &[], Some(credentials)).await {
-                if let Ok(encrypted) = socket.retrieve_profile_by_id(Aci::from(uuid), Some(key)).await {
-                    let badges: Vec<String> = encrypted
-                        .badges
-                        .iter()
-                        .filter(|b| b.visible && !b.name.trim().is_empty())
-                        .map(|b| b.name.trim().to_owned())
-                        .collect();
-                    let cipher = ProfileCipher::new(key);
-                    if let Ok(decrypted) = cipher.decrypt(encrypted) {
-                        let name = decrypted.name.map(|n| n.to_string()).unwrap_or_default();
-                        if !name.is_empty() {
-                            self.names.insert(aci.to_owned(), name.clone());
-                        }
-                        return Ok(PersonProfile {
-                            name,
-                            about: decrypted.about.unwrap_or_default(),
-                            emoji: decrypted.about_emoji.unwrap_or_default(),
-                            badges,
-                            key_known: true,
-                        });
-                    }
-                }
-            }
-        }
+        // Use the manager's existing Signal connection rather than opening a competing Identified
+        // websocket to `/v1/websocket/` (Signal closes the live receiving socket on duplicate
+        // identified connections for the same `(aci, device_id)`).
         let profile = self.manager.retrieve_profile_by_uuid(Aci::from(uuid), key).await.map_err(fault)?;
         let name = profile.name.map(|n| n.to_string()).unwrap_or_default();
         if !name.is_empty() {
@@ -2668,7 +2654,7 @@ impl Session {
                     ..Default::default()
                 })
             }
-            Body::Files { text, quote, files, timer } => {
+            Body::Files { text, quote, ranges, files, timer } => {
                 let mut attachments = Vec::with_capacity(files.len());
                 for file in files {
                     let name = file.name.clone();
@@ -2696,6 +2682,7 @@ impl Session {
                 }
                 ContentBody::DataMessage(DataMessage {
                     body: (!text.is_empty()).then_some(text),
+                    body_ranges: proto_ranges(&ranges),
                     attachments,
                     quote: quoted(quote),
                     timestamp: Some(at),
