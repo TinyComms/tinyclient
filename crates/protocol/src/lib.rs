@@ -1869,6 +1869,17 @@ pub enum Request {
         muted: bool,
         deafened: bool,
     },
+    /// Rings people in the current direct/group call (`None` rings everyone in the conversation).
+    /// Single explicit user action; never retried.
+    CallRing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        people: Option<Vec<String>>,
+    },
+    /// Stops ringing specific people in the current direct/group call (`None` stops ringing all).
+    CallStopRinging {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        people: Option<Vec<String>>,
+    },
     /// Where the official app takes this conversation's call.
     Handoff {
         conversation: Key,

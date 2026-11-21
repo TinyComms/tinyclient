@@ -1138,12 +1138,12 @@ impl Shell {
     pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let account = call.conversation.account();
         let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
-        people.sort_by_key(|who| who.name.to_lowercase());
-        let count = people.len() + 1;
-        let noun = if count == 1 { "PERSON" } else { "PEOPLE" };
+        people.sort_by_key(|who| (who.ringing, who.name.to_lowercase()));
+        let joined_count = people.iter().filter(|p| !p.ringing).count() + 1;
+        let noun = if joined_count == 1 { "PERSON" } else { "PEOPLE" };
         let own = super::components::Avatar::named("You", 22.).build();
         let heard = call.speaking && !call.muted && !call.deafened;
-        let mut rows = Vec::with_capacity(count);
+        let mut rows = Vec::with_capacity(people.len() + 1);
         rows.push(
             div()
                 .w_full()
@@ -1161,6 +1161,55 @@ impl Shell {
                 .into_any_element(),
         );
         for who in people {
+            let key = Key { network: call.conversation.network, account: call.conversation.account.clone(), id: who.id.clone() };
+            let face = self.call_participant_picture(&account, who, cx);
+            let avatar = super::components::Avatar::new(&key, &who.name, 22.).image_at(face).build();
+            if who.ringing {
+                let stop_id = who.id.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("call-ringing-row-{}", who.id)))
+                        .w_full()
+                        .h(px(32.))
+                        .flex_none()
+                        .pl(px(12.))
+                        .pr(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(13.))
+                        .text_color(theme::text_faint())
+                        .child(ringed(avatar, 22., false))
+                        .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
+                        .child(div().flex_none().type_micro().text_color(theme::text_faint()).child("Ringing…"))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("call-stop-ring-{}", who.id)))
+                                .flex_none()
+                                .px(px(6.))
+                                .h(px(20.))
+                                .rounded(px(6.))
+                                .bg(theme::hover())
+                                .hover(|s| s.bg(theme::danger_soft()).text_color(theme::danger()))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .type_micro()
+                                .text_color(theme::text_soft())
+                                .tooltip(tip("Stop ringing", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.call_ask(
+                                        Request::CallStopRinging { people: Some(vec![stop_id.clone()]) },
+                                        cx,
+                                    );
+                                }))
+                                .child("Stop"),
+                        )
+                        .into_any_element(),
+                );
+                continue;
+            }
             let (percent, muted) = self.call_gain(&account, &who.id);
             let gain_tag = if muted {
                 Some("Muted for you".to_owned())
@@ -1169,9 +1218,6 @@ impl Shell {
             } else {
                 None
             };
-            let key = Key { network: call.conversation.network, account: call.conversation.account.clone(), id: who.id.clone() };
-            let face = self.call_participant_picture(&account, who, cx);
-            let avatar = super::components::Avatar::new(&key, &who.name, 22.).image_at(face).build();
             let menu_account = account.clone();
             let menu_id = who.id.clone();
             let menu_name = who.name.clone();
@@ -1211,6 +1257,7 @@ impl Shell {
                     .into_any_element(),
             );
         }
+        let can_ring_group = call.conversation.network == Network::Discord && subject.kind == ConversationKind::Group;
         div()
             .flex()
             .flex_col()
@@ -1221,10 +1268,33 @@ impl Shell {
                     .px(px(12.))
                     .flex()
                     .items_center()
+                    .justify_between()
                     .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text_faint())
-                    .child(format!("{} · {count} {noun}", subject.title.to_uppercase())),
+                    .child(format!("{} · {joined_count} {noun}", subject.title.to_uppercase()))
+                    .when(can_ring_group, |header| {
+                        header.child(
+                            div()
+                                .id("call-ring-group")
+                                .px(px(6.))
+                                .h(px(20.))
+                                .rounded(px(6.))
+                                .bg(theme::hover())
+                                .hover(|s| s.bg(theme::selected()).text_color(theme::text()))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .type_micro()
+                                .text_color(theme::text_soft())
+                                .tooltip(tip("Ring everyone in the group", None))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.call_ask(Request::CallRing { people: None }, cx);
+                                }))
+                                .child("Ring"),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1537,7 +1607,7 @@ impl Shell {
 
     /// The name of whoever was in this call with me and is not any more.
     pub(super) fn call_left_alone(&self, call: &Call) -> Option<String> {
-        if call.state != CallState::Joined || !call.participants.is_empty() {
+        if call.state != CallState::Joined || call.participants.iter().any(|p| !p.ringing) {
             return None;
         }
         #[cfg(feature = "gui-shot")]

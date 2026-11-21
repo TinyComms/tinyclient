@@ -136,6 +136,9 @@ pub struct Participant {
     /// They hold the room's share.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sharing: bool,
+    /// Being rung for this call and not yet joined (Discord DM / group DM calls).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ringing: bool,
 }
 
 /// The most screens and windows `mediad --screens` lists.

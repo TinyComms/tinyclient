@@ -1777,10 +1777,10 @@ impl Calls {
                 participant.speaking = live.talking.contains(&participant.id);
             }
             live.call.participants = participants;
-            // The first other person in a call we rang is the answer.
+            // The first other person who actually joined a call we rang is the answer.
             if live.call.state == CallState::RingingOut
                 && live.connected
-                && !live.call.participants.is_empty()
+                && live.call.participants.iter().any(|p| !p.ringing)
             {
                 live.join();
             }
@@ -2084,11 +2084,11 @@ fn arrival(call: &Call, roster: &[Participant], now: i64) -> Option<Cue> {
     if call.state != CallState::Joined || call.joined == 0 || now - call.joined < SETTLING || roster.len() > OCCUPANTS_LIMIT {
         return None;
     }
-    let had = |id: &str| call.participants.iter().any(|p| p.id == id);
-    let has = |id: &str| roster.iter().any(|p| p.id == id);
-    if roster.iter().any(|p| !had(&p.id)) {
+    let had = |id: &str| call.participants.iter().any(|p| !p.ringing && p.id == id);
+    let has = |id: &str| roster.iter().any(|p| !p.ringing && p.id == id);
+    if roster.iter().any(|p| !p.ringing && !had(&p.id)) {
         Some(Cue::Joined)
-    } else if call.participants.iter().any(|p| !has(&p.id)) {
+    } else if call.participants.iter().any(|p| !p.ringing && !has(&p.id)) {
         Some(Cue::Left)
     } else {
         None

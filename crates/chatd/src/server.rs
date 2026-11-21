@@ -3328,6 +3328,34 @@ impl Chat {
                 }
                 Err(err) => call_error(err),
             },
+            Request::CallRing { people } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallRing {
+                    conversation_id,
+                    people,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallStopRinging { people } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallStopRinging {
+                    conversation_id,
+                    people,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Handoff { conversation } => {
                 let conversation_id = conversation.id.clone();
                 match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {

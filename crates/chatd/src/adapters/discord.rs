@@ -1720,6 +1720,12 @@ impl Discord {
             Command::CallLeave(conversation_id) => self.call_leave(&conversation_id),
             Command::CallAudio { muted, deafened } => self.call_audio(muted, deafened),
             Command::CallPicture(picture) => self.call_picture(picture),
+            Command::CallRing { conversation_id, people, reply } => {
+                answer(reply, self.call_ring(&conversation_id, people))
+            }
+            Command::CallStopRinging { conversation_id, people, reply } => {
+                answer(reply, self.call_stop_ringing(&conversation_id, people))
+            }
             // The user asked to sign out, so the token should stop working, not just be
             // forgotten: the answer goes once Discord has ended the session, or refused to.
             Command::SignOut(done) => {

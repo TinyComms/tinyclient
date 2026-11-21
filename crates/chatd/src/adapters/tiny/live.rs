@@ -1942,6 +1942,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             priority: who.priority,
             camera: who.camera,
             sharing: who.sharing,
+            ringing: false,
         });
         ctx.participants(room, roster.collect());
     }
@@ -2663,6 +2664,7 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
             priority: who.priority,
             camera: who.camera,
             sharing: who.sharing,
+            ringing: false,
         });
     ctx.participants(direct_id, roster.collect());
 }

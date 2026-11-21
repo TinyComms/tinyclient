@@ -1074,6 +1074,19 @@ impl Shell {
                     }))
             })
         });
+        let ring_again = (call.conversation.network == Network::Discord
+            && subject.kind.is_direct()
+            && joined
+            && enabled
+            && alone.is_some())
+        .then(|| {
+            control("call-ring-again", "icons/phone-outgoing.svg", Look::Rest, true)
+                .tooltip(tip("Ring again", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_ask(Request::CallRing { people: None }, cx);
+                }))
+        });
         let devices = control(
             "call-devices",
             "icons/settings.svg",
@@ -1123,6 +1136,7 @@ impl Shell {
             .when(in_call(call), |row| row.child(deafen.flex_1().min_w_0()))
             .children(share.map(|button| button.flex_1().min_w_0()))
             .children(camera.map(|button| button.flex_1().min_w_0()))
+            .children(ring_again.map(|button| button.flex_1().min_w_0()))
             .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
             .child(
                 end.when(in_call(call), |button| button.flex_1().min_w_0())

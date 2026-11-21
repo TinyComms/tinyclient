@@ -4526,3 +4526,75 @@ fn dm_call_message_updates_outcome_participants_and_unread_without_double_count(
     world.discord.push("MESSAGE_ACK", json!({"channel_id": dm, "message_id": call_msg_id, "mention_count": 0}));
     wait("unread cleared by MESSAGE_ACK", || (world.conversation(dm).unread == 0).then_some(()));
 }
+
+#[test]
+fn discord_call_ring_stop_ringing_and_ringing_roster() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    let dm = "3001";
+    world.discord.script(&format!("/channels/{dm}/call/ring"), 204, json!(null));
+    world.discord.script(&format!("/channels/{dm}/call/ring"), 204, json!(null));
+    world.discord.script(&format!("/channels/{dm}/call/ring"), 204, json!(null));
+    world.discord.script(&format!("/channels/{dm}/call/stop-ringing"), 204, json!(null));
+
+    // Start a direct call in DM 3001.
+    world.ask(Request::CallStart { conversation: world.key(dm) });
+    wait("the join", || world.discord.frames_of(4).pop());
+    // Our own voice state arrives so the initial ring proceeds.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": null, "channel_id": dm, "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false
+        }),
+    );
+
+    // CALL_UPDATE reports 2001 and 2002 are being rung -> surfaced as ringing: true participants.
+    world.discord.push(
+        "CALL_UPDATE",
+        json!({
+            "channel_id": dm,
+            "ringing": ["2001", "2002"],
+            "voice_states": []
+        }),
+    );
+    let active = wait("ringing participants reach shell", || {
+        call().filter(|c| {
+            let p1 = c.participants.iter().find(|p| p.id == "2001");
+            let p2 = c.participants.iter().find(|p| p.id == "2002");
+            p1.is_some_and(|p| p.ringing) && p2.is_some_and(|p| p.ringing)
+        })
+    });
+    assert_eq!(active.participants.iter().filter(|p| p.ringing).count(), 2);
+
+    // Stop ringing one person: POST /channels/{id}/call/stop-ringing with recipients: ["2002"].
+    assert_eq!(
+        world.ask(Request::CallStopRinging { people: Some(vec!["2002".into()]) }),
+        Response::Ok
+    );
+    let stopped = world.discord.requests_to("POST", &format!("/channels/{dm}/call/stop-ringing"));
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].body, json!({"recipients": ["2002"]}));
+
+    // Ring one specific person again: POST /channels/{id}/call/ring with recipients: ["2002"].
+    assert_eq!(
+        world.ask(Request::CallRing { people: Some(vec!["2002".into()]) }),
+        Response::Ok
+    );
+    // Ring everyone again: POST /channels/{id}/call/ring with recipients: null.
+    assert_eq!(world.ask(Request::CallRing { people: None }), Response::Ok);
+    let rung = world.discord.requests_to("POST", &format!("/channels/{dm}/call/ring"));
+    assert!(
+        rung.iter().any(|r| r.body == json!({"recipients": ["2002"]})),
+        "expected targeted ring body, got {:?}",
+        rung.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+    assert!(
+        rung.iter().any(|r| r.body == json!({"recipients": null})),
+        "expected ring-all body, got {:?}",
+        rung.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+}

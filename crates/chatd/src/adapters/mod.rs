@@ -586,6 +586,10 @@ pub enum Command {
     /// A camera, a screen share, or whose share to watch. Nothing answers: the call's own
     /// events say what the network did.
     CallPicture(Picture),
+    /// Rings everyone (`None`) or specific people (`Some`) in the current direct/group call.
+    CallRing { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
+    /// Stops ringing everyone (`None`) or specific people (`Some`) in the current direct/group call.
+    CallStopRinging { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),
@@ -612,6 +616,9 @@ impl Command {
             | Command::CreateGroup { reply, .. }
             | Command::StartThread { reply, .. }
             | Command::Handoff { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

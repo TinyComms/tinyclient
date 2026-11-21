@@ -42,8 +42,9 @@ fn person(call: &Call, who: &Participant, size: f32, picture: Option<std::path::
 /// Up to three 20 px avatars overlapping 6, then "+N". A speaker's edge turns `positive`.
 /// The box is sized outright and each avatar placed in it, so the title row measures it right.
 pub(super) fn stack(call: &Call, mut picture: impl FnMut(&Participant) -> Option<std::path::PathBuf>) -> Div {
-    let shown = call.participants.len().min(3);
-    let more = call.participants.len() - shown;
+    let active: Vec<&Participant> = call.participants.iter().filter(|p| !p.ringing).collect();
+    let shown = active.len().min(3);
+    let more = active.len() - shown;
     let chip = if more > 9 { 32. } else { 26. };
     let width = shown as f32 * 18. + if more > 0 { chip } else { 6. };
     let slot = |ix: usize, speaking: bool, width: f32| {
@@ -64,8 +65,8 @@ pub(super) fn stack(call: &Call, mut picture: impl FnMut(&Participant) -> Option
         .w(px(width))
         .h(px(24.))
         .children(
-            call.participants
-                .iter()
+            active
+                .into_iter()
                 .take(3)
                 .enumerate()
                 .map(|(ix, who)| slot(ix, who.speaking, 24.).child(person(call, who, 20., picture(who)))),
