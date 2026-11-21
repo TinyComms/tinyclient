@@ -57,6 +57,7 @@ impl Fault {
                 "MESSAGE_TOO_LONG" => "That message is too long for Telegram.".to_owned(),
                 "MESSAGE_EDIT_TIME_EXPIRED" => "This message is too old to edit.".to_owned(),
                 "MESSAGE_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
+                "CHAT_FORWARDS_RESTRICTED" | "MESSAGE_FORWARDS_RESTRICTED" => "Forwarding is disabled in this chat.".to_owned(),
                 "MESSAGE_DELETE_FORBIDDEN" => "You can't delete this message.".to_owned(),
                 "MESSAGE_ID_INVALID" => "That message is no longer there.".to_owned(),
                 "REACTION_INVALID" | "REACTIONS_TOO_MANY" => "That reaction isn't allowed here.".to_owned(),

@@ -3342,3 +3342,79 @@ fn shared_contact_send_and_receive() {
         world.calls()
     );
 }
+
+#[test]
+fn forward_to_chat_saved_messages_and_refuses_noforwards() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.forward, "Telegram must advertise forward capability");
+
+    // Open Odalys (u7002) so we have a message id to forward.
+    let msgs = world.until("u7002 messages", || {
+        let list = world.messages("u7002");
+        (!list.is_empty()).then_some(list)
+    });
+    let msg_id = msgs[0].id.clone();
+
+    // Forward to another chat (Tobin u7003) and to Saved Messages (u7001 / InputPeer::PeerSelf).
+    let resp = world.ask(Request::Forward {
+        from: key("u7002"),
+        message_ids: vec![msg_id.clone()],
+        to: vec![key("u7003"), key("u7001")],
+        note: String::new(),
+    });
+    match resp {
+        Response::Forwarded { results } => {
+            assert_eq!(results.len(), 2);
+            assert!(results[0].ok, "forward to u7003 failed: {:?}", results[0]);
+            assert!(results[1].ok, "forward to Saved Messages failed: {:?}", results[1]);
+        }
+        other => panic!("expected Forwarded, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("ForwardMessages u7002 -> u7003")),
+        "expected ForwardMessages to u7003, got: {:#?}",
+        world.calls()
+    );
+    assert!(
+        world.calls().iter().any(|c| c.contains("ForwardMessages u7002 -> self")),
+        "expected ForwardMessages to Saved Messages (InputPeer::PeerSelf), got: {:#?}",
+        world.calls()
+    );
+    // Target chat u7003 should now show the forwarded message with Forwarded metadata.
+    let fwd = world.until("forwarded message in u7003", || {
+        world.messages("u7003").into_iter().find(|m| m.forwarded.is_some())
+    });
+    assert!(fwd.forwarded.is_some());
+
+    // Protected noforwards chat refuses forwarding clearly.
+    world.steer("noforwards c9001");
+    let notes_msgs = world.until("c9001 messages", || {
+        let list = world.messages("c9001");
+        (!list.is_empty()).then_some(list)
+    });
+    let blocked = world.ask(Request::Forward {
+        from: key("c9001"),
+        message_ids: vec![notes_msgs[0].id.clone()],
+        to: vec![key("u7003")],
+        note: String::new(),
+    });
+    match blocked {
+        Response::Error { detail, .. } => {
+            assert!(
+                detail.to_lowercase().contains("forward"),
+                "expected clear noforwards refusal, got: {detail}"
+            );
+        }
+        Response::Forwarded { results } => {
+            assert!(!results[0].ok, "noforwards chat must refuse forwarding");
+            assert!(
+                results[0].error.as_deref().unwrap_or("").to_lowercase().contains("forward"),
+                "expected clear noforwards refusal, got: {:?}",
+                results[0]
+            );
+        }
+        other => panic!("expected refusal for noforwards chat, got {other:?}"),
+    }
+}

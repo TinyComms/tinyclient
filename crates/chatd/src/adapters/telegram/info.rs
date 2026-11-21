@@ -437,6 +437,9 @@ pub(super) fn forward(
     note: &str,
 ) -> Result<Vec<(String, Result<(), String>)>, Fault> {
     let (from_who, _) = Who::parse(from).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    if account.dir().get(from_who).is_some_and(|known| known.noforwards) {
+        return Err(invalid("CHAT_FORWARDS_RESTRICTED"));
+    }
     let from_peer = account.input(from_who)?;
     let ids: Vec<i32> = message_ids
         .iter()
@@ -452,14 +455,22 @@ pub(super) fn forward(
         .map_or(1, |d| d.as_nanos() as i64);
     for (t_ix, target) in targets.iter().enumerate() {
         let res: Result<(), Fault> = (|| {
-            let (to_who, top_msg_id) = Who::parse(target).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
-            let to_peer = account.input(to_who)?;
+            let (to_who, top_msg_id) = if matches!(target.as_str(), "self" | "saved") {
+                (Who::User(account.me), None)
+            } else {
+                Who::parse(target).ok_or_else(|| invalid("PEER_ID_INVALID"))?
+            };
+            let to_peer = if to_who == Who::User(account.me) {
+                tl::enums::InputPeer::PeerSelf
+            } else {
+                account.input(to_who)?
+            };
             let random_id: Vec<i64> = ids
                 .iter()
                 .enumerate()
                 .map(|(m_ix, _)| base.wrapping_add(((t_ix as i64) << 16) + m_ix as i64 + 1))
                 .collect();
-            account.ask(&tl::functions::messages::ForwardMessages {
+            let answer = account.ask(&tl::functions::messages::ForwardMessages {
                 silent: false,
                 background: false,
                 with_my_score: false,
@@ -482,8 +493,9 @@ pub(super) fn forward(
                 allow_paid_stars: None,
                 suggested_post: None,
             })?;
+            super::live::answered(account, &answer);
             if !note.is_empty() {
-                account.ask(&tl::functions::messages::SendMessage {
+                let note_answer = account.ask(&tl::functions::messages::SendMessage {
                     no_webpage: false,
                     silent: false,
                     background: false,
@@ -507,10 +519,11 @@ pub(super) fn forward(
                     allow_paid_stars: None,
                     suggested_post: None,
                 })?;
+                super::live::answered(account, &note_answer);
             }
             Ok(())
         })();
-        results.push((target.clone(), res.map_err(|e| format!("{e:?}"))));
+        results.push((target.clone(), res.map_err(|e| e.words())));
     }
     Ok(results)
 }

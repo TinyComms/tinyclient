@@ -554,6 +554,8 @@ struct World {
     cdn_reuploaded: bool,
     /// The first piece of `big-file` past the start has already been dropped once.
     large_broke: bool,
+    /// Chats marked as protected (`noforwards`) via `steer`.
+    noforwards: HashSet<Who>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -615,6 +617,7 @@ impl World {
             file_at_once: 0,
             cdn_reuploaded: false,
             large_broke: false,
+            noforwards: HashSet::new(),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1216,6 +1219,12 @@ impl World {
             }
             "peer-go" => {
                 self.peer_go = true;
+                Vec::new()
+            }
+            "noforwards" => {
+                if let Some((who, None)) = words.next().and_then(Who::parse) {
+                    self.noforwards.insert(who);
+                }
                 Vec::new()
             }
             "file-go" => {
@@ -2985,6 +2994,53 @@ impl World {
             let (kind, media) = held_media(&request.media, self.next + 1_000);
             self.log(&format!("UploadMedia {kind}"));
             return Some(answer(media));
+        }
+        if let Some(request) = asked::<f::messages::ForwardMessages>(body) {
+            let from_who = input_who(&request.from_peer);
+            let to_who = input_who(&request.to_peer);
+            let to_label = match request.to_peer {
+                tl::enums::InputPeer::PeerSelf => "self".to_owned(),
+                _ => to_who.text(),
+            };
+            self.log(&format!("ForwardMessages {} -> {} ids={:?}", from_who.text(), to_label, request.id));
+            if self.noforwards.contains(&from_who) {
+                return Some(Err(Fault::Rpc { code: 400, name: "CHAT_FORWARDS_RESTRICTED".to_owned(), value: None }));
+            }
+            let mut all = Vec::new();
+            for (idx, msg_id) in request.id.iter().enumerate() {
+                let text = self
+                    .messages
+                    .get(&from_who.text())
+                    .and_then(|map| map.get(msg_id))
+                    .and_then(|m| match m {
+                        tl::enums::Message::Message(m) => Some(m.message.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("forwarded #{msg_id}"));
+                self.next += 1;
+                let id = self.next;
+                let mut sent = message(to_who, id, ME, crate::hub::now() as i32, &text);
+                if !request.drop_author {
+                    let mut fwd: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(t0())]);
+                    fwd.from_id = Some(from_who.peer());
+                    sent.fwd_from = Some(fwd.into());
+                }
+                if let Some(topic) = request.top_msg_id {
+                    sent = in_topic(sent, topic);
+                }
+                self.store(request.top_msg_id, sent.clone());
+                let random_id = request.random_id.get(idx).copied().unwrap_or(i64::from(id));
+                let named: tl::enums::Update = tl::types::UpdateMessageId { id, random_id }.into();
+                let new: tl::enums::Update = match to_who {
+                    Who::Channel(_) => tl::types::UpdateNewChannelMessage { message: sent.into(), pts: 0, pts_count: 0 }.into(),
+                    _ => tl::types::UpdateNewMessage { message: sent.into(), pts: 0, pts_count: 0 }.into(),
+                };
+                let _ = events.send(update(named.clone()));
+                let _ = events.send(update(new.clone()));
+                all.push(named);
+                all.push(new);
+            }
+            return Some(answer(updates(all)));
         }
         if let Some(request) = asked::<f::messages::SendMedia>(body) {
             let peer = input_who(&request.peer);
