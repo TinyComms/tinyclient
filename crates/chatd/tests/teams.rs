@@ -347,6 +347,7 @@ impl Fake {
             }
             "/presence/v1/presence/getpresence/" if bearer("presence") => ok(self.fixture("presence").unwrap()),
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
+            "/presence/v1/me/publishnote" if bearer("presence") => ok(json!({})),
             // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
             _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
                 status: "200 OK",
@@ -1523,4 +1524,32 @@ fn leaving_a_group_chat_removes_myself_and_drops_the_row() {
     let left = world.fake.calls("DELETE", &format!("/v1/threads/19:grp1@thread.v2/members/{ME}"));
     assert_eq!(left.len(), 1);
     assert!(world.conversation(&grp1).is_none());
+}
+
+#[test]
+fn setting_a_status_message_publishes_the_note_and_availability() {
+    let world = World::start();
+    world.ready();
+
+    let set = Request::SetPresence {
+        account: key("").account(),
+        presence: Presence::Dnd,
+        status: Some("Heads down until 3".to_owned()),
+    };
+    assert_eq!(world.ask(set), Response::Ok);
+    let avail = world.fake.calls("PUT", "/presence/v1/me/forceavailability/").pop().expect("availability set");
+    assert_eq!(avail.json(), json!({"availability": "DoNotDisturb"}));
+    let note = world.fake.calls("PUT", "/presence/v1/me/publishnote").pop().expect("note published");
+    assert_eq!(note.json()["message"], json!("Heads down until 3"));
+    assert!(note.json()["expiry"].as_str().is_some_and(|e| !e.is_empty()));
+
+    // Clearing the status message publishes an empty note.
+    let clear = Request::SetPresence {
+        account: key("").account(),
+        presence: Presence::Online,
+        status: Some(String::new()),
+    };
+    assert_eq!(world.ask(clear), Response::Ok);
+    let cleared = world.fake.calls("PUT", "/presence/v1/me/publishnote").pop().expect("note cleared");
+    assert_eq!(cleared.json()["message"], json!(""));
 }
