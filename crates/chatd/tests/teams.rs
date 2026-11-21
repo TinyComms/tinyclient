@@ -496,7 +496,61 @@ impl Fake {
                         return ok(json!({"messages": msgs, "_metadata": {}}));
                     }
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
-                    "48:notifications" => "messages.activity",
+                    "48:notifications" => {
+                        if call.query.contains("syncState=actpage2") {
+                            return ok(json!({
+                                "messages": [
+                                    {
+                                        "id": "1760000800001",
+                                        "type": "Message",
+                                        "messagetype": "Text",
+                                        "contenttype": "text",
+                                        "content": "Missed call from Ana Ruiz",
+                                        "conversationid": "48:notifications",
+                                        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+                                        "imdisplayname": "Ana Ruiz",
+                                        "composetime": "2025-10-09T09:01:00.0000000Z",
+                                        "properties": {
+                                            "activity": json!({
+                                                "activityType": "missedCall",
+                                                "sourceThreadId": CHAT_ANA,
+                                                "sourceMessageId": "1760000500100",
+                                                "sourceUserId": ANA,
+                                                "sourceUserImDisplayName": "Ana Ruiz",
+                                                "messagePreview": "Missed call"
+                                            }).to_string()
+                                        }
+                                    },
+                                    {
+                                        "id": "1760000800002",
+                                        "type": "Message",
+                                        "messagetype": "Text",
+                                        "contenttype": "text",
+                                        "content": "You were added to Platform",
+                                        "conversationid": "48:notifications",
+                                        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{BEN}"),
+                                        "imdisplayname": "Ben Okafor",
+                                        "composetime": "2025-10-09T09:00:00.0000000Z",
+                                        "properties": {
+                                            "activity": json!({
+                                                "activityType": "reply",
+                                                "sourceThreadId": GENERAL,
+                                                "sourceMessageId": "1760000210210",
+                                                "sourceReplyChainId": ROOT,
+                                                "sourceUserId": BEN,
+                                                "sourceUserImDisplayName": "Ben Okafor",
+                                                "messagePreview": "On it"
+                                            }).to_string()
+                                        }
+                                    }
+                                ],
+                                "_metadata": {}
+                            }));
+                        }
+                        let mut first = self.fixture("messages.activity").unwrap();
+                        first["_metadata"]["backwardLink"] = json!("https://example.invalid/messages?syncState=actpage2");
+                        return ok(first);
+                    }
                     "48:saved" => {
                         let msgs = self.saved.lock().unwrap().clone();
                         return ok(json!({"messages": msgs, "_metadata": {}}));
@@ -2544,5 +2598,145 @@ fn pinned_and_saved_messages_read_write_and_push_update() {
         Response::Ok
     );
     assert!(!world.message(&general, "1760000100100").unwrap().starred);
+}
+
+#[test]
+fn activity_feed_pages_filters_marks_read_and_handles_live_push() {
+    let world = World::start();
+    world.ready();
+
+    let account = key(GENERAL).account();
+    assert!(world.account(HOME).can.activity_feed);
+
+    // 1. First page returns mentions and reactions with a cursor to page 2.
+    let (items, cursor) = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, cursor } => (items, cursor),
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].kind, protocol::ActivityItemKind::Mention);
+    assert_eq!(items[0].conversation, key("19:grp1@thread.v2"));
+    assert_eq!(items[0].message_id, "1759600000000");
+    assert_eq!(items[0].actor, "Ben Okafor");
+    assert!(items[0].unread);
+    assert_eq!(items[2].kind, protocol::ActivityItemKind::Reaction);
+    assert_eq!(cursor.as_deref(), Some("actpage2"));
+
+    // 2. Second page via cursor returns missed call and thread reply (pointing at the reply chain).
+    let (page2, cursor2) = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, cursor } => (items, cursor),
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2[0].kind, protocol::ActivityItemKind::MissedCall);
+    assert_eq!(page2[0].actor, "Ana Ruiz");
+    assert_eq!(page2[1].kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(page2[1].thread_id.as_deref(), Some("19:platform0general@thread.tacv2;messageid=1760000200200"));
+    assert_eq!(page2[1].conversation, key("19:platform0general@thread.tacv2;messageid=1760000200200"));
+    assert!(cursor2.is_none());
+
+    // 3. Kind filter narrows the feed to only matching entries.
+    let only_reactions = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: Some(protocol::ActivityItemKind::Reaction),
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, .. } => items,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(only_reactions.len(), 1);
+    assert_eq!(only_reactions[0].kind, protocol::ActivityItemKind::Reaction);
+
+    // 4. Mark single activity item read writes isRead property to 48:notifications and flips unread=false.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead {
+            account: account.clone(),
+            item_id: Some("1760000900001".to_owned()),
+        }),
+        Response::Ok
+    );
+    let read_call = world
+        .fake
+        .calls("PUT", "/48:notifications/messages/1760000900001/properties")
+        .pop()
+        .expect("activity item mark read PUT");
+    assert!(read_call.query.contains("name=isRead"));
+
+    let after_one = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, .. } => items,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(!after_one.iter().find(|i| i.id == "1760000900001").unwrap().unread);
+    assert!(after_one.iter().find(|i| i.id == "1760000900003").unwrap().unread);
+
+    // 5. Mark all activity read writes consumptionhorizon on 48:notifications.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead { account: account.clone(), item_id: None }),
+        Response::Ok
+    );
+    let horizon_call = world
+        .fake
+        .calls("PUT", "/48:notifications/properties")
+        .pop()
+        .expect("activity mark all read PUT");
+    assert!(horizon_call.query.contains("name=consumptionhorizon"));
+    let after_all = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, .. } => items,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(after_all.iter().all(|i| !i.unread));
+
+    // 6. Live push on 48:notifications is handled instead of dropped and increments mentions badge.
+    let deploys = key(DEPLOYS);
+    let mentions_before = world.conversation(&deploys).unwrap().mentions;
+    world.fake.push(
+        "NewMessage",
+        json!({
+            "id": "1760009990001",
+            "type": "Message",
+            "messagetype": "Text",
+            "contenttype": "text",
+            "content": "Check the release pipeline",
+            "conversationid": "48:notifications",
+            "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+            "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+            "imdisplayname": "Ana Ruiz",
+            "properties": {
+                "activity": json!({
+                    "activityType": "mention",
+                    "sourceThreadId": DEPLOYS,
+                    "sourceMessageId": "1760009990000",
+                    "sourceUserId": ANA,
+                    "sourceUserImDisplayName": "Ana Ruiz",
+                    "messagePreview": "Check the release pipeline"
+                }).to_string()
+            }
+        }),
+        false,
+    );
+    world.until("live activity mention updates deploys badge", || {
+        world.conversation(&deploys).filter(|row| row.mentions > mentions_before)
+    });
 }
 

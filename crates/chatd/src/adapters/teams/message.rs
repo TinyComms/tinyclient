@@ -1060,6 +1060,9 @@ impl Teams {
         let Some((place, root)) = placed(raw) else {
             return Ok(());
         };
+        if place == super::tree::ACTIVITY {
+            return self.heard_activity(raw);
+        }
         match self.read(&place, raw) {
             Read::Typing { person, name, on } => {
                 if person != self.me() && self.ctx.known(&place)?.is_some() {

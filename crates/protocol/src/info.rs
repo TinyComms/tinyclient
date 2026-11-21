@@ -711,6 +711,7 @@ pub enum ActivityItemKind {
     Mention,
     ThreadReply,
     Reaction,
+    MissedCall,
     App,
     Invite,
     Other,
@@ -1173,5 +1174,13 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn activity_item_kind_missed_call_round_trips() {
+        let wire = serde_json::to_string(&ActivityItemKind::MissedCall).unwrap();
+        assert_eq!(wire, "\"missed_call\"");
+        let back: ActivityItemKind = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, ActivityItemKind::MissedCall);
     }
 }

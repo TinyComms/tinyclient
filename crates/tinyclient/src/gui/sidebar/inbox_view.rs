@@ -343,11 +343,12 @@ impl Shell {
         use protocol::ActivityItemKind;
         let state = &self.sidebar_state;
         let current = state.activity_filter;
-        let chips: [(&str, Option<ActivityItemKind>); 5] = [
+        let chips: [(&str, Option<ActivityItemKind>); 6] = [
             ("All", None),
             ("Mentions", Some(ActivityItemKind::Mention)),
             ("Threads", Some(ActivityItemKind::ThreadReply)),
             ("Reactions", Some(ActivityItemKind::Reaction)),
+            ("Calls", Some(ActivityItemKind::MissedCall)),
             ("Apps", Some(ActivityItemKind::App)),
         ];
         let mut bar = div().flex_none().px(px(12.)).py(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
@@ -386,6 +387,7 @@ impl Shell {
                             format!("reacted {}", item.emoji)
                         }
                     }
+                    ActivityItemKind::MissedCall => "missed call".to_owned(),
                     ActivityItemKind::App => "app notification".to_owned(),
                     ActivityItemKind::Invite => "invited you".to_owned(),
                     ActivityItemKind::Other => "activity".to_owned(),

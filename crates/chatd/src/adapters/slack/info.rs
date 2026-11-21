@@ -529,6 +529,7 @@ impl Slack {
             ActivityItemKind::Mention => Some("at_mention,broadcast,keyword,usergroup_mention"),
             ActivityItemKind::ThreadReply => Some("thread_v2,thread"),
             ActivityItemKind::Reaction => Some("reaction"),
+            ActivityItemKind::MissedCall => None,
             ActivityItemKind::App => Some("app_mention,bot_dm,workflow"),
             ActivityItemKind::Invite => Some("channel_invite"),
             ActivityItemKind::Other => None,

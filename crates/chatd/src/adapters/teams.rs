@@ -347,6 +347,14 @@ struct State {
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
     scheduled: HashMap<String, i64>,
+    /// Newest activity item timestamp (ms) marked read across the `48:notifications` stream.
+    activity_read_horizon: i64,
+    /// Individual activity item ids marked read locally / on Teams.
+    activity_read_ids: HashSet<String>,
+    /// Mapping from activity item id -> `(thread_id, source_message_id)` for syncing read state.
+    activity_targets: HashMap<String, (String, String)>,
+    /// Newest activity item id seen from `48:notifications`.
+    activity_newest_ms: i64,
 }
 
 /// What a call presents.
@@ -933,6 +941,7 @@ impl Teams {
             threads: true,
             pins: true,
             save_messages: true,
+            activity_feed: true,
             pin_chats: 15,
             close_direct: true,
             clear_history: true,
@@ -1034,6 +1043,12 @@ impl Teams {
             Command::StarredMessages { conversation_id, limit, reply } => {
                 let _ = reply.send(self.saved_messages(conversation_id.as_deref(), limit).map_err(refuse));
             }
+            Command::ActivityFeed { kind, cursor, limit, reply } => {
+                let _ = reply.send(self.activity_feed_page(kind, cursor.as_deref(), limit).map_err(refuse));
+            }
+            Command::ActivityMarkRead { item_id, reply } => {
+                let _ = reply.send(self.activity_mark_read(item_id.as_deref()).map_err(refuse));
+            }
             Command::CloseDirect { conversation_id, reply } => {
                 let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));
             }
@@ -1130,6 +1145,7 @@ impl Teams {
         if let Some((channel, root)) = chain_of(conversation) {
             self.clear_chain_unread(channel, root)?;
         }
+        self.mark_activity_for_conversation(thread, message);
         Ok(())
     }
 
