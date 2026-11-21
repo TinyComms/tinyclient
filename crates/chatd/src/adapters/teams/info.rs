@@ -251,7 +251,8 @@ impl Teams {
                         "External".to_owned()
                     }
                 }
-                Some(k) if k.guest => "Guest".to_owned(),
+                // A non-external guest keeps an empty org string. The row's Guest mark
+                // is the label; storing "Guest" here renders as External · Guest.
                 _ => String::new(),
             }
         } else {
