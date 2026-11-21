@@ -761,6 +761,7 @@ impl Composer {
             self.reply = draft.reply;
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
+            self.joining = false;
             self.undo_join = None;
             self.no_preview = false;
             self.broadcast = false;
