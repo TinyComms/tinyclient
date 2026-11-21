@@ -685,6 +685,7 @@ fn steer(line: &str) -> Vec<Event> {
                 emails: if email.is_empty() { Vec::new() } else { vec![email] },
                 organization: org,
                 avatar: None,
+                person_id: None,
             };
             let text = Text {
                 author: author.into(),

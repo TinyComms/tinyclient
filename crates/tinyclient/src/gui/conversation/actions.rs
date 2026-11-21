@@ -362,6 +362,8 @@ enum MenuAct {
     Open,
     /// A file attachment that is already on disk.
     SaveAs,
+    /// Save an animated GIF attachment to the account's saved GIFs (`Capabilities::save_gif`).
+    SaveGif,
     /// This message becomes the first unread one.
     Unread,
     /// Enter multi-message selection mode with this message ticked.
@@ -507,6 +509,7 @@ fn menu_acts(
     has_link: bool,
     can_open_link: bool,
     can_save: bool,
+    can_save_gif: bool,
 ) -> Vec<MenuAct> {
     if can.unsent {
         let mut acts = Vec::new();
@@ -550,6 +553,9 @@ fn menu_acts(
     }
     if can_save {
         acts.push(MenuAct::SaveAs);
+    }
+    if can_save_gif {
+        acts.push(MenuAct::SaveGif);
     }
     if !can.unsent {
         acts.push(MenuAct::Unread);
@@ -1139,6 +1145,7 @@ impl Pane {
             has_link,
             has_link && self.open.as_ref().is_some_and(|open| open.key.network != Network::Tiny),
             self.saveable_file(message).is_some(),
+            self.saveable_gif(message).is_some(),
         );
         let cursor = if acts.is_empty() {
             0
@@ -1219,6 +1226,16 @@ impl Pane {
                     self.save_attachment_as(path, name, cx);
                 }
             }
+            MenuAct::SaveGif => {
+                if let (Some(open), Some(id)) = (self.open.as_ref(), self.saveable_gif(&message)) {
+                    let request = Request::SaveGif {
+                        account: open.key.account(),
+                        id,
+                        unsave: false,
+                    };
+                    cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
+                }
+            }
             MenuAct::Unread => self.mark_message_unread(&message, cx),
             MenuAct::Select => {
                 self.multi_select.enter(&message.id);
@@ -1268,6 +1285,20 @@ impl Pane {
             }
             let path = attachment.file.path.clone().or_else(|| self.known.get(&attachment.file.id).cloned())?;
             Some((path, super::media::disk_name(attachment)))
+        })
+    }
+
+    /// A GIF attachment's network document id when the account supports saving GIFs.
+    fn saveable_gif(&self, message: &Message) -> Option<String> {
+        if !self.open.as_ref().is_some_and(|open| open.can.save_gif) {
+            return None;
+        }
+        message.attachments.iter().find_map(|attachment| {
+            if attachment.gif && !attachment.sticker && !attachment.file.id.is_empty() {
+                Some(attachment.file.id.clone())
+            } else {
+                None
+            }
         })
     }
 
@@ -1425,6 +1456,20 @@ impl Pane {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
                             this.save_attachment_as(path.clone(), name.clone(), cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if let Some(gif_id) = self.saveable_gif(message) {
+                let account = self.open.as_ref().map(|open| open.key.account());
+                rows.push(
+                    row("sheet-save-gif", "icons/star.svg", "Save GIF".into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            if let Some(account) = account.clone() {
+                                let request = Request::SaveGif { account, id: gif_id.clone(), unsave: false };
+                                cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
+                            }
                         }))
                         .into_any_element(),
                 );
@@ -1684,6 +1729,13 @@ impl Pane {
                     menu_item("save-as", Some("icons/folder-plus.svg"), "Save as…", None)
                         .when(lit(MenuAct::SaveAs), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::SaveAs)),
+                );
+            }
+            if self.saveable_gif(&message).is_some() {
+                items = items.child(
+                    menu_item("save-gif", Some("icons/star.svg"), "Save GIF", None)
+                        .when(lit(MenuAct::SaveGif), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::SaveGif)),
                 );
             }
             if message.state == SendState::Sent {
@@ -2681,7 +2733,7 @@ mod tests {
         let said = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&said, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(on, false, 2, true, true, true, true, false),
+            menu_acts(on, false, 2, true, true, true, true, false, false),
             vec![
                 MenuAct::Quick(0),
                 MenuAct::Quick(1),
@@ -2697,7 +2749,7 @@ mod tests {
             ]
         );
         // Tiny has Copy link without Open in Tiny.
-        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false);
+        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false);
         assert!(tiny_acts.contains(&MenuAct::Link) && !tiny_acts.contains(&MenuAct::Open));
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         mine.state = SendState::Failed {
@@ -2705,10 +2757,10 @@ mod tests {
         };
         let failed = can(&mine, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(failed, true, 3, true, true, false, false, true),
+            menu_acts(failed, true, 3, true, true, false, false, true, false),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
-            menu_acts(on, false, 0, false, false, false, false, true),
+            menu_acts(on, false, 0, false, false, false, false, true, false),
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
     }

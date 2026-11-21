@@ -114,6 +114,8 @@ pub struct Known {
     pub seen: String,
     /// Call availability and privacy flags from `users.getFullUser`.
     pub call_flags: Option<CallFlags>,
+    /// Protected chat: Telegram refuses forwarding or saving content from here.
+    pub noforwards: bool,
 }
 
 /// The tag Telegram's flags give: a warning wins over a tick.
@@ -252,6 +254,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 rights,
                 photo,
                 photo_dc,
+                noforwards: chat.noforwards,
                 ..Known::default()
             };
             (Who::Group(chat.id), known)
@@ -305,6 +308,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 photo,
                 photo_dc,
                 mark: mark(channel.verified, channel.scam, channel.fake),
+                noforwards: channel.noforwards,
                 ..Known::default()
             };
             (Who::Channel(channel.id), known)

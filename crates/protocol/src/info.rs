@@ -661,6 +661,12 @@ pub struct Capabilities {
     /// This account supports leaving a Space (`Request::LeaveSpace`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub leave_space: bool,
+    /// This account supports sharing contact cards (`Outgoing::contact`, Telegram/Signal).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub share_contact: bool,
+    /// This account supports saving and removing GIFs in the saved GIFs collection (`Request::SaveGif`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub save_gif: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

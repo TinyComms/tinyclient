@@ -433,6 +433,9 @@ pub struct SharedContact {
     pub organization: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<MediaFile>,
+    /// Optional network person id (e.g. `u12345` on Telegram) to open or message this contact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<String>,
 }
 
 /// A poll on a message: the question, the choices and their counts, which I picked, and whether

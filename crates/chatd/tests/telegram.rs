@@ -3540,3 +3540,280 @@ fn privacy_settings_read_and_write_rules_with_user_and_chat_exceptions() {
         world.calls()
     );
 }
+
+#[test]
+fn shared_contact_send_and_receive() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.share_contact, "Telegram must advertise share_contact capability");
+
+    let shared = protocol::SharedContact {
+        name: "Odalys Brandt".into(),
+        phones: vec!["+15550100777".into()],
+        emails: vec!["odalys@example.org".into()],
+        organization: "Trail Crew".into(),
+        avatar: None,
+        person_id: None,
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7003"),
+            client_id: "contact-tg-1".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { contact: Some(shared), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("contact sent", || {
+        world
+            .messages("u7003")
+            .into_iter()
+            .find(|m| !m.contacts.is_empty() && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
+    assert_eq!(sent.kind, MessageKind::Normal);
+    assert_eq!(sent.contacts.len(), 1);
+    let card = &sent.contacts[0];
+    assert_eq!(card.name, "Odalys Brandt");
+    assert_eq!(card.phones, vec!["+15550100777"]);
+    assert_eq!(card.emails, vec!["odalys@example.org"]);
+    assert_eq!(card.organization, "Trail Crew");
+    assert_eq!(card.person_id.as_deref(), Some("u7002"));
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMedia u7003 contact:Odalys:Brandt:+15550100777")),
+        "expected InputMediaContact on wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn forward_to_chat_saved_messages_and_refuses_noforwards() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.forward, "Telegram must advertise forward capability");
+
+    // Open Odalys (u7002) so we have a message id to forward.
+    let msgs = world.until("u7002 messages", || {
+        let list = world.messages("u7002");
+        (!list.is_empty()).then_some(list)
+    });
+    let msg_id = msgs[0].id.clone();
+
+    // Forward to another chat (Tobin u7003) and to Saved Messages (u7001 / InputPeer::PeerSelf).
+    let resp = world.ask(Request::Forward {
+        from: key("u7002"),
+        message_ids: vec![msg_id.clone()],
+        to: vec![key("u7003"), key("u7001")],
+        note: String::new(),
+    });
+    match resp {
+        Response::Forwarded { results } => {
+            assert_eq!(results.len(), 2);
+            assert!(results[0].ok, "forward to u7003 failed: {:?}", results[0]);
+            assert!(results[1].ok, "forward to Saved Messages failed: {:?}", results[1]);
+        }
+        other => panic!("expected Forwarded, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("ForwardMessages u7002 -> u7003")),
+        "expected ForwardMessages to u7003, got: {:#?}",
+        world.calls()
+    );
+    assert!(
+        world.calls().iter().any(|c| c.contains("ForwardMessages u7002 -> self")),
+        "expected ForwardMessages to Saved Messages (InputPeer::PeerSelf), got: {:#?}",
+        world.calls()
+    );
+    // Target chat u7003 should now show the forwarded message with Forwarded metadata.
+    let fwd = world.until("forwarded message in u7003", || {
+        world.messages("u7003").into_iter().find(|m| m.forwarded.is_some())
+    });
+    assert!(fwd.forwarded.is_some());
+
+    // Protected noforwards chat refuses forwarding clearly.
+    world.steer("noforwards c9001");
+    let notes_msgs = world.until("c9001 messages", || {
+        let list = world.messages("c9001");
+        (!list.is_empty()).then_some(list)
+    });
+    let blocked = world.ask(Request::Forward {
+        from: key("c9001"),
+        message_ids: vec![notes_msgs[0].id.clone()],
+        to: vec![key("u7003")],
+        note: String::new(),
+    });
+    match blocked {
+        Response::Error { detail, .. } => {
+            assert!(
+                detail.to_lowercase().contains("forward"),
+                "expected clear noforwards refusal, got: {detail}"
+            );
+        }
+        Response::Forwarded { results } => {
+            assert!(!results[0].ok, "noforwards chat must refuse forwarding");
+            assert!(
+                results[0].error.as_deref().unwrap_or("").to_lowercase().contains("forward"),
+                "expected clear noforwards refusal, got: {:?}",
+                results[0]
+            );
+        }
+        other => panic!("expected refusal for noforwards chat, got {other:?}"),
+    }
+}
+
+#[test]
+fn global_search_across_chats_with_pagination() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.search_global, "Telegram must advertise search_global capability");
+
+    // Search across all chats without having opened them first.
+    let resp = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(account()),
+        network: None,
+        query: "trail".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    });
+    let (hits, not_searched) = match resp {
+        Response::MessageHits { hits, not_searched, .. } => (hits, not_searched),
+        other => panic!("expected MessageHits, got {other:?}"),
+    };
+    assert!(not_searched.is_empty(), "Telegram should have been searched: {not_searched:?}");
+    let distinct_chats: std::collections::HashSet<String> = hits.iter().map(|h| h.conversation.id.clone()).collect();
+    assert!(
+        distinct_chats.len() >= 2,
+        "expected global search hits from at least 2 distinct chats, got {distinct_chats:?} (hits: {hits:?})"
+    );
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("SearchGlobal trail")),
+        "expected messages.searchGlobal on wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn report_message_and_peer() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.abuse_reports, "Telegram must advertise abuse_reports capability");
+
+    // Query report reasons.
+    match world.ask(Request::ReportReasons {
+        target: protocol::ReportTarget::Message { conversation: key("u7005"), message_id: "6".into() },
+    }) {
+        Response::ReportReasons { reasons } => {
+            assert!(!reasons.is_empty());
+            assert!(reasons.contains(&protocol::ReportReason::Spam));
+        }
+        other => panic!("expected ReportReasons, got {other:?}"),
+    }
+
+    // Report a message via messages.report (walks Telegram's option tree to Reported).
+    let resp = world.ask(Request::Report {
+        target: protocol::ReportTarget::Message { conversation: key("u7005"), message_id: "6".into() },
+        reason: protocol::ReportReason::Spam,
+        note: "Unsolicited prize scam".into(),
+        block: false,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok reporting message, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("messages.report u7005 [6]")),
+        "expected messages.report on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Report a peer (user/channel) via account.reportPeer with reason mapping.
+    let resp = world.ask(Request::Report {
+        target: protocol::ReportTarget::Person(key("u7006")),
+        reason: protocol::ReportReason::Impersonation,
+        note: "Fake support account".into(),
+        block: false,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok reporting peer, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.reportPeer u7006 fake")),
+        "expected account.reportPeer with fake reason on wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn save_and_unsave_gif() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.save_gif, "Telegram must advertise save_gif capability");
+
+    // Initial saved GIFs contain d6200.
+    let initial = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("expected Catalog, got {other:?}"),
+    };
+    assert!(initial.iter().any(|i| i.id == "d6200"), "expected d6200 in initial saved GIFs: {initial:?}");
+
+    // Unsave d6200 via Request::SaveGif { unsave: true }.
+    let resp = world.ask(Request::SaveGif {
+        account: account(),
+        id: "d6200".into(),
+        unsave: true,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok unsaving GIF, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c == "SaveGif d6200 unsave=true"),
+        "expected messages.saveGif unsave=true on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Saved GIFs list should no longer contain d6200.
+    let after_unsave = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("expected Catalog, got {other:?}"),
+    };
+    assert!(!after_unsave.iter().any(|i| i.id == "d6200"), "d6200 should be removed after unsave: {after_unsave:?}");
+
+    // Re-save d6200 via Request::SaveGif { unsave: false }.
+    let resp = world.ask(Request::SaveGif {
+        account: account(),
+        id: "d6200".into(),
+        unsave: false,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok saving GIF, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c == "SaveGif d6200 unsave=false"),
+        "expected messages.saveGif unsave=false on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Saved GIFs list should contain d6200 again.
+    let after_save = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("expected Catalog, got {other:?}"),
+    };
+    assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
+}

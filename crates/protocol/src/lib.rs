@@ -1898,6 +1898,14 @@ pub enum Request {
         cursor: Option<String>,
     },
 
+    /// Saves a GIF to the account's saved GIFs, or removes it when `unsave` is true (Telegram).
+    SaveGif {
+        account: AccountKey,
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        unsave: bool,
+    },
+
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
     /// later is a `Media` change. Ask only for what is on screen.
     Fetch {

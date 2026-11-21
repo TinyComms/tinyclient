@@ -341,7 +341,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gifs: true,
         stickers: true,
         search: true,
-        search_global: false,
+        search_global: true,
         custom_emoji: EmojiScope::All,
         silent: true,
         schedule: true,
@@ -352,6 +352,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         edit_window: 48 * 3_600,
         file_scan: false,
         allow_archives: false,
+        abuse_reports: true,
         voice_notes: true,
         direct_calls: false,
         revisions: false,
@@ -376,6 +377,8 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         effects: false,
         view_once: false,
         blocks: true,
+        share_contact: true,
+        save_gif: true,
         ..Capabilities::default()
     }
 }
@@ -1839,6 +1842,13 @@ pub(super) fn mapped(account: &Account, conversation: &str, raw: &[tl::enums::Me
     let mut wants = Vec::new();
     for one in &mut mapped {
         finish(account, conversation, one, &page);
+        for want in &one.wants {
+            if let tl::enums::InputFileLocation::InputDocumentFileLocation(loc) = &want.location {
+                if loc.thumb_size.is_empty() {
+                    super::catalog::remember_document(account, loc);
+                }
+            }
+        }
         wants.append(&mut one.wants);
     }
     (mapped.into_iter().map(|one| one.message).collect(), wants)

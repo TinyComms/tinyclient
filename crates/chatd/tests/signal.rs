@@ -1656,6 +1656,7 @@ fn shared_contact_arrives_as_structured_card_and_can_be_sent() {
         emails: vec!["alan@bletchley.example".into()],
         organization: String::new(),
         avatar: None,
+        person_id: None,
     };
     let asked = Request::Send {
         conversation: key(GRACE),

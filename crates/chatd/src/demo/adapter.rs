@@ -1004,6 +1004,7 @@ impl Demo {
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
