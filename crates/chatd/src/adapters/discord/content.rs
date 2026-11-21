@@ -17,6 +17,10 @@ pub trait Names {
     fn channel(&self, id: &str) -> Option<String>;
     /// A server's name.
     fn space(&self, id: &str) -> Option<String>;
+    /// People, roles, or channels an entity select (component types 5–8) can offer, as `(id, name)`.
+    fn choices(&self, _kind: u8) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// The files something refers to: each with the address it is fetched from, and the other
@@ -1460,7 +1464,8 @@ pub(super) fn extract_components(
                     *dropped = true;
                 }
             }
-            // Types 5..=8: User, Role, Mentionable, Channel Selects (entity pickers)
+            // Types 5..=8: User, Role, Mentionable, Channel selects. The shell posts the picked
+            // ids the same way a string select posts its value. They are not permalinks.
             5 | 6 | 7 | 8 => {
                 let (element_type, fallback_placeholder) = match comp.kind {
                     5 => ("discord_user_select", "Select a user"),
@@ -1476,6 +1481,15 @@ pub(super) fn extract_components(
                         .unwrap_or(fallback_placeholder)
                         .trim()
                         .to_owned();
+                    let options = names
+                        .choices(comp.kind)
+                        .into_iter()
+                        .map(|(value, label)| ControlOption {
+                            label,
+                            value,
+                            description: String::new(),
+                        })
+                        .collect();
                     controls.push(MessageControl {
                         block_id: block_id.to_owned(),
                         action_id: custom_id.to_owned(),
@@ -1485,9 +1499,9 @@ pub(super) fn extract_components(
                         confirm: None,
                         kind: ControlKind::Select {
                             placeholder,
-                            options: Vec::new(),
+                            options,
                             selected: None,
-                            external: true,
+                            external: false,
                         },
                         disabled: comp.disabled,
                         emoji: String::new(),
@@ -1809,6 +1823,59 @@ mod tests {
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
         assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
+    }
+
+    #[test]
+    fn entity_selects_offer_ids_instead_of_a_permalink() {
+        struct Listed;
+        impl Names for Listed {
+            fn user(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn role(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn channel(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn space(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn choices(&self, kind: u8) -> Vec<(String, String)> {
+                match kind {
+                    5 => vec![("2001".into(), "Mara".into())],
+                    6 => vec![("4000".into(), "mods".into())],
+                    8 => vec![("4101".into(), "general".into())],
+                    _ => Vec::new(),
+                }
+            }
+        }
+        let comps: Vec<Component> = serde_json::from_value(serde_json::json!([
+            {"type": 5, "custom_id": "who", "placeholder": "Who"},
+            {"type": 6, "custom_id": "which_role"},
+            {"type": 8, "custom_id": "which_channel"}
+        ]))
+        .unwrap();
+        let mut rich = Rich::default();
+        let mut attachments = Vec::new();
+        let (controls, dropped) = extract_components(&comps, "m1", "app", 0, "https://discord.com/channels/g/c/m1", &Listed, &mut rich, &mut attachments);
+        assert!(!dropped);
+        assert_eq!(controls.len(), 3);
+        assert!(matches!(
+            &controls[0].kind,
+            ControlKind::Select { external: false, options, .. }
+                if options.iter().any(|opt| opt.value == "2001" && opt.label == "Mara")
+        ));
+        assert_eq!(controls[0].element_type, "discord_user_select");
+        assert!(matches!(
+            &controls[1].kind,
+            ControlKind::Select { external: false, options, .. } if options.iter().any(|opt| opt.value == "4000")
+        ));
+        assert!(matches!(
+            &controls[2].kind,
+            ControlKind::Select { external: false, options, .. } if options.iter().any(|opt| opt.value == "4101" && opt.label == "general")
+        ));
+        assert_eq!(controls[2].element_type, "discord_channel_select");
     }
 
     #[test]

@@ -515,7 +515,101 @@ struct Lookup<'a> {
     mentions: &'a [User],
 }
 
+const ENTITY_CHOICES: usize = 100;
+
+impl Lookup<'_> {
+    fn user_choices(&self) -> Vec<(String, String)> {
+        let state = crate::hub::lock(&self.discord.state);
+        let mut rows: Vec<(String, String)> = state
+            .users
+            .iter()
+            .filter(|(id, name)| !id.is_empty() && !name.is_empty())
+            .map(|(id, name)| (id.clone(), name.clone()))
+            .collect();
+        for user in self.mentions {
+            if user.id.is_empty() || rows.iter().any(|(id, _)| id == &user.id) {
+                continue;
+            }
+            let nick = user.member.as_ref().and_then(|member| member.nick.clone());
+            let name = nick.filter(|nick| !nick.is_empty()).unwrap_or_else(|| user.name().to_owned());
+            if !name.is_empty() {
+                rows.push((user.id.clone(), name));
+            }
+        }
+        rows
+    }
+
+    fn role_choices(&self) -> Vec<(String, String)> {
+        let state = crate::hub::lock(&self.discord.state);
+        let Some(guild) = self.guild.and_then(|id| state.guilds.get(id)) else {
+            return Vec::new();
+        };
+        guild
+            .roles
+            .iter()
+            .filter(|(id, role)| *id != 0 && !role.name.is_empty())
+            .map(|(id, role)| (id.to_string(), role.name.clone()))
+            .collect()
+    }
+
+    fn channel_choices(&self) -> Vec<(String, String)> {
+        let ids: Vec<String> = {
+            let state = crate::hub::lock(&self.discord.state);
+            let Some(guild) = self.guild.and_then(|id| state.guilds.get(id)) else {
+                return Vec::new();
+            };
+            guild.channels.iter().map(|(id, _)| id.to_string()).collect()
+        };
+        let mut rows = Vec::new();
+        for id in ids {
+            if rows.iter().any(|(known, _)| known == &id) {
+                continue;
+            }
+            let Ok(Some(row)) = self.discord.ctx.known(&id) else {
+                continue;
+            };
+            if !matches!(
+                row.kind,
+                ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
+            ) {
+                continue;
+            }
+            let name = row.title.trim_start_matches('#').trim();
+            if name.is_empty() {
+                continue;
+            }
+            rows.push((id, name.to_owned()));
+        }
+        rows
+    }
+}
+
+fn sort_choices(rows: &mut Vec<(String, String)>) {
+    rows.sort_by(|a, b| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()).then(a.0.cmp(&b.0)));
+    rows.truncate(ENTITY_CHOICES);
+}
+
 impl Names for Lookup<'_> {
+    fn choices(&self, kind: u8) -> Vec<(String, String)> {
+        let mut rows = match kind {
+            5 => self.user_choices(),
+            6 => self.role_choices(),
+            7 => {
+                let mut rows = self.user_choices();
+                for role in self.role_choices() {
+                    if !rows.iter().any(|(id, _)| id == &role.0) {
+                        rows.push(role);
+                    }
+                }
+                rows
+            }
+            8 => self.channel_choices(),
+            _ => return Vec::new(),
+        };
+        sort_choices(&mut rows);
+        rows
+    }
+
     fn user(&self, id: &str) -> Option<String> {
         if let Some(user) = self.mentions.iter().find(|user| user.id == id) {
             let nick = user.member.as_ref().and_then(|member| member.nick.clone());

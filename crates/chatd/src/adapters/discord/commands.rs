@@ -462,6 +462,63 @@ fn kind_type(kind: CommandKind) -> u8 {
     }
 }
 
+fn arg_item(arg: &CommandArg, focused: Option<&str>, attachments: &[Value], file_at: &mut usize) -> Value {
+    let focusing = focused == Some(arg.name.as_str());
+    let value = if focusing {
+        json!(arg.value)
+    } else {
+        match arg.kind {
+            CommandOptionKind::Integer => arg.value.parse::<i64>().map(|number| json!(number)).unwrap_or_else(|_| json!(arg.value)),
+            CommandOptionKind::Number => arg.value.parse::<f64>().map(|number| json!(number)).unwrap_or_else(|_| json!(arg.value)),
+            CommandOptionKind::Boolean => json!(matches!(arg.value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
+            CommandOptionKind::Attachment => {
+                let id = attachments.get(*file_at).and_then(|file| file["id"].as_str()).unwrap_or("0");
+                *file_at += 1;
+                json!(id)
+            }
+            _ => json!(arg.value),
+        }
+    };
+    let mut item = json!({"type": option_type(arg.kind), "name": arg.name, "value": value});
+    if focusing {
+        item["focused"] = json!(true);
+    }
+    item
+}
+
+/// A subcommand or group, with every following argument nested inside it.
+/// A group holds its subcommand; that subcommand holds the values.
+fn take_branch(
+    arguments: &[CommandArg],
+    index: usize,
+    focused: Option<&str>,
+    attachments: &[Value],
+    file_at: &mut usize,
+) -> (Value, usize) {
+    let arg = &arguments[index];
+    let mut node = json!({"type": option_type(arg.kind), "name": arg.name});
+    let mut next = index + 1;
+    let mut children = Vec::new();
+    if arg.kind == CommandOptionKind::SubCommandGroup
+        && arguments.get(next).is_some_and(|child| child.kind == CommandOptionKind::SubCommand)
+    {
+        let (sub, at) = take_branch(arguments, next, focused, attachments, file_at);
+        children.push(sub);
+        next = at;
+    } else {
+        while arguments.get(next).is_some_and(|child| {
+            !matches!(child.kind, CommandOptionKind::SubCommand | CommandOptionKind::SubCommandGroup)
+        }) {
+            children.push(arg_item(&arguments[next], focused, attachments, file_at));
+            next += 1;
+        }
+    }
+    if !children.is_empty() {
+        node["options"] = json!(children);
+    }
+    (node, next)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn interaction_body(
     interaction_type: u8,
@@ -481,32 +538,16 @@ fn interaction_body(
 ) -> Value {
     let mut file_at = 0usize;
     let mut options = Vec::new();
-    for arg in arguments {
-        if matches!(arg.kind, CommandOptionKind::SubCommand | CommandOptionKind::SubCommandGroup) {
-            options.push(json!({"type": option_type(arg.kind), "name": arg.name}));
-            continue;
-        }
-        let focusing = focused == Some(arg.name.as_str());
-        let value = if focusing {
-            json!(arg.value)
+    let mut index = 0;
+    while index < arguments.len() {
+        if matches!(arguments[index].kind, CommandOptionKind::SubCommand | CommandOptionKind::SubCommandGroup) {
+            let (node, next) = take_branch(arguments, index, focused, attachments, &mut file_at);
+            options.push(node);
+            index = next;
         } else {
-            match arg.kind {
-                CommandOptionKind::Integer => arg.value.parse::<i64>().map(|number| json!(number)).unwrap_or_else(|_| json!(arg.value)),
-                CommandOptionKind::Number => arg.value.parse::<f64>().map(|number| json!(number)).unwrap_or_else(|_| json!(arg.value)),
-                CommandOptionKind::Boolean => json!(matches!(arg.value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
-                CommandOptionKind::Attachment => {
-                    let id = attachments.get(file_at).and_then(|file| file["id"].as_str()).unwrap_or("0");
-                    file_at += 1;
-                    json!(id)
-                }
-                _ => json!(arg.value),
-            }
-        };
-        let mut item = json!({"type": option_type(arg.kind), "name": arg.name, "value": value});
-        if focusing {
-            item["focused"] = json!(true);
+            options.push(arg_item(&arguments[index], focused, attachments, &mut file_at));
+            index += 1;
         }
-        options.push(item);
     }
     let mut data = json!({
         "id": command_id,
@@ -562,6 +603,43 @@ mod tests {
         assert_eq!(cmds[0].options[0].choices[1].value, "7");
         assert_eq!(cmds[1].kind, CommandKind::Message);
         assert_eq!(cmds[2].kind, CommandKind::User);
+    }
+
+    #[test]
+    fn subcommand_arguments_nest_under_the_definition_name() {
+        let args = vec![
+            CommandArg { name: "user".into(), value: String::new(), kind: CommandOptionKind::SubCommandGroup },
+            CommandArg { name: "grant".into(), value: String::new(), kind: CommandOptionKind::SubCommand },
+            CommandArg { name: "perm".into(), value: "admin".into(), kind: CommandOptionKind::String },
+        ];
+        let body = interaction_body(
+            2,
+            "4101",
+            None,
+            "session",
+            "nonce",
+            "app",
+            "cmd",
+            "1",
+            "mod",
+            CommandKind::ChatInput,
+            &args,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            body["data"]["options"],
+            json!([{
+                "type": 2,
+                "name": "user",
+                "options": [{
+                    "type": 1,
+                    "name": "grant",
+                    "options": [{"type": 3, "name": "perm", "value": "admin"}]
+                }]
+            }])
+        );
     }
 
     #[test]

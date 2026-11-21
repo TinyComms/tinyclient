@@ -385,6 +385,16 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let Ok(Response::Commands { commands }) = answer else {
+                // A refusal or a dropped answer must not stick, or the next Apps open never asks again.
+                let _ = this.update(cx, |this, _| match kind {
+                    CommandKind::User => {
+                        this.user_commands_asked.remove(&conversation);
+                    }
+                    CommandKind::Message => {
+                        this.message_commands_asked.remove(&conversation);
+                    }
+                    CommandKind::ChatInput => {}
+                });
                 return;
             };
             let _ = this.update(cx, |this, cx| {

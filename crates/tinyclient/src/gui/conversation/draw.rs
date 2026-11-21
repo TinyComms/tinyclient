@@ -2483,6 +2483,65 @@ impl Pane {
     }
 
     /// Interactive controls attached to a message (buttons, menus, pickers, radios, checkboxes).
+    /// Users, roles, and channels the shell already holds, so an entity select with no stored
+    /// options can still post a picked id.
+    fn entity_choices(&self, element_type: &str, cx: &mut Context<Self>) -> Vec<protocol::ControlOption> {
+        let Some(shell) = self.shell.upgrade() else {
+            return Vec::new();
+        };
+        let shell = shell.read(cx);
+        let Some(open) = self.open.as_ref() else {
+            return Vec::new();
+        };
+        let account = open.key.account();
+        let mut rows = Vec::new();
+        if matches!(element_type, "discord_user_select" | "discord_mentionable_select") {
+            for person in shell.people_state.hub().friends(&account) {
+                if person.name.is_empty() || person.key.id.is_empty() {
+                    continue;
+                }
+                rows.push(protocol::ControlOption {
+                    label: person.name,
+                    value: person.key.id,
+                    description: String::new(),
+                });
+            }
+        }
+        if element_type == "discord_channel_select" {
+            let space = shell
+                .snapshot
+                .as_ref()
+                .and_then(|snap| snap.open.as_ref())
+                .filter(|row| row.key == open.key)
+                .and_then(|row| row.space.clone());
+            if let Some(space) = space {
+                if let Some(tree) = shell.trees.get(&Key::new(&account, space.as_str())) {
+                    for conv in &tree.conversations {
+                        if matches!(
+                            conv.kind,
+                            protocol::ConversationKind::Thread
+                                | protocol::ConversationKind::Direct
+                                | protocol::ConversationKind::Group
+                        ) {
+                            continue;
+                        }
+                        let name = conv.title.trim_start_matches('#').trim();
+                        if name.is_empty() || conv.key.id.is_empty() {
+                            continue;
+                        }
+                        rows.push(protocol::ControlOption {
+                            label: name.to_owned(),
+                            value: conv.key.id.clone(),
+                            description: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+        rows.truncate(100);
+        rows
+    }
+
     fn message_controls(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         if message.controls.is_empty() {
             return None;
@@ -2582,9 +2641,23 @@ impl Pane {
                     row = row.child(btn);
                 }
                 protocol::ControlKind::Select { placeholder, options, selected, external } => {
+                    let entity = matches!(
+                        control.element_type.as_str(),
+                        "discord_user_select"
+                            | "discord_role_select"
+                            | "discord_mentionable_select"
+                            | "discord_channel_select"
+                    );
+                    let menu_options = if !options.is_empty() {
+                        options.clone()
+                    } else if entity {
+                        self.entity_choices(&control.element_type, cx)
+                    } else {
+                        Vec::new()
+                    };
                     let current_label = selected
                         .as_deref()
-                        .and_then(|val| options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
+                        .and_then(|val| menu_options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
                         .unwrap_or_else(|| if placeholder.is_empty() { "Select…" } else { placeholder.as_str() });
                     let shown = if pending {
                         format!("{current_label}…")
@@ -2610,7 +2683,7 @@ impl Pane {
                         .child(shown);
                     if disabled {
                         // Disabled select: inert.
-                    } else if !options.is_empty() && !pending {
+                    } else if !menu_options.is_empty() && !pending {
                         let initial_multi = selected.iter().cloned().collect();
                         let open = super::OpenSelect {
                             conversation: conversation.clone(),
@@ -2618,7 +2691,7 @@ impl Pane {
                             block_id: control.block_id.clone(),
                             action_id: control.action_id.clone(),
                             element_type: control.element_type.clone(),
-                            options: options.clone(),
+                            options: menu_options,
                             selected: selected.clone(),
                             multi_selected: initial_multi,
                             min_values: control.min_values,
@@ -2633,7 +2706,7 @@ impl Pane {
                             this.open_select = Some(next);
                             cx.notify();
                         }));
-                    } else if *external && !message.permalink.is_empty() {
+                    } else if !entity && *external && !message.permalink.is_empty() {
                         let link = message.permalink.clone();
                         chip = chip.on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();

@@ -2468,6 +2468,10 @@ impl Composer {
         let this = cx.weak_entity();
         ask_later(cx, request, move |answer, cx| {
             let Ok(Response::Commands { commands }) = answer else {
+                // A refusal or a dropped answer must not stick, or the next `/` never asks again.
+                let _ = this.update(cx, |this, _| {
+                    this.slash_loaded.remove(&key);
+                });
                 return;
             };
             let _ = this.update(cx, |this, cx| {

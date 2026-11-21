@@ -5268,14 +5268,12 @@ fn discord_buttons_selects_and_modals_round_trip() {
         }),
         Response::Ok
     );
-    let modal = wait("interaction modal change", || {
-        let Response::Changed { changes, .. } = world.ask(Request::Wait { since: seq, timeout_ms: 200 }) else {
-            return None;
-        };
-        changes.into_iter().find_map(|c| match c {
+    let modal = wait("interaction modal change", || match world.ask(Request::Wait { since: seq }) {
+        Response::Changes { changes, .. } => changes.into_iter().find_map(|change| match change {
             protocol::Change::InteractionModal { conversation, modal } if conversation == channel => Some(modal),
             _ => None,
-        })
+        }),
+        other => panic!("{other:?}"),
     });
     assert_eq!(modal.title, "Feedback Form");
     assert_eq!(modal.fields.len(), 1);
@@ -5318,15 +5316,16 @@ fn discord_buttons_selects_and_modals_round_trip() {
         }),
         Response::Ok
     );
-    let failed_reason = wait("interaction failure change", || {
-        let Response::Changed { changes, .. } = world.ask(Request::Wait { since: seq2, timeout_ms: 200 }) else {
-            return None;
-        };
-        changes.into_iter().find_map(|c| match c {
+    let failed_reason = wait("interaction failure change", || match world.ask(Request::Wait { since: seq2 }) {
+        Response::Changes { changes, .. } => changes.into_iter().find_map(|change| match change {
             protocol::Change::InteractionFailed { conversation, action_id, reason, .. }
-                if conversation == channel && action_id == "fail_me" => Some(reason),
+                if conversation == channel && action_id == "fail_me" =>
+            {
+                Some(reason)
+            }
             _ => None,
-        })
+        }),
+        other => panic!("{other:?}"),
     });
     assert!(failed_reason.contains("did not respond"));
 }

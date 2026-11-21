@@ -88,18 +88,25 @@ pub(super) fn active_option(text: &str, caret: usize, commands: &[AppCommand]) -
     }
     let rest_start = 1 + space + 1;
     let rest = text.get(rest_start..caret).unwrap_or("");
+    // A subcommand or group is not the value being typed. Step into it once its name is complete.
+    let (level, args_text) = leaf_span(rest, &cmd.options);
+    if level.is_empty() || level.iter().all(is_branch) {
+        return None;
+    }
+    let args_off = rest.len() - args_text.len();
     let filled = parse_args(rest, &cmd.options);
     // Find the last whitespace-delimited token currently at the caret.
-    let token_rel = rest.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
-    let token = &rest[token_rel..];
+    let token_rel = args_text.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let token = &args_text[token_rel..];
     let (opt, typed, replace_start) = if let Some((k, v)) = token.split_once(':') {
-        let opt = cmd.options.iter().find(|o| o.name.eq_ignore_ascii_case(k))?.clone();
-        (opt, v.to_owned(), rest_start + token_rel + k.len() + 1)
+        let opt = level.iter().find(|o| !is_branch(o) && o.name.eq_ignore_ascii_case(k))?.clone();
+        (opt, v.to_owned(), rest_start + args_off + token_rel + k.len() + 1)
     } else {
         // Positional: pick the option matching the count of already-completed tokens before this one.
-        let completed = rest[..token_rel].split_whitespace().count();
-        let opt = cmd.options.get(completed).or_else(|| cmd.options.last())?.clone();
-        (opt, token.to_owned(), rest_start + token_rel)
+        let completed = args_text[..token_rel].split_whitespace().count();
+        let values: Vec<&CommandOption> = level.iter().filter(|opt| !is_branch(opt)).collect();
+        let opt = values.get(completed).or_else(|| values.last()).map(|opt| (*opt).clone())?;
+        (opt, token.to_owned(), rest_start + args_off + token_rel)
     };
     if !opt.autocomplete && opt.choices.is_empty() {
         return None;
@@ -159,11 +166,85 @@ pub(super) fn parse_invocation<'a>(text: &str, commands: &'a [AppCommand]) -> Op
     Some((cmd, args))
 }
 
+fn is_branch(opt: &CommandOption) -> bool {
+    matches!(opt.kind, CommandOptionKind::SubCommand | CommandOptionKind::SubCommandGroup)
+}
+
+/// The option list the caret is filling, and the unread suffix of `rest` after any finished
+/// subcommand or group name. A name still being typed stays at this level.
+fn leaf_span<'a>(rest: &'a str, options: &'a [CommandOption]) -> (&'a [CommandOption], &'a str) {
+    if !options.iter().any(is_branch) {
+        return (options, rest);
+    }
+    let skipped = rest.len() - rest.trim_start().len();
+    let trimmed = &rest[skipped..];
+    let Some((token, consumed)) = head_span(trimmed) else {
+        return (options, rest);
+    };
+    let Some(opt) = options.iter().find(|opt| is_branch(opt) && opt.name.eq_ignore_ascii_case(&token)) else {
+        return (options, rest);
+    };
+    let after = &trimmed[consumed..];
+    if after.starts_with(char::is_whitespace) {
+        leaf_span(&rest[skipped + consumed..], &opt.options)
+    } else {
+        (options, rest)
+    }
+}
+
+/// First token, with its quotes removed, and how many bytes of `tail` it occupied.
+fn head_span(tail: &str) -> Option<(String, usize)> {
+    if tail.is_empty() {
+        return None;
+    }
+    let mut consumed = 0usize;
+    let mut token = String::new();
+    let mut in_quotes = false;
+    for ch in tail.chars() {
+        let len = ch.len_utf8();
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            consumed += len;
+            continue;
+        }
+        if ch.is_whitespace() && !in_quotes {
+            break;
+        }
+        token.push(ch);
+        consumed += len;
+    }
+    (!token.is_empty()).then_some((token, consumed))
+}
+
+fn head(tail: &str) -> Option<(String, &str)> {
+    let tail = tail.trim_start();
+    let (token, consumed) = head_span(tail)?;
+    Some((token, &tail[consumed..]))
+}
+
+/// A subcommand or group name, then whatever was typed inside it.
+/// The name kept is the one on the command definition.
+fn parse_branch(tail: &str, options: &[CommandOption]) -> Vec<CommandArg> {
+    let Some((token, after)) = head(tail) else {
+        return Vec::new();
+    };
+    let Some(opt) = options.iter().find(|opt| is_branch(opt) && opt.name.eq_ignore_ascii_case(&token)) else {
+        return Vec::new();
+    };
+    let mut out = vec![CommandArg { name: opt.name.clone(), value: String::new(), kind: opt.kind }];
+    out.extend(parse_args(after, &opt.options));
+    out
+}
+
 /// Parses `key:value` pairs and positional arguments against `options`.
+/// Subcommands and groups nest: the next token picks one, and the rest is parsed inside it.
 pub(super) fn parse_args(tail: &str, options: &[CommandOption]) -> Vec<CommandArg> {
     let tail = tail.trim();
     if tail.is_empty() {
         return Vec::new();
+    }
+    if options.iter().any(is_branch) {
+        return parse_branch(tail, options);
     }
     // Single-option commands take the entire tail verbatim unless explicitly named `opt:val`.
     if options.len() == 1 {
@@ -404,5 +485,73 @@ mod tests {
         assert_eq!(named.option.name, "env");
         assert_eq!(named.typed, "st");
         assert_eq!(named.replace_start, 12);
+    }
+
+    fn mod_cmd() -> AppCommand {
+        AppCommand {
+            name: "mod".into(),
+            options: vec![CommandOption {
+                name: "user".into(),
+                kind: CommandOptionKind::SubCommandGroup,
+                options: vec![CommandOption {
+                    name: "grant".into(),
+                    kind: CommandOptionKind::SubCommand,
+                    options: vec![CommandOption {
+                        name: "perm".into(),
+                        kind: CommandOptionKind::String,
+                        required: true,
+                        autocomplete: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parse_invocation_nests_subcommand_groups() {
+        let cmds = [mod_cmd()];
+        let (_, args) = parse_invocation("/mod USER grant perm:admin", &cmds).unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!((args[0].name.as_str(), args[0].kind), ("user", CommandOptionKind::SubCommandGroup));
+        assert_eq!((args[1].name.as_str(), args[1].kind), ("grant", CommandOptionKind::SubCommand));
+        assert_eq!((args[2].name.as_str(), args[2].value.as_str(), args[2].kind), ("perm", "admin", CommandOptionKind::String));
+
+        // The only top-level option is a subcommand, so the tail is not stuffed into it.
+        let mut ban = AppCommand { name: "tool".into(), ..Default::default() };
+        ban.options = vec![CommandOption {
+            name: "ban".into(),
+            kind: CommandOptionKind::SubCommand,
+            options: vec![CommandOption { name: "reason".into(), kind: CommandOptionKind::String, ..Default::default() }],
+            ..Default::default()
+        }];
+        let (_, args) = parse_invocation("/tool ban they were rude", &[ban]).unwrap();
+        assert_eq!((args[0].name.as_str(), args[0].value.as_str(), args[0].kind), ("ban", "", CommandOptionKind::SubCommand));
+        assert_eq!((args[1].name.as_str(), args[1].value.as_str()), ("reason", "they were rude"));
+    }
+
+    #[test]
+    fn active_option_steps_into_a_subcommand() {
+        let cmds = [mod_cmd()];
+        let text = "/mod user grant pe";
+        let active = active_option(text, text.len(), &cmds).unwrap();
+        assert_eq!(active.option.name, "perm");
+        assert_eq!(active.typed, "pe");
+        assert_eq!(active.filled[0].name, "user");
+        assert_eq!(active.filled[1].name, "grant");
+    }
+
+    #[test]
+    fn a_single_string_option_still_takes_the_tail() {
+        let cmd = AppCommand {
+            name: "shrug".into(),
+            options: vec![CommandOption { name: "text".into(), kind: CommandOptionKind::String, ..Default::default() }],
+            ..Default::default()
+        };
+        let (_, args) = parse_invocation("/shrug hello there", &[cmd]).unwrap();
+        assert_eq!((args[0].name.as_str(), args[0].value.as_str()), ("text", "hello there"));
     }
 }
