@@ -383,6 +383,15 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
+    /// Forwards one or more messages to target conversations on the same account.
+    /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
+    Forward {
+        from_conversation_id: String,
+        message_ids: Vec<String>,
+        to_conversation_ids: Vec<String>,
+        note: String,
+        reply: Reply<Vec<(String, Result<(), String>)>>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -490,6 +499,7 @@ impl Command {
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

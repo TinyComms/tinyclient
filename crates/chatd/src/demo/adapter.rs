@@ -690,6 +690,47 @@ impl Demo {
                 let done = demo.ctx.pinned(&conversation_id, &message_id, pinned);
                 let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
             }
+            Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+                let from_key = demo.key(&from_conversation_id);
+                let (from_title, from_space) = demo
+                    .hub
+                    .store()
+                    .conversation(&from_key)
+                    .ok()
+                    .flatten()
+                    .map(|c| (c.title, c.space_title))
+                    .unwrap_or_default();
+                let originals: Vec<Message> = message_ids
+                    .iter()
+                    .filter_map(|id| demo.hub.store().message(&from_key, id).ok().flatten())
+                    .collect();
+                let mut results = Vec::with_capacity(to_conversation_ids.len());
+                let note = note.trim();
+                for target in to_conversation_ids {
+                    let mut err: Option<String> = None;
+                    for orig in &originals {
+                        let mut fwd = demo.accepted(&target, orig.text.clone(), None, orig.attachments.clone());
+                        fwd.spans = orig.spans.clone();
+                        fwd.forwarded = Some(Box::new(protocol::Forwarded {
+                            from_title: from_title.clone(),
+                            from_space: from_space.clone(),
+                            link: String::new(),
+                        }));
+                        if let Err(e) = demo.ctx.message(&target, &fwd) {
+                            err = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    if err.is_none() && !note.is_empty() {
+                        let note_msg = demo.accepted(&target, note.to_owned(), None, Vec::new());
+                        if let Err(e) = demo.ctx.message(&target, &note_msg) {
+                            err = Some(e.to_string());
+                        }
+                    }
+                    results.push((target, err.map_or(Ok(()), Err)));
+                }
+                let _ = reply.send(Ok(results));
+            }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));
             }

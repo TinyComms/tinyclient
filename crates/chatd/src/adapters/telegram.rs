@@ -711,6 +711,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
@@ -826,6 +827,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Pin { conversation_id, message_id, pinned, notify, me_only, reply } => {
             let _ = reply.send(info::pin(account, &conversation_id, &message_id, pinned, notify, me_only).map_err(refused));
+        }
+        Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+            let _ = reply.send(info::forward(account, &from_conversation_id, &message_ids, &to_conversation_ids, &note).map_err(refused));
         }
         Command::Search { query, scope, reply, .. } => {
             let result = match scope {

@@ -98,6 +98,19 @@ pub struct Menu {
     pub reactor: Option<usize>,
 }
 
+/// The forward / copy-to picker, open for one message.
+pub struct Forwarding {
+    pub message: Rc<Message>,
+    /// True when the account supports native `Request::Forward`; false for "Copy to…" fallback.
+    pub native: bool,
+    /// Same-account candidate conversations from chatd's switcher list (`Request::Find`).
+    pub candidates: Vec<protocol::Conversation>,
+    /// Chosen target conversations, capped at [`protocol::FORWARD_LIMIT`].
+    pub selected: Vec<protocol::Key>,
+    /// Optional note sent along with the forwarded message.
+    pub note: String,
+}
+
 /// The reaction picker, open for a message.
 pub struct Picking {
     pub message: String,
@@ -247,6 +260,8 @@ enum MenuAct {
     Edit,
     /// Pin or unpin a message when `can.pin` is true.
     Pin,
+    /// Forward natively (`can.forward`) or "Copy to…" fallback (`can.act && !can.forward`).
+    Forward,
     Link,
     Open,
     /// A file attachment that is already on disk.
@@ -295,6 +310,9 @@ fn menu_acts(
     }
     if can.pin {
         acts.push(MenuAct::Pin);
+    }
+    if can.act {
+        acts.push(MenuAct::Forward);
     }
     if has_text {
         acts.push(MenuAct::Copy);
@@ -856,6 +874,10 @@ impl Pane {
             MenuAct::React => self.open_picker(&message.id, at, window, cx),
             MenuAct::Edit => self.edit(&message, window, cx),
             MenuAct::Pin => self.toggle_pin(&message, cx),
+            MenuAct::Forward => {
+                let native = self.can(&message).forward;
+                self.open_forward(message, native, window, cx);
+            }
             MenuAct::Link => {
                 if let Some(link) = link {
                     cx.write_to_clipboard(ClipboardItem::new_string(link));
@@ -1029,6 +1051,17 @@ impl Pane {
                 rows.push(
                     row("sheet-pin", "icons/pin.svg", label.into(), false)
                         .on_click(then(|this, message, _, cx| this.toggle_pin(message, cx)))
+                        .into_any_element(),
+                );
+            }
+            if can.act {
+                let label = if can.forward { "Forward…" } else { "Copy to…" };
+                rows.push(
+                    row("sheet-forward", "icons/corner-up-right.svg", label.into(), false)
+                        .on_click(then(|this, message, window, cx| {
+                            let native = this.can(message).forward;
+                            this.open_forward(message.clone(), native, window, cx);
+                        }))
                         .into_any_element(),
                 );
             }
@@ -1206,6 +1239,14 @@ impl Pane {
                     menu_item("pin", Some("icons/pin.svg"), label, None)
                         .when(lit(MenuAct::Pin), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Pin)),
+                );
+            }
+            if can.act {
+                let label = if can.forward { "Forward…" } else { "Copy to…" };
+                items = items.child(
+                    menu_item("forward", Some("icons/corner-up-right.svg"), label, None)
+                        .when(lit(MenuAct::Forward), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Forward)),
                 );
             }
             let selected = self.selection.as_ref().is_some_and(|selection| {
@@ -1495,11 +1536,213 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    /// Opens the Forward / Copy-to conversation picker, loading same-account conversations
+    /// from chatd's quick switcher list (`Request::Find`).
+    fn open_forward(&mut self, message: Rc<Message>, native: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.key().cloned() else {
+            return;
+        };
+        let account = from.account();
+        self.forward = Some(Forwarding {
+            message,
+            native,
+            candidates: Vec::new(),
+            selected: Vec::new(),
+            note: String::new(),
+        });
+        window.focus(&self.focus, cx);
+        cx.notify();
+        let request = Request::Find {
+            network: Some(from.network),
+            query: String::new(),
+            limit: 60,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            if let Ok(Response::Conversations { conversations, .. }) = answer {
+                let same_account: Vec<protocol::Conversation> = conversations
+                    .into_iter()
+                    .filter(|c| c.key.account() == account && !c.read_only)
+                    .collect();
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(fwd) = this.forward.as_mut() {
+                        fwd.candidates = same_account;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_forward_target(&mut self, key: protocol::Key, cx: &mut Context<Self>) {
+        let Some(fwd) = self.forward.as_mut() else {
+            return;
+        };
+        if let Some(ix) = fwd.selected.iter().position(|k| *k == key) {
+            fwd.selected.remove(ix);
+        } else if fwd.selected.len() < protocol::FORWARD_LIMIT {
+            fwd.selected.push(key);
+        }
+        cx.notify();
+    }
+
+    fn submit_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(from) = self.key().cloned() else {
+            return;
+        };
+        let Some(fwd) = self.forward.take() else {
+            return;
+        };
+        cx.notify();
+        if fwd.selected.is_empty() {
+            return;
+        }
+        if fwd.native {
+            let request = Request::Forward {
+                from,
+                message_ids: vec![fwd.message.id.clone()],
+                to: fwd.selected,
+                note: fwd.note,
+            };
+            cx.spawn(async move |this, cx| {
+                let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                let _ = this.update(cx, |this, cx| match answer {
+                    Ok(Response::Forwarded { results }) => {
+                        let failed: Vec<String> = results.into_iter().filter_map(|r| r.error).collect();
+                        if let Some(first) = failed.first() {
+                            this.say(format!("Couldn't forward: {first}"), cx);
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("forward", &err), cx),
+                    _ => {}
+                });
+            })
+            .detach();
+        } else {
+            // "Copy to…" fallback: re-send text and cached on-disk files as a new message per target.
+            let files: Vec<protocol::OutgoingFile> = fwd
+                .message
+                .attachments
+                .iter()
+                .filter_map(|att| {
+                    let path = att.file.path.clone().or_else(|| self.known.get(&att.file.id).cloned())?;
+                    Some(protocol::OutgoingFile { path, name: att.name.clone(), ..protocol::OutgoingFile::default() })
+                })
+                .collect();
+            let text = if fwd.note.trim().is_empty() {
+                fwd.message.text.clone()
+            } else if fwd.message.text.is_empty() {
+                fwd.note.trim().to_owned()
+            } else {
+                format!("{}\n{}", fwd.note.trim(), fwd.message.text)
+            };
+            let targets = fwd.selected;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            cx.spawn(async move |this, cx| {
+                for (ix, target) in targets.into_iter().enumerate() {
+                    let req = Request::Send {
+                        conversation: target,
+                        client_id: format!("copy-{now}-{ix}"),
+                        text: text.clone(),
+                        reply_to: None,
+                        with: protocol::Outgoing { files: files.clone(), ..protocol::Outgoing::default() },
+                    };
+                    let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                    if let Ok(Response::Error { detail, .. }) = answer {
+                        let _ = this.update(cx, |this, cx| this.say(detail, cx));
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn forward_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let fwd = self.forward.as_ref()?;
+        let heading = if fwd.native { "Forward message" } else { "Copy message to…" };
+        let count = fwd.selected.len();
+        let action_label = if fwd.native {
+            if count > 1 { format!("Forward ({count})") } else { "Forward".to_owned() }
+        } else if count > 1 {
+            format!("Copy ({count})")
+        } else {
+            "Copy".to_owned()
+        };
+        let rows = fwd.candidates.iter().take(40).map(|conv| {
+            let key = conv.key.clone();
+            let picked = fwd.selected.contains(&key);
+            let title = if conv.title.is_empty() { conv.key.id.clone() } else { conv.title.clone() };
+            div()
+                .id(ElementId::Name(format!("fwd-{}", conv.key.id).into()))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .when(picked, |d| d.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
+                .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(title))
+                .when(picked, |d| d.child(div().type_micro().text_color(theme::accent_text()).child("Selected")))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_forward_target(key.clone(), cx)))
+        });
+        let panel = modal(heading)
+            .w(px(400.))
+            .child(modal_body(format!(
+                "Choose up to {} conversations on this account.",
+                protocol::FORWARD_LIMIT
+            )))
+            .child(
+                div()
+                    .id("forward-candidates")
+                    .mt(px(8.))
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(rows),
+            )
+            .child(
+                modal_buttons()
+                    .child(button("forward-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.forward = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button("forward-go", ButtonKind::Primary, action_label)
+                            .when(count > 0, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_forward(cx)))),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("forward-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.forward = None;
+                cx.notify();
+            }))
+            .child(fade_in("forward-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
-            return [self.menu_sheet(window, cx), self.revisions_layer(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
+            return [self.menu_sheet(window, cx), self.revisions_layer(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.forward_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
         }
-        [self.menu_layer(window, cx), self.revisions_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
+        [self.menu_layer(window, cx), self.revisions_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.forward_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
     }
 
     /// Keys for whatever floats over the messages. True when the key was theirs.
@@ -1507,6 +1750,11 @@ impl Pane {
     pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         if self.link_key(event, cx) {
+            return true;
+        }
+        if key == "escape" && self.forward.is_some() {
+            self.forward = None;
+            cx.notify();
             return true;
         }
         if key == "escape" && self.revisions.is_some() {
@@ -1726,6 +1974,7 @@ mod tests {
                 MenuAct::Reply,
                 MenuAct::Thread,
                 MenuAct::React,
+                MenuAct::Forward,
                 MenuAct::Copy,
                 MenuAct::Link,
                 MenuAct::Open,
@@ -1742,7 +1991,7 @@ mod tests {
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
             menu_acts(on, false, 0, false, false, false, true),
-            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs, MenuAct::Unread],
+            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread],
         );
     }
 

@@ -338,6 +338,8 @@ pub struct Pane {
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
+    /// The message being forwarded (or copied to another conversation).
+    forward: Option<actions::Forwarding>,
     /// The link a click asked about, until the person opens it or does not.
     link_ask: Option<links::LinkAsk>,
     /// Earlier wordings of one message, opened from its edited mark.
@@ -435,6 +437,7 @@ impl Pane {
             menu: None,
             picker: None,
             confirm: None,
+            forward: None,
             link_ask: None,
             revisions: None,
             hold: None,
@@ -586,6 +589,7 @@ impl Pane {
         self.menu = None;
         self.picker = None;
         self.confirm = None;
+        self.forward = None;
         self.link_ask = None;
         self.hold = None;
         self.land = false;

@@ -1076,6 +1076,18 @@ pub struct MessageReminder {
     pub due: i64,
 }
 
+/// Most targets a single `Request::Forward` may name (official apps cap around 5).
+pub const FORWARD_LIMIT: usize = 5;
+
+/// Per-target outcome of a `Request::Forward`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardOutcome {
+    pub conversation: Key,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1509,6 +1521,15 @@ pub enum Request {
     Delete {
         conversation: Key,
         message_id: String,
+    },
+    /// Forwards one or more messages to up to [`FORWARD_LIMIT`] conversations on the same account.
+    /// Cross-account targets are refused; callers use a separate re-send for "Copy to…".
+    Forward {
+        from: Key,
+        message_ids: Vec<String>,
+        to: Vec<Key>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        note: String,
     },
     /// Vote on a poll, take a vote back, or end one. `votes` of `None` ends it (only the person
     /// who started it), `Some` replaces our vote, and an empty list takes it back. Signal only.
@@ -2236,6 +2257,10 @@ pub enum Response {
         message_id: Option<String>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         title: String,
+    },
+    /// Answers `Forward`: one outcome per target conversation.
+    Forwarded {
+        results: Vec<ForwardOutcome>,
     },
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {

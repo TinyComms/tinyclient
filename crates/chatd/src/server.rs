@@ -1816,6 +1816,50 @@ impl Chat {
         }
     }
 
+    fn forward(&self, from: Key, message_ids: Vec<String>, to: Vec<Key>, note: String) -> Response {
+        if message_ids.is_empty() || to.is_empty() {
+            return error(ErrorCode::Refused, "Choose at least one message and one conversation.");
+        }
+        if to.len() > protocol::FORWARD_LIMIT {
+            return error(
+                ErrorCode::Refused,
+                format!("You can forward to at most {} conversations at once.", protocol::FORWARD_LIMIT),
+            );
+        }
+        let account = from.account();
+        if to.iter().any(|target| target.account() != account) {
+            return error(
+                ErrorCode::Refused,
+                "Forwarding only works within the same account. Use Copy to… for another account.",
+            );
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let to_ids: Vec<String> = to.iter().map(|k| k.id.clone()).collect();
+        let from_id = from.id.clone();
+        match self.ask(&account, |reply| Command::Forward {
+            from_conversation_id: from_id,
+            message_ids,
+            to_conversation_ids: to_ids,
+            note,
+            reply,
+        }) {
+            Ok(outcomes) => {
+                let results = outcomes
+                    .into_iter()
+                    .map(|(id, res)| protocol::ForwardOutcome {
+                        conversation: Key { id, ..from.clone() },
+                        ok: res.is_ok(),
+                        error: res.err(),
+                    })
+                    .collect();
+                Response::Forwarded { results }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     fn resolve_link(&self, url: &str) -> Response {
         let Some(parsed) = protocol::link::parse_network_link(url) else {
             return Response::Resolved { conversation: None, message_id: None, title: String::new() };
@@ -2660,6 +2704,7 @@ impl Chat {
             Request::Reactions { conversation } => self.reactions(conversation),
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans),
             Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None, Vec::new()),
+            Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 

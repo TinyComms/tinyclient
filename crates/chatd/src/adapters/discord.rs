@@ -1096,6 +1096,47 @@ impl Discord {
         self.ctx.pinned(channel, message, pinned).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
+    fn forward(
+        &self,
+        from: &str,
+        message_ids: &[String],
+        targets: &[String],
+        note: &str,
+    ) -> Result<Vec<(String, Result<(), String>)>, Refusal> {
+        let mut results = Vec::with_capacity(targets.len());
+        let note = note.trim();
+        for target in targets {
+            let mut err: Option<String> = None;
+            for mid in message_ids {
+                let body = serde_json::json!({
+                    "message_reference": {
+                        "type": 1,
+                        "channel_id": from,
+                        "message_id": mid,
+                    }
+                });
+                if let Err(e) = self.call("POST", &format!("/channels/{target}/messages"), Some(body)) {
+                    err = Some(match refusal(e) {
+                        Refusal::Refused(why) => why,
+                        Refusal::Unsupported => "Forwarding is not supported.".to_owned(),
+                    });
+                    break;
+                }
+            }
+            if err.is_none() && !note.is_empty() {
+                let body = serde_json::json!({ "content": note });
+                if let Err(e) = self.call("POST", &format!("/channels/{target}/messages"), Some(body)) {
+                    err = Some(match refusal(e) {
+                        Refusal::Refused(why) => why,
+                        Refusal::Unsupported => "Could not send note.".to_owned(),
+                    });
+                }
+            }
+            results.push((target.clone(), err.map_or(Ok(()), Err)));
+        }
+        Ok(results)
+    }
+
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
     /// managing friends is what Discord's anti-abuse system watches most closely.
     ///
@@ -1638,6 +1679,9 @@ impl Discord {
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
             Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
                 answer(reply, self.pin(&conversation_id, &message_id, pinned))
+            }
+            Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+                answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
