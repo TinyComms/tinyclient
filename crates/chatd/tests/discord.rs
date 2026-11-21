@@ -747,7 +747,7 @@ impl World {
     /// Asks for files and answers what is known at once.
     fn fetch(&self, ids: &[&str], size: Option<u32>, retry: bool) -> Vec<protocol::MediaFile> {
         let ids = ids.iter().map(|id| (*id).to_owned()).collect();
-        match self.ask(Request::Fetch { account: self.account(), ids, size, retry }) {
+        match self.ask(Request::Fetch { account: self.account(), ids, size, retry, span: None }) {
             Response::Media { files } => files,
             other => panic!("{other:?}"),
         }
@@ -1055,7 +1055,7 @@ fn ready_fills_spaces_trees_people_and_unread_state() {
 
     // Pictures are registered, so the shell can ask for them.
     let wanted = vec!["avatar:2001:a1b2c3".to_owned(), "icon:4000:gu1ldicon".to_owned()];
-    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted }) {
+    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted, span: None }) {
         Response::Media { files } => {
             assert_eq!(files.len(), 2);
             assert_eq!((files[0].kind, files[0].width), (MediaKind::Avatar, 80));
@@ -1290,7 +1290,7 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
 
     // Everything the message refers to can be fetched by id; the addresses are Discord's own.
     let wanted: Vec<String> = rich.files().map(|file| file.id.clone()).collect();
-    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted.clone() }) {
+    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted.clone(), span: None }) {
         Response::Media { files } => assert_eq!(files.len(), wanted.len()),
         other => panic!("{other:?}"),
     }
@@ -5712,4 +5712,81 @@ fn gif_favourites_lead_categories_and_search_pages_past_fifty() {
     assert!(searches[0].path.starts_with("/gifs/search?q=wave&media_format=tinygif"));
     assert_eq!(world.discord.requests_to("GET", "/gifs/suggest").len(), 1);
     assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1, "a search does not read frecency");
+}
+
+#[test]
+fn a_site_player_stays_a_card_and_a_byte_window_is_not_stored_as_the_file() {
+    let world = World::start();
+    let dm = "3002";
+    let still = format!("{}/media/external/yt-still.png", world.api);
+    let card_id = world.incoming(
+        dm,
+        None,
+        "https://www.youtube.com/watch?v=abc",
+        json!({
+            "embeds": [{
+                "type": "video",
+                "url": "https://www.youtube.com/watch?v=abc",
+                "title": "Otter",
+                "provider": {"name": "YouTube"},
+                "thumbnail": {"url": "https://i.ytimg.com/vi/abc/hqdefault.jpg", "proxy_url": still, "width": 480, "height": 360},
+                "video": {"url": "https://www.youtube.com/watch?v=abc", "width": 1280, "height": 720, "duration_secs": 84}
+            }]
+        }),
+    );
+    let card = wait("the site card", || world.messages(dm).into_iter().find(|message| message.id == card_id));
+    assert!(card.attachments.is_empty(), "a site player is not an attachment: {:?}", card.attachments);
+    assert_eq!(card.previews.len(), 1);
+    let preview = &card.previews[0];
+    assert!(preview.opens_in_browser);
+    assert_eq!(preview.duration, 84);
+    assert_eq!(preview.site, "YouTube");
+    assert!(preview.url.contains("youtube.com"));
+    assert!(preview.image.is_some(), "the poster is the card's picture");
+
+    let moving = format!("{}/media/external/span.mp4", world.api);
+    let poster = format!("{}/media/external/span-still.png", world.api);
+    let clip_id = world.incoming(
+        dm,
+        None,
+        "",
+        json!({
+            "embeds": [{
+                "type": "video",
+                "url": "https://cdn.discordapp.com/attachments/1/clip.mp4",
+                "title": "Clip",
+                "thumbnail": {"proxy_url": poster, "width": 498, "height": 280},
+                "video": {"url": moving, "proxy_url": moving, "width": 498, "height": 280, "duration_secs": 12.4}
+            }]
+        }),
+    );
+    let clip = wait("the proxied video", || world.messages(dm).into_iter().find(|message| message.id == clip_id));
+    assert!(clip.previews.is_empty(), "{:?}", clip.previews);
+    let video = clip.attachments.iter().find(|attachment| attachment.file.kind == MediaKind::Video).expect("proxied video");
+    assert_eq!((video.mime.as_str(), video.duration), ("video/mp4", 12));
+    assert!(video.file.path.is_none());
+    let id = video.file.id.clone();
+
+    settled(&world);
+    assert!(world.discord.requests_to("GET", "/media/external/span.mp4").is_empty());
+    let window = |world: &World| match world.ask(Request::Fetch {
+        account: world.account(),
+        ids: vec![id.clone()],
+        size: None,
+        retry: false,
+        span: Some((0, 65_536)),
+    }) {
+        Response::Media { files } => files,
+        other => panic!("{other:?}"),
+    };
+    let first = window(&world);
+    assert!(first.iter().all(|file| file.path.is_none() && file.failed.is_none()), "a window is not the file: {first:?}");
+    let seen = wait("the byte window to be read and not stored", || {
+        let files = window(&world);
+        assert!(files.iter().all(|file| file.path.is_none() && file.failed.is_none()), "a window is not the file: {files:?}");
+        let seen = world.discord.requests_to("GET", "/media/external/span.mp4");
+        let windows = seen.iter().filter(|seen| seen.headers.get("range").is_some_and(|range| range.starts_with("bytes="))).count();
+        (windows >= 2).then_some(seen)
+    });
+    assert_eq!(seen[0].headers.get("range").map(String::as_str), Some("bytes=0-65535"));
 }

@@ -597,6 +597,7 @@ fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option
     let mut attachment = Attachment::new(name, file);
     attachment.thumb = Some(thumb);
     attachment.mime = "video/mp4".to_owned();
+    attachment.duration = whole_seconds(video.duration_secs);
     if let Some(url) = embed.url.as_deref().filter(|url| url.starts_with("https://") || url.starts_with("http://")) {
         attachment.page = url.to_owned();
     }
@@ -615,13 +616,23 @@ fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Previ
     let picture = embed.image.as_ref().or(embed.thumbnail.as_ref());
     let image = picture.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}"), picture));
     let site = embed.provider.as_ref().or(embed.author.as_ref());
+    // No proxy address: YouTube and the other site players stay a card. The poster is large
+    // in the row; a click opens the browser. This client has no web view to play them in.
+    let elsewhere = matches!(embed.kind.as_deref(), Some("video") | Some("gifv"));
+    let duration = embed.video.as_ref().filter(|_| elsewhere).map(|video| whole_seconds(video.duration_secs)).unwrap_or(0);
     Preview {
         url: embed.url.clone().unwrap_or_default(),
         site: site.map_or_else(String::new, |site| site.name.clone()),
         title: embed.title.clone().unwrap_or_default(),
         description,
         image,
+        duration,
+        opens_in_browser: elsewhere,
     }
+}
+
+fn whole_seconds(value: f64) -> u32 {
+    value.round().clamp(0.0, u32::MAX as f64) as u32
 }
 
 /// What a bot or webhook composed, as the one framed card a message can carry. Its text is

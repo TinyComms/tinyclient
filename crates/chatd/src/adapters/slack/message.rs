@@ -717,6 +717,8 @@ fn join_link(app: &str, v1: &Value) -> Option<Preview> {
         title: "Join".to_owned(),
         description: String::new(),
         image: None,
+        duration: 0,
+        opens_in_browser: false,
     })
 }
 
@@ -1412,6 +1414,8 @@ impl Slack {
             title: first(&[&card["title"]]).unwrap_or("").to_owned(),
             description: description.chars().take(DESCRIPTION).collect(),
             image,
+            duration: 0,
+            opens_in_browser: false,
         }
     }
 
@@ -1726,6 +1730,8 @@ impl Slack {
                             title: first(&[&block["title"]["text"], &block["alt_text"]]).unwrap_or("Video").to_owned(),
                             description: first(&[&block["description"]["text"]]).unwrap_or("").chars().take(DESCRIPTION).collect(),
                             image,
+                            duration: 0,
+                            opens_in_browser: false,
                         });
                     }
                 }

@@ -222,6 +222,12 @@ pub struct Preview {
     /// Only when the network serves it from its own proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<MediaFile>,
+    /// Seconds, when the card is a video its site plays. Zero when it is not one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub duration: u32,
+    /// The picture plays on its site. A click opens the browser; this client has no web view.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opens_in_browser: bool,
 }
 
 /// How many reactors a reaction carries: what a network names in the payload it already

@@ -1987,6 +1987,10 @@ pub enum Request {
         /// with its `failed` reason and nothing is fetched.
         #[serde(default, skip_serializing_if = "is_false")]
         retry: bool,
+        /// A byte window of one file, inclusive start and exclusive end. Absent asks for the
+        /// whole file and stores it. A window is a `Range` read for the player and is not stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span: Option<(u64, u64)>,
     },
 
     /// Opens the network's sign-in and keeps the session. Answers when the user is done.
@@ -3470,7 +3474,7 @@ mod tests {
     #[test]
     fn frames_written_before_these_fields_existed_still_read() {
         let request: Request = serde_json::from_str(r#"{"op":"fetch","account":{"network":"slack","account":"T1"},"ids":["a"]}"#).unwrap();
-        assert!(matches!(request, Request::Fetch { size: None, retry: false, .. }));
+        assert!(matches!(request, Request::Fetch { size: None, retry: false, span: None, .. }));
         let request: Request = serde_json::from_str(r#"{"op":"sign_in","network":"slack"}"#).unwrap();
         assert!(matches!(request, Request::SignIn { at: None, .. }));
         let thread: ThreadSummary = serde_json::from_str(r#"{"id":"t","replies":2,"last":5}"#).unwrap();

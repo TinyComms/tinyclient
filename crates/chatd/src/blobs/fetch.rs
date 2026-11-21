@@ -177,6 +177,13 @@ pub struct Want<'a> {
     /// Other files of the account waiting to be fetched, as `(id, address)`, read only when
     /// an address has to be renewed.
     pub also: &'a dyn Fn() -> Vec<(String, String)>,
+    /// A byte window, inclusive start and exclusive end. Absent reads the whole file.
+    pub span: Option<(u64, u64)>,
+}
+
+/// `Range` for a window `[start, end)`. None when the window is empty.
+pub fn range_header(start: u64, end: u64) -> Option<String> {
+    (end > start).then(|| format!("bytes={start}-{}", end - 1))
 }
 
 /// True for an address that says of itself that it has run out, so asking it is a wasted
@@ -243,9 +250,12 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
                 request = request.header(name.as_str(), value.as_str());
             }
         }
+        if let Some(range) = want.span.and_then(|(start, end)| range_header(start, end)) {
+            request = request.header("Range", range.as_str());
+        }
         let response = request.call().map_err(|err| Failed::Other(format!("The download failed: {err}.")))?;
         match response.status().as_u16() {
-            200 => break response,
+            200 | 206 => break response,
             gone @ (403 | 404) => return Err(Failed::Gone(gone)),
             moved @ (301 | 302 | 303 | 307 | 308) if hops < REDIRECTS => {
                 let location = response.headers().get("location").and_then(|value| value.to_str().ok());
@@ -263,20 +273,29 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
         return Err(Failed::Other(format!("The server sent {mime:?}, not the file.")));
     }
     let too_large = || Failed::Other(format!("The file is larger than {} MB.", want.cap.div_ceil(MB)));
-    if body.content_length().is_some_and(|length| length > want.cap) {
+    // A window stops after its own bytes. A server that ignores Range answers 200 and names the
+    // whole file; that length is not the file we keep, so it is not held to the file's cap.
+    let window = want.span.and_then(|(start, end)| (end > start).then_some(end - start));
+    if window.is_none() && body.content_length().is_some_and(|length| length > want.cap) {
         return Err(too_large());
     }
+    let limit = window.unwrap_or(want.cap);
     let broken = |err: std::io::Error| Failed::Other(format!("The download failed: {err}."));
     let mut out = protocol::private::create(want.part).map_err(broken)?;
     let mut reader = response.body_mut().as_reader();
     let mut total = 0u64;
     loop {
-        let read = reader.read(buffer).map_err(broken)?;
+        let room = limit.saturating_sub(total);
+        if room == 0 {
+            return Ok(total);
+        }
+        let chunk = buffer.len().min(room as usize);
+        let read = reader.read(&mut buffer[..chunk]).map_err(broken)?;
         if read == 0 {
             return Ok(total);
         }
         total += read as u64;
-        if total > want.cap {
+        if window.is_none() && total > want.cap {
             return Err(too_large());
         }
         out.write_all(&buffer[..read]).map_err(broken)?;
@@ -542,6 +561,7 @@ mod tests {
             part: &part,
             cap: MB,
             also: &Vec::new,
+            span: None,
         };
         let done = download(hosts, &agent(), &want, &mut vec![0u8; BUFFER]).map(|_| std::fs::read(&part).unwrap());
         assert_eq!(done.is_err(), !part.exists(), "a failure leaves no part file");
@@ -626,6 +646,7 @@ mod tests {
             part: &part,
             cap: MB,
             also: &|| waiting.clone(),
+            span: None,
         };
         download(&hosts, &agent(), &want, &mut vec![0u8; BUFFER]).unwrap();
         let _ = std::fs::remove_file(&part);
@@ -747,5 +768,55 @@ mod tests {
         assert!((20 * MB..24 * MB).contains(&cap(&file(MediaKind::File, 20 * MB), cache)));
         assert_eq!(cap(&file(MediaKind::Video, 0), cache), 100 * MB);
         assert_eq!(cap(&file(MediaKind::File, 800 * MB), cache), cache);
+    }
+
+    #[test]
+    fn a_window_asks_for_a_range_and_stops_even_when_the_server_sends_the_file() {
+        assert_eq!(range_header(0, 65_536).as_deref(), Some("bytes=0-65535"));
+        assert_eq!(range_header(10, 138).as_deref(), Some("bytes=10-137"));
+        assert_eq!(range_header(5, 5), None);
+        assert_eq!(range_header(8, 4), None);
+
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen, asked) = channel();
+        std::thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut reader = BufReader::new(stream);
+            let (mut range, mut line) = (String::new(), String::new());
+            while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("range:") {
+                    range = value.trim().to_owned();
+                }
+                line.clear();
+            }
+            let _ = seen.send(range);
+            let body = vec![b'a'; 4_000];
+            let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", body.len());
+            let mut out = reader.into_inner();
+            let _ = out.write_all(head.as_bytes());
+            let _ = out.write_all(&body);
+        });
+        let hosts = Hosts { local: vec![("127.0.0.1".to_owned(), Trust::Open)] };
+        let part = std::env::temp_dir().join(format!("tinyclient-fetch-{}-span.part", std::process::id()));
+        let file = MediaFile::new("clip", MediaKind::Video);
+        let url = format!("http://127.0.0.1:{port}/clip.mp4");
+        let want = Want {
+            network: Network::Discord,
+            file: &file,
+            url: &url,
+            adapter: None,
+            part: &part,
+            cap: 32,
+            also: &Vec::new,
+            span: Some((10, 138)),
+        };
+        let bytes = download(&hosts, &agent(), &want, &mut vec![0u8; 64]).unwrap().0;
+        let kept = std::fs::read(&part).unwrap();
+        let _ = std::fs::remove_file(&part);
+        assert_eq!(asked.recv().unwrap(), "bytes=10-137");
+        assert_eq!(bytes, 128, "a window is not the whole answer");
+        assert_eq!(kept.len(), 128);
     }
 }

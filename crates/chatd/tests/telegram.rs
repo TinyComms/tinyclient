@@ -636,7 +636,7 @@ fn channel_thumb(call: &str) -> bool {
 /// The shell drawing these files on screen asks for them, as `fetch_wanted` does.
 fn on_screen(world: &World, ids: &[&str]) {
     let ids = ids.iter().map(|id| (*id).to_owned()).collect();
-    match world.ask(Request::Fetch { account: account(), ids, size: Some(320), retry: false }) {
+    match world.ask(Request::Fetch { account: account(), ids, size: Some(320), retry: false, span: None }) {
         Response::Media { .. } => {}
         other => panic!("{other:?}"),
     }
@@ -865,7 +865,7 @@ fn a_pin_or_a_folder_change_is_told_row_by_row_and_never_rereads_the_chats() {
 fn a_photos_stripped_preview_is_on_disk_while_its_thumbnail_is_still_downloading() {
     let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_FILE_HOLD", "1")]);
     world.connected();
-    let on_disk = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+    let on_disk = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false, span: None }) {
         Response::Media { mut files } => files.pop().and_then(|file| file.path),
         other => panic!("{other:?}"),
     };
@@ -903,7 +903,7 @@ fn a_thumbnail_gone_from_disk_is_never_marked_failed_and_telegram_keeps_it_again
     world.connected();
     world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
     world.until("history", || world.message("u7002", "12"));
-    let asked = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+    let asked = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false, span: None }) {
         Response::Media { mut files } => files.pop(),
         other => panic!("{other:?}"),
     };
@@ -1001,7 +1001,7 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     // Its stripped thumbnail names a size and no picture: there is no preview to draw.
     assert!(attachment.preview.is_none(), "{attachment:?}");
     let landed = world.until("the thumbnail on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["p6014m".into()], size: None, retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["p6014m".into()], size: None, retry: false, span: None }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
             other => panic!("{other:?}"),
         }
@@ -1017,7 +1017,7 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     // asking for it fetches it, ahead of anything else waiting.
     assert_eq!(world.called("GetFile photo 6014 y"), 0, "{calls:#?}");
     let original = world.until("the original on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["p6014y".into()], size: Some(2_560), retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["p6014y".into()], size: Some(2_560), retry: false, span: None }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
             other => panic!("{other:?}"),
         }
@@ -1036,7 +1036,7 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     // Telegram in one piece when the shell asks for it to play.
     assert_eq!(world.called("GetFile document 6100"), 0);
     let played = world.until("the voice message on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["d6100".into()], size: None, retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["d6100".into()], size: None, retry: false, span: None }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
             other => panic!("{other:?}"),
         }
@@ -1258,7 +1258,7 @@ fn a_custom_emoji_reactions_document_is_asked_and_its_file_lands_for_the_chip() 
     // The file is fetched whole (the animated document) and kept under the name the
     // reaction carries, unpacked from the gzip Telegram serves it in.
     let landed = world.until("the reaction picture on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false, span: None }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
             other => panic!("{other:?}"),
         }
@@ -1291,7 +1291,7 @@ fn a_premium_emoji_in_message_text_is_asked_and_its_file_lands_for_the_row() {
     assert_eq!(named(&read), ("🦀".to_owned(), "e5002".to_owned()));
     world.until("the emoji document asked for", || (world.called("GetCustomEmojiDocuments 5002") > 0).then_some(()));
     let landed = world.until("the message emoji on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false, span: None }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
             other => panic!("{other:?}"),
         }
@@ -1305,7 +1305,7 @@ fn a_premium_emoji_in_message_text_is_asked_and_its_file_lands_for_the_row() {
     assert_eq!(named(&live), ("🔥".to_owned(), "e5001".to_owned()));
     world.until("the still emoji asked for", || (world.called("GetCustomEmojiDocuments 5001") > 0).then_some(()));
     world.until("the still emoji on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["e5001".into()], size: None, retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5001".into()], size: None, retry: false, span: None }) {
             Response::Media { files } => files.first().and_then(|file| file.path.clone()),
             other => panic!("{other:?}"),
         }
@@ -1667,7 +1667,7 @@ fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a
 
     // The file lands whole under the name the reaction carries, as any reaction's does.
     let landed = world.until("the comment's reaction picture on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false, span: None }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
             other => panic!("{other:?}"),
         }
@@ -3074,7 +3074,7 @@ fn a_secret_chat_is_a_row_that_says_it_stays_in_the_phone_apps() {
 }
 
 fn fetch_path(world: &World, id: &str) -> Option<String> {
-    match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+    match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false, span: None }) {
         Response::Media { mut files } => files.pop().and_then(|file| file.path),
         other => panic!("{other:?}"),
     }
@@ -3136,7 +3136,7 @@ fn a_link_card_fetches_its_picture_and_not_the_full_photo() {
     let image = card.image.as_ref().expect("the card names its picture");
     assert_eq!((image.id.as_str(), image.width, image.height), ("p8801m", 320, 240));
     let landed = world.until("the card's picture on disk", || {
-        match world.ask(Request::Fetch { account: account(), ids: vec!["p8801m".into()], size: None, retry: false }) {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["p8801m".into()], size: None, retry: false, span: None }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
             other => panic!("{other:?}"),
         }

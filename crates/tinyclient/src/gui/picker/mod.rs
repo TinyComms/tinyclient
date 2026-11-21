@@ -595,7 +595,7 @@ impl Picker {
         if ids.is_empty() {
             return;
         }
-        let request = Request::Fetch { account, ids, size: Some(edge), retry: false };
+        let request = Request::Fetch { account, ids, size: Some(edge), retry: false, span: None };
         let this = cx.weak_entity();
         ask_later(cx, request, move |answer, cx| {
             if let Ok(Response::Media { files }) = answer {

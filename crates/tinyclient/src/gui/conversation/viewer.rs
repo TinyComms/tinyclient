@@ -6,6 +6,7 @@ use super::icons::{icon, Icon};
 use super::images::Picture;
 use super::media::{self, Shape};
 use super::tokens;
+use super::video::{self, Reel};
 use super::Pane;
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{tip, Avatar};
@@ -15,9 +16,10 @@ use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::now;
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, AnyElement, ClipboardItem, Context, Div, ElementId, Image,
+    anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, ClipboardItem, Context, Div, ElementId, Image,
     ImageFormat, KeyDownEvent, MouseButton, ObjectFit, Pixels, Point, Stateful, Window,
 };
+use std::cell::Cell;
 use protocol::{Attachment, Message};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -100,6 +102,10 @@ pub struct Viewer {
     /// The sizes the original was asked to be decoded at, as `(path, edge)`: each goes once a
     /// larger or smaller one shows, and all of them when the viewer moves on or closes.
     decoded: Vec<(String, u32)>,
+    /// Play head for a video or an MP4 GIF. The picture stays the poster.
+    reel: Option<Reel>,
+    /// The byte window already asked for this picture. Cleared when the play head is scrubbed.
+    spanned: Option<(u64, u64)>,
 }
 
 /// What is kept around the picture: the sides, the bar above it, the caption below. A phone
@@ -155,18 +161,16 @@ fn side_button(id: impl Into<ElementId>, which: Icon) -> Stateful<Div> {
 }
 
 impl Pane {
-    /// Every picture held, oldest first: single pictures, grid tiles and GIFs. Videos are not
-    /// pictures, and a spoiler nobody opened stays closed.
+    /// Every picture held, oldest first: single pictures, grid tiles, GIFs and videos. The
+    /// viewer is where an MP4 plays. A spoiler nobody opened stays closed.
     fn pictures(&self) -> Vec<(Rc<Message>, usize)> {
         let root = self.open.as_ref().and_then(|open| open.root.as_ref()).map(|(root, _)| root);
         root.into_iter()
             .chain(&self.window.messages)
             .flat_map(|message| {
                 message.attachments.iter().enumerate().filter_map(move |(ix, attachment)| {
-                    // A GIF that is an MP4 plays in the video player, not here.
                     let shown = match media::shape(attachment) {
-                        Shape::Image => true,
-                        Shape::Gif => !media::is_video(attachment),
+                        Shape::Image | Shape::Gif | Shape::Video => true,
                         _ => false,
                     };
                     let open = !media::is_spoiler(attachment) || self.shown.contains(&attachment.file.id);
@@ -188,6 +192,8 @@ impl Pane {
             note: None,
             saved: None,
             decoded: Vec::new(),
+            reel: None,
+            spanned: None,
         });
         self.hover = None;
         window.focus(&self.focus, cx);
@@ -232,6 +238,8 @@ impl Pane {
         viewer.pan = (0., 0.);
         viewer.note = None;
         viewer.saved = None;
+        viewer.reel = None;
+        viewer.spanned = None;
         cx.notify();
     }
 
@@ -417,10 +425,118 @@ impl Pane {
             ("c", true) => self.copy_viewed(cx),
             ("s", true) if keys.modifiers.shift => self.save_viewed_as(cx),
             ("s", true) => self.save_viewed(cx),
-            ("space", false) | ("y", true) => self.open_viewed(false, cx),
+            ("space", false) => {
+                if self.viewed().is_some_and(|(_, attachment)| media::is_video(&attachment)) {
+                    if let Some(reel) = self.viewer.as_mut().and_then(|viewer| viewer.reel.as_mut()) {
+                        reel.toggle();
+                    }
+                    cx.notify();
+                } else {
+                    self.open_viewed(false, cx);
+                }
+            }
+            ("y", true) => {
+                if !self.viewed().is_some_and(|(_, attachment)| media::is_video(&attachment)) {
+                    self.open_viewed(false, cx);
+                }
+            }
             _ => return false,
         }
         true
+    }
+
+    /// Play, scrub and volume for a moving picture. The viewer is already the full screen.
+    /// Scrubbing forgets the byte window so the next draw asks for the new one.
+    fn player(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(reel) = self.viewer.as_ref().and_then(|viewer| viewer.reel.clone()) else {
+            return div().into_any_element();
+        };
+        let at = media::duration_label((reel.at_ms / 1_000) as u32);
+        let length = media::duration_label((reel.duration_ms / 1_000) as u32);
+        let volume = if reel.muted || reel.volume == 0. { "Muted".to_owned() } else { format!("{}%", (reel.volume * 100.).round() as u32) };
+        let fraction = if reel.duration_ms == 0 { 0. } else { reel.at_ms as f32 / reel.duration_ms as f32 };
+        let track = Rc::new(Cell::new((0f32, 1f32)));
+        let remembered = Rc::clone(&track);
+        let play = bar_button("viewer-play", if reel.playing { Icon::Pause } else { Icon::Play }).on_click(cx.listener(|this, _, _, cx| {
+            if let Some(reel) = this.viewer.as_mut().and_then(|viewer| viewer.reel.as_mut()) {
+                reel.toggle();
+            }
+            cx.stop_propagation();
+            cx.notify();
+        }));
+        let sound = bar_button("viewer-volume", Icon::Music).on_click(cx.listener(|this, _, _, cx| {
+            if let Some(reel) = this.viewer.as_mut().and_then(|viewer| viewer.reel.as_mut()) {
+                let next = if reel.muted || reel.volume == 0. {
+                    1.
+                } else if reel.volume > 0.5 {
+                    0.5
+                } else {
+                    0.
+                };
+                reel.set_volume(next);
+            }
+            cx.stop_propagation();
+            cx.notify();
+        }));
+        let scrub = div()
+            .id("viewer-scrub")
+            .w(px(160.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                let (left, wide) = track.get();
+                let x = f32::from(event.position().x);
+                let fraction = ((x - left) / wide).clamp(0., 1.);
+                if let Some(viewer) = this.viewer.as_mut() {
+                    if let Some(reel) = viewer.reel.as_mut() {
+                        reel.scrub((reel.duration_ms as f32 * fraction) as u64);
+                    }
+                    viewer.spanned = None;
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .relative()
+                    .w(px(160.))
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(theme::hover())
+                    .child(div().absolute().left_0().top_0().h(px(4.)).w(px((160. * fraction).clamp(0., 160.))).rounded_full().bg(theme::accent()))
+                    .child(canvas(
+                        move |bounds, _, _| remembered.set((f32::from(bounds.origin.x), f32::from(bounds.size.width).max(1.))),
+                        |_, _, _, _| {},
+                    ).absolute().inset_0()),
+            );
+        div()
+            .absolute()
+            .bottom(px(8.))
+            .left(px(12.))
+            .right(px(12.))
+            .px(px(8.))
+            .py(px(6.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::overlay())
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(play)
+                    .child(div().type_micro().text_color(theme::text()).child(format!("{at} / {length}")))
+                    .child(scrub)
+                    .child(sound)
+                    .child(div().type_micro().text_color(theme::text_soft()).child(volume)),
+            )
+            .child(div().type_micro().text_color(theme::text_faint()).child("The picture stays this still."))
+            .into_any_element()
     }
 
     pub(super) fn viewer_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -434,12 +550,49 @@ impl Pane {
         let scale = window.scale_factor();
         let phone = crate::gui::phone::active();
 
+        // A moving picture stays its poster. The whole file is not fetched. One byte window
+        // is, and the reel only tracks time: this build has no MP4 decoder.
+        let moving = media::is_video(&attachment);
+        if moving {
+            let gif = media::shape(&attachment) == Shape::Gif;
+            let duration_ms = u64::from(attachment.duration).saturating_mul(1_000);
+            let bytes = attachment.file.bytes;
+            let id = attachment.file.id.clone();
+            let mut span_ask = None;
+            if let Some(viewer) = self.viewer.as_mut() {
+                if viewer.reel.is_none() {
+                    // A gifv follows autoplay. Never stays paused. A video waits for play.
+                    let playing = gif && anim::autoplay() != anim::Autoplay::Never;
+                    viewer.reel = Some(if gif { Reel::gif(duration_ms, playing) } else { Reel::clip(duration_ms) });
+                    viewer.spanned = None;
+                }
+                if let Some(reel) = viewer.reel.as_mut() {
+                    if video::advance(reel) {
+                        window.request_animation_frame();
+                    }
+                }
+                if viewer.spanned.is_none() {
+                    let at_ms = viewer.reel.as_ref().map(|reel| reel.at_ms).unwrap_or(0);
+                    let length = viewer.reel.as_ref().map(|reel| reel.duration_ms).unwrap_or(duration_ms);
+                    let span = video::byte_span(at_ms, length, bytes);
+                    viewer.spanned = Some(span);
+                    span_ask = Some((id, span));
+                }
+            }
+            if let Some((id, span)) = span_ask {
+                self.fetch_span(id, span, cx);
+            }
+        }
+
         // The original, once it is here; the still from the row stands in until then.
         let full = &attachment.file;
         let still = attachment.thumb.as_ref().unwrap_or(full);
         let fit_to = |wide: u32, tall: u32| fit_zoom((wide as f32, tall as f32), room, scale);
         let edge = viewer_edge((full.width, full.height), asked.unwrap_or_else(|| fit_to(full.width, full.height)));
-        let original = match &full.path {
+        let original = if moving {
+            Picture::Loading
+        } else {
+            match &full.path {
             Some(path) => {
                 let picture = self.images.get_to(path, edge, None, Play::Asked, cx, Self::decoded);
                 if let Some(viewer) = self.viewer.as_mut() {
@@ -466,8 +619,24 @@ impl Pane {
                 self.want(full, full.width.max(full.height).max(1));
                 Picture::Loading
             }
+        }
         };
-        let (shown, loading, failed) = match original {
+        let (shown, loading, failed) = if moving {
+            let poster = attachment.thumb.as_ref();
+            if let Some(poster) = poster.filter(|poster| poster.failed.is_none() && poster.path.is_none()) {
+                self.want(poster, poster.width.max(poster.height).max(1));
+            }
+            let edge = media::decode_edge((still.width, still.height), room.0, room.1, media::Fit::Contain, scale);
+            let stand_in = poster.and_then(|poster| poster.path.as_deref()).and_then(|path| {
+                match self.picture(path, edge, None, cx) {
+                    Picture::Ready(image) => Some(image),
+                    _ => self.images.largest(path),
+                }
+            });
+            let missing = poster.is_some_and(|poster| poster.failed.is_some()) && stand_in.is_none();
+            (stand_in, false, missing)
+        } else {
+            match original {
             Picture::Ready(image) => (Some(image), false, false),
             other => {
                 let edge = media::decode_edge((still.width, still.height), room.0, room.1, media::Fit::Contain, scale);
@@ -479,6 +648,7 @@ impl Pane {
                     }
                 });
                 (stand_in, matches!(other, Picture::Loading), matches!(other, Picture::Failed))
+            }
             }
         };
         // Its size as the network gave it, or as decoded when it did not say.
@@ -534,13 +704,20 @@ impl Pane {
                         this.zoom(if asked.is_some() { None } else { Some(1.) }, cx);
                     }
                 }))
-                // Opened on purpose: a moving picture plays here whatever the autoplay setting.
-                .child(anim::picture(image, ObjectFit::Fill, 0., Play::Asked))
+                // Opened on purpose: a still plays here whatever the autoplay setting. A video's
+                // poster is one frame; the reel below is what moves.
+                .child(anim::picture(image, ObjectFit::Fill, 0., if moving { Play::Inline } else { Play::Asked }))
                 .into_any_element(),
             None => div()
                 .type_ui()
                 .text_color(theme::text_soft())
-                .child(if failed { "Couldn't load the full image" } else { "Loading…" })
+                .child(if moving {
+                    "The picture stays this still."
+                } else if failed {
+                    "Couldn't load the full image"
+                } else {
+                    "Loading…"
+                })
                 .into_any_element(),
         };
         let stage = div()
@@ -554,6 +731,7 @@ impl Pane {
             // The original is on its way: the bar moves only when a file lands, never on a timer.
             .children(loading.then(|| div().absolute().top_0().left_0().w(px(wide * 0.3)).h(px(2.)).bg(theme::accent())))
             .child(picture)
+            .children(moving.then(|| self.player(cx)))
             .on_scroll_wheel(cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
                 let delta = event.delta.pixel_delta(px(20.));
                 if crate::gui::shortcuts::primary(event.modifiers) {

@@ -1372,6 +1372,8 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
             title: preview.title.clone(),
             description: preview.description.clone(),
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
     if wire::find_group_invite_link(&message.text).is_some() {

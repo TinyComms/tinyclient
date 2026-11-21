@@ -341,6 +341,8 @@ fn carpool(key: &Key) -> Vec<Message> {
         title: "Weir Creek loop · 6.2 km".into(),
         description: "An easy loop along the creek, past two footbridges and the old fence line. Muddy after rain.".into(),
         image: Some(picture("preview-creek", MediaKind::Image, "preview-creek.webp", 640, 336)),
+        duration: 0,
+        opens_in_browser: false,
     }];
     let i = at(&mut all, "m10");
     all[i].attachments = vec![Attachment {

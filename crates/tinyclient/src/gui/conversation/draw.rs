@@ -3111,8 +3111,9 @@ impl Pane {
         let scale = window.scale_factor();
         let image = preview.image.as_ref();
         // Only the first card may be large, and only for a picture wide enough to deserve it.
-        let large = index == 0
-            && image.is_some_and(|image| image.width >= 400 && image.width as f32 >= image.height as f32 * 1.3);
+        // A site player is large even when its poster is small or missing.
+        let large = preview.opens_in_browser
+            || index == 0 && image.is_some_and(|image| image.width >= 400 && image.width as f32 >= image.height as f32 * 1.3);
         // A phone's card follows the phone's run: 12 / 16 / 14 over the desktop's 11 / 15 / 13.
         let phone = self.metrics == Metrics::PHONE;
         let sized = move |line: Div, size: f32, height: f32| match phone {
@@ -3139,6 +3140,9 @@ impl Pane {
             }))
             .children((!preview.description.is_empty()).then(|| {
                 clamp(sized(div().type_ui(), 14., 20.), 20.).text_color(theme::text_soft()).child(preview.description.clone())
+            }))
+            .children(preview.opens_in_browser.then(|| {
+                sized(div().truncate().type_micro(), 12., 16.).text_color(theme::text_faint()).child("Opens in browser")
             }));
         let url = preview.url.clone();
         // A phone's card is exactly the column's width: wrapped words then measure against it,
@@ -3155,11 +3159,22 @@ impl Pane {
             .border_color(theme::hairline())
             .cursor_pointer()
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)));
-        let Some(image) = image.cloned() else {
-            return card.child(words).into_any_element();
-        };
         let holder = |id: &'static str, wide: f32, tall: f32, radius: f32| {
             div().id(id).relative().w(px(wide)).h(px(tall)).flex_none().rounded(px(radius)).bg(theme::hover()).overflow_hidden()
+        };
+        let dress = |picture: Stateful<Div>| match preview.opens_in_browser {
+            true => {
+                let length = (preview.duration > 0).then(|| badge(media::duration_label(preview.duration)).right(px(6.)));
+                picture.child(play_disc()).children(length)
+            }
+            false => picture,
+        };
+        let Some(image) = image.cloned() else {
+            if !preview.opens_in_browser {
+                return card.child(words).into_any_element();
+            }
+            let wide = if phone { self.media_width() - 26. } else { self.media_width().min(416.) };
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(holder("preview", wide, 180., 8.))).into_any_element();
         };
         let shown = |image, radius: f32| anim::picture(image, ObjectFit::Cover, radius, Play::Inline);
         if large {
@@ -3170,14 +3185,14 @@ impl Pane {
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
             if self.held_back(&image) {
                 let picture = self.load_box(holder("preview", wide, tall, 8.), &image, "Preview", image.bytes, true, cx);
-                return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+                return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
             }
             let picture = match self.still(&image, edge, edge, None, cx) {
                 Picture::Ready(decoded) => holder("preview", wide, tall, 8.).child(shown(decoded, 8.)),
                 Picture::Loading => holder("preview", wide, tall, 8.).child(in_box(Icon::Image, None)),
                 Picture::Failed => self.failed_box(holder("preview", wide, tall, 8.), &image, false, cx),
             };
-            return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
         }
         let edge = media::decode_edge((image.width, image.height), 72., 72., Fit::Cover, scale);
         if self.held_back(&image) {

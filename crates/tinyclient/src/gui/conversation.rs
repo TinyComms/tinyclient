@@ -1192,7 +1192,7 @@ impl Pane {
         let Some(account) = self.key().map(Key::account) else {
             return;
         };
-        let request = Request::Fetch { retry, size, account: account.clone(), ids };
+        let request = Request::Fetch { retry, size, span: None, account: account.clone(), ids };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let Ok(Response::Media { files }) = answer else {
@@ -1224,6 +1224,18 @@ impl Pane {
         self.relay(pinned, self.list.logical_scroll_top());
         self.fetch(vec![file.id.clone()], size, true, cx);
         cx.notify();
+    }
+
+    /// One byte window of a moving picture. The answer is not the file, so it is not landed.
+    fn fetch_span(&mut self, id: String, span: (u64, u64), cx: &mut Context<Self>) {
+        let Some(account) = self.key().map(Key::account) else {
+            return;
+        };
+        let request = Request::Fetch { retry: false, size: None, span: Some(span), account, ids: vec![id] };
+        cx.spawn(async move |_this, cx| {
+            let _ = cx.background_executor().spawn(async move { ask(&request) }).await;
+        })
+        .detach();
     }
 
     /// Fetches a whole file because the user asked for it, and does `then` when it is here.

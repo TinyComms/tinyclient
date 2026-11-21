@@ -3464,7 +3464,7 @@ impl Chat {
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 
-            Request::Fetch { account, ids, size, retry } => {
+            Request::Fetch { account, ids, size, retry, span } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
                 let ids = &ids[..ids.len().min(PAGE_LIMIT as usize)];
                 // What the cache is asked for is decided here: a failure the user wants tried
@@ -3484,7 +3484,11 @@ impl Chat {
                 if retry {
                     self.blobs.retried(&account, ids);
                 }
-                match self.blobs.request(&account, ids, adapter.clone()) {
+                let asked = match span {
+                    Some(span) => self.blobs.request_span(&account, ids, adapter.clone(), span),
+                    None => self.blobs.request(&account, ids, adapter.clone()),
+                };
+                match asked {
                     Ok(files) => {
                         // What the cache has never heard of may be the adapter's to fetch itself.
                         let unknown: Vec<String> = ids.iter().filter(|id| !files.iter().any(|file| file.id == **id)).cloned().collect();

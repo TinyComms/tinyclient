@@ -3141,6 +3141,8 @@ fn apply_wire_previews(
             title: super::preview::clean_field(&p.title, 200),
             description: super::preview::clean_field(&p.description, 500),
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
 }
@@ -3178,6 +3180,8 @@ fn apply_sealed_previews(
             title: super::preview::clean_field(&p.title, 200),
             description: super::preview::clean_field(&p.description, 500),
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
 }

@@ -901,6 +901,9 @@ pub struct EmbedImage {
     pub width: u32,
     #[serde(default, deserialize_with = "nullable")]
     pub height: u32,
+    /// Seconds, on a video or gifv. Absent on a thumbnail or a still.
+    #[serde(default, deserialize_with = "nullable")]
+    pub duration_secs: f64,
 }
 
 #[derive(Deserialize, Clone, Debug)]
