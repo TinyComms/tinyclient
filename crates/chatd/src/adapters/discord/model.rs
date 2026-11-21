@@ -395,6 +395,9 @@ pub struct Channel {
     pub is_message_request: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub is_spam: bool,
+    /// Age-gated (NSFW) channel flag.
+    #[serde(default, deserialize_with = "nullable")]
+    pub nsfw: bool,
 }
 
 /// What is kept of a server's channel between connects, in a note: enough to work out again

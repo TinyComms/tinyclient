@@ -362,6 +362,8 @@ struct State {
     /// Per channel, the read acknowledgement last sent and the newest one held back since
     /// (`mark_read`): one per channel per [`ACK_EVERY`].
     acks: HashMap<String, Ack>,
+    /// Age-gated (NSFW) channel ids, kept so recent mentions skip them.
+    nsfw_channels: HashSet<String>,
 }
 
 /// One channel's read acknowledgements.
@@ -1881,6 +1883,10 @@ impl Discord {
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
             }
+            Command::Mentions { before, everyone, roles, space_id, limit, reply } => {
+                answer(reply, self.mentions(before.as_deref(), everyone, roles, space_id.as_deref(), limit))
+            }
+            Command::DismissMention { message_id, reply } => answer(reply, self.dismiss_mention(&message_id)),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { kind, space_id, query, cursor, reply } => {
                 answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))

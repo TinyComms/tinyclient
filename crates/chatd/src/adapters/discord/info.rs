@@ -767,6 +767,83 @@ impl Discord {
         }
         Ok(found_hits)
     }
+
+    /// Recent mentions from before tinyclient was open (`GET /users/@me/mentions`).
+    /// Mapped through `convert()` without writing into channel message history; respects hidden
+    /// channels, message requests, and age-gated (NSFW) channels.
+    pub(super) fn mentions(
+        &self,
+        before: Option<&str>,
+        everyone: bool,
+        roles: bool,
+        space: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<protocol::MentionHit>, bool), Refusal> {
+        let cap = limit.clamp(1, 25);
+        let mut path = format!("/users/@me/mentions?limit={cap}&roles={roles}&everyone={everyone}");
+        if let Some(before) = before.filter(|b| !b.is_empty()) {
+            path.push_str(&format!("&before={}", escaped(before)));
+        }
+        if let Some(guild) = space.filter(|g| !g.is_empty()) {
+            path.push_str(&format!("&guild_id={}", escaped(guild)));
+        }
+        let answer = self.call("GET", &path, None).map_err(refusal)?;
+        let raw: Vec<Posted> = serde_json::from_str(&answer).map_err(refused)?;
+        let more = raw.len() >= cap as usize;
+        let nsfw = crate::hub::lock(&self.state).nsfw_channels.clone();
+        let mut hits = Vec::new();
+        for posted in &raw {
+            if !self.ctx.listable(&posted.channel_id) || nsfw.contains(&posted.channel_id) {
+                continue;
+            }
+            let known = self.ctx.known(&posted.channel_id).ok().flatten();
+            if known.as_ref().is_some_and(|row| row.special == protocol::Special::Request) {
+                continue;
+            }
+            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
+            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
+            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            let guild = posted
+                .guild_id
+                .as_deref()
+                .or_else(|| known.as_ref().and_then(|row| row.space.as_deref()));
+            let (message, files) = self.convert(posted, guild, kind);
+            if !files.files.is_empty() {
+                let _ = self.ctx.media(&files.files);
+            }
+            let text = if !message.text.is_empty() {
+                message.text
+            } else if let Some(first) = message.attachments.first() {
+                if first.name.is_empty() { "Attachment".to_owned() } else { first.name.clone() }
+            } else {
+                posted.content.clone().unwrap_or_default()
+            };
+            hits.push(protocol::MentionHit {
+                conversation: self.ctx.key(&posted.channel_id),
+                message_id: posted.id.clone(),
+                sent: model::seconds(&posted.id),
+                sender: message.sender.name,
+                sender_avatar: message.sender.avatar,
+                text,
+                title,
+                space_title,
+                mentions_everyone: posted.mention_everyone,
+                mentions_role: !posted.mention_roles.is_empty(),
+            });
+        }
+        Ok((hits, more))
+    }
+
+    /// Dismisses a recent mention (`DELETE /users/@me/mentions/{message_id}`).
+    pub(super) fn dismiss_mention(&self, message_id: &str) -> Result<(), Refusal> {
+        let id = message_id.trim();
+        if id.is_empty() {
+            return Err(refused("Missing mention message id."));
+        }
+        self.call("DELETE", &format!("/users/@me/mentions/{}", escaped(id)), None)
+            .map_err(refusal)?;
+        Ok(())
+    }
 }
 
 /// Largest avatar or banner image file accepted before base64-encoding into a Discord data URI.

@@ -71,6 +71,14 @@ pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn default_mentions_true() -> bool {
+    true
+}
+
+fn default_mentions_limit() -> u32 {
+    25
+}
+
 pub(crate) fn is_true(value: &bool) -> bool {
     *value
 }
@@ -2545,6 +2553,26 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
     },
+    /// Fetch recent mentions from the network (e.g. Discord `GET /users/@me/mentions`),
+    /// asked only when the user opens Mentions or requests another page.
+    Mentions {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default = "default_mentions_true")]
+        everyone: bool,
+        #[serde(default = "default_mentions_true")]
+        roles: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default = "default_mentions_limit")]
+        limit: u32,
+    },
+    /// Dismiss a recent mention on the network (e.g. Discord `DELETE /users/@me/mentions/{id}`).
+    DismissMention {
+        account: AccountKey,
+        message_id: String,
+    },
     /// Add a link bookmark to a channel (Slack `bookmarks.add`).
     BookmarkAdd {
         conversation: Key,
@@ -3105,6 +3133,12 @@ pub enum Response {
         items: Vec<ActivityItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+    },
+    /// One page of recent mentions (`Request::Mentions`).
+    Mentions {
+        items: Vec<MentionHit>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
     /// A created or edited channel bookmark (`BookmarkAdd` / `BookmarkEdit`).
     Bookmark {

@@ -477,6 +477,20 @@ pub enum Command {
         item_id: Option<String>,
         reply: Reply<()>,
     },
+    /// Fetch recent mentions from the network (e.g. Discord `GET /users/@me/mentions`).
+    Mentions {
+        before: Option<String>,
+        everyone: bool,
+        roles: bool,
+        space_id: Option<String>,
+        limit: u32,
+        reply: Reply<(Vec<protocol::MentionHit>, bool)>,
+    },
+    /// Dismiss a recent mention on the network (`DELETE /users/@me/mentions/{id}`).
+    DismissMention {
+        message_id: String,
+        reply: Reply<()>,
+    },
     /// Add a bookmark to a channel.
     BookmarkAdd {
         conversation_id: String,
@@ -888,6 +902,8 @@ impl Command {
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Mentions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

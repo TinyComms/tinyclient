@@ -114,6 +114,13 @@ pub struct State {
     pub(super) activity_cursor: Option<(AccountKey, String)>,
     pub(super) activity_loading: bool,
     activity_epoch: u64,
+    /// Recent mentions fetched from the network on demand (`Request::Mentions`, Discord).
+    pub(super) mentions_items: Vec<protocol::MentionHit>,
+    pub(super) mentions_more: Option<(AccountKey, String)>,
+    pub(super) mentions_loading: bool,
+    pub(super) mentions_everyone: bool,
+    pub(super) mentions_roles: bool,
+    mentions_epoch: u64,
     /// The network home on show: what chatd said, and the user's folds.
     pub home: home::Home,
     saved_homes: HashMap<Network, home::Home>,
@@ -264,6 +271,12 @@ impl State {
             activity_cursor: None,
             activity_loading: false,
             activity_epoch: 0,
+            mentions_items: Vec::new(),
+            mentions_more: None,
+            mentions_loading: false,
+            mentions_everyone: true,
+            mentions_roles: true,
+            mentions_epoch: 0,
             home: home::Home::default(),
             saved_homes: HashMap::new(),
             home_list: list_state(),
@@ -866,7 +879,145 @@ impl Shell {
         self.load_inbox(vec![0], cx);
         if filter == InboxFilter::Activity {
             self.load_activity_feed(cx);
+        } else if filter == InboxFilter::Mentions {
+            self.load_mentions_history(cx);
         }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_mentions_everyone(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_state.mentions_everyone = !self.sidebar_state.mentions_everyone;
+        self.load_mentions_history(cx);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_mentions_roles(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_state.mentions_roles = !self.sidebar_state.mentions_roles;
+        self.load_mentions_history(cx);
+        cx.notify();
+    }
+
+    pub(super) fn load_mentions_history(&mut self, cx: &mut Context<Self>) {
+        let accounts: Vec<AccountKey> = self
+            .snapshot
+            .as_ref()
+            .map(|s| {
+                s.accounts
+                    .iter()
+                    .filter(|a| a.can.mentions_history && a.link == Link::Connected)
+                    .map(|a| a.key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.sidebar_state.mentions_epoch += 1;
+        let epoch = self.sidebar_state.mentions_epoch;
+        self.sidebar_state.mentions_items.clear();
+        self.sidebar_state.mentions_more = None;
+        if accounts.is_empty() {
+            self.sidebar_state.mentions_loading = false;
+            return;
+        }
+        self.sidebar_state.mentions_loading = true;
+        let everyone = self.sidebar_state.mentions_everyone;
+        let roles = self.sidebar_state.mentions_roles;
+        cx.spawn(async move |this, cx| {
+            let (merged, more) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut merged = Vec::new();
+                    let mut more = None;
+                    for account in accounts {
+                        let req = Request::Mentions {
+                            account: account.clone(),
+                            before: None,
+                            everyone,
+                            roles,
+                            space: None,
+                            limit: 25,
+                        };
+                        if let Ok(Response::Mentions { items, more: has_more }) = ask(&req) {
+                            if has_more && more.is_none() {
+                                if let Some(last) = items.last() {
+                                    more = Some((account, last.message_id.clone()));
+                                }
+                            }
+                            merged.extend(items);
+                        }
+                    }
+                    merged.sort_by_key(|item| std::cmp::Reverse(item.sent));
+                    (merged, more)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar_state.mentions_epoch != epoch {
+                    return;
+                }
+                this.sidebar_state.mentions_loading = false;
+                this.sidebar_state.mentions_items = merged;
+                this.sidebar_state.mentions_more = more;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn load_more_mentions(&mut self, cx: &mut Context<Self>) {
+        let Some((account, before)) = self.sidebar_state.mentions_more.take() else {
+            return;
+        };
+        let epoch = self.sidebar_state.mentions_epoch;
+        let everyone = self.sidebar_state.mentions_everyone;
+        let roles = self.sidebar_state.mentions_roles;
+        self.sidebar_state.mentions_loading = true;
+        cx.spawn(async move |this, cx| {
+            let req = Request::Mentions {
+                account: account.clone(),
+                before: Some(before),
+                everyone,
+                roles,
+                space: None,
+                limit: 25,
+            };
+            let got = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar_state.mentions_epoch != epoch {
+                    return;
+                }
+                this.sidebar_state.mentions_loading = false;
+                if let Ok(Response::Mentions { items, more }) = got {
+                    if more {
+                        if let Some(last) = items.last() {
+                            this.sidebar_state.mentions_more = Some((account, last.message_id.clone()));
+                        }
+                    }
+                    this.sidebar_state.mentions_items.extend(items);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn open_mention_hit(&mut self, hit: protocol::MentionHit, cx: &mut Context<Self>) {
+        let title = if !hit.title.is_empty() {
+            hit.title.clone()
+        } else {
+            self.sidebar_state
+                .inbox
+                .all()
+                .iter()
+                .find(|c| c.key == hit.conversation)
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| hit.conversation.id.clone())
+        };
+        self.open_resolved_link(hit.conversation, Some(hit.message_id), &title, cx);
+        cx.notify();
+    }
+
+    pub(super) fn dismiss_mention_hit(&mut self, account: AccountKey, message_id: String, cx: &mut Context<Self>) {
+        self.sidebar_state.mentions_items.retain(|m| m.message_id != message_id);
+        let req = Request::DismissMention { account, message_id };
+        cx.background_executor().spawn(async move { let _ = ask(&req); }).detach();
         cx.notify();
     }
 

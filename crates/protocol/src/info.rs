@@ -734,6 +734,32 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account can fetch recent mentions from before tinyclient was open (`Request::Mentions`, Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_history: bool,
+}
+
+/// One recent mention fetched from the network (`Request::Mentions`).
+/// Never written to the channel's message history store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionHit {
+    pub conversation: Key,
+    pub message_id: String,
+    pub sent: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_avatar: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub space_title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_everyone: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_role: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

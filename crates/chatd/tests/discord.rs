@@ -5432,3 +5432,115 @@ fn edit_own_profile_avatar_banner_and_server_nickname() {
     assert_eq!(srv_patches.len(), 1);
     assert_eq!(srv_patches[0].body, json!({"bio": "Nitro guild bio"}));
 }
+
+#[test]
+fn recent_mentions_fetch_filter_and_dismiss() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add an age-gated (NSFW) channel 4199 to guild 4000.
+    ready["guilds"][0]["channels"].as_array_mut().unwrap().push(json!({
+        "id": "4199", "type": 0, "name": "age-gated", "position": 9, "parent_id": "4100",
+        "nsfw": true, "permission_overwrites": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let account = world.account();
+
+    // 1. Capability is advertised.
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == account).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(can.mentions_history);
+
+    // 2. Fetch mentions: includes normal channel 4101, filters out message request 3005 and NSFW channel 4199.
+    let before_msgs = world.messages("4101").len();
+    world.discord.script(
+        "/users/@me/mentions",
+        200,
+        json!([
+            {
+                "id": "1300000000000090001", "channel_id": "4101", "guild_id": "4000", "type": 0,
+                "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                "content": "hey <@1000> check this out",
+                "timestamp": "2026-10-13T08:15:00.000000+00:00",
+                "mentions": [{"id": "1000", "username": "justin", "global_name": "Justin"}],
+                "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+            },
+            {
+                "id": "1300000000000090002", "channel_id": "3005", "type": 0,
+                "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                "content": "spam request mention",
+                "timestamp": "2026-10-13T08:14:00.000000+00:00",
+                "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+            },
+            {
+                "id": "1300000000000090003", "channel_id": "4199", "guild_id": "4000", "type": 0,
+                "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                "content": "nsfw channel mention",
+                "timestamp": "2026-10-13T08:13:00.000000+00:00",
+                "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+            }
+        ]),
+    );
+    match world.ask(Request::Mentions {
+        account: account.clone(),
+        before: None,
+        everyone: true,
+        roles: true,
+        space: None,
+        limit: 25,
+    }) {
+        Response::Mentions { items, more } => {
+            assert!(!more);
+            assert_eq!(items.len(), 1, "request DM and NSFW channel must be filtered out: {items:?}");
+            assert_eq!(items[0].message_id, "1300000000000090001");
+            assert_eq!(items[0].conversation, world.key("4101"));
+            assert_eq!(items[0].sender, "Sam Whitlock");
+            assert!(items[0].text.contains("check this out"));
+        }
+        other => panic!("expected Response::Mentions, got {other:?}"),
+    }
+    let reqs = world.discord.requests_to("GET", "/users/@me/mentions");
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].path.contains("limit=25") && reqs[0].path.contains("roles=true") && reqs[0].path.contains("everyone=true"));
+    // Mentions must NEVER be written into channel message history.
+    assert_eq!(world.messages("4101").len(), before_msgs);
+
+    // 3. Paging + filters: everyone=false, roles=false, before, guild_id.
+    world.discord.script("/users/@me/mentions", 200, json!([]));
+    assert!(matches!(
+        world.ask(Request::Mentions {
+            account: account.clone(),
+            before: Some("1300000000000090001".into()),
+            everyone: false,
+            roles: false,
+            space: Some(world.key("4000")),
+            limit: 10,
+        }),
+        Response::Mentions { items, more: false } if items.is_empty()
+    ));
+    let reqs = world.discord.requests_to("GET", "/users/@me/mentions");
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        reqs[1].path.contains("limit=10")
+            && reqs[1].path.contains("roles=false")
+            && reqs[1].path.contains("everyone=false")
+            && reqs[1].path.contains("before=1300000000000090001")
+            && reqs[1].path.contains("guild_id=4000"),
+        "got {}",
+        reqs[1].path
+    );
+
+    // 4. Dismiss sends DELETE /users/@me/mentions/{id}.
+    world.discord.script("/users/@me/mentions/1300000000000090001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DismissMention {
+            account,
+            message_id: "1300000000000090001".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/users/@me/mentions/1300000000000090001").len(), 1);
+}

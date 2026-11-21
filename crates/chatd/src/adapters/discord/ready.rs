@@ -505,6 +505,10 @@ impl Discord {
         for row in &tree.rows {
             self.ctx.muted(&row.id, info.quiet.mutes(&row.id, row.group.as_deref(), now))?;
         }
+        let nsfw: Vec<String> = guild.channels.iter().filter(|ch| ch.nsfw).map(|ch| ch.id.clone()).collect();
+        if !nsfw.is_empty() {
+            self.state.lock().unwrap().nsfw_channels.extend(nsfw);
+        }
         let kept: Vec<Kept> = guild.channels.iter().map(Kept::of).collect();
         self.ctx.set_note(&format!("kept:{}", guild.id), &serde_json::to_string(&kept).unwrap_or_default());
         self.unlist_threads(&guild.id, &tree.rows)
@@ -856,6 +860,7 @@ impl Discord {
             profile_accent: true,
             profile_banner: premium > 0,
             profile_server: premium > 0,
+            mentions_history: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -1212,6 +1217,14 @@ impl Discord {
         };
         if !self.state.lock().unwrap().guilds.contains_key(&guild) {
             return Ok(());
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            if channel.nsfw {
+                state.nsfw_channels.insert(channel.id.clone());
+            } else {
+                state.nsfw_channels.remove(&channel.id);
+            }
         }
         self.keep(&guild, |kept| match kept.iter_mut().find(|known| known.id == channel.id) {
             Some(known) => *known = Kept::of(&channel),

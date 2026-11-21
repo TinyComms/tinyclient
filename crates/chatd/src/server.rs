@@ -3784,6 +3784,34 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Mentions { account, before, everyone, roles, space, limit } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 25 } else { limit.min(50) };
+                let space_id = space.filter(|s| s.account() == account).map(|s| s.id);
+                match self.ask(&account, |reply| Command::Mentions { before, everyone, roles, space_id, limit, reply }) {
+                    Ok((mut items, more)) => {
+                        for item in &mut items {
+                            clip(&mut item.sender, 120);
+                            clip(&mut item.text, 500);
+                            clip(&mut item.title, 120);
+                            clip(&mut item.space_title, 120);
+                        }
+                        Response::Mentions { items, more }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DismissMention { account, message_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DismissMention { message_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::BookmarkAdd { conversation, title, link, emoji } => {
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {
