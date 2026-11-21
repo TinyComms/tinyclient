@@ -630,7 +630,7 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
-    /// Executes an interactive Block Kit control on a message (Slack `blocks.actions`).
+    /// Executes an interactive control on a message (Slack `blocks.actions`, Telegram giveaways / games / callbacks).
     MessageAction {
         conversation_id: String,
         message_id: String,
@@ -639,7 +639,7 @@ pub enum Command {
         element_type: String,
         value: String,
         values: Vec<String>,
-        reply: Reply<()>,
+        reply: Reply<Option<protocol::ActionResult>>,
     },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.

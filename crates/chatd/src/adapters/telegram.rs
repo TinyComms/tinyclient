@@ -878,6 +878,16 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
         }
+        Command::MessageAction { conversation_id, message_id, action_id, value, reply, .. } => {
+            let answer = match action_id.as_str() {
+                "tg:giveaway_info" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::giveaway_info(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
         }
@@ -1489,6 +1499,11 @@ pub fn prove_telegram_accounts() -> Result<(), String> {
 /// The lab's telegram-invoices driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_invoices() -> Result<(), String> {
     content::prove_invoices()
+}
+
+/// The lab's telegram-giveaways driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_giveaways() -> Result<(), String> {
+    content::prove_giveaways()
 }
 
 /// The lab's telegram-location driver. A build without this stays up and the driver fails.

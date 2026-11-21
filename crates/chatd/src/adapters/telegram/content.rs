@@ -5,8 +5,8 @@
 use super::peers::{is_replies, message_link, thread_id, Directory, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyTo, Sender, Span,
-    Style, ThreadSummary,
+    Attachment, Card, ControlKind, ControlStyle, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageControl,
+    MessageKind, Preview, Reaction, ReplyTo, Sender, Span, Style, ThreadSummary,
 };
 use std::collections::HashSet;
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
@@ -1305,7 +1305,6 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
         }
         MessageMedia::Invoice(invoice) => format!("Invoice: {}", invoice.title),
         MessageMedia::Story(_) => "Story".to_owned(),
-        MessageMedia::Giveaway(_) | MessageMedia::GiveawayResults(_) => "Giveaway".to_owned(),
         MessageMedia::PaidMedia(_) => "Paid media".to_owned(),
         MessageMedia::VideoStream(_) => "Live stream".to_owned(),
         MessageMedia::Unsupported => "A message this version of tinyclient cannot show".to_owned(),
@@ -1327,6 +1326,37 @@ fn stars(amount: i64) -> String {
     } else {
         format!("{amount} Stars")
     }
+}
+
+/// Public-within-adapter helper for Stars wording (used by giveaway status responses too).
+pub(super) fn stars_label(amount: i64) -> String {
+    stars(amount)
+}
+
+/// Whether a Telegram slug (gift code, mini app, etc.) is safe to interpolate into a `https://t.me/` URL.
+pub(super) fn is_safe_slug(slug: &str) -> bool {
+    !slug.is_empty() && slug.len() <= 128 && slug.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Formats a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM UTC` without external date crates.
+pub(super) fn format_utc(unix: i32) -> String {
+    let secs = i64::from(unix);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let hour = tod / 3_600;
+    let minute = (tod % 3_600) / 60;
+    // Civil date from days since 1970-01-01 (Howard Hinnant algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
 /// How many decimal places the currency's minor unit has. Stars are not a currency here.
@@ -1496,6 +1526,116 @@ fn shared_contact(contact: &tl::types::MessageMediaContact) -> protocol::SharedC
         organization,
         avatar: None,
         person_id,
+    }
+}
+
+/// Structured card and "Check status" button for a Telegram giveaway or giveaway results message.
+fn giveaway_card(dir: &Directory, media: &MessageMedia, msg_id: i32) -> Option<(Card, Vec<MessageControl>)> {
+    let check_button = |target_msg_id: i32| MessageControl {
+        block_id: String::new(),
+        action_id: "tg:giveaway_info".to_owned(),
+        element_type: "telegram_giveaway".to_owned(),
+        label: "Check status".to_owned(),
+        value: target_msg_id.to_string(),
+        confirm: None,
+        kind: ControlKind::Button { url: String::new(), style: ControlStyle::Default },
+    };
+    let channel_label = |id: i64| {
+        let name = dir.name(Who::Channel(id));
+        if name == "Unknown" { format!("Channel {id}") } else { name }
+    };
+    match media {
+        MessageMedia::Giveaway(g) => {
+            let qty = g.quantity.max(1);
+            let (title, prize) = if let Some(s) = g.stars.filter(|&s| s > 0) {
+                (
+                    format!("{} Giveaway", stars(s)),
+                    format!("{} among {}", stars(s), count_words(qty, "winner", "winners")),
+                )
+            } else if let Some(months) = g.months.filter(|&m| m > 0) {
+                let period = count_words(months, "month", "months");
+                (
+                    format!("{qty} × {period} of Telegram Premium"),
+                    format!("{qty} × {period} Telegram Premium"),
+                )
+            } else {
+                (
+                    format!("Giveaway ({})", count_words(qty, "prize", "prizes")),
+                    count_words(qty, "prize", "prizes"),
+                )
+            };
+            let mut card = Card {
+                author: "Giveaway".to_owned(),
+                title,
+                text: g.prize_description.clone().unwrap_or_default(),
+                footer: "Telegram Giveaway".to_owned(),
+                ..Card::default()
+            };
+            card.fields.push(("Prizes".to_owned(), prize));
+            if !g.channels.is_empty() {
+                let names: Vec<String> = g.channels.iter().map(|&id| channel_label(id)).collect();
+                card.fields.push(("Channels".to_owned(), names.join(", ")));
+            }
+            card.fields.push((
+                "Eligibility".to_owned(),
+                if g.only_new_subscribers { "New subscribers only" } else { "All subscribers" }.to_owned(),
+            ));
+            if let Some(countries) = g.countries_iso2.as_ref().filter(|list| !list.is_empty()) {
+                card.fields.push(("Countries".to_owned(), countries.join(", ")));
+            }
+            card.fields.push((
+                "Winners".to_owned(),
+                if g.winners_are_visible { "Public" } else { "Private" }.to_owned(),
+            ));
+            if g.until_date > 0 {
+                card.fields.push(("Ends".to_owned(), format_utc(g.until_date)));
+            }
+            Some((card, vec![check_button(msg_id)]))
+        }
+        MessageMedia::GiveawayResults(r) => {
+            let title = if r.refunded {
+                "Giveaway refunded".to_owned()
+            } else {
+                format!("{} selected", count_words(r.winners_count, "winner", "winners"))
+            };
+            let mut card = Card {
+                author: "Giveaway results".to_owned(),
+                title,
+                text: r.prize_description.clone().unwrap_or_default(),
+                footer: if r.refunded { "Refunded" } else { "Finished" }.to_owned(),
+                ..Card::default()
+            };
+            let mut ch = channel_label(r.channel_id);
+            if let Some(extra) = r.additional_peers_count.filter(|&n| n > 0) {
+                ch.push_str(&format!(" (+{extra} more)"));
+            }
+            card.fields.push(("Channel".to_owned(), ch));
+            if let Some(s) = r.stars.filter(|&s| s > 0) {
+                card.fields.push(("Prize".to_owned(), stars(s)));
+            } else if let Some(months) = r.months.filter(|&m| m > 0) {
+                card.fields.push(("Prize".to_owned(), format!("{} of Telegram Premium", count_words(months, "month", "months"))));
+            }
+            if !r.winners.is_empty() {
+                let names: Vec<String> = r
+                    .winners
+                    .iter()
+                    .map(|&id| {
+                        let name = dir.name(Who::User(id));
+                        if name == "Unknown" { format!("User {id}") } else { name }
+                    })
+                    .collect();
+                card.fields.push(("Winners".to_owned(), names.join(", ")));
+            }
+            if r.unclaimed_count > 0 {
+                card.fields.push(("Unclaimed".to_owned(), r.unclaimed_count.to_string()));
+            }
+            if r.until_date > 0 {
+                card.fields.push(("Ended".to_owned(), format_utc(r.until_date)));
+            }
+            let target = if r.launch_msg_id > 0 { r.launch_msg_id } else { msg_id };
+            Some((card, vec![check_button(target)]))
+        }
+        _ => None,
     }
 }
 
@@ -1918,7 +2058,15 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         } else {
             format!("{who} started a giveaway")
         }),
-        A::GiveawayResults(results) => named(format!("A giveaway finished with {}", count_words(results.winners_count, "winner", "winners"))),
+        A::GiveawayResults(results) => named(if results.unclaimed_count > 0 {
+            format!(
+                "A giveaway finished with {}, {} unclaimed",
+                count_words(results.winners_count, "winner", "winners"),
+                results.unclaimed_count
+            )
+        } else {
+            format!("A giveaway finished with {}", count_words(results.winners_count, "winner", "winners"))
+        }),
         A::BoostApply(boost) => named(if boost.boosts == 1 {
             format!("{who} boosted this channel")
         } else {
@@ -1971,6 +2119,22 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             let mut message = Message::plain(service.id.to_string(), "", text, i64::from(service.date), outgoing);
             message.sender = sender(dir, from);
             message.call = call_note;
+            if let MessageAction::GiftCode(gift) = &service.action {
+                if is_safe_slug(&gift.slug) {
+                    message.controls.push(MessageControl {
+                        block_id: String::new(),
+                        action_id: "tg:giftcode".to_owned(),
+                        element_type: "telegram_link".to_owned(),
+                        label: "Redeem gift code".to_owned(),
+                        value: String::new(),
+                        confirm: None,
+                        kind: ControlKind::Button {
+                            url: format!("https://t.me/giftcode/{}", gift.slug),
+                            style: ControlStyle::Primary,
+                        },
+                    });
+                }
+            }
             // A named event is the grey line. One this build does not word opens in Telegram,
             // the same way a poll or a story does.
             message.kind = if known {
@@ -2104,6 +2268,12 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
                 Some(MessageMedia::Contact(contact)) => {
                     message.contacts.push(shared_contact(contact));
+                }
+                Some(media @ (MessageMedia::Giveaway(_) | MessageMedia::GiveawayResults(_))) => {
+                    if let Some((card, controls)) = giveaway_card(dir, media, raw.id) {
+                        message.card = Some(Box::new(card));
+                        message.controls.extend(controls);
+                    }
                 }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
@@ -3004,6 +3174,185 @@ pub(super) fn prove_invoices() -> Result<(), String> {
     let (line, known) = action(&Directory::new(1), "Ada", &sent.into());
     if !known || line != "Ada sent a payment of 50 Stars" {
         return Err(format!("a Star payment is unnamed, got {line}"));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-giveaways check. An announcement and its results are cards with the
+/// prizes and rules, a status button asks who is taking part, and the service lines name
+/// the launch, the results, and a gift code. A build from before this says only "Giveaway".
+pub(super) fn prove_giveaways() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let blank = || tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned());
+    let field = |card: &Card, label: &str| -> Option<&str> {
+        card.fields.iter().find(|row| row.0 == label).map(|row| row.1.as_str())
+    };
+
+    let mut premium = blank()?;
+    premium.media = Some(
+        tl::types::MessageMediaGiveaway {
+            only_new_subscribers: true,
+            winners_are_visible: false,
+            channels: vec![-100],
+            countries_iso2: Some(vec!["US".into(), "CA".into()]),
+            prize_description: Some("A year on the ridge".into()),
+            quantity: 3,
+            months: Some(1),
+            stars: None,
+            until_date: 1_700_000_000,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &premium.into()).ok_or("the giveaway maps")?;
+    let card = mapped.message.card.ok_or("a giveaway is a card")?;
+    if card.title != "3 × 1 month of Telegram Premium" || card.text != "A year on the ridge" || card.author != "Giveaway" {
+        return Err(format!("the giveaway card is unnamed, got {}", card.title));
+    }
+    if field(&card, "Prizes") != Some("3 × 1 month Telegram Premium")
+        || field(&card, "Channels") != Some("Channel -100")
+        || field(&card, "Eligibility") != Some("New subscribers only")
+        || field(&card, "Countries") != Some("US, CA")
+        || field(&card, "Winners") != Some("Private")
+        || field(&card, "Ends") != Some("2023-11-14 22:12 UTC")
+    {
+        return Err(format!("the giveaway fields are wrong: {:?}", card.fields));
+    }
+    match mapped.message.controls.first() {
+        Some(control) if control.action_id == "tg:giveaway_info" && control.value == "9" && control.label == "Check status" => {}
+        _ => return Err("a giveaway has no status button".into()),
+    }
+    if matches!(mapped.message.kind, MessageKind::Unsupported { .. }) {
+        return Err("a giveaway still opens only in Telegram".into());
+    }
+
+    let mut stars_msg = blank()?;
+    stars_msg.id = 11;
+    stars_msg.media = Some(
+        tl::types::MessageMediaGiveaway {
+            only_new_subscribers: false,
+            winners_are_visible: true,
+            channels: vec![],
+            countries_iso2: None,
+            prize_description: None,
+            quantity: 2,
+            months: None,
+            stars: Some(100),
+            until_date: 0,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &stars_msg.into()).ok_or("the Stars giveaway maps")?;
+    let card = mapped.message.card.ok_or("a Stars giveaway is a card")?;
+    if card.title != "100 Stars Giveaway" || field(&card, "Prizes") != Some("100 Stars among 2 winners") || field(&card, "Winners") != Some("Public") {
+        return Err(format!("the Stars giveaway is unnamed, got {} {:?}", card.title, card.fields));
+    }
+
+    let mut results = blank()?;
+    results.id = 41;
+    results.media = Some(
+        tl::types::MessageMediaGiveawayResults {
+            only_new_subscribers: false,
+            refunded: false,
+            channel_id: 100,
+            additional_peers_count: Some(1),
+            launch_msg_id: 40,
+            winners_count: 2,
+            unclaimed_count: 1,
+            winners: vec![9],
+            months: None,
+            stars: Some(50),
+            prize_description: None,
+            until_date: 1_700_000_000,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &results.into()).ok_or("the results map")?;
+    let card = mapped.message.card.ok_or("giveaway results are a card")?;
+    if card.author != "Giveaway results"
+        || card.title != "2 winners selected"
+        || field(&card, "Channel") != Some("Channel 100 (+1 more)")
+        || field(&card, "Prize") != Some("50 Stars")
+        || field(&card, "Winners") != Some("User 9")
+        || field(&card, "Unclaimed") != Some("1")
+        || field(&card, "Ended") != Some("2023-11-14 22:12 UTC")
+    {
+        return Err(format!("the results card is wrong: {} {:?}", card.title, card.fields));
+    }
+    match mapped.message.controls.first() {
+        Some(control) if control.action_id == "tg:giveaway_info" && control.value == "40" => {}
+        _ => return Err("results do not ask about the launch message".into()),
+    }
+
+    let (launch, known) = action(
+        &Directory::new(1),
+        "Ada",
+        &tl::types::MessageActionGiveawayLaunch { stars: Some(10) }.into(),
+    );
+    if !known || launch != "Ada started a Stars giveaway" {
+        return Err(format!("a launch is unnamed, got {launch}"));
+    }
+    let (finished, known) = action(
+        &Directory::new(1),
+        "Ada",
+        &tl::types::MessageActionGiveawayResults { stars: false, winners_count: 3, unclaimed_count: 2 }.into(),
+    );
+    if !known || finished != "A giveaway finished with 3 winners, 2 unclaimed" {
+        return Err(format!("results are unnamed, got {finished}"));
+    }
+
+    let code = tl::types::MessageActionGiftCode {
+        via_giveaway: true,
+        unclaimed: false,
+        boost_peer: None,
+        days: 30,
+        slug: "Winter-2023".into(),
+        currency: None,
+        amount: None,
+        crypto_currency: None,
+        crypto_amount: None,
+        message: None,
+    };
+    let service = tl::types::MessageService {
+        out: false,
+        mentioned: false,
+        media_unread: false,
+        reactions_are_possible: false,
+        silent: false,
+        post: false,
+        legacy: false,
+        id: 12,
+        from_id: Some(Who::User(7_002).peer()),
+        peer_id: Who::User(7_002).peer(),
+        saved_peer_id: None,
+        reply_to: None,
+        date: 1_700_000_000,
+        action: code.into(),
+        reactions: None,
+        ttl_period: None,
+    };
+    let mapped = map(&Directory::new(1), &service.into()).ok_or("a gift code maps")?;
+    if mapped.message.text != "A giveaway sent a Premium gift code for 30 days" {
+        return Err(format!("a gift code is unnamed, got {}", mapped.message.text));
+    }
+    match mapped.message.controls.first().and_then(|control| match &control.kind {
+        ControlKind::Button { url, .. } => Some(url.as_str()),
+        _ => None,
+    }) {
+        Some("https://t.me/giftcode/Winter-2023") => {}
+        other => return Err(format!("a gift code has no redeem link, got {other:?}")),
+    }
+    if !is_safe_slug("Winter-2023") || is_safe_slug("bad slug") || is_safe_slug("../x") {
+        return Err("a gift-code slug was not checked".into());
+    }
+    if format_utc(1_700_000_000) != "2023-11-14 22:12 UTC" {
+        return Err(format!("a giveaway date is wrong, got {}", format_utc(1_700_000_000)));
     }
     Ok(())
 }
@@ -4168,6 +4517,11 @@ mod tests {
             }
             MessageKind::System | MessageKind::Normal => panic!("an unnamed action needs a link into Telegram"),
         }
+    }
+
+    #[test]
+    fn giveaway_media_maps_to_card_fields() {
+        prove_giveaways().unwrap();
     }
 
     fn text_message(text: &str, reply_to: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {

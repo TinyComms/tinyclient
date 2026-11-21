@@ -391,6 +391,8 @@ pub struct Pane {
     pending_actions: HashMap<(String, String), Instant>,
     /// Pending confirmation dialog for a Block Kit control.
     action_confirm: Option<PendingControlAction>,
+    /// Details modal returned by an interactive control (giveaway status, game high scores, alerts).
+    action_result: Option<protocol::ActionResult>,
     /// Currently open select/overflow/date/time picker popover for a Block Kit control.
     open_select: Option<OpenSelect>,
     /// On-demand reactors fetched for messages in the open conversation, keyed by `(message_id, emoji)`.
@@ -499,6 +501,7 @@ impl Pane {
             revisions: None,
             pending_actions: HashMap::new(),
             action_confirm: None,
+            action_result: None,
             open_select: None,
             fetched_reactors: HashMap::new(),
             reactors_loading: None,
@@ -712,6 +715,7 @@ impl Pane {
         self.picker = None;
         self.confirm = None;
         self.action_confirm = None;
+        self.action_result = None;
         self.open_select = None;
         self.pending_actions.clear();
         self.forward = None;
@@ -1631,6 +1635,7 @@ impl Pane {
         value: String,
         values: Vec<String>,
         confirm: Option<protocol::ConfirmDialog>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.open_select = None;
@@ -1652,7 +1657,7 @@ impl Pane {
             cx.notify();
             return;
         }
-        self.execute_control(conversation, message_id, block_id, action_id, element_type, value, values, cx);
+        self.execute_control(conversation, message_id, block_id, action_id, element_type, value, values, window, cx);
     }
 
     /// Triggers a Block Kit link button, showing its confirmation dialog first if required.
@@ -1687,7 +1692,7 @@ impl Pane {
         self.open_external_link(&url, window, cx);
     }
 
-    /// Sends `Request::MessageAction` off-thread, tracking pending state and toasting any refusal.
+    /// Sends `Request::MessageAction` off-thread, tracking pending state and handling alerts/links/toasts.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_control(
         &mut self,
@@ -1698,6 +1703,7 @@ impl Pane {
         element_type: String,
         value: String,
         values: Vec<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.key() != Some(&conversation) {
@@ -1715,12 +1721,23 @@ impl Pane {
             value,
             values,
         };
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.pending_actions.remove(&key);
                 match answer {
                     Ok(Response::Ok) => {}
+                    Ok(Response::ActionResult { result }) => {
+                        if !result.alert && result.title.is_empty() && result.fields.is_empty() {
+                            if let Some(url) = &result.url {
+                                this.open_external_link(url, window, cx);
+                            } else if !result.text.is_empty() {
+                                this.say(result.text, cx);
+                            }
+                        } else {
+                            this.action_result = Some(result);
+                        }
+                    }
                     Ok(Response::Error { detail, .. }) => this.say(detail, cx),
                     Err(err) => this.say(crate::client::trouble_words("run action", &err), cx),
                     _ => {}

@@ -481,7 +481,7 @@ impl Pane {
             Item::New => new_line(metrics).into_any_element(),
             Item::Message { message, head } => self.message_row(message, *head, false, window, cx),
             Item::System(message) if message.call.is_some() => self.call_line(message, cx).into_any_element(),
-            Item::System(message) => system_line(message).into_any_element(),
+            Item::System(message) => self.system_row(message, cx).into_any_element(),
         };
         let seen = self.seen.clone();
         let mark = canvas(move |bounds, _, _| seen.borrow_mut().push((ix, bounds)), |_, (), _, _| {});
@@ -491,6 +491,35 @@ impl Pane {
             .child(body)
             .child(mark.absolute().top_0().left_0().size_full())
             .into_any_element()
+    }
+
+    /// A grey service line, plus any https link the adapter attached (a gift-code redeem).
+    fn system_row(&mut self, message: &Message, cx: &mut Context<Self>) -> Div {
+        let mut line = system_line(message);
+        for (idx, control) in message.controls.iter().enumerate() {
+            let protocol::ControlKind::Button { url, .. } = &control.kind else {
+                continue;
+            };
+            if url.is_empty() {
+                continue;
+            }
+            let target = url.clone();
+            let label = if control.label.is_empty() { "Open".to_owned() } else { control.label.clone() };
+            line = line.child(
+                div()
+                    .id(SharedString::from(format!("sys-{}-{idx}", message.id)))
+                    .ml(px(8.))
+                    .cursor_pointer()
+                    .text_color(theme::accent())
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_external_link(&target, window, cx);
+                    })),
+            );
+        }
+        line
     }
 
     /// The widest a picture may be: 400, or what the pane leaves beside the gutter.
@@ -2508,7 +2537,7 @@ impl Pane {
                         let element_type = control.element_type.clone();
                         let value = control.value.clone();
                         let confirm = control.confirm.clone();
-                        btn = btn.on_click(cx.listener(move |this, _, _, cx| {
+                        btn = btn.on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.trigger_control(
                                 conv.clone(),
@@ -2519,6 +2548,7 @@ impl Pane {
                                 value.clone(),
                                 Vec::new(),
                                 confirm.clone(),
+                                window,
                                 cx,
                             );
                         }));
@@ -2716,7 +2746,7 @@ impl Pane {
                                 .text_color(theme::text())
                                 .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.trigger_control(
                                         conv.clone(),
@@ -2727,6 +2757,7 @@ impl Pane {
                                         String::new(),
                                         next.clone(),
                                         confirm.clone(),
+                                        window,
                                         cx,
                                     );
                                 }))
@@ -2759,7 +2790,7 @@ impl Pane {
                                 .text_color(theme::text())
                                 .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.trigger_control(
                                         conv.clone(),
@@ -2770,6 +2801,7 @@ impl Pane {
                                         val.clone(),
                                         Vec::new(),
                                         confirm.clone(),
+                                        window,
                                         cx,
                                     );
                                 }))

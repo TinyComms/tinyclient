@@ -2962,6 +2962,10 @@ pub enum Response {
         network: Network,
         step: SignInStep,
     },
+    /// Answers `MessageAction` when the network returned structured details, an alert, or a link.
+    ActionResult {
+        result: ActionResult,
+    },
     Error {
         code: ErrorCode,
         detail: String,

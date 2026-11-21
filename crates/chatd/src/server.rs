@@ -3921,16 +3921,33 @@ impl Chat {
                 element_type,
                 value,
                 values,
-            } => self.act(&conversation, |conversation_id, reply| Command::MessageAction {
-                conversation_id,
-                message_id,
-                block_id,
-                action_id,
-                element_type,
-                value,
-                values,
-                reply,
-            }),
+            } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::MessageAction {
+                    conversation_id,
+                    message_id,
+                    block_id,
+                    action_id,
+                    element_type,
+                    value,
+                    values,
+                    reply,
+                }) {
+                    Ok(Some(mut result)) => {
+                        result.bound();
+                        Response::ActionResult { result }
+                    }
+                    Ok(None) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

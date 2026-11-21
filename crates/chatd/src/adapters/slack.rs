@@ -1568,7 +1568,8 @@ impl Slack {
                     &element_type,
                     &value,
                     &values,
-                ),
+                )
+                .map(|()| None),
             ),
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))

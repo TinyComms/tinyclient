@@ -2326,7 +2326,7 @@ impl Pane {
             list = list.child(
                 menu_item(("ctrl-opt", ix), None, label, None)
                     .when(active, |row| row.bg(theme::selected()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.trigger_control(
                             conversation.clone(),
                             msg_id.clone(),
@@ -2336,6 +2336,7 @@ impl Pane {
                             val.clone(),
                             values.clone(),
                             confirm.clone(),
+                            window,
                             cx,
                         );
                     })),
@@ -2391,6 +2392,7 @@ impl Pane {
                                 to_run.element_type.clone(),
                                 to_run.value.clone(),
                                 to_run.values.clone(),
+                                window,
                                 cx,
                             );
                         }
@@ -2418,6 +2420,66 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    fn action_result_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let result = self.action_result.as_ref()?;
+        let title = if result.title.is_empty() { "Details".to_owned() } else { result.title.clone() };
+        let body = result.text.clone();
+        let fields = result.fields.clone();
+        let url = result.url.clone();
+        let url_label = if result.url_label.is_empty() { "Open".to_owned() } else { result.url_label.clone() };
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let field_rows = (!fields.is_empty()).then(|| {
+            div().mt(px(8.)).flex().flex_col().gap(px(4.)).children(fields.into_iter().map(|(label, value)| {
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(div().w(px(96.)).flex_none().type_small().text_color(theme::text_faint()).child(label))
+                    .child(div().flex_1().min_w_0().type_small().text_color(theme::text()).child(value))
+            }))
+        });
+        let open = url.clone();
+        let panel = modal(title)
+            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .when(!body.is_empty(), |m| m.child(modal_body(body)))
+            .children(field_rows)
+            .child(
+                modal_buttons()
+                    .child(button("action-result-close", ButtonKind::Secondary, "Close").on_click(cx.listener(|this, _, _, cx| {
+                        this.action_result = None;
+                        cx.notify();
+                    })))
+                    .when(open.is_some(), |row| {
+                        let target = open.clone().unwrap_or_default();
+                        row.child(button("action-result-open", ButtonKind::Primary, url_label.clone()).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.action_result = None;
+                                this.open_external_link(&target, window, cx);
+                            }),
+                        ))
+                    }),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("action-result-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.action_result = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("action-result-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
             return [
@@ -2427,6 +2489,7 @@ impl Pane {
                 self.picker_sheet(window, cx),
                 self.confirm_layer(window, cx),
                 self.action_confirm_layer(window, cx),
+                self.action_result_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
                 self.link_layer(window, cx),
@@ -2442,6 +2505,7 @@ impl Pane {
             self.picker_layer(window, cx),
             self.confirm_layer(window, cx),
             self.action_confirm_layer(window, cx),
+            self.action_result_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),
             self.link_layer(window, cx),

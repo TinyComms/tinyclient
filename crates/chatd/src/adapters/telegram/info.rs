@@ -982,6 +982,75 @@ pub(super) fn report(
     }
 }
 
+/// Queries `payments.getGiveawayInfo` for a giveaway message (or launch message referenced by
+/// a giveaway results message) and formats participation, eligibility, or win status for display.
+pub(super) fn giveaway_info(account: &Account, conversation: &str, msg_id: i32) -> Result<protocol::ActionResult, Fault> {
+    if msg_id <= 0 {
+        return Err(invalid("MESSAGE_ID_INVALID"));
+    }
+    let Some((who, _)) = Who::parse(conversation) else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let peer = account.input(who)?;
+    let info = account.ask(&tl::functions::payments::GetGiveawayInfo { peer, msg_id })?;
+    let mut result = protocol::ActionResult { alert: true, ..protocol::ActionResult::default() };
+    match info {
+        tl::enums::payments::GiveawayInfo::Info(info) => {
+            result.title = "Giveaway status".to_owned();
+            result.text = if info.preparing_results {
+                "The giveaway has ended and Telegram is selecting winners.".to_owned()
+            } else if info.participating {
+                "You are participating in this giveaway.".to_owned()
+            } else if let Some(country) = &info.disallowed_country {
+                format!("Not eligible: giveaways are not available in {country}.")
+            } else if let Some(chat_id) = info.admin_disallowed_chat_id {
+                let name = account.dir().name(Who::Channel(chat_id));
+                let chat = if name == "Unknown" { format!("channel {chat_id}") } else { name };
+                format!("Not eligible: you are an admin of {chat}.")
+            } else if let Some(joined) = info.joined_too_early_date {
+                format!(
+                    "Not eligible: only new subscribers qualify (joined {}).",
+                    super::content::format_utc(joined)
+                )
+            } else {
+                "You are not participating in this giveaway.".to_owned()
+            };
+            if info.start_date > 0 {
+                result.fields.push(("Started".to_owned(), super::content::format_utc(info.start_date)));
+            }
+        }
+        tl::enums::payments::GiveawayInfo::Results(res) => {
+            result.title = "Giveaway results".to_owned();
+            result.text = if res.refunded {
+                "This giveaway was cancelled and refunded.".to_owned()
+            } else if res.winner {
+                if let Some(stars) = res.stars_prize.filter(|&s| s > 0) {
+                    format!("Congratulations! You won {}.", super::content::stars_label(stars))
+                } else {
+                    "Congratulations! You won Telegram Premium in this giveaway.".to_owned()
+                }
+            } else {
+                "You did not win this giveaway.".to_owned()
+            };
+            result.fields.push(("Winners".to_owned(), res.winners_count.max(0).to_string()));
+            if let Some(activated) = res.activated_count {
+                result.fields.push(("Claimed".to_owned(), format!("{} / {}", activated.max(0), res.winners_count.max(0))));
+            }
+            if res.start_date > 0 {
+                result.fields.push(("Started".to_owned(), super::content::format_utc(res.start_date)));
+            }
+            if res.finish_date > 0 {
+                result.fields.push(("Finished".to_owned(), super::content::format_utc(res.finish_date)));
+            }
+            if let Some(slug) = res.gift_code_slug.as_deref().filter(|s| super::content::is_safe_slug(s)) {
+                result.url = Some(format!("https://t.me/giftcode/{slug}"));
+                result.url_label = "Redeem gift code".to_owned();
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
