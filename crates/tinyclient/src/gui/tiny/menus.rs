@@ -7,11 +7,11 @@
 use super::model::{self, PersonMenu};
 use super::{Modal, Page, Sub};
 use crate::gui::components::{
-    glyph, menu, menu_item, menu_item_check, menu_item_danger, menu_item_more, menu_label, menu_separator, slider, Avatar,
+    menu, menu_item, menu_item_check, menu_item_danger, menu_item_more, menu_label, menu_separator, Avatar,
 };
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{canvas, div, prelude::*, px, Context, Div, MouseButton, MouseDownEvent, SharedString, Stateful};
+use gpui::{canvas, div, prelude::*, px, Context, Div, MouseButton, SharedString, Stateful};
 use protocol::Network;
 
 const SLIDER: f32 = 132.;
@@ -155,42 +155,10 @@ impl Shell {
             items = items.child(self.plain(menu_item("tiny-person-message", Some("icons/message-square.svg"), "Message", None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_message(message_id.clone(), cx))));
         }
         if facts.local {
-            let (percent, muted) = self.tiny_state.gain(user_id);
-            let slide_id = user_id.to_owned();
-            let bounds = self.tiny_state.slider.clone();
-            let track = div()
-                .id("tiny-volume")
-                .relative()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        this.tiny_state.sliding = Some(slide_id.clone());
-                        this.tiny_slide(f32::from(event.position.x), cx);
-                    }),
-                )
-                .child(slider(f32::from(percent) / f32::from(protocol::GAIN_MAX), SLIDER, Some(0.5)))
-                .child(canvas(move |at, _, _| bounds.set(Some(at)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
-            let mute_id = user_id.to_owned();
-            let local = model::local_mute_words(muted);
             items = items
                 .child(menu_separator())
                 .child(menu_label("For you"))
-                .child(
-                    div()
-                        .h(px(32.))
-                        .px(px(8.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(glyph(if muted || percent == 0 { "icons/volume-x.svg" } else { "icons/volume-2.svg" }, 16., theme::text_soft()))
-                        .child(track)
-                        .child(div().flex_1().flex().justify_end().type_small().text_color(theme::text_soft()).child(format!("{percent} %"))),
-                )
-                .child(self.plain(menu_item("tiny-person-mute-local", Some(local.icon), local.label, None), cx).on_click(cx.listener(move |this, _, _, cx| {
-                    let (percent, muted) = this.tiny_state.gain(&mute_id);
-                    this.tiny_set_gain(&mute_id, percent, !muted, true, cx);
-                })));
+                .child(self.call_volume_controls(page.account.clone(), user_id, cx));
         }
         if facts.moderates() {
             items = items.child(menu_separator()).child(menu_label("Moderation"));
@@ -377,28 +345,5 @@ impl Shell {
             items = items.child(menu_separator()).child(self.plain(menu_item_danger("tiny-category-delete", Some("icons/trash-2.svg"), "Delete category…"), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::DeleteCategory(id.clone()), window, cx))));
         }
         items
-    }
-
-    /// The volume slider follows the pointer while its button is down.
-    pub(super) fn tiny_slide(&mut self, x: f32, cx: &mut Context<Self>) {
-        let (Some(user_id), Some(bounds)) = (self.tiny_state.sliding.clone(), self.tiny_state.slider.get()) else {
-            return;
-        };
-        let at = crate::gui::components::slider_value(x, f32::from(bounds.origin.x), f32::from(bounds.size.width));
-        // It snaps to 100 % near the middle, where most people want to come back to.
-        let mut percent = (at * f32::from(protocol::GAIN_MAX)).round() as u16;
-        if percent.abs_diff(100) <= 4 {
-            percent = 100;
-        }
-        let muted = self.tiny_state.gain(&user_id).1;
-        self.tiny_set_gain(&user_id, percent, muted, false, cx);
-    }
-
-    /// The pointer let go of the slider: the volume is kept and sent.
-    pub(super) fn tiny_slide_end(&mut self, cx: &mut Context<Self>) {
-        if let Some(user_id) = self.tiny_state.sliding.take() {
-            let (percent, muted) = self.tiny_state.gain(&user_id);
-            self.tiny_set_gain(&user_id, percent, muted, true, cx);
-        }
     }
 }

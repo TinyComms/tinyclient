@@ -103,7 +103,7 @@ impl Shell {
         if let Some(menu) = super::shot::menu() {
             return Some(menu);
         }
-        self.call_state.menu
+        self.call_state.menu.clone()
     }
 
     /// Tells chatd the device menu opened or closed: levels flow only in between. Nothing is
@@ -118,7 +118,10 @@ impl Shell {
 
     /// Closes whatever popover is open, however it came to close.
     pub(super) fn call_menu_set(&mut self, menu: Option<Menu>, cx: &mut Context<Self>) {
-        let before = std::mem::replace(&mut self.call_state.menu, menu);
+        if self.call_state.sliding.is_some() && menu.is_none() {
+            self.call_slide_end(cx);
+        }
+        let before = std::mem::replace(&mut self.call_state.menu, menu.clone());
         if before == menu {
             return;
         }
@@ -151,7 +154,7 @@ impl Shell {
             // Only long enough to absorb the button's own click after mouse_down_out closed the
             // popover. 400ms also ate a deliberate reopen after dismissing, so the lock felt dead.
             .is_some_and(|at| at.elapsed() < Duration::from_millis(50));
-        if self.call_state.menu == Some(menu) || just_closed {
+        if self.call_state.menu.as_ref() == Some(&menu) || just_closed {
             self.call_menu_set(None, cx);
         } else {
             self.call_menu_set(Some(menu), cx);
@@ -340,15 +343,27 @@ impl Shell {
             this.call_menu_close(cx);
             settings::open(settings::Section::Audio, cx);
         }));
+        let peer_volume = (call.participants.len() == 1).then(|| {
+            let peer = &call.participants[0];
+            div()
+                .flex()
+                .flex_col()
+                .child(menu_separator().mx(px(8.)))
+                .child(crate::gui::components::menu_label(format!("Volume · {}", peer.name)))
+                .child(self.call_volume_controls(call.conversation.account(), &peer.id, cx))
+        });
         div()
             .flex()
             .flex_col()
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| this.call_track(event, cx)))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
             .children(self.call_device_notice_row(call))
             .child(self.call_device_section(Side::Input, call, cx))
             .child(self.call_level(call, Side::Input))
             .child(div().flex_none().my(px(4.)).mx(px(8.)).h(px(1.)).bg(theme::hairline()))
             .child(self.call_device_section(Side::Output, call, cx))
             .child(self.call_level(call, Side::Output))
+            .children(peer_volume)
             .child(menu_separator().mx(px(8.)))
             .child(test)
             .child(settings)

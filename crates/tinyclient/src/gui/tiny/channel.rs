@@ -684,9 +684,11 @@ impl Shell {
         let color = page.community.member(&seat.user_id).and_then(|member| model::color_of(page.community, member)).map(gpui::rgb).unwrap_or(theme::text());
         let states = model::seat_states(seat);
         let mut glyphs = super::column::seat_glyphs(seat);
-        let (percent, local_mute) = self.tiny_state.gain(&seat.user_id);
+        let (percent, local_mute) = self.call_gain(page.account, &seat.user_id);
         if local_mute && !me {
             glyphs.push(("icons/volume-x.svg", theme::warning(), "Muted for you"));
+        } else if percent != 100 && !me {
+            glyphs.push(("icons/volume-2.svg", theme::text_soft(), "Volume adjusted"));
         }
         let focused = self.tiny_state.focus.as_ref() == Some(&Focus::Person(seat.user_id.clone()));
         let group: SharedString = format!("tiny-tile-{}", seat.user_id).into();

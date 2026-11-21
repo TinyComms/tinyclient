@@ -41,8 +41,8 @@ impl Shell {
                     .occlude()
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.tiny_close_float(cx)))
                     .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| this.tiny_close_float(cx)))
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.tiny_track(event, cx)))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.tiny_slide_end(cx))),
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx))),
             );
             layer = layer.children(self.tiny_float(&page, &float, window, cx));
         } else if let Some((user_id, y)) = state.card.clone().filter(|_| state.modal.is_none() && state.settings.is_none()) {
@@ -66,24 +66,13 @@ impl Shell {
         Some(layer.into_any_element())
     }
 
-    fn tiny_track(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if self.tiny_state.sliding.is_none() {
-            return;
-        }
-        if event.pressed_button == Some(MouseButton::Left) {
-            self.tiny_slide(f32::from(event.position.x), cx);
-        } else {
-            self.tiny_slide_end(cx);
-        }
-    }
-
     fn tiny_float(&self, page: &Page, float: &Float, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let tall = f32::from(window.viewport_size().height);
         let sidebar = self.layout_state.sidebar_width;
         let mut out = Vec::new();
         let menu_events = |menu: gpui::Div, cx: &mut Context<Self>| {
-            menu.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.tiny_track(event, cx)))
-                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.tiny_slide_end(cx)))
+            menu.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
         };
         match float {
             Float::Header => {

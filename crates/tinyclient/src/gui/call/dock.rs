@@ -804,10 +804,25 @@ impl Shell {
                 .justify_center()
                 .child(glyph("icons/volume-2.svg", 14., theme::positive()))
         } else {
-            let peer_speaks = live && direct && call.participants.first().is_some_and(|peer| peer.speaking);
+            let peer = call.participants.first();
+            let peer_speaks = live && direct && peer.is_some_and(|peer| peer.speaking);
             let picture = self.media_path(&call.conversation, subject.avatar.as_ref());
             let avatar = Avatar::new(&call.conversation, &subject.title, 28.).image_at(picture);
-            ringed(avatar.build(), 28., peer_speaks)
+            let ring = ringed(avatar.build(), 28., peer_speaks);
+            if let Some(peer) = peer.filter(|_| live && direct) {
+                let account = call.conversation.account();
+                let user_id = peer.id.clone();
+                let name = peer.name.clone();
+                ring.on_mouse_down(
+                    gpui::MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_menu_set(Some(Menu::Person { account: account.clone(), user_id: user_id.clone(), name: name.clone() }), cx);
+                    }),
+                )
+            } else {
+                ring
+            }
         };
         // What was refused, then what the system just did, then the state.
         let notice = self.call_state.notice.clone().filter(|_| live);
@@ -1096,9 +1111,12 @@ impl Shell {
 
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
-            Some(Menu::People) if joined => Some((280., people::list(call, subject).py(px(6.)))),
+            Some(Menu::People) if joined => Some((280., self.call_people_list(call, subject, cx).py(px(6.)))),
             Some(Menu::Security) if self.call_security_open(Place::Dock) => {
                 Some((320., div().child(self.call_security_panel(call, cx))))
+            }
+            Some(Menu::Person { account, user_id, name }) if joined => {
+                Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
             }
             _ => None,
         };

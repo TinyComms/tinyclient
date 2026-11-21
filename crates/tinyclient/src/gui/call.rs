@@ -25,21 +25,24 @@ pub(crate) use phone::hooks::{
 pub(super) use people::occupants;
 pub(super) use people::ringed;
 
-use super::components::{glyph, network_icon, tip};
+use super::components::{glyph, menu_item, menu_label, menu_separator, network_icon, slider, tip};
 use super::state::{Shell, Snapshot};
-use super::theme;
+use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, Action, AnyElement, App, Context, Div, Entity, FontWeight, Global, KeyBinding,
-    MouseButton, Rgba, SharedString, Stateful, Svg, Task, WeakEntity, Window,
+    canvas, div, prelude::*, px, Action, AnyElement, App, Bounds, Context, Div, Entity, FontWeight,
+    Global, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Rgba, SharedString,
+    Stateful, Svg, Task, WeakEntity, Window,
 };
 use protocol::settings::MUTED_TALK;
 use protocol::{
-    Call, CallFailure, CallState, CallSupport, Change, ConversationKind, Key, MediaFile, Network,
-    Occupants, Request, Response,
+    AccountKey, Call, CallFailure, CallState, CallSupport, Change, ConversationKind, Key,
+    MediaFile, Network, Occupants, Request, Response,
 };
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
+use std::collections::HashMap;
 use std::mem::{discriminant, Discriminant};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 gpui::actions!(call, [ToggleMute, ToggleDeafen, Leave, Accept, Decline, Jump]);
@@ -96,12 +99,14 @@ fn now() -> i64 {
 }
 
 /// The popover open above the dock.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum Menu {
     Devices,
     People,
     /// How the call is protected (`security`).
     Security,
+    /// Per-person volume and local mute for someone in any call.
+    Person { account: AccountKey, user_id: String, name: String },
 }
 
 /// What a counter in the dock is counting.
@@ -282,6 +287,26 @@ pub struct State {
     notice: Option<String>,
     /// Clears `ended` or `notice` when its few seconds are up.
     brief: Option<Task<()>>,
+    /// Per-person volume and local mute, keyed by `(AccountKey, user_id)` so it works in any call
+    /// regardless of which server page is open.
+    pub(in crate::gui) gains: HashMap<(AccountKey, String), (u16, bool)>,
+    /// The volume slider's track bounds, as last drawn, and whose volume is being dragged.
+    pub(in crate::gui) slider: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub(in crate::gui) sliding: Option<(AccountKey, String)>,
+}
+
+/// Someone's volume and mute among what chatd keeps, else 100 % and heard.
+pub(in crate::gui) fn kept_gain(kept: &[(String, u16, bool)], user_id: &str) -> (u16, bool) {
+    kept.iter().find(|(id, _, _)| id == user_id).map_or((100, false), |(_, percent, muted)| (*percent, *muted))
+}
+
+impl State {
+    pub(in crate::gui) fn gain(&self, account: &AccountKey, user_id: &str) -> (u16, bool) {
+        if let Some(set) = self.gains.get(&(account.clone(), user_id.to_owned())) {
+            return *set;
+        }
+        kept_gain(&crate::gui::app::prefs::values().gains(account), user_id)
+    }
 }
 
 /// What a call is of: the conversation's name, kind and picture.
@@ -830,6 +855,222 @@ impl Shell {
                 self.select(key, title, cx);
             }
         }
+    }
+
+    /// One person's volume and mute for me on a given account.
+    pub(in crate::gui) fn call_gain(&self, account: &AccountKey, user_id: &str) -> (u16, bool) {
+        self.call_state.gain(account, user_id)
+    }
+
+    /// Sets one person's volume and local mute on `account`. With `send`, chatd persists it and
+    /// applies it to the active call (`CallGain`).
+    pub(in crate::gui) fn call_set_gain(
+        &mut self,
+        account: AccountKey,
+        user_id: &str,
+        percent: u16,
+        muted: bool,
+        send: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let percent = percent.min(protocol::GAIN_MAX);
+        self.call_state.gains.insert((account.clone(), user_id.to_owned()), (percent, muted));
+        if send {
+            let request = Request::CallGain { account, user_id: user_id.to_owned(), percent, muted };
+            self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn call_slide(&mut self, x: f32, cx: &mut Context<Self>) {
+        let (Some((account, user_id)), Some(bounds)) = (self.call_state.sliding.clone(), self.call_state.slider.get()) else {
+            return;
+        };
+        let at = super::components::slider_value(x, f32::from(bounds.origin.x), f32::from(bounds.size.width));
+        let mut percent = (at * f32::from(protocol::GAIN_MAX)).round() as u16;
+        if percent.abs_diff(100) <= 4 {
+            percent = 100;
+        }
+        let muted = self.call_gain(&account, &user_id).1;
+        self.call_set_gain(account, &user_id, percent, muted, false, cx);
+    }
+
+    pub(in crate::gui) fn call_slide_end(&mut self, cx: &mut Context<Self>) {
+        if let Some((account, user_id)) = self.call_state.sliding.take() {
+            let (percent, muted) = self.call_gain(&account, &user_id);
+            self.call_set_gain(account, &user_id, percent, muted, true, cx);
+        }
+    }
+
+    pub(in crate::gui) fn call_track(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.call_state.sliding.is_none() {
+            return;
+        }
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.call_slide(f32::from(event.position.x), cx);
+        } else {
+            self.call_slide_end(cx);
+        }
+    }
+
+    /// Reusable per-person volume slider and "Mute for me" toggle, shared by the call-owned person
+    /// popover, the device menu (for 1:1 calls), and the Tiny server person menu.
+    pub(in crate::gui) fn call_volume_controls(&self, account: AccountKey, user_id: &str, cx: &mut Context<Self>) -> Div {
+        const SLIDER: f32 = 132.;
+        let (percent, muted) = self.call_gain(&account, user_id);
+        let slide_account = account.clone();
+        let slide_id = user_id.to_owned();
+        let bounds = self.call_state.slider.clone();
+        let track = div()
+            .id(SharedString::from(format!("call-volume-{user_id}")))
+            .relative()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.call_state.sliding = Some((slide_account.clone(), slide_id.clone()));
+                    this.call_slide(f32::from(event.position.x), cx);
+                }),
+            )
+            .child(slider(f32::from(percent) / f32::from(protocol::GAIN_MAX), SLIDER, Some(0.5)))
+            .child(canvas(move |at, _, _| bounds.set(Some(at)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
+        let mute_account = account;
+        let mute_id = user_id.to_owned();
+        let mute_icon = if muted { "icons/volume-2.svg" } else { "icons/volume-x.svg" };
+        let mute_label = if muted { "Unmute for me" } else { "Mute for me" };
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(32.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(glyph(if muted || percent == 0 { "icons/volume-x.svg" } else { "icons/volume-2.svg" }, 16., theme::text_soft()))
+                    .child(track)
+                    .child(div().flex_1().flex().justify_end().type_small().text_color(theme::text_soft()).child(format!("{percent} %"))),
+            )
+            .child(
+                menu_item(SharedString::from(format!("call-mute-local-{user_id}")), Some(mute_icon), mute_label, None).on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let (percent, muted) = this.call_gain(&mute_account, &mute_id);
+                    this.call_set_gain(mute_account.clone(), &mute_id, percent, !muted, true, cx);
+                })),
+            )
+    }
+
+    pub(super) fn call_person_menu(&self, account: AccountKey, user_id: &str, name: &str, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
+            .child(menu_label(name.to_owned()))
+            .child(menu_separator().mx(px(8.)))
+            .child(self.call_volume_controls(account, user_id, cx))
+    }
+
+    pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
+        let account = call.conversation.account();
+        let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
+        people.sort_by_key(|who| who.name.to_lowercase());
+        let count = people.len() + 1;
+        let noun = if count == 1 { "PERSON" } else { "PEOPLE" };
+        let own = super::components::Avatar::named("You", 22.).build();
+        let heard = call.speaking && !call.muted && !call.deafened;
+        let mut rows = Vec::with_capacity(count);
+        rows.push(
+            div()
+                .w_full()
+                .h(px(32.))
+                .flex_none()
+                .pl(px(12.))
+                .pr(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(13.))
+                .text_color(if heard { theme::text() } else { theme::text_soft() })
+                .child(ringed(own, 22., heard))
+                .child(div().flex_1().min_w_0().truncate().child("You"))
+                .into_any_element(),
+        );
+        for who in people {
+            let (percent, muted) = self.call_gain(&account, &who.id);
+            let gain_tag = if muted {
+                Some("Muted for you".to_owned())
+            } else if percent != 100 {
+                Some(format!("{percent} %"))
+            } else {
+                None
+            };
+            let key = Key { network: call.conversation.network, account: call.conversation.account.clone(), id: who.id.clone() };
+            let avatar = super::components::Avatar::new(&key, &who.name, 22.).build();
+            let menu_account = account.clone();
+            let menu_id = who.id.clone();
+            let menu_name = who.name.clone();
+            let open_person = move |this: &mut Shell, cx: &mut Context<Shell>| {
+                cx.stop_propagation();
+                this.call_menu_set(Some(Menu::Person { account: menu_account.clone(), user_id: menu_id.clone(), name: menu_name.clone() }), cx);
+            };
+            let open_click = open_person.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("call-person-row-{}", who.id)))
+                    .w_full()
+                    .h(px(32.))
+                    .flex_none()
+                    .pl(px(12.))
+                    .pr(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .text_size(px(13.))
+                    .text_color(if who.speaking { theme::text() } else { theme::text_soft() })
+                    .tooltip(tip("Adjust volume", None))
+                    .on_click(cx.listener(move |this, _, _, cx| open_click(this, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| open_person(this, cx)))
+                    .child(ringed(avatar, 22., who.speaking))
+                    .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
+                    .children(gain_tag.map(|tag| div().flex_none().type_micro().text_color(if muted { theme::warning() } else { theme::text_faint() }).child(tag)))
+                    .when(who.muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::text_faint())))
+                    .when(who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(26.))
+                    .flex_none()
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_faint())
+                    .child(format!("{} · {count} {noun}", subject.title.to_uppercase())),
+            )
+            .child(
+                div()
+                    .id("call-people-rows")
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
     }
 
     /// A join was asked for here: a new room that follows is not a moderator's move.
@@ -1491,5 +1732,20 @@ mod tests {
         );
         assert_eq!(call_go_target(&tiny_direct, false), CallGoTarget::Conversation);
         assert_eq!(call_go_target(&discord_dm, false), CallGoTarget::Conversation);
+    }
+
+    #[test]
+    fn gain_cache_is_keyed_by_call_account_not_shown_server() {
+        let mut state = State::default();
+        let tiny_a = AccountKey { network: Network::Tiny, account: "srv-a".into() };
+        let tiny_b = AccountKey { network: Network::Tiny, account: "srv-b".into() };
+        let discord = AccountKey { network: Network::Discord, account: "acc-1".into() };
+        state.gains.insert((tiny_a.clone(), "u1".into()), (140, false));
+        state.gains.insert((tiny_b.clone(), "u1".into()), (60, true));
+        state.gains.insert((discord.clone(), "u1".into()), (180, false));
+        assert_eq!(state.gain(&tiny_a, "u1"), (140, false));
+        assert_eq!(state.gain(&tiny_b, "u1"), (60, true));
+        assert_eq!(state.gain(&discord, "u1"), (180, false));
+        assert_eq!(state.gain(&tiny_a, "other"), (100, false));
     }
 }
