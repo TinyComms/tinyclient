@@ -1371,8 +1371,10 @@ pub enum Request {
         limit: u32,
     },
     /// Ask the network itself for messages, as the pane's Enter does: a server's own search
-    /// when a Space is the scope, the channel's when one conversation is, one account/network, or
-    /// everywhere across every connected account that supports global search.
+    /// when a Space is the scope, the channel's when one conversation is, one account's direct
+    /// messages when `home` is set, one account/network, or everywhere across every connected
+    /// account that supports global search. `home` is one Discord account's direct messages,
+    /// not a search of every server.
     SearchNetwork {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
@@ -1387,6 +1389,9 @@ pub enum Request {
         filters: SearchFilters,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+        /// All direct messages on `account`. Discord only; ignored for an everywhere search.
+        #[serde(default, skip_serializing_if = "is_false")]
+        home: bool,
     },
     /// Keeps what the user typed and did not send. Empty text forgets it. Local: no network
     /// hears of it and no change is announced.
@@ -3490,11 +3495,14 @@ mod tests {
             query: "lichen".into(),
             filters: SearchFilters::default(),
             cursor: None,
+            home: false,
         };
         assert_eq!(
             serde_json::to_string(&asked).unwrap(),
             r#"{"op":"search_network","conversation":{"network":"discord","account":"1","id":"C2"},"query":"lichen"}"#
         );
+        let home: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen","home":true}"#).unwrap();
+        assert!(matches!(home, Request::SearchNetwork { home: true, .. }));
     }
 
     #[test]

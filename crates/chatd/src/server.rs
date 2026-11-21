@@ -2764,7 +2764,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::SearchNetwork { conversation, space, account, network, query, filters, cursor } => {
+            Request::SearchNetwork { conversation, space, account, network, query, filters, cursor, home } => {
                 let query = query.trim().to_owned();
                 if query.is_empty() && filters.is_empty() {
                     Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() }
@@ -2780,6 +2780,22 @@ impl Chat {
                     match self.ask(&target_account, |reply| Command::Search {
                         query,
                         scope,
+                        filters,
+                        cursor,
+                        at: std::time::Instant::now(),
+                        reply,
+                    }) {
+                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
+                        Err(refused) => *refused,
+                    }
+                } else if home {
+                    // One Discord account's direct messages. Not a fan-out across its servers.
+                    let Some(target) = account.filter(|key| key.network == Network::Discord && self.shows(key)) else {
+                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() };
+                    };
+                    match self.ask(&target, |reply| Command::Search {
+                        query,
+                        scope: SearchScope::Home,
                         filters,
                         cursor,
                         at: std::time::Instant::now(),

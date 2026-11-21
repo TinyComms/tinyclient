@@ -824,12 +824,18 @@ impl Demo {
                 let (conv, space) = match &scope {
                     crate::adapters::SearchScope::Conversation(id) => (Some(id.as_str()), None),
                     crate::adapters::SearchScope::Space(id) => (None, Some(id.as_str())),
-                    crate::adapters::SearchScope::Account => (None, None),
+                    crate::adapters::SearchScope::Account | crate::adapters::SearchScope::Home => (None, None),
                 };
                 let found = demo
                     .hub
                     .store()
                     .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
+                    .map(|mut hits| {
+                        if matches!(scope, crate::adapters::SearchScope::Home) {
+                            hits.retain(|hit| hit.space_title.is_empty());
+                        }
+                        hits
+                    })
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }

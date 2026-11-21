@@ -95,19 +95,26 @@ pub struct NetworkFound {
     pub result: Result<Vec<MessageHit>, String>,
 }
 
-/// How far a search asks: the conversation open now, its Space, or the whole cache.
+/// How far a search asks: the conversation open now, its Space, one Discord account's direct
+/// messages, or the whole cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
     #[default]
     Everywhere,
     Conversation,
     Space,
+    /// Every direct message on one Discord account. Not a search of every server.
+    Home,
 }
 
 /// Whether the pane's Enter asks this account's network itself: the account's capabilities say
 /// it searches, and the scope is one the network takes. Slack and Discord search a Space or
-/// one conversation, Telegram only one conversation. Everywhere is the cache alone.
+/// one conversation, Discord also searches its direct messages, Telegram only one conversation.
+/// Everywhere is the cache alone.
 fn network_searches(can: &Capabilities, network: Network, scope: Scope) -> bool {
+    if scope == Scope::Home {
+        return network == Network::Discord && can.search;
+    }
     if scope == Scope::Everywhere {
         return can.search_global;
     }
@@ -128,9 +135,35 @@ impl Scope {
             (Scope::Conversation, _) => "This conversation",
             (Scope::Space, Some(Network::Discord)) => "This server",
             (Scope::Space, _) => "This space",
+            (Scope::Home, _) => "Direct messages",
             (Scope::Everywhere, _) => "Everywhere",
         }
     }
+}
+
+/// The Discord account a direct-message search names: the open conversation's, or the first
+/// connected Discord account.
+fn discord_home_target(shell: &Shell) -> Option<protocol::AccountKey> {
+    if let Some(open) = shell.open_key().filter(|key| key.network == Network::Discord) {
+        return Some(open.account());
+    }
+    shell.snapshot.as_ref().and_then(|snapshot| {
+        snapshot
+            .accounts
+            .iter()
+            .find(|account| account.key.network == Network::Discord && account.link == Link::Connected)
+            .map(|account| account.key.clone())
+    })
+}
+
+/// Enter may ask Discord for every direct message when that account is connected and searches.
+fn discord_home_asks(shell: &Shell) -> bool {
+    let Some(target) = discord_home_target(shell) else {
+        return false;
+    };
+    shell.snapshot.as_ref().and_then(|snapshot| snapshot.account(&target)).is_some_and(|status| {
+        status.link == Link::Connected && status.can.search
+    })
 }
 
 /// A scope's filters for `SearchMessages`: the one conversation, or the Space's key, or neither.
@@ -790,8 +823,20 @@ impl Shell {
             return;
         }
         let open = self.open_with_space();
-        let (conversation, space) = scope_filters(scope, open.as_ref().map(|(key, space)| (key, space.as_deref())));
-        let request = Request::SearchMessages { conversation, network: None, space, query: words.clone(), limit: protocol::PAGE_LIMIT };
+        let home = scope == Scope::Home;
+        let home_account = home.then(|| discord_home_target(self)).flatten();
+        let (conversation, space) = if home {
+            (None, None)
+        } else {
+            scope_filters(scope, open.as_ref().map(|(key, space)| (key, space.as_deref())))
+        };
+        let request = Request::SearchMessages {
+            conversation,
+            network: home.then_some(Network::Discord),
+            space,
+            query: words.clone(),
+            limit: protocol::PAGE_LIMIT,
+        };
         self.off_thread(
             cx,
             move || ask(&request),
@@ -806,7 +851,16 @@ impl Shell {
                     return;
                 };
                 match answer {
-                    Ok(Response::MessageHits { hits, .. }) => page.hits = Some(hits),
+                    Ok(Response::MessageHits { mut hits, .. }) => {
+                        if home {
+                            hits.retain(|hit| {
+                                hit.space_title.is_empty()
+                                    && hit.conversation.network == Network::Discord
+                                    && home_account.as_ref().is_none_or(|account| &hit.conversation.account() == account)
+                            });
+                        }
+                        page.hits = Some(hits);
+                    }
                     Ok(_) | Err(_) => page.failed = true,
                 }
                 cx.notify();
@@ -848,6 +902,8 @@ impl Shell {
             self.snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.accounts.iter().any(|a| a.link == Link::Connected && a.can.search_global))
+        } else if scope == Scope::Home {
+            discord_home_asks(self)
         } else {
             self.open_key().is_some_and(|key| {
                 let can = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|account| account.can).unwrap_or_default();
@@ -896,8 +952,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// Asks the network itself for the page's words: a Space's own search, one conversation's, or
-    /// everywhere across connected accounts that support global search.
+    /// Asks the network itself for the page's words: a Space's own search, one conversation's,
+    /// one Discord account's direct messages, or everywhere across connected accounts that
+    /// support global search.
     fn ask_network(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
         let Some(page) = self.conversation_state.side.search.as_ref() else {
             return;
@@ -911,7 +968,7 @@ impl Shell {
         if !load_more && page.network_asked_for.as_deref() == Some(trimmed.as_str()) {
             return;
         }
-        let (conversation, space, where_at) = match scope {
+        let (conversation, space, account, where_at) = match scope {
             Scope::Conversation => {
                 let Some(open) = self.snapshot.as_ref().and_then(|s| s.open.as_ref()) else {
                     return;
@@ -919,7 +976,7 @@ impl Shell {
                 let key = open.key.clone();
                 let name = if open.title.is_empty() { key.id.clone() } else { open.title.clone() };
                 let where_at = format!("{} · {}", key.network.label(), name);
-                (Some(key), None, where_at)
+                (Some(key), None, None, where_at)
             }
             Scope::Space => {
                 let Some((key, Some(space))) = self.open_with_space() else {
@@ -932,9 +989,18 @@ impl Shell {
                     .map_or_else(String::new, |known| known.name.clone());
                 let where_at = format!("{} · {}", key.network.label(), if known.is_empty() { space.clone() } else { known });
                 let space = Key { network: key.network, account: key.account.clone(), id: space };
-                (None, Some(space), where_at)
+                (None, Some(space), None, where_at)
             }
-            Scope::Everywhere => (None, None, "connected networks".to_owned()),
+            Scope::Everywhere => (None, None, None, "connected networks".to_owned()),
+            Scope::Home => {
+                if !discord_home_asks(self) {
+                    return;
+                }
+                let Some(account) = discord_home_target(self) else {
+                    return;
+                };
+                (None, None, Some(account), format!("{} · Direct messages", Network::Discord.label()))
+            }
         };
         let asked = {
             let side = &mut self.conversation_state.side;
@@ -950,11 +1016,12 @@ impl Shell {
         let request = Request::SearchNetwork {
             conversation,
             space,
-            account: None,
+            account,
             network: None,
             query: trimmed,
             filters,
             cursor,
+            home: scope == Scope::Home,
         };
         self.off_thread(
             cx,
@@ -1354,8 +1421,8 @@ fn crumb(base: &'static str, cx: &mut Context<Shell>) -> AnyElement {
         .into_any_element()
 }
 
-/// The message search's pane: what was asked, and the cache's hits, newest first. Every hit is
-/// the cache's word for it, so a row says "cached"; the networks are a later ask.
+/// The message search's pane: what was asked, and the cache's hits, newest first. A cache row
+/// says "cached". A direct-message hit Discord itself returned says "Discord".
 fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
     let Some(page) = shell.conversation_state.side.search.as_ref() else {
         return div().into_any_element();
@@ -1375,16 +1442,17 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
             Some(field) => div().flex_1().min_w_0().child(field).into_any_element(),
             None => div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(page.words.clone()).into_any_element(),
         });
-    // The scope's chips: the conversation open now, its Space, or the whole cache. One is the
-    // scope asked; a chip about no conversation open is not drawn, for it cannot be asked.
+    // The scope's chips: the conversation open now, its Space, Discord's direct messages, or
+    // the whole cache. One is the scope asked; a chip that cannot be asked is not drawn.
     let open = shell.open_with_space();
     let network = open.as_ref().map(|(key, _)| key.network);
     let in_space = open.as_ref().and_then(|(_, space)| space.as_deref()).is_some();
     let mut chips = div().flex_none().px(px(8.)).pt(px(8.)).pb(px(2.)).flex().flex_wrap().gap(px(6.));
-    for candidate in [Scope::Conversation, Scope::Space, Scope::Everywhere] {
+    for candidate in [Scope::Conversation, Scope::Space, Scope::Home, Scope::Everywhere] {
         let available = match candidate {
             Scope::Conversation => open.is_some(),
             Scope::Space => in_space,
+            Scope::Home => discord_home_target(shell).is_some(),
             Scope::Everywhere => true,
         };
         if !available {
@@ -1491,6 +1559,9 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                             })
                             .when(*cached, |row| {
                                 row.child(div().flex_none().type_micro().text_color(theme::text_soft()).child("cached"))
+                            })
+                            .when(!*cached && page.scope == Scope::Home, |row| {
+                                row.child(div().flex_none().type_micro().text_color(theme::text_soft()).child("Discord"))
                             }),
                     ),
             );
@@ -1636,7 +1707,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                 key.network == Network::Tiny
                     && shell.held_rows().any(|r| r.key.account() == key.account() && is_e2ee(r.encryption))
             }),
-            Scope::Everywhere => false,
+            Scope::Everywhere | Scope::Home => false,
         };
     div()
         .size_full()
@@ -1939,6 +2010,9 @@ mod tests {
         assert!(network_searches(&searching, Network::Slack, Scope::Conversation));
         assert!(network_searches(&searching, Network::Slack, Scope::Space));
         assert!(network_searches(&searching, Network::Discord, Scope::Space));
+        assert!(network_searches(&searching, Network::Discord, Scope::Home));
+        assert!(!network_searches(&searching, Network::Slack, Scope::Home));
+        assert!(!network_searches(&searching, Network::Telegram, Scope::Home), "direct messages are a Discord search");
         assert!(network_searches(&searching, Network::Tiny, Scope::Conversation));
         assert!(network_searches(&searching, Network::Tiny, Scope::Space));
         assert!(!network_searches(&searching, Network::Tiny, Scope::Everywhere));
@@ -1952,6 +2026,8 @@ mod tests {
         let quiet = Capabilities::default();
         assert!(!network_searches(&quiet, Network::Slack, Scope::Conversation));
         assert!(!network_searches(&quiet, Network::Telegram, Scope::Conversation), "the demo answers no network search");
+        assert!(!network_searches(&quiet, Network::Discord, Scope::Home));
+        assert_eq!(Scope::Home.label(Some(Network::Discord)), "Direct messages");
     }
 
     #[test]

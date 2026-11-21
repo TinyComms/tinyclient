@@ -3723,7 +3723,7 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
 fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_index_still_building() {
     let world = polished();
     // A Space's own search: the server's, one request, the hits mapped like the cache's.
-    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  }) {
+    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("{other:?}"),
     };
@@ -3742,7 +3742,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A server channel as the conversation: the server's search narrowed to the channel.
     let before = world.discord.requests_to("GET", "/guilds/4000/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/guilds/4000/messages/search");
     assert_eq!(asked.len(), before + 1, "the channel search is asked");
@@ -3751,7 +3751,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
     // One conversation: the DM's own channel search.
     sleep(Duration::from_millis(400));
     let before = world.discord.requests_to("GET", "/channels/3001/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/channels/3001/messages/search");
     assert_eq!(asked.len(), before + 1, "the DM's channel search is asked");
@@ -3759,12 +3759,70 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A 202: the index is still building, and the words say so.
     sleep(Duration::from_millis(400));
-    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(&not_ready, Response::Error { detail, .. } if detail.contains("isn't ready")), "{not_ready:?}");
 
     // Paced: Enter again at once is refused in words, so no client can turn it into a burst.
-    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(&paced, Response::Error { detail, .. } if detail.contains("paced")), "{paced:?}");
+}
+
+#[test]
+fn home_search_asks_every_direct_message_and_drops_text_the_user_cannot_read() {
+    let world = polished();
+    let secret = "secret-from-a-channel-you-cannot-read";
+    let guild_words = "server-channel-words-stay-out";
+    let dm = "the lichen note in a direct message";
+    let hit = |channel: &str, id: &str, content: &str| {
+        json!({
+            "id": id, "channel_id": channel, "type": 0,
+            "author": {"id": "200000000000000001", "username": "Ines Marchetti", "global_name": "Ines Marchetti", "discriminator": "0", "avatar": null},
+            "content": content,
+            "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+            "mention_everyone": false, "embeds": [], "pinned": false, "attachments": [],
+        })
+    };
+    let page = |rows: Vec<Value>| {
+        let messages: Vec<Value> = rows.into_iter().map(|row| json!([row])).collect();
+        json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": messages.len(), "messages": messages})
+    };
+
+    // No Discord account named: not a fan-out across servers, and Discord is not asked.
+    let skipped = world.ask(Request::SearchNetwork {
+        conversation: None, space: None, account: None, network: None, query: "lichen".into(),
+        filters: protocol::SearchFilters::default(), cursor: None, home: true,
+    });
+    assert!(matches!(skipped, Response::MessageHits { hits, .. } if hits.is_empty()), "{skipped:?}");
+    assert!(world.discord.requests_to("GET", "/users/@me/messages/search").is_empty());
+
+    world.discord.script("/users/@me/messages/search", 200, page(vec![
+        hit("3001", "1300000000000000610", dm),
+        hit("9999", "1300000000000000611", secret),
+        hit("4101", "1300000000000000612", guild_words),
+    ]));
+    let hits = match world.ask(Request::SearchNetwork {
+        conversation: None, space: None, account: Some(world.account()), network: None, query: "lichen".into(),
+        filters: protocol::SearchFilters::default(), cursor: None, home: true,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].conversation, world.key("3001"));
+    assert!(hits[0].snippet.contains("lichen"), "{}", hits[0].snippet);
+    let shown = format!("{hits:?}");
+    assert!(!shown.contains(secret) && !shown.contains(guild_words), "{shown}");
+    let asked = world.discord.requests_to("GET", "/users/@me/messages/search");
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].path.contains("content=lichen") && !asked[0].path.contains("guilds"), "{}", asked[0].path);
+
+    sleep(Duration::from_millis(450));
+    world.discord.script("/users/@me/messages/search", 403, json!({"message": "Missing Access", "code": 50001}));
+    let refused = world.ask(Request::SearchNetwork {
+        conversation: None, space: None, account: Some(world.account()), network: None, query: "nope".into(),
+        filters: protocol::SearchFilters::default(), cursor: None, home: true,
+    });
+    assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
 }
 
 /// A file of `size` bytes beside the world's directory: chatd never sends from its own.

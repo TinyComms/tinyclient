@@ -116,12 +116,15 @@ impl std::fmt::Debug for SealedFile {
     }
 }
 
-/// What the search's ask names: a Space's own search, one conversation's, or the whole account.
+/// What the search's ask names: a Space's own search, one conversation's, the whole account,
+/// or one account's direct messages (`Home`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Space(String),
     Conversation(String),
     Account,
+    /// Every direct message on this account. Not a search of every server.
+    Home,
 }
 
 /// One page of recent calls across all chats on an account (`Command::CallHistory`).

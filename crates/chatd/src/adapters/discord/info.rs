@@ -405,8 +405,9 @@ impl Discord {
     }
 
     /// What the network itself finds for the pane's words, from Discord's own search: the
-    /// server's when a Space is the scope, the channel's when one conversation is. The hits
-    /// are mapped like the cache's, so the pane can merge the two lists and tell them apart.
+    /// server's when a Space is the scope, the channel's when one conversation is, and every
+    /// direct message when the scope is home. The hits are mapped like the cache's, so the
+    /// pane can merge the two lists and tell them apart.
     pub(super) fn search_messages(&self, query: &str, scope: &SearchScope, at: Instant) -> Result<Vec<MessageHit>, Refusal> {
         if at.elapsed() >= super::SEARCH_PATIENCE {
             return Err(refused("That took too long. Try again."));
@@ -423,6 +424,7 @@ impl Discord {
                 format!("/guilds/{space}/messages/search?content={}", escaped(query))
             }
             SearchScope::Account => return Err(Refusal::Unsupported),
+            SearchScope::Home => format!("/users/@me/messages/search?content={}", escaped(query)),
             SearchScope::Conversation(channel) => {
                 let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
                 match self.guild_of(&known) {
@@ -470,19 +472,18 @@ impl Discord {
             SearchScope::Conversation(channel) => {
                 self.ctx.known(channel).ok().flatten().and_then(|known| self.guild_of(&known))
             }
-            SearchScope::Account => None,
+            SearchScope::Account | SearchScope::Home => None,
         };
         let mut found_hits = Vec::new();
         for posted in hits.iter().filter_map(|hit| hit.first()) {
-            // Hidden conversations and message requests stay out of it, as they stay out of
-            // the cache's own search.
-            if !self.ctx.listable(&posted.channel_id) {
+            // Hidden rows, message requests, and anything we cannot confirm the user can read
+            // stay out. The message text is not used until that check passes.
+            let Some(known) = self.quotable(scope, &posted.channel_id) else {
                 continue;
-            }
-            let known = self.ctx.known(&posted.channel_id).ok().flatten();
-            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
-            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
-            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            };
+            let kind = known.kind;
+            let title = known.title.clone();
+            let space_title = known.space_title.clone();
             let (message, _) = self.convert(posted, space_id.as_deref(), kind);
             let text = if !message.text.is_empty() {
                 message.text
@@ -503,5 +504,29 @@ impl Discord {
             });
         }
         Ok(found_hits)
+    }
+
+    /// A hit we may quote: the conversation is listed, we know it, and a server channel is one
+    /// this account can see. Home is direct messages only. Unknown channels are dropped before
+    /// their text is read.
+    fn quotable(&self, scope: &SearchScope, channel_id: &str) -> Option<protocol::Conversation> {
+        if !self.ctx.listable(channel_id) {
+            return None;
+        }
+        let known = self.ctx.known(channel_id).ok().flatten()?;
+        let guild = self.guild_of(&known);
+        if matches!(scope, SearchScope::Home) && guild.is_some() {
+            return None;
+        }
+        if let Some(guild) = guild.as_deref() {
+            let id = number(channel_id);
+            let seen = crate::hub::lock(&self.state).guilds.get(guild).is_some_and(|info| {
+                id != 0 && info.channels.iter().any(|(channel, _)| *channel == id)
+            });
+            if !seen {
+                return None;
+            }
+        }
+        Some(known)
     }
 }
