@@ -36,7 +36,10 @@ pub fn sensitive_cover(
     on_reveal: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> Div {
     div()
+        .max_w_full()
+        .min_w_0()
         .flex()
+        .flex_wrap()
         .items_center()
         .gap(px(8.))
         .px(px(8.))
@@ -48,10 +51,17 @@ pub fn sensitive_cover(
         .type_small()
         .text_color(theme::text_soft())
         .child(glyph("icons/eye-off.svg", 13., theme::text_faint()))
-        .child("Hidden in Streamer mode (invite link or sign-in code).")
+        .child(
+            div()
+                .min_w_0()
+                .flex_shrink_1()
+                .whitespace_normal()
+                .child("Hidden in Streamer mode (invite link or sign-in code)."),
+        )
         .child(
             div()
                 .id(id)
+                .flex_none()
                 .cursor_pointer()
                 .font_weight(theme::MEDIUM)
                 .text_color(theme::accent_text())
@@ -256,10 +266,34 @@ pub fn list_row(
     focused: bool,
     content: Div,
 ) -> Stateful<Div> {
+    list_row_in(id, height, selected, focused, content, false)
+}
+
+/// A [`list_row`] at least `height` tall that grows when `content` is taller.
+/// The activity cover uses this so a wrapped Reveal stays inside the row.
+pub fn list_row_fit(
+    id: impl Into<ElementId>,
+    height: f32,
+    selected: bool,
+    focused: bool,
+    content: Div,
+) -> Stateful<Div> {
+    list_row_in(id, height, selected, focused, content, true)
+}
+
+fn list_row_in(
+    id: impl Into<ElementId>,
+    height: f32,
+    selected: bool,
+    focused: bool,
+    content: Div,
+    grow: bool,
+) -> Stateful<Div> {
     // A finger has no hover: on a phone the row shows its press instead.
     let phone = super::phone::active();
+    // A fixed height clips a cover that wraps. Growing rows take their height from the content.
+    let content = if grow { content.w_full() } else { content.size_full() };
     let face = content
-        .size_full()
         .px(px(8.))
         .rounded(px(theme::R_CONTROL))
         .flex()
@@ -267,7 +301,9 @@ pub fn list_row(
         .when(selected, |row| row.bg(theme::selected()))
         // Rows abut, so the keyboard's ring is inset, over any fill.
         .when(focused, |row| row.shadow(theme::focus_ring_inset()));
-    let row = div().id(id).w_full().h(px(height)).px(px(theme::INSET)).py(px(1.)).cursor_pointer();
+    let row = div().id(id).w_full();
+    let row = if grow { row.min_h(px(height)) } else { row.h(px(height)) };
+    let row = row.px(px(theme::INSET)).py(px(1.)).cursor_pointer();
     // The face must be stateful: GPUI only keeps `hover_state` and notifies on enter/leave when
     // the hovered element has an id. Hover on an anonymous child painted the fill only when
     // something else happened to redraw, so the highlight lagged and skipped rows (R18).

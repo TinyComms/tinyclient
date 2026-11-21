@@ -2372,3 +2372,21 @@ fn parse_offer_video_mids_and_build_watch_frame_match_tinyserver_contract() {
     let empty = build_watch_frame("43", &mids, &[]);
     assert_eq!(empty["video"], json!([]));
 }
+
+#[test]
+fn a_late_watch_ack_does_not_replace_a_newer_list() {
+    assert!(watch_ack_keeps(1, 0));
+    assert!(watch_ack_keeps(2, 1));
+    assert!(!watch_ack_keeps(1, 2));
+    assert!(!watch_ack_keeps(4, 4));
+}
+
+#[test]
+fn a_single_video_slot_keeps_the_watch_locally() {
+    assert!(!watch_wire(true, 1, true));
+    assert!(watch_local(true, 1));
+    assert!(watch_wire(true, 5, true));
+    assert!(!watch_local(true, 5));
+    assert!(!watch_wire(true, 5, false), "multi-video without mids is not ready");
+    assert!(!watch_local(false, 1), "a watch before the call is up is not kept locally");
+}

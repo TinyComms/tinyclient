@@ -3,7 +3,7 @@
 use super::chat::{row_time, Look};
 use super::inbox::{self, Item};
 use super::{on_screen, respliced, Mode};
-use crate::gui::components::{badge_dot, badge_mention, button, empty_state, empty_state_with, glyph, list_row, section_header, sensitive_cover, skeleton, Avatar, ButtonKind, Shape};
+use crate::gui::components::{badge_dot, badge_mention, button, empty_state, empty_state_with, glyph, list_row, list_row_fit, section_header, sensitive_cover, skeleton, Avatar, ButtonKind, Shape};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -423,14 +423,17 @@ impl Shell {
                     )
                     .when(hide, |col| {
                         let id = item.id.clone();
-                        col.child(sensitive_cover(
-                            gpui::SharedString::from(format!("reveal-activity-{}", item.id)),
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.sidebar_state.activity_revealed.insert(id.clone());
-                                cx.notify();
-                            }),
-                        ))
+                        col.child(
+                            sensitive_cover(
+                                gpui::SharedString::from(format!("reveal-activity-{}", item.id)),
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.sidebar_state.activity_revealed.insert(id.clone());
+                                    cx.notify();
+                                }),
+                            )
+                            .w_full(),
+                        )
                     })
                     .when(!hide && !snippet.is_empty(), |col| {
                         col.child(
@@ -441,10 +444,14 @@ impl Shell {
                                 .child(snippet),
                         )
                     });
-                let height = theme::row_height(theme::ROW_TWO) + if hide { 20. } else { 0. };
-                list_box = list_box.child(
+                let height = theme::row_height(theme::ROW_TWO);
+                let row = if hide {
+                    list_row_fit(("activity-row", ix), height, false, false, content)
+                } else {
                     list_row(("activity-row", ix), height, false, false, content)
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_activity_item(picked.clone(), cx))),
+                };
+                list_box = list_box.child(
+                    row.on_click(cx.listener(move |this, _, _, cx| this.open_activity_item(picked.clone(), cx))),
                 );
             }
             if state.activity_cursor.is_some() {

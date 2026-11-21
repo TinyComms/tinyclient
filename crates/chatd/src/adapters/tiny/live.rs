@@ -104,7 +104,8 @@ const ROOM_CAP: u16 = 12;
 pub(crate) const OFFLINE: &str = "Tiny server isn't connected. Try again in a moment.";
 const LOST: &str = "The connection to the server dropped. Try again.";
 const NO_ANSWER: &str = "The server didn't answer. Try again.";
-/// A watch asked before this call can take one (no video mids yet, or a single slot).
+/// A watch asked before this call can take one: not in the call yet, or its video mids
+/// are not known. A single slot is kept locally instead of refused.
 const WATCH_UNREADY: &str = "This call can't watch that yet. Try again in a moment.";
 const BUSY: &str = "Wait for the last request to finish.";
 const AUDIO_DOWN: &str = "This server's audio is down. Try again later.";
@@ -414,8 +415,12 @@ struct Seat {
     video_slots: u8,
     /// Receive-only video mids from our last SDP offer, in offer order (`mids[0]` = primary).
     video_mids: Vec<String>,
-    /// The watch list the server last accepted. A refusal puts mediad back to this.
+    /// The watch list mediad is on. A refusal puts mediad back to this.
     watch_applied: Vec<protocol::WatchSource>,
+    /// Generation of `watch_applied`. A late ack of an older watch does not replace it.
+    watch_kept: u64,
+    /// Next generation handed to a watch ask. Counts for the life of the seat.
+    watch_epoch: u64,
     /// Everyone in our room's call, as mediad was last told: whom its MLS group may hold.
     rostered: Vec<String>,
     /// Resumes spent since media last held for [`MEDIA_HELD`]. Same budget as a Discord call.
@@ -576,6 +581,8 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         video_slots: 1,
         video_mids: Vec::new(),
         watch_applied: Vec::new(),
+        watch_kept: 0,
+        watch_epoch: 0,
         rostered: Vec::new(),
         resumes: 0,
         up_at: None,
@@ -772,8 +779,8 @@ enum Asked {
     Moderate,
     /// A `call.offer`. The answer is `call.answer`, or `share_taken`.
     Offer,
-    /// A `call.watch` subscription update, and the list that was sent.
-    Watch(Vec<protocol::WatchSource>),
+    /// A `call.watch` subscription update, the list that was sent, and its generation.
+    Watch { sources: Vec<protocol::WatchSource>, epoch: u64 },
     /// `call.cancel`, `call.decline`, or `call.leave` of a direct. A room seat is left alone.
     Direct,
 }
@@ -1014,15 +1021,25 @@ fn serve(
                         )
                     }
                     Ask::Offer { .. } => Ok(()),
-                    Ask::Watch { sources, reply } if seat.call_id.is_some() && seat.video_slots > 1 && !seat.video_mids.is_empty() => {
+                    Ask::Watch { sources, reply } if watch_goes_on_wire(seat) => {
+                        let epoch = next_watch_epoch(seat);
                         let reference = refs.to_string();
                         pending.push(Pending {
                             reference: reference.clone(),
-                            asked: Asked::Watch(sources.clone()),
+                            asked: Asked::Watch { sources: sources.clone(), epoch },
                             until: Instant::now() + timing.answer,
                             reply: Some(reply),
                         });
                         wire.send(build_watch_frame(&reference, &seat.video_mids, &sources).to_string())
+                    }
+                    Ask::Watch { sources, reply } if watch_stays_local(seat) => {
+                        // One video slot: `call.watch` is not this server's subscription. The list
+                        // still reaches mediad, and ok lets the shell keep it. Refusing would
+                        // restore the empty list and leave that ask retrying.
+                        let epoch = next_watch_epoch(seat);
+                        keep_watch(ctx, seat, &sources, epoch);
+                        let _ = reply.send(Ok(()));
+                        Ok(())
                     }
                     Ask::Watch { reply, .. } => {
                         // The shell already asked. Ok would leave that list stuck with nothing sent.
@@ -1131,7 +1148,7 @@ fn serve(
                     );
                 }
             }
-            if let Asked::Watch(_) = &late.asked {
+            if let Asked::Watch { .. } = &late.asked {
                 restore_watch(ctx, seat);
             }
             if let Asked::Join(room, media, _) = &late.asked {
@@ -1233,7 +1250,7 @@ fn state(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, seat: &Seat, ti
 fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room: String, timing: &Timing) -> io::Result<()> {
     let from = seat.last.clone().or_else(|| seat.wanted.clone());
     seat.call_id = None;
-    seat.watch_applied.clear();
+    drop_watch(seat);
     seat.speaking.clear();
     if live.seats_only() {
         seat.wanted = Some(room.clone());
@@ -2204,7 +2221,7 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
     }
     if seat.wanted.is_none() || seat.wanted.as_deref() == Some(room) {
         seat.call_id = None;
-        seat.watch_applied.clear();
+        drop_watch(seat);
         seat.speaking.clear();
     }
     if !ctx.in_call(room) {
@@ -2652,7 +2669,7 @@ fn hangup_direct(
     seat.say_state = false;
     if seated {
         seat.call_id = None;
-        seat.watch_applied.clear();
+        drop_watch(seat);
     }
     let reference = refs.to_string();
     pending.push(Pending {
@@ -2727,7 +2744,7 @@ fn direct_unseated(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str) 
             seat.wanted = None;
         }
         seat.call_id = None;
-        seat.watch_applied.clear();
+        drop_watch(seat);
         seat.direct = None;
         seat.join_direct = false;
     }
@@ -3214,7 +3231,55 @@ fn ask_direct_join(
     wire.send(frame.to_string())
 }
 
-/// Puts mediad back on the last watch list the server accepted.
+/// True when `epoch` is strictly newer than the generation already kept.
+/// A late ack of an older list is not newer, so it does not rewind mediad.
+fn watch_ack_keeps(epoch: u64, kept: u64) -> bool {
+    epoch != kept && epoch.wrapping_sub(kept) <= u64::MAX / 2
+}
+
+/// `call.watch` is the subscription only once the server offered more than one video slot
+/// and the offer has mids to name them.
+fn watch_goes_on_wire(seat: &Seat) -> bool {
+    watch_wire(seat.call_id.is_some(), seat.video_slots, !seat.video_mids.is_empty())
+}
+
+fn watch_wire(in_call: bool, video_slots: u8, have_mids: bool) -> bool {
+    in_call && video_slots > 1 && have_mids
+}
+
+/// A joined call with one slot (no `multi_video`) keeps the list on mediad and does not
+/// send `call.watch`.
+fn watch_stays_local(seat: &Seat) -> bool {
+    watch_local(seat.call_id.is_some(), seat.video_slots)
+}
+
+fn watch_local(in_call: bool, video_slots: u8) -> bool {
+    in_call && video_slots <= 1
+}
+
+fn next_watch_epoch(seat: &mut Seat) -> u64 {
+    seat.watch_epoch = seat.watch_epoch.wrapping_add(1);
+    seat.watch_epoch
+}
+
+/// The call no longer has a watch. An ack already in flight is not newer than this, so it
+/// cannot put the old list back onto mediad.
+fn drop_watch(seat: &mut Seat) {
+    seat.watch_applied.clear();
+    seat.watch_kept = seat.watch_epoch;
+}
+
+/// Records `sources` and tells mediad, when this generation is still the newest kept.
+fn keep_watch(ctx: &Context, seat: &mut Seat, sources: &[protocol::WatchSource], epoch: u64) {
+    if !watch_ack_keeps(epoch, seat.watch_kept) {
+        return;
+    }
+    seat.watch_kept = epoch;
+    seat.watch_applied = sources.to_vec();
+    restore_watch(ctx, seat);
+}
+
+/// Puts mediad back on the last watch list that was kept.
 fn restore_watch(ctx: &Context, seat: &Seat) {
     let Some(room) = seat.wanted.clone() else {
         return;
@@ -3273,7 +3338,7 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             Asked::Leave => {
                 seat.wanted = None;
                 seat.call_id = None;
-                seat.watch_applied.clear();
+                drop_watch(seat);
             }
             Asked::Kick
             | Asked::State
@@ -3281,8 +3346,9 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             | Asked::Ring(_, _)
             | Asked::Accept(_, _)
             | Asked::Direct => {}
-            Asked::Watch(sources) => {
-                seat.watch_applied = sources.clone();
+            Asked::Watch { sources, epoch } => {
+                // A newer list may already be the one mediad is on. This ack must not rewind it.
+                keep_watch(ctx, seat, sources, *epoch);
             }
             Asked::Offer => {
                 if let (Some(sdp), Some(room)) = (text(frame, "sdp"), seat.wanted.clone()) {
@@ -3350,12 +3416,12 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
                 );
             }
         }
-        if let Asked::Watch(_) = &pending.asked {
+        if let Asked::Watch { .. } = &pending.asked {
             restore_watch(ctx, seat);
         }
         // A rejoin nobody asked for that fails is not tried again. A refused renegotiation
         // leaves the seat. A refused watch keeps the last list the server accepted.
-        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct | Asked::Watch(_)) {
+        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct | Asked::Watch { .. }) {
             seat.wanted = None;
         }
         Err(Refusal::Refused(said.to_owned()))

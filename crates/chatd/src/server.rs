@@ -3664,20 +3664,20 @@ impl Chat {
                 Response::Ok
             }
             Request::Media(request) => {
-                // Tiny `call.watch` is applied to mediad only after the server accepts it.
-                // ShareWatch is Discord's picture subscription and is not this path.
+                // Tiny `call.watch` reaches mediad from the live socket, and only when that
+                // list is still the newest one accepted. Applying the sources here, after
+                // `ask` returns, lets an older connection thread rewind mediad. A single
+                // video slot never sends `call.watch`; the socket keeps that list locally
+                // and answers ok. ShareWatch is Discord's picture subscription.
                 if let MediaRequest::Watch { sources } = &request {
                     if let (Some(call), true) = self.hub.calls.describe() {
                         if call.conversation.network == Network::Tiny {
                             let sources = sources.clone();
                             let account = call.conversation.account();
                             return match self.ask(&account, |reply| {
-                                Command::Tiny(adapters::tiny::live::Ask::Watch { sources: sources.clone(), reply })
+                                Command::Tiny(adapters::tiny::live::Ask::Watch { sources, reply })
                             }) {
-                                Ok(()) => match self.hub.calls.request(&self.hub, &MediaRequest::Watch { sources }) {
-                                    Ok(()) => self.status(),
-                                    Err(err) => call_error(err),
-                                },
+                                Ok(()) => self.status(),
                                 Err(refused) => *refused,
                             };
                         }
