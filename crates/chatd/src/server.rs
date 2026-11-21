@@ -2586,6 +2586,19 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::FollowThread { conversation, on } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::FollowThread {
+                    conversation_id: conversation.id.clone(),
+                    on,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),

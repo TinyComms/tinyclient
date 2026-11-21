@@ -580,6 +580,12 @@ impl Fake {
                 }
                 Some(json!({"ok": true}))
             }
+            "subscriptions.thread.add" | "subscriptions.thread.remove" => {
+                if channel.is_empty() || param("thread_ts").is_empty() {
+                    return refused("thread_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
             "drafts.list" => self.drafts_list.lock().unwrap().clone().or_else(|| Some(json!({
                 "ok": true,
                 "drafts": []
@@ -4759,4 +4765,103 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
     assert!(sent2.contains("in:#deployments"), "{sent2}");
     assert!(!sent2.contains("in:#general"), "must not duplicate in: modifier: {sent2}");
     assert!(sent2.contains("during:2026-11"), "{sent2}");
+}
+
+#[test]
+fn slack_follow_unfollow_thread_and_unread_reply_counting() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.follow_threads, "Slack should advertise follow_threads");
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+
+    // 1. Follow the thread -> calls subscriptions.thread.add and marks followed=true.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: thread.clone(), on: true }),
+        Response::Ok
+    );
+    let add = world.fake.calls(ALPHA, "subscriptions.thread.add").pop().expect("subscriptions.thread.add called");
+    assert_eq!(add.params["channel"], "C0GEN");
+    assert_eq!(add.params["thread_ts"], ROOT);
+    world.until("thread marked followed", || {
+        world.conversation(&thread).filter(|c| c.followed).map(|_| ())
+    });
+
+    // 2. A live socket reply from Ana increments unread reply count to 1 without opening the thread.
+    let reply1 = "1760000901.000901";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Following up on this thread",
+        "ts": reply1,
+        "thread_ts": ROOT,
+        "event_ts": reply1,
+    }));
+    world.until("followed thread unread becomes 1", || {
+        world.conversation(&thread).filter(|c| c.unread == 1).map(|_| ())
+    });
+
+    // 3. thread_marked clears unread back to 0.
+    world.fake.push(ALPHA, json!({
+        "type": "thread_marked",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+            "unread_count": 0,
+            "last_read": reply1,
+        }
+    }));
+    world.until("thread_marked clears unread", || {
+        world.conversation(&thread).filter(|c| c.unread == 0).map(|_| ())
+    });
+
+    // 4. Unfollow the thread -> calls subscriptions.thread.remove and marks followed=false.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: thread.clone(), on: false }),
+        Response::Ok
+    );
+    let rem = world.fake.calls(ALPHA, "subscriptions.thread.remove").pop().expect("subscriptions.thread.remove called");
+    assert_eq!(rem.params["channel"], "C0GEN");
+    assert_eq!(rem.params["thread_ts"], ROOT);
+    world.until("thread marked unfollowed", || {
+        world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
+    });
+
+    // 5. A reply in an unfollowed thread does NOT increment unread.
+    let reply2 = "1760000902.000902";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Noise after unfollow",
+        "ts": reply2,
+        "thread_ts": ROOT,
+        "event_ts": reply2,
+    }));
+    world.until("reply2 stored in thread", || world.message(&thread, reply2));
+    assert_eq!(world.conversation(&thread).unwrap().unread, 0);
+
+    // 6. Live thread_subscribed and thread_unsubscribed socket events flip followed state.
+    world.fake.push(ALPHA, json!({
+        "type": "thread_subscribed",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+        }
+    }));
+    world.until("live thread_subscribed sets followed=true", || {
+        world.conversation(&thread).filter(|c| c.followed).map(|_| ())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "thread_unsubscribed",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+        }
+    }));
+    world.until("live thread_unsubscribed sets followed=false", || {
+        world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
+    });
 }

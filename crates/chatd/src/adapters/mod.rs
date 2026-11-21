@@ -555,6 +555,12 @@ pub enum Command {
         post_at: i64,
         reply: Reply<protocol::ScheduledMessage>,
     },
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`).
+    FollowThread {
+        conversation_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -769,7 +775,8 @@ impl Command {
             | Command::File { reply, .. }
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
-            | Command::CancelScheduled { reply, .. } => {
+            | Command::CancelScheduled { reply, .. }
+            | Command::FollowThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

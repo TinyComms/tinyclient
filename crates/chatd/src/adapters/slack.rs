@@ -302,6 +302,9 @@ struct State {
     drafts: HashMap<String, SlackDraft>,
     /// Unix seconds of the latest local draft edit per conversation (conflict rule: newest wins).
     local_draft_at: HashMap<String, i64>,
+    /// Followed thread conversation ids (`C0…:root_ts`) learned from `subscriptions.thread.getView`,
+    /// `conversations.replies`, `FollowThread`, and live `thread_subscribed` / `thread_unsubscribed` events.
+    followed_threads: HashSet<String>,
 }
 
 /// Remote draft metadata tracked so subsequent edits call `drafts.update` and clears call `drafts.delete`.
@@ -947,6 +950,8 @@ impl Slack {
             "reaction_added" | "reaction_removed" => self.reacted(event),
             "channel_marked" | "im_marked" | "group_marked" | "mpim_marked" => self.marked(event),
             "thread_marked" => self.thread_marked(event),
+            "thread_subscribed" => self.thread_subscription_changed(event, true),
+            "thread_unsubscribed" => self.thread_subscription_changed(event, false),
             "user_typing" => {
                 let (Some(channel), Some(user)) = (event["channel"].as_str(), event["user"].as_str()) else {
                     return Ok(());
@@ -1121,12 +1126,13 @@ impl Slack {
                 self.ctx.draft(&thread, "")?;
             }
         }
-        if message.mentions_me {
-            // A mention is the one thing in a thread that needs me whether or not I follow it.
+        if message.mentions_me || self.is_following_thread(&thread) {
             self.ctx.message(&thread, &message)?;
+            if !message.outgoing {
+                let unread = self.ctx.known(&thread)?.map_or(1, |row| row.unread);
+                self.thread_unread(channel, root, unread)?;
+            }
         } else {
-            // Slack counts a thread's replies as unread only for its followers, and does not
-            // say on the socket who they are. Opening the thread reads its real state.
             self.ctx.history(&thread, std::slice::from_ref(&message))?;
             self.ctx.typing_stopped(&thread, &message.sender.id);
         }
@@ -1399,9 +1405,14 @@ impl Slack {
                     self.ctx.history(channel, &[stored])?;
                 }
                 if first["subscribed"] == true {
+                    self.state().followed_threads.insert(thread.clone());
+                    self.ctx.filing(&thread, &crate::store::Filing { followed: true, ..crate::store::Filing::default() })?;
                     let unread = first["unread_count"].as_u64().unwrap_or(0) as u32;
                     let latest = seconds(first["latest_reply"].as_str().unwrap_or(root));
                     self.ctx.counts(&thread, unread, 0, first["last_read"].as_str(), latest)?;
+                } else if first["subscribed"] == false {
+                    self.state().followed_threads.remove(&thread);
+                    self.ctx.filing(&thread, &crate::store::Filing { followed: false, ..crate::store::Filing::default() })?;
                 }
             }
             cursor = page["response_metadata"]["next_cursor"].as_str().unwrap_or("").to_owned();
@@ -1420,6 +1431,43 @@ impl Slack {
         if let Some(summary) = first.thread.as_mut().filter(|summary| summary.unread != unread) {
             summary.unread = unread;
             self.ctx.history(channel, &[first])?;
+        }
+        Ok(())
+    }
+
+    /// True if we follow `thread_conv_id` (`C0…:root_ts`), either in memory or persisted in the store.
+    fn is_following_thread(&self, thread_conv_id: &str) -> bool {
+        if self.state().followed_threads.contains(thread_conv_id) {
+            return true;
+        }
+        if self.ctx.known(thread_conv_id).ok().flatten().is_some_and(|row| row.followed) {
+            self.state().followed_threads.insert(thread_conv_id.to_owned());
+            return true;
+        }
+        false
+    }
+
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread via `subscriptions.thread.add` / `remove`.
+    fn follow_thread(&self, conversation: &str, on: bool) -> Result<(), Fault> {
+        let Some((channel, root)) = thread_of(conversation) else {
+            return Err(Fault::Slack("thread_not_found".to_owned()));
+        };
+        let method = if on { "subscriptions.thread.add" } else { "subscriptions.thread.remove" };
+        self.api(method, &[("channel", channel), ("thread_ts", root)])?;
+        if on {
+            self.thread_known(channel, root).map_err(kept)?;
+            self.state().followed_threads.insert(conversation.to_owned());
+        } else {
+            self.state().followed_threads.remove(conversation);
+        }
+        self.ctx
+            .filing(conversation, &crate::store::Filing { followed: on, ..crate::store::Filing::default() })
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        if !on {
+            self.ctx
+                .counts(conversation, 0, 0, None, 0)
+                .map_err(|err| Fault::Net(err.to_string()))?;
+            self.thread_unread(channel, root, 0).map_err(kept)?;
         }
         Ok(())
     }
@@ -1530,6 +1578,9 @@ impl Slack {
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
+            Command::FollowThread { conversation_id, on, reply } => {
+                answer(reply, self.follow_thread(&conversation_id, on))
+            }
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
@@ -2744,6 +2795,7 @@ fn capabilities() -> protocol::Capabilities {
         save_messages: true,
         rich_status: true,
         dnd_snooze: true,
+        follow_threads: true,
         ..protocol::Capabilities::default()
     }
 }

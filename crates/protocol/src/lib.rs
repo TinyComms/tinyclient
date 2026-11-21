@@ -1418,6 +1418,12 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread for reply notifications
+    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`).
+    FollowThread {
+        conversation: Key,
+        on: bool,
+    },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.
     /// With `landing`, not a page but the one topic opening the forum lands on: the newest
@@ -3537,5 +3543,20 @@ mod sock_path_tests {
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
         let one = Response::ScheduledMessage { message: msg };
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&one).unwrap()).unwrap(), one);
+    }
+
+    #[test]
+    fn follow_thread_request_and_capability_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, "C1:1760000200.000200");
+        let req = Request::FollowThread { conversation: conv, on: true };
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), req);
+
+        let can = Capabilities { follow_threads: true, dnd_snooze: true, ..Capabilities::default() };
+        let cjson = serde_json::to_string(&can).unwrap();
+        assert_eq!(serde_json::from_str::<Capabilities>(&cjson).unwrap(), can);
+        let old: Capabilities = serde_json::from_str("{}").unwrap();
+        assert!(!old.follow_threads);
+        assert!(!old.dnd_snooze);
     }
 }

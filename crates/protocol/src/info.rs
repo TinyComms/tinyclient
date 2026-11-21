@@ -649,6 +649,9 @@ pub struct Capabilities {
     /// This account supports pausing notifications for a duration (`SetPresence { presence: Dnd, clear_at: Some(..) }` -> `dnd.setSnooze` / `dnd.endSnooze`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub dnd_snooze: bool,
+    /// This account supports following and unfollowing threads (`Request::FollowThread`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follow_threads: bool,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
