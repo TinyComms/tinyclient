@@ -815,6 +815,9 @@ pub enum Command {
     /// The user signed out: end the session on the network, best effort, then answer. chatd
     /// waits five seconds for the answer and forgets the account either way.
     SignOut(Reply<()>),
+    /// A round video message started playing. Telegram tells the network it was listened to
+    /// (`readMessageContents`). Nothing answers, and every other network ignores it.
+    Played { conversation_id: String, message_id: String },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }

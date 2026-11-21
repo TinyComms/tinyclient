@@ -83,12 +83,21 @@ impl Source {
             .format(&hint, stream, &options, &MetadataOptions::default())
             .map_err(why)?;
         let format = probed.format;
-        let (track, params) = format
-            .tracks()
-            .iter()
-            .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
-            .map(|track| (track.id, track.codec_params.clone()))
-            .ok_or_else(|| UNREADABLE.to_owned())?;
+        // The first track of a round video is H.264, which this reader does not decode (symphonia
+        // leaves it `CODEC_TYPE_NULL`). Skip anything that is not audio so the AAC track still plays.
+        let mut chosen = None;
+        for track in format.tracks() {
+            let params = &track.codec_params;
+            if params.codec == CODEC_TYPE_NULL {
+                continue;
+            }
+            if params.codec == CODEC_TYPE_OPUS || symphonia::default::get_codecs().make(params, &DecoderOptions::default()).is_ok() {
+                chosen = Some((track.id, params.clone()));
+                break;
+            }
+            tracing::warn!("mediad: skipped a track this build cannot decode");
+        }
+        let (track, params) = chosen.ok_or_else(|| UNREADABLE.to_owned())?;
         let (codec, rate, pre_skip, gain) = if params.codec == CODEC_TYPE_OPUS {
             let (pre_skip, gain) = params.extra_data.as_deref().and_then(opus_head).ok_or_else(|| {
                 tracing::warn!("mediad: an Opus stream this build cannot decode");

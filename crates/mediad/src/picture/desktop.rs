@@ -1087,6 +1087,12 @@ fn start_download(path: PathBuf) {
 /// Cisco's OpenH264 2.6.0 for this machine. A download in progress is [`CODEC_LATER`], not a
 /// failure, and this never blocks on the network. A failed download says its words, and the
 /// next share or camera that is turned on starts a new download.
+/// The OpenH264 decoder a round video message plays through. The same library a call loads.
+pub(crate) fn open_h264() -> Result<Decoder, String> {
+    let api = load_api()?;
+    Decoder::with_api_config(api, DecoderConfig::new()).map_err(|err| err.to_string())
+}
+
 fn load_api() -> Result<OpenH264API, String> {
     let path = library_path()?;
     if let Some(api) = open_cached(&path) {

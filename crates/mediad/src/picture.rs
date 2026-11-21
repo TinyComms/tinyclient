@@ -393,6 +393,11 @@ fn write_jpeg(rgb: &[u8], width: u32, height: u32, generation: u64) -> io::Resul
     Ok(path)
 }
 
+/// One RGB picture as a JPEG the window can read. The caller drops the file it replaces.
+pub(crate) fn paint_rgb(rgb: &[u8], width: u32, height: u32, generation: u64) -> Option<PathBuf> {
+    write_jpeg(rgb, width, height, generation).ok()
+}
+
 /// One picture on disk for the window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Painted {

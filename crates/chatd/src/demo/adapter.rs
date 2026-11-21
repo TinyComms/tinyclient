@@ -1052,6 +1052,7 @@ impl Demo {
             | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)
+            | Command::Played { .. }
             | Command::Stop => {}
         }
     }

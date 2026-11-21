@@ -667,6 +667,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-giveaways:0");
         return Ok(());
     }
+    // The lab's telegram-round-video driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-round-video") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_round() {
+            eprintln!("telegram-round-video: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-round-video:0");
+        return Ok(());
+    }
     // The lab's telegram-location driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-location") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_location() {

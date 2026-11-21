@@ -102,6 +102,9 @@ fn start(path: &Path, at: Option<u32>, rate: u16) -> PlayRequest {
         at,
         rate,
         output: None,
+        round: false,
+        muted: false,
+        looped: false,
     }
 }
 

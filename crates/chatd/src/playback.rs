@@ -31,6 +31,9 @@ struct Slot {
     /// The file's place on disk and the speaker asked for, to start again after a pause.
     path: PathBuf,
     output: Option<String>,
+    /// A round video message: mediad decodes the picture too, and loops it.
+    round: bool,
+    looped: bool,
     /// The running mediad's stdin. Closing it is the pause.
     stdin: Option<Box<dyn Write + Send>>,
     /// Tells this start from the next, for the threads that read an earlier mediad.
@@ -63,7 +66,7 @@ impl Player {
     /// The shell's request. Errors are words for the user.
     pub fn request(&self, hub: &Arc<Hub>, media: &Path, request: PlayRequest) -> Result<(), String> {
         match request {
-            PlayRequest::Start { account, file, path, conversation, message, title, at, rate, output } => {
+            PlayRequest::Start { account, file, path, conversation, message, title, at, rate, output, round, muted, looped } => {
                 let path = PathBuf::from(path);
                 let preview = hub.recorder.shown().is_some_and(|recording| {
                     recording.conversation == conversation && recording.conversation.account() == account
@@ -73,7 +76,7 @@ impl Player {
                 if !inside(media, &path) && !preview {
                     return Err("That file is not in tinyclient's media cache.".to_owned());
                 }
-                self.start(hub, Start { account, file, path, conversation, message, title, at, rate, output });
+                self.start(hub, Start { account, file, path, conversation, message, title, at, rate, output, round, muted, looped });
             }
             PlayRequest::Pause => self.pause(hub),
             PlayRequest::Seek { at } => self.seek(hub, at),
@@ -108,9 +111,13 @@ impl Player {
             since: now_ms(),
             duration,
             rate,
+            muted: start.muted,
+            picture: None,
         });
         slot.path = start.path;
         slot.output = start.output;
+        slot.round = start.round;
+        slot.looped = start.looped;
         match self.spawn(hub, &slot, generation) {
             Ok(stdin) => slot.stdin = Some(stdin),
             Err(err) => {
@@ -137,6 +144,9 @@ impl Player {
             at: shown.at,
             rate: shown.rate,
             output: slot.output.clone(),
+            round: slot.round,
+            muted: shown.muted,
+            looped: slot.looped,
         };
         write_frame(&mut stdin, &open)?;
         let hub = hub.clone();
@@ -172,6 +182,9 @@ impl Player {
                 if duration > 0 {
                     shown.duration = duration;
                 }
+            }
+            PlayerEvent::Frame { path, width, height, generation } => {
+                shown.picture = Some(protocol::PlayPicture { path, width, height, generation });
             }
             PlayerEvent::Ended { duration } => {
                 shown.state = PlayState::Ended;
@@ -306,6 +319,9 @@ struct Start {
     at: Option<u32>,
     rate: u16,
     output: Option<String>,
+    round: bool,
+    muted: bool,
+    looped: bool,
 }
 
 #[cfg(test)]

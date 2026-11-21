@@ -3670,10 +3670,25 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::Play(request) => match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
-                Ok(()) => Response::Ok,
-                Err(detail) => error(ErrorCode::Media, detail),
-            },
+            Request::Play(request) => {
+                // A round note is listened to when it starts, the same receipt a voice message
+                // owes. Muted autoplay counts: the picture is playing. Telegram is idempotent.
+                let played = match &request {
+                    protocol::PlayRequest::Start { account, conversation, message, round, .. } if *round && account.network == Network::Telegram => {
+                        Some((account.clone(), conversation.id.clone(), message.clone()))
+                    }
+                    _ => None,
+                };
+                match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
+                    Ok(()) => {
+                        if let Some((account, conversation_id, message_id)) = played {
+                            self.command(&account, Command::Played { conversation_id, message_id });
+                        }
+                        Response::Ok
+                    }
+                    Err(detail) => error(ErrorCode::Media, detail),
+                }
+            }
             // Answered `Ok` whatever became of it: the recording's own word is `Change::Recording`.
             Request::Record(request) => {
                 self.hub.recorder.request(&self.hub, request);

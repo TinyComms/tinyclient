@@ -52,7 +52,7 @@ fn a_recorded_opus_note_can_be_uploaded_and_private_cache_files_stay_blocked() {
     let play = |path: &std::path::Path, conversation: Key| PlayRequest::Start {
         account: conversation.account(), file: path.to_string_lossy().into_owned(),
         path: path.to_string_lossy().into_owned(), conversation, message: String::new(),
-        title: "Voice message preview".into(), at: None, rate: 100, output: None,
+        title: "Voice message preview".into(), at: None, rate: 100, output: None, round: false, muted: false, looped: false,
     };
     // An outbox file is playable only while it is the current finished recording, and
     // only for that recording's account and conversation.

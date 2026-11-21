@@ -1,12 +1,14 @@
-//! `mediad --play`: one voice message or audio file, from chatd's `Open` until the end, or until
-//! chatd closes our stdin (pause, another file, stop). Then the process exits, so nothing of the
-//! file, the decoder or the speaker outlives playing it.
+//! `mediad --play`: one voice message, audio file, or round video message, from chatd's `Open`
+//! until the end, or until chatd closes our stdin (pause, another file, stop). Then the process
+//! exits, so nothing of the file, the decoder or the speaker outlives playing it.
 //!
 //! The loop decodes only as far ahead as the speaker needs ([`AHEAD`]); the rest of the time it
-//! waits on chatd's next word or on the speaker draining.
+//! waits on chatd's next word or on the speaker draining. A round video message also demuxes its
+//! H.264 picture ([`crate::reel`]) and sends frames. Its sound is silence while it is muted.
 
 use crate::audio::Speaker;
 use crate::decode::Source;
+use crate::reel::Reel;
 use crate::stretch::Stretch;
 use crate::{CHANNELS, RATE};
 use protocol::{read_frame, PlayerEvent, PlayerRequest, RATES};
@@ -86,8 +88,8 @@ impl Clock {
 
 pub fn run() -> io::Result<()> {
     let told = requests();
-    let (path, at, rate, output) = match told.recv() {
-        Ok(Some(PlayerRequest::Open { path, at, rate, output })) => (path, at, rate, output),
+    let (path, at, rate, output, round, muted, looped) = match told.recv() {
+        Ok(Some(PlayerRequest::Open { path, at, rate, output, round, muted, looped })) => (path, at, rate, output, round, muted, looped),
         Ok(Some(other)) => {
             tracing::warn!("mediad: {other:?} before Open");
             fail("Playing could not start.")
@@ -95,6 +97,11 @@ pub fn run() -> io::Result<()> {
         _ => return Ok(()),
     };
     let mut source = Source::open(Path::new(&path)).unwrap_or_else(|detail| fail(detail));
+    let mut reel = if round {
+        Some(Reel::open(Path::new(&path)).unwrap_or_else(|detail| fail(detail)))
+    } else {
+        None
+    };
     let duration = source.duration();
     let mut speaker = Speaker::open(output.as_deref()).unwrap_or_else(|err| {
         tracing::warn!("mediad: speaker: {err:?}");
@@ -104,6 +111,9 @@ pub fn run() -> io::Result<()> {
     let mut clock = Clock { from: 0, read: 0 };
     if at > 0 && (duration == 0 || at < duration) {
         clock.from = source.seek(at).unwrap_or_else(|detail| fail(detail));
+        if let Some(reel) = &mut reel {
+            reel.seek(at).unwrap_or_else(|detail| fail(detail));
+        }
     }
     send(&PlayerEvent::Playing { at: clock.from, duration, rate: stretch.rate() });
 
@@ -119,6 +129,9 @@ pub fn run() -> io::Result<()> {
                 let rate = stretch.rate();
                 stretch.reset(rate);
                 clock = Clock { from: source.seek(at).unwrap_or_else(|detail| fail(detail)), read: 0 };
+                if let Some(reel) = &mut reel {
+                    reel.seek(clock.from).unwrap_or_else(|detail| fail(detail));
+                }
                 ended = false;
                 send(&PlayerEvent::Playing { at: clock.from, duration, rate });
                 continue;
@@ -130,6 +143,9 @@ pub fn run() -> io::Result<()> {
                 // speaker dropped is read again from `at`.
                 stretch.reset(rate_of(rate));
                 clock = Clock { from: source.seek(at).unwrap_or_else(|detail| fail(detail)), read: 0 };
+                if let Some(reel) = &mut reel {
+                    reel.seek(clock.from).unwrap_or_else(|detail| fail(detail));
+                }
                 ended = false;
                 send(&PlayerEvent::Playing { at: clock.from, duration, rate: stretch.rate() });
                 continue;
@@ -146,6 +162,18 @@ pub fn run() -> io::Result<()> {
         }
         if ended {
             if speaker.queued() == 0 {
+                if looped {
+                    speaker.clear();
+                    let rate = stretch.rate();
+                    stretch.reset(rate);
+                    clock = Clock { from: source.seek(0).unwrap_or_else(|detail| fail(detail)), read: 0 };
+                    if let Some(reel) = &mut reel {
+                        reel.seek(0).unwrap_or_else(|detail| fail(detail));
+                    }
+                    ended = false;
+                    send(&PlayerEvent::Playing { at: 0, duration, rate });
+                    continue;
+                }
                 send(&PlayerEvent::Ended { duration: duration.max(clock.heard(&stretch, &speaker)) });
                 return Ok(());
             }
@@ -159,6 +187,14 @@ pub fn run() -> io::Result<()> {
         clock.read += (piece.len() / CHANNELS) as u64;
         made.clear();
         stretch.push(&piece, &mut made);
+        if muted {
+            made.fill(0.);
+        }
+        if let Some(reel) = &mut reel {
+            if let Some(frame) = reel.catch_up(clock.heard(&stretch, &speaker)).unwrap_or_else(|detail| fail(detail)) {
+                send(&frame);
+            }
+        }
         if !more {
             // The stretcher's last windows: what it holds is played through at normal speed.
             let left = stretch.reset(100);

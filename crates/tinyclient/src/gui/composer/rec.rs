@@ -154,6 +154,9 @@ pub(super) fn preview(recording: &Option<Recording>, chip: &super::attach::Stage
         message: String::new(),
         title: "Voice message preview".to_owned(),
         at: None,
+        round: false,
+        muted: false,
+        looped: false,
     })
 }
 
@@ -219,7 +222,7 @@ mod tests {
         let mut playback = protocol::Playback {
             account: target().account(), file: "voice.opus".into(), conversation: target(),
             message: String::new(), title: "Voice message preview".into(),
-            state: protocol::PlayState::Loading, at: 0, since: 1000, duration: 0, rate: 100,
+            state: protocol::PlayState::Loading, at: 0, since: 1000, duration: 0, rate: 100, muted: false, picture: None,
         };
         assert_eq!(preview_caption(12_000, None, 1000), "Voice note · 0:12");
         assert_eq!(preview_caption(12_000, Some(&playback), 1000), "Loading · 0:00 / 0:12");

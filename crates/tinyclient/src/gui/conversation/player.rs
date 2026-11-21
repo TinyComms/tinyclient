@@ -172,6 +172,9 @@ impl Pane {
             message: message.id.clone(),
             title,
             at,
+            round: false,
+            muted: false,
+            looped: false,
         })
     }
 
@@ -184,8 +187,14 @@ impl Pane {
             return;
         }
         self.play_after = None;
+        let round = std::mem::take(&mut self.round_after);
         let play = self.find(&message).and_then(|message| self.play_of(&message, index, at));
-        if let Some(play) = play {
+        if let Some(mut play) = play {
+            if round {
+                play.round = true;
+                play.muted = false;
+                play.looped = true;
+            }
             // A landing is told through the shell, which is busy telling it: asked once it is done.
             let shell = self.shell.clone();
             cx.defer(move |cx| drop(shell.update(cx, |shell, cx| shell.play(play, cx))));
@@ -376,6 +385,8 @@ mod tests {
             since: 1_000,
             duration: 6_000,
             rate: 200,
+            muted: false,
+            picture: None,
         }
     }
 

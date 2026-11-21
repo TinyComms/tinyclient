@@ -915,6 +915,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answer);
         }
+        Command::Played { conversation_id, message_id } => played(account, &conversation_id, &message_id),
         Command::SignOut(reply) => {
             // Ends the session on Telegram, so the device list no longer shows it. What the
             // link was down for belongs to this session and not the next.
@@ -928,6 +929,27 @@ fn serve(account: &Arc<Account>, command: Command) {
         // (a full photo, a file, a video) cannot be fetched until the cache hands Telegram's
         // `Fetch`es to the adapter.
         other => other.unsupported(ctx),
+    }
+}
+
+/// A round video message started. Telegram is told the contents were played, the same call
+/// the official apps send for a voice or video message. A channel uses the channel form.
+fn played(account: &Account, conversation: &str, message: &str) {
+    let (Some((who, _)), Ok(id)) = (Who::parse(conversation), message.parse::<i32>()) else {
+        return;
+    };
+    if id <= 0 {
+        return;
+    }
+    let told = match who {
+        Who::Channel(_) => match account.input_channel(who) {
+            Ok(channel) => account.ask(&tl::functions::channels::ReadMessageContents { channel, id: vec![id] }).map(drop),
+            Err(fault) => Err(fault),
+        },
+        _ => account.ask(&tl::functions::messages::ReadMessageContents { id: vec![id] }).map(drop),
+    };
+    if let Err(fault) = told {
+        tracing::warn!("chatd: Telegram: played: {fault}");
     }
 }
 
@@ -1504,6 +1526,10 @@ pub fn prove_telegram_invoices() -> Result<(), String> {
 /// The lab's telegram-giveaways driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_giveaways() -> Result<(), String> {
     content::prove_giveaways()
+}
+
+pub fn prove_telegram_round() -> Result<(), String> {
+    protocol::prove_round_video()
 }
 
 /// The lab's telegram-location driver. A build without this stays up and the driver fails.

@@ -425,6 +425,19 @@ pub struct Pane {
     scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// A file the user pressed play on before it was on disk: file, message, attachment, from.
     play_after: Option<(String, String, usize, Option<u32>)>,
+    /// That press was a round video message, so it plays in the circle when the file lands.
+    round_after: bool,
+    /// The round note muted autoplay started, stopped once it leaves the screen.
+    round_auto: Option<String>,
+    /// The round tile under the pointer, for hover autoplay.
+    round_hover: Option<String>,
+    /// The JPEG currently drawn in a round note, so the one before it can be dropped.
+    round_frame: Option<(String, String)>,
+    /// Bumped at each draw. A round tile sets [`Self::round_mark`] to it while it is laid out.
+    round_stamp: u64,
+    round_mark: u64,
+    /// Draws in a row that did not lay the round tile out. A few of them and muted autoplay stops.
+    round_miss: u8,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -516,6 +529,13 @@ impl Pane {
             scrub: None,
             scrub_bounds: Rc::default(),
             play_after: None,
+            round_after: false,
+            round_auto: None,
+            round_hover: None,
+            round_frame: None,
+            round_stamp: 0,
+            round_mark: 0,
+            round_miss: 0,
             width: 0.,
             opening: false,
             seen: Rc::default(),
@@ -1326,7 +1346,37 @@ impl Pane {
         }
     }
 
+    /// Muted autoplay stops once the round note has not been laid out for a few draws.
+    /// Sound keeps going: the now-playing bar is the circle that stays.
+    fn settle_round(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.round_auto.clone() else {
+            return;
+        };
+        if self.round_mark == self.round_stamp {
+            self.round_miss = 0;
+            return;
+        }
+        self.round_miss = self.round_miss.saturating_add(1);
+        if self.round_miss < 8 {
+            return;
+        }
+        let account = self.key().map(protocol::Key::account);
+        let muted = account.as_ref().is_some_and(|account| {
+            self.shell.upgrade().is_some_and(|shell| {
+                shell.read(cx).playing_state.of(account, &file).is_some_and(|playback| {
+                    playback.muted && matches!(playback.state, protocol::PlayState::Playing | protocol::PlayState::Loading)
+                })
+            })
+        });
+        if muted {
+            let _ = self.shell.update(cx, |shell, cx| shell.play_stop(cx));
+        }
+        self.round_auto = None;
+        self.round_miss = 0;
+    }
+
     fn after_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_round(cx);
         self.images.sweep(window, cx);
         let scale = window.scale_factor();
         if scale != self.scale {
@@ -1847,6 +1897,7 @@ impl Render for Pane {
         if std::mem::take(&mut self.wants_focus) {
             window.focus(&self.focus, cx);
         }
+        self.round_stamp = self.round_stamp.wrapping_add(1);
         self.seen.borrow_mut().clear();
         let this = cx.entity();
         let rows = gpui::list(self.list.clone(), cx.processor(|this: &mut Pane, ix: usize, window, cx| this.row(ix, window, cx)))
