@@ -538,6 +538,9 @@ pub struct Capabilities {
     /// Most files in one message.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_files: u32,
+    /// Only image files (e.g. pasted screenshots) may be attached; other documents are refused.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub images_only: bool,
     /// Longest caption under files, in characters. 0: the text limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub caption_limit: u32,
@@ -699,6 +702,9 @@ pub struct Capabilities {
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,
+    /// This account supports per-message read-receipt lookup (`Request::ReadBy`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_by: bool,
     /// This account supports channel bookmarks (`bookmarks.list` / `add` / `edit` / `remove`, Slack).
     #[serde(default, skip_serializing_if = "is_false")]
     pub bookmarks: bool,
@@ -735,6 +741,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_mute: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
@@ -833,6 +842,19 @@ pub struct ActivityItem {
     /// Whether the network considers this item unread.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread: bool,
+}
+
+/// One member who has read up to a given message (`Request::ReadBy`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadBy {
+    pub person: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+    /// Unix seconds when they read it, if reported by the network.
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.
