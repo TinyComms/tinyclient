@@ -4316,3 +4316,404 @@ fn source_fetches_raw_markdown_for_editing() {
         asked.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn server_mute_deafen_and_suppress_are_kept_apart_from_self_flags() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    // Someone else: server-muted (not self-muted), suppressed; another: self-muted only.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev",
+            "self_mute": false, "self_deaf": false, "mute": true, "deaf": true, "suppress": true,
+            "self_stream": false, "self_video": false
+        }),
+    );
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": true, "self_deaf": false, "mute": false, "deaf": false, "suppress": false,
+            "self_stream": false, "self_video": false,
+            "member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock"}, "nick": null, "roles": []}
+        }),
+    );
+    // Us: server-muted by a moderator (not self-muted) and suppressed.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": true, "deaf": false, "suppress": true,
+            "self_stream": false, "self_video": false
+        }),
+    );
+
+    let active = wait("server mute flags on call and participants", || {
+        call().filter(|call| {
+            let dev = call.participants.iter().find(|p| p.id == "2002");
+            let sam = call.participants.iter().find(|p| p.id == "2006");
+            call.server_muted
+                && call.suppressed
+                && !call.server_deafened
+                && dev.is_some_and(|p| p.server_muted && p.server_deafened && p.suppressed && !p.muted && !p.deafened)
+                && sam.is_some_and(|p| p.muted && !p.server_muted && !p.server_deafened && !p.suppressed)
+        })
+    });
+    assert!(!active.muted, "self mute stays false when only server-muted");
+    assert!(active.server_muted && active.suppressed && !active.server_deafened);
+
+    // Occupants on the tree row also carry the split.
+    let (dev_occ, sam_occ) = wait("occupants carry server mute split", || {
+        match world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) {
+            Response::Tree { conversations, .. } => {
+                let row = conversations.iter().find(|r| r.key.id == "4201")?;
+                let occ = row.occupants.as_ref()?;
+                let dev = occ.people.iter().find(|p| p.person.id == "2002")?;
+                let sam = occ.people.iter().find(|p| p.person.id == "2006")?;
+                (dev.server_muted && dev.server_deafened && dev.suppressed && !dev.muted && sam.muted && !sam.server_muted)
+                    .then(|| (dev.clone(), sam.clone()))
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert!(dev_occ.server_muted && dev_occ.server_deafened && dev_occ.suppressed && !dev_occ.muted);
+    assert!(sam_occ.muted && !sam_occ.server_muted && !sam_occ.suppressed);
+
+    // Moderator lifts the server mute and suppress on us.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false,
+            "self_stream": false, "self_video": false
+        }),
+    );
+    wait("server mute cleared on call", || {
+        call().filter(|call| !call.server_muted && !call.suppressed && !call.server_deafened)
+    });
+}
+
+#[test]
+fn voice_state_member_avatar_reaches_participant_and_occupant() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    // Member with both a guild server avatar and a user avatar: server avatar wins.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "member": {
+                "avatar": "srv_hash_1",
+                "nick": null,
+                "roles": [],
+                "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "avatar": "usr_hash_1"}
+            }
+        }),
+    );
+    // Member with only a user avatar: user avatar is used.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2007", "session_id": "voice-riley",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "member": {
+                "avatar": null,
+                "nick": null,
+                "roles": [],
+                "user": {"id": "2007", "username": "riley", "global_name": "Riley", "avatar": "usr_hash_2"}
+            }
+        }),
+    );
+
+    let active = wait("participants carry avatars", || {
+        call().filter(|call| {
+            let sam = call.participants.iter().find(|p| p.id == "2006");
+            let riley = call.participants.iter().find(|p| p.id == "2007");
+            sam.and_then(|p| p.avatar.as_ref()).is_some_and(|a| a.id == "mavatar:4000:2006:srv_hash_1")
+                && riley.and_then(|p| p.avatar.as_ref()).is_some_and(|a| a.id == "avatar:2007:usr_hash_2")
+        })
+    });
+    assert_eq!(active.participants.iter().find(|p| p.id == "2006").unwrap().avatar.as_ref().unwrap().id, "mavatar:4000:2006:srv_hash_1");
+    assert_eq!(active.participants.iter().find(|p| p.id == "2007").unwrap().avatar.as_ref().unwrap().id, "avatar:2007:usr_hash_2");
+
+    // Occupants on the voice channel row carry the same avatar references.
+    let occ_avatars = wait("occupants carry avatars", || {
+        match world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) {
+            Response::Tree { conversations, .. } => {
+                let row = conversations.iter().find(|r| r.key.id == "4201")?;
+                let occ = row.occupants.as_ref()?;
+                let sam = occ.people.iter().find(|p| p.person.id == "2006")?.avatar.as_ref()?.id.clone();
+                let riley = occ.people.iter().find(|p| p.person.id == "2007")?.avatar.as_ref()?.id.clone();
+                Some((sam, riley))
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(occ_avatars.0, "mavatar:4000:2006:srv_hash_1");
+    assert_eq!(occ_avatars.1, "avatar:2007:usr_hash_2");
+}
+
+#[test]
+fn dm_call_message_updates_outcome_participants_and_unread_without_double_count() {
+    let world = World::start();
+    let dm = "3001";
+    let unread_before = world.conversation(dm).unread;
+    let call_msg_id = "1600000000000000801";
+    // Incoming ongoing type-3 call message in DM 3001 from Ada (2001).
+    world.discord.push(
+        "MESSAGE_CREATE",
+        json!({
+            "id": call_msg_id,
+            "channel_id": dm,
+            "type": 3,
+            "author": {"id": "2001", "username": "ada", "global_name": "Ada Lovelace"},
+            "content": "",
+            "timestamp": "2026-10-13T09:00:00.000000+00:00",
+            "mentions": [],
+            "attachments": [],
+            "embeds": [],
+            "call": {
+                "participants": ["2001"],
+                "ended_timestamp": null
+            }
+        }),
+    );
+    let live = wait("live call message stored", || {
+        world.messages(dm).into_iter().find(|m| m.id == call_msg_id)
+    });
+    assert_eq!(live.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Live));
+    assert_eq!(live.call.as_ref().map(|c| c.participants.as_slice()), Some(&["2001".to_owned()][..]));
+    let unread_after_create = world.conversation(dm).unread;
+    assert_eq!(unread_after_create, unread_before + 1, "incoming call message counts once as unread");
+
+    // Partial MESSAGE_UPDATE when the call ends unanswered (I am not in participants) -> Missed,
+    // without double-counting unread.
+    world.discord.push(
+        "MESSAGE_UPDATE",
+        json!({
+            "id": call_msg_id,
+            "channel_id": dm,
+            "call": {
+                "participants": ["2001"],
+                "ended_timestamp": "2026-10-13T09:00:45.000000+00:00"
+            }
+        }),
+    );
+    let missed = wait("call message updated to missed", || {
+        world
+            .messages(dm)
+            .into_iter()
+            .find(|m| m.id == call_msg_id && m.call.as_ref().is_some_and(|c| c.outcome == protocol::CallOutcome::Missed))
+    });
+    assert_eq!(missed.text, "Missed call from Mara O");
+    assert_eq!(world.conversation(dm).unread, unread_after_create, "MESSAGE_UPDATE must not double-count unread");
+
+    // MESSAGE_ACK clears the unread count.
+    world.discord.push("MESSAGE_ACK", json!({"channel_id": dm, "message_id": call_msg_id, "mention_count": 0}));
+    wait("unread cleared by MESSAGE_ACK", || (world.conversation(dm).unread == 0).then_some(()));
+}
+
+#[test]
+fn discord_call_ring_stop_ringing_and_ringing_roster() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    let dm = "3001";
+    world.discord.script(&format!("/channels/{dm}/call/ring"), 204, json!(null));
+    world.discord.script(&format!("/channels/{dm}/call/ring"), 204, json!(null));
+    world.discord.script(&format!("/channels/{dm}/call/ring"), 204, json!(null));
+    world.discord.script(&format!("/channels/{dm}/call/stop-ringing"), 204, json!(null));
+
+    // Start a direct call in DM 3001.
+    world.ask(Request::CallStart { conversation: world.key(dm) });
+    wait("the join", || world.discord.frames_of(4).pop());
+    // Our own voice state arrives so the initial ring proceeds.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": null, "channel_id": dm, "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false
+        }),
+    );
+
+    // CALL_UPDATE reports 2001 and 2002 are being rung -> surfaced as ringing: true participants.
+    world.discord.push(
+        "CALL_UPDATE",
+        json!({
+            "channel_id": dm,
+            "ringing": ["2001", "2002"],
+            "voice_states": []
+        }),
+    );
+    let active = wait("ringing participants reach shell", || {
+        call().filter(|c| {
+            let p1 = c.participants.iter().find(|p| p.id == "2001");
+            let p2 = c.participants.iter().find(|p| p.id == "2002");
+            p1.is_some_and(|p| p.ringing) && p2.is_some_and(|p| p.ringing)
+        })
+    });
+    assert_eq!(active.participants.iter().filter(|p| p.ringing).count(), 2);
+
+    // Stop ringing one person: POST /channels/{id}/call/stop-ringing with recipients: ["2002"].
+    assert_eq!(
+        world.ask(Request::CallStopRinging { people: Some(vec!["2002".into()]) }),
+        Response::Ok
+    );
+    let stopped = world.discord.requests_to("POST", &format!("/channels/{dm}/call/stop-ringing"));
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].body, json!({"recipients": ["2002"]}));
+
+    // Ring one specific person again: POST /channels/{id}/call/ring with recipients: ["2002"].
+    assert_eq!(
+        world.ask(Request::CallRing { people: Some(vec!["2002".into()]) }),
+        Response::Ok
+    );
+    // Ring everyone again: POST /channels/{id}/call/ring with recipients: null.
+    assert_eq!(world.ask(Request::CallRing { people: None }), Response::Ok);
+    let rung = world.discord.requests_to("POST", &format!("/channels/{dm}/call/ring"));
+    assert!(
+        rung.iter().any(|r| r.body == json!({"recipients": ["2002"]})),
+        "expected targeted ring body, got {:?}",
+        rung.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+    assert!(
+        rung.iter().any(|r| r.body == json!({"recipients": null})),
+        "expected ring-all body, got {:?}",
+        rung.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn discord_call_add_people_group_dm_and_1to1_escalation_with_rollback() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+
+    // --- Flow 1: 1:1 DM (3001 with friend 2001) -> add non-friend 2006 is refused ---
+    world.discord.script("/channels/3001/call/ring", 204, json!(null));
+    world.ask(Request::CallStart { conversation: world.key("3001") });
+    wait("join 3001", || world.discord.frames_of(4).pop());
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": null, "channel_id": "3001", "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false
+        }),
+    );
+
+    match world.ask(Request::CallAddPeople { people: vec!["2006".into()] }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("friends"), "expected friend check, got {detail}");
+        }
+        other => panic!("expected Refused for non-friend, got {other:?}"),
+    }
+
+    // --- Flow 2: 1:1 DM -> failure after group creation rolls back voice state to 3001 ---
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3098",
+            "type": 3,
+            "name": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara O"},
+                {"id": "2002", "username": "dev", "global_name": "Dev"}
+            ]
+        }),
+    );
+    world.discord.script("/channels/3098/call/ring", 403, json!({"code": 50013, "message": "Forbidden"}));
+    match world.ask(Request::CallAddPeople { people: vec!["2002".into()] }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused when ring fails, got {other:?}"),
+    }
+    // Call must still be on 3001, and last op 4 frame restored channel 3001.
+    assert_eq!(call().unwrap().conversation.id, "3001");
+    let last_op4 = world.discord.frames_of(4).pop().unwrap();
+    assert_eq!(last_op4["d"]["channel_id"], json!("3001"));
+
+    // --- Flow 3: 1:1 DM -> add friend 2002 succeeds, moves call to new group 3099 ---
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3099",
+            "type": 3,
+            "name": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara O"},
+                {"id": "2002", "username": "dev", "global_name": "Dev"}
+            ]
+        }),
+    );
+    world.discord.script("/channels/3099/call/ring", 204, json!(null));
+    match world.ask(Request::CallAddPeople { people: vec!["2002".into()] }) {
+        Response::Conversation { conversation } => assert_eq!(conversation.key.id, "3099"),
+        other => panic!("expected Response::Conversation for new group, got {other:?}"),
+    }
+    assert_eq!(call().unwrap().conversation.id, "3099", "call must retarget to new group DM");
+    let created_reqs = world.discord.requests_to("POST", "/users/@me/channels");
+    assert!(
+        created_reqs.iter().any(|r| r.body == json!({"recipients": ["2001", "2002"]})),
+        "expected group creation with [peer, added], got {:?}",
+        created_reqs.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+    let ring_new = world.discord.requests_to("POST", "/channels/3099/call/ring");
+    assert_eq!(ring_new.len(), 1);
+    assert_eq!(ring_new[0].body, json!({"recipients": null}));
+
+    // --- Flow 4: Group DM (3099) -> add friend 2003 PUTs recipient and rings only [2003] ---
+    // Make 2003 a friend via RELATIONSHIP_ADD first.
+    world.discord.push(
+        "RELATIONSHIP_ADD",
+        json!({
+            "id": "2003",
+            "type": 1,
+            "user": {"id": "2003", "username": "lin", "global_name": "Lin"}
+        }),
+    );
+    wait("2003 friend recorded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Discord),
+            relation: Some(Relation::Friend),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. } => people.iter().any(|p| p.key.id == "2003").then_some(()),
+            _ => None,
+        }
+    });
+    world.discord.script("/channels/3099/recipients/2003", 204, json!(null));
+    world.discord.script("/channels/3099/call/ring", 204, json!(null));
+    match world.ask(Request::CallAddPeople { people: vec!["2003".into()] }) {
+        Response::Conversation { conversation } => assert_eq!(conversation.key.id, "3099"),
+        other => panic!("expected Response::Conversation for group add, got {other:?}"),
+    }
+    let put_rec = world.discord.requests_to("PUT", "/channels/3099/recipients/2003");
+    assert_eq!(put_rec.len(), 1);
+    let ring_3099 = world.discord.requests_to("POST", "/channels/3099/call/ring");
+    assert!(
+        ring_3099.iter().any(|r| r.body == json!({"recipients": ["2003"]})),
+        "expected targeted ring for newly added friend, got {:?}",
+        ring_3099.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+}

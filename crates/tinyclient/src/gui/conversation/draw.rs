@@ -483,6 +483,28 @@ impl Pane {
         let disc_fg = if spec.missed { theme::danger() } else { theme::text_soft() };
         let label_fg = if spec.missed { theme::danger() } else { theme::text_soft() };
         let open_key = self.open.as_ref().map(|open| open.key.clone());
+        let faces: Option<Div> = message.call.as_ref().filter(|note| !note.participants.is_empty()).and_then(|note| {
+            let key = open_key.as_ref()?;
+            let account = key.account();
+            let shell = self.shell.upgrade()?;
+            let hub = shell.read(cx).people_state.hub().clone();
+            let shown: Vec<Div> = note
+                .participants
+                .iter()
+                .take(4)
+                .map(|id| {
+                    let person_key = Key::new(&account, id);
+                    let known = hub.person(&person_key);
+                    let name = known.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| id.clone());
+                    let picture = known
+                        .and_then(|p| p.avatar)
+                        .and_then(|file| hub.file(&account, &file, cx).path)
+                        .map(std::path::PathBuf::from);
+                    Avatar::new(&person_key, &name, 18.).image_at(picture).build()
+                })
+                .collect();
+            Some(div().flex_none().flex().items_center().gap(px(3.)).children(shown))
+        });
         let shell = self.shell.clone();
         let pill = spec.pill.and_then(|words| {
             let key = open_key?;
@@ -545,6 +567,7 @@ impl Pane {
                             .text_color(label_fg)
                             .child(spec.label),
                     )
+                    .children(faces)
                     .child(div().type_micro().text_color(theme::text_faint()).child(short_clock(message.sent))),
             )
             .children(pill)
@@ -3262,7 +3285,7 @@ mod tests {
         let make = |outcome, outgoing, seconds| {
             let mut m = Message::plain("r1", "Bea", "fallback", 100, outgoing);
             m.kind = MessageKind::System;
-            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds });
+            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new() });
             m
         };
         let missed_in = call_line_spec(&make(protocol::CallOutcome::Missed, false, None), "Bea");

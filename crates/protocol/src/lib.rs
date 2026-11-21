@@ -355,10 +355,20 @@ pub enum CallSupport {
 pub struct Occupant {
     pub person: Key,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub deafened: bool,
+    /// A moderator muted or deafened them on the server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_deafened: bool,
+    /// They may not speak in this voice channel.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppressed: bool,
     /// Sharing a screen.
     #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,
@@ -1874,6 +1884,23 @@ pub enum Request {
     CallSet {
         muted: bool,
         deafened: bool,
+    },
+    /// Rings people in the current direct/group call (`None` rings everyone in the conversation).
+    /// Single explicit user action; never retried.
+    CallRing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        people: Option<Vec<String>>,
+    },
+    /// Stops ringing specific people in the current direct/group call (`None` stops ringing all).
+    CallStopRinging {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        people: Option<Vec<String>>,
+    },
+    /// Adds friends to the current direct or group call. In a 1:1 DM call, creates a group DM
+    /// with the peer and added friends and moves the call there; in a group DM call, adds them
+    /// and rings them.
+    CallAddPeople {
+        people: Vec<String>,
     },
     /// Where the official app takes this conversation's call.
     Handoff {

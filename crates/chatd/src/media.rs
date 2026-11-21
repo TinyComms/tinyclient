@@ -263,6 +263,9 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         participants: Vec::new(),
         muted: false,
         deafened: false,
+        server_muted: false,
+        server_deafened: false,
+        suppressed: false,
         joined: 0,
         input: String::new(),
         output: String::new(),
@@ -1621,12 +1624,57 @@ impl Calls {
             self.tell(hub);
             return Ok(conversation);
         }
-        self.request(hub, &MediaRequest::Audio { muted, deafened })?;
+        let eff_muted = muted || call.server_muted || call.suppressed;
+        let eff_deafened = deafened || call.server_deafened;
+        self.request(hub, &MediaRequest::Audio { muted: eff_muted, deafened: eff_deafened })?;
         self.update(hub, &conversation, |live| {
             live.call.muted = muted;
             live.call.deafened = deafened;
         });
         Ok(conversation)
+    }
+
+    /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
+    /// Tells mediad to close the microphone while server-muted or suppressed so nothing is
+    /// captured or sent.
+    pub fn set_self_moderation(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        server_muted: bool,
+        server_deafened: bool,
+        suppressed: bool,
+    ) {
+        let mut changed = false;
+        let mut effective = None;
+        let known = self.update(hub, conversation, |live| {
+            let before_eff = (
+                live.call.muted || live.call.server_muted || live.call.suppressed,
+                live.call.deafened || live.call.server_deafened,
+            );
+            changed = live.call.server_muted != server_muted
+                || live.call.server_deafened != server_deafened
+                || live.call.suppressed != suppressed;
+            live.call.server_muted = server_muted;
+            live.call.server_deafened = server_deafened;
+            live.call.suppressed = suppressed;
+            if server_muted || suppressed {
+                live.call.speaking = false;
+            }
+            let after_eff = (
+                live.call.muted || live.call.server_muted || live.call.suppressed,
+                live.call.deafened || live.call.server_deafened,
+            );
+            if after_eff != before_eff {
+                effective = Some(after_eff);
+            }
+        });
+        if known && changed {
+            if let Some((muted, deafened)) = effective {
+                let _ = self.request(hub, &MediaRequest::Audio { muted, deafened });
+            }
+            self.tell(hub);
+        }
     }
 
     // What the adapter reports.
@@ -1729,10 +1777,10 @@ impl Calls {
                 participant.speaking = live.talking.contains(&participant.id);
             }
             live.call.participants = participants;
-            // The first other person in a call we rang is the answer.
+            // The first other person who actually joined a call we rang is the answer.
             if live.call.state == CallState::RingingOut
                 && live.connected
-                && !live.call.participants.is_empty()
+                && live.call.participants.iter().any(|p| !p.ringing)
             {
                 live.join();
             }
@@ -1754,8 +1802,8 @@ impl Calls {
         // last saw; and the wait is now for mediad, not for the network.
         let mut again = false;
         let known = self.update(hub, conversation, |live| {
-            voice.muted = live.call.muted;
-            voice.deafened = live.call.deafened;
+            voice.muted = live.call.muted || live.call.server_muted || live.call.suppressed;
+            voice.deafened = live.call.deafened || live.call.server_deafened;
             again = live.joining;
             live.joining = true;
             live.me = voice.user_id.clone();
@@ -2036,11 +2084,11 @@ fn arrival(call: &Call, roster: &[Participant], now: i64) -> Option<Cue> {
     if call.state != CallState::Joined || call.joined == 0 || now - call.joined < SETTLING || roster.len() > OCCUPANTS_LIMIT {
         return None;
     }
-    let had = |id: &str| call.participants.iter().any(|p| p.id == id);
-    let has = |id: &str| roster.iter().any(|p| p.id == id);
-    if roster.iter().any(|p| !had(&p.id)) {
+    let had = |id: &str| call.participants.iter().any(|p| !p.ringing && p.id == id);
+    let has = |id: &str| roster.iter().any(|p| !p.ringing && p.id == id);
+    if roster.iter().any(|p| !p.ringing && !had(&p.id)) {
         Some(Cue::Joined)
-    } else if call.participants.iter().any(|p| !has(&p.id)) {
+    } else if call.participants.iter().any(|p| !p.ringing && !has(&p.id)) {
         Some(Cue::Left)
     } else {
         None
