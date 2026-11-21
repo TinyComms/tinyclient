@@ -89,9 +89,10 @@ pub(crate) const SERVER: Timing = Timing {
 const FRAME: usize = 4 << 20;
 /// Names kept for the people in calls. The server's call frames carry only user ids.
 const NAMES: usize = 2_000;
-/// Rooms with someone in them, and people in one room. The server caps them at 12 and 32.
+/// Rooms with someone in them, and people in one room. Large calls can hold hundreds of
+/// participants (many silent without an audio slot), so the roster cap matches `NAMES`.
 const ROOMS: usize = 256;
-const SEATS: usize = 64;
+const SEATS: usize = 2_000;
 /// Call requests waiting for the socket. A user clicks; nothing queues many.
 const QUEUED: usize = 16;
 /// How often a held socket looks up, to notice it was stopped.

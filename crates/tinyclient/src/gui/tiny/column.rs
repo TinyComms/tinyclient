@@ -206,7 +206,7 @@ impl Shell {
             let line = div().px(px(theme::PANE_PAD)).pt(px(12.)).whitespace_normal();
             return line.type_small().text_color(theme::danger()).child(detail).into_any_element();
         };
-        let lines = model::lines(page.community, &self.tiny_state.folded, page.mine);
+        let lines = model::lines_with_expanded(page.community, &self.tiny_state.folded, &self.tiny_state.expanded_rooms, page.mine);
         let mut list = div().id("tiny-channels").size_full().overflow_y_scroll().pt(px(4.)).pb(px(12.)).flex().flex_col();
         let chats = self.tiny_chats();
         list = text_section(list, "Text channels", &chats, ConversationKind::Channel, self.open.as_ref(), cx);
@@ -240,6 +240,23 @@ impl Shell {
                         Some(seat) => self.seat_row(&page, room, seat, cx),
                         None => continue,
                     }
+                }
+                Line::MoreSeats { room, hidden, expanded } => {
+                    let toggle_id = room.clone();
+                    let label = if *expanded { "Show fewer".to_owned() } else { format!("+{hidden} more") };
+                    let content = div()
+                        .pl(px(24.))
+                        .gap(px(8.))
+                        .child(div().type_small().text_color(theme::text_faint()).child(label));
+                    list_row(SharedString::from(format!("tiny-more-seats-{room}")), theme::row_height(theme::ROW_ONE), false, false, content)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.tiny_state.expanded_rooms.remove(&toggle_id) {
+                                this.tiny_state.expanded_rooms.insert(toggle_id.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element()
                 }
             };
             list = list.child(row);

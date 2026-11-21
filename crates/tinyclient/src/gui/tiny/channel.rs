@@ -372,17 +372,62 @@ impl Shell {
         let focus = stage::still(self.tiny_state.focus.as_ref(), room, &streams);
         let base = div().id("tiny-stage").flex_1().min_h_0();
         match focus {
-            None => crate::gui::components::scroll::scroll_page("tiny-stage-grid-scroll-frame", base
-                .overflow_y_scroll()
-                .p(px(24.))
-                .flex()
-                .flex_wrap()
-                .content_center()
-                .items_center()
-                .justify_center()
-                .gap(px(12.))
-                .children(self.tiny_tiles(page, room, &streams, call, None, Size::Grid, cx)))
-                .into_any_element(),
+            None => {
+                let (grid_seats, roster_seats) = stage::partition_stage(&room.participants, &streams, page.me, stage::STAGE_GRID_CAP);
+                let grid_tiles = self.tiny_tiles_for(page, &grid_seats, &streams, call, None, Size::Grid, cx);
+                let mut content = base.overflow_y_scroll().p(px(24.)).flex().flex_col().items_center().gap(px(20.)).child(
+                    div().w_full().flex().flex_wrap().content_center().items_center().justify_center().gap(px(12.)).children(grid_tiles),
+                );
+                if !roster_seats.is_empty() {
+                    let mut roster = div()
+                        .w_full()
+                        .max_w(px(680.))
+                        .p(px(12.))
+                        .rounded(px(theme::R_CARD))
+                        .bg(theme::raised())
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .pb(px(4.))
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child(format!("ALSO IN CALL · {}", roster_seats.len())),
+                        );
+                    for seat in roster_seats {
+                        let name = model::name_by_id(page.community, &seat.user_id);
+                        let avatar = Avatar::new(&page.key(&seat.user_id), &name, 20.).image_at(page.picture(&seat.user_id)).build();
+                        let glyphs = super::column::seat_glyphs(seat);
+                        let menu_id = seat.user_id.clone();
+                        roster = roster.child(
+                            div()
+                                .id(SharedString::from(format!("tiny-roster-{}", seat.user_id)))
+                                .h(px(28.))
+                                .px(px(6.))
+                                .rounded(px(theme::R_CONTROL))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .hover(|s| s.bg(theme::hover()))
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        this.tiny_open_float(Float::Person { user_id: menu_id.clone(), at: event.position }, cx);
+                                    }),
+                                )
+                                .child(avatar)
+                                .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(name))
+                                .child(div().flex_none().flex().items_center().gap(px(4.)).children(glyphs.into_iter().map(|(icon, color, _)| glyph(icon, 14., color)))),
+                        );
+                    }
+                    content = content.child(roster);
+                }
+                crate::gui::components::scroll::scroll_page("tiny-stage-grid-scroll-frame", content).into_any_element()
+            }
             Some(Focus::Person(focus)) => {
                 let big = room.participants.iter().find(|seat| seat.user_id == *focus).map(|seat| self.tiny_tile(page, seat, call, Size::Big, cx));
                 let rest = self.tiny_tiles(page, room, &streams, call, Some(&Focus::Person(focus.clone())), Size::Grid, cx);
@@ -434,9 +479,15 @@ impl Shell {
     /// Everyone's tile, each followed by their stream's, leaving out the one focused.
     #[allow(clippy::too_many_arguments)]
     fn tiny_tiles(&self, page: &Page, room: &TinyRoom, streams: &[Stream], call: Option<&Call>, except: Option<&Focus>, size: Size, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let seats: Vec<&TinySeat> = room.participants.iter().collect();
+        self.tiny_tiles_for(page, &seats, streams, call, except, size, cx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tiny_tiles_for(&self, page: &Page, seats: &[&TinySeat], streams: &[Stream], call: Option<&Call>, except: Option<&Focus>, size: Size, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let shown = |focus: Focus| except != Some(&focus);
         let mut tiles = Vec::new();
-        for seat in &room.participants {
+        for seat in seats {
             if shown(Focus::Person(seat.user_id.clone())) {
                 tiles.push(self.tiny_tile(page, seat, call, size, cx));
             }
@@ -445,7 +496,7 @@ impl Shell {
             }
         }
         // My stream before the room lists my seat.
-        for stream in streams.iter().filter(|stream| !room.participants.iter().any(|seat| seat.user_id == stream.user_id)) {
+        for stream in streams.iter().filter(|stream| !seats.iter().any(|seat| seat.user_id == stream.user_id)) {
             if shown(Focus::Stream(stream.user_id.clone())) {
                 tiles.push(self.tiny_stream_tile(page, stream, call, size, cx));
             }

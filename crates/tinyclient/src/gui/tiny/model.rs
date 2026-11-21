@@ -246,6 +246,9 @@ pub fn draw_role(roles: &mut Vec<String>, role_id: &str) {
     }
 }
 
+/// How many seats a voice channel lists in the sidebar before collapsing the rest under "+N more".
+pub const SIDEBAR_SEAT_CAP: usize = 8;
+
 /// One row of the channel list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
@@ -254,6 +257,8 @@ pub enum Line {
     Category { id: Option<String>, name: String, folded: bool, key: String, rooms: usize },
     Room { id: String },
     Seat { room: String, user: String },
+    /// Collapsible overflow row under a voice channel with more than [`SIDEBAR_SEAT_CAP`] seats.
+    MoreSeats { room: String, hidden: usize, expanded: bool },
 }
 
 /// The key under which an uncategorized group folds.
@@ -263,6 +268,17 @@ pub const LOOSE: &str = "";
 /// each room by its place and then name; under a room, who is in its call. A folded category
 /// keeps a room someone is in visible only when it is ours, as Discord keeps the connected one.
 pub fn lines(community: &TinyCommunity, folded: &HashSet<String>, mine: Option<&str>) -> Vec<Line> {
+    lines_with_expanded(community, folded, &HashSet::new(), mine)
+}
+
+/// Like [`lines`], with `expanded` rooms showing all seats instead of collapsing past
+/// [`SIDEBAR_SEAT_CAP`].
+pub fn lines_with_expanded(
+    community: &TinyCommunity,
+    folded: &HashSet<String>,
+    expanded: &HashSet<String>,
+    mine: Option<&str>,
+) -> Vec<Line> {
     let mut rooms: Vec<&TinyRoom> = community.rooms.iter().collect();
     rooms.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     let mut categories: Vec<_> = community.categories.iter().collect();
@@ -281,8 +297,38 @@ pub fn lines(community: &TinyCommunity, folded: &HashSet<String>, mine: Option<&
                 continue;
             }
             out.push(Line::Room { id: room.id.clone() });
-            for seat in &room.participants {
-                out.push(Line::Seat { room: room.id.clone(), user: seat.user_id.clone() });
+            if room.participants.len() <= SIDEBAR_SEAT_CAP {
+                for seat in &room.participants {
+                    out.push(Line::Seat { room: room.id.clone(), user: seat.user_id.clone() });
+                }
+            } else if expanded.contains(&room.id) {
+                for seat in &room.participants {
+                    out.push(Line::Seat { room: room.id.clone(), user: seat.user_id.clone() });
+                }
+                out.push(Line::MoreSeats {
+                    room: room.id.clone(),
+                    hidden: room.participants.len() - SIDEBAR_SEAT_CAP,
+                    expanded: true,
+                });
+            } else {
+                // Prioritize `mine` and active speakers in the collapsed preview.
+                let mut priority: Vec<&TinySeat> = Vec::new();
+                let mut others: Vec<&TinySeat> = Vec::new();
+                for seat in &room.participants {
+                    if mine == Some(seat.user_id.as_str()) || seat.speaking {
+                        priority.push(seat);
+                    } else {
+                        others.push(seat);
+                    }
+                }
+                for seat in priority.into_iter().chain(others).take(SIDEBAR_SEAT_CAP) {
+                    out.push(Line::Seat { room: room.id.clone(), user: seat.user_id.clone() });
+                }
+                out.push(Line::MoreSeats {
+                    room: room.id.clone(),
+                    hidden: room.participants.len() - SIDEBAR_SEAT_CAP,
+                    expanded: false,
+                });
             }
         }
     };
@@ -723,6 +769,7 @@ mod tests {
                 Line::Category { name, .. } => format!("# {name}"),
                 Line::Room { id } => id.clone(),
                 Line::Seat { user, .. } => format!("  {user}"),
+                Line::MoreSeats { hidden, .. } => format!("  +{hidden} more"),
             })
             .collect();
         assert_eq!(shape, ["loose", "# Play", "games", "  mod", "# Talk", "quiet", "lounge", "  mem", "  me"]);
@@ -876,5 +923,54 @@ mod tests {
         assert_eq!(channel_occupancy(&busy), "3 in call");
         busy.user_limit = 12;
         assert_eq!(channel_occupancy(&busy), "3 of 12");
+    }
+
+    #[test]
+    fn sidebar_collapses_large_voice_rooms_and_expands_on_demand() {
+        let mut community: TinyCommunity = serde_json::from_value(serde_json::json!({
+            "role": "member",
+            "members": [],
+            "invites": [],
+            "audit": [],
+            "me": "u39"
+        }))
+        .unwrap();
+        let mut room = TinyRoom::new("big", "Town Hall");
+        for i in 0..40 {
+            room.participants.push(TinySeat {
+                user_id: format!("u{i}"),
+                speaking: i == 30,
+                ..TinySeat::default()
+            });
+        }
+        community.rooms.push(room);
+
+        let collapsed = lines_with_expanded(&community, &HashSet::new(), &HashSet::new(), Some("u39"));
+        let seat_lines: Vec<&str> = collapsed
+            .iter()
+            .filter_map(|line| match line {
+                Line::Seat { user, .. } => Some(user.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seat_lines.len(), SIDEBAR_SEAT_CAP);
+        assert!(seat_lines.contains(&"u30"), "speaking seat prioritized in collapsed sidebar");
+        assert!(seat_lines.contains(&"u39"), "own seat prioritized in collapsed sidebar");
+        assert!(collapsed.contains(&Line::MoreSeats {
+            room: "big".into(),
+            hidden: 40 - SIDEBAR_SEAT_CAP,
+            expanded: false,
+        }));
+
+        let mut expanded_set = HashSet::new();
+        expanded_set.insert("big".to_owned());
+        let expanded = lines_with_expanded(&community, &HashSet::new(), &expanded_set, Some("u39"));
+        let expanded_seats = expanded.iter().filter(|line| matches!(line, Line::Seat { .. })).count();
+        assert_eq!(expanded_seats, 40);
+        assert!(expanded.contains(&Line::MoreSeats {
+            room: "big".into(),
+            hidden: 40 - SIDEBAR_SEAT_CAP,
+            expanded: true,
+        }));
     }
 }

@@ -218,6 +218,8 @@ pub struct State {
     shared: Option<protocol::ScreenSource>,
     /// Categories folded, by key ([`model::LOOSE`] for the rooms in none).
     folded: HashSet<String>,
+    /// Voice rooms whose seat list is expanded past [`model::SIDEBAR_SEAT_CAP`].
+    expanded_rooms: HashSet<String>,
     members_open: bool,
 
     float: Option<Float>,
@@ -321,6 +323,7 @@ impl State {
             share_cursor: true,
             shared: None,
             folded: HashSet::new(),
+            expanded_rooms: HashSet::new(),
             members_open: true,
             float: None,
             sub: None,
