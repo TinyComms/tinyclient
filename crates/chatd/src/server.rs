@@ -1963,11 +1963,27 @@ impl Chat {
             external: about.external,
             link: about.link,
             bookmarks: about.bookmarks,
+            tabs: about.tabs,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
         clip(&mut info.external, 100);
         clip(&mut info.link, 300);
+        info.tabs.truncate(protocol::TABS_LIMIT);
+        for tab in &mut info.tabs {
+            clip(&mut tab.id, 128);
+            clip(&mut tab.name, 120);
+            clip(&mut tab.app, 80);
+            clip(&mut tab.kind, 32);
+            clip(&mut tab.web_url, 1_024);
+            clip(&mut tab.content_url, 1_024);
+            if !tab.web_url.starts_with("https://") && !tab.web_url.starts_with("http://") {
+                tab.web_url.clear();
+            }
+            if !tab.content_url.starts_with("https://") && !tab.content_url.starts_with("http://") {
+                tab.content_url.clear();
+            }
+        }
         self.hub.infos.keep(conversation, info.clone());
         Response::ConversationInfo { info: Box::new(info) }
     }

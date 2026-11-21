@@ -648,6 +648,12 @@ impl Fake {
                 ]
             }));
         }
+        if call.path.ends_with("/tabs") && (call.path.contains("/beta/channels/") || call.path.contains("/beta/chats/")) {
+            if call.path.contains(GENERAL) {
+                return ok(self.fixture("tabs").unwrap());
+            }
+            return ok(json!({"value": []}));
+        }
         if call.path.ends_with("/v1/messages/translate") {
             let asked = call.json();
             let to = asked["targetLanguage"].as_str().unwrap_or("en");
@@ -2801,6 +2807,41 @@ fn translate_message_returns_ephemeral_translation_without_mutating_store() {
         panic!("expected Response::Translated with stored target language");
     };
     assert!(fr_text.starts_with("Bonjour"), "{fr_text}");
+}
+
+#[test]
+fn channel_and_chat_tabs_are_listed_and_tab_added_activity_is_readable() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 1);
+
+    // 1. Channel info lists Files, Planner, and Website tabs with validated external URLs.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+        panic!("expected Response::ConversationInfo");
+    };
+    assert_eq!(info.tabs.len(), 3, "{:?}", info.tabs);
+    assert_eq!((info.tabs[0].name.as_str(), info.tabs[0].kind.as_str()), ("Files", "files"));
+    assert!(info.tabs[0].web_url.starts_with("https://contoso.sharepoint.com/"));
+    assert_eq!((info.tabs[1].name.as_str(), info.tabs[1].app.as_str(), info.tabs[1].kind.as_str()), ("Sprint Board", "Planner", "planner"));
+    assert_eq!((info.tabs[2].name.as_str(), info.tabs[2].kind.as_str()), ("Runbook", "website"));
+    assert_eq!(info.tabs[2].web_url, "https://docs.contoso.example/runbook");
+
+    // 2. "New tab added" ThreadActivity arrives as a readable system message naming the tab.
+    let mut tab_event = message(
+        GENERAL,
+        None,
+        1_760_000_860_001,
+        ANA,
+        "Ana Ruiz",
+        "<addtab><initiator>8:orgid:00000000-0000-4000-8000-0000000000a1</initiator><tabName>Sprint Board</tabName></addtab>",
+    );
+    tab_event["messagetype"] = json!("ThreadActivity/AddTab");
+    world.fake.push("NewMessage", tab_event, false);
+    let added = world.until("tab added system message", || world.message(&general, "1760000860001"));
+    assert_eq!(added.kind, MessageKind::System);
+    assert!(added.text.contains("Sprint Board"), "{}", added.text);
+    assert!(!added.text.contains("Card"), "{}", added.text);
 }
 
 

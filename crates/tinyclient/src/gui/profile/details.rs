@@ -490,6 +490,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 format!("{} {}", bm.emoji, bm.title)
             };
             let url = bm.link.clone();
+            let valid_url = url.starts_with("https://") || url.starts_with("http://");
             let chip = div()
                 .id(("details-bookmark", ix))
                 .px(px(8.))
@@ -498,7 +499,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .bg(theme::raised())
                 .type_small()
                 .text_color(theme::text())
-                .when(!url.is_empty(), |d| {
+                .when(valid_url, |d| {
                     d.cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
                         .on_click(move |_, _, cx| cx.open_url(&url))
@@ -515,6 +516,57 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .gap(px(8.))
                 .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Bookmarks"))
                 .child(chips),
+        );
+    }
+    if let Some(tabs) = info.map(|i| i.tabs.as_slice()).filter(|t| !t.is_empty()) {
+        let fallback_link = link.clone().unwrap_or_default();
+        let mut rows = div().flex().flex_col().gap(px(2.));
+        for (ix, tab) in tabs.iter().enumerate() {
+            let open_url = [&tab.web_url, &tab.content_url, &fallback_link]
+                .into_iter()
+                .find(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .cloned();
+            let icon = match tab.kind.as_str() {
+                "files" => "icons/folder-plus.svg",
+                "planner" => "icons/check.svg",
+                "website" => "icons/link.svg",
+                _ => "icons/external-link.svg",
+            };
+            let show_app = !tab.app.is_empty() && !tab.app.eq_ignore_ascii_case(&tab.name);
+            let mut row = div()
+                .id(("details-tab", ix))
+                .h(px(theme::ROW_ONE))
+                .mx(px(-8.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .child(glyph(icon, 15., theme::text_soft()))
+                .child(div().flex_1().min_w_0().truncate().text_color(theme::text()).child(tab.name.clone()));
+            if show_app {
+                row = row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(tab.app.clone()));
+            }
+            if let Some(url) = open_url {
+                row = row
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(glyph("icons/external-link.svg", 13., theme::text_faint()))
+                    .on_click(move |_, _, cx| cx.open_url(&url));
+            }
+            rows = rows.child(row);
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Tabs"))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Tabs open in your browser or Teams."))
+                .child(rows),
         );
     }
     if !waiting || late {

@@ -198,6 +198,7 @@ pub struct ConversationAbout {
     pub link: String,
     pub disappearing: Option<u32>,
     pub bookmarks: Vec<protocol::Bookmark>,
+    pub tabs: Vec<protocol::ConversationTab>,
 }
 
 /// What a Space's info says, as the network tells it.

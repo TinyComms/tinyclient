@@ -28,6 +28,8 @@ pub const CATALOG_LIMIT: usize = 200;
 pub const PINNED_LIMIT: usize = 50;
 /// Most people each section of `Around` lists.
 pub const AROUND_LIMIT: usize = 100;
+/// Most channel or chat tabs listed in [`ConversationInfo::tabs`].
+pub const TABS_LIMIT: usize = 32;
 
 fn is_true(value: &bool) -> bool {
     *value
@@ -291,6 +293,28 @@ pub struct ConversationInfo {
     /// Channel bookmarks (links, canvases, folders; Slack `bookmarks.list`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// Pinned channel/chat tabs and apps (Teams: Files, Notes, Planner, websites, apps).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<ConversationTab>,
+}
+
+/// One tab or pinned app on a channel or chat (`ConversationInfo::tabs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationTab {
+    pub id: String,
+    pub name: String,
+    /// App display name when distinct from `name` (e.g. "Planner", "OneNote", "Website").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    /// Normalized kind: `"files"`, `"notes"`, `"planner"`, `"website"`, or `"app"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// Direct web URL (`https://` or `http://`) to open the tab externally, or Teams deep link.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub web_url: String,
+    /// Underlying content URL when provided by the tab configuration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_url: String,
 }
 
 /// Kind of a channel bookmark.

@@ -379,6 +379,7 @@ impl Demo {
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
             disappearing: row.disappearing,
             bookmarks: Vec::new(),
+            ..ConversationAbout::default()
         })
     }
 

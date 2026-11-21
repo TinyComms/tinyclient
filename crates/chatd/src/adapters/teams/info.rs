@@ -8,9 +8,9 @@
 //! - A thread's `createdat` and `creator` properties, read off the thread description.
 
 use super::links;
-use super::{escaped, id_of, millis, thread_of, Body, Fault, Teams};
+use super::{escaped, id_of, millis, thread_of, Audience, Auth, Body, Fault, Teams};
 use crate::adapters::{ConversationAbout, SpaceAbout};
-use protocol::{ConversationKind, Notify};
+use protocol::{ConversationKind, ConversationTab, Notify};
 use serde_json::{json, Value};
 
 /// "Seen" is told in one-to-one and small chats only, never in channels, as Teams does.
@@ -135,6 +135,8 @@ impl Teams {
         };
         let created = millis(&id_of(&properties["createdat"])) / 1000;
         let shared = properties["sharedChannel"] == true || properties["threadType"] == "sharedChannel";
+        let link = self.share_link(thread, row.as_ref(), shared);
+        let tabs = self.fetch_tabs(thread, channel, &described, &link);
         Ok(ConversationAbout {
             // A chat's topic is its title, already on the row: only a description is more.
             description: text("description"),
@@ -143,9 +145,36 @@ impl Teams {
             creator,
             notify,
             external: if shared { "Shared channel".to_owned() } else { String::new() },
-            link: self.share_link(thread, row.as_ref(), shared),
+            link,
+            tabs,
             ..ConversationAbout::default()
         })
+    }
+
+    /// Reads channel or chat tabs from thread properties or Teams' middle-tier tabs endpoint.
+    /// Never fails `ConversationInfo` if the tabs endpoint is unavailable.
+    fn fetch_tabs(&self, thread: &str, is_channel: bool, described: &Value, channel_link: &str) -> Vec<ConversationTab> {
+        let mut raw_tabs: Vec<Value> = match &described["properties"]["tabs"] {
+            Value::Array(list) => list.clone(),
+            Value::String(s) if !s.trim().is_empty() => serde_json::from_str::<Vec<Value>>(s).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if raw_tabs.is_empty() {
+            if let Ok(place) = self.place() {
+                let kind_seg = if is_channel { "channels" } else { "chats" };
+                let url = format!("{}/beta/{kind_seg}/{}/tabs", place.middle, escaped(thread));
+                if let Ok(answer) = self.call("GET", &url, Auth::Both(Audience::Spaces), Body::None, false) {
+                    if let Some(list) = answer.body["value"]
+                        .as_array()
+                        .or_else(|| answer.body["tabs"].as_array())
+                        .or_else(|| answer.body.as_array())
+                    {
+                        raw_tabs = list.clone();
+                    }
+                }
+            }
+        }
+        parse_tabs(self.cloud.endpoints().teams, thread, channel_link, &raw_tabs)
     }
 
     /// The https link the info pane copies. A channel and a chat use Microsoft's documented
@@ -354,9 +383,141 @@ impl Teams {
     }
 }
 
+fn valid_http_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    (trimmed.starts_with("https://") || trimmed.starts_with("http://")).then(|| trimmed.to_owned())
+}
+
+fn classify_tab(app_id: &str, app_name: &str, display_name: &str) -> (&'static str, String) {
+    let id = app_id.to_ascii_lowercase();
+    let app = app_name.trim();
+    let name = display_name.trim().to_ascii_lowercase();
+    if id.contains("files.sharepoint") || id == "files" || name == "files" {
+        return ("files", if app.is_empty() { "Files".to_owned() } else { app.to_owned() });
+    }
+    if id.contains(".wiki")
+        || id.contains("onenote")
+        || id == "0d820ecd-def2-4297-adad-78056cde7c78"
+        || name == "notes"
+        || name == "wiki"
+    {
+        return ("notes", if app.is_empty() { "Notes".to_owned() } else { app.to_owned() });
+    }
+    if id.contains(".planner") || id == "com.microsoft.teamspace.tab.planner" || app.eq_ignore_ascii_case("planner") {
+        return ("planner", if app.is_empty() { "Planner".to_owned() } else { app.to_owned() });
+    }
+    if id.contains(".tab.web") || id == "com.microsoft.teamspace.tab.web" || app.eq_ignore_ascii_case("website") {
+        return ("website", if app.is_empty() { "Website".to_owned() } else { app.to_owned() });
+    }
+    ("app", app.to_owned())
+}
+
+fn parse_tabs(teams_host: &str, thread: &str, channel_link: &str, raw_tabs: &[Value]) -> Vec<ConversationTab> {
+    let mut tabs = Vec::new();
+    for (idx, item) in raw_tabs.iter().take(protocol::TABS_LIMIT).enumerate() {
+        let id = item["id"]
+            .as_str()
+            .or_else(|| item["tabId"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("tab-{idx}"));
+        let name = item["displayName"]
+            .as_str()
+            .or_else(|| item["name"].as_str())
+            .or_else(|| item["title"].as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let app_id = item["teamsAppId"]
+            .as_str()
+            .or_else(|| item["teamsApp"]["id"].as_str())
+            .or_else(|| item["appDefinitionId"].as_str())
+            .unwrap_or("")
+            .trim();
+        let app_name = item["teamsApp"]["displayName"]
+            .as_str()
+            .or_else(|| item["appName"].as_str())
+            .unwrap_or("");
+        let (kind, app) = classify_tab(app_id, app_name, &name);
+        let config = &item["configuration"];
+        let content_url = config["contentUrl"]
+            .as_str()
+            .or_else(|| item["contentUrl"].as_str())
+            .and_then(valid_http_url)
+            .unwrap_or_default();
+        let mut web_url = item["webUrl"]
+            .as_str()
+            .or_else(|| config["websiteUrl"].as_str())
+            .or_else(|| item["websiteUrl"].as_str())
+            .and_then(valid_http_url)
+            .unwrap_or_default();
+        if web_url.is_empty() {
+            if !content_url.is_empty() && kind == "website" {
+                web_url = content_url.clone();
+            } else if !app_id.is_empty() {
+                let entity = config["entityId"].as_str().filter(|s| !s.is_empty()).unwrap_or(&id);
+                let ctx = format!("{{\"channelId\":\"{}\"}}", thread);
+                web_url = format!(
+                    "{}/l/entity/{}/{}?context={}",
+                    teams_host.trim_end_matches('/'),
+                    escaped(app_id),
+                    escaped(entity),
+                    escaped(&ctx),
+                );
+            } else if let Some(fallback) = valid_http_url(channel_link) {
+                web_url = fallback;
+            }
+        }
+        tabs.push(ConversationTab {
+            id,
+            name,
+            app,
+            kind: kind.to_owned(),
+            web_url,
+            content_url,
+        });
+    }
+    tabs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tabs_classifies_known_apps_validates_urls_and_builds_fallback_links() {
+        let raw = vec![
+            json!({
+                "id": "t1",
+                "displayName": "Files",
+                "teamsAppId": "com.microsoft.teamspace.tab.files.sharepoint",
+                "webUrl": "https://contoso.sharepoint.com/sites/Eng/Shared%20Documents"
+            }),
+            json!({
+                "id": "t2",
+                "displayName": "Q4 Board",
+                "teamsAppId": "com.microsoft.teamspace.tab.planner",
+                "teamsApp": {"displayName": "Planner"},
+                "webUrl": "javascript:alert(1)"
+            }),
+            json!({
+                "id": "t3",
+                "displayName": "Docs",
+                "teamsAppId": "com.microsoft.teamspace.tab.web",
+                "configuration": {"websiteUrl": "https://docs.example.com"}
+            }),
+        ];
+        let tabs = parse_tabs("https://gov.teams.microsoft.us", "19:chan@thread.tacv2", "https://gov.teams.microsoft.us/l/channel/x", &raw);
+        assert_eq!(tabs.len(), 3);
+        assert_eq!((tabs[0].kind.as_str(), tabs[0].name.as_str()), ("files", "Files"));
+        assert_eq!((tabs[1].kind.as_str(), tabs[1].app.as_str()), ("planner", "Planner"));
+        assert!(tabs[1].web_url.starts_with("https://gov.teams.microsoft.us/l/entity/"), "javascript URL must be rejected and replaced with cloud handoff: {}", tabs[1].web_url);
+        assert_eq!((tabs[2].kind.as_str(), tabs[2].web_url.as_str()), ("website", "https://docs.example.com"));
+    }
 
     #[test]
     fn parse_notify_reads_channel_settings_and_alerts_properties() {

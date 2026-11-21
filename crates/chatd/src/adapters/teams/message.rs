@@ -648,6 +648,29 @@ impl Teams {
             "MemberJoined" => joined("joined"),
             "MemberLeft" => joined("left"),
             "PictureUpdate" => Some("The picture was changed".to_owned()),
+            "AddTab" | "TabAdded" => {
+                let tab = tab_name_from(content);
+                Some(match (initiator, tab) {
+                    (Some(who), Some(name)) => format!("{who} added tab {name}"),
+                    (None, Some(name)) => format!("Added tab {name}"),
+                    (Some(who), None) => format!("{who} added a tab"),
+                    (None, None) => "Added a tab".to_owned(),
+                })
+            }
+            "UpdateTab" | "TabUpdated" => {
+                let tab = tab_name_from(content);
+                Some(match tab {
+                    Some(name) => format!("Updated tab {name}"),
+                    None => "Updated a tab".to_owned(),
+                })
+            }
+            "DeleteTab" | "RemoveTab" | "TabRemoved" => {
+                let tab = tab_name_from(content);
+                Some(match tab {
+                    Some(name) => format!("Removed tab {name}"),
+                    None => "Removed a tab".to_owned(),
+                })
+            }
             _ => None,
         }
     }
@@ -2110,6 +2133,23 @@ pub(super) fn prove_chain_paging() -> Result<(), String> {
     Ok(())
 }
 
+/// Extracts a tab's display name from a Teams `ThreadActivity/*Tab*` XML or JSON payload.
+fn tab_name_from(content: &str) -> Option<String> {
+    if let Ok(parsed) = serde_json::from_str::<Value>(content) {
+        for key in ["tabName", "displayName", "name", "title"] {
+            if let Some(name) = parsed[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    for tag in ["tabName", "tabname", "displayName", "displayname", "name", "value"] {
+        if let Some(found) = inside(content, tag).first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return Some(found.to_owned());
+        }
+    }
+    None
+}
+
 /// Reads a translated message body and optional detected language from Teams' translate response.
 fn parse_translation_response(body: &Value) -> Option<crate::adapters::Translation> {
     let direct_text = [&body["translatedText"], &body["translation"], &body["text"]]
@@ -2403,5 +2443,18 @@ mod tests {
         assert_eq!((t2.text.as_str(), t2.detected_language.as_str()), ("Good morning", "ja"));
 
         assert!(parse_translation_response(&json!({"translatedText": "   "})).is_none());
+    }
+
+    #[test]
+    fn tab_activity_extracts_tab_name_from_xml_and_json() {
+        assert_eq!(
+            tab_name_from("<addtab><initiator>8:orgid:ana</initiator><tabName>Sprint Board</tabName></addtab>").as_deref(),
+            Some("Sprint Board")
+        );
+        assert_eq!(
+            tab_name_from(r#"{"displayName":"Runbook"}"#).as_deref(),
+            Some("Runbook")
+        );
+        assert_eq!(tab_name_from("<addtab></addtab>"), None);
     }
 }
