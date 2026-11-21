@@ -788,6 +788,22 @@ pub enum UnreadItemKind {
     Reactions,
 }
 
+/// What a jump tells the network it just opened.
+/// A mention is that message. A reaction names the one just opened until the last,
+/// which clears the chat (`readReactions` takes no ids).
+pub fn jump_mark_ids(kind: UnreadItemKind, id: &str, last: bool) -> Vec<String> {
+    match kind {
+        UnreadItemKind::Mentions => vec![id.to_owned()],
+        UnreadItemKind::Reactions if last => Vec::new(),
+        UnreadItemKind::Reactions => vec![id.to_owned()],
+    }
+}
+
+/// The badge left after that mark. An empty mark clears the count.
+pub fn badge_after_jump(count: u32, marked: u32) -> u32 {
+    if marked == 0 { 0 } else { count.saturating_sub(marked) }
+}
+
 /// Preview of a Space invite (`Request::InvitePreview`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvitePreview {
@@ -1243,6 +1259,15 @@ impl Keychain {
 mod tests {
     use super::*;
     use crate::{AccountKey, Key, Network, Request};
+
+    #[test]
+    fn jump_mark_ids_mentions_one_message_and_reactions_clear_on_the_last() {
+        assert_eq!(jump_mark_ids(UnreadItemKind::Mentions, "21", true), vec!["21".to_owned()]);
+        assert_eq!(jump_mark_ids(UnreadItemKind::Reactions, "24", false), vec!["24".to_owned()]);
+        assert!(jump_mark_ids(UnreadItemKind::Reactions, "25", true).is_empty());
+        assert_eq!(badge_after_jump(3, 1), 2);
+        assert_eq!(badge_after_jump(3, 0), 0);
+    }
 
     #[test]
     fn profile_edit_capabilities_and_requests_round_trip() {

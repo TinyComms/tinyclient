@@ -1608,6 +1608,24 @@ pub fn prove_telegram_mark_unread() -> Result<(), String> {
     Ok(())
 }
 
+/// `TINYCLIENT_PROVE=telegram-unread-jumps`. A mention jump marks that message. A reaction
+/// jump names the one just opened until the last, which clears the chat.
+pub fn prove_telegram_unread_jumps() -> Result<(), String> {
+    if protocol::jump_mark_ids(protocol::UnreadItemKind::Mentions, "21", true) != ["21"] {
+        return Err("a mention jump marks that message".into());
+    }
+    if protocol::jump_mark_ids(protocol::UnreadItemKind::Reactions, "24", false) != ["24"] {
+        return Err("a reaction jump names the one just opened".into());
+    }
+    if !protocol::jump_mark_ids(protocol::UnreadItemKind::Reactions, "25", true).is_empty() {
+        return Err("the last reaction jump clears the chat".into());
+    }
+    if protocol::badge_after_jump(3, 1) != 2 || protocol::badge_after_jump(3, 0) != 0 {
+        return Err("the badge drops by what was just read, and a clear ends it".into());
+    }
+    Ok(())
+}
+
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()
