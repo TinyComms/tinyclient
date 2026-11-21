@@ -1254,6 +1254,7 @@ impl Slack {
             thumbnail: None,
             color: Some(0x1d_9bd1),
             sponsored: false,
+            actions: Vec::new(),
         }
     }
 
@@ -1279,6 +1280,7 @@ impl Slack {
             thumbnail: None,
             color: Some(0x4a_154b),
             sponsored: false,
+            actions: Vec::new(),
         }
     }
 
@@ -1581,6 +1583,7 @@ impl Slack {
             thumbnail: None,
             color: Some(0x4a_154b),
             sponsored: false,
+            actions: Vec::new(),
         }
     }
 
@@ -1676,6 +1679,7 @@ impl Slack {
             thumbnail: None,
             color: Some(0x2e_7d6f),
             sponsored: false,
+            actions: Vec::new(),
         }
     }
 
