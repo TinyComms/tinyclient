@@ -323,7 +323,7 @@ pub(in crate::gui::tiny) fn channels(shell: &Shell, facts: &Facts, window: &mut 
         };
         tools = tools.child(
             button_with_icon("tiny-channels-new-room", ButtonKind::Primary, "icons/plus.svg", "Create channel")
-                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewRoom(category.clone()), window, cx))),
+                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewChannel { category: category.clone(), kind: crate::gui::tiny::NewChannelKind::Text, e2ee: false }, window, cx))),
         );
     }
     if facts.may.categories {

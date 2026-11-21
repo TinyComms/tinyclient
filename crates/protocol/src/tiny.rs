@@ -775,7 +775,12 @@ fn tiny_bits(id: &str) -> Option<u64> {
         "community.members.timeout" => TINY_TIMEOUT_MEMBERS,
         "community.audit.read" => TINY_VIEW_AUDIT_LOG,
         "community.server.edit" | "community.bots.manage" => TINY_MANAGE_SERVER,
-        "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.rooms.edit" | "community.categories.manage" => {
+        "community.rooms.create"
+        | "community.rooms.rename"
+        | "community.rooms.delete"
+        | "community.rooms.edit"
+        | "community.channels.create"
+        | "community.categories.manage" => {
             TINY_MANAGE_CHANNELS
         }
         "community.rooms.overrides" => TINY_MANAGE_CHANNELS | TINY_MANAGE_ROLES,
@@ -1157,6 +1162,25 @@ pub struct TinyRoomEdit {
     pub e2ee_required: Option<bool>,
 }
 
+/// A text channel to make, or a change to one. Only what is `Some` is sent; `category_id: Some("")`
+/// moves it out of its category. `e2ee` is only used when creating a channel and only sent when true.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyChannelEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2ee: Option<bool>,
+}
+
+/// The server's limit for a text channel's topic.
+pub const TINY_CHANNEL_TOPIC_MAX: usize = 1024;
+
 /// The lowest and highest bitrate a room may have, and what one has unless set.
 pub const TINY_BITRATE_MIN: u32 = 16;
 pub const TINY_BITRATE_MAX: u32 = 128;
@@ -1502,7 +1526,7 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
         "account.name.edit" | "account.sessions.end" | "community.calls.join" => {
             matches!(role, "owner" | "admin" | "member")
         }
-        "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.calls.kick" => {
+        "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.channels.create" | "community.calls.kick" => {
             matches!(role, "owner" | "admin")
         }
         _ => false,

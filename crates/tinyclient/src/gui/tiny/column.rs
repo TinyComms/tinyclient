@@ -272,7 +272,7 @@ impl Shell {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.tiny_open_modal(super::Modal::NewRoom(category.clone()), window, cx);
+                        this.tiny_open_modal(super::Modal::NewChannel { category: category.clone(), kind: super::NewChannelKind::Text, e2ee: false }, window, cx);
                     }))
                     .child(glyph("icons/plus.svg", 14., theme::text_soft())),
             );

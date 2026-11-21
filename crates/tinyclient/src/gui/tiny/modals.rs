@@ -7,7 +7,7 @@
 //! members, shown once; Sign-in's removal of one of your passkeys, and your new recovery codes,
 //! shown once.
 
-use super::{model, Modal, Page};
+use super::{model, Modal, NewChannelKind, Page};
 use crate::gui::components::{button, button_disabled, field, glyph, modal, segment, segmented, ButtonKind};
 use crate::gui::input::TextInput;
 use crate::gui::state::Shell;
@@ -125,18 +125,93 @@ impl Shell {
                     .children(self.modal_error())
                     .child(self.buttons("Delete category", ButtonKind::Danger, cx, move |this, cx| this.tiny_delete_category(id.clone(), cx)))
             }
-            Modal::NewRoom(category) => {
+            Modal::NewChannel { category, kind, e2ee } => {
                 let place = category.as_ref().and_then(|id| page.community.categories.iter().find(|category| category.id == *id)).map(|category| category.name.clone());
-                let category = category.clone();
-                modal("Create voice channel")
-                    .child(words(match place {
-                        Some(place) => format!("In {place}. People join and leave it as they like."),
-                        None => "People join and leave it as they like.".to_owned(),
-                    }))
+                let category_btn = category.clone();
+                let kind_now = *kind;
+                let e2ee_now = *e2ee;
+                let picker = segmented()
+                    .child(segment("tiny-new-kind-text", "Text", kind_now == NewChannelKind::Text).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(Modal::NewChannel { kind, .. }) = this.tiny_state.modal.as_mut() {
+                            *kind = NewChannelKind::Text;
+                            this.tiny_state.modal_error = None;
+                            cx.notify();
+                        }
+                    })))
+                    .child(segment("tiny-new-kind-voice", "Voice", kind_now == NewChannelKind::Voice).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(Modal::NewChannel { kind, .. }) = this.tiny_state.modal.as_mut() {
+                            *kind = NewChannelKind::Voice;
+                            this.tiny_state.modal_error = None;
+                            cx.notify();
+                        }
+                    })));
+                let description = match (kind_now, place) {
+                    (NewChannelKind::Text, Some(place)) => format!("In {place}. Send messages, files and threads."),
+                    (NewChannelKind::Text, None) => "Send messages, files and threads.".to_owned(),
+                    (NewChannelKind::Voice, Some(place)) => format!("In {place}. People join and leave it as they like."),
+                    (NewChannelKind::Voice, None) => "People join and leave it as they like.".to_owned(),
+                };
+                let mut panel = modal("Create channel")
+                    .child(div().mt(px(12.)).child(picker))
+                    .child(words(description))
                     .child(label("Channel name"))
-                    .child(self.input_box(&self.tiny_state.name_input, window, cx))
+                    .child(self.input_box(&self.tiny_state.name_input, window, cx));
+                if kind_now == NewChannelKind::Text {
+                    panel = panel
+                        .child(label("Topic"))
+                        .child(self.input_box(&self.tiny_state.topic_input, window, cx));
+                    if page.community.has(protocol::TINY_FEATURE_E2EE_TEXT) {
+                        if let Some(status) = self.tiny_e2ee_status_for(page.account) {
+                            let ready = status.device == protocol::DeviceState::Ready;
+                            match status.mode.as_str() {
+                                "optional" => {
+                                    let on = e2ee_now && ready;
+                                    let row = div()
+                                        .mt(px(14.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(12.))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(2.))
+                                                .child(div().type_ui().text_color(theme::text()).child("End-to-end encrypted"))
+                                                .child(div().type_small().text_color(theme::text_soft()).child(if ready {
+                                                    "Can't be turned off later."
+                                                } else {
+                                                    "Set up encryption on this device first"
+                                                })),
+                                        )
+                                        .child(
+                                            crate::gui::settings::controls::switch("tiny-new-channel-e2ee", "End-to-end encrypted", on)
+                                                .when(!ready, |el| el.opacity(0.45))
+                                                .when(ready, |el| {
+                                                    el.on_click(cx.listener(|this, _, _, cx| {
+                                                        if let Some(Modal::NewChannel { e2ee, .. }) = this.tiny_state.modal.as_mut() {
+                                                            *e2ee = !*e2ee;
+                                                            cx.notify();
+                                                        }
+                                                    }))
+                                                }),
+                                        );
+                                    panel = panel.child(row);
+                                }
+                                "new_required" | "required" => {
+                                    panel = panel.child(words("End-to-end encrypted. This server requires it."));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                panel
                     .children(self.modal_error())
-                    .child(self.buttons("Create channel", ButtonKind::Primary, cx, move |this, cx| this.tiny_create_room(category.clone(), cx)))
+                    .child(self.buttons("Create channel", ButtonKind::Primary, cx, move |this, cx| match kind_now {
+                        NewChannelKind::Voice => this.tiny_create_room(category_btn.clone(), cx),
+                        NewChannelKind::Text => this.tiny_create_channel(category_btn.clone(), e2ee_now, cx),
+                    }))
             }
             Modal::RenameRoom(room_id) => {
                 let id = room_id.clone();

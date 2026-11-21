@@ -74,6 +74,13 @@ pub(super) enum Sub {
     Roles,
 }
 
+/// What kind of channel the Create channel modal is making.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NewChannelKind {
+    Text,
+    Voice,
+}
+
 /// The modal on show.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Modal {
@@ -84,8 +91,12 @@ pub(super) enum Modal {
     Ban(String),
     DeleteRoom(String),
     DeleteCategory(String),
-    /// A new channel, in this category.
-    NewRoom(Option<String>),
+    /// A new channel (text or voice), in this category.
+    NewChannel {
+        category: Option<String>,
+        kind: NewChannelKind,
+        e2ee: bool,
+    },
     RenameRoom(String),
     NewCategory,
     Profile(String),
@@ -249,9 +260,12 @@ pub struct State {
     stats_task: Option<Task<()>>,
 
     name_input: Entity<TextInput>,
+    topic_input: Entity<TextInput>,
     label_input: Entity<TextInput>,
     reason_input: Entity<TextInput>,
     search_input: Entity<TextInput>,
+    /// Last-read encryption status for an account, used by the Create channel modal.
+    e2ee_status: Option<(AccountKey, protocol::E2eeStatus)>,
 
     /// Server Settings, while open.
     settings: Option<settings::Overlay>,
@@ -266,18 +280,21 @@ pub struct State {
 impl State {
     pub(super) fn new(cx: &mut Context<Shell>) -> State {
         let name_input = cx.new(|cx| TextInput::new("Name", cx));
+        let topic_input = cx.new(|cx| TextInput::new("Topic (optional)", cx));
         let label_input = cx.new(|cx| TextInput::new("Who it's for (optional)", cx));
         let reason_input = cx.new(|cx| TextInput::new("Reason (optional, goes in the audit log)", cx));
         let search_input = cx.new(|cx| TextInput::new("Search members", cx));
-        cx.subscribe(&name_input, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Submit => this.submit_name(cx),
-            InputEvent::Changed => {
-                this.tiny_state.modal_error = None;
-                cx.notify();
-            }
-        })
-        .detach();
-        for input in [&name_input, &label_input, &reason_input] {
+        for input in [&name_input, &topic_input] {
+            cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Submit => this.submit_name(cx),
+                InputEvent::Changed => {
+                    this.tiny_state.modal_error = None;
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+        for input in [&name_input, &topic_input, &label_input, &reason_input] {
             cx.subscribe(input, |this, _, event: &InputKey, cx| {
                 if *event == InputKey::Escape {
                     this.close_modal(cx);
@@ -339,9 +356,11 @@ impl State {
             stats_note: None,
             stats_task: None,
             name_input,
+            topic_input,
             label_input,
             reason_input,
             search_input,
+            e2ee_status: None,
             settings: None,
             settings_fields,
             setup: setup::State::default(),
@@ -765,6 +784,14 @@ impl Shell {
                 }
                 self.tiny_settings_saved(cx);
                 self.fetch(account, Some(epoch), cx);
+                None
+            }
+            Ok(Response::TinyChannelCreated { id, name }) => {
+                self.tiny_state.modal = None;
+                self.tiny_settings_saved(cx);
+                let key = Key { network: Network::Tiny, account: account.account.clone(), id };
+                self.fetch(account, Some(epoch), cx);
+                self.select(key, &name, cx);
                 None
             }
             Ok(Response::TinyCode { code }) => {
@@ -1327,7 +1354,8 @@ impl Shell {
     /// The name field's Return: whichever modal holds it.
     fn submit_name(&mut self, cx: &mut Context<Self>) {
         match self.tiny_state.modal.clone() {
-            Some(Modal::NewRoom(category)) => self.tiny_create_room(category, cx),
+            Some(Modal::NewChannel { category, kind: NewChannelKind::Voice, .. }) => self.tiny_create_room(category, cx),
+            Some(Modal::NewChannel { category, kind: NewChannelKind::Text, e2ee }) => self.tiny_create_channel(category, e2ee, cx),
             Some(Modal::RenameRoom(room_id)) => self.tiny_rename_room(room_id, cx),
             Some(Modal::NewCategory) => self.tiny_create_category(cx),
             _ => {}
@@ -1357,6 +1385,79 @@ impl Shell {
         self.act(request, cx);
     }
 
+    pub(super) fn tiny_e2ee_status_for(&self, account: &AccountKey) -> Option<&protocol::E2eeStatus> {
+        self.tiny_state
+            .settings
+            .as_ref()
+            .and_then(|overlay| overlay.encryption.status.as_ref())
+            .or_else(|| self.tiny_state.e2ee_status.as_ref().filter(|(acc, _)| acc == account).map(|(_, status)| status))
+    }
+
+    fn tiny_load_e2ee_status(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        let asked_account = account.clone();
+        self.off_thread(
+            cx,
+            move || ask(&Request::TinyE2ee { account, ask: protocol::E2eeAsk::Status }),
+            move |this, answer, cx| {
+                if let Ok(Response::TinyE2ee { status }) = answer {
+                    let default_e2ee = matches!(status.mode.as_str(), "new_required" | "required")
+                        || (status.mode == "optional" && status.device == protocol::DeviceState::Ready);
+                    this.tiny_state.e2ee_status = Some((asked_account.clone(), status));
+                    if this.tiny_state.account.as_ref() == Some(&asked_account) {
+                        if let Some(Modal::NewChannel { e2ee, .. }) = this.tiny_state.modal.as_mut() {
+                            *e2ee = default_e2ee;
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        );
+    }
+
+    pub(super) fn tiny_create_channel(&mut self, category: Option<String>, e2ee: bool, cx: &mut Context<Self>) {
+        let (Some(account), Some(name)) = (self.with_account(), self.typed_name(cx)) else {
+            return;
+        };
+        let topic_raw = self.tiny_state.topic_input.read(cx).text().trim().to_owned();
+        if topic_raw.chars().count() > protocol::TINY_CHANNEL_TOPIC_MAX {
+            self.tiny_state.modal_error = Some("A topic is at most 1024 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        let has_e2ee_feature = self.tiny_state.community.as_ref().is_some_and(|c| c.has(protocol::TINY_FEATURE_E2EE_TEXT));
+        let status = self.tiny_e2ee_status_for(&account);
+        let mode = status.map(|s| s.mode.as_str()).unwrap_or("off");
+        let ready = status.is_some_and(|s| s.device == protocol::DeviceState::Ready);
+        let want_e2ee = if !has_e2ee_feature {
+            false
+        } else {
+            match mode {
+                "new_required" | "required" => {
+                    if !ready {
+                        self.tiny_state.modal_error = Some("This device isn't set up for encrypted messages yet. Open Encryption in the server's settings.".to_owned());
+                        cx.notify();
+                        return;
+                    }
+                    true
+                }
+                "optional" => e2ee && ready,
+                _ => false,
+            }
+        };
+        let topic = (!topic_raw.is_empty()).then_some(topic_raw);
+        let request = Request::TinyChannelCreate {
+            account,
+            channel: protocol::TinyChannelEdit {
+                name: Some(name),
+                topic,
+                category_id: category,
+                position: None,
+                e2ee: want_e2ee.then_some(true),
+            },
+        };
+        self.act(request, cx);
+    }
+
     pub(super) fn tiny_rename_room(&mut self, room_id: String, cx: &mut Context<Self>) {
         let (Some(account), Some(name)) = (self.with_account(), self.typed_name(cx)) else {
             return;
@@ -1377,8 +1478,22 @@ impl Shell {
         self.tiny_state.card = None;
         self.tiny_state.modal_error = None;
         self.tiny_state.copied = false;
-        let focus = match &modal {
-            Modal::NewRoom(_) | Modal::NewCategory => {
+        let mut modal = modal;
+        let focus = match &mut modal {
+            Modal::NewChannel { e2ee, .. } => {
+                self.tiny_state.name_input.update(cx, |input, cx| input.set_text("", cx));
+                self.tiny_state.topic_input.update(cx, |input, cx| input.set_text("", cx));
+                if let Some(account) = self.tiny_state.account.clone() {
+                    if let Some(status) = self.tiny_e2ee_status_for(&account) {
+                        *e2ee = matches!(status.mode.as_str(), "new_required" | "required")
+                            || (status.mode == "optional" && status.device == protocol::DeviceState::Ready);
+                    } else {
+                        self.tiny_load_e2ee_status(account, cx);
+                    }
+                }
+                Some(self.tiny_state.name_input.clone())
+            }
+            Modal::NewCategory => {
                 self.tiny_state.name_input.update(cx, |input, cx| input.set_text("", cx));
                 Some(self.tiny_state.name_input.clone())
             }

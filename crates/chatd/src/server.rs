@@ -3117,6 +3117,7 @@ impl Chat {
             Request::TinyCategoryDelete { account, category_id } => adapters::tiny::manage::category_delete(account, category_id),
             Request::TinyLayout { account, groups } => adapters::tiny::manage::layout(account, groups),
             Request::TinyRoomCreateWith { account, room } => adapters::tiny::manage::room_create(account, room),
+            Request::TinyChannelCreate { account, channel } => adapters::tiny::manage::channel_create(account, channel),
             Request::TinyRoomUpdate { account, room_id, room } => adapters::tiny::manage::room_update(account, room_id, room),
             Request::TinyOverrideSet { account, room_id, role_id, allow, deny } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
             Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),

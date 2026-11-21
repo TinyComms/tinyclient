@@ -1034,6 +1034,107 @@ pub(crate) fn room_create(account: AccountKey, room: TinyRoomEdit) -> Response {
     sent(&saved, "POST", "/v1/rooms", Some(body), Missing::Room)
 }
 
+const CHANNEL_TOPIC_SIZE: &str = "A topic is at most 1024 characters.";
+const CHANNELS_UNSUPPORTED: &str = "This server is older than text channels.";
+const E2EE_NOT_SET_UP: &str = "This device isn't set up for encrypted messages yet. Open Encryption in the server's settings.";
+
+fn channel_body(channel: &protocol::TinyChannelEdit, creating: bool) -> Result<(Map<String, Value>, Option<String>), Response> {
+    let mut body = Map::new();
+    let mut kept_name = None;
+    match &channel.name {
+        Some(name) => match tiny_name(name) {
+            Some(name) => {
+                kept_name = Some(name.to_owned());
+                body.insert("name".into(), json!(name));
+            }
+            None => return Err(refused(super::ROOM_NAME_SIZE)),
+        },
+        None if creating => return Err(refused(super::ROOM_NAME_SIZE)),
+        None => {}
+    }
+    if let Some(category) = &channel.category_id {
+        if !category.is_empty() && !safe_id(category) {
+            return Err(refused(CHECK));
+        }
+        body.insert("category_id".into(), id_or_null(category));
+    }
+    if let Some(position) = channel.position {
+        body.insert("position".into(), json!(position));
+    }
+    if let Some(topic) = &channel.topic {
+        let Some(topic) = text_within(topic, protocol::TINY_CHANNEL_TOPIC_MAX) else {
+            return Err(refused(CHANNEL_TOPIC_SIZE));
+        };
+        body.insert("topic".into(), json!(topic));
+    }
+    Ok((body, kept_name))
+}
+
+pub(crate) fn channel_create(account: AccountKey, channel: protocol::TinyChannelEdit) -> Response {
+    let saved = match allowed(&account, None, "community.channels.create") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let (mut body, kept_name) = match channel_body(&channel, true) {
+        Ok(parsed) => parsed,
+        Err(answer) => return answer,
+    };
+    // If this device is not ready for encryption and the server requires it (or caller asked for
+    // it), refuse with the same words a new direct message uses.
+    if let Some(device) = super::e2ee::started(&saved) {
+        let (ready, mode) = {
+            let device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (device.ready(), device.mode().to_owned())
+        };
+        if !ready && (channel.e2ee == Some(true) || mode == "new_required" || mode == "required") {
+            return refused(E2EE_NOT_SET_UP);
+        }
+    }
+    // Send `e2ee` only when true so a server from before encrypted text gets the body it has
+    // always taken.
+    if channel.e2ee == Some(true) {
+        body.insert("e2ee".into(), json!(true));
+    }
+    // When no position is given, send one past the highest position among text channels in that
+    // category (older servers default to 0, which ties and sorts by name).
+    if channel.position.is_none() {
+        let target_cat = channel.category_id.as_deref().filter(|id| !id.is_empty());
+        let existing = channels_of(&saved);
+        let next_pos = existing
+            .iter()
+            .filter(|ch| ch.category_id.as_deref() == target_cat)
+            .map(|ch| ch.position)
+            .max()
+            .map(|max| max.saturating_add(1))
+            .unwrap_or(0);
+        body.insert("position".into(), json!(next_pos));
+    }
+    match asked("POST", &saved, "/v1/channels", Some(Value::Object(body))) {
+        Err(detail) => refused(detail),
+        Ok((200 | 201, answer)) => {
+            let id = answer
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| answer.pointer("/channel/id").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned();
+            let name = answer
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| answer.pointer("/channel/name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .or(kept_name)
+                .unwrap_or_default();
+            if !safe_id(&id) {
+                return refused(super::UNREADABLE);
+            }
+            Response::TinyChannelCreated { id, name }
+        }
+        Ok((404, _)) => refused(CHANNELS_UNSUPPORTED),
+        Ok((status, answer)) => refused(explain(status, &answer, Missing::Channel)),
+    }
+}
+
 pub(crate) fn room_update(account: AccountKey, room_id: String, room: TinyRoomEdit) -> Response {
     if !safe_id(&room_id) {
         return refused(CHECK);

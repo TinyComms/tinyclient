@@ -1172,6 +1172,33 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
             });
             changed(community)
         }
+        Request::TinyChannelCreate { account, channel } if ours(account) => {
+            let id = format!("chan-{}", community.channels.len() + 1);
+            let name = channel.name.as_deref().unwrap_or("new-channel").to_owned();
+            let target_cat = channel.category_id.as_deref().filter(|c| !c.is_empty()).map(str::to_owned);
+            let position = channel.position.unwrap_or_else(|| {
+                community
+                    .channels
+                    .iter()
+                    .filter(|ch| ch.category_id == target_cat)
+                    .map(|ch| ch.position)
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0)
+            });
+            community.channels.push(TinyChannel {
+                id: id.clone(),
+                name: name.clone(),
+                topic: channel.topic.clone().unwrap_or_default(),
+                category_id: target_cat,
+                position,
+                e2ee: channel.e2ee.unwrap_or(false),
+                overrides: Vec::new(),
+                my_permissions: Some(TINY_ALL),
+            });
+            let _ = changed(community);
+            Some(Response::TinyChannelCreated { id, name })
+        }
         Request::TinyRoomDelete { account, room_id } if ours(account) => {
             community.rooms.retain(|room| room.id != *room_id);
             changed(community)

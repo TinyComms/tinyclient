@@ -766,3 +766,83 @@ fn community_loads_rooms_when_channels_route_answers_404() {
         other => panic!("expected community, got {other:?}"),
     });
 }
+
+#[test]
+fn channel_create_sends_position_e2ee_only_when_true_and_explains_refusals() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        if first.starts_with("GET /v1/channels ") {
+            return http(200, "OK", r#"{"channels":[{"id":"c1","name":"a","category_id":"cat-1","position":4},{"id":"c2","name":"b","category_id":"cat-1","position":7}]}"#);
+        }
+        if first.starts_with("POST /v1/channels ") {
+            if body.contains("\"err-req\"") {
+                return http(400, "Bad Request", r#"{"error":"e2ee_required"}"#);
+            }
+            if body.contains("\"err-off\"") {
+                return http(400, "Bad Request", r#"{"error":"e2ee_off"}"#);
+            }
+            if body.contains("\"err-large\"") {
+                return http(400, "Bad Request", r#"{"error":"e2ee_group_too_large"}"#);
+            }
+            if body.contains("\"err-old\"") {
+                return http(404, "Not Found", r#"{"error":"not_found"}"#);
+            }
+            return http(201, "Created", r#"{"id":"ch-new","name":"design"}"#);
+        }
+        http(200, "OK", "{}")
+    });
+    with_session(&base, "owner", |account| {
+        // Plaintext channel omits `e2ee` and computes next position in category (7 + 1 = 8).
+        let res = channel_create(
+            account.clone(),
+            protocol::TinyChannelEdit {
+                name: Some("design".into()),
+                topic: Some("UI".into()),
+                category_id: Some("cat-1".into()),
+                position: None,
+                e2ee: Some(false),
+            },
+        );
+        assert_eq!(res, Response::TinyChannelCreated { id: "ch-new".into(), name: "design".into() });
+        let body = json_body(&last(&log, "POST /v1/channels "));
+        assert_eq!(body["name"], "design");
+        assert_eq!(body["topic"], "UI");
+        assert_eq!(body["category_id"], "cat-1");
+        assert_eq!(body["position"], 8);
+        assert!(body.get("e2ee").is_none(), "e2ee should only be sent when true");
+
+        // Encrypted channel sends `e2ee: true`.
+        let res = channel_create(
+            account.clone(),
+            protocol::TinyChannelEdit {
+                name: Some("secret".into()),
+                e2ee: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(res, Response::TinyChannelCreated { .. }));
+        let body = json_body(&last(&log, "POST /v1/channels "));
+        assert_eq!(body["e2ee"], true);
+
+        // Refusal messages.
+        let req = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-req".into()), ..Default::default() });
+        assert!(matches!(req, Response::Error { detail, .. } if detail.contains("requires")));
+        let off = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-off".into()), ..Default::default() });
+        assert!(matches!(off, Response::Error { detail, .. } if detail.contains("turned off")));
+        let large = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-large".into()), ..Default::default() });
+        assert!(matches!(large, Response::Error { detail, .. } if detail.contains("Too many devices")));
+        let old = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-old".into()), ..Default::default() });
+        assert_eq!(old, said("This server is older than text channels."));
+
+        // Topic over 1024 chars is refused locally.
+        let long_topic = channel_create(
+            account,
+            protocol::TinyChannelEdit { name: Some("ok".into()), topic: Some("x".repeat(1025)), ..Default::default() },
+        );
+        assert!(matches!(long_topic, Response::Error { detail, .. } if detail.contains("1024")));
+    });
+}

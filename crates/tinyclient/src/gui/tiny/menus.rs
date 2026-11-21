@@ -65,7 +65,7 @@ impl Shell {
             items = items.child(menu_separator());
         }
         if may.make_room {
-            items = items.child(self.plain(menu_item("tiny-menu-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::NewRoom(None), window, cx))));
+            items = items.child(self.plain(menu_item("tiny-menu-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::NewChannel { category: None, kind: super::NewChannelKind::Text, e2ee: false }, window, cx))));
         }
         if may.categories {
             items = items.child(self.plain(menu_item("tiny-menu-category", Some("icons/folder-plus.svg"), "Create category", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::NewCategory, window, cx))));
@@ -338,7 +338,7 @@ impl Shell {
         );
         if may.make_room {
             let id = category.map(|category| category.id.clone());
-            items = items.child(self.plain(menu_item("tiny-category-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewRoom(id.clone()), window, cx))));
+            items = items.child(self.plain(menu_item("tiny-category-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewChannel { category: id.clone(), kind: super::NewChannelKind::Text, e2ee: false }, window, cx))));
         }
         if let (Some(category), true) = (category, may.categories) {
             items = items.child(self.plain(menu_item("tiny-category-edit", Some("icons/pencil.svg"), "Edit categories", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_settings(super::settings::Page::Channels, None, window, cx))));

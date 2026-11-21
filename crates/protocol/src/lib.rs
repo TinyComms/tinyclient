@@ -2078,6 +2078,11 @@ pub enum Request {
         account: AccountKey,
         room: TinyRoomEdit,
     },
+    /// Makes a text channel on a Tiny server. Answers `TinyChannelCreated`.
+    TinyChannelCreate {
+        account: AccountKey,
+        channel: TinyChannelEdit,
+    },
     /// Changes a room's name, category, place, topic, limit, bitrate, push-to-talk or video.
     TinyRoomUpdate {
         account: AccountKey,
@@ -2589,6 +2594,12 @@ pub enum Response {
     /// An invite that was just created. `code.token` is not kept.
     TinyCode {
         code: TinyCode,
+    },
+    /// A text channel that was just created, so the UI can open it.
+    TinyChannelCreated {
+        id: String,
+        #[serde(default)]
+        name: String,
     },
     /// One page of a Tiny server's audit, newest first. Fewer rows than the limit: the end.
     TinyAudit {
