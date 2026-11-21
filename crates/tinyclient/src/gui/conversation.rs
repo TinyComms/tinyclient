@@ -379,6 +379,8 @@ pub struct Pane {
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
+    /// Pending confirmation dialog for a paid Telegram Star reaction (#517).
+    paid_react: Option<actions::PaidReactConfirm>,
     /// The message being forwarded (or copied to another conversation).
     forward: Option<actions::Forwarding>,
     /// Multi-message selection mode state (#795).
@@ -493,6 +495,7 @@ impl Pane {
             menu: None,
             picker: None,
             confirm: None,
+            paid_react: None,
             forward: None,
             multi_select: actions::MultiSelect::default(),
             link_ask: None,
@@ -711,6 +714,7 @@ impl Pane {
         self.menu = None;
         self.picker = None;
         self.confirm = None;
+        self.paid_react = None;
         self.action_confirm = None;
         self.open_select = None;
         self.pending_actions.clear();

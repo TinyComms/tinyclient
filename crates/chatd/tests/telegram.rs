@@ -3817,3 +3817,124 @@ fn save_and_unsave_gif() {
     };
     assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
 }
+
+#[test]
+fn paid_star_reactions_big_reaction_and_default_quick_reaction() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("workshop tools topic", || world.message("c9002_31", "41"));
+
+    // Read reaction rules for Workshop: paid reactions enabled, big enabled, and default quick reaction from help.getConfig.
+    let rules = match world.ask(Request::Reactions { conversation: key("c9002_31") }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("expected Reactions, got {other:?}"),
+    };
+    assert!(rules.paid, "Workshop channel should advertise paid Star reactions");
+    assert!(rules.big, "Telegram should advertise big reactions");
+    assert_eq!(rules.quick.as_deref(), Some("❤"), "default quick reaction read from help.getConfig");
+
+    // A paid ⭐ reaction arrives on message 41 with a top-senders leaderboard.
+    world.steer("paid-reaction");
+    let with_paid = world.until("paid star reaction", || {
+        let msg = world.message("c9002_31", "41")?;
+        msg.reactions.iter().any(|r| r.emoji == "⭐" && r.count == 5).then_some(msg)
+    });
+    let paid_chip = with_paid.reactions.iter().find(|r| r.emoji == "⭐").unwrap();
+    assert_eq!(paid_chip.who, vec!["u7002".to_owned()], "top_reactors populates the leaderboard");
+
+    // Guard: clicking ⭐ as an ordinary Request::React MUST be refused and NEVER send ReactionEmoji("⭐").
+    let stray = world.ask(Request::React {
+        conversation: key("c9002_31"),
+        message_id: "41".into(),
+        emoji: "⭐".into(),
+        on: true,
+        burst: false,
+    });
+    assert!(matches!(stray, Response::Error { code: ErrorCode::Refused, .. }), "expected refusal for stray ⭐ click, got {stray:?}");
+    assert!(
+        !world.calls().iter().any(|c| c.starts_with("SendReaction") && c.contains("⭐")),
+        "must never send plain reactionEmoji ⭐ on wire: {:#?}",
+        world.calls()
+    );
+
+    // Check Stars balance via payments.getStarsStatus.
+    let Response::StarsBalance { balance, .. } = world.ask(Request::StarsBalance { account: account() }) else {
+        panic!("expected StarsBalance");
+    };
+    assert_eq!(balance, 250);
+
+    // Confirmed paid flow sends messages.sendPaidReaction with the right count and privacy.
+    assert_eq!(
+        world.ask(Request::SendPaidReaction {
+            conversation: key("c9002_31"),
+            message_id: "41".into(),
+            count: 10,
+            anonymous: true,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SendPaidReaction c9002 41 count=10 private=anonymous"),
+        "expected SendPaidReaction on wire, got: {:#?}",
+        world.calls()
+    );
+    let updated = world.until("paid count incremented", || {
+        let msg = world.message("c9002_31", "41")?;
+        msg.reactions.iter().find(|r| r.emoji == "⭐" && r.count == 15 && r.mine).cloned()
+    });
+    assert_eq!(updated.count, 15);
+
+    // Balance reflects spent Stars.
+    let Response::StarsBalance { balance: after_bal, .. } = world.ask(Request::StarsBalance { account: account() }) else {
+        panic!("expected StarsBalance after spend");
+    };
+    assert_eq!(after_bal, 240);
+
+    // Toggle paid reaction privacy via messages.togglePaidReactionPrivacy.
+    assert_eq!(
+        world.ask(Request::TogglePaidReactionPrivacy {
+            conversation: key("c9002_31"),
+            message_id: "41".into(),
+            anonymous: false,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "TogglePaidReactionPrivacy c9002 41 private=default"),
+        "expected TogglePaidReactionPrivacy on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Sending a big reaction (`burst: true`) sets `big: true` on messages.sendReaction.
+    assert_eq!(
+        world.ask(Request::React {
+            conversation: key("u7002"),
+            message_id: "12".into(),
+            emoji: "🔥".into(),
+            on: true,
+            burst: true,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SendReaction u7002 12 🔥 big"),
+        "expected big=true SendReaction on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Changing the default quick reaction calls messages.setDefaultReaction and updates rules.quick.
+    assert_eq!(
+        world.ask(Request::SetDefaultReaction { account: account(), emoji: "👍".into() }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SetDefaultReaction 👍"),
+        "expected SetDefaultReaction on wire, got: {:#?}",
+        world.calls()
+    );
+    let refreshed = match world.ask(Request::Reactions { conversation: key("u7002") }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("expected refreshed Reactions, got {other:?}"),
+    };
+    assert_eq!(refreshed.quick.as_deref(), Some("👍"));
+}

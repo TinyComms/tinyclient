@@ -1854,6 +1854,31 @@ pub enum Request {
     Reactions {
         conversation: Key,
     },
+    /// Current Telegram Stars balance for an account (`payments.getStarsStatus`).
+    StarsBalance {
+        account: AccountKey,
+    },
+    /// Send a confirmed paid Star reaction on a Telegram message (`messages.sendPaidReaction`).
+    /// Never sent from a stray click on the ⭐ chip; only after explicit user confirmation.
+    SendPaidReaction {
+        conversation: Key,
+        message_id: String,
+        count: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        anonymous: bool,
+    },
+    /// Toggle whether our paid Star reaction on a Telegram message is anonymous or public
+    /// (`messages.togglePaidReactionPrivacy`).
+    TogglePaidReactionPrivacy {
+        conversation: Key,
+        message_id: String,
+        anonymous: bool,
+    },
+    /// Change the account's default quick reaction (`messages.setDefaultReaction`).
+    SetDefaultReaction {
+        account: AccountKey,
+        emoji: String,
+    },
     /// Who reacted to a message with `emoji`, paged. Fetched only on demand (clicking or
     /// opening the reactors list), never prefetched.
     Reactors {
@@ -2937,6 +2962,12 @@ pub enum Response {
     Reactions {
         conversation: Key,
         rules: ReactionRules,
+    },
+    /// Current Telegram Stars balance (`Request::StarsBalance`).
+    StarsBalance {
+        balance: i64,
+        #[serde(default)]
+        nanos: i32,
     },
     /// Answers `Reactors`: one page of people who reacted with `emoji`.
     Reactors {

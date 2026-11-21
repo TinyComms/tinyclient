@@ -268,8 +268,10 @@ struct Live {
     unread_check: Option<Instant>,
     /// Unread snapshots from recovered dialogs already include messages up to these IDs.
     recovered_through: VecDeque<(Who, i32)>,
-    /// Telegram's reaction emoji, and whether each needs Premium, once asked (`react`).
-    reactions: Option<Vec<(String, bool)>>,
+    /// Telegram's reaction emoji, whether each needs Premium, and whether it carries an `around_animation`, once asked (`react`).
+    reactions: Option<Vec<(String, bool, bool)>>,
+    /// The account's default quick reaction from `help.getConfig` (`reactions_default`), once asked.
+    default_reaction: Option<Option<String>>,
     /// File, caption and reaction limits from `help.getAppConfig`, or the documented defaults.
     limits: premium::Limits,
     /// One conversation's member list, so the next page does not ask Telegram again.
@@ -704,7 +706,13 @@ fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Telegram is offline.".to_owned());
     match command {
         Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
-        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::React { reply, .. }
+        | Command::StarsBalance { reply }
+        | Command::SendPaidReaction { reply, .. }
+        | Command::TogglePaidReactionPrivacy { reply, .. }
+        | Command::SetDefaultReaction { reply, .. }
+        | Command::Edit { reply, .. }
+        | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
@@ -764,11 +772,23 @@ fn serve(account: &Arc<Account>, command: Command) {
             send::send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
         }
         Command::CancelSend { conversation_id, client_id } => send::cancel(account, &conversation_id, &client_id),
-        Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
-            let _ = reply.send(react::react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
+        Command::React { conversation_id, message_id, emoji, on, burst, reply } => {
+            let _ = reply.send(react::react(account, &conversation_id, &message_id, &emoji, on, burst).map_err(refused));
         }
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
+        }
+        Command::StarsBalance { reply } => {
+            let _ = reply.send(react::stars_balance(account).map_err(refused));
+        }
+        Command::SendPaidReaction { conversation_id, message_id, count, anonymous, reply } => {
+            let _ = reply.send(react::send_paid(account, &conversation_id, &message_id, count, anonymous).map_err(refused));
+        }
+        Command::TogglePaidReactionPrivacy { conversation_id, message_id, anonymous, reply } => {
+            let _ = reply.send(react::toggle_paid_privacy(account, &conversation_id, &message_id, anonymous).map_err(refused));
+        }
+        Command::SetDefaultReaction { emoji, reply } => {
+            let _ = reply.send(react::set_default(account, &emoji).map_err(refused));
         }
         Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));

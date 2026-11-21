@@ -1522,6 +1522,10 @@ impl Chat {
         if burst && !self.hub.capabilities(&account).burst_reactions {
             return error(ErrorCode::Unsupported, "Super reactions are not available on this account.");
         }
+        // Paid Telegram Star reactions cost real Stars and must never fire from a normal React call.
+        if conversation.network == Network::Telegram && protocol::bare_emoji(&emoji) == "⭐" {
+            return error(ErrorCode::Refused, "Paid Star reactions must be confirmed before spending Stars.");
+        }
         let ours = |emoji: &str| Reaction {
             emoji: emoji.to_owned(),
             file: None,
@@ -3355,6 +3359,61 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
+            Request::StarsBalance { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::StarsBalance { reply }) {
+                    Ok((balance, nanos)) => Response::StarsBalance { balance, nanos },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SendPaidReaction { conversation, message_id, count, anonymous } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                if count == 0 || count > 2_500 {
+                    return error(ErrorCode::Refused, "Choose between 1 and 2,500 Stars for a paid reaction.");
+                }
+                match self.ask(&account, |reply| Command::SendPaidReaction {
+                    conversation_id: conversation.id,
+                    message_id,
+                    count,
+                    anonymous,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::TogglePaidReactionPrivacy { conversation, message_id, anonymous } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::TogglePaidReactionPrivacy {
+                    conversation_id: conversation.id,
+                    message_id,
+                    anonymous,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDefaultReaction { account, emoji } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetDefaultReaction { emoji, reply }) {
+                    Ok(()) => {
+                        self.hub.reactions.forget_where(|key| key.account() == account);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
             }

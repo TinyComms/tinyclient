@@ -688,6 +688,10 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 }
             }
         }
+        // Server config changed (including default quick reaction): re-read next time rules are asked.
+        Update::Config => {
+            account.live().default_reaction = None;
+        }
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}

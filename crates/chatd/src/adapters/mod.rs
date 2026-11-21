@@ -328,6 +328,28 @@ pub enum Command {
     /// opened it; chatd keeps the answer five minutes. `Unsupported` leaves every reaction to the
     /// network to judge.
     ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
+    /// Current Telegram Stars balance (`payments.getStarsStatus`).
+    StarsBalance { reply: Reply<(i64, i32)> },
+    /// Send a confirmed paid Star reaction (`messages.sendPaidReaction`).
+    SendPaidReaction {
+        conversation_id: String,
+        message_id: String,
+        count: u32,
+        anonymous: bool,
+        reply: Reply<()>,
+    },
+    /// Toggle privacy of our paid Star reaction (`messages.togglePaidReactionPrivacy`).
+    TogglePaidReactionPrivacy {
+        conversation_id: String,
+        message_id: String,
+        anonymous: bool,
+        reply: Reply<()>,
+    },
+    /// Change the account's default quick reaction (`messages.setDefaultReaction`).
+    SetDefaultReaction {
+        emoji: String,
+        reply: Reply<()>,
+    },
     /// Who reacted to a message with `emoji`, paged.
     Reactors {
         conversation_id: String,
@@ -885,6 +907,10 @@ impl Command {
             | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StarsBalance { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendPaidReaction { reply, .. }
+            | Command::TogglePaidReactionPrivacy { reply, .. }
+            | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());

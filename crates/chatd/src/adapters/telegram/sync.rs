@@ -367,6 +367,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         forward: true,
         polls: None,
         reactions: true,
+        burst_reactions: true,
         gif_file: false,
         mention_format: protocol::MentionFormat::Plain,
         mention_spans: true,

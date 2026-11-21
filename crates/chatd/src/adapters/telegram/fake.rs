@@ -562,6 +562,12 @@ struct World {
     noforwards: HashSet<Who>,
     /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
     saved_gifs: Vec<i64>,
+    /// Current Telegram Stars balance (`payments.getStarsStatus` / `messages.sendPaidReaction`).
+    stars_balance: i64,
+    /// Account default quick reaction (`help.getConfig` / `messages.setDefaultReaction`).
+    default_reaction: String,
+    /// Paid reaction count accumulated per `(peer, msg_id)` in this session.
+    paid_counts: HashMap<(Who, i32), i32>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -631,6 +637,9 @@ impl World {
             large_broke: false,
             noforwards: HashSet::new(),
             saved_gifs: vec![6_200],
+            stars_balance: 250,
+            default_reaction: "❤".to_owned(),
+            paid_counts: HashMap::new(),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1239,6 +1248,39 @@ impl World {
                     self.noforwards.insert(who);
                 }
                 Vec::new()
+            }
+            "paid-reaction" => {
+                // Adds a paid ⭐ reaction with a top-senders leaderboard on Workshop message 41.
+                let peer = Who::Channel(WORKSHOP);
+                self.paid_counts.insert((peer, 41), 5);
+                let reactions = tl::types::MessageReactions {
+                    min: false,
+                    can_see_list: true,
+                    reactions_as_tags: false,
+                    results: vec![tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                        chosen_order: None,
+                        reaction: tl::enums::Reaction::Paid,
+                        count: 5,
+                    })],
+                    recent_reactions: None,
+                    top_reactors: Some(vec![tl::enums::MessageReactor::Reactor(tl::types::MessageReactor {
+                        top: true,
+                        my: false,
+                        anonymous: false,
+                        peer_id: Some(Who::User(ODALYS).peer()),
+                        count: 5,
+                    })]),
+                };
+                vec![update(
+                    tl::types::UpdateMessageReactions {
+                        peer: peer.peer(),
+                        msg_id: 41,
+                        top_msg_id: Some(TOOLS),
+                        saved_peer_id: None,
+                        reactions: reactions.into(),
+                    }
+                    .into(),
+                )]
             }
             "file-go" => {
                 self.file_go = true;
@@ -2536,7 +2578,11 @@ impl World {
                 tl::enums::Reaction::Emoji(emoji) => Some(emoji.emoticon.clone()),
                 _ => None,
             }).collect();
-            self.log(&format!("SendReaction {} {} {}", peer.text(), request.msg_id, sent.join("")));
+            if request.big {
+                self.log(&format!("SendReaction {} {} {} big", peer.text(), request.msg_id, sent.join("")));
+            } else {
+                self.log(&format!("SendReaction {} {} {}", peer.text(), request.msg_id, sent.join("")));
+            }
             if sent.iter().any(|emoji| emoji == "🚫") {
                 return Err(rpc(400, "REACTION_INVALID", None));
             }
@@ -2546,6 +2592,92 @@ impl World {
             let reactions = tl::types::MessageReactions { min: false, can_see_list: true, reactions_as_tags: false, results: results.collect(), recent_reactions: None, top_reactors: None };
             let reacted = tl::types::UpdateMessageReactions { peer: peer.peer(), msg_id: request.msg_id, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() };
             return answer(updates(vec![reacted.into()]));
+        }
+        if let Some(request) = asked::<f::messages::SendPaidReaction>(body) {
+            let peer = input_who(&request.peer);
+            let privacy = match &request.private {
+                Some(tl::enums::PaidReactionPrivacy::Anonymous) => "anonymous",
+                _ => "default",
+            };
+            self.log(&format!("SendPaidReaction {} {} count={} private={privacy}", peer.text(), request.msg_id, request.count));
+            if i64::from(request.count) > self.stars_balance {
+                return Err(rpc(400, "BALANCE_TOO_LOW", None));
+            }
+            self.stars_balance -= i64::from(request.count);
+            let entry = self.paid_counts.entry((peer, request.msg_id)).or_insert(0);
+            *entry += request.count;
+            let total = *entry;
+            let anonymous = privacy == "anonymous";
+            let top_reactors = vec![
+                tl::enums::MessageReactor::Reactor(tl::types::MessageReactor {
+                    top: true,
+                    my: true,
+                    anonymous,
+                    peer_id: (!anonymous).then(|| Who::User(ME).peer()),
+                    count: request.count,
+                }),
+                tl::enums::MessageReactor::Reactor(tl::types::MessageReactor {
+                    top: true,
+                    my: false,
+                    anonymous: false,
+                    peer_id: Some(Who::User(ODALYS).peer()),
+                    count: 5,
+                }),
+            ];
+            let reactions = tl::types::MessageReactions {
+                min: false,
+                can_see_list: true,
+                reactions_as_tags: false,
+                results: vec![tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                    chosen_order: Some(0),
+                    reaction: tl::enums::Reaction::Paid,
+                    count: total,
+                })],
+                recent_reactions: None,
+                top_reactors: Some(top_reactors),
+            };
+            let top_msg_id = (peer == Who::Channel(WORKSHOP) && request.msg_id == 41).then_some(TOOLS);
+            let reacted = tl::types::UpdateMessageReactions {
+                peer: peer.peer(),
+                msg_id: request.msg_id,
+                top_msg_id,
+                saved_peer_id: None,
+                reactions: reactions.into(),
+            };
+            return answer(updates(vec![reacted.into()]));
+        }
+        if let Some(request) = asked::<f::messages::TogglePaidReactionPrivacy>(body) {
+            let peer = input_who(&request.peer);
+            let privacy = match &request.private {
+                tl::enums::PaidReactionPrivacy::Anonymous => "anonymous",
+                _ => "default",
+            };
+            self.log(&format!("TogglePaidReactionPrivacy {} {} private={privacy}", peer.text(), request.msg_id));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::SetDefaultReaction>(body) {
+            let emoji = match &request.reaction {
+                tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
+                tl::enums::Reaction::CustomEmoji(c) => format!("e{}", c.document_id),
+                _ => String::new(),
+            };
+            self.default_reaction = emoji.clone();
+            self.log(&format!("SetDefaultReaction {emoji}"));
+            return answer(true);
+        }
+        if asked::<f::payments::GetStarsStatus>(body).is_some() {
+            self.log("GetStarsStatus");
+            let status = tl::types::payments::StarsStatus {
+                balance: tl::enums::StarsAmount::Amount(tl::types::StarsAmount { amount: self.stars_balance, nanos: 0 }),
+                subscriptions: None,
+                subscriptions_next_offset: None,
+                subscriptions_missing_balance: None,
+                history: None,
+                next_offset: None,
+                chats: Vec::new(),
+                users: Vec::new(),
+            };
+            return answer(tl::enums::payments::StarsStatus::Status(status));
         }
         if let Some(request) = asked::<f::messages::MarkDialogUnread>(body) {
             let who = match &request.peer {
@@ -2718,6 +2850,61 @@ impl World {
             };
             self.log(&format!("GetCommonChats {id}"));
             return answer(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats: chats() }));
+        }
+        if asked::<f::help::GetConfig>(body).is_some() {
+            self.log("GetConfig");
+            let cfg = tl::types::Config {
+                default_p2p_contacts: false,
+                preload_featured_stickers: false,
+                revoke_pm_inbox: true,
+                blocked_mode: false,
+                force_try_ipv6: false,
+                date: t0(),
+                expires: t0() + 3_600,
+                test_mode: false,
+                this_dc: 2,
+                dc_options: Vec::new(),
+                dc_txt_domain_name: String::new(),
+                chat_size_max: 200,
+                megagroup_size_max: 200_000,
+                forwarded_count_max: 100,
+                online_update_period_ms: 210_000,
+                offline_blur_timeout_ms: 5_000,
+                offline_idle_timeout_ms: 30_000,
+                online_cloud_timeout_ms: 300_000,
+                notify_cloud_delay_ms: 30_000,
+                notify_default_delay_ms: 1_500,
+                push_chat_period_ms: 60_000,
+                push_chat_limit: 2,
+                edit_time_limit: 172_800,
+                revoke_time_limit: i32::MAX,
+                revoke_pm_time_limit: i32::MAX,
+                rating_e_decay: 2_419_200,
+                stickers_recent_limit: 30,
+                channels_read_media_period: 604_800,
+                tmp_sessions: None,
+                call_receive_timeout_ms: 20_000,
+                call_ring_timeout_ms: 90_000,
+                call_connect_timeout_ms: 30_000,
+                call_packet_timeout_ms: 10_000,
+                me_url_prefix: "https://t.me/".to_owned(),
+                autoupdate_url_prefix: None,
+                gif_search_username: Some("gif".to_owned()),
+                venue_search_username: None,
+                img_search_username: None,
+                static_maps_provider: None,
+                caption_length_max: 1_024,
+                message_length_max: 4_096,
+                webfile_dc_id: 4,
+                suggested_lang_code: None,
+                lang_pack_version: None,
+                base_lang_pack_version: None,
+                reactions_default: (!self.default_reaction.is_empty()).then(|| {
+                    tl::types::ReactionEmoji { emoticon: self.default_reaction.clone() }.into()
+                }),
+                autologin_token: None,
+            };
+            return answer(tl::enums::Config::Config(cfg));
         }
         if asked::<f::help::GetAppConfig>(body).is_some() {
             self.log("GetAppConfig");
@@ -2997,6 +3184,7 @@ impl World {
             } else {
                 full.available_reactions = Some(tl::types::ChatReactionsAll { allow_custom: false }.into());
                 full.reactions_limit = Some(2);
+                full.paid_reactions_available = true;
             }
             // Field Notes stays a large channel. Workshop's count is the four people its
             // member list holds, so no empty Members tail is drawn behind them.
