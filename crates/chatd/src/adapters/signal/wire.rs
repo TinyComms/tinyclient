@@ -69,6 +69,32 @@ pub struct Contact {
     pub phone: String,
 }
 
+/// Who is permitted to perform a group action in Signal Groups v2.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GroupAccess {
+    #[default]
+    Member,
+    Administrator,
+    Unsatisfiable,
+    Any,
+}
+
+/// One member, pending invitee, or join requester of a Signal group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupMember {
+    pub id: String,
+    pub name: String,
+    pub admin: bool,
+}
+
+/// Full membership lists for a Signal group, read from the decrypted group state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupMembers {
+    pub members: Vec<GroupMember>,
+    pub pending: Vec<GroupMember>,
+    pub requesting: Vec<GroupMember>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupInfo {
     /// Public id, hex.
@@ -80,6 +106,18 @@ pub struct GroupInfo {
     pub member: bool,
     /// Account ids of the members, including us. Empty when the wire has not said who.
     pub member_ids: Vec<String>,
+    /// Account ids of the group's administrators.
+    pub admins: Vec<String>,
+    /// Who may add members to the group.
+    pub member_access: GroupAccess,
+    /// Who may edit the group's title, avatar, description, and disappearing timer.
+    pub attributes_access: GroupAccess,
+    /// Who may join from the group's invite link (`Any` = open, `Administrator` = approval required, `Unsatisfiable` = off).
+    pub invite_link_access: GroupAccess,
+    /// Only administrators may send messages (announcement group).
+    pub announcements_only: bool,
+    /// The group's `https://signal.group/#...` invite link when enabled. Empty when disabled or unknown.
+    pub invite_link: String,
     /// Disappearing-message timer in seconds. 0 means off.
     pub timer_secs: u32,
 }
@@ -333,6 +371,22 @@ pub trait Wire: Send + Sync {
     /// The account id behind a username (`name.42`), or none when Signal has no such username.
     /// A phone number is not looked up here.
     fn lookup(&self, username: &str) -> Result<Option<String>, Fault>;
+    /// Lists a group's members (with admin flags), pending invites, and join requests.
+    fn group_members(&self, _group_id: &str) -> Result<GroupMembers, Fault> {
+        Err(Fault::Refused("Group members are not available.".to_owned()))
+    }
+    /// Adds or invites people (ACIs) to a group.
+    fn group_add_members(&self, _group_id: &str, _people: &[String]) -> Result<(), Fault> {
+        Err(Fault::Refused("Adding group members is not available.".to_owned()))
+    }
+    /// Removes a member (ACI) from a group.
+    fn group_remove_member(&self, _group_id: &str, _person: &str) -> Result<(), Fault> {
+        Err(Fault::Refused("Removing group members is not available.".to_owned()))
+    }
+    /// Promotes a member to admin or revokes their admin role.
+    fn group_set_admin(&self, _group_id: &str, _person: &str, _admin: bool) -> Result<(), Fault> {
+        Err(Fault::Refused("Changing group admin roles is not available.".to_owned()))
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }

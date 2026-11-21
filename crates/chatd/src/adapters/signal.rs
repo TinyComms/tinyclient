@@ -41,11 +41,11 @@ pub mod signin;
 mod vault;
 mod wire;
 
-use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
+use super::{keep_connected, serve_commands, About, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{Attachment, Contact, ContactKind, ConversationKind, Delivery, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
+use protocol::{Attachment, Contact, ContactKind, ConversationKind, ConversationRights, Delivery, Link, MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -87,6 +87,29 @@ const POLL_MOST: usize = 10;
 /// never starts with this mark.
 const POLL_VOTE: &str = "\u{1}signal-poll-vote\u{1}";
 const POLL_END: &str = "\u{1}signal-poll-end\u{1}";
+/// Promote or revoke a group admin, packed into a `MembersRemove` person string (`\u{1}admin\u{1}<aci>`
+/// or `\u{1}member\u{1}<aci>`). An ACI never starts with `\u{1}`.
+const GROUP_ADMIN_PROMOTE: &str = "\u{1}signal-admin-promote\u{1}";
+const GROUP_ADMIN_REVOKE: &str = "\u{1}signal-admin-revoke\u{1}";
+
+/// Packs a Signal group admin role change so the existing member-management channel carries it.
+pub fn group_admin_command(person: &str, admin: bool) -> String {
+    if admin {
+        format!("{GROUP_ADMIN_PROMOTE}{person}")
+    } else {
+        format!("{GROUP_ADMIN_REVOKE}{person}")
+    }
+}
+
+fn group_admin_action(person: &str) -> Option<(&str, bool)> {
+    if let Some(aci) = person.strip_prefix(GROUP_ADMIN_PROMOTE) {
+        Some((aci, true))
+    } else if let Some(aci) = person.strip_prefix(GROUP_ADMIN_REVOKE) {
+        Some((aci, false))
+    } else {
+        None
+    }
+}
 /// What a person with no name we know is called.
 const NO_NAME: &str = "Signal user";
 
@@ -521,6 +544,8 @@ struct Live {
     /// A group's members, including us, keyed by the conversation id. The read tick waits
     /// until every member but us has read.
     groups: HashMap<String, Vec<String>>,
+    /// Full group metadata, keyed by conversation id (`g.<hex>`), for info panes and access checks.
+    group_info: HashMap<String, wire::GroupInfo>,
     /// Each person's reaction on a message: (message id, person) → emoji.
     /// Bounded to `REACTIONS_KEPT` in memory and on disk at `reactions_path`.
     reactions: HashMap<(String, String), String>,
@@ -994,16 +1019,23 @@ fn apply(account: &Account, event: Event) {
             for group in groups {
                 let peer = Peer::Group(group.id.clone());
                 let conv = peer.conversation();
+                let rights = group_rights(&group, &account.me);
+                let is_admin = group.admins.iter().any(|id| id == &account.me);
                 {
                     let mut live = account.live();
                     live.groups.insert(conv.clone(), group.member_ids.clone());
+                    live.group_info.insert(conv.clone(), group.clone());
                     if group.timer_secs > 0 {
                         live.note_timer(&conv, group.timer_secs, 0);
                     }
                 }
                 let mut row = row(&peer, &group.title);
                 row.topic = group.description.chars().take(300).collect();
-                row.read_only = !group.member;
+                row.read_only = !group.member || (group.announcements_only && !is_admin);
+                if group.member && group.announcements_only && !is_admin {
+                    row.read_only_reason = "Only admins can send messages".to_owned();
+                }
+                row.rights = rights;
                 row.avatar = ctx.avatar_of(&row.id);
                 let _ = ctx.conversation(&row);
             }
@@ -1407,7 +1439,13 @@ fn offline(ctx: &Context, command: Command) {
             ctx.sent(&conversation_id, &client_id, Err("Signal is offline.".to_owned()));
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
-        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::React { reply, .. }
+        | Command::Edit { reply, .. }
+        | Command::Delete { reply, .. }
+        | Command::MembersAdd { reply, .. }
+        | Command::MembersRemove { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Members { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -1513,6 +1551,18 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
         }
         Command::SearchPeople(query) => search_people(account, &query),
+        Command::Members { conversation_id, offset, limit, reply } => {
+            let _ = reply.send(group_members(account, &conversation_id, offset, limit));
+        }
+        Command::ConversationInfo { conversation_id, reply } => {
+            let _ = reply.send(conversation_info(account, &conversation_id));
+        }
+        Command::MembersAdd { conversation_id, people, reply } => {
+            let _ = reply.send(members_add(account, &conversation_id, &people));
+        }
+        Command::MembersRemove { conversation_id, person, reply } => {
+            let _ = reply.send(members_remove(account, &conversation_id, &person));
+        }
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
@@ -1595,6 +1645,198 @@ fn set_own(account: &Account, name: Option<String>, about: Option<String>, emoji
     account.wire.set_card(name, about, emoji).map_err(refused)?;
     show_self(account);
     Ok(())
+}
+
+/// Computes `ConversationRights` for a Signal group from its access control and our role.
+fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
+    if !group.member {
+        return ConversationRights::default();
+    }
+    let is_admin = group.admins.iter().any(|id| id == me);
+    let can_add = is_admin || matches!(group.member_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
+    let can_edit = is_admin || matches!(group.attributes_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
+    ConversationRights {
+        pin: false,
+        delete_others: is_admin,
+        manage_members: is_admin,
+        add_members: can_add,
+        remove_members: is_admin,
+        rename: can_edit,
+        edit_topic: can_edit,
+        edit_picture: can_edit,
+    }
+}
+
+fn group_members(account: &Account, conversation_id: &str, offset: u32, limit: u32) -> Result<Members, Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    let listed = account.wire.group_members(&group_id).map_err(refused)?;
+    let live = account.live();
+    let resolve_name = |m: &wire::GroupMember| -> String {
+        if m.id == account.me {
+            if !account.name.is_empty() {
+                return account.name.clone();
+            }
+        }
+        if !m.name.is_empty() {
+            return m.name.clone();
+        }
+        live.name(&m.id)
+    };
+    let make_person = |m: &wire::GroupMember, status: &str| -> Person {
+        let mut person = Person::new(account.ctx.key(&m.id), resolve_name(m));
+        person.status = status.to_owned();
+        person
+    };
+
+    let mut admins: Vec<Person> = listed
+        .members
+        .iter()
+        .filter(|m| m.admin)
+        .map(|m| make_person(m, "Admin"))
+        .collect();
+    let mut regular: Vec<Person> = listed
+        .members
+        .iter()
+        .filter(|m| !m.admin)
+        .map(|m| make_person(m, ""))
+        .collect();
+    let mut pending: Vec<Person> = listed
+        .pending
+        .iter()
+        .map(|m| make_person(m, "Invited"))
+        .collect();
+    let mut requesting: Vec<Person> = listed
+        .requesting
+        .iter()
+        .map(|m| make_person(m, "Requested to join"))
+        .collect();
+    drop(live);
+
+    let mut sections = Vec::new();
+    if !admins.is_empty() {
+        sections.push(MemberSection { name: "Admins".into(), count: admins.len() as u32 });
+    }
+    if !regular.is_empty() {
+        sections.push(MemberSection { name: "Members".into(), count: regular.len() as u32 });
+    }
+    if !pending.is_empty() {
+        sections.push(MemberSection { name: "Pending invites".into(), count: pending.len() as u32 });
+    }
+    if !requesting.is_empty() {
+        sections.push(MemberSection { name: "Join requests".into(), count: requesting.len() as u32 });
+    }
+
+    let mut all = Vec::with_capacity(admins.len() + regular.len() + pending.len() + requesting.len());
+    all.append(&mut admins);
+    all.append(&mut regular);
+    all.append(&mut pending);
+    all.append(&mut requesting);
+
+    let start = (offset as usize).min(all.len());
+    let take = if limit == 0 { all.len() } else { limit as usize };
+    let members = all.into_iter().skip(start).take(take).collect();
+    Ok(Members { pending: false, sections, members })
+}
+
+fn conversation_info(account: &Account, conversation_id: &str) -> Result<ConversationAbout, Refusal> {
+    let Some(peer) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    let live = account.live();
+    match peer {
+        Peer::Group(_) => {
+            let Some(group) = live.group_info.get(conversation_id) else {
+                return Err(Refusal::Refused("This group isn't one Signal still knows for you.".into()));
+            };
+            let timer = live.timer_of(conversation_id).seconds;
+            let disappearing = if timer > 0 { Some(timer) } else if group.timer_secs > 0 { Some(group.timer_secs) } else { None };
+            Ok(ConversationAbout {
+                description: group.description.clone(),
+                members: Some(group.members),
+                link: group.invite_link.clone(),
+                disappearing,
+                ..ConversationAbout::default()
+            })
+        }
+        Peer::Direct(_) => {
+            let timer = live.timer_of(conversation_id).seconds;
+            Ok(ConversationAbout {
+                disappearing: (timer > 0).then_some(timer),
+                ..ConversationAbout::default()
+            })
+        }
+    }
+}
+
+fn members_add(account: &Account, conversation_id: &str, people: &[String]) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    if people.is_empty() {
+        return Err(Refusal::Refused("Choose at least one person to add.".into()));
+    }
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| group_rights(g, &account.me).add_members);
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can add members.".into()));
+    }
+    let mut acis = Vec::with_capacity(people.len());
+    for raw in people {
+        let trimmed = raw.trim();
+        if wire::is_aci(trimmed) {
+            acis.push(trimmed.to_owned());
+        } else if let Some(username) = username_of(trimmed) {
+            match account.wire.lookup(username).map_err(refused)? {
+                Some(aci) if wire::is_aci(&aci) => acis.push(aci),
+                _ => return Err(Refusal::Refused(format!("No Signal account found for {trimmed}."))),
+            }
+        } else {
+            return Err(Refusal::Refused(format!("{trimmed} is not a Signal account id or username.")));
+        }
+    }
+    account.wire.group_add_members(&group_id, &acis).map_err(refused)
+}
+
+fn members_remove(account: &Account, conversation_id: &str, person: &str) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    if let Some((target_aci, admin)) = group_admin_action(person) {
+        let target_aci = target_aci.trim();
+        if !wire::is_aci(target_aci) {
+            return Err(Refusal::Refused("That person's role can't be changed here.".into()));
+        }
+        let allowed = account
+            .live()
+            .group_info
+            .get(conversation_id)
+            .is_some_and(|g| group_rights(g, &account.me).manage_members);
+        if !allowed {
+            return Err(Refusal::Refused("Only group admins can change admin roles.".into()));
+        }
+        return account.wire.group_set_admin(&group_id, target_aci, admin).map_err(refused);
+    }
+    let person = person.trim();
+    if !wire::is_aci(person) {
+        return Err(Refusal::Refused("That person can't be removed from here.".into()));
+    }
+    if person == account.me {
+        return Err(Refusal::Refused("You can't remove yourself from the group here.".into()));
+    }
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| group_rights(g, &account.me).remove_members);
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can remove members.".into()));
+    }
+    account.wire.group_remove_member(&group_id, person).map_err(refused)
 }
 
 /// The pictures of the people and groups on screen (rows, people, the open conversation): each

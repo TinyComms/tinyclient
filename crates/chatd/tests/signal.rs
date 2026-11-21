@@ -1370,3 +1370,116 @@ fn sending_with_a_mention_span_sends_a_signal_mention_range() {
     );
     world.heard(&format!("send {CLUB} text hi \u{FFFC}! ranges=Mention({GRACE}):3+1"));
 }
+
+#[test]
+fn a_group_lists_its_members_and_admins_and_serves_conversation_info() {
+    let world = World::linked();
+    world.connected();
+
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(CLUB) }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.description, "Tuesdays, 7 pm");
+    assert_eq!(info.members, Some(3));
+
+    let Response::Members { sections, members, .. } = world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) else {
+        panic!("expected Members");
+    };
+    assert_eq!(sections.len(), 2);
+    assert_eq!((sections[0].name.as_str(), sections[0].count), ("Admins", 1));
+    assert_eq!((sections[1].name.as_str(), sections[1].count), ("Members", 2));
+    assert_eq!(members.len(), 3);
+    assert_eq!(members[0].key.id, ME);
+    assert_eq!(members[0].name, "Ada Quill");
+    assert_eq!(members[0].status, "Admin");
+    let non_admins: Vec<&str> = members[1..].iter().map(|p| p.key.id.as_str()).collect();
+    assert!(non_admins.contains(&GRACE) && non_admins.contains(&ALAN));
+
+    // Pending invites and join requests appear in their own sections.
+    let dave = "d4d4d4d4-0000-4000-8000-000000000004";
+    let eve = "e5e5e5e5-0000-4000-8000-000000000005";
+    world.steer(&format!("group-pending {dave} Dave"));
+    world.steer(&format!("group-requesting {eve} Eve"));
+    let (sections, members) = world.until("pending and requesting members", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { sections, members, .. } if sections.len() == 4 => Some((sections, members)),
+            _ => None,
+        }
+    });
+    assert_eq!((sections[2].name.as_str(), sections[2].count), ("Pending invites", 1));
+    assert_eq!((sections[3].name.as_str(), sections[3].count), ("Join requests", 1));
+    assert!(members.iter().any(|p| p.key.id == dave && p.status == "Invited"));
+    assert!(members.iter().any(|p| p.key.id == eve && p.status == "Requested to join"));
+}
+
+#[test]
+fn adding_and_removing_group_members_respects_permissions() {
+    let world = World::linked();
+    world.connected();
+
+    let club = world.conversation(CLUB).unwrap();
+    assert!(club.rights.add_members, "admin can add members");
+    assert!(club.rights.remove_members, "admin can remove members");
+    assert!(club.rights.manage_members, "admin can manage members");
+
+    let dave = "d4d4d4d4-0000-4000-8000-000000000004";
+    assert_eq!(
+        world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![dave.into()] }),
+        Response::Ok
+    );
+    world.heard(&format!("group-add {CLUB} {dave}"));
+    world.until("Dave in member list", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().any(|m| m.key.id == dave) => Some(()),
+            _ => None,
+        }
+    });
+
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: ALAN.into() }),
+        Response::Ok
+    );
+    world.heard(&format!("group-remove {CLUB} {ALAN}"));
+    world.until("Alan removed from member list", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if !members.iter().any(|m| m.key.id == ALAN) => Some(()),
+            _ => None,
+        }
+    });
+
+    // Promote Grace to admin, then revoke.
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-admin-promote\u{1}{GRACE}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-role {CLUB} {GRACE} admin"));
+    world.until("Grace promoted to admin", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().any(|m| m.key.id == GRACE && m.status == "Admin") => Some(()),
+            _ => None,
+        }
+    });
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-admin-revoke\u{1}{GRACE}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-role {CLUB} {GRACE} member"));
+    world.until("Grace demoted to member", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().any(|m| m.key.id == GRACE && m.status.is_empty()) => Some(()),
+            _ => None,
+        }
+    });
+
+    // Demote Ada and restrict member additions to admins only: both rights turn off and requests are refused.
+    world.steer("group-role me member");
+    world.steer("group-access members=admin");
+    world.until("rights revoked for non-admin", || {
+        let row = world.conversation(CLUB)?;
+        (!row.rights.add_members && !row.rights.remove_members).then_some(())
+    });
+    let add_err = world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![ALAN.into()] });
+    assert!(matches!(add_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {add_err:?}");
+    let rem_err = world.ask(Request::MembersRemove { conversation: key(CLUB), person: GRACE.into() });
+    assert!(matches!(rem_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {rem_err:?}");
+}

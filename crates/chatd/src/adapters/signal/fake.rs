@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupInfo, GroupMember, GroupMembers, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -84,6 +84,53 @@ fn record(line: &str) {
     }
 }
 
+#[derive(Clone)]
+struct FakeGroup {
+    info: GroupInfo,
+    members: Vec<GroupMember>,
+    pending: Vec<GroupMember>,
+    requesting: Vec<GroupMember>,
+}
+
+impl FakeGroup {
+    fn initial() -> Self {
+        let members = vec![
+            GroupMember { id: ME.into(), name: "Ada Quill".into(), admin: true },
+            GroupMember { id: GRACE.into(), name: "Grace Ombra".into(), admin: false },
+            GroupMember { id: ALAN.into(), name: "Alan Ferro".into(), admin: false },
+        ];
+        let mut group = Self {
+            info: GroupInfo {
+                id: CLUB.into(),
+                title: "Bridge club".into(),
+                description: "Tuesdays, 7 pm".into(),
+                members: 3,
+                member: true,
+                member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+                admins: vec![ME.into()],
+                member_access: GroupAccess::Member,
+                attributes_access: GroupAccess::Member,
+                invite_link_access: GroupAccess::Unsatisfiable,
+                announcements_only: false,
+                invite_link: String::new(),
+                timer_secs: 0,
+            },
+            members,
+            pending: Vec::new(),
+            requesting: Vec::new(),
+        };
+        group.sync_info();
+        group
+    }
+
+    fn sync_info(&mut self) {
+        self.info.members = self.members.len() as u32;
+        self.info.member = self.members.iter().any(|m| m.id == ME);
+        self.info.member_ids = self.members.iter().map(|m| m.id.clone()).collect();
+        self.info.admins = self.members.iter().filter(|m| m.admin).map(|m| m.id.clone()).collect();
+    }
+}
+
 pub struct Fake {
     events: Sender<Event>,
     heard: Mutex<Option<Receiver<Event>>>,
@@ -98,6 +145,8 @@ pub struct Fake {
     card: Arc<Mutex<OwnCard>>,
     /// Usernames a test has scripted, lower case, to an account id.
     lookups: Arc<Mutex<HashMap<String, String>>>,
+    /// Mutable state of the fake `CLUB` group.
+    club: Arc<Mutex<FakeGroup>>,
 }
 
 impl Fake {
@@ -107,16 +156,8 @@ impl Fake {
         let grace = Contact { id: GRACE.into(), name: "Grace Ombra".into(), phone: "+15550100002".into() };
         let alan = Contact { id: ALAN.into(), name: "Alan Ferro".into(), phone: String::new() };
         let _ = events.send(Event::Contacts(vec![grace, alan]));
-        let club = GroupInfo {
-            id: CLUB.into(),
-            title: "Bridge club".into(),
-            description: "Tuesdays, 7 pm".into(),
-            members: 3,
-            member: true,
-            member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
-            timer_secs: 0,
-        };
-        let _ = events.send(Event::Groups(vec![club]));
+        let club_state = FakeGroup::initial();
+        let _ = events.send(Event::Groups(vec![club_state.info.clone()]));
         let _ = events.send(Event::Settings { read_receipts: true, typing: true });
         let _ = events.send(Event::Caught);
         let fake = Fake {
@@ -138,6 +179,7 @@ impl Fake {
                 link: "https://signal.me/#eu/fake-ada".into(),
             })),
             lookups: Arc::default(),
+            club: Arc::new(Mutex::new(club_state)),
         };
         fake.listen();
         fake
@@ -145,7 +187,15 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.fail_one.clone(), self.control.clone(), self.lookups.clone());
+        let (events, closed, refuse, fail_one, control, lookups, club) = (
+            self.events.clone(),
+            self.closed.clone(),
+            self.refuse.clone(),
+            self.fail_one.clone(),
+            self.control.clone(),
+            self.lookups.clone(),
+            self.club.clone(),
+        );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
@@ -169,6 +219,77 @@ impl Fake {
                 }
                 if let Some(who_word) = line.strip_prefix("fail ") {
                     *fail_one.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = who(who_word.trim()).map(|(id, _)| id.to_owned());
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-role ") {
+                    let mut parts = rest.split_whitespace();
+                    let target = match parts.next().unwrap_or("") {
+                        "me" => Some(ME),
+                        other => who(other).map(|(id, _)| id),
+                    };
+                    let admin = parts.next().unwrap_or("") == "admin";
+                    if let Some(target) = target {
+                        let mut g = club.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(m) = g.members.iter_mut().find(|m| m.id == target) {
+                            m.admin = admin;
+                        }
+                        g.sync_info();
+                        let _ = events.send(Event::Groups(vec![g.info.clone()]));
+                    }
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-pending ") {
+                    let mut parts = rest.splitn(2, ' ');
+                    let aci = parts.next().unwrap_or("").trim();
+                    let name = parts.next().unwrap_or("").trim();
+                    if super::wire::is_aci(aci) {
+                        let mut g = club.lock().unwrap_or_else(|p| p.into_inner());
+                        if !g.pending.iter().any(|m| m.id == aci) {
+                            g.pending.push(GroupMember { id: aci.to_owned(), name: name.to_owned(), admin: false });
+                        }
+                    }
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-requesting ") {
+                    let mut parts = rest.splitn(2, ' ');
+                    let aci = parts.next().unwrap_or("").trim();
+                    let name = parts.next().unwrap_or("").trim();
+                    if super::wire::is_aci(aci) {
+                        let mut g = club.lock().unwrap_or_else(|p| p.into_inner());
+                        if !g.requesting.iter().any(|m| m.id == aci) {
+                            g.requesting.push(GroupMember { id: aci.to_owned(), name: name.to_owned(), admin: false });
+                        }
+                    }
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-access ") {
+                    let mut g = club.lock().unwrap_or_else(|p| p.into_inner());
+                    for token in rest.split_whitespace() {
+                        if let Some((k, v)) = token.split_once('=') {
+                            match (k, v) {
+                                ("members", "admin") => g.info.member_access = GroupAccess::Administrator,
+                                ("members", "member") => g.info.member_access = GroupAccess::Member,
+                                ("attributes", "admin") => g.info.attributes_access = GroupAccess::Administrator,
+                                ("attributes", "member") => g.info.attributes_access = GroupAccess::Member,
+                                ("link", "off") => {
+                                    g.info.invite_link_access = GroupAccess::Unsatisfiable;
+                                    g.info.invite_link.clear();
+                                }
+                                ("link", "on") => {
+                                    g.info.invite_link_access = GroupAccess::Any;
+                                    g.info.invite_link = "https://signal.group/#CjQKIFoXWhdaF1oXWhdaF1oXWhdaF1oXWhdaF1oXWhdaF1oXEhBwbGFjZWhvbGRlcl9wYXNz".into();
+                                }
+                                ("link", "approval") => {
+                                    g.info.invite_link_access = GroupAccess::Administrator;
+                                    g.info.invite_link = "https://signal.group/#CjQKIFoXWhdaF1oXWhdaF1oXWhdaF1oXWhdaF1oXWhdaF1oXEhBwbGFjZWhvbGRlcl9wYXNz".into();
+                                }
+                                ("announcements", "on") => g.info.announcements_only = true,
+                                ("announcements", "off") => g.info.announcements_only = false,
+                                _ => {}
+                            }
+                        }
+                    }
+                    let _ = events.send(Event::Groups(vec![g.info.clone()]));
                     return true;
                 }
                 for event in steer(line) {
@@ -527,6 +648,79 @@ impl Wire for Fake {
         record(&format!("lookup {username}"));
         let found = self.lookups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&username.to_ascii_lowercase()).cloned();
         Ok(found)
+    }
+
+    fn group_members(&self, group_id: &str) -> Result<GroupMembers, Fault> {
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        let g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(GroupMembers {
+            members: g.members.clone(),
+            pending: g.pending.clone(),
+            requesting: g.requesting.clone(),
+        })
+    }
+
+    fn group_add_members(&self, group_id: &str, people: &[String]) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        record(&format!("group-add {} {}", Peer::Group(group_id.to_owned()).conversation(), people.join(",")));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        for aci in people {
+            if !g.members.iter().any(|m| m.id == *aci) {
+                g.members.push(GroupMember { id: aci.clone(), name: String::new(), admin: false });
+            }
+            g.pending.retain(|m| m.id != *aci);
+            g.requesting.retain(|m| m.id != *aci);
+        }
+        g.sync_info();
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(())
+    }
+
+    fn group_remove_member(&self, group_id: &str, person: &str) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        record(&format!("group-remove {} {person}", Peer::Group(group_id.to_owned()).conversation()));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        g.members.retain(|m| m.id != person);
+        g.pending.retain(|m| m.id != person);
+        g.requesting.retain(|m| m.id != person);
+        g.sync_info();
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(())
+    }
+
+    fn group_set_admin(&self, group_id: &str, person: &str, admin: bool) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        record(&format!("group-role {} {person} {}", Peer::Group(group_id.to_owned()).conversation(), if admin { "admin" } else { "member" }));
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(m) = g.members.iter_mut().find(|m| m.id == person) {
+            m.admin = admin;
+        }
+        g.sync_info();
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(())
     }
 
     fn close(&self) {

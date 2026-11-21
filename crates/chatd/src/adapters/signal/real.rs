@@ -7,7 +7,7 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupInfo, GroupMember, GroupMembers, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -57,6 +57,10 @@ enum Ask {
     Card { answer: Sender<Result<OwnCard, Fault>> },
     SetCard { name: Option<String>, about: Option<String>, emoji: Option<String>, answer: Sender<Result<(), Fault>> },
     Lookup { username: String, answer: Sender<Result<Option<String>, Fault>> },
+    GroupMembers { group_id: String, answer: Sender<Result<GroupMembers, Fault>> },
+    GroupAddMembers { group_id: String, people: Vec<String>, answer: Sender<Result<(), Fault>> },
+    GroupRemoveMember { group_id: String, person: String, answer: Sender<Result<(), Fault>> },
+    GroupSetAdmin { group_id: String, person: String, admin: bool, answer: Sender<Result<(), Fault>> },
 }
 
 pub struct Real {
@@ -130,6 +134,15 @@ fn aci_bytes(bytes: &[u8]) -> Option<String> {
 /// the group and stays in the vault.
 fn group_id(master_key: &[u8; 32]) -> String {
     hex(&GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key)).get_group_identifier())
+}
+
+fn access_of(req: AccessRequired) -> GroupAccess {
+    match req {
+        AccessRequired::Any => GroupAccess::Any,
+        AccessRequired::Member => GroupAccess::Member,
+        AccessRequired::Administrator => GroupAccess::Administrator,
+        AccessRequired::Unsatisfiable | AccessRequired::Unknown => GroupAccess::Unsatisfiable,
+    }
 }
 
 /// The stored group, as a change compares it. Presage fetched this; the message's unsigned change is not read.
@@ -406,6 +419,22 @@ impl Wire for Real {
         self.ask(|answer| Ask::Lookup { username: username.to_owned(), answer })
     }
 
+    fn group_members(&self, group_id: &str) -> Result<GroupMembers, Fault> {
+        self.ask(|answer| Ask::GroupMembers { group_id: group_id.to_owned(), answer })
+    }
+
+    fn group_add_members(&self, group_id: &str, people: &[String]) -> Result<(), Fault> {
+        self.ask(|answer| Ask::GroupAddMembers { group_id: group_id.to_owned(), people: people.to_vec(), answer })
+    }
+
+    fn group_remove_member(&self, group_id: &str, person: &str) -> Result<(), Fault> {
+        self.ask(|answer| Ask::GroupRemoveMember { group_id: group_id.to_owned(), person: person.to_owned(), answer })
+    }
+
+    fn group_set_admin(&self, group_id: &str, person: &str, admin: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::GroupSetAdmin { group_id: group_id.to_owned(), person: person.to_owned(), admin, answer })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -531,6 +560,15 @@ impl Session {
             let timer_secs = snap.timer_secs;
             let member = snap.members.iter().any(|member| member.id == self.me);
             let member_ids = group.members.iter().map(|member| ServiceId::from(member.aci).raw_uuid().to_string()).collect();
+            let admins = group
+                .members
+                .iter()
+                .filter(|member| member.role == Role::Administrator)
+                .map(|member| ServiceId::from(member.aci).raw_uuid().to_string())
+                .collect();
+            let member_access = group.access_control.as_ref().map_or(GroupAccess::Member, |ac| access_of(ac.members));
+            let attributes_access = group.access_control.as_ref().map_or(GroupAccess::Member, |ac| access_of(ac.attributes));
+            let invite_link_access = group.access_control.as_ref().map_or(GroupAccess::Unsatisfiable, |ac| access_of(ac.add_from_invite_link));
             self.groups.insert(id.clone(), key);
             self.known.seed(id.clone(), revision, snap);
             told.push(GroupInfo {
@@ -540,6 +578,12 @@ impl Session {
                 members: group.members.len() as u32,
                 member,
                 member_ids,
+                admins,
+                member_access,
+                attributes_access,
+                invite_link_access,
+                announcements_only: false,
+                invite_link: String::new(),
                 timer_secs,
             });
         }
@@ -950,7 +994,211 @@ impl Session {
                 };
                 let _ = answer.send(found);
             }
+            Ask::GroupMembers { group_id, answer } => {
+                let _ = answer.send(self.group_members(&group_id).await);
+            }
+            Ask::GroupAddMembers { group_id, people, answer } => {
+                let _ = answer.send(self.group_add_members(&group_id, &people).await);
+            }
+            Ask::GroupRemoveMember { group_id, person, answer } => {
+                let _ = answer.send(self.group_remove_member(&group_id, &person).await);
+            }
+            Ask::GroupSetAdmin { group_id, person, admin, answer } => {
+                let _ = answer.send(self.group_set_admin(&group_id, &person, admin).await);
+            }
         }
+    }
+
+    async fn group_members(&mut self, group_id: &str) -> Result<GroupMembers, Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let group = self
+            .vault
+            .group_keys()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|(stored, _)| *stored == key).map(|(_, group)| group))
+            .ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let mut members = Vec::with_capacity(group.members.len());
+        for m in &group.members {
+            let id = m.aci.service_id_string();
+            let name = if id == self.me { String::new() } else { self.name_of(&id).await };
+            members.push(GroupMember { id, name, admin: m.role == Role::Administrator });
+        }
+        let mut pending = Vec::with_capacity(group.pending_members.len());
+        for p in &group.pending_members {
+            let id = p.uuid.to_string();
+            let name = self.name_of(&id).await;
+            pending.push(GroupMember { id, name, admin: p.role == Role::Administrator });
+        }
+        let mut requesting = Vec::with_capacity(group.requesting_members.len());
+        for r in &group.requesting_members {
+            let id = r.aci.service_id_string();
+            let name = self.name_of(&id).await;
+            requesting.push(GroupMember { id, name, admin: false });
+        }
+        Ok(GroupMembers { members, pending, requesting })
+    }
+
+    /// Patches a group via Signal's Groups v2 API (`PATCH /v1/groups/`), sends the signed
+    /// `GroupChange` in a group update message, and refreshes the stored group state.
+    async fn patch_group(&mut self, group_id: &str, actions: presage::proto::group_change::Actions) -> Result<(), Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let data: &RegistrationData = self.manager.registration_data();
+        let password = self.vault.password().ok_or_else(|| Fault::Net("no password kept".into()))?;
+        let phone = (&data.phone_number).try_into_e164().map_err(|err| Fault::Net(err.to_string()))?;
+        let credentials = ServiceCredentials {
+            aci: Some(data.service_ids.aci),
+            pni: Some(data.service_ids.pni),
+            phonenumber: phone,
+            password: Some(password),
+            device_id: Some(self.manager.device_id()),
+        };
+        let mut push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
+        let unid_ws = push
+            .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
+            .await
+            .map_err(|err| fault::<vault::VaultError>(err.into()))?;
+        let server_public_params = presage::libsignal_service::configuration::ServiceConfiguration::from(SignalServers::Production).zkgroup_server_public_params;
+        let mut groups_mgr = presage::libsignal_service::groups_v2::GroupsManager::new(
+            data.service_ids.clone(),
+            push.clone(),
+            unid_ws,
+            presage::libsignal_service::groups_v2::InMemoryCredentialsCache::default(),
+            server_public_params,
+        );
+        let group_secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let auth = groups_mgr
+            .get_authorization_for_today(&mut rand::rng(), group_secret_params)
+            .await
+            .map_err(|err| fault::<vault::VaultError>(err.into()))?;
+        let encoded_actions = prost::Message::encode_to_vec(&actions);
+        let change = presage::proto::GroupChange {
+            actions: encoded_actions,
+            server_signature: Vec::new(),
+            change_epoch: 0,
+        };
+        let body = prost::Message::encode_to_vec(&change);
+        let resp = push
+            .request(
+                reqwest::Method::PATCH,
+                presage::libsignal_service::configuration::Endpoint::storage("/v1/groups/"),
+                presage::libsignal_service::push_service::HttpAuthOverride::Identified(auth),
+            )
+            .map_err(|err| fault::<vault::VaultError>(err.into()))?
+            .header("Content-Type", "application/x-protobuf")
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(Fault::Refused(format!("Signal rejected the group change ({}).", resp.status())));
+        }
+        let signed_bytes = resp.bytes().await.map_err(|err| Fault::Net(err.to_string()))?;
+        // Refresh the stored group from the server and broadcast the signed change.
+        if let Ok(encrypted) = groups_mgr.fetch_encrypted_group(&mut rand::rng(), &key).await {
+            if let Ok(decrypted) = presage::libsignal_service::groups_v2::decrypt_group(&key, encrypted) {
+                let rev = decrypted.version;
+                let _ = self.vault.save_group(key, decrypted).await;
+                let ctx = GroupContextV2 {
+                    master_key: Some(key.to_vec()),
+                    revision: Some(rev),
+                    group_change: (!signed_bytes.is_empty()).then(|| signed_bytes.to_vec()),
+                };
+                let update = ContentBody::DataMessage(DataMessage {
+                    group_v2: Some(ctx),
+                    timestamp: Some(now_ms()),
+                    ..Default::default()
+                });
+                let _ = self.manager.send_message_to_group(&key, update, now_ms()).await;
+            }
+        }
+        self.groups_changed().await;
+        Ok(())
+    }
+
+    fn encrypt_aci_bytes(params: &GroupSecretParams, aci: Aci) -> Vec<u8> {
+        presage::libsignal_service::zkgroup::serialize(&params.encrypt_service_id(ServiceId::Aci(aci).into()))
+    }
+
+    async fn group_add_members(&mut self, group_id: &str, people: &[String]) -> Result<(), Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let revision = self
+            .vault
+            .group_keys()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|(stored, _)| *stored == key).map(|(_, g)| g.revision))
+            .unwrap_or(0);
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let ops = presage::libsignal_service::groups_v2::GroupOperations::new(params);
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: Self::encrypt_aci_bytes(&params, Aci::from(me_uuid)),
+            version: revision + 1,
+            ..Default::default()
+        };
+        for person in people {
+            let uuid = Uuid::parse_str(person).map_err(|_| Fault::Refused(format!("{person} is not a valid Signal account id.")))?;
+            let aci = Aci::from(uuid);
+            let sid = ServiceId::Aci(aci);
+            if let Ok(Some(pk)) = self.manager.store().profile_key(&sid).await {
+                let add = ops
+                    .build_add_member_action(aci, pk, Role::Default)
+                    .map_err(|err| Fault::Net(err.to_string()))?;
+                actions.add_members.push(add);
+            } else {
+                let pending = ops
+                    .build_add_pending_member_action(sid, Aci::from(me_uuid), Role::Default)
+                    .map_err(|err| Fault::Net(err.to_string()))?;
+                actions.add_members_pending_profile_key.push(pending);
+            }
+        }
+        self.patch_group(group_id, actions).await
+    }
+
+    async fn group_remove_member(&mut self, group_id: &str, person: &str) -> Result<(), Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let revision = self
+            .vault
+            .group_keys()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|(stored, _)| *stored == key).map(|(_, g)| g.revision))
+            .unwrap_or(0);
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let ops = presage::libsignal_service::groups_v2::GroupOperations::new(params);
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let target_uuid = Uuid::parse_str(person).map_err(|_| Fault::Refused("That person can't be removed from here.".into()))?;
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: Self::encrypt_aci_bytes(&params, Aci::from(me_uuid)),
+            version: revision + 1,
+            ..Default::default()
+        };
+        actions
+            .delete_members
+            .push(ops.build_remove_member_action(Aci::from(target_uuid)).map_err(|err| Fault::Net(err.to_string()))?);
+        self.patch_group(group_id, actions).await
+    }
+
+    async fn group_set_admin(&mut self, group_id: &str, person: &str, admin: bool) -> Result<(), Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let revision = self
+            .vault
+            .group_keys()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|(stored, _)| *stored == key).map(|(_, g)| g.revision))
+            .unwrap_or(0);
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let target_uuid = Uuid::parse_str(person).map_err(|_| Fault::Refused("That person's role can't be changed here.".into()))?;
+        let role = if admin { Role::Administrator } else { Role::Default };
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: Self::encrypt_aci_bytes(&params, Aci::from(me_uuid)),
+            version: revision + 1,
+            ..Default::default()
+        };
+        actions.modify_member_roles.push(presage::proto::group_change::actions::ModifyMemberRoleAction {
+            user_id: Self::encrypt_aci_bytes(&params, Aci::from(target_uuid)),
+            role: role.into(),
+        });
+        self.patch_group(group_id, actions).await
     }
 
     /// Name, about, emoji, and the number this device registered with. A username is not on
