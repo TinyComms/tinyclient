@@ -839,6 +839,8 @@ impl Teams {
             ("DELETE", _) => dressed!(self.agent.delete(url)).call(),
             ("PUT", Body::Json(body)) => dressed!(self.agent.put(url)).send_json(*body),
             ("PUT", _) => dressed!(self.agent.put(url)).send_empty(),
+            ("PATCH", Body::Json(body)) => dressed!(self.agent.patch(url)).send_json(*body),
+            ("PATCH", _) => dressed!(self.agent.patch(url)).send_empty(),
             (_, Body::Json(body)) => dressed!(self.agent.post(url)).send_json(*body),
             (_, Body::Text(text)) => dressed!(self.agent.post(url)).header("Content-Type", "application/json").send(*text),
             (_, Body::None) => dressed!(self.agent.post(url)).send_empty(),
@@ -938,6 +940,7 @@ impl Teams {
             mention_spans: true,
             importance: true,
             channel_subject: true,
+            out_of_office: true,
             ..protocol::Capabilities::default()
         });
         {
@@ -1034,6 +1037,12 @@ impl Teams {
             Command::Previews(_) => {}
             Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => {
                 let _ = reply.send(self.set_presence(presence, status.as_deref()).map_err(refuse));
+            }
+            Command::GetOutOfOffice { reply } => {
+                let _ = reply.send(self.get_out_of_office().map_err(refuse));
+            }
+            Command::SetOutOfOffice { ooo, reply } => {
+                let _ = reply.send(self.set_out_of_office(&ooo).map_err(refuse));
             }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(self.download(url).map_err(refuse));

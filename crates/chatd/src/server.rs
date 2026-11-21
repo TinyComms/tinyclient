@@ -2295,6 +2295,26 @@ impl Chat {
         }
     }
 
+    fn get_out_of_office(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetOutOfOffice { reply }) {
+            Ok(ooo) => Response::OutOfOffice { ooo },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_out_of_office(&self, account: AccountKey, ooo: protocol::OutOfOffice) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetOutOfOffice { ooo, reply }) {
+            Ok(ooo) => Response::OutOfOffice { ooo },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Drops an unsent row locally. A queued send is cancelled this way: the adapter never had it.
     fn drop_unsent(&self, conversation: Key, client_id: &str, message: &Message) -> Response {
         match self.hub.store().delete_message(&conversation, client_id) {
@@ -3267,6 +3287,8 @@ impl Chat {
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
+            Request::GetOutOfOffice { account } => self.get_out_of_office(account),
+            Request::SetOutOfOffice { account, ooo } => self.set_out_of_office(account, ooo),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),

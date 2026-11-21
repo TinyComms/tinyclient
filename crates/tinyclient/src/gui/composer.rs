@@ -272,6 +272,8 @@ struct Target {
     link: Link,
     /// The Space it is in, for `#` completion and the Space's own emoji. A thread pane is not told.
     space: Option<String>,
+    /// Peer person id for a 1:1 Direct chat (used for out-of-office banner).
+    peer: Option<String>,
     read_only: bool,
     read_only_reason: String,
     joined: bool,
@@ -600,6 +602,9 @@ pub struct Composer {
     importance: protocol::Importance,
     broadcast: bool,
     effect: Option<String>,
+    /// Cached out-of-office `(note, until)` for 1:1 direct chat peers (Key = person key).
+    peer_away: HashMap<Key, Option<(String, Option<i64>)>>,
+    peer_away_asked: HashSet<Key>,
 }
 
 impl Composer {
@@ -704,6 +709,8 @@ impl Composer {
             importance: protocol::Importance::Normal,
             broadcast: false,
             effect: None,
+            peer_away: HashMap::new(),
+            peer_away_asked: HashSet::new(),
         }
     }
 
@@ -773,6 +780,27 @@ impl Composer {
             input.set_alt_submits(silent);
             input.set_format_discord(discord, cx);
         });
+        if target.kind == ConversationKind::Direct && target.link == Link::Connected && live() {
+            if let Some(peer_id) = target.peer.as_deref().filter(|id| !id.is_empty()) {
+                let peer_key = Key::new(&target.key.account(), peer_id);
+                if self.peer_away_asked.insert(peer_key.clone()) {
+                    let this = cx.weak_entity();
+                    let asked_key = peer_key.clone();
+                    ask_later(cx, Request::Profile { person: peer_key, space: None }, move |answer, cx| {
+                        let away = match answer {
+                            Ok(Response::Profile { profile }) if !profile.away.is_empty() => {
+                                Some((profile.away, profile.away_until))
+                            }
+                            _ => None,
+                        };
+                        let _ = this.update(cx, |this, cx| {
+                            this.peer_away.insert(asked_key, away);
+                            cx.notify();
+                        });
+                    });
+                }
+            }
+        }
         self.target = Some(target);
         cx.notify();
     }
@@ -3843,6 +3871,76 @@ fn shot_pictures() -> Vec<PathBuf> {
     found
 }
 
+/// Formats a UTC Unix timestamp as a compact date like `"Mon, Oct 19"` for OOO banners.
+fn format_ooo_until(unix_secs: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let raw_days = unix_secs.div_euclid(86_400);
+    let weekday = WEEKDAYS[raw_days.rem_euclid(7) as usize];
+    let days = raw_days + 719_468;
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let month = MONTHS[(m - 1).clamp(0, 11) as usize];
+    format!("{weekday}, {month} {d}")
+}
+
+/// Formats the composer out-of-office banner line for a 1:1 direct chat peer.
+fn ooo_banner_text(name: &str, away: &str, until: Option<i64>) -> (String, Option<String>) {
+    let who = if name.is_empty() { "This person" } else { name };
+    let head = match until.filter(|&ts| ts > 0) {
+        Some(ts) => format!("{who} is out of office until {}", format_ooo_until(ts)),
+        None => format!("{who} is out of office"),
+    };
+    let trimmed = away.trim();
+    let note = (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("Out of office")).then(|| {
+        let mut s = trimmed.to_owned();
+        protocol::clip(&mut s, 180);
+        s
+    });
+    (head, note)
+}
+
+impl Composer {
+    /// Compact banner shown above the composer in a 1:1 chat when the peer is out of office.
+    fn ooo_banner(&self, target: &Target) -> Option<Div> {
+        if target.kind != ConversationKind::Direct {
+            return None;
+        }
+        let peer_id = target.peer.as_deref().filter(|id| !id.is_empty())?;
+        let peer_key = Key::new(&target.key.account(), peer_id);
+        let (away, until) = self.peer_away.get(&peer_key)?.as_ref()?;
+        let (head, note) = ooo_banner_text(&target.title, away, *until);
+        Some(
+            div()
+                .mb(px(6.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::selected())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_start()
+                .gap(px(8.))
+                .child(glyph("icons/calendar.svg", 14., theme::warning()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(head))
+                        .children(note.map(|text| div().type_small().text_color(theme::text_soft()).child(text))),
+                ),
+        )
+    }
+}
+
 impl Focusable for Composer {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
@@ -3915,6 +4013,7 @@ impl Render for Composer {
         let anchors = self.anchors.clone();
         // The row sits over the card's text, not its edge.
         dock.child(div().pl(px(13.)).child(self.typing.clone()))
+            .children(self.ooo_banner(&target))
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
             .child(div().relative().child(body).children(self.popover(cx)))
@@ -3985,6 +4084,7 @@ impl Shell {
             kind,
             link,
             space: open.space.clone(),
+            peer: open.peer.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
             joined: open.joined,
@@ -4016,6 +4116,7 @@ impl Shell {
             kind: ConversationKind::Thread,
             link,
             space: None,
+            peer: None,
             read_only: false,
             read_only_reason: String::new(),
             joined: true,
@@ -4565,6 +4666,17 @@ mod tests {
     }
 
     #[test]
+    fn ooo_banner_formats_return_date_and_note() {
+        let (head, note) = ooo_banner_text("Dee Park", "Back Monday, ask Ben", Some(1_792_396_800));
+        assert_eq!(head, "Dee Park is out of office until Mon, Oct 19");
+        assert_eq!(note.as_deref(), Some("Back Monday, ask Ben"));
+
+        let (head_no_date, note_default) = ooo_banner_text("Ana Ruiz", "Out of office", None);
+        assert_eq!(head_no_date, "Ana Ruiz is out of office");
+        assert_eq!(note_default, None);
+    }
+
+    #[test]
     fn a_parked_draft_is_still_a_reply_until_that_reply_goes() {
         let parked = Draft { text: "On it".into(), reply: reply("m1"), ..Draft::default() };
         // Coming back takes a copy of what was parked: the message it answers comes with it.
@@ -4627,6 +4739,7 @@ mod tests {
             kind,
             link,
             space: None,
+            peer: None,
             read_only,
             read_only_reason: String::new(),
             blocked_peer: None,

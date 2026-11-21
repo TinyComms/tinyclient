@@ -37,6 +37,29 @@ fn yes() -> bool {
     true
 }
 
+/// Automatic replies / out-of-office settings for an account (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutOfOffice {
+    /// True when automatic replies are turned on (always or scheduled).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    /// Internal reply message (shown to colleagues in Teams and Outlook).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// Optional scheduled start (Unix seconds, UTC). Both `start` and `end` set schedules the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
+    /// Optional scheduled end (Unix seconds, UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
+    /// Whether automatic replies are also sent to people outside the organization.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub send_external: bool,
+    /// Reply message sent to external senders when `send_external` is true (defaults to `message` when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external_message: String,
+}
+
 /// Which account privacy setting to read or update (`Request::GetPrivacy`, `Request::SetPrivacy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -681,6 +704,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports reading and setting out-of-office / automatic replies (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub out_of_office: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

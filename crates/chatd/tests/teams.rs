@@ -190,6 +190,7 @@ struct Fake {
     heard: Mutex<Vec<String>>,
     pushed: AtomicU32,
     posted: AtomicU32,
+    mailbox_ooo: Mutex<Value>,
 }
 
 impl Fake {
@@ -206,6 +207,12 @@ impl Fake {
             heard: Mutex::default(),
             pushed: AtomicU32::new(0),
             posted: AtomicU32::new(0),
+            mailbox_ooo: Mutex::new(json!({
+                "status": "disabled",
+                "externalAudience": "none",
+                "internalReplyMessage": "",
+                "externalReplyMessage": "",
+            })),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -512,8 +519,18 @@ impl Fake {
         answer("201 Created", json!({"OriginalArrivalTime": arrived}))
     }
 
-    /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, and channel SharePoint `filesFolder`.
+    /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, and mailbox OOO.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "GET" && path == "/v1.0/me/mailboxSettings/automaticRepliesSetting" {
+            return ok(self.mailbox_ooo.lock().unwrap().clone());
+        }
+        if call.method == "PATCH" && path == "/v1.0/me/mailboxSettings" {
+            let body = call.json();
+            if body["automaticRepliesSetting"].is_object() {
+                *self.mailbox_ooo.lock().unwrap() = body["automaticRepliesSetting"].clone();
+            }
+            return ok(json!({"automaticRepliesSetting": self.mailbox_ooo.lock().unwrap().clone()}));
+        }
         if call.method == "POST" && path.starts_with("/v1.0/me/drive/root:/Microsoft Teams Chat Files/") && path.ends_with(":/createUploadSession") {
             return ok(json!({"uploadUrl": format!("{}/upload/session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
         }
@@ -2538,5 +2555,62 @@ fn sending_files_in_channels_uses_sharepoint_folder_and_refused_external_invite_
         "failed invite must not post message"
     );
     let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn out_of_office_profile_fetches_presence_and_mailbox_settings_round_trip() {
+    let world = World::start();
+    world.ready();
+    assert!(world.account(HOME).can.out_of_office);
+
+    // 1. Opening Dee's profile directly (with NO prior Request::Watch) fetches presence so OOO appears.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key(DEE), space: None }) else {
+        panic!("expected Response::Profile for Dee");
+    };
+    assert_eq!(profile.away, "Back Monday, ask Ben");
+    assert_eq!(profile.away_until, Some(1_792_396_800));
+
+    // 2. Reading our own automatic replies queries Graph mailboxSettings.
+    let account = protocol::AccountKey {
+        network: Network::Teams,
+        account: HOME.to_owned(),
+    };
+    let Response::OutOfOffice { ooo } = world.ask(Request::GetOutOfOffice { account: account.clone() }) else {
+        panic!("expected Response::OutOfOffice");
+    };
+    assert!(!ooo.enabled);
+
+    // 3. Updating automatic replies sends PATCH /v1.0/me/mailboxSettings and updates own profile OOO.
+    let wanted = protocol::OutOfOffice {
+        enabled: true,
+        message: "Out at summit, back Thursday".to_owned(),
+        start: Some(1_792_396_800),
+        end: Some(1_792_656_000),
+        send_external: true,
+        external_message: "External: back Thursday".to_owned(),
+    };
+    let Response::OutOfOffice { ooo: saved } = world.ask(Request::SetOutOfOffice {
+        account: account.clone(),
+        ooo: wanted.clone(),
+    }) else {
+        panic!("expected Response::OutOfOffice after set");
+    };
+    assert_eq!(saved, wanted);
+    let patch = world
+        .fake
+        .calls("PATCH", "/graph/v1.0/me/mailboxSettings")
+        .pop()
+        .expect("PATCH mailboxSettings reached Graph");
+    let sent = patch.json();
+    assert_eq!(sent["automaticRepliesSetting"]["status"].as_str(), Some("scheduled"));
+    assert_eq!(sent["automaticRepliesSetting"]["internalReplyMessage"].as_str(), Some("Out at summit, back Thursday"));
+    assert_eq!(sent["automaticRepliesSetting"]["externalAudience"].as_str(), Some("all"));
+    assert_eq!(sent["automaticRepliesSetting"]["externalReplyMessage"].as_str(), Some("External: back Thursday"));
+
+    // Reading back confirms Graph persisted it.
+    let Response::OutOfOffice { ooo: reread } = world.ask(Request::GetOutOfOffice { account }) else {
+        panic!("expected Response::OutOfOffice on re-read");
+    };
+    assert_eq!(reread, wanted);
 }
 

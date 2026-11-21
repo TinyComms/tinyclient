@@ -1643,6 +1643,15 @@ pub enum Request {
         key: PrivacyKey,
         policy: PrivacyPolicy,
     },
+    /// Read an account's out-of-office / automatic replies settings (Teams / Exchange mailbox).
+    GetOutOfOffice {
+        account: AccountKey,
+    },
+    /// Write an account's out-of-office / automatic replies settings (Teams / Exchange mailbox).
+    SetOutOfOffice {
+        account: AccountKey,
+        ooo: OutOfOffice,
+    },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2901,6 +2910,9 @@ pub enum Response {
     Privacy {
         key: PrivacyKey,
         policy: PrivacyPolicy,
+    },
+    OutOfOffice {
+        ooo: OutOfOffice,
     },
     Folders {
         folders: Vec<Folder>,

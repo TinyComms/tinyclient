@@ -1,7 +1,7 @@
 //! People in a tenant: who wrote a message, who a chat is with, who is online. The directory is
 //! searched and looked up by id, never listed.
 
-use super::{escaped, Auth, Body, Fault, Teams, PRESENCE, REMEMBERED, SPACES};
+use super::{escaped, iso_utc, Auth, Body, Fault, Teams, GRAPH, PRESENCE, REMEMBERED, SPACES};
 use crate::adapters::{About, Members};
 use crate::store::{PersonDetails, PersonRow};
 use protocol::{Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation};
@@ -35,6 +35,70 @@ pub(super) struct Known {
     /// A guest in this tenant.
     #[serde(rename = "g", default)]
     pub guest: bool,
+}
+
+/// Extracts an active out-of-office `(message, until_unix)` from a Teams unified presence
+/// payload. Checks both `outOfOfficeNote` (legacy / web presence) and `outOfOfficeSettings`
+/// (Graph / unified presence), as well as `calendarData.isOutOfOffice` and `activity == "OutOfOffice"`.
+pub(super) fn parse_out_of_office(presence: &Value) -> Option<(String, Option<i64>)> {
+    let doing_now = presence["activity"].as_str().unwrap_or("");
+    let note_obj = &presence["outOfOfficeNote"];
+    let settings_obj = &presence["outOfOfficeSettings"];
+    let raw_msg = [
+        note_obj["message"].as_str(),
+        settings_obj["message"].as_str(),
+        settings_obj["outOfOfficeMessage"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|raw| super::html::parse(raw, &Nobody, "").text.trim().to_owned())
+    .find(|s| !s.is_empty());
+    let is_ooo = settings_obj["isOutOfOffice"] == true
+        || presence["calendarData"]["isOutOfOffice"] == true
+        || doing_now == "OutOfOffice"
+        || raw_msg.is_some();
+    if !is_ooo {
+        return None;
+    }
+    let until = [
+        note_obj["expiry"].as_str(),
+        settings_obj["expirationDateTime"].as_str(),
+        settings_obj["scheduledEndDateTime"]["dateTime"].as_str(),
+        settings_obj["expiry"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(super::seconds)
+    .find(|&ts| ts > 0);
+    Some((raw_msg.unwrap_or_else(|| "Out of office".to_owned()), until))
+}
+
+/// Parses Microsoft Graph `automaticRepliesSetting` JSON into `protocol::OutOfOffice`.
+pub(super) fn parse_automatic_replies(setting: &Value) -> protocol::OutOfOffice {
+    let status = setting["status"].as_str().unwrap_or("disabled");
+    let enabled = !status.eq_ignore_ascii_case("disabled") && !status.is_empty();
+    let strip = |raw: Option<&str>| {
+        raw.map(|s| super::html::parse(s, &Nobody, "").text.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let start = setting["scheduledStartDateTime"]["dateTime"]
+        .as_str()
+        .map(super::seconds)
+        .filter(|&ts| ts > 0 && status.eq_ignore_ascii_case("scheduled"));
+    let end = setting["scheduledEndDateTime"]["dateTime"]
+        .as_str()
+        .map(super::seconds)
+        .filter(|&ts| ts > 0 && status.eq_ignore_ascii_case("scheduled"));
+    let audience = setting["externalAudience"].as_str().unwrap_or("none");
+    let send_external = !audience.eq_ignore_ascii_case("none") && !audience.is_empty();
+    protocol::OutOfOffice {
+        enabled,
+        message: strip(setting["internalReplyMessage"].as_str()),
+        start,
+        end,
+        send_external,
+        external_message: strip(setting["externalReplyMessage"].as_str()),
+    }
 }
 
 /// Most people whose out-of-office note is held, from the presence answers.
@@ -390,6 +454,57 @@ impl Teams {
         Ok(id)
     }
 
+    fn away_of(&self, person: &str) -> (String, Option<i64>) {
+        if let Some(cached) = self.state().away.get(person).cloned() {
+            return cached;
+        }
+        let Some(raw) = self.ctx.note(&format!("ooo:{person}")).filter(|s| !s.is_empty()) else {
+            return (String::new(), None);
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+            return (String::new(), None);
+        };
+        let msg = parsed["m"].as_str().unwrap_or("").to_owned();
+        let until = parsed["u"].as_i64().filter(|&ts| ts > 0);
+        if !msg.is_empty() {
+            self.state().away.insert(person.to_owned(), (msg.clone(), until));
+        }
+        (msg, until)
+    }
+
+    fn save_away(&self, person: &str, away: Option<(String, Option<i64>)>) {
+        let mut state = self.state();
+        if let Some((msg, until)) = away {
+            if state.away.len() >= AWAY_KEPT {
+                state.away.clear();
+            }
+            state.away.insert(person.to_owned(), (msg.clone(), until));
+            drop(state);
+            let persisted = json!({"m": msg, "u": until}).to_string();
+            self.ctx.set_note(&format!("ooo:{person}"), &persisted);
+        } else {
+            state.away.remove(person);
+            drop(state);
+            self.ctx.set_note(&format!("ooo:{person}"), "");
+        }
+    }
+
+    /// Best-effort fetch of presence (including out-of-office note and return date) for a set of MRIs.
+    pub(super) fn fetch_presence_for(&self, ids: &[String]) {
+        let mris: Vec<&String> = ids.iter().filter(|id| id.starts_with("8:")).collect();
+        if mris.is_empty() {
+            return;
+        }
+        let Ok(place) = self.place() else {
+            return;
+        };
+        let asked: Vec<Value> = mris.iter().map(|id| json!({"mri": id})).collect();
+        let url = format!("{}/v1/presence/getpresence/", place.presence);
+        if let Ok(found) = self.call("POST", &url, Auth::Bearer(PRESENCE), Body::Json(&json!(asked)), true) {
+            self.presences(&found.body);
+        }
+    }
+
     /// One person's card: what their organization says of them.
     pub(super) fn profile(&self, person: &str) -> Result<About, Fault> {
         let path = "/beta/users/fetchShortProfile?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true\
@@ -398,7 +513,8 @@ impl Teams {
         let learned = self.learn(Teams::listed(&found));
         let known = learned.into_iter().find(|(id, _)| id == person).map(|(_, known)| known).or_else(|| self.cached(person));
         let known = known.unwrap_or_default();
-        let (away, away_until) = self.state().away.get(person).cloned().unwrap_or_default();
+        self.fetch_presence_for(&[person.to_owned()]);
+        let (away, away_until) = self.away_of(person);
         Ok(About {
             title: known.title,
             department: known.department,
@@ -407,6 +523,67 @@ impl Teams {
             away_until,
             ..About::default()
         })
+    }
+
+    /// Reads our Exchange/Teams automatic replies setting from Microsoft Graph.
+    pub(super) fn get_out_of_office(&self) -> Result<protocol::OutOfOffice, Fault> {
+        let url = format!("{}/v1.0/me/mailboxSettings/automaticRepliesSetting", self.graph);
+        let answer = self.call("GET", &url, Auth::Bearer(GRAPH), Body::None, true)?.body;
+        let setting = if answer["automaticRepliesSetting"].is_object() {
+            &answer["automaticRepliesSetting"]
+        } else {
+            &answer
+        };
+        Ok(parse_automatic_replies(setting))
+    }
+
+    /// Writes our Exchange/Teams automatic replies setting via Microsoft Graph `PATCH /v1.0/me/mailboxSettings`.
+    pub(super) fn set_out_of_office(&self, ooo: &protocol::OutOfOffice) -> Result<protocol::OutOfOffice, Fault> {
+        let status = if !ooo.enabled {
+            "disabled"
+        } else if ooo.start.is_some() && ooo.end.is_some() {
+            "scheduled"
+        } else {
+            "alwaysEnabled"
+        };
+        let external_audience = if ooo.enabled && ooo.send_external { "all" } else { "none" };
+        let external_msg = if ooo.send_external {
+            if ooo.external_message.is_empty() { ooo.message.as_str() } else { ooo.external_message.as_str() }
+        } else {
+            ""
+        };
+        let mut setting = json!({
+            "status": status,
+            "internalReplyMessage": ooo.message,
+            "externalAudience": external_audience,
+            "externalReplyMessage": external_msg,
+        });
+        if let (Some(start), Some(end)) = (ooo.start, ooo.end) {
+            if status == "scheduled" {
+                setting["scheduledStartDateTime"] = json!({"dateTime": iso_utc(start), "timeZone": "UTC"});
+                setting["scheduledEndDateTime"] = json!({"dateTime": iso_utc(end), "timeZone": "UTC"});
+            }
+        }
+        let url = format!("{}/v1.0/me/mailboxSettings", self.graph);
+        let body = json!({"automaticRepliesSetting": setting});
+        let answer = self.call("PATCH", &url, Auth::Bearer(GRAPH), Body::Json(&body), false)?.body;
+        let saved = if answer["automaticRepliesSetting"].is_object() {
+            parse_automatic_replies(&answer["automaticRepliesSetting"])
+        } else {
+            ooo.clone()
+        };
+        let me = self.me();
+        if !me.is_empty() {
+            if saved.enabled {
+                let msg = if saved.message.is_empty() { "Out of office".to_owned() } else { saved.message.clone() };
+                self.save_away(&me, Some((msg, saved.end)));
+                self.ctx.presence(&me, self.ctx.presence_of(&me), "Out of office", true);
+            } else {
+                self.save_away(&me, None);
+                self.ctx.presence(&me, self.ctx.presence_of(&me), "", true);
+            }
+        }
+        Ok(saved)
     }
 
     // Presence.
@@ -422,11 +599,8 @@ impl Teams {
             let note = presence["note"]["message"].as_str().unwrap_or("");
             let said = super::html::parse(note, &Nobody, "").text;
             let doing_now = presence["activity"].as_str().unwrap_or("");
-            // The status line: what they are doing, else out of office, else their note.
-            // Unverified: the out-of-office fields' names, read off the web client's answer.
-            let oof = presence["outOfOfficeNote"]["message"].as_str().map(|note| super::html::parse(note, &Nobody, "").text).filter(|note| !note.is_empty());
-            let away = presence["calendarData"]["isOutOfOffice"] == true || oof.is_some() || doing_now == "OutOfOffice";
-            let status = match (activity(doing_now), away) {
+            let ooo = parse_out_of_office(presence);
+            let status = match (activity(doing_now), ooo.is_some()) {
                 (words, _) if !words.is_empty() && words != "Out of office" => words.to_owned(),
                 (_, true) => "Out of office".to_owned(),
                 _ => said,
@@ -435,16 +609,7 @@ impl Teams {
             self.ctx.presence(id, presence_of(presence["availability"].as_str().unwrap_or("")), &status, owned);
             let kind = doing(doing_now);
             self.ctx.activity(id, "", kind.map(|kind| Activity { kind, name: String::new(), place: String::new(), conversation: None }), owned);
-            let mut state = self.state();
-            if away {
-                if state.away.len() >= AWAY_KEPT {
-                    state.away.clear();
-                }
-                let until = presence["outOfOfficeNote"]["expiry"].as_str().map(super::seconds).filter(|until| *until > 0);
-                state.away.insert(id.to_owned(), (oof.unwrap_or_else(|| "Out of office".to_owned()), until));
-            } else {
-                state.away.remove(id);
-            }
+            self.save_away(id, ooo);
         }
     }
 
@@ -549,5 +714,48 @@ mod tests {
         assert!(Teams::listed(&json!({"value": null})).is_empty());
         assert_eq!(Teams::link("ana@contoso.com"), "msteams:/l/chat/0/0?users=ana%40contoso.com");
         assert_eq!(Teams::link(""), "");
+    }
+
+    #[test]
+    fn out_of_office_is_parsed_from_both_note_and_settings_shapes() {
+        let note_shape = json!({
+            "activity": "OutOfOffice",
+            "outOfOfficeNote": {
+                "message": "<p>Back Monday, ask Ben</p>",
+                "expiry": "2026-10-19T08:00:00Z"
+            }
+        });
+        assert_eq!(parse_out_of_office(&note_shape), Some(("Back Monday, ask Ben".to_owned(), Some(1_792_396_800))));
+
+        let settings_shape = json!({
+            "activity": "Away",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": true,
+                "message": "On vacation until Friday",
+                "scheduledEndDateTime": {"dateTime": "2026-10-23T17:00:00Z", "timeZone": "UTC"}
+            }
+        });
+        assert_eq!(parse_out_of_office(&settings_shape), Some(("On vacation until Friday".to_owned(), Some(1_792_774_800))));
+
+        let cal_only = json!({"activity": "Available", "calendarData": {"isOutOfOffice": true}});
+        assert_eq!(parse_out_of_office(&cal_only), Some(("Out of office".to_owned(), None)));
+
+        let not_ooo = json!({"activity": "Available", "outOfOfficeSettings": {"isOutOfOffice": false}});
+        assert_eq!(parse_out_of_office(&not_ooo), None);
+
+        let graph = json!({
+            "status": "scheduled",
+            "externalAudience": "all",
+            "internalReplyMessage": "<p>Out this week</p>",
+            "externalReplyMessage": "<p>External reply</p>",
+            "scheduledStartDateTime": {"dateTime": "2026-10-19T08:00:00Z", "timeZone": "UTC"},
+            "scheduledEndDateTime": {"dateTime": "2026-10-23T17:00:00Z", "timeZone": "UTC"}
+        });
+        let parsed = parse_automatic_replies(&graph);
+        assert!(parsed.enabled && parsed.send_external);
+        assert_eq!(parsed.message, "Out this week");
+        assert_eq!(parsed.external_message, "External reply");
+        assert_eq!(parsed.start, Some(1_792_396_800));
+        assert_eq!(parsed.end, Some(1_792_774_800));
     }
 }

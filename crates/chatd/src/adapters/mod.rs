@@ -689,6 +689,15 @@ pub enum Command {
         policy: protocol::PrivacyPolicy,
         reply: Reply<protocol::PrivacyPolicy>,
     },
+    /// Read an account's out-of-office / automatic replies settings.
+    GetOutOfOffice {
+        reply: Reply<protocol::OutOfOffice>,
+    },
+    /// Write an account's out-of-office / automatic replies settings.
+    SetOutOfOffice {
+        ooo: protocol::OutOfOffice,
+        reply: Reply<protocol::OutOfOffice>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -873,6 +882,8 @@ impl Command {
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetOutOfOffice { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetOutOfOffice { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

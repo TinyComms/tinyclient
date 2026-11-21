@@ -207,6 +207,15 @@ pub struct StatusMenu {
     /// The head is editing our name and picture on this device.
     editing: bool,
     name: Entity<TextInput>,
+    /// Out-of-office / automatic replies inline form (for accounts with `can.out_of_office`).
+    ooo_open: Option<AccountKey>,
+    ooo_loading: bool,
+    ooo_saving: bool,
+    ooo_enabled: bool,
+    ooo_external: bool,
+    ooo_days: u32,
+    ooo_message: Entity<TextInput>,
+    ooo_external_message: Entity<TextInput>,
 }
 
 /// What an account's row says of it: how others see us there while it is connected, else why
@@ -270,6 +279,8 @@ impl StatusMenu {
             }
         })
         .detach();
+        let ooo_message = cx.new(|cx| TextInput::new("Internal automatic reply", cx));
+        let ooo_external_message = cx.new(|cx| TextInput::new("External reply (defaults to internal)", cx));
         StatusMenu {
             shell,
             hub,
@@ -281,12 +292,21 @@ impl StatusMenu {
             refused: None,
             editing: false,
             name,
+            ooo_open: None,
+            ooo_loading: false,
+            ooo_saving: false,
+            ooo_enabled: false,
+            ooo_external: false,
+            ooo_days: 0,
+            ooo_message,
+            ooo_external_message,
         }
     }
 
     /// The menu opened again: it starts as it was first seen, nothing half edited.
     pub fn opened(&mut self, cx: &mut Context<Self>) {
         self.editing = false;
+        self.ooo_open = None;
         self.refused = None;
         cx.notify();
     }
@@ -367,6 +387,7 @@ impl StatusMenu {
 
     fn toggle(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
         self.refused = None;
+        self.ooo_open = None;
         if self.open.as_ref() == Some(account) {
             self.open = None;
         } else {
@@ -444,6 +465,241 @@ impl StatusMenu {
             (None, None)
         };
         self.send(own.key, own.presence, Some(text), status_emoji, clear_at, cx);
+    }
+
+    fn toggle_ooo(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        self.refused = None;
+        if self.ooo_open.as_ref() == Some(&account) {
+            self.ooo_open = None;
+            cx.notify();
+            return;
+        }
+        self.ooo_open = Some(account.clone());
+        self.ooo_loading = true;
+        self.ooo_saving = false;
+        cx.notify();
+        if only_draws() {
+            self.ooo_loading = false;
+            return;
+        }
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::GetOutOfOffice { account }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.ooo_loading = false;
+                match answer {
+                    Ok(Response::OutOfOffice { ooo }) => {
+                        this.ooo_enabled = ooo.enabled;
+                        this.ooo_external = ooo.send_external;
+                        this.ooo_days = match (ooo.start, ooo.end) {
+                            (Some(s), Some(e)) if e > s => ((e - s) / 86_400).clamp(1, 7) as u32,
+                            _ => 0,
+                        };
+                        this.ooo_message.update(cx, |f, cx| f.set_text(&ooo.message, cx));
+                        this.ooo_external_message.update(cx, |f, cx| f.set_text(&ooo.external_message, cx));
+                    }
+                    Ok(Response::Error { detail, .. }) => this.refused = Some(detail),
+                    Err(err) => this.refused = Some(crate::client::trouble_words("people", &err)),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    fn save_ooo(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        if self.ooo_saving {
+            return;
+        }
+        self.refused = None;
+        self.ooo_saving = true;
+        let now = crate::view::now();
+        let (start, end) = if self.ooo_enabled && self.ooo_days > 0 {
+            (Some(now), Some(now + i64::from(self.ooo_days) * 86_400))
+        } else {
+            (None, None)
+        };
+        let ooo = protocol::OutOfOffice {
+            enabled: self.ooo_enabled,
+            message: self.ooo_message.read(cx).text().trim().to_owned(),
+            start,
+            end,
+            send_external: self.ooo_enabled && self.ooo_external,
+            external_message: self.ooo_external_message.read(cx).text().trim().to_owned(),
+        };
+        cx.notify();
+        if only_draws() {
+            self.ooo_saving = false;
+            self.ooo_open = None;
+            return;
+        }
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::SetOutOfOffice { account, ooo }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.ooo_saving = false;
+                match answer {
+                    Ok(Response::OutOfOffice { .. }) => {
+                        this.ooo_open = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => this.refused = Some(detail),
+                    Err(err) => this.refused = Some(crate::client::trouble_words("people", &err)),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    fn ooo_panel(&self, ix: usize, own: &Own, window: &Window, cx: &mut Context<Self>) -> Div {
+        let account = own.key.clone();
+        let open = self.ooo_open.as_ref() == Some(&own.key);
+        let mut box_div = div().mt(px(4.)).flex().flex_col().gap(px(4.)).child(
+            div()
+                .id(("own-ooo-toggle", ix))
+                .h(px(theme::ROW_ONE))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::selected()))
+                .child(glyph("icons/calendar.svg", 14., theme::text_soft()))
+                .child(div().flex_1().min_w_0().truncate().child("Out of office…"))
+                .child(glyph(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }, 14., theme::text_faint()))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_ooo(account.clone(), cx))),
+        );
+        if !open {
+            return box_div;
+        }
+        if self.ooo_loading {
+            return box_div.child(div().px(px(8.)).type_small().text_color(theme::text_faint()).child("Loading automatic replies…"));
+        }
+        let save_acc = own.key.clone();
+        let msg_focused = self.ooo_message.focus_handle(cx).is_focused(window);
+        let ext_focused = self.ooo_external_message.focus_handle(cx).is_focused(window);
+        let durations: [(&str, u32); 4] = [("Until off", 0), ("1 day", 1), ("3 days", 3), ("1 week", 7)];
+        let form = div()
+            .mx(px(8.))
+            .p(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::field())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .id(("ooo-enabled", ix))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child("Send automatic replies"))
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(theme::R_CHIP))
+                            .bg(if self.ooo_enabled { theme::accent() } else { theme::selected() })
+                            .type_micro()
+                            .text_color(if self.ooo_enabled { theme::on_accent() } else { theme::text_soft() })
+                            .child(if self.ooo_enabled { "On" } else { "Off" }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.ooo_enabled = !this.ooo_enabled;
+                        cx.notify();
+                    })),
+            )
+            .when(self.ooo_enabled, |form| {
+                form.child(
+                    field(msg_focused)
+                        .line_height(px(18.))
+                        .child(div().flex_1().min_w_0().child(self.ooo_message.clone())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(4.))
+                        .children(durations.into_iter().enumerate().map(|(dix, (label, days))| {
+                            let chosen = self.ooo_days == days;
+                            div()
+                                .id(("ooo-dur", ix * 8 + dix))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(theme::R_CHIP))
+                                .type_micro()
+                                .text_color(if chosen { theme::text() } else { theme::text_soft() })
+                                .when(chosen, |el| el.bg(theme::selected()))
+                                .cursor_pointer()
+                                .hover(|el| el.bg(theme::hover()))
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.ooo_days = days;
+                                    cx.notify();
+                                }))
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("ooo-external", ix))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .cursor_pointer()
+                        .child(div().type_small().text_color(theme::text()).child("Reply outside organization"))
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(theme::R_CHIP))
+                                .bg(if self.ooo_external { theme::warning() } else { theme::selected() })
+                                .type_micro()
+                                .text_color(if self.ooo_external { theme::on_accent() } else { theme::text_soft() })
+                                .child(if self.ooo_external { "On" } else { "Off" }),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ooo_external = !this.ooo_external;
+                            cx.notify();
+                        })),
+                )
+                .when(self.ooo_external, |form| {
+                    form.child(
+                        field(ext_focused)
+                            .line_height(px(18.))
+                            .child(div().flex_1().min_w_0().child(self.ooo_external_message.clone())),
+                    )
+                })
+            })
+            .child(
+                div()
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .child("Also updates your Outlook automatic replies. Turning on external replies notifies senders outside your organization."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(4.))
+                    .child(
+                        button(("ooo-cancel", ix), ButtonKind::Ghost, "Cancel")
+                            .h(px(24.))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ooo_open = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button(("ooo-save", ix), ButtonKind::Primary, if self.ooo_saving { "Saving…" } else { "Save" })
+                            .h(px(24.))
+                            .on_click(cx.listener(move |this, _, _, cx| this.save_ooo(save_acc.clone(), cx))),
+                    ),
+            );
+        box_div = box_div.child(form);
+        box_div
     }
 
     fn account_row(&self, ix: usize, own: &Own, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -638,9 +894,13 @@ impl StatusMenu {
                 }));
             status_box = status_box.child(emoji_row).child(clear_row);
         }
-        choices.child(status_box.when(unsent, |status| {
+        let mut out = choices.child(status_box.when(unsent, |status| {
             status.child(div().type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label("Return sets it.")))
-        }))
+        }));
+        if own.can.out_of_office {
+            out = out.child(self.ooo_panel(ix, own, window, cx));
+        }
+        out
     }
 }
 
