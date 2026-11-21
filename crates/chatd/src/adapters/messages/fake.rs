@@ -333,6 +333,7 @@ fn note(
         outgoing: false,
         file,
         pieces,
+        location: None,
         reactions,
         status: 0,
         tmp: String::new(),
@@ -399,6 +400,10 @@ fn media_note(
         vec![piece],
         Vec::new(),
     ))]
+}
+
+fn sample_vcard() -> Vec<u8> {
+    b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Linnea Sol\r\nORG:Harbor Co\r\nTEL;TYPE=CELL:+1 555 010 0042\r\nEMAIL:linnea@harbor.example\r\nEND:VCARD\r\n".to_vec()
 }
 
 fn png() -> Vec<u8> {
@@ -483,6 +488,56 @@ fn steer(line: &str) -> Vec<Event> {
                 &text,
                 false,
                 vec![photo_piece(true)],
+                Vec::new(),
+            ))]
+        }
+        "location" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let lat: f64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(37.7749);
+            let lng: f64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(-122.4194);
+            let label = rest(4);
+            let mut msg = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-loc"),
+                "",
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            msg.location = Some(crate::adapters::messages::bugle::Location {
+                lat,
+                lng,
+                label,
+                address: String::new(),
+            });
+            vec![Event::Message(msg)]
+        }
+        "vcard" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let remote = words.next() == Some("remote");
+            let raw = sample_vcard();
+            let piece = Piece {
+                name: "linnea.vcf".into(),
+                mime: "text/vcard".into(),
+                media_id: if remote { "fake-vcard".into() } else { String::new() },
+                inline: if remote { Vec::new() } else { raw.clone() },
+                size: raw.len() as u64,
+                ..Piece::default()
+            };
+            vec![Event::Message(note(
+                author,
+                name,
+                author,
+                if remote { "m-vcard-remote" } else { "m-vcard-inline" },
+                "",
+                true,
+                vec![piece],
                 Vec::new(),
             ))]
         }
@@ -1055,6 +1110,9 @@ impl Drive for Fake {
     ) -> Result<Vec<u8>, String> {
         self.unanswered()?;
         record(&format!("fetch {message} {media_id}"));
+        if media_id == "fake-vcard" {
+            return Ok(sample_vcard());
+        }
         Ok(png())
     }
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {

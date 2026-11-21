@@ -2090,3 +2090,78 @@ fn messages_can_be_starred_unstarred_and_listed_under_starred() {
         other => panic!("expected Pinned/Starred response, got {other:?}"),
     }
 }
+
+#[test]
+fn shared_location_and_vcard_render_as_cards_without_leaking_coordinates() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Shared location decodes into a Location card (not Unsupported) with geo: link and
+    //    empty message text so notification previews only show the label, not coordinates.
+    world.steer("location grace 37.7749 -122.4194 Ferry Building");
+    let loc_msg = world.until("location message", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-phone-grace-loc")
+    });
+    assert_eq!(loc_msg.kind, MessageKind::Normal);
+    assert!(loc_msg.text.is_empty(), "location text stays empty so previews omit coordinates");
+    let card = loc_msg.card.as_deref().expect("location card present");
+    assert_eq!(card.title, "Ferry Building");
+    assert_eq!(card.footer, "Open in Maps");
+    assert!(card.text.contains("geo:37.7749,-122.4194"));
+    assert_eq!(
+        card.fields,
+        [
+            ("Latitude".to_owned(), "37.7749".to_owned()),
+            ("Longitude".to_owned(), "-122.4194".to_owned()),
+        ]
+    );
+
+    // 2. Inline vCard renders immediately as a masked contact card while keeping the .vcf file.
+    world.steer("vcard grace");
+    let inline_vc = world.until("inline vcard", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-vcard-inline")
+    });
+    let card = inline_vc.card.as_deref().expect("inline vcard card present");
+    assert_eq!(card.title, "Linnea Sol");
+    assert_eq!(card.text, "Harbor Co");
+    assert_eq!(card.footer, "Contact card");
+    assert_eq!(card.fields[0].0, "Phone");
+    assert!(card.fields[0].1.contains("42"));
+    assert!(!card.fields[0].1.contains("555"), "phone number must be masked");
+    assert_eq!(card.fields[1], ("Email".to_owned(), "linnea@harbor.example".to_owned()));
+    assert_eq!(inline_vc.attachments.len(), 1);
+    assert_eq!(inline_vc.attachments[0].name, "linnea.vcf");
+
+    // 3. Remote vCard starts as a downloadable file and upgrades to a contact card once fetched.
+    world.steer("vcard grace remote");
+    let remote_vc = world.until("remote vcard", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-vcard-remote")
+    });
+    assert!(remote_vc.card.is_none());
+    let file_id = remote_vc.attachments[0].file.id.clone();
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec![file_id],
+        size: None,
+        retry: false,
+    });
+    let upgraded = world.until("fetched vcard card", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-vcard-remote" && m.card.is_some())
+    });
+    let card = upgraded.card.as_deref().unwrap();
+    assert_eq!(card.title, "Linnea Sol");
+    assert_eq!(card.footer, "Contact card");
+    assert!(!card.fields[0].1.contains("555"));
+}

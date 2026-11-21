@@ -222,6 +222,12 @@ impl Buf {
     fn msg(&mut self, field: u32, inner: &[u8]) {
         self.bytes(field, inner);
     }
+
+    #[cfg(test)]
+    fn double(&mut self, field: u32, value: f64) {
+        self.key(field, 1);
+        self.0.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
 }
 
 fn config_version() -> Vec<u8> {
@@ -265,6 +271,8 @@ struct Field {
     number: u32,
     bytes: Vec<u8>,
     varint: Option<u64>,
+    fixed64: Option<u64>,
+    fixed32: Option<u32>,
 }
 
 fn read_varint(input: &mut &[u8]) -> Option<u64> {
@@ -299,6 +307,8 @@ fn fields(mut input: &[u8]) -> Vec<Field> {
                     number,
                     bytes: Vec::new(),
                     varint: Some(n),
+                    fixed64: None,
+                    fixed32: None,
                 });
             }
             2 => {
@@ -315,19 +325,37 @@ fn fields(mut input: &[u8]) -> Vec<Field> {
                     number,
                     bytes: data.to_vec(),
                     varint: None,
+                    fixed64: None,
+                    fixed32: None,
                 });
             }
             1 => {
                 if input.len() < 8 {
                     break;
                 }
+                let raw = u64::from_le_bytes(input[..8].try_into().unwrap());
                 input = &input[8..];
+                out.push(Field {
+                    number,
+                    bytes: Vec::new(),
+                    varint: None,
+                    fixed64: Some(raw),
+                    fixed32: None,
+                });
             }
             5 => {
                 if input.len() < 4 {
                     break;
                 }
+                let raw = u32::from_le_bytes(input[..4].try_into().unwrap());
                 input = &input[4..];
+                out.push(Field {
+                    number,
+                    bytes: Vec::new(),
+                    varint: None,
+                    fixed64: None,
+                    fixed32: Some(raw),
+                });
             }
             _ => break,
         }
@@ -355,6 +383,20 @@ fn field_int(list: &[Field], number: u32) -> u64 {
     field(list, number)
         .and_then(|field| field.varint)
         .unwrap_or(0)
+}
+
+fn field_double(list: &[Field], number: u32) -> Option<f64> {
+    let f = field(list, number)?;
+    if let Some(bits) = f.fixed64 {
+        return Some(f64::from_bits(bits));
+    }
+    if let Some(bits) = f.fixed32 {
+        return Some(f64::from(f32::from_bits(bits)));
+    }
+    if !f.bytes.is_empty() {
+        return std::str::from_utf8(&f.bytes).ok()?.trim().parse::<f64>().ok();
+    }
+    None
 }
 
 /// `RPCPairData.revoked` (field 5) with no `paired` (field 4): the phone removed this computer.
@@ -1231,6 +1273,15 @@ pub struct Mark {
     pub who: Vec<String>,
 }
 
+/// A shared geographic location decoded from `MessageInfo.location` (field 5).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Location {
+    pub lat: f64,
+    pub lng: f64,
+    pub label: String,
+    pub address: String,
+}
+
 #[derive(Clone, Default)]
 pub struct Note {
     pub id: String,
@@ -1242,6 +1293,7 @@ pub struct Note {
     pub outgoing: bool,
     pub file: bool,
     pub pieces: Vec<Piece>,
+    pub location: Option<Location>,
     pub reactions: Vec<Mark>,
     /// The phone's word on the message (`MessageStatus.status`, field 4.2).
     pub status: u64,
@@ -3026,6 +3078,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         let mut text = String::new();
         let mut file = false;
         let mut pieces = Vec::new();
+        let mut location = None;
         for info in msg.iter().filter(|field| field.number == 10) {
             let parts = fields(&info.bytes);
             let action_id = field_text(&parts, 1);
@@ -3044,13 +3097,17 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
                     pieces.push(piece);
                 }
             }
-            if field(&parts, 5).is_some() && pieces.is_empty() {
-                file = true;
-                pieces.push(Piece {
-                    name: "Location".into(),
-                    mime: "text/plain".into(),
-                    ..Piece::default()
-                });
+            if let Some(loc_field) = field(&parts, 5) {
+                if let Some(loc) = decode_location(&loc_field.bytes) {
+                    location = Some(loc);
+                } else if location.is_none() && pieces.is_empty() {
+                    file = true;
+                    pieces.push(Piece {
+                        name: "Location".into(),
+                        mime: "text/plain".into(),
+                        ..Piece::default()
+                    });
+                }
             }
         }
         let reactions = decode_reactions(&msg);
@@ -3061,6 +3118,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         let starred = field_int(&msg, 24) != 0;
         if text.is_empty()
             && file
+            && location.is_none()
             && pieces
                 .iter()
                 .all(|piece| piece.inline.is_empty() && piece.media_id.is_empty())
@@ -3085,6 +3143,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             outgoing,
             file,
             pieces,
+            location,
             reactions,
             status,
             tmp,
@@ -3098,6 +3157,63 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         });
     }
     notes
+}
+
+/// Decodes a Bugle `Location` part (`MessageInfo` field 5).
+/// Supports both flat coordinates (`1: lat, 2: lng, 3: label, 4: address`) and nested
+/// `Coordinates` submessages (`1: name, 2: address, 3: { 1: lat, 2: lng }` or
+/// `1: { 1: lat, 2: lng }, 2: label, 3: address`).
+fn decode_location(bytes: &[u8]) -> Option<Location> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let list = fields(bytes);
+    let valid = |lat: f64, lng: f64| {
+        lat.is_finite()
+            && lng.is_finite()
+            && (-90.0..=90.0).contains(&lat)
+            && (-180.0..=180.0).contains(&lng)
+    };
+    // 1. Flat layout: field 1 = lat, field 2 = lng, field 3 = label, field 4 = address.
+    if let (Some(lat), Some(lng)) = (field_double(&list, 1), field_double(&list, 2)) {
+        if valid(lat, lng) {
+            return Some(Location {
+                lat,
+                lng,
+                label: field_text(&list, 3),
+                address: field_text(&list, 4),
+            });
+        }
+    }
+    // 2. Nested Coordinates in field 3: field 1 = label, field 2 = address, field 3 = { 1: lat, 2: lng }.
+    if let Some(coords_field) = field(&list, 3).filter(|f| !f.bytes.is_empty()) {
+        let coords = fields(&coords_field.bytes);
+        if let (Some(lat), Some(lng)) = (field_double(&coords, 1), field_double(&coords, 2)) {
+            if valid(lat, lng) {
+                return Some(Location {
+                    lat,
+                    lng,
+                    label: field_text(&list, 1),
+                    address: field_text(&list, 2),
+                });
+            }
+        }
+    }
+    // 3. Nested Coordinates in field 1: field 1 = { 1: lat, 2: lng }, field 2 = label, field 3 = address.
+    if let Some(coords_field) = field(&list, 1).filter(|f| !f.bytes.is_empty()) {
+        let coords = fields(&coords_field.bytes);
+        if let (Some(lat), Some(lng)) = (field_double(&coords, 1), field_double(&coords, 2)) {
+            if valid(lat, lng) {
+                return Some(Location {
+                    lat,
+                    lng,
+                    label: field_text(&list, 2),
+                    address: field_text(&list, 3),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Decodes RCS edit metadata from a Bugle `Message`:
@@ -3876,5 +3992,51 @@ mod tests {
         assert_eq!(field_text(&req, 1), "c1");
         assert_eq!(field_text(&req, 2), "m-star");
         assert_eq!(field_int(&req, 3), 1);
+    }
+
+    #[test]
+    fn location_part_decodes_flat_and_nested_coordinates_and_rejects_out_of_range() {
+        // Flat layout: double lat/lng + label + address.
+        let mut loc = Buf::new();
+        loc.double(1, 37.7749);
+        loc.double(2, -122.4194);
+        loc.text(3, "Ferry Building");
+        loc.text(4, "1 Ferry Building, San Francisco, CA");
+        let mut info = Buf::new();
+        info.msg(5, &loc.0);
+        let mut msg = Buf::new();
+        msg.text(1, "m-loc-1");
+        msg.text(7, "c1");
+        msg.msg(10, &info.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        let got = notes[0].location.as_ref().expect("location decoded");
+        assert!((got.lat - 37.7749).abs() < 1e-6);
+        assert!((got.lng + 122.4194).abs() < 1e-6);
+        assert_eq!(got.label, "Ferry Building");
+        assert_eq!(got.address, "1 Ferry Building, San Francisco, CA");
+        assert!(!notes[0].file, "decoded location must not be flagged as unsupported file");
+
+        // Nested layout: label/address + Coordinates submessage in field 3.
+        let mut coords = Buf::new();
+        coords.double(1, 51.5074);
+        coords.double(2, -0.1278);
+        let mut nested = Buf::new();
+        nested.text(1, "London");
+        nested.text(2, "London, UK");
+        nested.msg(3, &coords.0);
+        let dec = decode_location(&nested.0).expect("nested location decoded");
+        assert!((dec.lat - 51.5074).abs() < 1e-6);
+        assert!((dec.lng + 0.1278).abs() < 1e-6);
+        assert_eq!(dec.label, "London");
+        assert_eq!(dec.address, "London, UK");
+
+        // Out-of-range coordinates rejected.
+        let mut bad = Buf::new();
+        bad.double(1, 95.0);
+        bad.double(2, 200.0);
+        assert!(decode_location(&bad.0).is_none());
     }
 }

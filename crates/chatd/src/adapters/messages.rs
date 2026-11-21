@@ -501,9 +501,11 @@ pub fn reaction_rules() -> protocol::ReactionRules {
 struct Held {
     media_id: String,
     key: Vec<u8>,
+    conversation: String,
     message: String,
     action: String,
     mime: String,
+    name: String,
 }
 
 /// A text this computer has not asked the phone to send yet. Kept only for this connection.
@@ -1270,6 +1272,9 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
     if !note.reply.is_empty() {
         message.reply_to = Some(quoted(account, &note.conversation, &note.reply, page));
     }
+    if let Some(loc) = &note.location {
+        message.card = Some(Box::new(location_card(loc)));
+    }
     let mut shown = Vec::new();
     for (index, piece) in note.pieces.iter().enumerate() {
         if piece.inline.is_empty() && piece.media_id.is_empty() {
@@ -1299,15 +1304,20 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
                 }
             }
             if !piece.media_id.is_empty() {
-                remember_held(account, &id, piece, &note.id);
+                remember_held(account, &id, piece, &note.conversation, &note.id);
             }
         } else if !piece.inline.is_empty() {
             if let Some(path) = land(account, &file, &piece.inline) {
                 file.path = Some(path);
                 file.bytes = piece.inline.len() as u64;
             }
+            if message.card.is_none() && is_vcard(&piece.mime, &piece.name) {
+                if let Some(vc) = parse_vcard(&piece.inline) {
+                    message.card = Some(Box::new(vcard_card(&vc)));
+                }
+            }
         } else if !piece.media_id.is_empty() {
-            remember_held(account, &id, piece, &note.id);
+            remember_held(account, &id, piece, &note.conversation, &note.id);
         }
         let label = if piece.name.is_empty() {
             "File".into()
@@ -1413,7 +1423,7 @@ fn kind_of(mime: &str) -> MediaKind {
     }
 }
 
-fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, message: &str) {
+fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, conversation: &str, message: &str) {
     account
         .held
         .lock()
@@ -1423,11 +1433,178 @@ fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, message: &st
             Held {
                 media_id: piece.media_id.clone(),
                 key: piece.key.clone(),
+                conversation: conversation.to_owned(),
                 message: message.to_owned(),
                 action: piece.action_id.clone(),
                 mime: piece.mime.clone(),
+                name: piece.name.clone(),
             },
         );
+}
+
+fn coord(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn location_card(loc: &bugle::Location) -> protocol::Card {
+    let geo = format!("geo:{},{}", coord(loc.lat), coord(loc.lng));
+    let title = if loc.label.is_empty() {
+        "Location".to_owned()
+    } else {
+        loc.label.clone()
+    };
+    let text = if loc.address.is_empty() {
+        geo
+    } else {
+        format!("{}\n{geo}", loc.address)
+    };
+    protocol::Card {
+        title,
+        text,
+        fields: vec![
+            ("Latitude".to_owned(), coord(loc.lat)),
+            ("Longitude".to_owned(), coord(loc.lng)),
+        ],
+        footer: "Open in Maps".to_owned(),
+        color: None,
+        sponsored: false,
+    }
+}
+
+pub(crate) fn mask_phone(phone: &str) -> String {
+    let code = if phone.starts_with('+') {
+        phone.split_whitespace().next().unwrap_or("").len()
+    } else {
+        0
+    };
+    let digits = phone
+        .char_indices()
+        .filter(|(ix, ch)| *ix >= code && ch.is_ascii_digit())
+        .count();
+    let mut seen = 0;
+    phone
+        .char_indices()
+        .map(|(ix, ch)| {
+            if !ch.is_ascii_digit() || ix < code {
+                return ch;
+            }
+            seen += 1;
+            if seen + 2 > digits {
+                ch
+            } else {
+                '•'
+            }
+        })
+        .collect()
+}
+
+fn is_vcard(mime: &str, name: &str) -> bool {
+    let mime = mime.to_ascii_lowercase();
+    mime.contains("vcard") || name.to_ascii_lowercase().ends_with(".vcf")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VCard {
+    name: String,
+    org: String,
+    phones: Vec<String>,
+    emails: Vec<String>,
+}
+
+fn parse_vcard(bytes: &[u8]) -> Option<VCard> {
+    let raw = std::str::from_utf8(bytes).ok()?;
+    let mut unfolded = Vec::<String>::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix(' ').or_else(|| line.strip_prefix('\t')) {
+            if let Some(last) = unfolded.last_mut() {
+                last.push_str(rest);
+                continue;
+            }
+        }
+        unfolded.push(line.to_owned());
+    }
+    if !unfolded
+        .iter()
+        .any(|line| line.trim().eq_ignore_ascii_case("BEGIN:VCARD"))
+    {
+        return None;
+    }
+    let mut card = VCard::default();
+    let mut fallback_name = String::new();
+    for line in unfolded {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let prop = key.split(';').next().unwrap_or("").trim().to_ascii_uppercase();
+        let val = value.trim();
+        if val.is_empty() {
+            continue;
+        }
+        match prop.as_str() {
+            "FN" if card.name.is_empty() => card.name = val.to_owned(),
+            "N" if fallback_name.is_empty() => {
+                let parts: Vec<&str> = val.split(';').collect();
+                let last = parts.first().copied().unwrap_or("").trim();
+                let first = parts.get(1).copied().unwrap_or("").trim();
+                let joined = format!("{first} {last}").trim().to_owned();
+                if !joined.is_empty() {
+                    fallback_name = joined;
+                }
+            }
+            "ORG" if card.org.is_empty() => {
+                card.org = val.split(';').next().unwrap_or(val).trim().to_owned();
+            }
+            "TEL" => {
+                let clean = val.strip_prefix("tel:").unwrap_or(val).trim().to_owned();
+                if !clean.is_empty() && !card.phones.contains(&clean) {
+                    card.phones.push(clean);
+                }
+            }
+            "EMAIL" => {
+                let clean = val.to_owned();
+                if !card.emails.contains(&clean) {
+                    card.emails.push(clean);
+                }
+            }
+            _ => {}
+        }
+    }
+    if card.name.is_empty() {
+        card.name = fallback_name;
+    }
+    if card.name.is_empty() && card.phones.is_empty() && card.emails.is_empty() {
+        return None;
+    }
+    Some(card)
+}
+
+fn vcard_card(vcard: &VCard) -> protocol::Card {
+    let mut fields = Vec::new();
+    for phone in &vcard.phones {
+        fields.push(("Phone".to_owned(), mask_phone(phone)));
+    }
+    for email in &vcard.emails {
+        fields.push(("Email".to_owned(), email.clone()));
+    }
+    protocol::Card {
+        title: if vcard.name.is_empty() {
+            "Contact".to_owned()
+        } else {
+            vcard.name.clone()
+        },
+        text: vcard.org.clone(),
+        fields,
+        footer: "Contact card".to_owned(),
+        color: None,
+        sponsored: false,
+    }
 }
 
 /// A JPEG or PNG, which is the only still a video's inline bytes can be. The layout has no
@@ -1622,9 +1799,11 @@ fn wanted(account: &Account, ids: &[String]) {
             .map(|held| Held {
                 media_id: held.media_id.clone(),
                 key: held.key.clone(),
+                conversation: held.conversation.clone(),
                 message: held.message.clone(),
                 action: held.action.clone(),
                 mime: held.mime.clone(),
+                name: held.name.clone(),
             });
         let Some(held) = held else {
             continue;
@@ -1637,6 +1816,18 @@ fn wanted(account: &Account, ids: &[String]) {
                 let mut file = MediaFile::new(id.clone(), kind_of(&held.mime));
                 file.bytes = bytes.len() as u64;
                 let _ = land(account, &file, &bytes);
+                if is_vcard(&held.mime, &held.name) {
+                    if let Some(vc) = parse_vcard(&bytes) {
+                        if let Ok(Some(mut stored)) =
+                            account.ctx.stored_message(&held.conversation, &held.message)
+                        {
+                            if stored.card.is_none() {
+                                stored.card = Some(Box::new(vcard_card(&vc)));
+                                let _ = account.ctx.message(&held.conversation, &stored);
+                            }
+                        }
+                    }
+                }
             }
             Err(why) => {
                 let file = MediaFile::new(id.clone(), kind_of(&held.mime));
@@ -3413,8 +3604,45 @@ mod outbox_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_full_page_keeps_reading_and_a_short_one_stops() {
         super::prove_message_search().unwrap();
+    }
+
+    #[test]
+    fn location_card_omits_coordinates_from_notification_preview() {
+        let loc = bugle::Location {
+            lat: 37.7749,
+            lng: -122.4194,
+            label: "Ferry Building".into(),
+            address: "1 Ferry Building, SF".into(),
+        };
+        let mut msg = Message::plain("m-loc", "Grace", "", 1_700_000_000, false);
+        msg.card = Some(Box::new(location_card(&loc)));
+        let preview = crate::store::preview_text(&msg);
+        assert_eq!(preview, "Ferry Building");
+        assert!(!preview.contains("37.7749"), "coordinates must not leak into notification previews");
+        assert!(!preview.contains("-122.4194"), "coordinates must not leak into notification previews");
+    }
+
+    #[test]
+    fn vcard_parses_folded_lines_and_masks_phone_numbers() {
+        let raw = b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Linnea\r\n  Sol\r\nORG:Harbor Co\r\nTEL;TYPE=CELL:+1 555 010 0042\r\nEMAIL:linnea@harbor.example\r\nEND:VCARD\r\n";
+        let vc = parse_vcard(raw).expect("vcard parsed");
+        assert_eq!(vc.name, "Linnea Sol");
+        assert_eq!(vc.org, "Harbor Co");
+        assert_eq!(vc.phones, ["+1 555 010 0042"]);
+        assert_eq!(vc.emails, ["linnea@harbor.example"]);
+
+        let card = vcard_card(&vc);
+        assert_eq!(card.title, "Linnea Sol");
+        assert_eq!(card.text, "Harbor Co");
+        assert_eq!(card.footer, "Contact card");
+        assert_eq!(card.fields[0].0, "Phone");
+        assert!(card.fields[0].1.contains("42"));
+        assert!(!card.fields[0].1.contains("555"), "phone number must be masked");
+        assert_eq!(card.fields[1], ("Email".to_owned(), "linnea@harbor.example".to_owned()));
     }
 }
