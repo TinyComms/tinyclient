@@ -412,6 +412,9 @@ pub struct SettingsWindow {
     /// Never written back until loaded so existing exceptions are always preserved.
     pub(super) tg_privacy: HashMap<(protocol::AccountKey, protocol::PrivacyKey), protocol::PrivacyPolicy>,
     pub(super) tg_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Loaded account-wide notification defaults and exceptions (Telegram).
+    pub(super) tg_notify_defaults: HashMap<protocol::AccountKey, protocol::NotifyDefaults>,
+    pub(super) tg_notify_requested: std::collections::HashSet<protocol::AccountKey>,
     /// Drawn as the phone's page: a list of sections, then one section at a time.
     pub(super) phone: bool,
     /// On a phone: the list of sections is on show, not `section`.
@@ -556,6 +559,8 @@ impl SettingsWindow {
             tiny,
             tg_privacy: HashMap::new(),
             tg_privacy_requested: std::collections::HashSet::new(),
+            tg_notify_defaults: HashMap::new(),
+            tg_notify_requested: std::collections::HashSet::new(),
             phone,
             listing: phone,
             shown: phone,

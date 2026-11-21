@@ -3974,6 +3974,24 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::GetNotifyDefaults { account } => {
+                match self.ask(&account, |reply| Command::GetNotifyDefaults { reply }) {
+                    Ok(defaults) => Response::NotifyDefaults { defaults },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetNotifyDefault { account, scope, muted } => {
+                match self.ask(&account, |reply| Command::SetNotifyDefault { scope, muted, reply }) {
+                    Ok(defaults) => Response::NotifyDefaults { defaults },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ResetNotifyDefaults { account } => {
+                match self.ask(&account, |reply| Command::ResetNotifyDefaults { reply }) {
+                    Ok(defaults) => Response::NotifyDefaults { defaults },
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

@@ -164,6 +164,9 @@ impl SettingsWindow {
                 if network == Network::Telegram && account.link == Link::Connected {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
                 }
+                if account.can.notify_defaults && account.link == Link::Connected {
+                    group = group.child(self.notify_defaults_rows(account, ix, cx));
+                }
             }
             if network == Network::Tiny {
                 tiny_line = self.tiny_line();
@@ -186,6 +189,182 @@ impl SettingsWindow {
     fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
         cx.notify();
+    }
+
+    fn load_notify_defaults(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_notify_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::GetNotifyDefaults { account: acc }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::NotifyDefaults { defaults }) = answer {
+                    this.tg_notify_defaults.insert(account, defaults);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_notify_default(
+        &mut self,
+        account: protocol::AccountKey,
+        scope: protocol::NotifyDefaultScope,
+        muted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(cur) = self.tg_notify_defaults.get_mut(&account) {
+            match scope {
+                protocol::NotifyDefaultScope::Users => cur.users_muted = muted,
+                protocol::NotifyDefaultScope::Groups => cur.groups_muted = muted,
+                protocol::NotifyDefaultScope::Channels => cur.channels_muted = muted,
+            }
+            cx.notify();
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&protocol::Request::SetNotifyDefault { account: acc, scope, muted })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::NotifyDefaults { defaults }) = answer {
+                    this.tg_notify_defaults.insert(account, defaults);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn reset_notify_defaults(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::ResetNotifyDefaults { account: acc }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::NotifyDefaults { defaults }) = answer {
+                    this.tg_notify_defaults.insert(account, defaults);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn notify_defaults_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_notify_defaults(account.key.clone(), cx);
+        let loaded = self.tg_notify_defaults.get(&account.key).cloned();
+        let mut box_div = div().flex().flex_col();
+        let scopes: [(&str, protocol::NotifyDefaultScope); 3] = [
+            ("Private chats", protocol::NotifyDefaultScope::Users),
+            ("Groups", protocol::NotifyDefaultScope::Groups),
+            ("Channels", protocol::NotifyDefaultScope::Channels),
+        ];
+        for (s_ix, (label, scope)) in scopes.into_iter().enumerate() {
+            let control = if let Some(ref defs) = loaded {
+                let muted = match scope {
+                    protocol::NotifyDefaultScope::Users => defs.users_muted,
+                    protocol::NotifyDefaultScope::Groups => defs.groups_muted,
+                    protocol::NotifyDefaultScope::Channels => defs.channels_muted,
+                };
+                let acc_on = account.key.clone();
+                let acc_off = account.key.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        button(
+                            ("tg-ndef-on", ix * 100 + s_ix * 2),
+                            if !muted { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            "On",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_notify_default(acc_on.clone(), scope, false, cx);
+                        })),
+                    )
+                    .child(
+                        button(
+                            ("tg-ndef-off", ix * 100 + s_ix * 2 + 1),
+                            if muted { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            "Muted",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_notify_default(acc_off.clone(), scope, true, cx);
+                        })),
+                    )
+                    .into_any_element()
+            } else {
+                div().type_small().text_color(theme::text_faint()).child("Loading…").into_any_element()
+            };
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().type_ui().text_color(theme::text()).child(format!("{label} notifications")))
+                            .child(
+                                div()
+                                    .type_small()
+                                    .text_color(theme::text_soft())
+                                    .child("Account-wide default across all your devices."),
+                            ),
+                    )
+                    .child(control),
+            );
+        }
+        if let Some(ref defs) = loaded {
+            let exc_summary = if defs.exceptions.is_empty() {
+                "No per-chat notification exceptions.".to_owned()
+            } else {
+                let names: Vec<String> = defs
+                    .exceptions
+                    .iter()
+                    .take(5)
+                    .map(|e| format!("{} ({})", e.title, if e.muted { "muted" } else { "unmuted" }))
+                    .collect();
+                format!("Exceptions ({}): {}", defs.exceptions.len(), names.join(", "))
+            };
+            let acc_reset = account.key.clone();
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(div().flex_1().min_w_0().type_small().text_color(theme::text_soft()).child(exc_summary))
+                    .child(
+                        button(("tg-ndef-reset", ix), ButtonKind::Ghost, "Reset all").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.reset_notify_defaults(acc_reset.clone(), cx);
+                            },
+                        )),
+                    ),
+            );
+        }
+        box_div
     }
 
     fn load_telegram_privacy(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {

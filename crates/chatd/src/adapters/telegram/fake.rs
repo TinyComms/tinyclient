@@ -562,6 +562,10 @@ struct World {
     noforwards: HashSet<Who>,
     /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
     saved_gifs: Vec<i64>,
+    /// Account-wide notification defaults: `[users_muted, groups_muted, channels_muted]`.
+    notify_defaults: [bool; 3],
+    /// Per-peer notification exceptions (`account.getNotifyExceptions`).
+    notify_exceptions: Vec<(Who, bool)>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -631,6 +635,8 @@ impl World {
             large_broke: false,
             noforwards: HashSet::new(),
             saved_gifs: vec![6_200],
+            notify_defaults: [false, false, false],
+            notify_exceptions: vec![(Who::Channel(NOTES), true)],
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -2169,9 +2175,36 @@ impl World {
             self.log("GetUsers");
             return answer(vec![tl::enums::User::from(self.self_user())]);
         }
-        if asked::<f::account::GetNotifySettings>(body).is_some() {
+        if let Some(request) = asked::<f::account::GetNotifySettings>(body) {
             self.log("GetNotifySettings");
-            return answer(settings(None));
+            let mute = match request.peer {
+                tl::enums::InputNotifyPeer::InputNotifyUsers => self.notify_defaults[0].then_some(i32::MAX),
+                tl::enums::InputNotifyPeer::InputNotifyChats => self.notify_defaults[1].then_some(i32::MAX),
+                tl::enums::InputNotifyPeer::InputNotifyBroadcasts => self.notify_defaults[2].then_some(i32::MAX),
+                _ => None,
+            };
+            return answer(settings(mute));
+        }
+        if asked::<f::account::GetNotifyExceptions>(body).is_some() {
+            self.log("GetNotifyExceptions");
+            let list: Vec<tl::enums::Update> = self
+                .notify_exceptions
+                .iter()
+                .map(|(who, muted)| {
+                    tl::types::UpdateNotifySettings {
+                        peer: tl::types::NotifyPeer { peer: who.peer() }.into(),
+                        notify_settings: settings(muted.then_some(i32::MAX)),
+                    }
+                    .into()
+                })
+                .collect();
+            return answer(updates(list));
+        }
+        if asked::<f::account::ResetNotifySettings>(body).is_some() {
+            self.log("ResetNotifySettings");
+            self.notify_defaults = [false; 3];
+            self.notify_exceptions.clear();
+            return answer(true);
         }
         if asked::<f::account::UpdateStatus>(body).is_some() {
             self.log("UpdateStatus");
@@ -3094,12 +3127,24 @@ impl World {
             return Some(answer(tl::enums::channels::ChannelParticipant::Participant(found)));
         }
         if let Some(request) = asked::<f::account::UpdateNotifySettings>(body) {
+            let tl::enums::InputPeerNotifySettings::Settings(settings) = &request.settings;
+            let is_muted = settings.mute_until.is_some_and(|v| v > 0);
             let peer = match &request.peer {
                 tl::enums::InputNotifyPeer::Peer(peer) => input_who(&peer.peer).text(),
                 tl::enums::InputNotifyPeer::InputNotifyForumTopic(topic) => key(input_who(&topic.peer), Some(topic.top_msg_id)),
-                _ => "default".to_owned(),
+                tl::enums::InputNotifyPeer::InputNotifyUsers => {
+                    self.notify_defaults[0] = is_muted;
+                    "users".to_owned()
+                }
+                tl::enums::InputNotifyPeer::InputNotifyChats => {
+                    self.notify_defaults[1] = is_muted;
+                    "chats".to_owned()
+                }
+                tl::enums::InputNotifyPeer::InputNotifyBroadcasts => {
+                    self.notify_defaults[2] = is_muted;
+                    "broadcasts".to_owned()
+                }
             };
-            let tl::enums::InputPeerNotifySettings::Settings(settings) = &request.settings;
             self.log(&format!("UpdateNotifySettings {peer} {}", settings.mute_until.unwrap_or(-1)));
             return Some(answer(true));
         }

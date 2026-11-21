@@ -671,6 +671,20 @@ pub enum Command {
         data: String,
         reply: Reply<protocol::ButtonAnswer>,
     },
+    /// Reads account-wide notification defaults and per-chat exceptions.
+    GetNotifyDefaults {
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Updates an account-wide notification default for private chats, groups, or channels.
+    SetNotifyDefault {
+        scope: protocol::NotifyDefaultScope,
+        muted: bool,
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Resets all account-wide notification defaults and exceptions.
+    ResetNotifyDefaults {
+        reply: Reply<protocol::NotifyDefaults>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -899,6 +913,9 @@ impl Command {
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNotifyDefaults { reply }
+            | Command::SetNotifyDefault { reply, .. }
+            | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

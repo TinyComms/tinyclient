@@ -1009,6 +1009,102 @@ pub(super) fn press_button(
     })
 }
 
+/// Read account-wide notification defaults (`account.getNotifySettings`) and per-chat exceptions
+/// (`account.getNotifyExceptions`).
+pub(super) fn get_notify_defaults(account: &Account) -> Result<protocol::NotifyDefaults, Fault> {
+    let kinds = [
+        tl::enums::InputNotifyPeer::InputNotifyUsers,
+        tl::enums::InputNotifyPeer::InputNotifyChats,
+        tl::enums::InputNotifyPeer::InputNotifyBroadcasts,
+    ];
+    let mut muted = [false; 3];
+    for (index, peer) in kinds.into_iter().enumerate() {
+        let tl::enums::PeerNotifySettings::Settings(settings) =
+            account.ask(&tl::functions::account::GetNotifySettings { peer })?;
+        muted[index] = settings.mute_until.is_some_and(super::filing::mute_holds);
+        account.live().muted[index] = muted[index];
+    }
+    let mut exceptions = Vec::new();
+    if let Ok(updates) = account.ask(&tl::functions::account::GetNotifyExceptions {
+        compare_sound: false,
+        compare_stories: false,
+        peer: None,
+    }) {
+        let list = match updates {
+            tl::enums::Updates::Updates(u) => {
+                account.learn(&u.users, &u.chats);
+                u.updates
+            }
+            tl::enums::Updates::Combined(u) => {
+                account.learn(&u.users, &u.chats);
+                u.updates
+            }
+            tl::enums::Updates::UpdateShort(u) => vec![u.update],
+            _ => Vec::new(),
+        };
+        let dir = account.dir();
+        let acc_key = protocol::AccountKey {
+            network: protocol::Network::Telegram,
+            account: account.me.to_string(),
+        };
+        for upd in list {
+            if let tl::enums::Update::NotifySettings(ns) = upd {
+                if let tl::enums::NotifyPeer::Peer(p) = ns.peer {
+                    let who = Who::of(&p.peer);
+                    let tl::enums::PeerNotifySettings::Settings(s) = ns.notify_settings;
+                    let is_muted = s.mute_until.is_some_and(super::filing::mute_holds);
+                    exceptions.push(protocol::NotifyException {
+                        conversation: protocol::Key::new(&acc_key, who.text()),
+                        title: dir.name(who),
+                        muted: is_muted,
+                    });
+                }
+            }
+        }
+    }
+    Ok(protocol::NotifyDefaults {
+        users_muted: muted[0],
+        groups_muted: muted[1],
+        channels_muted: muted[2],
+        exceptions,
+    })
+}
+
+/// Update one account-wide notification default scope (`account.updateNotifySettings`) and
+/// refresh unset dialogs so they reflect the new default immediately.
+pub(super) fn set_notify_default(
+    account: &std::sync::Arc<Account>,
+    scope: protocol::NotifyDefaultScope,
+    muted: bool,
+) -> Result<protocol::NotifyDefaults, Fault> {
+    let (index, peer) = match scope {
+        protocol::NotifyDefaultScope::Users => (0, tl::enums::InputNotifyPeer::InputNotifyUsers),
+        protocol::NotifyDefaultScope::Groups => (1, tl::enums::InputNotifyPeer::InputNotifyChats),
+        protocol::NotifyDefaultScope::Channels => (2, tl::enums::InputNotifyPeer::InputNotifyBroadcasts),
+    };
+    let settings = tl::types::InputPeerNotifySettings {
+        show_previews: None,
+        silent: None,
+        mute_until: Some(if muted { i32::MAX } else { 0 }),
+        sound: None,
+        stories_muted: None,
+        stories_hide_sender: None,
+        stories_sound: None,
+    };
+    account.ask(&tl::functions::account::UpdateNotifySettings { peer, settings: settings.into() })?;
+    account.live().muted[index] = muted;
+    let _ = sync::dialogs(account);
+    get_notify_defaults(account)
+}
+
+/// Reset all account-wide notification defaults and exceptions (`account.resetNotifySettings`).
+pub(super) fn reset_notify_defaults(account: &std::sync::Arc<Account>) -> Result<protocol::NotifyDefaults, Fault> {
+    account.ask(&tl::functions::account::ResetNotifySettings {})?;
+    account.live().muted = [false; 3];
+    let _ = sync::dialogs(account);
+    get_notify_defaults(account)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

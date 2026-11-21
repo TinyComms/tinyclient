@@ -722,6 +722,9 @@ fn offline(ctx: &Context, command: Command) {
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
         Command::PressButton { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetNotifyDefaults { reply }
+        | Command::SetNotifyDefault { reply, .. }
+        | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -884,6 +887,15 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::PressButton { conversation_id, message_id, data, reply } => {
             let _ = reply.send(info::press_button(account, &conversation_id, &message_id, &data).map_err(refused));
+        }
+        Command::GetNotifyDefaults { reply } => {
+            let _ = reply.send(info::get_notify_defaults(account).map_err(refused));
+        }
+        Command::SetNotifyDefault { scope, muted, reply } => {
+            let _ = reply.send(info::set_notify_default(account, scope, muted).map_err(refused));
+        }
+        Command::ResetNotifyDefaults { reply } => {
+            let _ = reply.send(info::reset_notify_defaults(account).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {

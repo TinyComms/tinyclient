@@ -3881,3 +3881,62 @@ fn bot_inline_buttons_render_and_fire_callback() {
         world.calls()
     );
 }
+
+#[test]
+fn notify_defaults_read_update_exceptions_and_reset() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.notify_defaults, "Telegram must advertise notify_defaults capability");
+
+    // Initial defaults: none muted, with Field Notes channel as an exception.
+    let initial = match world.ask(Request::GetNotifyDefaults { account: account() }) {
+        Response::NotifyDefaults { defaults } => defaults,
+        other => panic!("expected NotifyDefaults, got {other:?}"),
+    };
+    assert!(!initial.users_muted);
+    assert!(!initial.groups_muted);
+    assert!(!initial.channels_muted);
+    assert!(
+        initial.exceptions.iter().any(|e| e.conversation == key("c9001") && e.muted),
+        "expected c9001 muted exception, got {:?}",
+        initial.exceptions
+    );
+
+    // Mute all groups via SetNotifyDefault.
+    let after_groups = match world.ask(Request::SetNotifyDefault {
+        account: account(),
+        scope: protocol::NotifyDefaultScope::Groups,
+        muted: true,
+    }) {
+        Response::NotifyDefaults { defaults } => defaults,
+        other => panic!("expected NotifyDefaults, got {other:?}"),
+    };
+    assert!(after_groups.groups_muted);
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("UpdateNotifySettings chats ")),
+        "expected UpdateNotifySettings chats on wire, got: {:#?}",
+        world.calls()
+    );
+    // Unset group row g8001 should now inherit muted = true.
+    let crew = world.until("g8001 muted after group default changed", || {
+        match world.ask(Request::Conversation { conversation: key("g8001") }) {
+            Response::Conversation { conversation } if conversation.muted => Some(conversation),
+            _ => None,
+        }
+    });
+    assert!(crew.muted);
+
+    // Reset all defaults and exceptions.
+    let after_reset = match world.ask(Request::ResetNotifyDefaults { account: account() }) {
+        Response::NotifyDefaults { defaults } => defaults,
+        other => panic!("expected NotifyDefaults, got {other:?}"),
+    };
+    assert!(!after_reset.users_muted && !after_reset.groups_muted && !after_reset.channels_muted);
+    assert!(after_reset.exceptions.is_empty());
+    assert!(
+        world.calls().iter().any(|c| c == "ResetNotifySettings"),
+        "expected ResetNotifySettings on wire, got: {:#?}",
+        world.calls()
+    );
+}

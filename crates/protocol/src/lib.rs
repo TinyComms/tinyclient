@@ -2663,6 +2663,23 @@ pub enum Request {
         /// Hex-encoded callback payload from `InlineButtonKind::Callback::data`.
         data: String,
     },
+    /// Read account-wide notification defaults and per-chat exceptions (Telegram).
+    /// Answers `Response::NotifyDefaults`.
+    GetNotifyDefaults {
+        account: AccountKey,
+    },
+    /// Update one account-wide notification default scope (Telegram `account.updateNotifySettings`).
+    /// Answers `Response::NotifyDefaults`.
+    SetNotifyDefault {
+        account: AccountKey,
+        scope: NotifyDefaultScope,
+        muted: bool,
+    },
+    /// Reset all account-wide notification defaults and exceptions (Telegram `account.resetNotifySettings`).
+    /// Answers `Response::NotifyDefaults`.
+    ResetNotifyDefaults {
+        account: AccountKey,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3183,6 +3200,10 @@ pub enum Response {
     /// Answer to pressing an inline bot callback button (`Request::PressButton`).
     ButtonAnswer {
         answer: ButtonAnswer,
+    },
+    /// Account-wide notification defaults and per-chat exceptions.
+    NotifyDefaults {
+        defaults: NotifyDefaults,
     },
 }
 

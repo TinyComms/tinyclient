@@ -690,6 +690,41 @@ pub struct Capabilities {
     /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_mute: bool,
+    /// This account supports reading/updating account-wide notification defaults and exceptions (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub notify_defaults: bool,
+}
+
+/// Scope of an account-wide notification default (Telegram `InputNotifyUsers` / `Chats` / `Broadcasts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyDefaultScope {
+    Users,
+    Groups,
+    Channels,
+}
+
+/// One conversation whose notification setting overrides its account-wide scope default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyException {
+    pub conversation: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
+}
+
+/// Account-wide notification defaults and per-chat exceptions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyDefaults {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub users_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channels_muted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<NotifyException>,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
