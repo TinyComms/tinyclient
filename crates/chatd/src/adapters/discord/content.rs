@@ -343,13 +343,15 @@ fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
                 (quoted, line) = (true, rest);
             }
         }
-        let heading = ["### ", "## ", "# "].into_iter().find_map(|mark| line.strip_prefix(mark));
-        if let Some(heading) = heading {
-            // The model has no heading; bold is the nearest.
+        let heading = [("### ", 3u8), ("## ", 2), ("# ", 1)]
+            .into_iter()
+            .find_map(|(mark, level)| line.strip_prefix(mark).map(|body| (body, level)));
+        if let Some((heading, level)) = heading {
             inline(rich, heading, names);
-            rich.span(start, Style::Bold);
+            rich.span(start, Style::Heading { level });
         } else if let Some(small) = line.strip_prefix("-# ") {
             inline(rich, small, names);
+            rich.span(start, Style::Small);
         } else if let Some((depth, ordered, begins)) = list_item(line) {
             // The marker stays in the text for numbered items, so the numbers are not lost.
             if ordered {
@@ -1134,8 +1136,14 @@ mod tests {
 
     #[test]
     fn blocks_code_quotes_and_lists() {
-        let rich = parsed("before\n```rust\nlet a = *b;\n```\n> quoted **line**\n- one\n1. two\nénd");
-        assert_eq!(rich.text, "before\nlet a = *b;\nquoted line\none\n1. two\nénd");
+        let rich = parsed("# Big\n## Mid *em*\n### Small\n-# footnote **note**\nbefore\n```rust\nlet a = *b;\n```\n> quoted **line**\n- one\n1. two\nénd");
+        assert_eq!(rich.text, "Big\nMid em\nSmall\nfootnote note\nbefore\nlet a = *b;\nquoted line\none\n1. two\nénd");
+        assert_eq!(styled(&rich, &Style::Heading { level: 1 }), ["Big"]);
+        assert_eq!(styled(&rich, &Style::Heading { level: 2 }), ["Mid em"]);
+        assert_eq!(styled(&rich, &Style::Italic), ["em"]);
+        assert_eq!(styled(&rich, &Style::Heading { level: 3 }), ["Small"]);
+        assert_eq!(styled(&rich, &Style::Small), ["footnote note"]);
+        assert_eq!(styled(&rich, &Style::Bold), ["note", "line"]);
         assert_eq!(styled(&rich, &Style::CodeBlock { language: "rust".into() }), ["let a = *b;"]);
         assert_eq!(styled(&rich, &Style::Quote), ["quoted line"]);
         assert_eq!(styled(&rich, &Style::ListItem { ordered: false, depth: 0 }), ["one"]);

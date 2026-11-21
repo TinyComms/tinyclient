@@ -193,8 +193,9 @@ pub fn rank(name: &str, handle: &str, query: &str) -> Option<u8> {
 pub fn source(message: &Message) -> (String, Vec<Token>) {
     let text = &message.text;
     let on_char = |at: u32| text.is_char_boundary(at as usize).then_some(at as usize);
-    // (offset, closes, marker): at one offset, what closes goes before what opens.
-    let mut marks: Vec<(usize, bool, &str)> = Vec::new();
+    // (offset, closes, order, marker): at one offset, what closes goes before what opens, and
+    // line prefixes (`# `, `-# `) go before inline openers (`**`).
+    let mut marks: Vec<(usize, bool, u8, &str)> = Vec::new();
     let mut mentions = Vec::new();
     for span in &message.spans {
         let (Some(start), Some(end)) = (on_char(span.start), on_char(span.end)) else {
@@ -204,6 +205,19 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             continue;
         }
         let marker = match &span.style {
+            Style::Heading { level } => {
+                let prefix = match *level {
+                    1 => "# ",
+                    2 => "## ",
+                    _ => "### ",
+                };
+                marks.push((start, false, 0, prefix));
+                continue;
+            }
+            Style::Small => {
+                marks.push((start, false, 0, "-# "));
+                continue;
+            }
             Style::Bold => "**",
             Style::Italic => "_",
             Style::Strike => "~~",
@@ -220,13 +234,13 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             }
             _ => continue,
         };
-        marks.push((start, false, marker));
-        marks.push((end, true, marker));
+        marks.push((start, false, 1, marker));
+        marks.push((end, true, 1, marker));
     }
-    marks.sort_by_key(|(offset, closes, _)| (*offset, !*closes));
+    marks.sort_by_key(|(offset, closes, order, _)| (*offset, !*closes, *order));
     let mut out = String::with_capacity(text.len() + marks.len() * 2);
     let mut at = 0;
-    for (offset, _, marker) in &marks {
+    for (offset, _, _, marker) in &marks {
         out.push_str(&text[at..*offset]);
         out.push_str(marker);
         at = *offset;
@@ -464,6 +478,17 @@ mod tests {
         let (text, tokens) = source(&bold);
         assert_eq!(text, "cc **@Dev**");
         assert_eq!(wire(&text, &tokens, MentionFormat::Discord), "cc **<@8>**");
+
+        // Headings and subtext keep their line prefixes before any inline markup.
+        let mut headed = Message::plain("3", "me", "Big title\nSub note\nSmall fine print", 0, true);
+        headed.spans = vec![
+            Span { start: 0, end: 9, style: Style::Heading { level: 1 } },
+            Span { start: 0, end: 3, style: Style::Bold },
+            Span { start: 10, end: 18, style: Style::Heading { level: 2 } },
+            Span { start: 19, end: 35, style: Style::Small },
+        ];
+        let (text, _) = source(&headed);
+        assert_eq!(text, "# **Big** title\n## Sub note\n-# Small fine print");
     }
 
     #[test]

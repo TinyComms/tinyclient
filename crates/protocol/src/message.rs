@@ -102,8 +102,8 @@ pub enum MentionKind {
     Everyone,
 }
 
-/// How a range of a message's text is drawn. Block styles (`CodeBlock`, `Quote`, `ListItem`)
-/// cover whole lines.
+/// How a range of a message's text is drawn. Block styles (`CodeBlock`, `Quote`, `ListItem`,
+/// `Heading`, `Small`) cover whole lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "style", rename_all = "snake_case")]
 pub enum Style {
@@ -121,6 +121,12 @@ pub enum Style {
         ordered: bool,
         depth: u8,
     },
+    /// A section heading: level 1, 2, or 3 (`#`, `##`, `###`).
+    Heading {
+        level: u8,
+    },
+    /// Smaller, muted subtext (`-# ` in Discord).
+    Small,
     Spoiler,
     Link {
         url: String,
@@ -1300,5 +1306,14 @@ mod tests {
         msg.announcement = true;
         let wire = serde_json::to_string(&msg).unwrap();
         assert!(serde_json::from_str::<Message>(&wire).unwrap().announcement);
+    }
+
+    #[test]
+    fn heading_and_small_styles_round_trip() {
+        for style in [Style::Heading { level: 1 }, Style::Heading { level: 2 }, Style::Heading { level: 3 }, Style::Small] {
+            let span = Span { start: 0, end: 4, style };
+            let wire = serde_json::to_string(&span).unwrap();
+            assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        }
     }
 }

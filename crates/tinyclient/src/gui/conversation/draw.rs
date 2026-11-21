@@ -1391,6 +1391,38 @@ impl Pane {
                         block.into_any_element()
                     }
                 }
+                Block::Heading { level, text } => {
+                    let (size, line, top, bottom) = match *level {
+                        1 => (20., 26., 6., 2.),
+                        2 => (18., 24., 4., 1.),
+                        _ => (16., 22., 2., 0.),
+                    };
+                    div()
+                        .max_w(px(MEASURE))
+                        .mt(px(top))
+                        .mb(px(bottom))
+                        .flex()
+                        .flex_col()
+                        .text_size(theme::sized(size))
+                        .line_height(theme::sized(line))
+                        .font_weight(theme::SEMIBOLD)
+                        .when(phone, |div| {
+                            div.text_size(px(tokens_phone::scaled(size + 2.)))
+                                .line_height(px(tokens_phone::scaled(line + 2.)))
+                        })
+                        .child(self.rich(message, ix, text, theme::text().into_color(), window, cx))
+                        .into_any_element()
+                }
+                Block::Small(inline) => div()
+                    .max_w(px(MEASURE))
+                    .mt(px(1.))
+                    .flex()
+                    .flex_col()
+                    .type_small()
+                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(13.))).line_height(px(tokens_phone::scaled(18.))))
+                    .text_color(theme::text_faint())
+                    .child(self.rich(message, ix, inline, theme::text_faint().into_color(), window, cx))
+                    .into_any_element(),
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
                     .mt(px(3.))
@@ -1661,7 +1693,13 @@ impl Pane {
                     last.mark_edited();
                 }
                 let inline = match blocks.get(block) {
-                    Some(Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. }) => inline,
+                    Some(
+                        Block::Text(inline)
+                        | Block::Heading { text: inline, .. }
+                        | Block::Small(inline)
+                        | Block::Quote(inline)
+                        | Block::Item { text: inline, .. },
+                    ) => inline,
                     _ => return,
                 };
                 let Some(run) = inline.runs.get(run) else {
