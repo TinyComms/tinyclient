@@ -15,7 +15,7 @@ use super::tokens::{self, Metrics, MEASURE};
 use super::when;
 use super::{edited_tip, Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
-use crate::gui::components::{glyph, tip, Avatar, Shape};
+use crate::gui::components::{glyph, sensitive_cover, tip, Avatar, Shape};
 use crate::gui::phone::tokens as tokens_phone;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
@@ -945,36 +945,13 @@ impl Pane {
             );
         } else if sensitive_hidden {
             let reveal_id = message.id.clone();
-            sent = sent.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(8.))
-                    .py(px(4.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(tokens::card())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_small()
-                    .text_color(theme::text_soft())
-                    .child(glyph("icons/eye-off.svg", 13., theme::text_faint()))
-                    .child("Hidden in Streamer mode (invite link or sign-in code).")
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("reveal-sensitive-{}", message.id)))
-                            .cursor_pointer()
-                            .font_weight(theme::MEDIUM)
-                            .text_color(theme::accent_text())
-                            .hover(|style| style.underline())
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.revealed_sensitive.insert(reveal_id.clone());
-                                cx.notify();
-                            }))
-                            .child("Reveal"),
-                    ),
-            );
+            sent = sent.child(sensitive_cover(
+                SharedString::from(format!("reveal-sensitive-{}", message.id)),
+                cx.listener(move |this, _, _, cx| {
+                    this.revealed_sensitive.insert(reveal_id.clone());
+                    cx.notify();
+                }),
+            ));
         } else {
             let said = match &message.kind {
                 MessageKind::Unsupported { link } => vec![self.unsupported(message, link, cx).into_any_element()],
@@ -984,15 +961,30 @@ impl Pane {
             sent = match &message.forwarded {
                 // When the forwarder wrote a note of their own, render it above the quoted original.
                 Some(from) if !from.text.is_empty() && !message.text.is_empty() && from.text != message.text => {
+                    let forward_key = format!("forward:{}", message.id);
+                    let hide_from = crate::gui::streamer::is_active()
+                        && crate::gui::streamer::contains_sensitive(&from.text)
+                        && !self.revealed_sensitive.contains(&forward_key);
                     let mut quoted = div().pl(px(12.)).min_w_0().flex_1().flex().flex_col();
                     if !from.author.is_empty() {
                         quoted = quoted.child(
                             div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(from.author.clone()),
                         );
                     }
-                    quoted = quoted
-                        .child(div().type_body().text_color(theme::text()).child(from.text.clone()))
-                        .children(attached);
+                    quoted = if hide_from {
+                        let key = forward_key;
+                        quoted.child(sensitive_cover(
+                            SharedString::from(format!("reveal-forward-{}", message.id)),
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.revealed_sensitive.insert(key.clone());
+                                cx.notify();
+                            }),
+                        ))
+                    } else {
+                        quoted.child(div().type_body().text_color(theme::text()).child(from.text.clone()))
+                    };
+                    quoted = quoted.children(attached);
                     sent.children(said)
                         .child(div().mt(px(4.)).child(forwarded_line(from)))
                         .child(
@@ -1143,7 +1135,7 @@ impl Pane {
                     .bg(theme::accent_soft())
                     .with_animation(name_id("flash", &message.id), Animation::new(FLASH), |tint, done| tint.opacity(1. - done))
             }))
-            .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, window, cx)))
+            .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, &message.id, window, cx)))
             .child(
                 div()
                     .flex()
@@ -3328,7 +3320,7 @@ impl Pane {
         Some(row.child(add).into_any_element())
     }
 
-    fn reply_line(&mut self, reply: &protocol::ReplyTo, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn reply_line(&mut self, reply: &protocol::ReplyTo, message_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics;
         let target = reply.id.clone();
         let gone = reply.deleted || (reply.sender.is_empty() && reply.snippet.is_empty());
@@ -3337,6 +3329,11 @@ impl Pane {
             (false, true) => "Attachment".to_owned(),
             (false, false) => reply.snippet.replace('\n', " "),
         };
+        let reply_key = format!("reply:{}", reply.id);
+        let hide_reply = !gone
+            && crate::gui::streamer::is_active()
+            && crate::gui::streamer::contains_sensitive(&reply.snippet)
+            && !self.revealed_sensitive.contains(&reply_key);
         let face = (!gone).then(|| {
             let (_, file) = reply.person.as_ref().map(|person| self.who(person, cx)).unwrap_or_default();
             let plate = match &reply.person {
@@ -3349,7 +3346,8 @@ impl Pane {
         let reach = metrics.avatar / 2. + metrics.gap - 4.;
         div()
             .id("reply")
-            .h(px(20.))
+            .when(!hide_reply, |line| line.h(px(20.)))
+            .when(hide_reply, |line| line.min_h(px(20.)))
             .mb(px(2.))
             .flex()
             .items_center()
@@ -3379,7 +3377,20 @@ impl Pane {
             .children((!gone).then(|| {
                 div().flex_none().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(reply.sender.clone())
             }))
-            .child(div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet))
+            .child(if hide_reply {
+                let key = reply_key;
+                sensitive_cover(
+                    SharedString::from(format!("reveal-reply-{message_id}-{}", reply.id)),
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.revealed_sensitive.insert(key.clone());
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
+            } else {
+                div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet).into_any_element()
+            })
     }
 
     /// A channel post's footer: how many people saw it, as Telegram's apps say it. Telegram

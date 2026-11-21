@@ -113,6 +113,8 @@ pub struct State {
     pub(super) activity_items: Vec<protocol::ActivityItem>,
     pub(super) activity_cursor: Option<(AccountKey, String)>,
     pub(super) activity_loading: bool,
+    /// Activity rows whose invite or sign-in code the user chose to reveal in Streamer mode.
+    activity_revealed: HashSet<String>,
     activity_epoch: u64,
     /// The network home on show: what chatd said, and the user's folds.
     pub home: home::Home,
@@ -263,6 +265,7 @@ impl State {
             activity_items: Vec::new(),
             activity_cursor: None,
             activity_loading: false,
+            activity_revealed: HashSet::new(),
             activity_epoch: 0,
             home: home::Home::default(),
             saved_homes: HashMap::new(),

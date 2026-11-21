@@ -104,6 +104,8 @@ const ROOM_CAP: u16 = 12;
 pub(crate) const OFFLINE: &str = "Tiny server isn't connected. Try again in a moment.";
 const LOST: &str = "The connection to the server dropped. Try again.";
 const NO_ANSWER: &str = "The server didn't answer. Try again.";
+/// A watch asked before this call can take one (no video mids yet, or a single slot).
+const WATCH_UNREADY: &str = "This call can't watch that yet. Try again in a moment.";
 const BUSY: &str = "Wait for the last request to finish.";
 const AUDIO_DOWN: &str = "This server's audio is down. Try again later.";
 const MEDIA_TIMEOUT: &str =
@@ -194,6 +196,7 @@ pub enum Ask {
     /// Multi-stream watch selection for `call.watch` (sent only when server advertises `multi_video`).
     Watch {
         sources: Vec<protocol::WatchSource>,
+        reply: Reply<()>,
     },
     /// mediad lost the link, and the call is still up. Join again after the resume pause. Not
     /// kept while the socket is down: the call's state says it, and `ready` reads that.
@@ -219,7 +222,8 @@ impl Ask {
             | Ask::Kick { reply, .. }
             | Ask::Moderate { reply, .. }
             | Ask::Move { reply, .. }
-            | Ask::SetPresence { reply, .. } => Some(reply),
+            | Ask::SetPresence { reply, .. }
+            | Ask::Watch { reply, .. } => Some(reply),
             Ask::Look
             | Ask::Hangup { .. }
             | Ask::State { .. }
@@ -227,7 +231,6 @@ impl Ask {
             | Ask::Priority { .. }
             | Ask::E2ee { .. }
             | Ask::Offer { .. }
-            | Ask::Watch { .. }
             | Ask::Resume
             | Ask::Settled => None,
         }
@@ -411,6 +414,8 @@ struct Seat {
     video_slots: u8,
     /// Receive-only video mids from our last SDP offer, in offer order (`mids[0]` = primary).
     video_mids: Vec<String>,
+    /// The watch list the server last accepted. A refusal puts mediad back to this.
+    watch_applied: Vec<protocol::WatchSource>,
     /// Everyone in our room's call, as mediad was last told: whom its MLS group may hold.
     rostered: Vec<String>,
     /// Resumes spent since media last held for [`MEDIA_HELD`]. Same budget as a Discord call.
@@ -570,6 +575,7 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         e2ee: false,
         video_slots: 1,
         video_mids: Vec::new(),
+        watch_applied: Vec::new(),
         rostered: Vec::new(),
         resumes: 0,
         up_at: None,
@@ -766,8 +772,8 @@ enum Asked {
     Moderate,
     /// A `call.offer`. The answer is `call.answer`, or `share_taken`.
     Offer,
-    /// A `call.watch` subscription update.
-    Watch,
+    /// A `call.watch` subscription update, and the list that was sent.
+    Watch(Vec<protocol::WatchSource>),
     /// `call.cancel`, `call.decline`, or `call.leave` of a direct. A room seat is left alone.
     Direct,
 }
@@ -1008,17 +1014,22 @@ fn serve(
                         )
                     }
                     Ask::Offer { .. } => Ok(()),
-                    Ask::Watch { sources } if seat.call_id.is_some() && seat.video_slots > 1 && !seat.video_mids.is_empty() => {
+                    Ask::Watch { sources, reply } if seat.call_id.is_some() && seat.video_slots > 1 && !seat.video_mids.is_empty() => {
                         let reference = refs.to_string();
                         pending.push(Pending {
                             reference: reference.clone(),
-                            asked: Asked::Watch,
+                            asked: Asked::Watch(sources.clone()),
                             until: Instant::now() + timing.answer,
-                            reply: None,
+                            reply: Some(reply),
                         });
                         wire.send(build_watch_frame(&reference, &seat.video_mids, &sources).to_string())
                     }
-                    Ask::Watch { .. } => Ok(()),
+                    Ask::Watch { reply, .. } => {
+                        // The shell already asked. Ok would leave that list stuck with nothing sent.
+                        restore_watch(ctx, seat);
+                        let _ = reply.send(Err(Refusal::Refused(WATCH_UNREADY.to_owned())));
+                        Ok(())
+                    },
                     Ask::Moderate {
                         room_id,
                         user_id,
@@ -1120,6 +1131,9 @@ fn serve(
                     );
                 }
             }
+            if let Asked::Watch(_) = &late.asked {
+                restore_watch(ctx, seat);
+            }
             if let Asked::Join(room, media, _) = &late.asked {
                 seat.rejoining = false;
                 if *media {
@@ -1219,6 +1233,7 @@ fn state(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, seat: &Seat, ti
 fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room: String, timing: &Timing) -> io::Result<()> {
     let from = seat.last.clone().or_else(|| seat.wanted.clone());
     seat.call_id = None;
+    seat.watch_applied.clear();
     seat.speaking.clear();
     if live.seats_only() {
         seat.wanted = Some(room.clone());
@@ -2189,6 +2204,7 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
     }
     if seat.wanted.is_none() || seat.wanted.as_deref() == Some(room) {
         seat.call_id = None;
+        seat.watch_applied.clear();
         seat.speaking.clear();
     }
     if !ctx.in_call(room) {
@@ -2636,6 +2652,7 @@ fn hangup_direct(
     seat.say_state = false;
     if seated {
         seat.call_id = None;
+        seat.watch_applied.clear();
     }
     let reference = refs.to_string();
     pending.push(Pending {
@@ -2710,6 +2727,7 @@ fn direct_unseated(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str) 
             seat.wanted = None;
         }
         seat.call_id = None;
+        seat.watch_applied.clear();
         seat.direct = None;
         seat.join_direct = false;
     }
@@ -3196,6 +3214,14 @@ fn ask_direct_join(
     wire.send(frame.to_string())
 }
 
+/// Puts mediad back on the last watch list the server accepted.
+fn restore_watch(ctx: &Context, seat: &Seat) {
+    let Some(room) = seat.wanted.clone() else {
+        return;
+    };
+    ctx.tell_media(&room, MediaRequest::Watch { sources: seat.watch_applied.clone() });
+}
+
 fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &Value, ok: bool) {
     let reference = match frame.get("ref") {
         Some(Value::String(reference)) => reference.clone(),
@@ -3247,14 +3273,17 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             Asked::Leave => {
                 seat.wanted = None;
                 seat.call_id = None;
+                seat.watch_applied.clear();
             }
             Asked::Kick
             | Asked::State
             | Asked::Moderate
             | Asked::Ring(_, _)
             | Asked::Accept(_, _)
-            | Asked::Direct
-            | Asked::Watch => {}
+            | Asked::Direct => {}
+            Asked::Watch(sources) => {
+                seat.watch_applied = sources.clone();
+            }
             Asked::Offer => {
                 if let (Some(sdp), Some(room)) = (text(frame, "sdp"), seat.wanted.clone()) {
                     ctx.tell_media(
@@ -3321,9 +3350,12 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
                 );
             }
         }
+        if let Asked::Watch(_) = &pending.asked {
+            restore_watch(ctx, seat);
+        }
         // A rejoin nobody asked for that fails is not tried again. A refused renegotiation
-        // or watch update leaves the seat where it is.
-        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct | Asked::Watch) {
+        // leaves the seat. A refused watch keeps the last list the server accepted.
+        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct | Asked::Watch(_)) {
             seat.wanted = None;
         }
         Err(Refusal::Refused(said.to_owned()))

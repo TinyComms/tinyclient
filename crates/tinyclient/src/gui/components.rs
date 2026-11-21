@@ -29,6 +29,39 @@ use gpui::{
 use protocol::{Badge, Conversation, ConversationKind, Link, Network};
 use palette::IntoColor;
 
+/// A row that stands in for an invite link or a sign-in code while Streamer mode is on.
+/// `on_reveal` shows the text again; the caller remembers that choice.
+pub fn sensitive_cover(
+    id: impl Into<ElementId>,
+    on_reveal: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(theme::R_CONTROL))
+        .bg(theme::raised())
+        .border_1()
+        .border_color(theme::border())
+        .type_small()
+        .text_color(theme::text_soft())
+        .child(glyph("icons/eye-off.svg", 13., theme::text_faint()))
+        .child("Hidden in Streamer mode (invite link or sign-in code).")
+        .child(
+            div()
+                .id(id)
+                .cursor_pointer()
+                .font_weight(theme::MEDIUM)
+                .text_color(theme::accent_text())
+                .hover(|style| style.underline())
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(on_reveal)
+                .child("Reveal"),
+        )
+}
+
 /// A monochrome interface glyph, drawn with a 1.5 pt stroke at any size.
 pub fn glyph(name: &'static str, size: f32, color: impl IntoColor<Hsla>) -> Svg {
     svg()

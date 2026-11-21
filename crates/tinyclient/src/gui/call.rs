@@ -328,11 +328,28 @@ pub struct State {
     /// The sharer currently offered on the dock's notice strip (cleared on Watch, dismiss, stop,
     /// or call end).
     pub(super) share_prompt: Option<String>,
-    /// Last multi-stream watch list sent to chatd/mediad for this call (avoid duplicate sends).
+    /// Last multi-stream watch list the server accepted for this call.
     pub(in crate::gui) watched: Vec<protocol::WatchSource>,
+    /// The list in flight. It is not applied until chatd says ok.
+    watch_pending: Option<Vec<protocol::WatchSource>>,
+    /// Bumped when the call changes, so a late answer cannot apply.
+    watch_epoch: u64,
+    /// True once `MediaRequest::Watch` has been sent on this call. ShareWatch is then not the
+    /// Tiny subscription.
+    watch_sent: bool,
+    /// A refused list, and when the next picture frame may ask for it again. A click clears it.
+    watch_again: Option<(Vec<protocol::WatchSource>, Instant)>,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
+/// How long a refused watch list waits before the next picture frame may ask again.
+const WATCH_AGAIN: Duration = Duration::from_secs(2);
+
+/// ShareWatch replaces mediad's source list with one share. On Tiny, once `call.watch` has been
+/// sent, that list is the subscription.
+fn share_watch_superseded(network: Network, watch_sent: bool) -> bool {
+    network == Network::Tiny && watch_sent
+}
 
 /// Pure camera-speaker selection for Discord calls (where the shell names whose camera to paint).
 /// Returns `Some(Some(id))` to switch camera speaker, `Some(None)` to clear, or `None` for no change.
@@ -900,6 +917,7 @@ impl Shell {
             self.call_state.last = last;
             self.call_state.since = now();
             self.call_state.error = None;
+            self.call_reset_watch();
         }
         match call {
             None => {
@@ -923,6 +941,10 @@ impl Shell {
                 state.sharer = None;
                 state.share_prompt = None;
                 state.watched.clear();
+                state.watch_pending = None;
+                state.watch_again = None;
+                state.watch_sent = false;
+                state.watch_epoch = state.watch_epoch.wrapping_add(1);
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -1679,7 +1701,7 @@ impl Shell {
     }
 
     /// Ask mediad to watch `user_id`'s stream and schedule 3 s / 10 s redraws so the tile never
-    /// stays on "Connecting…" silently.
+    /// stays on "Connecting…" silently. On Tiny the subscription is `call.watch`, not ShareWatch.
     pub(in crate::gui) fn call_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
         self.call_state.share_prompt = None;
         self.call_state.watch_asked = Some((user_id.clone(), Instant::now()));
@@ -1689,7 +1711,34 @@ impl Shell {
             cx.background_executor().timer(Duration::from_secs(7)).await;
             let _ = this.update(cx, |_, cx| cx.notify());
         }));
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            return;
+        }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
+    }
+
+    /// One-click watch from a picture box or a phone tile. Tiny subscribes with `call.watch`.
+    pub(in crate::gui) fn call_watch_user(&mut self, user_id: String, cx: &mut Context<Self>) {
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            self.call_state.focus = Some(stage::Focus::Stream(user_id.clone()));
+            self.call_watch(user_id, cx);
+            self.call_sync_watch_now(cx);
+            return;
+        }
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
+    }
+
+    /// Stop the picture-box or phone watch. On Tiny that is a focus change and `call.watch`.
+    pub(in crate::gui) fn call_stop_watch_user(&mut self, cx: &mut Context<Self>) {
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            if matches!(self.call_state.focus, Some(stage::Focus::Stream(_))) {
+                self.call_state.focus = None;
+            }
+            self.call_unwatch(cx);
+            self.call_sync_watch_now(cx);
+            return;
+        }
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
     }
 
     /// Watch `user_id`'s screen, focus their stream on the stage, dismiss any share notice, and
@@ -1707,6 +1756,7 @@ impl Shell {
             self.call_watch(user_id, cx);
         }
         self.call_go(call.conversation.clone(), title, cx);
+        self.call_sync_watch_now(cx);
     }
 
     /// Dismiss the dock's screen-share notice strip until the sharer stops and someone shares again.
@@ -1737,7 +1787,7 @@ impl Shell {
         let Some(id) = started else {
             return;
         };
-        if !cfg!(feature = "gui-shot") {
+        if !cfg!(feature = "gui-shot") && !super::streamer::is_active() {
             cx.background_executor()
                 .spawn(async move {
                     let _ = ask(&Request::Media(protocol::MediaRequest::Cue {
@@ -1758,6 +1808,16 @@ impl Shell {
 
     /// Reset the decoder and ask for a fresh keyframe for `user_id`.
     pub(in crate::gui) fn call_retry_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            self.call_state.watched.clear();
+            self.call_state.watch_pending = None;
+            self.call_state.watch_again = None;
+            self.call_state.watch_epoch = self.call_state.watch_epoch.wrapping_add(1);
+            self.call_state.focus = Some(stage::Focus::Stream(user_id.clone()));
+            self.call_watch(user_id, cx);
+            self.call_sync_watch_now(cx);
+            return;
+        }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
         self.call_watch(user_id, cx);
     }
@@ -1766,14 +1826,21 @@ impl Shell {
     pub(in crate::gui) fn call_unwatch(&mut self, cx: &mut Context<Self>) {
         self.call_state.watch_asked = None;
         self.call_state.watch_timer = None;
+        if self.call_now().is_some_and(|call| share_watch_superseded(call.conversation.network, self.call_state.watch_sent)) {
+            return;
+        }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
     }
 
     /// In a 1:1 Tiny direct call, automatically watch the peer's screen share or camera as soon
-    /// as they start sending, and stop decoding when they stop.
+    /// as they start sending, and stop decoding when they stop. Once `call.watch` is the
+    /// subscription, ShareWatch would replace that list with one share.
     fn call_auto_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
         let is_room = self.tiny_room(&call.conversation).is_some();
         if let Some(source) = auto_watch_step(call, is_room, &mut self.call_state.auto_watch) {
+            if share_watch_superseded(call.conversation.network, self.call_state.watch_sent) {
+                return;
+            }
             self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source }), cx);
         }
     }
@@ -1789,22 +1856,68 @@ impl Shell {
         }
     }
 
+    /// Drops the watch bookkeeping so the next sync subscribes again. A late answer sees the
+    /// new epoch and does not apply.
+    fn call_reset_watch(&mut self) {
+        let state = &mut self.call_state;
+        state.watched.clear();
+        state.watch_pending = None;
+        state.watch_again = None;
+        state.watch_sent = false;
+        state.watch_epoch = state.watch_epoch.wrapping_add(1);
+    }
+
     /// Synchronizes multi-stream `MediaRequest::Watch` when the joined Tiny call's visible
-    /// cameras or focused stream change.
+    /// cameras or focused stream change. The list counts only after chatd says ok. A refusal
+    /// is shown and asked again, but not on every picture frame.
     pub(in crate::gui) fn call_sync_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
         if call.conversation.network != Network::Tiny {
             return;
         }
         let budget_small = if super::phone::active() { 2 } else { 4 };
         let next = desired_watch_sources(call, self.call_state.focus.as_ref(), budget_small);
-        if next != self.call_state.watched {
-            self.call_state.watched = next.clone();
-            self.call_ask(Request::Media(protocol::MediaRequest::Watch { sources: next }), cx);
+        if self.call_state.watch_pending.as_ref() == Some(&next) || self.call_state.watched == next {
+            return;
         }
+        if self.call_state.watch_again.as_ref().is_some_and(|(sources, until)| sources == &next && Instant::now() < *until) {
+            return;
+        }
+        self.call_state.watch_epoch = self.call_state.watch_epoch.wrapping_add(1);
+        let epoch = self.call_state.watch_epoch;
+        self.call_state.watch_pending = Some(next.clone());
+        self.call_state.watch_sent = true;
+        let request = Request::Media(protocol::MediaRequest::Watch { sources: next.clone() });
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.call_state.watch_epoch != epoch {
+                    return;
+                }
+                this.call_state.watch_pending = None;
+                let detail = match &answer {
+                    Ok(Response::Error { detail, .. }) => Some(detail.clone()),
+                    Err(err) => Some(crate::client::trouble_words("call", err)),
+                    Ok(_) => None,
+                };
+                if let Some(detail) = detail {
+                    this.call_state.watch_again = Some((next, Instant::now() + WATCH_AGAIN));
+                    this.call_state.error = Some(detail.clone());
+                    this.refused = Some(detail);
+                } else {
+                    this.call_state.watched = next;
+                    this.call_state.watch_again = None;
+                    this.call_state.error = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Re-evaluates multi-stream watch subscriptions for the currently active call (e.g. after focus changes).
+    /// A click or a focus change retries a refused list immediately.
     pub(in crate::gui) fn call_sync_watch_now(&mut self, cx: &mut Context<Self>) {
+        self.call_state.watch_again = None;
         if let Some(call) = self.snapshot.as_ref().and_then(|s| s.call.clone()) {
             self.call_sync_watch(&call, cx);
         }
@@ -1947,7 +2060,7 @@ impl Shell {
                             .font_weight(theme::SEMIBOLD)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(id.clone()) }), cx);
+                                this.call_watch_user(id.clone(), cx);
                             }))
                             .child(label),
                     )
@@ -1993,7 +2106,7 @@ impl Shell {
                     .type_micro()
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+                        this.call_stop_watch_user(cx);
                     }))
                     .child("Stop watching"),
             )
@@ -3003,6 +3116,14 @@ mod tests {
         call.state = CallState::Reconnecting;
         assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
         assert_eq!((prev, prompt), (None, None));
+    }
+
+    #[test]
+    fn share_watch_is_not_the_tiny_subscription_once_watch_was_sent() {
+        assert!(!share_watch_superseded(Network::Discord, true));
+        assert!(!share_watch_superseded(Network::Discord, false));
+        assert!(!share_watch_superseded(Network::Tiny, false));
+        assert!(share_watch_superseded(Network::Tiny, true));
     }
 
     #[test]

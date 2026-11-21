@@ -3,7 +3,7 @@
 use super::chat::{row_time, Look};
 use super::inbox::{self, Item};
 use super::{on_screen, respliced, Mode};
-use crate::gui::components::{badge_dot, badge_mention, button, empty_state, empty_state_with, glyph, ButtonKind, list_row, section_header, skeleton, Avatar, Shape};
+use crate::gui::components::{badge_dot, badge_mention, button, empty_state, empty_state_with, glyph, list_row, section_header, sensitive_cover, skeleton, Avatar, ButtonKind, Shape};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -374,6 +374,7 @@ impl Shell {
         } else if state.activity_items.is_empty() {
             self.inbox_empty(cx)
         } else {
+            let revealed = state.activity_revealed.clone();
             let mut list_box = div().id("activity-feed-list").size_full().overflow_y_scroll().flex().flex_col();
             for (ix, item) in state.activity_items.iter().enumerate() {
                 let kind_word = match item.kind {
@@ -392,6 +393,9 @@ impl Shell {
                 };
                 let who = if item.actor.is_empty() { kind_word } else { format!("{} {kind_word}", item.actor) };
                 let snippet = super::chat::one_line(&item.text).into_owned();
+                let hide = crate::gui::streamer::is_active()
+                    && crate::gui::streamer::contains_sensitive(&item.text)
+                    && !revealed.contains(&item.id);
                 let picked = item.clone();
                 let content = div()
                     .flex_1()
@@ -417,7 +421,18 @@ impl Shell {
                             .child(div().type_micro().text_color(theme::text_faint()).child(row_time(now(), item.time)))
                             .children(item.unread.then(|| badge_dot(7., theme::accent()))),
                     )
-                    .when(!snippet.is_empty(), |col| {
+                    .when(hide, |col| {
+                        let id = item.id.clone();
+                        col.child(sensitive_cover(
+                            gpui::SharedString::from(format!("reveal-activity-{}", item.id)),
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.sidebar_state.activity_revealed.insert(id.clone());
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .when(!hide && !snippet.is_empty(), |col| {
                         col.child(
                             div()
                                 .truncate()
@@ -426,8 +441,9 @@ impl Shell {
                                 .child(snippet),
                         )
                     });
+                let height = theme::row_height(theme::ROW_TWO) + if hide { 20. } else { 0. };
                 list_box = list_box.child(
-                    list_row(("activity-row", ix), theme::row_height(theme::ROW_TWO), false, false, content)
+                    list_row(("activity-row", ix), height, false, false, content)
                         .on_click(cx.listener(move |this, _, _, cx| this.open_activity_item(picked.clone(), cx))),
                 );
             }

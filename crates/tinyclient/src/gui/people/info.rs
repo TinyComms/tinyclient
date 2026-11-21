@@ -11,11 +11,11 @@ pub(in crate::gui) mod profile;
 use super::card::Float;
 use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
-use crate::gui::components::{button, glyph, icon_button, tip, ButtonKind};
+use crate::gui::components::{button, glyph, icon_button, sensitive_cover, tip, ButtonKind};
 use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, MouseButton, WeakEntity, Window};
+use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, MouseButton, SharedString, WeakEntity, Window};
 use profile::draw;
 use profile::facts::{self, Act, Call, Seen, Surface};
 use profile::shared::{self, Shared};
@@ -23,6 +23,7 @@ use protocol::{
     Contact, ContactKind, Conversation, ConversationInfo, Key, Link, Network, Notify, Person, Profile, RelateAction,
     Request, Response, Space, SpaceInfo,
 };
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// What the pane is about.
@@ -80,6 +81,8 @@ pub struct InfoPane {
     /// Show was clicked: the phone numbers read in full until the pane shows someone else.
     phones_shown: bool,
     about_open: bool,
+    /// Bio, note, and other contacts the user chose to reveal in Streamer mode.
+    revealed_sensitive: HashSet<String>,
     /// What the user set here, drawn before the row says so.
     notify_set: Option<(Key, Notify)>,
     /// Inline conversation management input (rename, topic, add people).
@@ -135,6 +138,7 @@ impl InfoPane {
             shared: Shared::default(),
             phones_shown: false,
             about_open: false,
+            revealed_sensitive: HashSet::new(),
             notify_set: None,
             manage: None,
             pending_remove: None,
@@ -218,6 +222,7 @@ impl InfoPane {
         if !same {
             self.phones_shown = false;
             self.about_open = false;
+            self.revealed_sensitive.clear();
         }
         let entity = cx.entity();
         self.shared.show(self.row.as_ref().map(|row| row.key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
@@ -778,31 +783,52 @@ impl InfoPane {
 
     fn about(&self, profile: &Profile, cx: &mut Context<Self>) -> Div {
         let bio = profile.bio.trim().to_owned();
+        let note = profile.note.trim().to_owned();
+        let streamer = crate::gui::streamer::is_active();
+        let hide_bio = streamer && crate::gui::streamer::contains_sensitive(&bio) && !self.revealed_sensitive.contains("bio");
+        let hide_note = streamer && crate::gui::streamer::contains_sensitive(&note) && !self.revealed_sensitive.contains("note");
         let long = bio.chars().count() > 180 || bio.lines().count() > 4;
         let folded = long && !self.about_open;
         div()
             .flex()
             .flex_col()
             .when(!bio.is_empty(), |about| {
-                about.child(div().type_ui().when(folded, |text| text.line_clamp(4)).child(bio)).when(long, |about| {
-                    about.child(
-                        div()
-                            .id("info-more-bio")
-                            .type_ui()
-                            .text_color(theme::accent_text())
-                            .cursor_pointer()
-                            .child(if folded { "more" } else { "less" })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.about_open = !this.about_open;
-                                cx.notify();
-                            })),
-                    )
-                })
+                if hide_bio {
+                    about.child(sensitive_cover("info-reveal-bio", cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.revealed_sensitive.insert("bio".into());
+                        cx.notify();
+                    })))
+                } else {
+                    about.child(div().type_ui().when(folded, |text| text.line_clamp(4)).child(bio)).when(long, |about| {
+                        about.child(
+                            div()
+                                .id("info-more-bio")
+                                .type_ui()
+                                .text_color(theme::accent_text())
+                                .cursor_pointer()
+                                .child(if folded { "more" } else { "less" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.about_open = !this.about_open;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                }
             })
-            .when(!profile.note.trim().is_empty(), |about| {
+            .when(!note.is_empty(), |about| {
                 about
                     .child(div().mt(px(8.)).type_micro().text_color(theme::text_faint()).child("Note · only you see this"))
-                    .child(div().type_ui().text_color(theme::text_soft()).child(profile.note.trim().to_owned()))
+                    .child(if hide_note {
+                        sensitive_cover("info-reveal-note", cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.revealed_sensitive.insert("note".into());
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                    } else {
+                        div().type_ui().text_color(theme::text_soft()).child(note).into_any_element()
+                    })
             })
     }
 
@@ -822,10 +848,16 @@ impl InfoPane {
             ContactKind::Other => "Contact",
         };
         let words = facts::contact_words_for(&contact, self.phones_shown, streamer);
+        let other_key = format!("other:{}", contact.value);
+        let hide_other = streamer
+            && contact.kind == ContactKind::Other
+            && crate::gui::streamer::contains_sensitive(&contact.value)
+            && !self.revealed_sensitive.contains(&other_key);
         let value = contact.value.clone();
         div()
             .id(("info-contact", ix))
-            .h(px(theme::ROW_ONE))
+            .when(!hide_other, |row| row.h(px(theme::ROW_ONE)))
+            .when(hide_other, |row| row.min_h(px(theme::ROW_ONE)).py(px(4.)))
             .mx(px(-8.))
             .px(px(8.))
             .rounded(px(theme::R_CONTROL))
@@ -835,7 +867,20 @@ impl InfoPane {
             .type_ui()
             .when(!streamer_locked, |row| row.cursor_pointer().hover(|row| row.bg(theme::hover())))
             .child(glyph(icon, 16., theme::text_soft()))
-            .child(div().flex_1().min_w_0().truncate().child(words))
+            .child(if hide_other {
+                let key = other_key;
+                sensitive_cover(
+                    SharedString::from(format!("info-reveal-other-{ix}")),
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.revealed_sensitive.insert(key.clone());
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
+            } else {
+                div().flex_1().min_w_0().truncate().child(words).into_any_element()
+            })
             .when(masked && !streamer_locked, |row| {
                 row.child(
                     button(("info-show", ix), ButtonKind::Ghost, "Show").h(px(24.)).px(px(6.)).type_small().on_click(cx.listener(
@@ -850,7 +895,7 @@ impl InfoPane {
             // A masked number is not copied: the click that shows it is the one that reveals it.
             // In Streamer mode, phone numbers and emails stay masked and cannot be revealed or copied.
             .on_click(cx.listener(move |this, _, _, cx| {
-                if streamer_locked {
+                if streamer_locked || hide_other {
                     return;
                 }
                 if masked {

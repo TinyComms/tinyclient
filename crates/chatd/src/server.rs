@@ -3664,14 +3664,29 @@ impl Chat {
                 Response::Ok
             }
             Request::Media(request) => {
+                // Tiny `call.watch` is applied to mediad only after the server accepts it.
+                // ShareWatch is Discord's picture subscription and is not this path.
+                if let MediaRequest::Watch { sources } = &request {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if call.conversation.network == Network::Tiny {
+                            let sources = sources.clone();
+                            let account = call.conversation.account();
+                            return match self.ask(&account, |reply| {
+                                Command::Tiny(adapters::tiny::live::Ask::Watch { sources: sources.clone(), reply })
+                            }) {
+                                Ok(()) => match self.hub.calls.request(&self.hub, &MediaRequest::Watch { sources }) {
+                                    Ok(()) => self.status(),
+                                    Err(err) => call_error(err),
+                                },
+                                Err(refused) => *refused,
+                            };
+                        }
+                    }
+                }
                 let picture = match &request {
                     MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
                     MediaRequest::ShareSend { on, .. } => Some(Picture::Share(*on)),
                     MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
-                    _ => None,
-                };
-                let tiny_watch = match &request {
-                    MediaRequest::Watch { sources } => Some(sources.clone()),
                     _ => None,
                 };
                 let asked = match request {
@@ -3688,14 +3703,6 @@ impl Chat {
                         if let Some(picture) = picture {
                             if call.conversation.network == Network::Discord {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
-                            }
-                        }
-                        if let Some(sources) = tiny_watch {
-                            if call.conversation.network == Network::Tiny {
-                                self.command(
-                                    &call.conversation.account(),
-                                    Command::Tiny(adapters::tiny::live::Ask::Watch { sources }),
-                                );
                             }
                         }
                     }

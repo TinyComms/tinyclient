@@ -13,7 +13,7 @@ use crate::gui::components::{glyph, tint_of, Avatar};
 use crate::gui::phone::tokens::{self, PhoneType};
 use crate::gui::theme;
 use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, MouseButton, ObjectFit, SharedString};
-use protocol::{Call, CallState, Content, ConversationKind, Key, MediaRequest, PictureKind, Request};
+use protocol::{Call, CallState, Content, ConversationKind, Key, PictureKind};
 use std::path::PathBuf;
 
 const GAP: f32 = 8.;
@@ -386,7 +386,7 @@ impl Shell {
                 .cursor_pointer()
                 .active(|style| style.bg(theme::pressed()))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::ShareWatch { source: Some(source.clone()) }), cx)))
+                .on_click(cx.listener(move |this, _, _, cx| this.call_watch_user(source.clone(), cx)))
                 .child(glyph(icon, 14., theme::text()))
                 .child(div().phone_stamp().child("Watch"))
         });
@@ -447,7 +447,7 @@ impl Shell {
             .cursor_pointer()
             .active(|style| style.bg(theme::pressed()))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| this.call_ask(Request::Media(MediaRequest::ShareWatch { source: None }), cx)))
+            .on_click(cx.listener(|this, _, _, cx| this.call_stop_watch_user(cx)))
             .child(glyph("icons/x.svg", 13., theme::text()))
             .child(div().phone_stamp().text_color(theme::text()).child("Stop watching"));
         let screen = div()
