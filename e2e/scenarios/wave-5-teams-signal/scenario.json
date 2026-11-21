@@ -1,0 +1,12 @@
+{
+  "id": "wave-5-teams-signal",
+  "title": "Wave 5A/5B Teams messaging, cards, priority, previews, unread and Signal synced storage, safety numbers, profiles, previews, pins, and group mentions",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 5A/5B Teams & Signal enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 5A/5B Teams & Signal enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
