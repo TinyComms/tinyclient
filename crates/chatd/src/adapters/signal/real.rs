@@ -10,15 +10,17 @@ use super::vault::{self, Vault};
 use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
-    CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote, Text, Wire,
+    CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote,
+    StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::groups_v2::{AccessControl, AccessRequired, Member, Role};
+use presage::libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use presage::libsignal_service::master_key::StorageServiceKey;
-use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, ProfileKey, PushService, ServiceCredentials, ServiceError, Uuid};
+use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, MasterKey, ProfileKey, PushService, ServiceCredentials, ServiceError, Uuid};
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::{AttachmentSpec, AttachmentUploadError, MessageSenderError};
@@ -32,12 +34,14 @@ use presage::model::messages::Received;
 use presage::proto::{
     account_record, addressable_message,
     body_range::{AssociatedValue, Style as RangeStyle},
-    call_message, chat_folder_record, conversation_identifier, data_message, receipt_message, recipient, storage_record, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
+    call_message, chat_folder_record, contact_record, conversation_identifier, data_message, receipt_message, recipient,
+    storage_record, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
     ConversationIdentifier, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage,
 };
 use presage::store::{ContentsStore, StateStore};
 use presage::Manager;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -710,17 +714,30 @@ impl Session {
         self.sync_storage().await;
     }
 
-    /// Reads Signal's encrypted Storage Service manifest and items (contact, group, account records)
-    /// to sync mute, archive, pin, mark-unread, blocked, and folder state from the phone.
+    /// Derives the account's read-only Storage Service key from the stored master key or account entropy pool.
+    async fn storage_key(&self) -> Option<StorageServiceKey> {
+        if let Ok(Some(master_key)) = self.vault.fetch_master_key().await {
+            return Some(StorageServiceKey::from_master_key(&master_key));
+        }
+        if let Ok(Some(aep)) = self.vault.fetch_account_entropy_pool().await {
+            if let Ok(master_key) = MasterKey::from_slice(aep.derive_svr_key().as_slice()) {
+                let _ = self.vault.store_master_key(Some(&master_key)).await;
+                return Some(StorageServiceKey::from_master_key(&master_key));
+            }
+        }
+        None
+    }
+
+    /// Reads Signal's encrypted Storage Service manifest and items (contact, group, account, folder records)
+    /// in read-only mode to seed contacts, groups, pins, archive, mutes, nicknames, notes, and settings.
     async fn sync_storage(&mut self) {
-        let Ok(Some(master_key)) = self.vault.fetch_master_key().await else {
+        let Some(storage_key) = self.storage_key().await else {
             return;
         };
         let Ok(credentials) = self.credentials() else {
             return;
         };
         let push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
-        let storage_key = StorageServiceKey::from_master_key(&master_key);
         let Ok(storage) = StorageService::new(push, storage_key).await else {
             return;
         };
@@ -735,9 +752,16 @@ impl Session {
         let Ok(records) = storage.read_items(keys, ikm).await else {
             return;
         };
-        let mut chats = Vec::new();
-        let mut pinned: Option<Vec<Peer>> = None;
-        let mut keep_muted_archived: Option<bool> = None;
+        let join_name = |given: &str, family: &str| -> String {
+            [given.trim(), family.trim()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut contacts = Vec::new();
+        let mut groups = Vec::new();
+        let mut account_record: Option<StorageAccount> = None;
         let mut folders = Vec::new();
         for record in records {
             match record.record {
@@ -755,57 +779,95 @@ impl Session {
                         } else {
                             self.blocked_acis.remove(&aci);
                         }
-                        chats.push(ChatState {
-                            peer: Peer::Direct(aci),
-                            muted_until: contact.muted_until_timestamp,
-                            dont_notify_for_mentions_if_muted: false,
-                            archived: contact.archived,
-                            marked_unread: contact.marked_unread,
+                        if let (Ok(uuid), Ok(pk_bytes)) = (Uuid::parse_str(&aci), <[u8; 32]>::try_from(contact.profile_key.as_slice())) {
+                            let _ = self.vault.upsert_profile_key(&uuid, ProfileKey::create(pk_bytes)).await;
+                        }
+                        let profile_name = join_name(&contact.given_name, &contact.family_name);
+                        let system_name = join_name(&contact.system_given_name, &contact.system_family_name);
+                        let name = if !profile_name.is_empty() { profile_name } else { system_name };
+                        let nickname = contact
+                            .nickname
+                            .as_ref()
+                            .map(|n| join_name(&n.given, &n.family))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| contact.system_nickname.trim().to_owned());
+                        let identity_state = match contact_record::IdentityState::try_from(contact.identity_state) {
+                            Ok(contact_record::IdentityState::Verified) => IdentityState::Verified,
+                            Ok(contact_record::IdentityState::Unverified) => IdentityState::Unverified,
+                            _ => IdentityState::Default,
+                        };
+                        contacts.push(StorageContact {
+                            aci,
+                            name,
+                            nickname,
+                            note: contact.note.trim().to_owned(),
+                            phone: contact.e164.trim().to_owned(),
+                            username: contact.username.trim().to_owned(),
+                            identity_state,
                             blocked: contact.blocked,
                             whitelisted: contact.whitelisted,
+                            archived: contact.archived,
+                            marked_unread: contact.marked_unread,
+                            muted_until: contact.muted_until_timestamp,
+                            hidden: contact.hidden,
                         });
                     }
                 }
                 Some(storage_record::Record::GroupV2(group)) => {
                     if let Ok(key) = <[u8; 32]>::try_from(group.master_key.as_slice()) {
                         let id = group_id(&key);
+                        self.groups.entry(id.clone()).or_insert(key);
                         if group.blocked {
                             self.blocked_groups.insert(id.clone());
                         } else {
                             self.blocked_groups.remove(&id);
                         }
-                        chats.push(ChatState {
-                            peer: Peer::Group(id),
-                            muted_until: group.muted_until_timestamp,
-                            dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
-                            archived: group.archived,
-                            marked_unread: group.marked_unread,
+                        let title = self
+                            .vault
+                            .group(key)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|g| g.title)
+                            .unwrap_or_default();
+                        groups.push(StorageGroup {
+                            id,
+                            title,
                             blocked: group.blocked,
                             whitelisted: group.whitelisted,
+                            archived: group.archived,
+                            marked_unread: group.marked_unread,
+                            muted_until: group.muted_until_timestamp,
+                            dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
                         });
                     }
                 }
                 Some(storage_record::Record::Account(account)) => {
-                    keep_muted_archived = Some(account.keep_muted_chats_archived);
                     let mut pins = Vec::new();
                     for item in account.pinned_conversations {
                         match item.identifier {
                             Some(account_record::pinned_conversation::Identifier::Contact(contact)) => {
                                 if super::wire::is_aci(&contact.service_id) {
-                                    pins.push(Peer::Direct(contact.service_id));
+                                    pins.push(contact.service_id);
                                 } else if let Some(aci) = aci_bytes(&contact.service_id_binary) {
-                                    pins.push(Peer::Direct(aci));
+                                    pins.push(aci);
                                 }
                             }
                             Some(account_record::pinned_conversation::Identifier::GroupMasterKey(raw)) => {
                                 if let Ok(key) = <[u8; 32]>::try_from(raw.as_slice()) {
-                                    pins.push(Peer::Group(group_id(&key)));
+                                    pins.push(Peer::Group(group_id(&key)).conversation());
                                 }
                             }
                             _ => {}
                         }
                     }
-                    pinned = Some(pins);
+                    account_record = Some(StorageAccount {
+                        pinned: pins,
+                        keep_muted_archived: Some(account.keep_muted_chats_archived),
+                        link_previews: Some(account.link_previews),
+                        universal_expire_timer: account.universal_expire_timer,
+                        note_to_self_marked_unread: account.note_to_self_marked_unread,
+                    });
                 }
                 Some(storage_record::Record::ChatFolder(folder)) => {
                     if folder.deleted_at_timestamp_ms != 0
@@ -849,8 +911,12 @@ impl Session {
                 _ => {}
             }
         }
-        if !chats.is_empty() || pinned.is_some() || keep_muted_archived.is_some() {
-            self.tell(Event::ChatStates { chats, pinned, keep_muted_archived });
+        if !contacts.is_empty() || !groups.is_empty() || account_record.is_some() {
+            self.tell(Event::StorageSync(StorageSnapshot {
+                contacts,
+                groups,
+                account: account_record,
+            }));
         }
         if !folders.is_empty() {
             folders.sort_by_key(|f| f.position);
@@ -1303,6 +1369,27 @@ impl Session {
             };
             if let (Some(peer), Some(action)) = (peer, action) {
                 self.tell(Event::MessageRequestResponse { peer, action });
+            }
+        }
+        if let Some(keys) = sync.keys {
+            let mut updated_key = false;
+            if let Some(aep_str) = keys.account_entropy_pool.as_deref() {
+                if let Ok(aep) = AccountEntropyPool::from_str(aep_str) {
+                    let _ = self.vault.store_account_entropy_pool(Some(&aep)).await;
+                    if let Ok(master) = MasterKey::from_slice(aep.derive_svr_key().as_slice()) {
+                        let _ = self.vault.store_master_key(Some(&master)).await;
+                    }
+                    updated_key = true;
+                }
+            }
+            if let Some(raw_master) = keys.master.as_deref() {
+                if let Ok(master) = MasterKey::from_slice(raw_master) {
+                    let _ = self.vault.store_master_key(Some(&master)).await;
+                    updated_key = true;
+                }
+            }
+            if updated_key {
+                self.sync_storage().await;
             }
         }
         if let Some(fetch) = sync.fetch_latest {

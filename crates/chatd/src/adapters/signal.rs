@@ -633,6 +633,18 @@ fn forget(saved: &Saved) {
 struct Live {
     /// Names as the user knows people: contact names, else what their messages said.
     names: HashMap<String, String>,
+    /// Contact nicknames from Signal's synced storage (preferred over profile names in rows).
+    nicknames: HashMap<String, String>,
+    /// Private notes on contacts from Signal's synced storage.
+    notes: HashMap<String, String>,
+    /// Phone numbers shared by contacts (from contact sync or synced storage).
+    phones: HashMap<String, String>,
+    /// Stored Signal usernames (from username search or synced storage).
+    usernames: HashMap<String, String>,
+    /// Universal default disappearing-messages timer in seconds from AccountRecord (0 = off).
+    default_timer: u32,
+    /// Account's "Generate link previews" setting (from configuration sync or AccountRecord).
+    link_previews: bool,
     /// Unread incoming messages per conversation, (author, sent), oldest first.
     unread: HashMap<String, VecDeque<(String, u64)>>,
     /// Our sent messages and their conversation, for receipts that name only the time.
@@ -706,7 +718,17 @@ struct Ring {
 
 impl Live {
     fn name(&self, id: &str) -> String {
+        if let Some(nick) = self.nicknames.get(id).filter(|s| !s.is_empty()) {
+            return nick.clone();
+        }
         self.names.get(id).cloned().unwrap_or_else(|| NO_NAME.to_owned())
+    }
+
+    fn known_name(&self, id: &str) -> String {
+        if let Some(nick) = self.nicknames.get(id).filter(|s| !s.is_empty()) {
+            return nick.clone();
+        }
+        self.names.get(id).cloned().unwrap_or_default()
     }
 
     fn unread(&mut self, conversation: &str, author: &str, sent: u64) {
@@ -781,7 +803,13 @@ impl Live {
     }
 
     fn timer_of(&self, conversation: &str) -> wire::Timer {
-        self.timers.get(conversation).copied().unwrap_or_default()
+        if let Some(timer) = self.timers.get(conversation) {
+            return *timer;
+        }
+        if self.default_timer > 0 && !conversation.starts_with("g.") {
+            return wire::Timer { seconds: self.default_timer, version: 1 };
+        }
+        wire::Timer::default()
     }
 
     fn remember_expiring(&mut self, conversation: &str, message_id: &str, seconds: u32) {
@@ -1218,18 +1246,6 @@ fn apply(account: &Account, event: Event) {
     let ctx = &account.ctx;
     match event {
         Event::Contacts(contacts) => {
-            let people: Vec<PersonRow> = contacts
-                .iter()
-                .map(|contact| PersonRow {
-                    id: contact.id.clone(),
-                    name: if contact.name.is_empty() { NO_NAME.to_owned() } else { contact.name.clone() },
-                    handle: String::new(),
-                    avatar: ctx.avatar_of(&contact.id),
-                    bot: false,
-                    status: String::new(),
-                    link: String::new(),
-                })
-                .collect();
             {
                 let mut live = account.live();
                 for contact in &contacts {
@@ -1239,8 +1255,30 @@ fn apply(account: &Account, event: Event) {
                     if !contact.name.is_empty() {
                         live.names.insert(contact.id.clone(), contact.name.clone());
                     }
+                    if !contact.phone.is_empty() {
+                        live.phones.insert(contact.id.clone(), contact.phone.clone());
+                    }
                 }
             }
+            let people: Vec<PersonRow> = {
+                let live = account.live();
+                contacts
+                    .iter()
+                    .map(|contact| {
+                        let display = live.known_name(&contact.id);
+                        let handle = live.usernames.get(&contact.id).cloned().unwrap_or_default();
+                        PersonRow {
+                            id: contact.id.clone(),
+                            name: if display.is_empty() { NO_NAME.to_owned() } else { display },
+                            handle,
+                            avatar: ctx.avatar_of(&contact.id),
+                            bot: false,
+                            status: String::new(),
+                            link: String::new(),
+                        }
+                    })
+                    .collect()
+            };
             let _ = ctx.people(&people);
             let owned: Vec<(String, Relation)> = {
                 let live = account.live();
@@ -1253,10 +1291,11 @@ fn apply(account: &Account, event: Event) {
                     .collect()
             };
             let _ = ctx.relations(&owned);
-            // A row named before the contact was known takes the contact's name.
-            for contact in contacts.iter().filter(|contact| !contact.name.is_empty()) {
-                if let Ok(Some(_)) = ctx.known(&contact.id) {
-                    ensure_row(account, &Peer::Direct(contact.id.clone()), &contact.name);
+            // A row named before the contact was known takes the contact's name (preferring nickname).
+            for contact in &contacts {
+                let display = account.live().known_name(&contact.id);
+                if !display.is_empty() && matches!(ctx.known(&contact.id), Ok(Some(_))) {
+                    ensure_row(account, &Peer::Direct(contact.id.clone()), &display);
                 }
             }
         }
@@ -1346,9 +1385,9 @@ fn apply(account: &Account, event: Event) {
                 }
             }
             match &peer {
-                // A person's row takes the name the user knows them by, once there is one.
+                // A person's row takes the name the user knows them by (preferring nickname), once there is one.
                 Peer::Direct(aci) => {
-                    let title = account.live().names.get(aci).cloned().unwrap_or_default();
+                    let title = account.live().known_name(aci);
                     ensure_row(account, &peer, &title);
                 }
                 Peer::Group(_) => {
@@ -1656,6 +1695,7 @@ fn apply(account: &Account, event: Event) {
                 sync_filing(account, &conv);
             }
         }
+        Event::StorageSync(snapshot) => apply_storage_sync(account, snapshot),
         Event::Folders(folders) => {
             let (rows, known): (Vec<FolderRow>, Vec<String>) = {
                 let mut live = account.live();
@@ -1733,6 +1773,190 @@ fn apply(account: &Account, event: Event) {
             }
         }
         Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
+    }
+}
+
+fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
+    let ctx = &account.ctx;
+    let mut to_file: HashSet<String> = HashSet::new();
+    let mut mutes: Vec<(String, bool)> = Vec::new();
+    let mut mark_unreads: Vec<String> = Vec::new();
+    let mut relation_updates: Vec<(String, Relation)> = Vec::new();
+    let mut people_rows: Vec<PersonRow> = Vec::new();
+    let mut seed_rows: Vec<(Peer, String)> = Vec::new();
+    {
+        let mut live = account.live();
+        if let Some(acct) = snapshot.account {
+            if let Some(keep) = acct.keep_muted_archived {
+                live.keep_muted_archived = keep;
+            }
+            if let Some(lp) = acct.link_previews {
+                live.link_previews = lp;
+            }
+            live.default_timer = acct.universal_expire_timer;
+            for old in &live.pinned {
+                to_file.insert(old.clone());
+            }
+            live.pinned = acct
+                .pinned
+                .into_iter()
+                .filter_map(|id| Peer::parse(&id).map(|p| p.conversation()))
+                .collect();
+            for id in &live.pinned {
+                to_file.insert(id.clone());
+                if let Some(peer) = Peer::parse(id) {
+                    let title = match &peer {
+                        Peer::Direct(aci) => live.known_name(aci),
+                        Peer::Group(_) => live.group_info.get(id).map(|g| g.title.clone()).unwrap_or_default(),
+                    };
+                    seed_rows.push((peer, title));
+                }
+            }
+            if acct.note_to_self_marked_unread {
+                mark_unreads.push(account.me.clone());
+            }
+        }
+        for contact in snapshot.contacts {
+            if !wire::is_aci(&contact.aci) {
+                continue;
+            }
+            let aci = contact.aci;
+            if !contact.name.is_empty() {
+                live.names.insert(aci.clone(), contact.name);
+            }
+            if !contact.nickname.is_empty() {
+                live.nicknames.insert(aci.clone(), contact.nickname);
+            } else {
+                live.nicknames.remove(&aci);
+            }
+            if !contact.note.is_empty() {
+                live.notes.insert(aci.clone(), contact.note);
+            } else {
+                live.notes.remove(&aci);
+            }
+            if !contact.phone.is_empty() {
+                live.phones.insert(aci.clone(), contact.phone);
+            }
+            if !contact.username.is_empty() {
+                live.usernames.insert(aci.clone(), contact.username);
+            }
+            live.contacts.insert(aci.clone());
+            if contact.whitelisted {
+                live.accepted.insert(aci.clone());
+                live.requests.remove(&aci);
+            }
+            if contact.blocked {
+                live.blocked.insert(aci.clone());
+                relation_updates.push((aci.clone(), Relation::Blocked));
+            } else {
+                live.blocked.remove(&aci);
+                relation_updates.push((aci.clone(), Relation::Contact));
+            }
+            if contact.muted_until > 0 {
+                live.muted_until.insert(aci.clone(), contact.muted_until);
+            } else {
+                live.muted_until.remove(&aci);
+            }
+            let is_muted = live.is_muted(&aci);
+            mutes.push((aci.clone(), is_muted));
+            let was_archived = live.archived.contains(&aci);
+            if contact.archived {
+                live.archived.insert(aci.clone());
+            } else {
+                live.archived.remove(&aci);
+            }
+            if was_archived != contact.archived || contact.archived {
+                to_file.insert(aci.clone());
+            }
+            if contact.marked_unread {
+                mark_unreads.push(aci.clone());
+            }
+            let display = live.known_name(&aci);
+            let handle = live.usernames.get(&aci).cloned().unwrap_or_default();
+            people_rows.push(PersonRow {
+                id: aci.clone(),
+                name: if display.is_empty() { NO_NAME.to_owned() } else { display.clone() },
+                handle,
+                avatar: ctx.avatar_of(&aci),
+                bot: false,
+                status: String::new(),
+                link: String::new(),
+            });
+            if !contact.hidden {
+                seed_rows.push((Peer::Direct(aci), display));
+            }
+        }
+        for group in snapshot.groups {
+            let peer = Peer::Group(group.id);
+            let conv = peer.conversation();
+            if group.whitelisted {
+                live.accepted.insert(conv.clone());
+                live.requests.remove(&conv);
+            }
+            if group.blocked {
+                live.blocked.insert(conv.clone());
+            } else {
+                live.blocked.remove(&conv);
+            }
+            if group.muted_until > 0 {
+                live.muted_until.insert(conv.clone(), group.muted_until);
+            } else {
+                live.muted_until.remove(&conv);
+            }
+            if group.dont_notify_for_mentions_if_muted {
+                live.dont_notify_mentions.insert(conv.clone());
+            } else {
+                live.dont_notify_mentions.remove(&conv);
+            }
+            let is_muted = live.is_muted(&conv);
+            mutes.push((conv.clone(), is_muted));
+            let was_archived = live.archived.contains(&conv);
+            if group.archived {
+                live.archived.insert(conv.clone());
+            } else {
+                live.archived.remove(&conv);
+            }
+            if was_archived != group.archived || group.archived {
+                to_file.insert(conv.clone());
+            }
+            if group.marked_unread {
+                mark_unreads.push(conv.clone());
+            }
+            let title = if !group.title.is_empty() {
+                group.title
+            } else {
+                live.group_info.get(&conv).map(|g| g.title.clone()).unwrap_or_default()
+            };
+            seed_rows.push((peer, title));
+        }
+    }
+    if !people_rows.is_empty() {
+        let _ = ctx.people(&people_rows);
+    }
+    for (person_id, rel) in relation_updates {
+        let _ = ctx.relation(&person_id, rel);
+    }
+    for (peer, title) in seed_rows {
+        let conv = peer.conversation();
+        ensure_row(account, &peer, &title);
+        if !account.live().folders.is_empty() {
+            to_file.insert(conv);
+        }
+    }
+    for (conv, muted) in mutes {
+        let _ = ctx.muted(&conv, muted);
+        if !account.live().folders.is_empty() {
+            to_file.insert(conv);
+        }
+    }
+    for conv in mark_unreads {
+        let _ = ctx.mark_unread(&conv);
+        if !account.live().folders.is_empty() {
+            to_file.insert(conv);
+        }
+    }
+    for conv in to_file {
+        sync_filing(account, &conv);
     }
 }
 

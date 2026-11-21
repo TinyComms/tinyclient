@@ -50,7 +50,8 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote, Text, Wire,
+    GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote,
+    StorageSnapshot, Text, Wire,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -167,6 +168,12 @@ impl Fake {
         let club_state = FakeGroup::initial();
         let _ = events.send(Event::Groups(vec![club_state.info.clone()]));
         let _ = events.send(Event::Settings { read_receipts: true, typing: true });
+        let manifest_path = protocol::support_dir().join("signal.storage.json");
+        if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(snapshot) = serde_json::from_str::<StorageSnapshot>(&raw) {
+                let _ = events.send(Event::StorageSync(snapshot));
+            }
+        }
         let _ = events.send(Event::Caught);
         let fake = Fake {
             events,
@@ -619,6 +626,13 @@ fn steer(line: &str) -> Vec<Event> {
         "keep-muted-archived" => {
             let on = next() == "on";
             vec![Event::ChatStates { chats: Vec::new(), pinned: None, keep_muted_archived: Some(on) }]
+        }
+        "storage-manifest" => {
+            let json = line.strip_prefix("storage-manifest ").unwrap_or("").trim();
+            match serde_json::from_str::<StorageSnapshot>(json) {
+                Ok(snapshot) => vec![Event::StorageSync(snapshot)],
+                Err(_) => Vec::new(),
+            }
         }
         "folders" => {
             // Format: folders id:Name:opts... ; id2:Name2:opts...

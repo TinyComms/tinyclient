@@ -50,11 +50,16 @@ impl World {
     }
 
     fn start(session: Option<&str>) -> World {
+        World::start_with_setup(session, |_| {})
+    }
+
+    fn start_with_setup(session: Option<&str>, setup: impl FnOnce(&std::path::Path)) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // On Windows "/tmp" has no drive; chatd takes only absolute paths.
         let dir = std::path::absolute(format!("/tmp/tinyclient-sg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        setup(&dir);
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
         command
@@ -2183,4 +2188,61 @@ fn call_links_are_redacted_render_join_cards_and_can_be_created_synced_joined_an
     };
     assert_eq!(del, "deleted");
     world.heard("call-link-delete");
+}
+
+#[test]
+fn storage_service_manifest_seeds_contacts_groups_pins_archive_and_mutes_on_first_connect() {
+    let club_hex = CLUB.strip_prefix("g.").unwrap();
+    let far_future: u64 = 4_102_444_800_000;
+    let manifest = format!(
+        r#"{{
+            "contacts": [
+                {{"aci":"{GRACE}","name":"Grace Ombra","nickname":"Gracie","note":"Bridge partner","phone":"+15550100002","username":"grace.42","whitelisted":true}},
+                {{"aci":"{ALAN}","name":"Alan Ferro","archived":true,"muted_until":{far_future},"whitelisted":true}}
+            ],
+            "groups": [
+                {{"id":"{club_hex}","title":"Bridge club","whitelisted":true}}
+            ],
+            "account": {{
+                "pinned": ["{GRACE}"],
+                "keep_muted_archived": true,
+                "link_previews": true,
+                "universal_expire_timer": 3600
+            }}
+        }}"#
+    );
+    let world = World::start_with_setup(Some(SESSION), |dir| {
+        std::fs::write(dir.join("signal.storage.json"), &manifest).unwrap();
+    });
+    world.connected();
+
+    // All 3 conversations (2 contacts + 1 group) are seeded on first connect with NO messages.
+    let grace = world.until("Grace seeded and pinned", || {
+        let row = world.conversation(GRACE)?;
+        (row.title == "Gracie" && row.pin == Some(0)).then_some(row)
+    });
+    assert_eq!(grace.kind, ConversationKind::Direct);
+    assert!(world.messages(GRACE).is_empty());
+
+    let alan = world.until("Alan seeded archived and muted", || {
+        let row = world.conversation(ALAN)?;
+        (row.archived && row.muted).then_some(row)
+    });
+    assert_eq!(alan.title, "Alan Ferro");
+    assert!(world.messages(ALAN).is_empty());
+
+    let club = world.conversation(CLUB).expect("group seeded on first connect");
+    assert_eq!(club.title, "Bridge club");
+    assert!(world.messages(CLUB).is_empty());
+
+    // Re-fetching an updated manifest (simulating SyncMessage.fetchLatest StorageManifest) updates pins and nicknames.
+    let updated = format!(
+        r#"{{"contacts":[{{"aci":"{GRACE}","name":"Grace Ombra","nickname":"G. Ombra","whitelisted":true}}],"groups":[{{"id":"{club_hex}","title":"Bridge club","whitelisted":true}}],"account":{{"pinned":["{CLUB}"]}}}}"#
+    );
+    world.steer(&format!("storage-manifest {updated}"));
+    world.until("updated manifest moved pin to club and updated nickname", || {
+        let g = world.conversation(GRACE)?;
+        let c = world.conversation(CLUB)?;
+        (g.title == "G. Ombra" && g.pin.is_none() && c.pin == Some(0)).then_some(())
+    });
 }

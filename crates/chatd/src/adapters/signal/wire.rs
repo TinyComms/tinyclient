@@ -276,6 +276,95 @@ pub struct ChatState {
     pub whitelisted: bool,
 }
 
+/// Verification state of a contact's Signal identity key (from storage service or `SyncMessage.verified`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityState {
+    #[default]
+    Default,
+    Verified,
+    Unverified,
+}
+
+/// One contact record decrypted from Signal's Storage Service (`ContactRecord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageContact {
+    pub aci: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub nickname: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub identity_state: IdentityState,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub whitelisted: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_unread: bool,
+    #[serde(default)]
+    pub muted_until: u64,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// One Groups v2 record decrypted from Signal's Storage Service (`GroupV2Record`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageGroup {
+    /// Group public id, hex (without `g.` prefix).
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub whitelisted: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_unread: bool,
+    #[serde(default)]
+    pub muted_until: u64,
+    #[serde(default)]
+    pub dont_notify_for_mentions_if_muted: bool,
+}
+
+/// Account-level settings decrypted from Signal's Storage Service (`AccountRecord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageAccount {
+    /// Ordered conversation ids (`<aci>` or `g.<hex>`) pinned on the account.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    #[serde(default)]
+    pub keep_muted_archived: Option<bool>,
+    #[serde(default)]
+    pub link_previews: Option<bool>,
+    /// Universal default disappearing-messages timer in seconds (0 = off).
+    #[serde(default)]
+    pub universal_expire_timer: u32,
+    #[serde(default)]
+    pub note_to_self_marked_unread: bool,
+}
+
+/// Full read-only snapshot decrypted from Signal's Storage Service manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageSnapshot {
+    #[serde(default)]
+    pub contacts: Vec<StorageContact>,
+    #[serde(default)]
+    pub groups: Vec<StorageGroup>,
+    #[serde(default)]
+    pub account: Option<StorageAccount>,
+}
+
 /// One Signal chat folder from the storage service (`ChatFolderRecord`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatFolder {
@@ -470,6 +559,8 @@ pub enum Event {
         /// Account setting: keep muted chats archived when new messages arrive.
         keep_muted_archived: Option<bool>,
     },
+    /// Read-only Storage Service snapshot (contacts, groups, account record) fetched on connect or `fetchLatest`.
+    StorageSync(StorageSnapshot),
     /// Chat folders synced from the phone's storage service.
     Folders(Vec<ChatFolder>),
     /// Block list synced from the phone (`SyncMessage.blocked`): blocked ACIs and group public ids.
