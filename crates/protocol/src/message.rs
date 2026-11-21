@@ -670,6 +670,10 @@ pub struct Message {
     /// Short label of the sending line or identity when reported (e.g. carrier name or "SIM 2").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_via: Option<String>,
+    /// Canonical HTTPS permalink for this message when the network supplies one (e.g. Slack
+    /// `https://<workspace>.slack.com/archives/<channel>/p<ts>`). Used by "Copy link".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permalink: String,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -773,6 +777,7 @@ impl Message {
             effect: None,
             contacts: Vec::new(),
             sent_via: None,
+            permalink: String::new(),
         }
     }
 

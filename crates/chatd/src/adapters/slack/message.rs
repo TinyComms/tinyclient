@@ -1024,7 +1024,7 @@ impl Slack {
             self.block_media(blocks, &mut media, &mut attachments, &mut previews);
         }
         for card in event["attachments"].as_array().into_iter().flatten() {
-            if card["is_share"] == true && forwarded.is_none() {
+            if (card["is_share"] == true || card["is_msg_unfurl"] == true) && forwarded.is_none() {
                 forwarded = Some(Box::new(self.forwarded(card, &mut rich, &mut media, &mut variants, &mut attachments)));
                 continue;
             }
@@ -1139,12 +1139,13 @@ impl Slack {
             // Never blank, never dropped: one line and the way to the real thing.
             let what = if rich.undrawn { "An interactive message" } else { "A message tinyclient cannot show yet" };
             rich.text = format!("{what} from {}", sender.name);
-            MessageKind::Unsupported { link }
+            MessageKind::Unsupported { link: link.clone() }
         } else if system || event["room"].is_object() {
             MessageKind::System
         } else {
             MessageKind::Normal
         };
+        message.permalink = link;
         message.text = rich.text;
         message.spans = rich.spans;
         message.sender = sender;

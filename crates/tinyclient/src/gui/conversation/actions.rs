@@ -1127,7 +1127,8 @@ impl Pane {
             _ => None,
         };
         let link = match act {
-            MenuAct::Link | MenuAct::Open => self.link_of(&message, cx),
+            MenuAct::Link => self.link_of(&message, cx),
+            MenuAct::Open => self.open_link_of(&message, cx),
             _ => None,
         };
         self.close_menu(cx);
@@ -1243,6 +1244,17 @@ impl Pane {
             return super::links::message_link(key, origin.as_deref(), message);
         }
         super::links::message_link_for(self.open.as_ref().map(|mine| &mine.key), open, message)
+    }
+
+    fn open_link_of(&self, message: &Message, cx: &Context<Self>) -> Option<String> {
+        let shell = self.shell.upgrade()?;
+        let shell = shell.read(cx);
+        let open = shell.snapshot.as_ref()?.open.as_ref()?;
+        let key = match (&self.open, open.key.network) {
+            (Some(mine), protocol::Network::Discord) => &mine.key,
+            _ => &open.key,
+        };
+        super::links::open_in_app_link(key, open.space.as_deref(), message)
     }
 
     /// A phone's message menu: a sheet from the bottom with the message it is about, the quick

@@ -4147,3 +4147,67 @@ fn slack_save_for_later_and_reminders() {
     );
     assert_eq!(world.fake.calls(ALPHA, "reminders.delete").len(), 1, "expected reminders.delete call");
 }
+
+#[test]
+fn slack_permalinks_and_in_app_link_resolution() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (!m.is_empty()).then_some(m)
+    });
+    let root = msgs.iter().find(|m| m.id == ROOT).expect("root message");
+    assert!(
+        root.permalink.ends_with("/archives/C0GEN/p1760000200000200"),
+        "expected HTTPS channel permalink, got: {}",
+        root.permalink
+    );
+    assert!(!root.permalink.starts_with("slack://"));
+
+    // Thread reply carries `?thread_ts=...&cid=...`.
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+    let reply_ts = "1760000250.000250";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Thread reply",
+        "ts": reply_ts,
+        "thread_ts": ROOT,
+        "event_ts": reply_ts,
+    }));
+    let reply = world.until("thread reply stored", || world.message(&thread, reply_ts));
+    assert!(
+        reply.permalink.ends_with(&format!("/archives/C0GEN/p1760000250000250?thread_ts={ROOT}&cid=C0GEN")),
+        "expected thread permalink, got: {}",
+        reply.permalink
+    );
+
+    // Resolving an HTTPS Slack archive link for a matching workspace jumps in-app.
+    let Response::Resolved { conversation, message_id, .. } = world.ask(Request::Resolve {
+        url: "https://alpha.slack.com/archives/C0GEN/p1760000200000200".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(conversation, Some(general.clone()));
+    assert_eq!(message_id.as_deref(), Some(ROOT));
+
+    // Resolving a thread reply link prefers the thread conversation when cached.
+    let Response::Resolved { conversation: t_conv, message_id: t_mid, .. } = world.ask(Request::Resolve {
+        url: format!("https://alpha.slack.com/archives/C0GEN/p1760000250000250?thread_ts={ROOT}&cid=C0GEN"),
+    }) else {
+        panic!("expected Resolved for thread");
+    };
+    assert_eq!(t_conv, Some(thread.clone()));
+    assert_eq!(t_mid.as_deref(), Some(reply_ts));
+
+    // A link for a different workspace does not hijack our workspace's channel.
+    let Response::Resolved { conversation: other_conv, .. } = world.ask(Request::Resolve {
+        url: "https://unrelated-workspace.slack.com/archives/C0GEN/p1760000200000200".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(other_conv, None);
+}

@@ -940,6 +940,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
+        permalink: String::new(),
     };
     (message, rich.files)
 }
