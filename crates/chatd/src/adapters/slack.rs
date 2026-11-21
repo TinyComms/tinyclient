@@ -2932,13 +2932,15 @@ pub(crate) fn prove_profile_fields() -> Result<(), String> {
 /// What a Slack account may send. The same on every plan (unverified: a workspace may lower
 /// the file limit or turn uploads off, which Slack then refuses in words). GIFs are enabled
 /// through `CatalogKind::Gifs` (`gifs.trending` / `gifs.search`) and posted as unfurled GIF URLs;
-/// a GIF pasted as a link or sent as a file also plays.
+/// a GIF pasted as a link or sent as a file also plays. Voice clips are enabled through
+/// `voice_notes: true` and uploaded with Slack's clip `subtype` (`slack_audio` / `slack_video`).
 fn capabilities() -> protocol::Capabilities {
     protocol::Capabilities {
         max_file_bytes: send::LARGEST,
         max_files: send::FILES as u32,
         custom_emoji: protocol::EmojiScope::All,
         gifs: true,
+        voice_notes: true,
         schedule: true,
         suppress_embeds: true,
         search: true,

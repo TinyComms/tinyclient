@@ -1292,13 +1292,27 @@ impl Slack {
     pub(super) fn file(&self, file: &Value, media: &mut Registered, variants: &mut Sizes) -> Option<Attachment> {
         let id = file["id"].as_str()?;
         let url = file["url_private"].as_str().filter(|url| self.hosted(url))?;
-        let mime = file["mimetype"].as_str().unwrap_or("");
-        let kind = match mime.split_once('/') {
+        let subtype = file["subtype"].as_str().unwrap_or("");
+        let raw_mime = file["mimetype"].as_str().unwrap_or("");
+        let kind = match raw_mime.split_once('/') {
             Some(("image", "gif")) => MediaKind::Gif,
             Some(("image", _)) => MediaKind::Image,
             Some(("video", _)) => MediaKind::Video,
             Some(("audio", _)) => MediaKind::Audio,
-            _ => MediaKind::File,
+            _ => match subtype {
+                "slack_audio" => MediaKind::Audio,
+                "slack_video" => MediaKind::Video,
+                _ => MediaKind::File,
+            },
+        };
+        let mime = if !raw_mime.is_empty() {
+            raw_mime
+        } else {
+            match subtype {
+                "slack_audio" => "audio/ogg",
+                "slack_video" => "video/mp4",
+                _ => "",
+            }
         };
         let whole = MediaFile {
             width: pixels(&file["original_w"]),
@@ -1367,6 +1381,8 @@ impl Slack {
         let samples: Vec<u64> = file["audio_wave_samples"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
         let every = samples.len().div_ceil(WAVEFORM_LIMIT).max(1);
         let waveform = samples.iter().step_by(every).map(|sample| ((*sample).min(100) * 255 / 100) as u8).collect();
+        let duration_ms = file["duration_ms"].as_u64().unwrap_or(0);
+        let duration = if duration_ms > 0 { (duration_ms / 1000).max(1) as u32 } else { 0 };
         Some(Attachment {
             // Slack has neither spoilers nor stickers.
             spoiler: false,
@@ -1377,7 +1393,7 @@ impl Slack {
             thumb,
             preview: None,
             mime: mime.to_owned(),
-            duration: (file["duration_ms"].as_u64().unwrap_or(0) / 1000) as u32,
+            duration,
             round: false,
             view_once: false,
         })

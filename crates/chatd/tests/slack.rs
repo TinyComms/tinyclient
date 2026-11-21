@@ -378,8 +378,32 @@ impl Fake {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|file| json!({"id": file["id"], "name": file["title"], "title": file["title"], "mimetype": "text/plain", "size": 3,
-                                        "url_private": format!("https://files.slack.com/files-pri/{}-{}/f", team(token), file["id"].as_str().unwrap())}))
+                    .map(|file| {
+                        let subtype = file["subtype"].as_str().unwrap_or("");
+                        let mime = match subtype {
+                            "slack_audio" => "audio/ogg",
+                            "slack_video" => "video/mp4",
+                            _ => "text/plain",
+                        };
+                        let mut out = json!({
+                            "id": file["id"],
+                            "name": file["title"],
+                            "title": file["title"],
+                            "mimetype": mime,
+                            "size": 3,
+                            "url_private": format!("https://files.slack.com/files-pri/{}-{}/f", team(token), file["id"].as_str().unwrap()),
+                        });
+                        if !subtype.is_empty() {
+                            out["subtype"] = subtype.into();
+                        }
+                        if let Some(ms) = file["duration_ms"].as_u64() {
+                            out["duration_ms"] = ms.into();
+                        }
+                        if let Some(wave) = file["audio_wave_samples"].as_array() {
+                            out["audio_wave_samples"] = Value::Array(wave.clone());
+                        }
+                        out
+                    })
                     .collect();
                 let number = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
                 let ts = format!("17600020{number:02}.{number:06}");
@@ -5740,4 +5764,139 @@ fn slack_follow_unfollow_thread_and_unread_reply_counting() {
     world.until("live thread_unsubscribed sets followed=false", || {
         world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
     });
+}
+
+#[test]
+fn slack_records_and_sends_audio_and_video_clips() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.voice_notes, "Slack must advertise voice_notes for clip recording");
+
+    let dir = world.dir.with_extension("clips");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Audio clip recorded as Ogg Opus (.opus) uploads as `slack_audio` (.ogg) with duration & waveform.
+    let audio_path = dir.join("voice-42.opus");
+    std::fs::write(&audio_path, b"OggS-fake-audio").unwrap();
+    let with_audio = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: audio_path.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            view_once: false,
+            media: None,
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 12_400,
+            waveform: vec![0, 128, 255],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56101".into(),
+            text: "Quick update".into(),
+            reply_to: None,
+            with: with_audio,
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("audio clip settles", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56101") && m.state != SendState::Pending)
+    });
+    assert_eq!(sent.state, SendState::Sent);
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent.attachments[0].duration, 12);
+    assert!(!sent.attachments[0].waveform.is_empty());
+
+    let get_url = world.fake.calls(ALPHA, "files.getUploadURLExternal").pop().unwrap();
+    assert_eq!(get_url.params["filename"], "voice-42.ogg");
+    assert_eq!(get_url.params.get("subtype").map(String::as_str), Some("slack_audio"));
+
+    let completed = world.fake.calls(ALPHA, "files.completeUploadExternal").pop().unwrap();
+    let files: Value = serde_json::from_str(&completed.params["files"]).unwrap();
+    assert_eq!(files[0]["subtype"], "slack_audio");
+    assert_eq!(files[0]["duration_ms"], 12_400);
+    assert_eq!(files[0]["audio_wave_samples"], json!([0, 50, 100]));
+
+    // 2. Voice clip exceeding Slack's 5-minute cap is refused cleanly.
+    let too_long = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: audio_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 300_001,
+            waveform: vec![64],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56102".into(),
+            text: String::new(),
+            reply_to: None,
+            with: too_long,
+        }),
+        Response::Sent { .. }
+    ));
+    let refused = world.until("overlong clip fails", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56102") && m.state != SendState::Pending)
+    });
+    assert!(
+        matches!(&refused.state, SendState::Failed { reason } if reason.contains("5 minutes")),
+        "{:?}",
+        refused.state
+    );
+
+    // 3. Video clip with duration metadata uploads as `slack_video`.
+    let video_path = dir.join("demo-clip.mp4");
+    std::fs::write(&video_path, b"ftypmp42-fake-video").unwrap();
+    let with_video = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: video_path.to_string_lossy().into_owned(),
+            media: Some(protocol::OutgoingMedia {
+                duration_ms: Some(45_000),
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56103".into(),
+            text: "Walkthrough".into(),
+            reply_to: None,
+            with: with_video,
+        }),
+        Response::Sent { .. }
+    ));
+    let video_sent = world.until("video clip settles", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56103") && m.state != SendState::Pending)
+    });
+    assert_eq!(video_sent.state, SendState::Sent);
+    assert_eq!(video_sent.attachments.len(), 1);
+    assert_eq!(video_sent.attachments[0].file.kind, MediaKind::Video);
+    assert_eq!(video_sent.attachments[0].duration, 45);
+    let vid_url = world.fake.calls(ALPHA, "files.getUploadURLExternal").pop().unwrap();
+    assert_eq!(vid_url.params.get("subtype").map(String::as_str), Some("slack_video"));
 }
