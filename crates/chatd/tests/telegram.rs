@@ -2455,6 +2455,94 @@ fn pickers_and_sending_with_files_options_and_picks() {
 }
 
 #[test]
+fn an_uninstalled_sticker_can_be_added_and_recent_favourite_and_searched_stickers_show() {
+    let stickers = |world: &World, query: &str, cursor: Option<&str>| match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Stickers,
+        space: None,
+        query: query.into(),
+        cursor: cursor.map(str::to_owned),
+    }) {
+        Response::Catalog { items, cursor } => (items, cursor),
+        other => panic!("{other:?}"),
+    };
+    let exact = |world: &World, line: &str| world.calls().iter().any(|call| call == line);
+
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let (found, next) = stickers(&world, "camp", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name, "⛺");
+    assert_eq!(found[0].pack, "Camp");
+    assert_eq!(found[0].set, "920:921");
+    assert!(!found[0].locked);
+    assert!(next.is_none());
+    assert!(exact(&world, "SearchStickers"), "{:?}", world.calls());
+
+    assert_eq!(
+        world.ask(Request::StickerSet { account: account(), set: found[0].set.clone(), install: Some(true), order: Vec::new() }),
+        Response::Ok
+    );
+    assert!(exact(&world, "InstallStickerSet 920"), "{:?}", world.calls());
+
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page.iter().map(|sticker| (sticker.name.as_str(), sticker.pack.as_str())).collect::<Vec<_>>(), [("🥾", "Hiking"), ("🥾", "Hiking")]);
+    assert!(page.iter().all(|sticker| sticker.set.is_empty() && !sticker.locked));
+    assert_eq!(next.as_deref(), Some("1"));
+    let (page, next) = stickers(&world, "", Some("1"));
+    assert_eq!(page.len(), 1, "{page:?}");
+    assert_eq!((page[0].name.as_str(), page[0].pack.as_str()), ("⛺", "Camp"));
+    assert!(next.is_none());
+
+    assert_eq!(
+        world.ask(Request::StickerSet { account: account(), set: String::new(), install: None, order: vec![920, 900] }),
+        Response::Ok
+    );
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Camp");
+    assert_eq!(next.as_deref(), Some("1"));
+
+    assert_eq!(
+        world.ask(Request::StickerSet { account: account(), set: "920:921".into(), install: Some(false), order: Vec::new() }),
+        Response::Ok
+    );
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page.iter().map(|sticker| sticker.pack.as_str()).collect::<Vec<_>>(), ["Hiking", "Hiking"]);
+    assert!(next.is_none());
+    let hiking = page[0].id.clone();
+
+    let (found, _) = stickers(&world, "⛺", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].set, "920:921");
+    assert!(exact(&world, "GetStickers"), "{:?}", world.calls());
+
+    assert_eq!(world.ask(Request::FaveSticker { account: account(), id: hiking, unfave: false }), Response::Ok);
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Favourites");
+    assert_eq!(next.as_deref(), Some("1"));
+
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("featured-premium");
+    let (page, next) = stickers(&world, "", None);
+    assert!(!page.is_empty());
+    assert!(page.iter().all(|sticker| sticker.locked), "{page:?}");
+    assert_eq!(page[0].pack, "Gold");
+    assert_eq!(page[0].set, "930:931");
+    assert_eq!(next.as_deref(), Some("1"));
+
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("recent-stickers");
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Recent");
+    assert_eq!(next.as_deref(), Some("1"));
+}
+
+#[test]
 fn an_inline_bot_query_lists_articles_and_a_pick_sends_the_result() {
     let world = World::signed_in();
     world.connected();

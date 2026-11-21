@@ -678,6 +678,19 @@ pub enum Command {
         unsave: bool,
         reply: Reply<()>,
     },
+    /// Install or remove a sticker pack, or restack the installed packs.
+    StickerSet {
+        set: String,
+        install: Option<bool>,
+        order: Vec<i64>,
+        reply: Reply<()>,
+    },
+    /// Star or unstar one sticker (`messages.faveSticker`).
+    FaveSticker {
+        id: String,
+        unfave: bool,
+        reply: Reply<()>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -890,6 +903,7 @@ impl Command {
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

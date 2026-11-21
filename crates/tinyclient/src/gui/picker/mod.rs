@@ -606,9 +606,13 @@ impl Picker {
             Tab::Stickers => (Tab::Stickers, &self.stickers.items),
             Tab::Emoji => return,
         };
-        let Some(id) = items.get(ix).map(|item| item.id.clone()) else {
+        let Some(item) = items.get(ix) else {
             return;
         };
+        if item.locked {
+            return;
+        }
+        let id = item.id.clone();
         if let (Tab::Stickers, Some(account)) = (tab, &self.setup.account) {
             kept::sent_sticker(account, &id);
             self.recent_stickers = kept::list(account, Kept::RecentStickers);
@@ -769,6 +773,12 @@ impl Picker {
         let Some(id) = items.get(ix).map(|item| item.id.clone()) else {
             return;
         };
+        // Telegram's own favourites, as well as the local star. `unfave` is what the star shows now.
+        if self.tab == Tab::Stickers && self.setup.network == Some(Network::Telegram) {
+            let unfave = self.favorites.contains(&id);
+            let request = Request::FaveSticker { account: account.clone(), id: id.clone(), unfave };
+            ask_later(cx, request, |_, _| {});
+        }
         kept::star(&account, &id);
         self.favorites = kept::list(&account, Kept::Favorites);
         let had = self.selected.is_some();
@@ -777,6 +787,42 @@ impl Picker {
             let found = self.lines.iter().enumerate().find_map(|(row, line)| line.items.iter().position(|(at, _)| *at == ix).map(|column| (row, column)));
             self.select(found, cx);
         }
+    }
+
+    /// The install key of the first sticker under this section label, when that pack is not installed.
+    fn section_set(&self, ix: usize) -> Option<String> {
+        if self.tab != Tab::Stickers {
+            return None;
+        }
+        for line in self.lines.iter().skip(ix + 1) {
+            if line.label.is_some() {
+                break;
+            }
+            for (at, _) in &line.items {
+                if let Some(item) = self.stickers.items.get(*at) {
+                    if !item.set.is_empty() {
+                        return Some(item.set.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Adds the pack named by `set` and opens the Stickers tab again so the new page shows.
+    fn add_pack(&mut self, set: String, cx: &mut Context<Self>) {
+        let Some(account) = self.setup.account.clone() else {
+            return;
+        };
+        let request = Request::StickerSet { account, set, install: Some(true), order: Vec::new() };
+        let this = cx.weak_entity();
+        ask_later(cx, request, move |answer, cx| {
+            if matches!(answer, Ok(Response::Ok)) {
+                let _ = this.update(cx, |this, cx| {
+                    this.ask(Tab::Stickers, String::new(), None, cx);
+                });
+            }
+        });
     }
 
     fn star_selected(&mut self, cx: &mut Context<Self>) {
@@ -1189,7 +1235,29 @@ impl Picker {
             return div().h(px(height)).into_any_element();
         };
         if let Some(label) = line.label {
-            return div().h(px(LABEL)).px(px(4.)).pb(px(4.)).flex().items_end().type_micro().text_color(theme::text_soft()).child(label).into_any_element();
+            let set = self.section_set(ix);
+            return div()
+                .h(px(LABEL))
+                .px(px(4.))
+                .pb(px(4.))
+                .flex()
+                .items_end()
+                .gap(px(8.))
+                .type_micro()
+                .text_color(theme::text_soft())
+                .child(div().flex_1().min_w_0().child(label))
+                .when_some(set, |row, set| {
+                    row.child(
+                        div()
+                            .id(("add-pack", ix))
+                            .flex_none()
+                            .cursor_pointer()
+                            .text_color(theme::accent())
+                            .child("Add")
+                            .on_click(cx.listener(move |this, _, _, cx| this.add_pack(set.clone(), cx))),
+                    )
+                })
+                .into_any_element();
         }
         let mut want = Vec::new();
         let gap = if gifs { GIF_GAP } else { STICKER_GAP };
@@ -1272,6 +1340,7 @@ impl Picker {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
+                    .when(item.locked, |cell| cell.opacity(0.45))
                     .when(selected || hovered, |cell| cell.border_2().border_color(if selected { theme::focus() } else { theme::border_strong() }))
                     .when(!gifs, |cell| cell.hover(|style| style.bg(theme::selected())))
                     .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_item(at, *on, cx)))
@@ -1552,7 +1621,7 @@ mod tests {
 
     fn gif(id: &str, w: u32, h: u32) -> CatalogItem {
         let file = MediaFile { width: w, height: h, ..MediaFile::new(id, MediaKind::Gif) };
-        CatalogItem { id: id.into(), name: id.into(), file: Some(file), pack: String::new(), animated: true }
+        CatalogItem { id: id.into(), name: id.into(), file: Some(file), pack: String::new(), animated: true, set: String::new(), locked: false }
     }
 
     #[test]
@@ -1632,7 +1701,7 @@ mod tests {
 
     #[test]
     fn stickers_sit_four_to_a_row_under_their_pack_and_filter_by_name() {
-        let sticker = |id: &str, name: &str, pack: &str| CatalogItem { id: id.into(), name: name.into(), file: None, pack: pack.into(), animated: false };
+        let sticker = |id: &str, name: &str, pack: &str| CatalogItem { id: id.into(), name: name.into(), file: None, pack: pack.into(), animated: false, set: String::new(), locked: false };
         let items: Vec<CatalogItem> = (0..6).map(|n| sticker(&n.to_string(), if n == 2 { "😮" } else { "👋" }, "Forest Friends")).chain([sticker("x", "🦊", "Foxes")]).collect();
         let lines = sticker_lines(&items, "", None, &[], &[]);
         assert_eq!(lines[0].label.as_deref(), Some("Forest Friends · 6"));

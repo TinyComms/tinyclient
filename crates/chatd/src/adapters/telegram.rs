@@ -256,8 +256,8 @@ struct Live {
     shown: Vec<(String, Vec<u8>, bool)>,
     /// What the picker's items send.
     picks: VecDeque<(String, catalog::Pick)>,
-    /// The installed sticker packs, from the first page of the Stickers tab.
-    sticker_sets: Option<Vec<(i64, i64, String)>>,
+    /// Sticker tab pages, from the first page: recent, favourites, featured, then installed packs.
+    sticker_sets: Option<Vec<catalog::StickerPage>>,
     /// The installed custom-emoji packs, kept apart from stickers so one tab does not blank the other.
     emoji_sets: Option<Vec<(i64, i64, String)>>,
     /// `:alt:` labels the emoji tab offered, newest last, so a send can name the document.
@@ -728,7 +728,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SaveGif { reply, .. } | Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -900,6 +900,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
+        }
+        Command::StickerSet { set, install, order, reply } => {
+            let _ = reply.send(catalog::sticker_set(account, &set, install, &order).map_err(refused));
+        }
+        Command::FaveSticker { id, unfave, reply } => {
+            let _ = reply.send(catalog::fave_sticker(account, &id, unfave).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {

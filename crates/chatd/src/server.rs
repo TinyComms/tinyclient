@@ -2153,6 +2153,7 @@ impl Chat {
                 for item in &mut page.items {
                     clip(&mut item.name, 100);
                     clip(&mut item.pack, 100);
+                    clip(&mut item.set, 80);
                 }
                 self.hub.catalogs.keep(asked, (page.items.clone(), page.cursor.clone()));
                 Response::Catalog { items: page.items, cursor: page.cursor }
@@ -2718,6 +2719,24 @@ impl Chat {
                 match self.ask(&account, |reply| Command::SaveGif { id, unsave, reply }) {
                     Ok(()) => {
                         self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Gifs);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StickerSet { account, set, install, order } => {
+                match self.ask(&account, |reply| Command::StickerSet { set, install, order, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Stickers);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::FaveSticker { account, id, unfave } => {
+                match self.ask(&account, |reply| Command::FaveSticker { id, unfave, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Stickers);
                         Response::Ok
                     }
                     Err(refused) => *refused,

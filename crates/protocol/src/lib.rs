@@ -1951,6 +1951,28 @@ pub enum Request {
         unsave: bool,
     },
 
+    /// Installs or removes one sticker pack, or restacks the installed packs (Telegram).
+    /// `set` is `id:access_hash` or a short name. `install` of `Some(true)` adds the pack and
+    /// `Some(false)` removes it. A non-empty `order` restacks instead: pack ids, first shown first.
+    StickerSet {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        set: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install: Option<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        order: Vec<i64>,
+    },
+
+    /// Stars or unstars one sticker in Telegram's favourites (`messages.faveSticker`).
+    /// `id` is the catalog item's id.
+    FaveSticker {
+        account: AccountKey,
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        unfave: bool,
+    },
+
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
     /// later is a `Media` change. Ask only for what is on screen.
     Fetch {

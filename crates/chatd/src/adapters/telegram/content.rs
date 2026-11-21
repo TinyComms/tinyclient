@@ -1134,7 +1134,25 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     attachment.sticker = sticker;
     attachment.waveform = wave;
     attachment.round = round || media.round;
+    attachment.sticker_set = sticker_set_key(&document.attributes);
     attachment
+}
+
+/// `id:access_hash` or a short name, from a sticker or custom-emoji attribute. Empty otherwise.
+pub(super) fn sticker_set_key(attributes: &[tl::enums::DocumentAttribute]) -> String {
+    attributes.iter().find_map(|attribute| {
+        let set = match attribute {
+            DocumentAttribute::Sticker(sticker) => &sticker.stickerset,
+            DocumentAttribute::CustomEmoji(emoji) => &emoji.stickerset,
+            _ => return None,
+        };
+        let key = match set {
+            tl::enums::InputStickerSet::Id(set) => format!("{}:{}", set.id, set.access_hash),
+            tl::enums::InputStickerSet::ShortName(set) => set.short_name.clone(),
+            _ => String::new(),
+        };
+        (!key.is_empty()).then_some(key)
+    }).unwrap_or_default()
 }
 
 /// The card for a poll or a quiz. Counts stay off while Telegram is still hiding them.

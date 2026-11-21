@@ -1478,6 +1478,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
             waveform,
             round: false,
             view_once: false,
+            sticker_set: String::new(),
         });
     }
     message.attachments = shown;
@@ -2738,6 +2739,7 @@ fn deliver_files(
             waveform,
             round: false,
             view_once: false,
+            sticker_set: String::new(),
         });
     }
     message.attachments = attachments;

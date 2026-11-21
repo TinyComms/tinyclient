@@ -583,6 +583,16 @@ struct World {
     pending_login_email: Option<String>,
     /// Whether the phone code flow is testing `authorizationSignUpRequired`.
     signup_required: bool,
+    /// The Camp pack (id 920) was installed with `messages.installStickerSet`.
+    camp_installed: bool,
+    /// Installed pack ids, first shown first (`messages.reorderStickerSets`). Empty keeps Hiking, then Camp.
+    sticker_order: Vec<i64>,
+    /// Starred sticker document ids (`messages.faveSticker`).
+    faved: Vec<i64>,
+    /// `messages.getRecentStickers` returns the Hiking sticker.
+    show_recent: bool,
+    /// `messages.getFeaturedStickers` returns one Premium pack.
+    featured_premium: bool,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -658,6 +668,11 @@ impl World {
             has_recovery: false,
             pending_login_email: None,
             signup_required: false,
+            camp_installed: false,
+            sticker_order: Vec::new(),
+            faved: Vec::new(),
+            show_recent: false,
+            featured_premium: false,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1548,6 +1563,14 @@ impl World {
                 message.edit_date = Some(t0() + 30);
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "recent-stickers" => {
+                self.show_recent = true;
+                Vec::new()
+            }
+            "featured-premium" => {
+                self.featured_premium = true;
+                Vec::new()
             }
             "call-flags" => {
                 let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
@@ -3466,10 +3489,94 @@ impl World {
         }
         if asked::<f::messages::GetAllStickers>(body).is_some() {
             self.log("GetAllStickers");
-            let mut set: tl::types::StickerSet = blank(&[&put(0u32), &put(900i64), &put(901i64), &put("Hiking".to_owned()), &put("hiking".to_owned()), &put(2i32), &put(1i32)]);
-            set.installed_date = Some(t0());
-            let found = tl::types::messages::AllStickers { hash: 1, sets: vec![set.into()] };
+            let mut sets = vec![installed_pack(900, 901, "Hiking", "hiking", 2)];
+            if self.camp_installed {
+                sets.push(installed_pack(920, 921, "Camp", "camp", 1));
+            }
+            if !self.sticker_order.is_empty() {
+                let order = self.sticker_order.clone();
+                sets.sort_by_key(|set| order.iter().position(|id| *id == set.id).unwrap_or(usize::MAX));
+            }
+            let found = tl::types::messages::AllStickers { hash: 1, sets: sets.into_iter().map(Into::into).collect() };
             return Some(answer(tl::enums::messages::AllStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetRecentStickers>(body).is_some() {
+            self.log("GetRecentStickers");
+            let stickers = if self.show_recent { vec![sticker(6_400).into()] } else { Vec::new() };
+            let dates = if self.show_recent { vec![t0()] } else { Vec::new() };
+            let found = tl::types::messages::RecentStickers { hash: 0, packs: Vec::new(), stickers, dates };
+            return Some(answer(tl::enums::messages::RecentStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetFavedStickers>(body).is_some() {
+            self.log("GetFavedStickers");
+            let stickers = self.faved.iter().copied().map(sticker_by_id).map(Into::into).collect();
+            let found = tl::types::messages::FavedStickers { hash: 0, packs: Vec::new(), stickers };
+            return Some(answer(tl::enums::messages::FavedStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetFeaturedStickers>(body).is_some() {
+            self.log("GetFeaturedStickers");
+            let (premium, sets) = if self.featured_premium {
+                let covered = tl::types::StickerSetCovered {
+                    set: pack(930, 931, "Gold", "gold", 1).into(),
+                    cover: sticker_in(6_430, "✨", 930, 931).into(),
+                };
+                (true, vec![covered.into()])
+            } else {
+                (false, Vec::new())
+            };
+            let found = tl::types::messages::FeaturedStickers { premium, hash: 1, count: sets.len() as i32, sets, unread: Vec::new() };
+            return Some(answer(tl::enums::messages::FeaturedStickers::Stickers(found)));
+        }
+        if let Some(request) = asked::<f::messages::SearchStickers>(body) {
+            self.log("SearchStickers");
+            let stickers = if request.q.eq_ignore_ascii_case("camp") { vec![sticker_in(6_420, "⛺", 920, 921).into()] } else { Vec::new() };
+            let found = tl::types::messages::FoundStickers { next_offset: None, hash: 1, stickers };
+            return Some(answer(tl::enums::messages::FoundStickers::Stickers(found)));
+        }
+        if let Some(request) = asked::<f::messages::GetStickers>(body) {
+            self.log("GetStickers");
+            let stickers = if request.emoticon == "⛺" {
+                vec![sticker_in(6_420, "⛺", 920, 921).into()]
+            } else if request.emoticon == "🥾" {
+                vec![sticker(6_400).into()]
+            } else {
+                Vec::new()
+            };
+            let found = tl::types::messages::Stickers { hash: 1, stickers };
+            return Some(answer(tl::enums::messages::Stickers::Stickers(found)));
+        }
+        if let Some(request) = asked::<f::messages::InstallStickerSet>(body) {
+            let id = set_id(&request.stickerset);
+            self.log(&format!("InstallStickerSet {id}"));
+            if id == 920 {
+                self.camp_installed = true;
+            }
+            return Some(answer(tl::enums::messages::StickerSetInstallResult::Success));
+        }
+        if let Some(request) = asked::<f::messages::UninstallStickerSet>(body) {
+            let id = set_id(&request.stickerset);
+            self.log(&format!("UninstallStickerSet {id}"));
+            if id == 920 {
+                self.camp_installed = false;
+            }
+            return Some(answer(true));
+        }
+        if let Some(request) = asked::<f::messages::ReorderStickerSets>(body) {
+            self.log("ReorderStickerSets");
+            self.sticker_order = request.order.clone();
+            return Some(answer(true));
+        }
+        if let Some(request) = asked::<f::messages::FaveSticker>(body) {
+            let doc_id = match &request.id {
+                tl::enums::InputDocument::Document(doc) => doc.id,
+                tl::enums::InputDocument::Empty => 0,
+            };
+            self.log(&format!("FaveSticker d{doc_id} unfave={}", request.unfave));
+            self.faved.retain(|&id| id != doc_id);
+            if !request.unfave && doc_id != 0 {
+                self.faved.insert(0, doc_id);
+            }
+            return Some(answer(true));
         }
         if asked::<f::messages::GetEmojiStickers>(body).is_some() {
             self.log("GetEmojiStickers");
@@ -3487,10 +3594,10 @@ impl World {
             return Some(answer(tl::enums::messages::Reactions::Reactions(found)));
         }
         if let Some(request) = asked::<f::messages::GetStickerSet>(body) {
-            let emoji = matches!(&request.stickerset, tl::enums::InputStickerSet::Id(set) if set.id == 910);
-            if emoji {
+            let id = set_id(&request.stickerset);
+            if id == 910 {
                 self.log("GetStickerSet emoji");
-                let set: tl::types::StickerSet = blank(&[&put(0u32), &put(910i64), &put(911i64), &put("Faces".to_owned()), &put("faces".to_owned()), &put(1i32), &put(1i32)]);
+                let set = pack(910, 911, "Faces", "faces", 1);
                 let found = tl::types::messages::StickerSet {
                     set: set.into(),
                     packs: Vec::new(),
@@ -3500,8 +3607,12 @@ impl World {
                 return Some(answer(tl::enums::messages::StickerSet::Set(found)));
             }
             self.log("GetStickerSet");
-            let set: tl::types::StickerSet = blank(&[&put(0u32), &put(900i64), &put(901i64), &put("Hiking".to_owned()), &put("hiking".to_owned()), &put(2i32), &put(1i32)]);
-            let found = tl::types::messages::StickerSet { set: set.into(), packs: Vec::new(), keywords: Vec::new(), documents: vec![sticker(6_400).into(), sticker(6_401).into()] };
+            let (set, documents) = match id {
+                920 => (pack(920, 921, "Camp", "camp", 1), vec![sticker_in(6_420, "⛺", 920, 921).into()]),
+                930 => (pack(930, 931, "Gold", "gold", 1), vec![sticker_in(6_430, "✨", 930, 931).into()]),
+                _ => (pack(900, 901, "Hiking", "hiking", 2), vec![sticker(6_400).into(), sticker(6_401).into()]),
+            };
+            let found = tl::types::messages::StickerSet { set: set.into(), packs: Vec::new(), keywords: Vec::new(), documents };
             return Some(answer(tl::enums::messages::StickerSet::Set(found)));
         }
         if let Some(request) = asked::<f::upload::SaveFilePart>(body) {
@@ -3734,6 +3845,10 @@ fn plain_document(id: i64, size: i64, name: &str) -> tl::types::Document {
 }
 
 fn sticker(id: i64) -> tl::types::Document {
+    sticker_in(id, "🥾", 900, 901)
+}
+
+fn sticker_in(id: i64, alt: &str, set_id: i64, access: i64) -> tl::types::Document {
     tl::types::Document {
         id,
         access_hash: id + 1,
@@ -3746,11 +3861,36 @@ fn sticker(id: i64) -> tl::types::Document {
         dc_id: 2,
         attributes: vec![tl::types::DocumentAttributeSticker {
             mask: false,
-            alt: "🥾".to_owned(),
-            stickerset: tl::types::InputStickerSetId { id: 900, access_hash: 901 }.into(),
+            alt: alt.to_owned(),
+            stickerset: tl::types::InputStickerSetId { id: set_id, access_hash: access }.into(),
             mask_coords: None,
         }
         .into()],
+    }
+}
+
+fn sticker_by_id(id: i64) -> tl::types::Document {
+    match id {
+        6_420 => sticker_in(id, "⛺", 920, 921),
+        6_430 => sticker_in(id, "✨", 930, 931),
+        _ => sticker(id),
+    }
+}
+
+fn pack(id: i64, access: i64, title: &str, short: &str, count: i32) -> tl::types::StickerSet {
+    blank(&[&put(0u32), &put(id), &put(access), &put(title.to_owned()), &put(short.to_owned()), &put(count), &put(1i32)])
+}
+
+fn installed_pack(id: i64, access: i64, title: &str, short: &str, count: i32) -> tl::types::StickerSet {
+    let mut set = pack(id, access, title, short, count);
+    set.installed_date = Some(t0());
+    set
+}
+
+fn set_id(set: &tl::enums::InputStickerSet) -> i64 {
+    match set {
+        tl::enums::InputStickerSet::Id(set) => set.id,
+        _ => 0,
     }
 }
 

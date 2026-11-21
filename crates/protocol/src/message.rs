@@ -181,6 +181,9 @@ pub struct Attachment {
     /// View-once media (Signal, Telegram): hidden until explicitly viewed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub view_once: bool,
+    /// Telegram sticker pack as `id:access_hash` or a short name. Empty on every other attachment.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sticker_set: String,
 }
 
 impl Attachment {
@@ -198,6 +201,7 @@ impl Attachment {
             waveform: Vec::new(),
             round: false,
             view_once: false,
+            sticker_set: String::new(),
         }
     }
 }
