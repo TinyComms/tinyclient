@@ -576,7 +576,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         media: "up".to_owned(),
         capabilities: TinyCapabilities {
             version: "0.4.0".to_owned(),
-            features: ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "upload_limits"]
+            features: ["server", "roles", "categories", "channel_layout", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "upload_limits"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
@@ -1126,11 +1126,30 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
         }
         Request::TinyLayout { account, groups } if ours(account) => {
             for group in groups {
-                for (position, room_id) in group.room_ids.iter().enumerate() {
-                    if let Some(room) = community.rooms.iter_mut().find(|room| room.id == *room_id)
-                    {
-                        room.category_id = group.category_id.clone();
-                        room.position = position as i32;
+                if !group.items.is_empty() {
+                    for (position, item) in group.items.iter().enumerate() {
+                        match item.kind {
+                            protocol::TinyLayoutItemKind::Channel => {
+                                if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == item.id) {
+                                    ch.category_id = group.category_id.clone();
+                                    ch.position = position as i32;
+                                }
+                            }
+                            protocol::TinyLayoutItemKind::Room => {
+                                if let Some(room) = community.rooms.iter_mut().find(|room| room.id == item.id) {
+                                    room.category_id = group.category_id.clone();
+                                    room.position = position as i32;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (position, room_id) in group.room_ids.iter().enumerate() {
+                        if let Some(room) = community.rooms.iter_mut().find(|room| room.id == *room_id)
+                        {
+                            room.category_id = group.category_id.clone();
+                            room.position = position as i32;
+                        }
                     }
                 }
             }

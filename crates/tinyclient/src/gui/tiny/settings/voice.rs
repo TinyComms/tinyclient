@@ -125,7 +125,7 @@ pub(in crate::gui::tiny) fn voice(shell: &Shell, facts: &Facts, window: &mut Win
 
     // Limits.
     let mut rows = kit::card().child(table_head(&[("Channel", None), ("People", Some(80.)), ("Bitrate", Some(80.)), ("Talk", Some(110.))]));
-    let mut ordered: Vec<_> = model::lines(community, &Default::default(), None)
+    let mut ordered: Vec<_> = model::lines(community, &Default::default(), None, &Default::default())
         .into_iter()
         .filter_map(|line| match line {
             model::Line::Room { id } => community.rooms.iter().find(|room| room.id == id),

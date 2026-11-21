@@ -958,13 +958,61 @@ pub(crate) fn category_delete(account: AccountKey, category_id: String) -> Respo
 }
 
 pub(crate) fn layout(account: AccountKey, groups: Vec<TinyLayoutGroup>) -> Response {
-    let rooms: usize = groups.iter().map(|group| group.room_ids.len()).sum();
-    let ids_fine = groups.iter().all(|group| group.category_id.as_deref().is_none_or(safe_id) && group.room_ids.iter().all(|id| safe_id(id)));
-    if groups.len() > LIST_MAX || rooms > LIST_MAX || !ids_fine {
+    let count: usize = groups.iter().map(|group| group.room_ids.len().max(group.items.len())).sum();
+    let ids_fine = groups.iter().all(|group| {
+        group.category_id.as_deref().is_none_or(safe_id)
+            && group.room_ids.iter().all(|id| safe_id(id))
+            && group.items.iter().all(|item| safe_id(&item.id))
+    });
+    if groups.len() > LIST_MAX || count > LIST_MAX || !ids_fine {
         return refused(CHECK);
     }
-    let categories: Vec<Value> = groups.iter().map(|group| json!({ "id": group.category_id, "room_ids": group.room_ids })).collect();
-    change(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage", "PUT", "/v1/layout", Some(json!({ "categories": categories })), Missing::Room)
+    let saved = match allowed(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let mixed = known(&saved).capabilities.has(protocol::TINY_FEATURE_CHANNEL_LAYOUT);
+    let categories: Vec<Value> = if mixed {
+        groups
+            .iter()
+            .map(|group| {
+                let items: Vec<Value> = if !group.items.is_empty() {
+                    group
+                        .items
+                        .iter()
+                        .map(|item| {
+                            let kind = match item.kind {
+                                protocol::TinyLayoutItemKind::Channel => "channel",
+                                protocol::TinyLayoutItemKind::Room => "room",
+                            };
+                            json!({ "kind": kind, "id": item.id })
+                        })
+                        .collect()
+                } else {
+                    group.room_ids.iter().map(|id| json!({ "kind": "room", "id": id })).collect()
+                };
+                json!({ "id": group.category_id, "items": items })
+            })
+            .collect()
+    } else {
+        groups
+            .iter()
+            .map(|group| {
+                let room_ids: Vec<&str> = if !group.room_ids.is_empty() {
+                    group.room_ids.iter().map(String::as_str).collect()
+                } else {
+                    group
+                        .items
+                        .iter()
+                        .filter(|item| item.kind == protocol::TinyLayoutItemKind::Room)
+                        .map(|item| item.id.as_str())
+                        .collect()
+                };
+                json!({ "id": group.category_id, "room_ids": room_ids })
+            })
+            .collect()
+    };
+    sent(&saved, "PUT", "/v1/layout", Some(json!({ "categories": categories })), Missing::Room)
 }
 
 // Rooms.

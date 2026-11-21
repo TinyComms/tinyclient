@@ -161,7 +161,10 @@ fn every_change_goes_to_its_route_with_its_body() {
         assert_eq!(json_body(&last(&log, "POST /v1/categories "))["name"], "Voice");
         assert_eq!(category_rename(account.clone(), VOICE.into(), "Talk".into()), Response::Ok);
         assert_eq!(category_delete(account.clone(), VOICE.into()), Response::Ok);
-        let groups = vec![TinyLayoutGroup { category_id: None, room_ids: vec![LOBBY.into()] }, TinyLayoutGroup { category_id: Some(VOICE.into()), room_ids: vec![] }];
+        let groups = vec![
+            TinyLayoutGroup { category_id: None, room_ids: vec![LOBBY.into()], items: vec![] },
+            TinyLayoutGroup { category_id: Some(VOICE.into()), room_ids: vec![], items: vec![] },
+        ];
         assert_eq!(layout(account.clone(), groups), Response::Ok);
         let body = json_body(&last(&log, "PUT /v1/layout "));
         assert!(body["categories"][0]["id"].is_null() && body["categories"][1]["id"] == VOICE);
@@ -923,5 +926,56 @@ fn channel_override_set_and_clear_hit_channel_routes_and_reject_overlap() {
         // Clear sends DELETE /v1/channels/{id}/overrides/{role_id}.
         assert_eq!(channel_override_clear(account, "ch-1".into(), "role-1".into()), Response::Ok);
         assert!(!sent(&log, "DELETE /v1/channels/ch-1/overrides/role-1 ").is_empty());
+    });
+}
+
+#[test]
+fn layout_sends_items_with_channel_layout_and_room_ids_without() {
+    use protocol::{TinyLayoutItem, TinyLayoutItemKind};
+    let groups = || {
+        vec![TinyLayoutGroup {
+            category_id: Some(VOICE.into()),
+            room_ids: vec![],
+            items: vec![
+                TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id: "ch-1".into() },
+                TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: LOBBY.into() },
+            ],
+        }]
+    };
+
+    // Server WITH channel_layout gets `items` (both channel and room) and no `room_ids`.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("GET /v1/capabilities ") {
+            return http(200, "OK", r#"{"version":"0.6.0","features":["categories","channel_layout"]}"#);
+        }
+        if first.starts_with("GET /v1/me ") {
+            return http(200, "OK", OWNER);
+        }
+        http(200, "OK", "{}")
+    });
+    with_session(&base, "owner", |account| {
+        let _ = community(&test_hub(), account.clone());
+        assert_eq!(layout(account, groups()), Response::Ok);
+        let body = json_body(&last(&log, "PUT /v1/layout "));
+        let bucket = &body["categories"][0];
+        assert!(bucket.get("room_ids").is_none());
+        assert_eq!(bucket["items"][0], json!({ "kind": "channel", "id": "ch-1" }));
+        assert_eq!(bucket["items"][1], json!({ "kind": "room", "id": LOBBY }));
+    });
+
+    // Server WITHOUT channel_layout gets `room_ids` with text channels omitted, and no `items`.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = newer(OWNER, log.clone());
+    with_session(&base, "owner", |account| {
+        let _ = community(&test_hub(), account.clone());
+        assert_eq!(layout(account, groups()), Response::Ok);
+        let body = json_body(&last(&log, "PUT /v1/layout "));
+        let bucket = &body["categories"][0];
+        assert!(bucket.get("items").is_none());
+        assert_eq!(bucket["room_ids"], json!([LOBBY]));
     });
 }

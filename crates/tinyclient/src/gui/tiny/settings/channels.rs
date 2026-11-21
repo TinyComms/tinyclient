@@ -362,15 +362,12 @@ impl Shell {
         });
         let kept = overlay.channels.sel.clone().filter(|sel| exists(sel));
         let first = || {
-            community
-                .channels
-                .first()
-                .map(|ch| Sel::Channel(ch.id.clone()))
-                .or_else(|| {
-                    model::lines(community, &HashSet::new(), None)
-                        .into_iter()
-                        .find_map(|line| if let Line::Room { id } = line { Some(Sel::Room(id)) } else { None })
-                })
+            let empty = HashSet::new();
+            model::lines(community, &empty, None, &empty).into_iter().find_map(|line| match line {
+                Line::Channel { id } => Some(Sel::Channel(id)),
+                Line::Room { id } => Some(Sel::Room(id)),
+                _ => None,
+            })
         };
         let pick = kept.clone().or(wanted).or_else(first);
         if let Some(overlay) = self.tiny_state.settings.as_mut() {
@@ -451,10 +448,11 @@ pub(in crate::gui::tiny) fn channels(shell: &Shell, facts: &Facts, window: &mut 
     page.child(div().flex().items_start().gap(px(24.)).child(tree(facts, draft, cx)).child(div().flex_1().min_w_0().child(editor))).into_any_element()
 }
 
-fn channel_tree_row(community: &TinyCommunity, draft: &Draft, ch: &TinyChannel, cx: &mut Context<Shell>) -> Stateful {
+fn channel_tree_row(facts: &Facts, draft: &Draft, ch: &TinyChannel, cx: &mut Context<Shell>) -> Stateful {
+    let community = facts.community;
     let on = draft.sel == Some(Sel::Channel(ch.id.clone()));
     let pick = ch.id.clone();
-    div()
+    let mut row = div()
         .id(SharedString::from(format!("tiny-channels-text-{}", ch.id)))
         .h(px(32.))
         .pl(px(if community.categories.is_empty() { 8. } else { 16. }))
@@ -469,7 +467,15 @@ fn channel_tree_row(community: &TinyCommunity, draft: &Draft, ch: &TinyChannel, 
         .on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_select(Some(Sel::Channel(pick.clone())), cx)))
         .child(glyph("icons/hash.svg", 14., theme::text_faint()))
         .child(div().flex_1().min_w_0().truncate().type_ui().text_color(if on { theme::text() } else { theme::text_soft() }).child(ch.name.clone()))
-        .when(!ch.overrides.is_empty(), |row| row.child(glyph("icons/lock.svg", 12., theme::text_faint())))
+        .when(!ch.overrides.is_empty(), |row| row.child(glyph("icons/lock.svg", 12., theme::text_faint())));
+    if facts.may.layout && community.has(TINY_FEATURE_CHANNEL_LAYOUT) {
+        let target = ch.id.clone();
+        row = row
+            .on_drag(Dragged::Channel { channel_id: ch.id.clone(), name: ch.name.clone() }, |dragged, _, _, cx| cx.new(|_| crate::gui::tiny::column::Ghost(dragged.label())))
+            .drag_over::<Dragged>(|style, _, _, _| style.bg(theme::accent_soft()))
+            .on_drop(cx.listener(move |this, dragged: &Dragged, _, cx| this.tiny_dropped_on_channel(target.clone(), dragged, cx)));
+    }
+    row
 }
 
 /// The categories, text channels and voice rooms, in order, each a drag handle and a drop target
@@ -477,39 +483,19 @@ fn channel_tree_row(community: &TinyCommunity, draft: &Draft, ch: &TinyChannel, 
 fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
     let community = facts.community;
     let mut tree = div().w(px(232.)).flex_none().flex().flex_col().gap(px(1.));
-    let lines = model::lines(community, &HashSet::new(), None);
-    let known_cat = |id: &Option<String>| id.as_ref().is_some_and(|id| community.categories.iter().any(|c| &c.id == id));
-    let sorted_channels = |cat: Option<&str>| -> Vec<&TinyChannel> {
-        let mut out: Vec<&TinyChannel> = community
-            .channels
-            .iter()
-            .filter(|ch| match cat {
-                None => !known_cat(&ch.category_id),
-                Some(id) => ch.category_id.as_deref() == Some(id),
-            })
-            .collect();
-        out.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-        out
-    };
+    let empty = HashSet::new();
+    let lines = model::lines(community, &empty, None, &empty);
     let headed_loose = !community.categories.is_empty() && lines.iter().any(|line| matches!(line, Line::Category { id: None, .. }));
     if !community.categories.is_empty() && !headed_loose {
         // The channels in no category still take a drop.
         tree = tree.child(loose_header(facts, cx));
-        for ch in sorted_channels(None) {
-            tree = tree.child(channel_tree_row(community, draft, ch, cx));
-        }
     }
     for line in lines {
         match line {
             Line::Category { id: None, .. } => {
                 tree = tree.child(loose_header(facts, cx));
-                for ch in sorted_channels(None) {
-                    tree = tree.child(channel_tree_row(community, draft, ch, cx));
-                }
             }
-            Line::Category { id: Some(id), name, rooms, .. } => {
-                let text_in = sorted_channels(Some(&id));
-                let total = rooms + text_in.len();
+            Line::Category { id: Some(id), name, channels, .. } => {
                 let on = draft.sel == Some(Sel::Category(id.clone()));
                 let pick = id.clone();
                 let mut row = div()
@@ -527,7 +513,7 @@ fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
                     .on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_select(Some(Sel::Category(pick.clone())), cx)))
                     .when(facts.may.layout, |row| row.child(glyph("icons/grip-vertical.svg", 12., theme::text_faint())))
                     .child(div().flex_1().min_w_0().truncate().type_micro().text_color(if on { theme::text() } else { theme::text_soft() }).child(name.to_uppercase()))
-                    .child(div().type_micro().text_color(theme::text_faint()).child(total.to_string()));
+                    .child(div().type_micro().text_color(theme::text_faint()).child(channels.to_string()));
                 if facts.may.layout {
                     let target = id.clone();
                     row = row
@@ -536,9 +522,12 @@ fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
                         .on_drop(cx.listener(move |this, dragged: &Dragged, _, cx| this.tiny_dropped_on_category(Some(target.clone()), dragged, cx)));
                 }
                 tree = tree.child(row);
-                for ch in text_in {
-                    tree = tree.child(channel_tree_row(community, draft, ch, cx));
-                }
+            }
+            Line::Channel { id } => {
+                let Some(ch) = community.channels.iter().find(|ch| ch.id == id) else {
+                    continue;
+                };
+                tree = tree.child(channel_tree_row(facts, draft, ch, cx));
             }
             Line::Room { id } => {
                 let Some(room) = community.rooms.iter().find(|room| room.id == id) else {

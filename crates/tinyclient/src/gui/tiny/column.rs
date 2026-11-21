@@ -10,7 +10,8 @@ use crate::gui::components::{badge_for, badge_look, glyph, list_row, network_ico
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
-use protocol::{Conversation, ConversationKind, Key, Network, TinyRoom, TinySeat};
+use protocol::{Conversation, ConversationKind, Key, Network, TinyChannel, TinyLayoutItem, TinyLayoutItemKind, TinyRoom, TinySeat, TINY_FEATURE_CHANNEL_LAYOUT};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// Text channels only. A direct message is a People chat, not a row in the server.
@@ -18,32 +19,9 @@ fn in_the_server(chats: &[Rc<Conversation>]) -> Vec<Rc<Conversation>> {
     chats.iter().filter(|chat| chat.kind == ConversationKind::Channel).cloned().collect()
 }
 
-/// Text channels above the voice rooms. The header is omitted when empty. Direct messages are
-/// not channels of the server; they live in People.
-fn text_section(mut list: Stateful<Div>, label: &str, chats: &[Rc<Conversation>], kind: ConversationKind, open: Option<&Key>, cx: &mut Context<Shell>) -> Stateful<Div> {
-    let rows: Vec<&Rc<Conversation>> = chats.iter().filter(|chat| chat.kind == kind).collect();
-    if rows.is_empty() {
-        return list;
-    }
-    list = list.child(
-        div()
-            .px(px(theme::INSET + 2.))
-            .pt(px(10.))
-            .pb(px(2.))
-            .text_size(px(11. + theme::text_step() as f32))
-            .line_height(px(14. + theme::text_step() as f32))
-            .font_weight(theme::SEMIBOLD)
-            .text_color(theme::text_faint())
-            .child(label.to_uppercase()),
-    );
-    for chat in rows {
-        list = list.child(text_row(chat, open, cx));
-    }
-    list
-}
-
-/// A text channel or a direct message. Picking it opens the conversation pane.
-fn text_row(chat: &Conversation, open: Option<&Key>, cx: &mut Context<Shell>) -> Stateful<Div> {
+/// A text channel row. Picking it opens the conversation pane; right-clicking opens its menu.
+/// With `draggable`, it is a drag source and a drop target for mixed channel/room layout.
+fn text_row(chat: &Conversation, open: Option<&Key>, draggable: bool, cx: &mut Context<Shell>) -> Stateful<Div> {
     let selected = open.is_some_and(|open| open == &chat.key);
     let unread = chat.unread > 0;
     let icon = if chat.kind == ConversationKind::Direct { "icons/user.svg" } else { "icons/hash.svg" };
@@ -67,11 +45,21 @@ fn text_row(chat: &Conversation, open: Option<&Key>, cx: &mut Context<Shell>) ->
     let key = chat.key.clone();
     let title = chat.title.clone();
     let menu_id = key.id.clone();
-    list_row(SharedString::from(format!("tiny-chat-{}", key.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
+    let mut row = list_row(SharedString::from(format!("tiny-chat-{}", key.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.select(key.clone(), &title, cx)))
         .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
             this.tiny_open_float(Float::TextChannel { id: menu_id.clone(), at: event.position }, cx);
-        }))
+        }));
+    if draggable {
+        let drag_id = chat.key.id.clone();
+        let drag_name = chat.title.clone();
+        let drop_id = chat.key.id.clone();
+        row = row
+            .on_drag(Dragged::Channel { channel_id: drag_id, name: drag_name }, |dragged, _, _, cx| cx.new(|_| Ghost(dragged.label())))
+            .drag_over::<Dragged>(|style, _, _, _| style.bg(theme::accent_soft()).rounded(px(theme::R_CONTROL)))
+            .on_drop(cx.listener(move |this, dragged: &Dragged, _, cx| this.tiny_dropped_on_channel(drop_id.clone(), dragged, cx)));
+    }
+    row
 }
 
 /// What is drawn under the pointer while something is dragged.
@@ -101,6 +89,7 @@ impl Dragged {
         match self {
             Dragged::Person { name, .. } => name.clone().into(),
             Dragged::Room { name, .. } => name.clone().into(),
+            Dragged::Channel { name, .. } => format!("#{name}").into(),
             Dragged::Category { name, .. } => name.clone().into(),
             Dragged::Role { name, .. } => name.clone().into(),
         }
@@ -185,11 +174,23 @@ impl Shell {
             let line = div().px(px(theme::PANE_PAD)).pt(px(12.)).whitespace_normal();
             return line.type_small().text_color(theme::danger()).child(detail).into_any_element();
         };
-        let lines = model::lines(page.community, &self.tiny_state.folded, page.mine);
-        let mut list = div().id("tiny-channels").size_full().overflow_y_scroll().pt(px(4.)).pb(px(12.)).flex().flex_col();
         let chats = self.tiny_chats();
-        list = text_section(list, "Text channels", &chats, ConversationKind::Channel, self.open.as_ref(), cx);
-        if page.community.rooms.is_empty() && chats.is_empty() {
+        let unread_ids: HashSet<String> = chats
+            .iter()
+            .filter(|chat| chat.unread > 0)
+            .map(|chat| chat.key.id.clone())
+            .collect();
+        let lines = model::lines(page.community, &self.tiny_state.folded, page.mine, &unread_ids);
+        let mut list = div().id("tiny-channels").size_full().overflow_y_scroll().pt(px(4.)).pb(px(12.)).flex().flex_col();
+        let channel_drag = page.may.layout && page.community.has(TINY_FEATURE_CHANNEL_LAYOUT);
+        // Fallback for servers whose `TinyCommunity.channels` is empty while the store still has
+        // text channels.
+        if page.community.channels.is_empty() {
+            for chat in &chats {
+                list = list.child(text_row(chat, self.open.as_ref(), false, cx));
+            }
+        }
+        if page.community.rooms.is_empty() && page.community.channels.is_empty() && chats.is_empty() {
             list = list.child(
                 div()
                     .px(px(theme::PANE_PAD))
@@ -207,7 +208,15 @@ impl Shell {
         }
         for (ix, line) in lines.iter().enumerate() {
             let row = match line {
-                Line::Category { id, name, folded, key, rooms } => self.category_row(&page, id.as_deref(), name, *folded, key, *rooms, ix == 0, cx),
+                Line::Category { id, name, folded, key, channels } => self.category_row(&page, id.as_deref(), name, *folded, key, *channels, ix == 0, cx),
+                Line::Channel { id } => {
+                    let chat = chats.iter().find(|c| &c.key.id == id).cloned().unwrap_or_else(|| {
+                        let ch: Option<&TinyChannel> = page.community.channels.iter().find(|c| &c.id == id);
+                        let title = ch.map(|c| c.name.as_str()).unwrap_or(id.as_str());
+                        Rc::new(Conversation::new(Key::new(page.account, id), ConversationKind::Channel, title))
+                    });
+                    text_row(&chat, self.open.as_ref(), channel_drag, cx).into_any_element()
+                }
                 Line::Room { id } => match page.community.rooms.iter().find(|room| room.id == *id) {
                     Some(room) => self.room_row(&page, room, cx),
                     None => continue,
@@ -404,6 +413,9 @@ impl Shell {
         let Some(community) = self.tiny_state.community.as_ref() else {
             return;
         };
+        let target = TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: room_id.clone() };
+        let category = community.rooms.iter().find(|room| room.id == room_id).and_then(|room| room.category_id.clone());
+        let category = category.filter(|id| community.categories.iter().any(|category| category.id == *id));
         match dragged {
             Dragged::Person { user_id, .. } => {
                 if model::person_menu(community, user_id).move_to.iter().any(|(id, _)| *id == room_id) {
@@ -411,9 +423,38 @@ impl Shell {
                 }
             }
             Dragged::Room { room_id: moved, .. } if *moved != room_id => {
-                let category = community.rooms.iter().find(|room| room.id == room_id).and_then(|room| room.category_id.clone());
-                let category = category.filter(|id| community.categories.iter().any(|category| category.id == *id));
-                let groups = model::move_room(model::layout_of(community), moved, category.as_deref(), Some(&room_id));
+                let item = TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: moved.clone() };
+                let groups = model::move_item(model::layout_of(community), &item, category.as_deref(), Some(&target));
+                self.tiny_layout(groups, cx);
+            }
+            Dragged::Channel { channel_id: moved, .. } if community.has(TINY_FEATURE_CHANNEL_LAYOUT) => {
+                let item = TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id: moved.clone() };
+                let groups = model::move_item(model::layout_of(community), &item, category.as_deref(), Some(&target));
+                self.tiny_layout(groups, cx);
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn tiny_dropped_on_channel(&mut self, channel_id: String, dragged: &Dragged, cx: &mut Context<Self>) {
+        let Some(community) = self.tiny_state.community.as_ref() else {
+            return;
+        };
+        if !community.has(TINY_FEATURE_CHANNEL_LAYOUT) {
+            return;
+        }
+        let target = TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id: channel_id.clone() };
+        let category = community.channels.iter().find(|ch| ch.id == channel_id).and_then(|ch| ch.category_id.clone());
+        let category = category.filter(|id| community.categories.iter().any(|category| category.id == *id));
+        match dragged {
+            Dragged::Channel { channel_id: moved, .. } if *moved != channel_id => {
+                let item = TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id: moved.clone() };
+                let groups = model::move_item(model::layout_of(community), &item, category.as_deref(), Some(&target));
+                self.tiny_layout(groups, cx);
+            }
+            Dragged::Room { room_id: moved, .. } => {
+                let item = TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: moved.clone() };
+                let groups = model::move_item(model::layout_of(community), &item, category.as_deref(), Some(&target));
                 self.tiny_layout(groups, cx);
             }
             _ => {}
@@ -426,7 +467,13 @@ impl Shell {
         };
         match dragged {
             Dragged::Room { room_id, .. } => {
-                let groups = model::move_room(model::layout_of(community), room_id, category.as_deref(), None);
+                let item = TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: room_id.clone() };
+                let groups = model::move_item(model::layout_of(community), &item, category.as_deref(), None);
+                self.tiny_layout(groups, cx);
+            }
+            Dragged::Channel { channel_id, .. } if community.has(TINY_FEATURE_CHANNEL_LAYOUT) => {
+                let item = TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id: channel_id.clone() };
+                let groups = model::move_item(model::layout_of(community), &item, category.as_deref(), None);
                 self.tiny_layout(groups, cx);
             }
             Dragged::Category { category_id, .. } => {
@@ -435,7 +482,7 @@ impl Shell {
                     self.tiny_layout(groups, cx);
                 }
             }
-            Dragged::Person { .. } | Dragged::Role { .. } => {}
+            Dragged::Channel { .. } | Dragged::Person { .. } | Dragged::Role { .. } => {}
         }
     }
 }

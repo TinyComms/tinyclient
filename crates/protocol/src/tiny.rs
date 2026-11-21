@@ -385,6 +385,7 @@ pub struct TinyCapabilities {
 pub const TINY_FEATURE_SERVER: &str = "server";
 pub const TINY_FEATURE_ROLES: &str = "roles";
 pub const TINY_FEATURE_CATEGORIES: &str = "categories";
+pub const TINY_FEATURE_CHANNEL_LAYOUT: &str = "channel_layout";
 pub const TINY_FEATURE_BANS: &str = "bans";
 pub const TINY_FEATURE_TIMEOUTS: &str = "timeouts";
 pub const TINY_FEATURE_INVITE_OPTIONS: &str = "invite_options";
@@ -1207,14 +1208,32 @@ pub struct TinyInviteOptions {
     pub default_expiry: bool,
 }
 
-/// One group of the channel list's order: a category, or `None` for the rooms outside any
-/// (always shown first), with its rooms top first.
+/// Whether an entry in a mixed `PUT /v1/layout` bucket is a text channel or a voice room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TinyLayoutItemKind {
+    Channel,
+    Room,
+}
+
+/// One text channel or voice room inside a [`TinyLayoutGroup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyLayoutItem {
+    pub kind: TinyLayoutItemKind,
+    pub id: String,
+}
+
+/// One group of the channel list's order: a category, or `None` for the channels outside any
+/// (always shown first), with its items top first. `items` is used on servers with
+/// `channel_layout`; `room_ids` stays for older servers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyLayoutGroup {
     #[serde(default)]
     pub category_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub room_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<TinyLayoutItem>,
 }
 
 /// One page of the audit, newest first. Page on by passing the last row's id as `before`.

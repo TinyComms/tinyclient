@@ -170,6 +170,10 @@ pub(super) enum Dragged {
         room_id: String,
         name: String,
     },
+    Channel {
+        channel_id: String,
+        name: String,
+    },
     Category {
         category_id: String,
         name: String,
