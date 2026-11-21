@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave10",
+  "title": "Wave 10 Telegram stickers, Premium packs, Star reactions, and account recovery",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 10 Telegram stickers, reactions, and account recovery verified by unit and integration test suites.",
+    "ios": "Desktop Wave 10 Telegram stickers, reactions, and account recovery verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
