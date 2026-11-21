@@ -86,17 +86,17 @@ impl Loudness {
     }
 }
 
-pub fn run(path: PathBuf) -> io::Result<()> {
-    run_with(path, stopper())
+pub fn run(path: PathBuf, input: Option<String>) -> io::Result<()> {
+    run_with(path, input, stopper())
 }
 
 /// The recording itself, as `run` and a test drive it: `told` is the stop.
-fn run_with(path: PathBuf, told: Receiver<()>) -> io::Result<()> {
+fn run_with(path: PathBuf, input: Option<String>, told: Receiver<()>) -> io::Result<()> {
     // The microphone of a call: the same capture stage, and no speaker, so what we hear never
     // comes back out through our own.
     // chatd reads `RecEvent` from us, not a call's `MediaResponse`: a microphone that will not
     // open is said in the event it reads, or the composer keeps on recording nothing.
-    let mut audio = Audio::open_sides(None, None, (true, false)).unwrap_or_else(|err| {
+    let mut audio = Audio::open_sides(input, None, (true, false)).unwrap_or_else(|err| {
         let (_, detail) = media::failure(err);
         fail(detail)
     });
@@ -121,6 +121,10 @@ fn run_with(path: PathBuf, told: Receiver<()>) -> io::Result<()> {
             fail("The recording could not be written.")
         }
     };
+    out::write(&RecEvent::Started {
+        device: audio.input.name.clone(),
+        notice: audio.input.notice.clone(),
+    });
     let mut loudness = Loudness::new();
     let mut packet = [0u8; 1600];
     let mut frames = 0u64;
@@ -207,7 +211,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1000));
             let _ = tell.send(());
         });
-        run_with(path.clone(), told).unwrap();
+        run_with(path.clone(), None, told).unwrap();
         std::env::remove_var("TINYCLIENT_MEDIAD_AUDIO");
 
         let mut source = crate::decode::Source::open(&path).unwrap();
@@ -255,6 +259,16 @@ mod tests {
         let over = loudness.over();
         assert_eq!(over.len(), 63);
         assert!(over.iter().filter(|&&bar| bar > 0).count() <= 2, "{over:?}");
+    }
+
+    #[test]
+    fn opening_a_missing_chosen_microphone_falls_back_with_a_notice_naming_it() {
+        std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
+        let audio = Audio::open_sides(Some("Blue Yeti\tusb-mic".into()), None, (true, false)).unwrap();
+        std::env::remove_var("TINYCLIENT_MEDIAD_AUDIO");
+        let notice = audio.input.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("Blue Yeti"), "expected fallback notice naming chosen mic, got: {notice:?}");
+        assert!(notice.contains("isn't connected"), "{notice}");
     }
 }
 

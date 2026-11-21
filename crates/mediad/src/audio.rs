@@ -1130,7 +1130,17 @@ impl Audio {
             };
             audio.input = match audio.source {
                 Source::Device(_) => InUse::unheard(&AudioError::NoMicrophone),
-                _ => InUse { name: kind.clone(), id: kind, notice: None },
+                _ => {
+                    let notice = match DeviceChoice::parse(audio.want_input.as_deref()) {
+                        DeviceChoice::Device { name, id }
+                            if name != kind && id.as_deref() != Some(kind.as_str()) =>
+                        {
+                            Some(format!("{name} isn't connected. Using {kind} until it's back."))
+                        }
+                        _ => None,
+                    };
+                    InUse { name: kind.clone(), id: kind, notice }
+                }
             };
             audio.output = InUse { name: "null".to_owned(), id: "null".to_owned(), notice: None };
             return Ok(audio);

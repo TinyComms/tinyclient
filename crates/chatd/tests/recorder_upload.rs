@@ -27,7 +27,7 @@ fn a_recorded_opus_note_can_be_uploaded_and_private_cache_files_stay_blocked() {
     let dir = protocol::support_dir();
     let hub = Arc::new(Hub::new(Store::open(&dir.join("chat.sqlite")).unwrap()));
     let key = Key { network: Network::Telegram, account: "1".into(), id: "7002".into() };
-    hub.recorder.request(&hub, RecordRequest::Start { conversation: key.clone() });
+    hub.recorder.request(&hub, RecordRequest::Start { conversation: key.clone(), input: None });
     let shown = hub.recorder.shown().unwrap();
     assert!(matches!(shown.state, RecordState::Active), "{shown:?}");
     sleep(Duration::from_millis(500));

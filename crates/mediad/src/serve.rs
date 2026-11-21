@@ -499,7 +499,12 @@ pub fn run(args: &[String]) -> u8 {
                 tracing::warn!("mediad: --rec needs a file to record to");
                 return 2;
             };
-            return match crate::rec::run(path) {
+            let input = args
+                .get(2)
+                .filter(|flag| flag.as_str() == "--input")
+                .and_then(|_| args.get(3))
+                .cloned();
+            return match crate::rec::run(path, input) {
                 Ok(()) => 0,
                 Err(err) => {
                     tracing::warn!("mediad: {err}");

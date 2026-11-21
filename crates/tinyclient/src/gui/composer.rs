@@ -2385,7 +2385,8 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target)), |_, _| {});
+        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
+        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input)), |_, _| {});
     }
 
     /// Push-to-talk, the press: record now. A press inside the previous release's grace drops
@@ -2396,7 +2397,8 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        ask_later(cx, Request::Record(rec::on_hold_down(&target)), |_, _| {});
+        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
+        ask_later(cx, Request::Record(rec::on_hold_down(&target, input)), |_, _| {});
         self.holding = Some(target);
     }
 

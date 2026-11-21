@@ -15,6 +15,12 @@ pub struct Recording {
     pub conversation: Key,
     /// Unix milliseconds the recording started at, for the clock in the composer.
     pub since: u64,
+    /// The microphone in use while recording, once opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// Why the microphone in use is not the one chosen. `None` when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
     #[serde(flatten)]
     pub state: RecordState,
 }
@@ -47,17 +53,29 @@ pub enum RecordState {
 pub enum RecordRequest {
     /// Starts one recording for the conversation: chatd names the file, mediad hears the
     /// microphone. Whatever was recording is stopped.
-    Start { conversation: Key },
+    Start {
+        conversation: Key,
+        /// The chosen microphone (Settings › Voice). `None` is automatic.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+    },
     /// Ends the recording: the facts arrive as `Recorded`, and stay until `Forget`.
     Stop,
     /// The composer is not showing a recording: the facts and the file go.
     Forget,
 }
 
-/// `mediad --rec` to chatd, over its stdout. One event, and the process exits.
+/// `mediad --rec` to chatd, over its stdout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "recorder", rename_all = "snake_case")]
 pub enum RecEvent {
+    /// The microphone is open and recording. `device` is the microphone in use; `notice` is set
+    /// when the chosen microphone was missing and recording fell back to another.
+    Started {
+        device: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+    },
     /// The file is complete. mediad exits.
     Done { duration: u32, waveform: Vec<u8> },
     /// The microphone could not be opened, or the file could not be written. mediad exits.
@@ -73,12 +91,20 @@ mod tests {
         let shown = Recording {
             conversation: Key { network: crate::Network::Telegram, account: "1".into(), id: "7002".into() },
             since: 10_000,
+            device: Some("Blue Yeti".into()),
+            notice: None,
             state: RecordState::Recorded { path: "/media/telegram/1/voice.opus".into(), duration: 12_000, waveform: vec![31, 0] },
         };
         let json = serde_json::to_string(&shown).unwrap();
         assert!(json.contains(r#""state":"recorded""#), "{json}");
         assert_eq!(serde_json::from_str::<Recording>(&json).unwrap(), shown);
-        let failed = Recording { conversation: shown.conversation.clone(), since: 10_000, state: RecordState::Failed { detail: "No microphone.".into() } };
+        let failed = Recording {
+            conversation: shown.conversation.clone(),
+            since: 10_000,
+            device: None,
+            notice: None,
+            state: RecordState::Failed { detail: "No microphone.".into() },
+        };
         let json = serde_json::to_string(&failed).unwrap();
         assert!(json.contains(r#""state":"failed""#), "{json}");
         assert_eq!(serde_json::from_str::<Recording>(&json).unwrap(), failed);
