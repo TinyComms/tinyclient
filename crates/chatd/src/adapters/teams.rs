@@ -311,6 +311,7 @@ struct Place {
     presence: String,
     urlp: Option<String>,
     search: Option<String>,
+    ams: Option<String>,
 }
 
 struct Token {
@@ -364,6 +365,8 @@ struct State {
     pinned_messages: HashMap<String, Vec<info::PinnedEntry>>,
     /// Saved (bookmarked) message ids for this account.
     saved_ids: HashSet<String>,
+    /// Channel ids pinned in Teams, in Teams' own order.
+    pinned_channels: Vec<String>,
     /// Per-conversation notification level as reported by Teams.
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
@@ -382,6 +385,10 @@ struct State {
     blocked: HashSet<String>,
     /// Last listed teams (Spaces), kept so leaving one updates the Spaces list cleanly.
     spaces: Vec<crate::store::SpaceRow>,
+    /// Activity feed item ids marked read locally this session.
+    activity_read: HashSet<String>,
+    /// Per-thread member consumption horizons (thread_id -> member_id -> arrival_ms), excluding me.
+    member_horizons: HashMap<String, HashMap<String, i64>>,
 }
 
 /// What a call presents.
@@ -394,6 +401,8 @@ enum Auth {
     Both(&'static str),
     /// The skype token as trouter takes it.
     Push,
+    /// The skype token as the AMS media store takes it (`Authorization: skype_token ...`).
+    Ams,
 }
 
 enum Body<'a> {
@@ -763,7 +772,7 @@ impl Teams {
     fn forget(&self, auth: Auth) {
         let mut state = self.state();
         match auth {
-            Auth::Skype | Auth::Push => state.skype = None,
+            Auth::Skype | Auth::Push | Auth::Ams => state.skype = None,
             Auth::Bearer(scope) => drop(state.access.remove(scope)),
             Auth::Both(scope) => {
                 state.access.remove(scope);
@@ -830,6 +839,7 @@ impl Teams {
                     .as_str()
                     .map(|url| url.trim_end_matches('/').to_owned())
                     .filter(|url| self.substrate_host(url)),
+                ams: named("ams"),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -859,6 +869,7 @@ impl Teams {
         Ok(match auth {
             Auth::Skype => vec![("Authentication", format!("skypetoken={}", self.skype()?.0))],
             Auth::Push => vec![("X-Skypetoken", self.skype()?.0)],
+            Auth::Ams => vec![("Authorization", format!("skype_token {}", self.skype()?.0))],
             Auth::Bearer(scope) => vec![("Authorization", format!("Bearer {}", self.token(scope)?))],
             Auth::Both(scope) => {
                 vec![("Authorization", format!("Bearer {}", self.token(scope)?)), ("X-Skypetoken", self.skype()?.0)]
@@ -970,12 +981,13 @@ impl Teams {
         self.ctx.describe(&self.session.name, &self.me())?;
         let mut push = self.open()?;
         self.ctx.link(Link::Connected);
-        // Files are off until they can be shared with the chat's members only. The OneDrive path
-        // below made an organization-wide link, which is not what the Teams app does and shows
-        // up in a company's audit logs.
+        // Pasted/attached images go inline through Teams' AMS media store (scoped to the
+        // conversation). Non-image documents stay off (`images_only: true`) until OneDrive
+        // sharing can be scoped to the conversation's members.
         self.ctx.capabilities(protocol::Capabilities {
-            max_file_bytes: 0,
-            max_files: 0,
+            max_file_bytes: 20 * 1024 * 1024,
+            max_files: 10,
+            images_only: true,
             reply: true,
             edit: true,
             delete: true,
@@ -1001,6 +1013,8 @@ impl Teams {
             mention_spans: true,
             importance: true,
             channel_subject: true,
+            activity_feed: true,
+            read_by: true,
             ..protocol::Capabilities::default()
         });
         {
@@ -1090,6 +1104,9 @@ impl Teams {
             Command::SpaceInfo { space_id, reply } => {
                 let _ = reply.send(self.space_info(&space_id).map_err(refuse));
             }
+            Command::ReadBy { conversation_id, message_id, reply } => {
+                let _ = reply.send(self.read_by(&conversation_id, &message_id).map_err(refuse));
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
             }
@@ -1118,12 +1135,7 @@ impl Teams {
                 let _ = reply.send(self.invite_join(&code).map_err(refuse));
             }
             Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {
-                let result = if archived == Some(true) && tree::is_channel(thread_of(&conversation_id)) {
-                    self.delete_channel(&conversation_id)
-                } else {
-                    self.file_chat(&conversation_id, pinned)
-                };
-                let _ = reply.send(result.map_err(refuse));
+                let _ = reply.send(self.file_conversation(&conversation_id, pinned, archived).map_err(refuse));
             }
             Command::Pinned { conversation_id, reply } => {
                 let _ = reply.send(self.pinned_messages(&conversation_id).map_err(refuse));

@@ -522,9 +522,16 @@ impl Shell {
                 click(self.action_row(("home-action", ix), Some(icon), words.into(), lit, trailing, focused), cx).into_any_element()
             }
             Item::Space { index, child, open } => click(self.space_row(ix, index, child, open, focused), cx).into_any_element(),
-            Item::Folder { name, color, open, lit, mention, .. } => {
+            Item::Folder { id, name, color, open, lit, mention } => {
                 let color = color.map_or(theme::text_faint(), gpui::rgb);
                 let chevron = if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
+                let folder_key = self
+                    .sidebar_state
+                    .home
+                    .folders
+                    .iter()
+                    .find(|f| f.key.id == id && (f.unread > 0 || f.mentions > 0))
+                    .map(|f| f.key.clone());
                 let content = div()
                     .gap(px(8.))
                     .child(div().size(px(20.)).flex_none().flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded(px(1.5)).bg(color)))
@@ -532,7 +539,17 @@ impl Shell {
                     .child(glyph(chevron, 12., theme::text_faint()))
                     .child(div().flex_1())
                     .children(lit.then(|| badge_dot(8., if mention { theme::mention() } else { theme::unread() })));
-                click(list_row(("folder", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx).into_any_element()
+                let mut row = click(list_row(("folder", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx);
+                if let Some(folder_key) = folder_key {
+                    row = row.on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_menu(super::Menu::Folder(folder_key.clone(), event.position), cx);
+                        }),
+                    );
+                }
+                row.into_any_element()
             }
             Item::Channel(c) => self.place_row(&c, 1, focused, cx).into_any_element(),
         }

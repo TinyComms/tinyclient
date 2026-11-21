@@ -253,6 +253,12 @@ impl Teams {
             return Ok(());
         };
         let props = &conversation["properties"];
+        if let Some(horizons) = conversation["consumptionhorizons"]
+            .as_array()
+            .or_else(|| props["consumptionhorizons"].as_array())
+        {
+            self.apply_member_horizons(id, horizons)?;
+        }
         let parse_flag = |val: &Value| -> Option<bool> {
             match val {
                 Value::Bool(b) => Some(*b),
@@ -261,21 +267,25 @@ impl Teams {
                 _ => None,
             }
         };
+        let is_chan = super::tree::is_channel(id);
         let hidden_upd = parse_flag(&props["hidden"]);
         let pinned_upd = parse_flag(&props["pinned"]);
         if hidden_upd.is_some() || pinned_upd.is_some() {
             let pin = match pinned_upd {
                 Some(true) => {
                     let mut state = self.state();
-                    if let Some(pos) = state.pinned_chats.iter().position(|p| p == id) {
+                    let list = if is_chan { &mut state.pinned_channels } else { &mut state.pinned_chats };
+                    if let Some(pos) = list.iter().position(|p| p == id) {
                         Some(pos as i32)
                     } else {
-                        state.pinned_chats.push(id.to_owned());
-                        Some((state.pinned_chats.len() - 1) as i32)
+                        list.push(id.to_owned());
+                        Some((list.len() - 1) as i32)
                     }
                 }
                 Some(false) => {
-                    self.state().pinned_chats.retain(|p| p != id);
+                    let mut state = self.state();
+                    let list = if is_chan { &mut state.pinned_channels } else { &mut state.pinned_chats };
+                    list.retain(|p| p != id);
                     None
                 }
                 None => row.pin,

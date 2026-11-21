@@ -368,10 +368,18 @@ pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Co
             dot: None,
         });
     }
-    let pinned: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| c.starred || c.pin.is_some()).collect();
-    if !pinned.is_empty() {
+    let pinned_chats: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| c.starred || c.pin.is_some()).collect();
+    let mut pinned_channels: Vec<Rc<Conversation>> = spaces
+        .iter()
+        .filter(|s| s.key.network == Network::Teams)
+        .flat_map(|team| channels(&team.key))
+        .filter(|c| c.pin.is_some())
+        .collect();
+    pinned_channels.sort_by_key(|c| c.pin.unwrap_or(i32::MAX));
+    if !pinned_chats.is_empty() || !pinned_channels.is_empty() {
         header(&mut out, "Pinned");
-        out.extend(pinned.iter().map(|c| Item::Chat(Rc::clone(c))));
+        out.extend(pinned_chats.iter().map(|c| Item::Chat(Rc::clone(c))));
+        out.extend(pinned_channels.into_iter().map(Item::Channel));
     }
     let rest: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| !(c.starred || c.pin.is_some())).collect();
     let quiet_meeting = |c: &Conversation| c.meeting && now - c.updated > MEETING_QUIET && c.badge() == Badge::None && open != Some(&c.key);
@@ -407,7 +415,9 @@ pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Co
             let hidden = listed.iter().filter(|c| c.opted_out).count();
             let show_hidden = home.hidden_shown.contains(&team.key.id);
             let shown = listed.iter().filter(|c| {
-                if c.opted_out {
+                if c.pin.is_some() {
+                    false
+                } else if c.opted_out {
                     show_hidden && opened
                 } else {
                     opened || c.badge() != Badge::None || open == Some(&c.key)
