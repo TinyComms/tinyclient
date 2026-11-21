@@ -3,11 +3,11 @@
 
 use super::mention::{self, Token};
 use super::niceties;
-use protocol::Network;
+use protocol::Capabilities;
 
 /// The text a send would put on the wire: mentions expanded, then emoticons when that setting is on.
-pub fn wire_text(field: &str, tokens: &[Token], network: Network, emoticons: bool) -> String {
-    let wire = mention::wire(field, tokens, network);
+pub fn wire_text(field: &str, tokens: &[Token], can: &Capabilities, emoticons: bool) -> String {
+    let wire = mention::wire(field, tokens, can.mention_format);
     let wire = wire.trim();
     match emoticons {
         true => niceties::emoticons(wire),
@@ -19,11 +19,11 @@ pub fn wire_text(field: &str, tokens: &[Token], network: Network, emoticons: boo
 pub fn wire_with_spans(
     field: &str,
     tokens: &[Token],
-    network: Network,
+    can: &Capabilities,
     emoticons: bool,
 ) -> (String, Vec<protocol::Span>) {
-    let wired = wire_text(field, tokens, network, emoticons);
-    if !matches!(network, Network::Telegram | Network::Teams | Network::Signal) || tokens.is_empty() {
+    let wired = wire_text(field, tokens, can, emoticons);
+    if !can.mention_spans || tokens.is_empty() {
         return (wired, Vec::new());
     }
     let lead = field.len() - field.trim_start().len();
@@ -41,7 +41,7 @@ pub fn wire_with_spans(
             shifted.push(Token { range: start..end, ..token.clone() });
         }
     }
-    let spans = mention::spans(&wired, &shifted, network);
+    let spans = mention::spans(&wired, &shifted, can.mention_spans);
     (wired, spans)
 }
 
@@ -88,10 +88,11 @@ mod tests {
     #[test]
     fn the_count_is_the_wire_form_not_what_the_field_shows() {
         let field = "@Mara hello";
+        let discord = Capabilities { mention_format: protocol::MentionFormat::Discord, ..Capabilities::default() };
         let wire = wire_text(
             field,
             &[person(0..5, "@Mara", "1000")],
-            Network::Discord,
+            &discord,
             false,
         );
         assert_eq!(wire, "<@1000> hello");
@@ -100,8 +101,9 @@ mod tests {
 
     #[test]
     fn emoticons_count_when_the_send_would_convert_them() {
-        assert_eq!(wire_text("hi :)", &[], Network::Discord, false), "hi :)");
-        assert_eq!(wire_text("hi :)", &[], Network::Discord, true), "hi 🙂");
+        let discord = Capabilities { mention_format: protocol::MentionFormat::Discord, ..Capabilities::default() };
+        assert_eq!(wire_text("hi :)", &[], &discord, false), "hi :)");
+        assert_eq!(wire_text("hi :)", &[], &discord, true), "hi 🙂");
     }
 
     #[test]

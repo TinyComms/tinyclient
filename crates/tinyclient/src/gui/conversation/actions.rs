@@ -18,7 +18,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
     KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
 };
-use protocol::{ConversationKind, ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
+use protocol::{Capabilities, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, ReactionRules, Request, Response, SendState};
 use std::rc::Rc;
 
 /// How far the toolbar rises above its row, and how wide the strip it can occupy is.
@@ -109,12 +109,18 @@ pub struct Picking {
 /// What may be done to a message, decided apart from any drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Can {
-    /// It is on the network: the toolbar shows and it can be reacted to.
+    /// It is on the network: the toolbar shows and it can be acted on.
     pub act: bool,
+    /// Reactions may be added to this message (`Capabilities::reactions`).
+    pub react: bool,
     pub reply: bool,
     pub thread: bool,
     pub edit: bool,
     pub delete: bool,
+    /// Pin or unpin this message (`Capabilities::pins` and `ConversationRights::pin`).
+    pub pin: bool,
+    /// Forward this message natively (`Capabilities::forward`).
+    pub forward: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
 }
@@ -133,63 +139,68 @@ fn thread_root(message: &Message) -> bool {
         && matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. })
 }
 
-/// Whether this message can start a thread that does not exist yet. Slack names one in a
-/// channel or a direct message. Teams and Discord do, in a channel. A thread, a voice channel
-/// and a forum do not start another. Telegram topics, Signal, Messages and Tiny have no such
-/// thread.
-pub(super) fn starts_thread(message: &Message, network: Network, kind: ConversationKind) -> bool {
-    if !thread_root(message) || matches!(kind, ConversationKind::Thread | ConversationKind::Voice | ConversationKind::Forum) {
+/// Whether this message can start a thread that does not exist yet, driven by account
+/// capabilities (`Capabilities::threads` and `Capabilities::direct_threads`).
+pub(super) fn starts_thread(message: &Message, caps: &Capabilities, kind: ConversationKind) -> bool {
+    if !caps.threads
+        || !thread_root(message)
+        || matches!(kind, ConversationKind::Thread | ConversationKind::Voice | ConversationKind::Forum)
+    {
         return false;
     }
-    match network {
-        Network::Slack => true,
-        Network::Teams | Network::Discord => matches!(kind, ConversationKind::Channel | ConversationKind::Announcement),
-        Network::Telegram | Network::Signal | Network::Messages | Network::Tiny => false,
-    }
+    caps.direct_threads || matches!(kind, ConversationKind::Channel | ConversationKind::Announcement)
+}
+
+/// Whether `message` is still within `caps.edit_window` at unix second `now`.
+fn within_edit_window(message: &Message, caps: &Capabilities, now: i64) -> bool {
+    caps.edit_window == 0
+        || now <= 0
+        || message.sent <= 0
+        || now.saturating_sub(message.sent) <= caps.edit_window as i64
 }
 
 /// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
-pub fn can(message: &Message, network: Network, kind: ConversationKind, in_thread: bool) -> Can {
+/// `now`: current unix seconds, for checking `Capabilities::edit_window` (0 skips the window check).
+pub fn can(
+    message: &Message,
+    caps: &Capabilities,
+    rights: ConversationRights,
+    kind: ConversationKind,
+    in_thread: bool,
+    now: i64,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
     let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
+    let edit = sent
+        && !message.deleted
+        && !message.saved_history
+        && match message.can_edit {
+            Some(allowed) => allowed,
+            None => own && caps.edit && within_edit_window(message, caps, now),
+        };
+    let delete = !message.deleted
+        && match message.can_delete {
+            Some(allowed) => allowed,
+            None => {
+                if !sent {
+                    own
+                } else {
+                    caps.delete && (own || (said && rights.delete_others))
+                }
+            }
+        };
     Can {
         act,
-        // Slack has no inline reply: its reply is the thread.
-        reply: act && network != Network::Slack,
-        thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, network, kind)),
-        // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
-        // on every message of mine and a refusal is the network's answer. Messages never edits
-        // or deletes, so those items stay off.
-        edit: sent && own && !message.saved_history && network != Network::Messages,
-        delete: own && network != Network::Messages,
+        react: act && caps.reactions,
+        reply: act && caps.reply,
+        thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, caps, kind)),
+        edit,
+        delete,
+        pin: act && caps.pins && rights.pin,
+        forward: act && caps.forward,
         unsent: !sent && message.outgoing,
-    }
-}
-
-/// Where a message leads in the network's own app, for "Copy link" and "Open in <network>".
-/// An unsupported message names its own; Discord's and Slack's are built from ids, as the
-/// conversation's are (`profile/facts.rs`).
-// CONTRACT: `Message` carries no permalink. Telegram's needs a public username the shell does
-// not hold, and Teams has none, so those offer neither item.
-pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: &Message) -> Option<String> {
-    if let MessageKind::Unsupported { link } = &message.kind {
-        if !link.is_empty() {
-            return Some(link.clone());
-        }
-    }
-    if message.state != SendState::Sent || message.deleted {
-        return None;
-    }
-    let (channel, id) = (&conversation.id, &message.id);
-    match conversation.network {
-        Network::Discord => {
-            let place = space.unwrap_or("@me");
-            Some(format!("https://discord.com/channels/{place}/{channel}/{id}"))
-        }
-        Network::Slack => space.map(|team| format!("slack://channel?team={team}&id={channel}&message={id}")),
-        Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => None,
     }
 }
 
@@ -300,14 +311,18 @@ fn menu_acts(
 }
 
 impl Pane {
-    fn network(&self) -> Network {
-        self.open.as_ref().map_or(Network::Discord, |open| open.key.network)
+    fn network_label(&self) -> &'static str {
+        self.open.as_ref().map_or("", |open| open.key.network.label())
     }
 
     pub(super) fn can(&self, message: &Message) -> Can {
-        // No open conversation is not a place a thread can be started from.
-        let kind = self.open.as_ref().map(|open| open.kind).unwrap_or(ConversationKind::Thread);
-        can(message, self.network(), kind, self.is_thread())
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        match self.open.as_ref() {
+            Some(open) => can(message, &open.can, open.rights, open.kind, self.is_thread(), now),
+            None => can(message, &Capabilities::default(), ConversationRights::default(), ConversationKind::Thread, self.is_thread(), now),
+        }
     }
 
     // Reactions.
@@ -836,12 +851,7 @@ impl Pane {
         let shell = self.shell.upgrade()?;
         let shell = shell.read(cx);
         let open = shell.snapshot.as_ref()?.open.as_ref()?;
-        // A Slack thread's replies are linked in their channel; a Discord thread is a channel.
-        let key = match (&self.open, open.key.network) {
-            (Some(mine), protocol::Network::Discord) => &mine.key,
-            _ => &open.key,
-        };
-        message_link(key, open.space.as_deref(), message)
+        super::links::message_link_for(self.open.as_ref().map(|mine| &mine.key), open, message)
     }
 
     /// A phone's message menu: a sheet from the bottom with the message it is about, the quick
@@ -851,7 +861,7 @@ impl Pane {
         use crate::gui::phone::tokens::{self, PhoneType};
         let Menu { message, at, .. } = self.menu.as_ref()?;
         let can = self.can(message);
-        let network = self.network().label();
+        let network = self.network_label();
         let row_height = (tokens::scaled(22.) + 26.).max(48.);
         let row = |id: &'static str, icon: &'static str, words: SharedString, danger: bool| {
             let tone = if danger { theme::danger() } else { theme::text() };
@@ -1088,7 +1098,7 @@ impl Pane {
             return self.reactors_layer(&message, reactor, at, window, cx);
         }
         let can = self.can(&message);
-        let network = self.network().label();
+        let network = self.network_label();
         let chosen = self
             .menu_state(cx)
             .and_then(|(acts, cursor)| acts.get(cursor).copied());
@@ -1573,11 +1583,84 @@ mod tests {
         );
     }
 
+    fn discord_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: true,
+            forward: true,
+            polls: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn slack_caps() -> Capabilities {
+        Capabilities {
+            edit: true,
+            delete: true,
+            threads: true,
+            direct_threads: true,
+            pins: true,
+            forward: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn teams_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: true,
+            forward: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn telegram_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            edit_window: 48 * 3_600,
+            pins: true,
+            forward: true,
+            polls: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn messages_caps() -> Capabilities {
+        Capabilities {
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn tiny_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            pins: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
     #[test]
     fn a_menu_lists_what_the_message_can_do_in_one_order() {
         let channel = ConversationKind::Channel;
+        let rights = ConversationRights::default();
         let said = Message::plain("1", "Mara", "hello", 1, false);
-        let on = can(&said, Network::Discord, channel, false);
+        let on = can(&said, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
             menu_acts(on, false, 2, true, true, true, false),
             vec![
@@ -1596,7 +1679,7 @@ mod tests {
         mine.state = SendState::Failed {
             reason: "Slow mode".into(),
         };
-        let failed = can(&mine, Network::Discord, channel, false);
+        let failed = can(&mine, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
             menu_acts(failed, true, 3, true, true, false, true),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
@@ -1616,45 +1699,31 @@ mod tests {
     }
 
     #[test]
-    fn a_message_link_is_built_from_ids_where_the_network_has_one() {
-        let mut key = protocol::Key { network: Network::Discord, account: "1".into(), id: "C9".into() };
-        let said = Message::plain("M3", "Mara", "hello", 1, false);
-        assert_eq!(message_link(&key, Some("G7"), &said).as_deref(), Some("https://discord.com/channels/G7/C9/M3"));
-        assert_eq!(message_link(&key, None, &said).as_deref(), Some("https://discord.com/channels/@me/C9/M3"));
-        key.network = Network::Slack;
-        assert_eq!(message_link(&key, None, &said), None, "a Slack link needs its workspace");
-        assert_eq!(message_link(&key, Some("T1"), &said).as_deref(), Some("slack://channel?team=T1&id=C9&message=M3"));
-        key.network = Network::Telegram;
-        assert_eq!(message_link(&key, Some("x"), &said), None);
-        // One that never left has no place on the network; an unsupported one names its own.
-        key.network = Network::Discord;
-        let mut pending = said.clone();
-        pending.state = SendState::Pending;
-        assert_eq!(message_link(&key, None, &pending), None);
-        let mut odd = said.clone();
-        odd.kind = MessageKind::Unsupported { link: "https://x.test/1".into() };
-        assert_eq!(message_link(&key, None, &odd).as_deref(), Some("https://x.test/1"));
-    }
-
-    #[test]
-    fn what_a_message_offers_follows_whose_it_is_and_whether_it_left() {
+    fn what_a_message_offers_follows_capabilities_rights_and_edit_window() {
         let channel = ConversationKind::Channel;
-        let theirs = Message::plain("1", "Mara", "hello", 1, false);
-        let on = can(&theirs, Network::Discord, channel, false);
-        assert_eq!((on.act, on.reply, on.edit, on.delete, on.thread), (true, true, false, false, true));
+        let none = ConversationRights::default();
+        let theirs = Message::plain("1", "Mara", "hello", 1_000, false);
+
+        // Discord fixture: inline reply + channel threads, no edit/delete on others without mod rights.
+        let on = can(&theirs, &discord_caps(), none, channel, false, 1_100);
+        assert_eq!((on.act, on.react, on.reply, on.edit, on.delete, on.thread, on.pin, on.forward), (true, true, true, false, false, true, false, true));
         assert_eq!(thread_label(&theirs), "Reply in thread");
-        let discord_dm = can(&theirs, Network::Discord, ConversationKind::Direct, false);
-        assert!(discord_dm.reply && !discord_dm.thread, "a Discord direct message stays an inline reply");
-        assert!(!can(&theirs, Network::Discord, ConversationKind::Voice, false).thread);
-        assert!(!can(&theirs, Network::Discord, ConversationKind::Forum, false).thread);
-        // Slack answers in a thread, never inline. The thread can be started before any reply exists:
-        // Slack names it by the parent message, in a channel and in a direct message.
-        let slack = can(&theirs, Network::Slack, channel, false);
-        assert!(!slack.reply);
-        assert!(slack.thread);
-        assert!(can(&theirs, Network::Slack, ConversationKind::Direct, false).thread);
-        assert!(!can(&theirs, Network::Slack, channel, true).thread, "a thread does not open inside a thread");
-        assert!(!can(&theirs, Network::Slack, ConversationKind::Thread, false).thread);
+        let discord_dm = can(&theirs, &discord_caps(), none, ConversationKind::Direct, false, 1_100);
+        assert!(discord_dm.reply && !discord_dm.thread, "channel-only threads stay inline in DMs");
+        assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Voice, false, 1_100).thread);
+        assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Forum, false, 1_100).thread);
+
+        // Moderator rights grant delete on others' messages and pin.
+        let mod_rights = ConversationRights { pin: true, delete_others: true, manage_members: true };
+        let moderated = can(&theirs, &discord_caps(), mod_rights, channel, false, 1_100);
+        assert!(moderated.delete && moderated.pin && !moderated.edit);
+
+        // Slack fixture: no inline reply, threads in both channels and DMs.
+        let slack = can(&theirs, &slack_caps(), none, channel, false, 1_100);
+        assert!(!slack.reply && slack.thread);
+        assert!(can(&theirs, &slack_caps(), none, ConversationKind::Direct, false, 1_100).thread);
+        assert!(!can(&theirs, &slack_caps(), none, channel, true, 1_100).thread, "a thread does not open inside a thread");
+        assert!(!can(&theirs, &slack_caps(), none, ConversationKind::Thread, false, 1_100).thread);
         let mut broadcast = theirs.clone();
         broadcast.reply_to = Some(protocol::ReplyTo {
             id: "parent".into(),
@@ -1663,56 +1732,68 @@ mod tests {
             person: None,
             deleted: false,
         });
-        assert!(!can(&broadcast, Network::Slack, channel, false).thread, "a channel copy of a reply belongs to its parent's thread");
+        assert!(!can(&broadcast, &slack_caps(), none, channel, false, 1_100).thread, "a channel copy of a reply belongs to its parent's thread");
         let mut pending = theirs.clone();
         pending.state = SendState::Pending;
-        assert!(!can(&pending, Network::Slack, channel, false).thread);
+        assert!(!can(&pending, &slack_caps(), none, channel, false, 1_100).thread);
         let mut joined = theirs.clone();
         joined.kind = MessageKind::System;
-        assert!(!can(&joined, Network::Slack, channel, false).thread);
+        assert!(!can(&joined, &slack_caps(), none, channel, false, 1_100).thread);
 
-        // Teams channels thread. A chat stays an inline reply.
-        let teams = can(&theirs, Network::Teams, channel, false);
+        // Teams fixture: inline reply + channel/announcement threads, not direct/group.
+        let teams = can(&theirs, &teams_caps(), none, channel, false, 1_100);
         assert!(teams.reply && teams.thread);
-        assert!(can(&theirs, Network::Teams, ConversationKind::Announcement, false).thread);
-        assert!(!can(&theirs, Network::Teams, ConversationKind::Direct, false).thread);
-        assert!(!can(&theirs, Network::Teams, ConversationKind::Group, false).thread);
-        for network in [Network::Telegram, Network::Signal, Network::Messages, Network::Tiny] {
-            assert!(!can(&theirs, network, channel, false).thread, "{network:?} has no thread to start");
-        }
+        assert!(can(&theirs, &teams_caps(), none, ConversationKind::Announcement, false, 1_100).thread);
+        assert!(!can(&theirs, &teams_caps(), none, ConversationKind::Direct, false, 1_100).thread);
+        assert!(!can(&theirs, &teams_caps(), none, ConversationKind::Group, false, 1_100).thread);
+
+        // Google Messages fixture: no reply, no edit, no delete, no thread, no pin, no forward; reactions only.
+        let mut mine_sms = Message::plain("s1", "Me", "hey", 1_000, true);
+        let sms = can(&mine_sms, &messages_caps(), mod_rights, ConversationKind::Direct, false, 1_100);
+        assert!(sms.act && sms.react && !sms.reply && !sms.edit && !sms.delete && !sms.thread && !sms.pin && !sms.forward);
+        // Per-message override can still grant or deny edit/delete explicitly.
+        mine_sms.can_edit = Some(true);
+        mine_sms.can_delete = Some(true);
+        let overridden = can(&mine_sms, &messages_caps(), none, ConversationKind::Direct, false, 1_100);
+        assert!(overridden.edit && overridden.delete);
+
+        // Telegram edit_window (48h): edit offered inside window, hidden past window.
+        let mine_tg = Message::plain("t1", "Me", "hi", 1_000, true);
+        assert!(can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
+        assert!(!can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 48 * 3_600 + 1).edit);
 
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
-        let own = can(&mine, Network::Discord, channel, false);
+        let own = can(&mine, &discord_caps(), none, channel, false, 100);
         assert!(own.edit && own.delete && !own.unsent);
         mine.thread = Some(protocol::ThreadSummary { id: "t".into(), replies: 1, last: 3, participants: Vec::new(), unread: 0 });
-        assert!(can(&mine, Network::Discord, channel, false).thread);
+        assert!(can(&mine, &discord_caps(), none, channel, false, 100).thread);
         assert_eq!(thread_label(&mine), "Open thread");
-        assert!(can(&mine, Network::Discord, ConversationKind::Direct, false).thread, "a thread that exists still opens");
-        assert!(!can(&mine, Network::Discord, channel, true).thread, "a thread does not open inside a thread");
+        assert!(can(&mine, &discord_caps(), none, ConversationKind::Direct, false, 100).thread, "a thread that exists still opens");
+        assert!(!can(&mine, &discord_caps(), none, channel, true, 100).thread, "a thread does not open inside a thread");
 
         // Not on the network yet: no toolbar, nothing to edit, and deleting is local.
         mine.state = SendState::Failed { reason: "Slow mode".into() };
-        let failed = can(&mine, Network::Discord, channel, false);
+        let failed = can(&mine, &discord_caps(), none, channel, false, 100);
         assert_eq!((failed.act, failed.edit, failed.delete, failed.unsent), (false, false, true, true));
 
         // A tombstone and a system line say nothing that can be acted on.
         let mut gone = Message::plain("3", "Wren", "", 4, true);
         gone.tombstone();
-        assert_eq!(can(&gone, Network::Discord, channel, false), Can { thread: false, ..Can::default() });
+        assert_eq!(can(&gone, &discord_caps(), none, channel, false, 100), Can::default());
         let mut joined = Message::plain("4", "Wren", "joined", 5, false);
         joined.kind = MessageKind::System;
-        assert!(!can(&joined, Network::Discord, channel, false).act);
+        assert!(!can(&joined, &discord_caps(), none, channel, false, 100).act);
     }
 
     #[test]
     fn saved_history_cannot_offer_edits_but_keeps_the_owners_delete_action() {
         let mut saved = Message::plain("saved", "Ada", "past", 1, true);
         saved.saved_history = true;
-        let actions = can(&saved, Network::Tiny, ConversationKind::Direct, false);
+        let actions = can(&saved, &tiny_caps(), ConversationRights::default(), ConversationKind::Direct, false, 10);
         assert!(!actions.edit);
         assert!(actions.delete && actions.reply);
         saved.outgoing = false;
-        let neutral = can(&saved, Network::Tiny, ConversationKind::Direct, false);
+        let neutral = can(&saved, &tiny_caps(), ConversationRights::default(), ConversationKind::Direct, false, 10);
         assert!(!neutral.edit && !neutral.delete);
     }
 }

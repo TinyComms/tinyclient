@@ -139,7 +139,19 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
         avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")),
         presence,
         status: String::new(),
-        can: Capabilities { max_file_bytes: 25 * 1024 * 1024, max_files: 10, ..Capabilities::default() },
+        can: Capabilities {
+            max_file_bytes: 25 * 1024 * 1024,
+            max_files: 10,
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: true,
+            forward: true,
+            polls: true,
+            reactions: true,
+            ..Capabilities::default()
+        },
     }
 }
 

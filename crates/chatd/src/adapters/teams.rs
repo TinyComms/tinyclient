@@ -880,7 +880,20 @@ impl Teams {
         // Files are off until they can be shared with the chat's members only. The OneDrive path
         // below made an organization-wide link, which is not what the Teams app does and shows
         // up in a company's audit logs.
-        self.ctx.capabilities(protocol::Capabilities { max_file_bytes: 0, max_files: 0, ..protocol::Capabilities::default() });
+        self.ctx.capabilities(protocol::Capabilities {
+            max_file_bytes: 0,
+            max_files: 0,
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: true,
+            forward: true,
+            reactions: true,
+            mention_format: protocol::MentionFormat::Teams,
+            mention_spans: true,
+            ..protocol::Capabilities::default()
+        });
         {
             let mut state = self.state();
             state.watched.clear();

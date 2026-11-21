@@ -90,6 +90,8 @@ pub struct Known {
     pub member: Option<bool>,
     /// We may read but not write: a channel we do not run, a group we were removed from.
     pub read_only: bool,
+    /// Per-conversation moderation / pin rights from Telegram's creator/admin/banned flags.
+    pub rights: protocol::ConversationRights,
     /// The picture's id and the datacenter that serves it. 0 for none.
     pub photo: i64,
     pub photo_dc: i32,
@@ -217,10 +219,25 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
         Chat::Empty(_) => return None,
         Chat::Chat(chat) => {
             let (photo, photo_dc) = chat_photo(&chat.photo);
+            let admin = match &chat.admin_rights {
+                Some(tl::enums::ChatAdminRights::Rights(r)) => Some(r),
+                None => None,
+            };
+            let pin_banned = matches!(
+                &chat.default_banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
+            );
+            let active = !chat.left && !chat.deactivated;
+            let rights = protocol::ConversationRights {
+                pin: active && (chat.creator || admin.is_some_and(|r| r.pin_messages) || !pin_banned),
+                delete_others: active && (chat.creator || admin.is_some_and(|r| r.delete_messages)),
+                manage_members: active && (chat.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
+            };
             let known = Known {
                 name: chat.title.clone(),
-                member: Some(!chat.left && !chat.deactivated),
+                member: Some(active),
                 read_only: chat.left || chat.deactivated || member_cannot_send(chat.creator, chat.admin_rights.is_some(), chat.default_banned_rights.as_ref(), None),
+                rights,
                 photo,
                 photo_dc,
                 ..Known::default()
@@ -233,14 +250,35 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
         }
         Chat::Channel(channel) => {
             let (photo, photo_dc) = chat_photo(&channel.photo);
+            let admin = match &channel.admin_rights {
+                Some(tl::enums::ChatAdminRights::Rights(r)) => Some(r),
+                None => None,
+            };
             // In a channel proper only its owners and admins with the right post. A megagroup
             // is a channel too: members cannot post when the group, or their own rights, say so.
-            let may_post = channel.creator
-                || matches!(&channel.admin_rights, Some(tl::enums::ChatAdminRights::Rights(rights)) if rights.post_messages);
+            let may_post = channel.creator || admin.is_some_and(|r| r.post_messages);
             let restricted = if channel.broadcast {
                 !may_post
             } else {
                 member_cannot_send(channel.creator, channel.admin_rights.is_some(), channel.default_banned_rights.as_ref(), channel.banned_rights.as_ref())
+            };
+            let pin_banned = matches!(
+                &channel.default_banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
+            ) || matches!(
+                &channel.banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
+            );
+            let active = !channel.left;
+            let rights = protocol::ConversationRights {
+                pin: active
+                    && if channel.broadcast {
+                        channel.creator || admin.is_some_and(|r| r.edit_messages || r.pin_messages)
+                    } else {
+                        channel.creator || admin.is_some_and(|r| r.pin_messages) || !pin_banned
+                    },
+                delete_others: active && (channel.creator || admin.is_some_and(|r| r.delete_messages)),
+                manage_members: active && (channel.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
             };
             let known = Known {
                 hash: channel.access_hash.filter(|_| !channel.min),
@@ -250,6 +288,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 forum: channel.forum,
                 member: (!channel.min).then_some(!channel.left),
                 read_only: channel.left || restricted,
+                rights,
                 photo,
                 photo_dc,
                 mark: mark(channel.verified, channel.scam, channel.fake),
@@ -358,6 +397,7 @@ impl Directory {
                 known.member = before.and_then(|before| before.member);
                 if let Some(before) = before {
                     known.read_only = before.read_only;
+                    known.rights = before.rights;
                 }
             }
             if before == Some(&known) {

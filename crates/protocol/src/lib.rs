@@ -525,6 +525,9 @@ pub struct Conversation {
     /// Flagged as spam by the network (e.g. Discord spam message request).
     #[serde(default, skip_serializing_if = "is_false")]
     pub spam: bool,
+    /// Per-conversation moderation / pin rights for this account.
+    #[serde(default, skip_serializing_if = "ConversationRights::is_none")]
+    pub rights: ConversationRights,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -588,7 +591,13 @@ impl Conversation {
             max_file_bytes: 0,
             read_only_reason: String::new(),
             spam: false,
+            rights: ConversationRights::default(),
         }
+    }
+
+    /// Whether this account may post messages in this conversation.
+    pub fn can_post(&self) -> bool {
+        !self.read_only
     }
 
     /// The mark on my newest message. `None` when the newest is not mine.

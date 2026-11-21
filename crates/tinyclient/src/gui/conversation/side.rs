@@ -292,9 +292,14 @@ fn pane_open(open: &protocol::Conversation) -> pane::Open {
 /// Slack's is `{channel}:{root}` and Teams' is `{channel};messageid={root}`, even before the
 /// first reply. Discord's does not exist until the thread channel is created.
 fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Option<Key> {
+    let caps = Capabilities {
+        threads: matches!(conversation.network, Network::Slack | Network::Teams | Network::Discord),
+        direct_threads: conversation.network == Network::Slack,
+        ..Capabilities::default()
+    };
     let id = if let Some(thread) = &root.thread {
         thread.id.clone()
-    } else if super::actions::starts_thread(root, conversation.network, kind) {
+    } else if super::actions::starts_thread(root, &caps, kind) {
         match conversation.network {
             Network::Slack if !conversation.id.contains(':') && !root.id.contains(':') => {
                 format!("{}:{}", conversation.id, root.id)
@@ -497,7 +502,18 @@ impl Shell {
         if held.as_ref() == Some(&key) {
             return;
         }
-        let title = self.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.title.clone()).unwrap_or_default();
+        let (title, rights) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.open.as_ref())
+            .map(|open| (open.title.clone(), open.rights))
+            .unwrap_or_default();
+        let can = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.account(&conversation.account()))
+            .map(|status| status.can)
+            .unwrap_or_default();
         let me = self.me(conversation);
         let shell = cx.weak_entity();
         let root = root.clone();
@@ -505,7 +521,7 @@ impl Shell {
             // On a phone the thread is a page of its own, read as the conversation is.
             let metrics = if crate::gui::phone::active() { super::tokens::Metrics::PHONE } else { super::tokens::Metrics::DENSE };
             let mut view = Pane::new(metrics, true, shell, cx);
-            view.show_thread(key, &title, &me, root, cx);
+            view.show_thread(key, &title, &me, can, rights, root, cx);
             view
         });
         *self.conversation_state.thread.borrow_mut() = Some(view);
@@ -523,7 +539,13 @@ impl Shell {
             return;
         }
         // Discord's thread id is a channel that does not exist yet. Creating it is the click.
-        if conversation.network == Network::Discord && super::actions::starts_thread(&root, Network::Discord, kind) {
+        let can = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.account(&conversation.account()))
+            .map(|status| status.can)
+            .unwrap_or_default();
+        if conversation.network == Network::Discord && super::actions::starts_thread(&root, &can, kind) {
             self.start_discord_thread(conversation, root, cx);
         }
     }

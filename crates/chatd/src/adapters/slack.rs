@@ -1967,6 +1967,17 @@ fn capabilities() -> protocol::Capabilities {
         suppress_embeds: true,
         search: true,
         close_direct: true,
+        reply: false,
+        edit: true,
+        delete: true,
+        threads: true,
+        direct_threads: true,
+        pins: true,
+        forward: true,
+        polls: false,
+        reactions: true,
+        mention_format: protocol::MentionFormat::Slack,
+        mention_spans: false,
         ..protocol::Capabilities::default()
     }
 }

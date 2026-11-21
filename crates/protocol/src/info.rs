@@ -280,9 +280,69 @@ impl EmojiScope {
     }
 }
 
-/// What an account may send, as the session says (the plan, the workspace's settings). A
-/// control the account lacks is absent in the shell, never disabled. Nothing is allowed until
-/// the adapter reports it (`Context::capabilities`).
+/// How an account encodes inline mentions in outgoing wire text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionFormat {
+    /// Mentions stay as their plain display label (Telegram, Signal, Messages, Tiny).
+    #[default]
+    Plain,
+    /// `<@id>`, `<@&id>`, `<#id>`, `<:name:id>` / `<a:name:id>`.
+    Discord,
+    /// `<@id>`, `<!subteam^id>`, `<#id>`; custom emoji stay `:name:`.
+    Slack,
+    /// `<@id|label>`, `<@&id|label>`, `<#id|label>`; custom emoji stay `:name:`.
+    Teams,
+}
+
+impl MentionFormat {
+    pub fn is_plain(&self) -> bool {
+        *self == MentionFormat::Plain
+    }
+}
+
+/// What this account may do in one conversation beyond its own messages.
+/// Posting follows `Conversation::read_only` (`Conversation::can_post()`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRights {
+    /// May pin or unpin messages in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pin: bool,
+    /// May delete other people's messages in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_others: bool,
+    /// May add, remove, or manage members in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_members: bool,
+}
+
+impl ConversationRights {
+    const PIN: u32 = 1 << 0;
+    const DELETE_OTHERS: u32 = 1 << 1;
+    const MANAGE_MEMBERS: u32 = 1 << 2;
+
+    pub fn is_none(&self) -> bool {
+        *self == ConversationRights::default()
+    }
+
+    pub fn to_bits(self) -> u32 {
+        (u32::from(self.pin) * Self::PIN)
+            | (u32::from(self.delete_others) * Self::DELETE_OTHERS)
+            | (u32::from(self.manage_members) * Self::MANAGE_MEMBERS)
+    }
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            pin: bits & Self::PIN != 0,
+            delete_others: bits & Self::DELETE_OTHERS != 0,
+            manage_members: bits & Self::MANAGE_MEMBERS != 0,
+        }
+    }
+}
+
+/// What an account may send and do on messages, as the session says (the plan, the workspace's
+/// settings). A control the account lacks is absent in the shell, never disabled. Nothing is
+/// allowed until the adapter reports it (`Context::capabilities`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     /// This Tiny account can ring a member before a direct conversation exists.
@@ -308,6 +368,9 @@ pub struct Capabilities {
     /// The network has a GIF search tinyclient can ask (`Catalog` with `Gifs`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub gifs: bool,
+    /// The GIF button picks a `.gif` file through the attachment path when `max_file_bytes > 0` (Tiny).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gif_file: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stickers: bool,
     /// The network searches its own messages (`SearchNetwork`), which the search pane's Enter
@@ -351,6 +414,39 @@ pub struct Capabilities {
     /// (`Request::ClearHistory`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub clear_history: bool,
+    /// This account supports inline replies on messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reply: bool,
+    /// This account supports editing own messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit: bool,
+    /// This account supports deleting messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete: bool,
+    /// This account supports starting threads on channel / announcement messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub threads: bool,
+    /// This account also supports starting threads in direct / group conversations (e.g. Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub direct_threads: bool,
+    /// This account supports pinning and unpinning messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pins: bool,
+    /// This account supports forwarding messages natively.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forward: bool,
+    /// This account supports polls.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub polls: bool,
+    /// This account supports message reactions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reactions: bool,
+    /// How inline mentions are formatted on the wire for this account.
+    #[serde(default, skip_serializing_if = "MentionFormat::is_plain")]
+    pub mention_format: MentionFormat,
+    /// Whether this account carries structured mention spans out-of-band on outgoing messages.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mention_spans: bool,
 }
 
 impl Capabilities {

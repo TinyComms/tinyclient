@@ -2,7 +2,7 @@
 //! lacks is absent, never disabled: neighbors close up.
 
 use super::picker::Tab;
-use protocol::{Capabilities, EmojiScope, Network};
+use protocol::{Capabilities, EmojiScope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Controls {
@@ -25,12 +25,9 @@ pub struct Controls {
 }
 
 /// `editing`: edit mode is text only on every network.
-pub fn controls(network: Network, can: &Capabilities, editing: bool) -> Controls {
-    // Slack and Teams have GIF pickers whose client calls are not captured yet (ruling 09):
-    // hidden there whatever a session reports. Tiny has no GIF catalog; the button sends a
-    // .gif file through the attachment path.
-    let catalog = can.gifs && matches!(network, Network::Discord | Network::Telegram);
-    let tiny_gif = network == Network::Tiny && can.max_file_bytes > 0;
+pub fn controls(can: &Capabilities, editing: bool) -> Controls {
+    let catalog = can.gifs;
+    let gif_file = can.gif_file && can.max_file_bytes > 0;
     let mut tabs = vec![Tab::Emoji];
     if catalog && !editing {
         tabs.push(Tab::Gifs);
@@ -40,13 +37,12 @@ pub fn controls(network: Network, can: &Capabilities, editing: bool) -> Controls
     }
     Controls {
         attach: can.max_file_bytes > 0 && !editing,
-        gif: (catalog || tiny_gif) && !editing,
+        gif: (catalog || gif_file) && !editing,
         emoji: true,
         tabs,
         silent: can.silent && !editing,
         ping: can.reply_ping,
-        // Teams builds the card at the sender; there is nothing to suppress.
-        link_chip: can.suppress_embeds && network != Network::Teams && !editing,
+        link_chip: can.suppress_embeds && !editing,
         custom_emoji: can.custom_emoji != EmojiScope::None,
         voice: super::rec::available(can) && !editing,
         schedule: can.schedule && !editing,
@@ -75,40 +71,40 @@ mod tests {
 
     #[test]
     fn each_network_lays_out_only_what_it_can_do() {
-        let d = controls(Network::Discord, &discord(), false);
+        let d = controls(&discord(), false);
         assert!(d.attach && d.gif && d.emoji && d.silent && d.ping && d.link_chip && d.custom_emoji);
         assert!(d.voice, "the account names its files voice notes");
         assert_eq!(d.tabs, [Tab::Emoji, Tab::Gifs, Tab::Stickers]);
 
-        let slack = Capabilities { max_file_bytes: 1 << 30, max_files: 10, custom_emoji: EmojiScope::All, suppress_embeds: true, gifs: true, ..Capabilities::default() };
-        let s = controls(Network::Slack, &slack, false);
+        let slack = Capabilities { max_file_bytes: 1 << 30, max_files: 10, custom_emoji: EmojiScope::All, suppress_embeds: true, ..Capabilities::default() };
+        let s = controls(&slack, false);
         assert!(s.attach && !s.gif && !s.silent && !s.ping && s.link_chip && s.custom_emoji);
-        assert_eq!(s.tabs, [Tab::Emoji], "Slack's GIFs wait for its client call");
+        assert_eq!(s.tabs, [Tab::Emoji]);
 
         let telegram = Capabilities { max_file_bytes: 2 << 30, gifs: true, stickers: true, silent: true, suppress_embeds: true, ..Capabilities::default() };
-        let t = controls(Network::Telegram, &telegram, false);
+        let t = controls(&telegram, false);
         assert!(t.gif && t.silent && !t.ping && !t.custom_emoji);
         assert_eq!(t.tabs, [Tab::Emoji, Tab::Gifs, Tab::Stickers]);
 
-        let teams = Capabilities { max_file_bytes: 250 << 20, max_files: 10, suppress_embeds: true, gifs: true, ..Capabilities::default() };
-        let m = controls(Network::Teams, &teams, false);
+        let teams = Capabilities { max_file_bytes: 250 << 20, max_files: 10, ..Capabilities::default() };
+        let m = controls(&teams, false);
         assert!(m.attach && !m.gif && !m.silent && !m.link_chip);
         assert_eq!(m.tabs, [Tab::Emoji]);
 
-        let tiny = Capabilities { max_file_bytes: 8 << 20, max_files: 10, ..Capabilities::default() };
-        let y = controls(Network::Tiny, &tiny, false);
+        let tiny = Capabilities { max_file_bytes: 8 << 20, max_files: 10, gif_file: true, ..Capabilities::default() };
+        let y = controls(&tiny, false);
         assert!(y.attach && y.gif && y.emoji && !y.custom_emoji);
         assert_eq!(y.tabs, [Tab::Emoji]);
-        let bare = controls(Network::Tiny, &Capabilities::default(), false);
+        let bare = controls(&Capabilities { gif_file: true, ..Capabilities::default() }, false);
         assert!(!bare.attach && !bare.gif && bare.emoji);
         assert_eq!(bare.tabs, [Tab::Emoji]);
     }
 
     #[test]
     fn nothing_is_allowed_until_the_session_says_so_and_edit_is_text_only() {
-        let none = controls(Network::Discord, &Capabilities::default(), false);
+        let none = controls(&Capabilities::default(), false);
         assert!(!none.attach && !none.gif && none.emoji && !none.silent && !none.link_chip);
-        let edit = controls(Network::Discord, &discord(), true);
+        let edit = controls(&discord(), true);
         assert!(!edit.attach && !edit.gif && edit.emoji && !edit.silent && !edit.link_chip);
         assert!(!edit.voice, "edit mode is text only");
         assert_eq!(edit.tabs, [Tab::Emoji]);
@@ -117,10 +113,10 @@ mod tests {
     #[test]
     fn schedule_shows_only_when_the_network_schedules_and_an_edit_hides_it() {
         let slack = Capabilities { schedule: true, silent: true, ..Capabilities::default() };
-        let open = controls(Network::Slack, &slack, false);
+        let open = controls(&slack, false);
         assert!(open.schedule && open.silent);
-        let edit = controls(Network::Slack, &slack, true);
+        let edit = controls(&slack, true);
         assert!(!edit.schedule && !edit.silent, "edit mode is text only");
-        assert!(!controls(Network::Discord, &discord(), false).schedule);
+        assert!(!controls(&discord(), false).schedule);
     }
 }

@@ -30,6 +30,43 @@ impl LinkAsk {
     }
 }
 
+/// Where a message leads in the network's own app, for "Copy link" and "Open in <network>".
+/// An unsupported message names its own; Discord's and Slack's are built from ids, as the
+/// conversation's are (`profile/facts.rs`).
+pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: &protocol::Message) -> Option<String> {
+    if let protocol::MessageKind::Unsupported { link } = &message.kind {
+        if !link.is_empty() {
+            return Some(link.clone());
+        }
+    }
+    if message.state != protocol::SendState::Sent || message.deleted {
+        return None;
+    }
+    let (channel, id) = (&conversation.id, &message.id);
+    match conversation.network {
+        protocol::Network::Discord => {
+            let place = space.unwrap_or("@me");
+            Some(format!("https://discord.com/channels/{place}/{channel}/{id}"))
+        }
+        protocol::Network::Slack => space.map(|team| format!("slack://channel?team={team}&id={channel}&message={id}")),
+        protocol::Network::Telegram | protocol::Network::Teams | protocol::Network::Signal | protocol::Network::Messages | protocol::Network::Tiny => None,
+    }
+}
+
+/// Chooses the channel key for `message_link`: a Slack thread's replies link into their parent
+/// channel, while a Discord thread is itself a channel.
+pub(super) fn message_link_for(
+    pane_key: Option<&protocol::Key>,
+    open: &protocol::Conversation,
+    message: &protocol::Message,
+) -> Option<String> {
+    let key = match (pane_key, open.key.network) {
+        (Some(mine), protocol::Network::Discord) => mine,
+        _ => &open.key,
+    };
+    message_link(key, open.space.as_deref(), message)
+}
+
 /// A `mailto:` link, which other networks put on an address. It opens the mail app as it is:
 /// no question, no tracking strip. Every other scheme that is not http or https stays refused.
 pub(super) fn is_mailto(url: &str) -> bool {

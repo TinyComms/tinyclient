@@ -517,6 +517,14 @@ pub struct Message {
     /// Structured metadata for a call transcript row (`MessageKind::System`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<CallNote>,
+    /// Per-message edit override when the network decides per message. `None`: derived from
+    /// account `Capabilities` and `edit_window`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_edit: Option<bool>,
+    /// Per-message delete override when the network decides per message. `None`: derived from
+    /// account `Capabilities` and conversation `ConversationRights`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_delete: Option<bool>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -606,6 +614,8 @@ impl Message {
             deliveries: Vec::new(),
             receipt_note: String::new(),
             call: None,
+            can_edit: None,
+            can_delete: None,
         }
     }
 

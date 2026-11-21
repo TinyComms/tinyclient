@@ -36,18 +36,23 @@ pub const STAGE: u8 = 13;
 pub const FORUM: u8 = 15;
 pub const MEDIA_FORUM: u8 = 16;
 
-pub const VIEW_CHANNEL: u64 = 1 << 10;
-pub const SEND_MESSAGES: u64 = 1 << 11;
+pub const KICK_MEMBERS: u64 = 1 << 1;
+pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
 pub const ADD_REACTIONS: u64 = 1 << 6;
 #[allow(dead_code)]
 pub const STREAM: u64 = 1 << 9;
+pub const VIEW_CHANNEL: u64 = 1 << 10;
+pub const SEND_MESSAGES: u64 = 1 << 11;
+pub const MANAGE_MESSAGES: u64 = 1 << 13;
 pub const READ_MESSAGE_HISTORY: u64 = 1 << 16;
 pub const CONNECT: u64 = 1 << 20;
 pub const SPEAK: u64 = 1 << 21;
 pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;
+pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
 pub fn user_link(id: &str) -> String {
