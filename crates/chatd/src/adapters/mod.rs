@@ -189,6 +189,7 @@ pub struct ConversationAbout {
     pub external: String,
     pub link: String,
     pub disappearing: Option<u32>,
+    pub bookmarks: Vec<protocol::Bookmark>,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -216,6 +217,20 @@ pub struct SharedPage {
 #[derive(Debug, Clone, Default)]
 pub struct CatalogPage {
     pub items: Vec<CatalogItem>,
+    pub cursor: Option<String>,
+}
+
+/// A page of an account's activity feed, and where the next one starts.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityPage {
+    pub items: Vec<protocol::ActivityItem>,
+    pub cursor: Option<String>,
+}
+
+/// A page of public channels from `BrowseChannels`.
+#[derive(Debug, Clone, Default)]
+pub struct BrowsedPage {
+    pub channels: Vec<protocol::BrowsedChannel>,
     pub cursor: Option<String>,
 }
 
@@ -408,6 +423,59 @@ pub enum Command {
     ProfileIn { person_id: String, space_id: String, reply: Reply<About> },
     /// A conversation's info pane: one request, because the user opened it.
     ConversationInfo { conversation_id: String, reply: Reply<ConversationAbout> },
+    /// Paged activity feed (mentions, thread replies, reactions, apps) for this account.
+    ActivityFeed {
+        kind: Option<protocol::ActivityItemKind>,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<ActivityPage>,
+    },
+    /// Mark one activity feed item (`Some(id)`) or all items (`None`) read.
+    ActivityMarkRead {
+        item_id: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Add a bookmark to a channel.
+    BookmarkAdd {
+        conversation_id: String,
+        title: String,
+        link: String,
+        emoji: String,
+        reply: Reply<protocol::Bookmark>,
+    },
+    /// Edit an existing channel bookmark.
+    BookmarkEdit {
+        conversation_id: String,
+        bookmark_id: String,
+        title: Option<String>,
+        link: Option<String>,
+        emoji: Option<String>,
+        reply: Reply<protocol::Bookmark>,
+    },
+    /// Remove a channel bookmark.
+    BookmarkRemove {
+        conversation_id: String,
+        bookmark_id: String,
+        reply: Reply<()>,
+    },
+    /// Browse public channels in a Space (paged, never fetched whole).
+    BrowseChannels {
+        space_id: String,
+        query: String,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<BrowsedPage>,
+    },
+    /// Preview an unjoined public channel (stores as `joined: false`, `read_only: true`, outside the sidebar).
+    PreviewChannel {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Join a public channel (`conversations.join`).
+    Join {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
@@ -632,6 +700,14 @@ impl Command {
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BookmarkAdd { reply, .. }
+            | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PreviewChannel { reply, .. }
+            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());

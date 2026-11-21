@@ -378,6 +378,7 @@ impl Demo {
             external: if self.ctx.account.network == Network::Slack && row.title == "customer-voice" { "Northwind Traders".to_owned() } else { String::new() },
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
             disappearing: row.disappearing,
+            bookmarks: Vec::new(),
         })
     }
 
@@ -992,6 +993,14 @@ impl Demo {
                 let _ = reply.send(outcome);
             }
             // Nothing is behind these: what is stored is all there is.
+            Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BookmarkAdd { reply, .. }
+            | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PreviewChannel { reply, .. }
+            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

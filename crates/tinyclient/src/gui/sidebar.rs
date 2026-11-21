@@ -107,6 +107,12 @@ pub struct State {
     /// caught up" offers them, and lists them when asked.
     muted_news: Vec<Rc<Conversation>>,
     muted_open: bool,
+    /// Network activity feed (mentions, thread replies, reactions, apps) shown under Activity.
+    pub(super) activity_filter: Option<protocol::ActivityItemKind>,
+    pub(super) activity_items: Vec<protocol::ActivityItem>,
+    pub(super) activity_cursor: Option<(AccountKey, String)>,
+    pub(super) activity_loading: bool,
+    activity_epoch: u64,
     /// The network home on show: what chatd said, and the user's folds.
     pub home: home::Home,
     saved_homes: HashMap<Network, home::Home>,
@@ -241,6 +247,11 @@ impl State {
             last_seen: None,
             muted_news: Vec::new(),
             muted_open: false,
+            activity_filter: None,
+            activity_items: Vec::new(),
+            activity_cursor: None,
+            activity_loading: false,
+            activity_epoch: 0,
             home: home::Home::default(),
             saved_homes: HashMap::new(),
             home_list: list_state(),
@@ -832,6 +843,125 @@ impl Shell {
         state.inbox.reset();
         self.rebuild_inbox(cx);
         self.load_inbox(vec![0], cx);
+        if filter == InboxFilter::Activity {
+            self.load_activity_feed(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn set_activity_filter(&mut self, kind: Option<protocol::ActivityItemKind>, cx: &mut Context<Self>) {
+        if self.sidebar_state.activity_filter == kind {
+            return;
+        }
+        self.sidebar_state.activity_filter = kind;
+        self.load_activity_feed(cx);
+        cx.notify();
+    }
+
+    pub(super) fn load_activity_feed(&mut self, cx: &mut Context<Self>) {
+        let accounts: Vec<AccountKey> = self
+            .snapshot
+            .as_ref()
+            .map(|s| {
+                s.accounts
+                    .iter()
+                    .filter(|a| a.can.activity_feed && a.link == Link::Connected)
+                    .map(|a| a.key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.sidebar_state.activity_epoch += 1;
+        let epoch = self.sidebar_state.activity_epoch;
+        self.sidebar_state.activity_items.clear();
+        self.sidebar_state.activity_cursor = None;
+        if accounts.is_empty() {
+            self.sidebar_state.activity_loading = false;
+            return;
+        }
+        self.sidebar_state.activity_loading = true;
+        let kind = self.sidebar_state.activity_filter;
+        cx.spawn(async move |this, cx| {
+            let (merged, next_cursor) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut merged = Vec::new();
+                    let mut next_cursor = None;
+                    for account in accounts {
+                        let req = Request::ActivityFeed { account: account.clone(), kind, cursor: None, limit: 30 };
+                        if let Ok(Response::ActivityFeed { items, cursor }) = ask(&req) {
+                            merged.extend(items);
+                            if next_cursor.is_none() {
+                                if let Some(c) = cursor {
+                                    next_cursor = Some((account, c));
+                                }
+                            }
+                        }
+                    }
+                    merged.sort_by_key(|item| std::cmp::Reverse(item.time));
+                    (merged, next_cursor)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar_state.activity_epoch != epoch {
+                    return;
+                }
+                this.sidebar_state.activity_loading = false;
+                this.sidebar_state.activity_items = merged;
+                this.sidebar_state.activity_cursor = next_cursor;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn load_more_activity(&mut self, cx: &mut Context<Self>) {
+        let Some((account, cursor)) = self.sidebar_state.activity_cursor.take() else {
+            return;
+        };
+        let epoch = self.sidebar_state.activity_epoch;
+        let kind = self.sidebar_state.activity_filter;
+        self.sidebar_state.activity_loading = true;
+        cx.spawn(async move |this, cx| {
+            let req = Request::ActivityFeed { account: account.clone(), kind, cursor: Some(cursor), limit: 30 };
+            let got = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar_state.activity_epoch != epoch {
+                    return;
+                }
+                this.sidebar_state.activity_loading = false;
+                if let Ok(Response::ActivityFeed { items, cursor }) = got {
+                    this.sidebar_state.activity_items.extend(items);
+                    this.sidebar_state.activity_cursor = cursor.map(|c| (account, c));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn open_activity_item(&mut self, item: protocol::ActivityItem, cx: &mut Context<Self>) {
+        if item.unread {
+            for existing in &mut self.sidebar_state.activity_items {
+                if existing.id == item.id {
+                    existing.unread = false;
+                }
+            }
+            let req = Request::ActivityMarkRead {
+                account: item.conversation.account(),
+                item_id: Some(item.id.clone()),
+            };
+            cx.background_executor().spawn(async move { let _ = ask(&req); }).detach();
+        }
+        let message_id = (!item.message_id.is_empty()).then_some(item.message_id);
+        let title = self
+            .sidebar_state
+            .inbox
+            .all()
+            .iter()
+            .find(|c| c.key == item.conversation)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| item.conversation.id.clone());
+        self.open_resolved_link(item.conversation, message_id, &title, cx);
         cx.notify();
     }
 

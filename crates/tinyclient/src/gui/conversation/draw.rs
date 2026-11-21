@@ -937,7 +937,7 @@ impl Pane {
                                 .child(via.to_owned()),
                         )
                 }))
-                .children(message.card.as_deref().map(|card| self.app_card(message, card, cx)))
+                .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
                 .children(self.cards(message, window, cx));
@@ -2145,7 +2145,7 @@ impl Pane {
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
-    fn app_card(&self, message: &Message, card: &Card, cx: &mut Context<Self>) -> AnyElement {
+    fn app_card(&self, message: &Message, ix: usize, card: &Card, cx: &mut Context<Self>) -> AnyElement {
         let bar = match media::card_tone(card.color) {
             media::Tone::Positive => theme::positive(),
             media::Tone::Danger => theme::danger(),
@@ -2158,7 +2158,7 @@ impl Pane {
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().truncate().type_small().text_color(theme::text_faint()).child(label.clone()))
+                .children((!label.is_empty()).then(|| div().truncate().type_small().text_color(theme::text_faint()).child(label.clone())))
                 .child(div().type_ui().child(value.clone()))
         };
         let maps_url = (card.footer == "Open in Maps").then(|| maps_url_for_card(card)).flatten();
@@ -2176,7 +2176,7 @@ impl Pane {
                     .flex()
                     .child(
                         div()
-                            .id(SharedString::from(format!("card-maps-{}", message.id)))
+                            .id(SharedString::from(format!("card-maps-{}-{ix}", message.id)))
                             .cursor_pointer()
                             .type_small()
                             .font_weight(theme::MEDIUM)
@@ -2198,7 +2198,7 @@ impl Pane {
             if let (Some(path), Some(account)) = (text_path, account) {
                 row = row.child(
                     div()
-                        .id(SharedString::from(format!("card-text-number-{}", message.id)))
+                        .id(SharedString::from(format!("card-text-number-{}-{ix}", message.id)))
                         .cursor_pointer()
                         .type_small()
                         .font_weight(theme::MEDIUM)
@@ -2220,7 +2220,7 @@ impl Pane {
             if let Some(path) = save_path {
                 row = row.child(
                     div()
-                        .id(SharedString::from(format!("card-save-vcard-{}", message.id)))
+                        .id(SharedString::from(format!("card-save-vcard-{}-{ix}", message.id)))
                         .cursor_pointer()
                         .type_small()
                         .text_color(theme::text_soft())
@@ -2240,6 +2240,23 @@ impl Pane {
         } else {
             None
         };
+        let title_el = (!card.title.is_empty()).then(|| {
+            if card.title_link.is_empty() {
+                div().type_body().font_weight(theme::SEMIBOLD).child(card.title.clone()).into_any_element()
+            } else {
+                let url = card.title_link.clone();
+                div()
+                    .id(SharedString::from(format!("card-title-link-{}-{ix}", message.id)))
+                    .type_body()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(card.title.clone())
+                    .into_any_element()
+            }
+        });
         let words = div()
             .flex_1()
             .min_w_0()
@@ -2248,7 +2265,8 @@ impl Pane {
             .flex()
             .flex_col()
             .gap(px(4.))
-            .children((!card.title.is_empty()).then(|| div().type_body().font_weight(theme::SEMIBOLD).child(card.title.clone())))
+            .children((!card.author.is_empty()).then(|| div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(card.author.clone())))
+            .children(title_el)
             .children((!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone())))
             .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
             .children(footer_el);
@@ -3297,6 +3315,7 @@ mod tests {
             footer: "Open in Maps".into(),
             color: None,
             sponsored: false,
+            ..Card::default()
         };
         assert_eq!(
             maps_url_for_card(&card).as_deref(),

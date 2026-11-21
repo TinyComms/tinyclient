@@ -35,10 +35,10 @@ impl Slack {
             if !up.files().is_empty() {
                 return Err("Slack schedules text only, not files.".to_owned());
             }
-            return self.schedule(conversation, text, at, with.suppress_embeds, &with.spans);
+            return self.schedule(conversation, text, at, with.suppress_embeds, &with.spans, with.broadcast);
         }
         if up.files().is_empty() {
-            return self.post(conversation, client_id, text, reply_to, with.suppress_embeds, &with.spans);
+            return self.post(conversation, client_id, text, reply_to, with.suppress_embeds, &with.spans, with.broadcast);
         }
         if up.files().len() > FILES {
             return Err(format!("Slack takes {FILES} files in one message."));
@@ -50,6 +50,7 @@ impl Slack {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, reply_to),
         };
+        let broadcast_thread = with.broadcast && thread_of(conversation).is_some();
         let ids = self.upload(up)?;
         up.check()?;
 
@@ -68,6 +69,9 @@ impl Slack {
         if let Some(root) = thread {
             asked.push(("thread_ts", root));
         }
+        if broadcast_thread {
+            asked.push(("reply_broadcast", "true"));
+        }
         let completed = match self.api("files.completeUploadExternal", &asked) {
             Ok(completed) => completed,
             Err(fault) => {
@@ -84,23 +88,33 @@ impl Slack {
             }
         };
         self.state().shares.remove(&ids[0]);
-        if let Some(message) = message {
-            return Ok(message);
+        let message = if let Some(message) = message {
+            message
+        } else {
+            // CONTRACT: the socket did not show it in time. Slack took the files, so the send is not
+            // failed (a retry would post them twice): it ends as the message Slack's answer
+            // describes, named by the share's timestamp where it gives one. Should the socket show
+            // it later under another name, it is listed twice until reopened.
+            let shares = &completed["files"][0]["shares"];
+            let ts = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
+            let ts = ts.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", crate::hub::now()));
+            let me = self.me.get().cloned().unwrap_or_default();
+            let event = super::Slack::with_blocks(
+                json!({"type": "message", "ts": ts, "user": me, "text": comment, "files": completed["files"]}),
+                text,
+                &with.spans,
+            );
+            self.message(channel, &event).ok_or_else(|| "Slack took the files but described no message.".to_owned())?
+        };
+        if let Some(root) = thread {
+            self.report(self.bump(channel, root, &message));
+            if broadcast_thread {
+                let mut in_channel = message.clone();
+                in_channel.reply_to = self.quote(channel, root);
+                self.report(self.ctx.message(channel, &in_channel).map_err(Into::into));
+            }
         }
-        // CONTRACT: the socket did not show it in time. Slack took the files, so the send is not
-        // failed (a retry would post them twice): it ends as the message Slack's answer
-        // describes, named by the share's timestamp where it gives one. Should the socket show
-        // it later under another name, it is listed twice until reopened.
-        let shares = &completed["files"][0]["shares"];
-        let ts = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
-        let ts = ts.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", crate::hub::now()));
-        let me = self.me.get().cloned().unwrap_or_default();
-        let event = super::Slack::with_blocks(
-            json!({"type": "message", "ts": ts, "user": me, "text": comment, "files": completed["files"]}),
-            text,
-            &with.spans,
-        );
-        self.message(channel, &event).ok_or_else(|| "Slack took the files but described no message.".to_owned())
+        Ok(message)
     }
 
     /// Asks for an address per file and posts each file's bytes there from its path. Answers
@@ -131,7 +145,7 @@ impl Slack {
     /// CONTRACT: there is no state for a scheduled message, so it ends as sent, dated when it
     /// will go, under Slack's id for the schedule. When Slack posts it, the socket brings it
     /// under its own timestamp, which is a second row until the scheduled one ages out.
-    fn schedule(&self, conversation: &str, text: &str, at: i64, suppress: bool, spans: &[protocol::Span]) -> Result<Message, String> {
+    fn schedule(&self, conversation: &str, text: &str, at: i64, suppress: bool, spans: &[protocol::Span], broadcast: bool) -> Result<Message, String> {
         let now = crate::hub::now();
         if at <= now || at > now + SCHEDULE_AHEAD {
             return Err("Slack schedules a message up to 120 days ahead.".to_owned());
@@ -148,6 +162,9 @@ impl Slack {
         }
         if let Some(root) = thread {
             asked.push(("thread_ts", root));
+            if broadcast {
+                asked.push(("reply_broadcast", "true"));
+            }
         }
         if suppress {
             asked.extend([("unfurl_links", "false"), ("unfurl_media", "false")]);

@@ -1631,6 +1631,7 @@ fn location_card(loc: &bugle::Location) -> protocol::Card {
         footer: "Open in Maps".to_owned(),
         color: None,
         sponsored: false,
+        ..protocol::Card::default()
     }
 }
 
@@ -1761,6 +1762,7 @@ fn vcard_card(vcard: &VCard) -> protocol::Card {
         footer: "Contact card".to_owned(),
         color: None,
         sponsored: false,
+        ..protocol::Card::default()
     }
 }
 

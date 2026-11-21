@@ -260,6 +260,7 @@ struct Target {
     space: Option<String>,
     read_only: bool,
     read_only_reason: String,
+    joined: bool,
     /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
     blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
@@ -273,6 +274,7 @@ struct Target {
 enum Locked {
     SignedOut,
     Expired,
+    NotJoined,
     ReadOnly(String),
     Blocked(protocol::Person),
     MessageRequest,
@@ -283,6 +285,7 @@ impl Target {
         match (self.link, self.kind) {
             (Link::SignedOut, _) => Some(Locked::SignedOut),
             (Link::Expired, _) => Some(Locked::Expired),
+            _ if !self.joined => Some(Locked::NotJoined),
             _ if self.special == protocol::Special::Request => Some(Locked::MessageRequest),
             _ if self.blocked_peer.is_some() => Some(Locked::Blocked(self.blocked_peer.clone().unwrap())),
             (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Posts in a forum are started in the network's app.".to_owned())),
@@ -719,6 +722,7 @@ impl Composer {
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
             self.no_preview = false;
+            self.broadcast = false;
             self.armed = None;
             self.focus_next = true;
             picker::emoji::set_account(Some(&target.key.account()));
@@ -1653,6 +1657,19 @@ impl Composer {
         }
         if show_broadcast {
             let on = self.broadcast;
+            let dest = self.target.as_ref().map(|t| t.title.as_str()).unwrap_or("");
+            let dest = dest
+                .strip_prefix("Thread in ")
+                .or_else(|| dest.strip_prefix("Thread with "))
+                .unwrap_or(dest)
+                .trim();
+            let label = if dest.is_empty() || dest == "Thread" {
+                if on { "☑ Also send to channel".to_owned() } else { "☐ Also send to channel".to_owned() }
+            } else if on {
+                format!("☑ Also send to {dest}")
+            } else {
+                format!("☐ Also send to {dest}")
+            };
             bar = bar.child(
                 div()
                     .id("opt-broadcast")
@@ -1668,7 +1685,7 @@ impl Composer {
                         this.broadcast = !this.broadcast;
                         cx.notify();
                     }))
-                    .child(if on { "☑ Also send to channel" } else { "☐ Also send to channel" }),
+                    .child(label),
             );
         }
         if show_effects {
@@ -2539,6 +2556,31 @@ impl Composer {
 
     /// The 40 pt bar that stands where the card would be.
     fn bar(&self, locked: Locked, network: Network, cx: &mut Context<Self>) -> Div {
+        if matches!(locked, Locked::NotJoined) {
+            let key = self.target.as_ref().map(|t| t.key.clone());
+            let title = self.target.as_ref().map(|t| t.title.clone()).unwrap_or_else(|| "this channel".to_owned());
+            return div()
+                .h(px(card_height()))
+                .pl(px(12.))
+                .pr(px(6.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(glyph("icons/hash.svg", 16., theme::text_faint()))
+                .child(div().flex_1().min_w_0().truncate().child(format!("Previewing {title}")))
+                .child(
+                    button("join-channel", ButtonKind::Primary, "Join channel").on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(conversation) = key.clone() {
+                            ask_later(cx, Request::Join { conversation }, |_, _| {});
+                        }
+                    })),
+                );
+        }
         if matches!(locked, Locked::MessageRequest) {
             let key = self.target.as_ref().map(|t| t.key.clone());
             let (accept_key, decline_key) = (key.clone(), key);
@@ -2604,7 +2646,7 @@ impl Composer {
                 Some("Sign in again"),
             ),
             Locked::ReadOnly(sentence) => ("icons/lock.svg", sentence, None),
-            Locked::MessageRequest | Locked::Blocked(_) => unreachable!(),
+            Locked::MessageRequest | Locked::Blocked(_) | Locked::NotJoined => unreachable!(),
         };
         let expired = action == Some("Sign in again");
         div()
@@ -3835,6 +3877,7 @@ impl Shell {
             space: open.space.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
+            joined: open.joined,
             blocked_peer,
             special: open.special,
             can,
@@ -3865,6 +3908,7 @@ impl Shell {
             space: None,
             read_only: false,
             read_only_reason: String::new(),
+            joined: true,
             blocked_peer: None,
             special: protocol::Special::None,
             can: self.can_of(thread),
@@ -4477,7 +4521,9 @@ mod tests {
             read_only_reason: String::new(),
             blocked_peer: None,
             special: protocol::Special::None,
+            joined: true,
             can: Capabilities::default(),
+            send_as: Vec::new(),
         }
     }
 
