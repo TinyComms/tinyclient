@@ -16,7 +16,7 @@
 //! WHO is `grace` or `alan`. `status` reports that code on the last text this computer sent.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, MediaPart, Note, Participant, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
+use crate::adapters::messages::bugle::{Chat, ContactEntry, Mark, MediaPart, Note, Participant, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
 use crate::adapters::script;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -103,14 +103,18 @@ impl Fake {
                     Participant {
                         id: ME.into(),
                         name: "Ada Quill".into(),
+                        first_name: "Ada".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        color: Some(0x4285F4),
                     },
                     Participant {
                         id: GRACE_PARTICIPANT.into(),
                         name: "Grace Ombra".into(),
+                        first_name: "Grace".into(),
                         number: "+15550100002".into(),
                         is_me: false,
+                        color: Some(0x34A853),
                     },
                 ],
             },
@@ -131,20 +135,26 @@ impl Fake {
                     Participant {
                         id: ME.into(),
                         name: "Ada Quill".into(),
+                        first_name: "Ada".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        color: Some(0x4285F4),
                     },
                     Participant {
                         id: GRACE_PARTICIPANT.into(),
                         name: "Grace Ombra".into(),
+                        first_name: "Grace".into(),
                         number: "+15550100002".into(),
                         is_me: false,
+                        color: Some(0x34A853),
                     },
                     Participant {
                         id: "participant-alan".into(),
                         name: "Alan Ferro".into(),
+                        first_name: "Alan".into(),
                         number: "+15550100003".into(),
                         is_me: false,
+                        color: Some(0xEA4335),
                     },
                 ],
             },
@@ -778,12 +788,14 @@ fn steer(line: &str) -> Vec<Event> {
                         name: "Ada Quill".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        ..Participant::default()
                     },
                     Participant {
                         id: format!("participant-{id}"),
                         name: sender.into(),
                         number: sender.into(),
                         is_me: false,
+                        ..Participant::default()
                     },
                 ],
                 ..Chat::default()
@@ -804,12 +816,14 @@ fn steer(line: &str) -> Vec<Event> {
                         name: "Ada Quill".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        ..Participant::default()
                     },
                     Participant {
                         id: format!("participant-{id}"),
                         name: code.into(),
                         number: code.into(),
                         is_me: false,
+                        ..Participant::default()
                     },
                 ],
                 ..Chat::default()
@@ -833,12 +847,14 @@ fn steer(line: &str) -> Vec<Event> {
                         name: "Ada Quill".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        ..Participant::default()
                     },
                     Participant {
                         id: format!("participant-{id}"),
                         name: title,
                         number: "+18005550199".into(),
                         is_me: false,
+                        ..Participant::default()
                     },
                 ],
                 ..Chat::default()
@@ -859,12 +875,14 @@ fn steer(line: &str) -> Vec<Event> {
                         name: "Ada Quill".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        ..Participant::default()
                     },
                     Participant {
                         id: format!("participant-{id}"),
                         name: number.into(),
                         number: number.into(),
                         is_me: false,
+                        ..Participant::default()
                     },
                 ],
                 ..Chat::default()
@@ -992,9 +1010,36 @@ impl Drive for Fake {
         record(&format!("thumbnails {}", participants.join(" ")));
         Ok(participants
             .iter()
-            .filter(|participant| *participant == GRACE_PARTICIPANT)
+            .filter(|participant| *participant == GRACE_PARTICIPANT || *participant == "participant-alan")
             .map(|participant| (participant.clone(), png()))
             .collect())
+    }
+    fn contacts(&self) -> Result<Vec<ContactEntry>, String> {
+        self.unanswered()?;
+        record("contacts");
+        Ok(vec![
+            ContactEntry {
+                id: "contact-grace".into(),
+                participant_id: GRACE_PARTICIPANT.into(),
+                name: "Grace Ombra".into(),
+                number: "+15550100002".into(),
+                formatted_number: "(555) 010-0002".into(),
+            },
+            ContactEntry {
+                id: "contact-alan".into(),
+                participant_id: "participant-alan".into(),
+                name: "Alan Ferro".into(),
+                number: "+15550100003".into(),
+                formatted_number: "(555) 010-0003".into(),
+            },
+            ContactEntry {
+                id: "contact-linnea".into(),
+                participant_id: "participant-linnea".into(),
+                name: "Linnea Sol".into(),
+                number: "+15550100004".into(),
+                formatted_number: "(555) 010-0004".into(),
+            },
+        ])
     }
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         record(&format!("read {conversation} {message}"));

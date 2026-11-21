@@ -1102,8 +1102,21 @@ fn unix_seconds(raw: i64) -> i64 {
 pub struct Participant {
     pub id: String,
     pub name: String,
+    pub first_name: String,
     pub number: String,
     pub is_me: bool,
+    /// Avatar colour assigned by the phone (`0xRRGGBB`), when present.
+    pub color: Option<u32>,
+}
+
+/// One contact from the phone's address book (`LIST_CONTACTS`, action 6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContactEntry {
+    pub id: String,
+    pub participant_id: String,
+    pub name: String,
+    pub number: String,
+    pub formatted_number: String,
 }
 
 #[derive(Clone, Default)]
@@ -1982,6 +1995,12 @@ impl Session {
         Ok(decode_thumbnails(&bytes))
     }
 
+    /// Lists the phone's contacts (`LIST_CONTACTS`, action 6).
+    pub fn contacts(&self) -> Result<Vec<ContactEntry>, String> {
+        let bytes = self.rpc(6, &list_contacts_request(), 2)?;
+        Ok(decode_contacts(&bytes))
+    }
+
     fn upload(&self, packed: &[u8], mime: &str) -> Result<String, String> {
         let (payload, cookies) = {
             let live = self
@@ -2610,10 +2629,11 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             if field_int(&participant, 18) != 0 || field_int(&info, 1) == 3 {
                 verified = true;
             }
+            let first_name = field_text(&participant, 2);
             let name = {
                 let full = field_text(&participant, 3);
                 if full.is_empty() {
-                    field_text(&participant, 2)
+                    first_name.clone()
                 } else {
                     full
                 }
@@ -2627,6 +2647,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
                 }
             };
             let is_me = field_int(&participant, 6) != 0;
+            let color = parse_hex_color(&field_text(&participant, 22));
             if !is_me && !group && peer.is_empty() {
                 peer = pid.clone();
             }
@@ -2641,8 +2662,10 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
                 participants.push(Participant {
                     id: pid,
                     name,
+                    first_name,
                     number,
                     is_me,
+                    color,
                 });
             }
         }
@@ -2670,6 +2693,56 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         });
     }
     chats
+}
+
+fn parse_hex_color(raw: &str) -> Option<u32> {
+    let hex = raw.trim().trim_start_matches('#');
+    if hex.len() == 6 {
+        u32::from_str_radix(hex, 16).ok()
+    } else if hex.len() == 8 {
+        // ARGB -> RGB
+        u32::from_str_radix(&hex[2..], 16).ok()
+    } else {
+        None
+    }
+}
+
+fn list_contacts_request() -> Vec<u8> {
+    let mut req = Buf::new();
+    req.int(1, 1);
+    req.int(2, 1);
+    req.int(3, 500);
+    req.0
+}
+
+fn decode_contacts(bytes: &[u8]) -> Vec<ContactEntry> {
+    let list = fields(bytes);
+    let mut out = Vec::new();
+    for item in list.iter().filter(|f| f.number == 2) {
+        let entry = fields(&item.bytes);
+        let participant_id = field_text(&entry, 1);
+        let name = field_text(&entry, 2);
+        let num = fields(&field_bytes(&entry, 3));
+        let number = field_text(&num, 1);
+        let formatted_number = {
+            let f = field_text(&num, 2);
+            if f.is_empty() { number.clone() } else { f }
+        };
+        let id = {
+            let cid = field_text(&entry, 7);
+            if cid.is_empty() { participant_id.clone() } else { cid }
+        };
+        if !name.is_empty() || !number.is_empty() {
+            out.push(ContactEntry {
+                id,
+                participant_id,
+                name,
+                number,
+                formatted_number,
+            });
+        }
+    }
+    out
 }
 
 fn emoji_of(unicode: &str, kind: u64) -> String {
@@ -3632,5 +3705,30 @@ mod tests {
         assert_eq!(field_text(&req, 2), "m-edit");
         let inner = fields(&field_bytes(&req, 3));
         assert_eq!(field_text(&fields(&field_bytes(&inner, 2)), 1), "updated text");
+    }
+
+    #[test]
+    fn contacts_and_participant_color_decode() {
+        assert_eq!(parse_hex_color("#4285F4"), Some(0x4285F4));
+        assert_eq!(parse_hex_color("FF4285F4"), Some(0x4285F4));
+        assert_eq!(parse_hex_color("bad"), None);
+
+        let mut num = Buf::new();
+        num.text(1, "+15550100004");
+        num.text(2, "(555) 010-0004");
+        let mut contact = Buf::new();
+        contact.text(1, "participant-linnea");
+        contact.text(2, "Linnea Sol");
+        contact.msg(3, &num.0);
+        contact.text(7, "contact-4");
+        let mut resp = Buf::new();
+        resp.msg(2, &contact.0);
+        let decoded = decode_contacts(&resp.0);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].participant_id, "participant-linnea");
+        assert_eq!(decoded[0].name, "Linnea Sol");
+        assert_eq!(decoded[0].number, "+15550100004");
+        assert_eq!(decoded[0].formatted_number, "(555) 010-0004");
+        assert_eq!(decoded[0].id, "contact-4");
     }
 }

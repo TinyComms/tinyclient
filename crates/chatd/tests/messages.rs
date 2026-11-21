@@ -1802,3 +1802,67 @@ fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
         other => panic!("expected SMS edit refusal, got {other:?}"),
     }
 }
+
+#[test]
+fn profile_shows_masked_number_open_group_fetches_member_avatars_and_contacts_search() {
+    let world = World::linked();
+    world.connected();
+
+    // 1:1 profile shows masked phone number and accent colour.
+    match world.ask(Request::Profile {
+        person: key("participant-grace"),
+        space: None,
+    }) {
+        Response::Profile { profile } => {
+            assert_eq!(profile.contacts.len(), 1, "{:?}", profile.contacts);
+            assert_eq!(profile.contacts[0].kind, protocol::ContactKind::Phone);
+            assert_eq!(profile.contacts[0].value, "+15550100002");
+            assert!(profile.contacts[0].masked, "phone number must be masked by default");
+            assert_eq!(profile.accent, Some(0x34A853));
+        }
+        other => panic!("expected Profile, got {other:?}"),
+    }
+
+    // Opening the group requests thumbnails for group participants and populates member avatars.
+    world.ask(Request::Watch(protocol::Watching {
+        conversation: Some(key(CLUB)),
+        ..Default::default()
+    }));
+    world.until("group participant avatars", || {
+        match world.ask(Request::Members {
+            conversation: key(CLUB),
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::Members { members, .. } => {
+                let alan = members.iter().find(|m| m.key.id == "participant-alan")?;
+                let grace = members.iter().find(|m| m.key.id == "participant-grace")?;
+                (alan.avatar.is_some() && grace.avatar.is_some()).then_some(())
+            }
+            _ => None,
+        }
+    });
+
+    // Searching People queries the phone's address book and returns contacts with no existing chat.
+    let _ = world.ask(Request::People {
+        network: Some(Network::Messages),
+        relation: None,
+        query: Some("Linnea".into()),
+        offset: 0,
+        limit: 20,
+    });
+    world.heard("contacts");
+    let linnea = world.until("Linnea Sol contact", || {
+        match world.ask(Request::People {
+            network: Some(Network::Messages),
+            relation: None,
+            query: Some("Linnea".into()),
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::People { people, .. } => people.into_iter().find(|p| p.name == "Linnea Sol"),
+            _ => None,
+        }
+    });
+    assert_eq!(linnea.key.id, "participant-linnea");
+}
