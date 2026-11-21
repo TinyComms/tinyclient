@@ -2435,7 +2435,11 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
     }
     let listed = world.fake.calls(ALPHA, "files.list");
     assert_eq!((listed[0].params["channel"].as_str(), listed[0].params["types"].as_str()), ("C0GEN", "images"));
-    assert!(matches!(shared(protocol::SharedKind::Links, true), Response::Error { code: ErrorCode::Unsupported, .. }));
+    // Links tab is fed from channel bookmarks (bookmarks.list), not files.list.
+    match shared(protocol::SharedKind::Links, true) {
+        Response::Shared { items, .. } => assert!(!items.is_empty()),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(world.fake.calls(ALPHA, "files.list").len(), 1);
 
     // The workspace's emoji, from the list kept a day: asked once, then read from the store.
