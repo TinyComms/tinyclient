@@ -350,7 +350,7 @@ pub fn button(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<Share
             .border_color(theme::border())
             .text_color(theme::text())
             .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
-            .active(|style| style.bg(gpui::rgba(0xffffff08)))
+            .active(|style| style.bg(theme::pressed()))
             .focus_visible(|style| style.bg(opaque(theme::hover())).shadow(theme::focus_ring())),
         ButtonKind::Ghost => shell
             .text_color(theme::text_soft())

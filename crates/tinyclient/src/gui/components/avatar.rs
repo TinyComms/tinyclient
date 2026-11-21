@@ -304,7 +304,7 @@ impl Avatar {
                     .size(px(size))
                     .rounded(px(radius))
                     .border_1()
-                    .border_color(gpui::rgba(0xffffff0f)),
+                    .border_color(theme::hairline()),
             )
             .children(self.presence.and_then(|(presence, ring)| presence_dot(presence, size, ring)))
     }

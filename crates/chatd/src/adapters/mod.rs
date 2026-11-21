@@ -431,11 +431,42 @@ pub enum Command {
         action: RelateAction,
         reply: Reply<()>,
     },
+    /// Report a message, person, or conversation to the network.
+    Report {
+        target: protocol::ReportTarget,
+        reason: protocol::ReportReason,
+        note: String,
+        block: bool,
+        reply: Reply<()>,
+    },
+    /// Ask the network's supported report reasons for `target`.
+    ReportReasons {
+        target: protocol::ReportTarget,
+        reply: Reply<Vec<protocol::ReportReason>>,
+    },
     /// The user set their own presence, and their status text unless it is `None` (empty clears
     /// it). The hub already shows it; answer `Err` and it is put back.
     SetPresence {
         presence: Presence,
         status: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Edit our own profile fields on the network. `None` leaves a field unchanged.
+    SetProfile {
+        name: Option<String>,
+        about: Option<String>,
+        pronouns: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set (or clear, when `path` is empty) our own profile picture from a local file path.
+    SetAvatar {
+        path: String,
+        reply: Reply<()>,
+    },
+    /// Set (or clear, when `None` or empty) our per-space nickname.
+    SetNickname {
+        space_id: String,
+        nickname: Option<String>,
         reply: Reply<()>,
     },
     /// A registered file is wanted: answer with where and how to fetch it now.
@@ -511,10 +542,15 @@ impl Command {
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
             | Command::Relate { reply, .. }
+            | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::SetProfile { reply, .. }
+            | Command::SetAvatar { reply, .. }
+            | Command::SetNickname { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -995,9 +1031,35 @@ impl Context {
 
     /// One person added or removed one reaction. Set `reaction.mine` when it was us.
     pub fn reacted(&self, conversation_id: &str, message_id: &str, reaction: &Reaction, added: bool) -> Stores {
+        self.reacted_by(conversation_id, message_id, reaction, added, None)
+    }
+
+    /// Like [`reacted`], with the reactor's display name when the network reports who reacted.
+    pub fn reacted_by(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        reaction: &Reaction,
+        added: bool,
+        reactor: Option<&str>,
+    ) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().react(&conversation, message_id, reaction, added)? {
-            self.hub.changed(Change::Messages { conversation });
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            if added && !reaction.mine {
+                if let Ok(Some(target)) = self.hub.store().message(&conversation, message_id) {
+                    if target.outgoing {
+                        let snippet = crate::store::preview_text(&target);
+                        self.hub.notify(crate::notify::Event::Reaction {
+                            conversation,
+                            emoji: reaction.emoji.clone(),
+                            reactor: reactor.map(str::to_owned),
+                            snippet,
+                            outgoing_target: true,
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }

@@ -37,12 +37,17 @@ pub const ROWS: &[Row] = &[
     row("G2", General, "", "Keep receiving when the window is closed", &[], &["background", "quit", "close", "run", "daemon"]),
     row("G3", General, "", "Keep tinyclient in the tray when I close the window", &[], &["tray", "notification area", "systray", "system tray", "icon", "hide", "background", "close"]),
     row("G4", General, "", "Install updates automatically", &[], &["update", "upgrade", "version", "install", "automatic"]),
+    row("GN1", General, "Network", "Proxy", &["Use system proxy", "No proxy", "Custom"], &["proxy", "socks", "socks5", "http", "network", "corporate", "firewall"]),
+    row("GN2", General, "Network", "Custom proxy", &["HTTP", "SOCKS5"], &["proxy", "socks", "socks5", "host", "port", "http", "network"]),
     row("N1", Notifications, "", "Show notifications", &[], &["notify", "notification", "alert", "banner", "toast", "popup"]),
     row("N2", Notifications, "", "Notify me about", &["Direct messages and mentions", "All messages"], &["dm", "mention", "every message", "channel"]),
     row("ND", Notifications, "Notify for", "Direct messages", &[], &["dm", "private", "notify"]),
     row("NG", Notifications, "Notify for", "Group chats", &[], &["group", "notify"]),
     row("NM", Notifications, "Notify for", "Mentions in channels", &[], &["mention", "@", "everyone", "here", "notify"]),
     row("NT", Notifications, "Notify for", "Tiny servers", &[], &["tiny", "server", "room", "notify"]),
+    row("NR", Notifications, "Notify for", "Reactions to my messages", &["Off", "In direct messages", "Everywhere"], &["reaction", "reactions", "emoji", "thumbs up", "notify"]),
+    row("NF", Notifications, "Notify for", "Replies in threads I follow", &[], &["thread", "threads", "reply", "replies", "followed", "notify"]),
+    row("NK", Notifications, "Notify for", "Keywords", &[], &["keyword", "keywords", "word", "words", "highlight", "watch", "notify"]),
     row("N4", Notifications, "Privacy", "Show in notifications", &["Sender and message", "Sender only", "Nothing"], &["preview", "privacy", "screen sharing", "hide", "text"]),
     row("NL", Notifications, "Privacy", "When the screen is locked", &["Sender and message", "Sender only", "Nothing"], &["lock", "locked", "lock screen", "privacy"]),
     row("N5", Notifications, "Calls", "Incoming calls", &["Ring", "Silently", "Don't notify"], &["ring", "ringtone", "call", "phone"]),
@@ -60,9 +65,11 @@ pub const ROWS: &[Row] = &[
     row("SV", Sounds, "Notification sounds", "Notification volume", &[], &["volume", "loud", "quiet", "sound"]),
     row("S13", Sounds, "Your sounds", "Add a sound…", &[], &["custom", "custom sound", "custom sounds", "sound file", "import", "add", "my sound", "audio"]),
     row("S14", Sounds, "Calls", "Ring back while I'm calling someone", &[], &["ringback", "ring back", "calling", "dial", "tone"]),
+    row("A1", Appearance, "", "Appearance", &["System", "Light", "Dark"], &["theme", "light", "dark", "dark mode", "light mode", "system", "colour", "color"]),
     row("A2", Appearance, "", "Text size", &["13 pt", "14 pt", "15 pt", "16 pt", "17 pt"], &["font", "bigger", "smaller", "zoom", "large"]),
     row("A3", Appearance, "", "Density", &["Comfortable", "Compact"], &["rows", "dense", "spacing", "compact"]),
     row("A4", Appearance, "", "Show message previews in the list", &[], &["preview", "screen sharing", "privacy", "list"]),
+    row("A5", Appearance, "", "Increase contrast", &[], &["contrast", "high contrast", "accessibility", "vision", "legible"]),
     row("M1", Messages, "", "Send with", &["Return", "⌘Return"], &["enter", "return", "newline", "send key", "cmd"]),
     row("M2", Messages, "", "Open conversations at", &["First unread", "Newest message"], &["scroll", "unread", "bottom", "jump"]),
     row("M3", Messages, "", "Show when others are typing", &[], &["typing", "indicator"]),
@@ -116,12 +123,6 @@ pub const ROWS: &[Row] = &[
 /// Words for what tinyclient does not have yet, or will not have, so a search for one gets an
 /// honest line rather than nothing.
 pub const NOT_YET: &[(&str, &str)] = &[
-    ("proxy", "tinyclient has no proxy setting yet."),
-    ("socks", "tinyclient has no proxy setting yet."),
-    ("reaction", "tinyclient does not notify about reactions yet."),
-    ("theme", "tinyclient is dark only for now."),
-    ("light", "tinyclient is dark only for now."),
-    ("dark mode", "tinyclient is dark only for now."),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
@@ -237,8 +238,8 @@ pub fn draws_label(id: &str) -> bool {
 pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
-        "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
-            | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
+        "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
+            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
 
@@ -369,19 +370,32 @@ mod tests {
 
     #[test]
     fn a_search_for_what_is_not_built_says_so() {
-        assert!(search("proxy").is_empty());
-        assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
-        // The words people reach for, not only the names in the product doc.
-        for words in ["reactions"] {
-            assert!(search(words).is_empty(), "{words} finds a row");
-            assert!(not_yet(words).is_some(), "{words} gets no line");
-        }
+        // Proxy is built now.
+        assert!(search("proxy").iter().any(|row| row.id == "GN1"));
+        assert!(search("socks").iter().any(|row| row.id == "GN1"));
+        assert_eq!(not_yet("proxy"), None);
+        assert_eq!(not_yet("socks"), None);
+        // Accent is intentionally not customizable yet.
+        assert_eq!(not_yet("accent"), Some("tinyclient keeps one accent colour."));
+        // Reactions, thread replies and keywords are built now.
+        assert!(search("reactions").iter().any(|row| row.id == "NR"));
+        assert!(search("threads").iter().any(|row| row.id == "NF"));
+        assert!(search("keywords").iter().any(|row| row.id == "NK"));
+        assert_eq!(not_yet("reactions"), None);
         assert!(search("spell").iter().any(|row| row.id == "M6"), "spell finds Check spelling");
         assert_eq!(not_yet("spell"), None);
         // Sounds of your own are built now: the words reach the row that adds one.
         assert_eq!(not_yet("custom sound"), None);
         assert_eq!(not_yet("sound file"), None);
         assert!(search("custom sound").iter().any(|row| row.id == "S13"));
+        // Appearance (light/dark/system) and high contrast are built now.
+        assert!(search("light").iter().any(|row| row.id == "A1"));
+        assert!(search("dark mode").iter().any(|row| row.id == "A1"));
+        assert!(search("theme").iter().any(|row| row.id == "A1"));
+        assert!(search("contrast").iter().any(|row| row.id == "A5"));
+        assert_eq!(not_yet("theme"), None);
+        assert_eq!(not_yet("light"), None);
+        assert_eq!(not_yet("dark mode"), None);
         assert_eq!(not_yet("zzz"), None);
     }
 

@@ -828,6 +828,7 @@ impl Discord {
             gif_file: false,
             mention_format: protocol::MentionFormat::Discord,
             mention_spans: false,
+            ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
     }

@@ -364,6 +364,14 @@ impl SettingsWindow {
                     groups.push(self.group(&["G3"], None, window, cx).child(caption(self.tray_caption())));
                 }
                 groups.push(self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())));
+                let proxy_rows: &[&str] = if prefs::values().word(GLOBAL, keys::PROXY_MODE) == "custom" {
+                    &["GN1", "GN2"]
+                } else {
+                    &["GN1"]
+                };
+                groups.push(self.group(proxy_rows, Some("Network"), window, cx).child(caption(
+                    "Applies to network requests and gateways. Voice calls use UDP, which does not cross an HTTP proxy (Tiny falls back to ICE-TCP; Discord voice has no TCP mode). Sign-in windows follow the system proxy.",
+                )));
                 groups
             }
             Section::Notifications => self.notifications_page(window, cx),
@@ -374,7 +382,7 @@ impl SettingsWindow {
             }
             Section::Appearance => vec![
                 // A phone's rows keep a thumb's height whatever the density: it has no Density.
-                self.group(if phone::active() { &["A2", "A4"] } else { &["A2", "A3", "A4"] }, None, window, cx)
+                self.group(if phone::active() { &["A1", "A2", "A4", "A5"] } else { &["A1", "A2", "A3", "A4", "A5"] }, None, window, cx)
                     // The caption is about keyboard shortcuts, which a phone has none of.
                     .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
@@ -599,6 +607,73 @@ impl SettingsWindow {
                 let on = choices.updates;
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_updates(on, cx), cx)
             }
+            "GN1" => {
+                let current_word = values.word(GLOBAL, keys::PROXY_MODE);
+                let current = keys::PROXY_MODE_CHOICES.iter().position(|w| *w == current_word).unwrap_or(0);
+                self.segmented_row(
+                    id,
+                    &["System", "None", "Custom"],
+                    current,
+                    0,
+                    None,
+                    |this, ix, cx| {
+                        let word = keys::PROXY_MODE_CHOICES[ix];
+                        let stored = (word != "system").then(|| word.to_owned());
+                        this.set("GN1", GLOBAL.into(), keys::PROXY_MODE, stored, cx);
+                    },
+                    cx,
+                )
+            }
+            "GN2" => {
+                let scheme_word = values.word(GLOBAL, keys::PROXY_SCHEME);
+                let is_socks = scheme_word == "socks5";
+                let scheme_btn = button(
+                    "gn2-scheme",
+                    ButtonKind::Secondary,
+                    if is_socks { "SOCKS5" } else { "HTTP" },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let next = if is_socks { None } else { Some("socks5".to_owned()) };
+                    this.set("GN2", GLOBAL.into(), keys::PROXY_SCHEME, next, cx);
+                }));
+                let host_field = div()
+                    .w(px(120.))
+                    .h(px(28.))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::field())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .child(self.proxy_host.clone());
+                let port_field = div()
+                    .w(px(56.))
+                    .h(px(28.))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::field())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .child(self.proxy_port.clone());
+                let save = button("gn2-save", ButtonKind::Secondary, "Save").on_click(cx.listener(|this, _, _, cx| {
+                    let host = this.proxy_host.read(cx).text().trim().to_owned();
+                    let port = this.proxy_port.read(cx).text().trim().to_owned();
+                    this.set("GN2", GLOBAL.into(), keys::PROXY_HOST, (!host.is_empty()).then_some(host), cx);
+                    this.set("GN2", GLOBAL.into(), keys::PROXY_PORT, (!port.is_empty()).then_some(port), cx);
+                }));
+                let control = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(scheme_btn)
+                    .child(host_field)
+                    .child(port_field)
+                    .child(save);
+                row(label, Some("Fails closed if host or port is missing.".into()), control)
+            }
             "S1" => {
                 let on = values.on(SOUNDS);
                 let second = (!on).then(|| "Notifications arrive silently and calls make no sounds. Your choices below are kept.".to_owned());
@@ -644,6 +719,21 @@ impl SettingsWindow {
                     .on_click(cx.listener(|this, _, _, cx| this.play_test_sound(cx)));
                 wide_row(label, None, div().flex().items_center().child(self.slider_control(id, cx)).child(play))
             }
+            "A1" => {
+                let at = match choices.appearance {
+                    theme::Appearance::System => 0,
+                    theme::Appearance::Light => 1,
+                    theme::Appearance::Dark => 2,
+                };
+                self.segmented_row(id, &["System", "Light", "Dark"], at, 0, None, |this, ix, cx| {
+                    let choice = match ix {
+                        1 => theme::Appearance::Light,
+                        2 => theme::Appearance::Dark,
+                        _ => theme::Appearance::System,
+                    };
+                    this.choose(|c| c.appearance = choice, cx);
+                }, cx)
+            }
             "A2" => wide_row(label, None, self.slider_control(id, cx)),
             "A3" => {
                 let second = choices.compact.then(|| "List rows are 40 instead of 48.".to_owned());
@@ -652,6 +742,11 @@ impl SettingsWindow {
             "A4" => {
                 let second = (!choices.previews).then(|| "Rows show names and times only.".to_owned());
                 self.switch_row(id, choices.previews, true, second, |this, on, cx| this.choose(|c| c.previews = on, cx), cx)
+            }
+            "A5" => {
+                let second = theme::system_high_contrast()
+                    .then(|| "System Increase Contrast is on, so high contrast is active.".to_owned());
+                self.switch_row(id, choices.high_contrast, false, second, |this, on, cx| this.choose(|c| c.high_contrast = on, cx), cx)
             }
             "M1" => {
                 let second = crate::gui::shortcuts::label(if choices.command_return { "Return adds a line." } else { "⇧Return adds a line." });
@@ -1918,6 +2013,7 @@ impl SettingsWindow {
     pub(super) fn modal(&mut self, confirm: &Confirm, cx: &mut Context<Self>) -> Div {
         match confirm.clone() {
             Confirm::SignOut(account) => self.sign_out_modal(&account, cx),
+            Confirm::EditProfile(account) => self.edit_profile_modal(&account, cx),
             Confirm::TinyEverywhere(account) => self.tiny_everywhere_modal(&account, cx),
             Confirm::Retention { days, prunable } => modal_panel(
                 format!("Delete messages older than {days} days?"),

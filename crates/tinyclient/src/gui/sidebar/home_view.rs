@@ -371,7 +371,7 @@ impl Shell {
             )
             .children(rollup_badge(space.attention, space.unread && !space.muted).filter(|_| open != Some(true)));
         let spine = child.map(|color| {
-            let color = if color == 0 { theme::text_faint() } else { gpui::rgb(color) };
+            let color = if color == 0 { theme::text_faint() } else { theme::role_color(color) };
             div().absolute().left(px(16.)).top_0().bottom_0().w(px(3.)).bg(color).opacity(0.7)
         });
         list_row(super::row_id("space", &space.key), theme::row_height(theme::ROW_ONE), here, focused, content)

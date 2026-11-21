@@ -105,6 +105,20 @@ pub const CACHE_MB: &str = "cache_mb";
 /// The schema of these rows, for migrations. Not a setting anyone changes.
 pub const VERSION: &str = "version";
 
+// Network proxy (Settings › General › Network).
+/// `system` (default), `none`, or `custom`.
+pub const PROXY_MODE: &str = "proxy_mode";
+pub const PROXY_MODE_CHOICES: [&str; 3] = ["system", "none", "custom"];
+/// `http` (HTTP CONNECT) or `socks5`.
+pub const PROXY_SCHEME: &str = "proxy_scheme";
+pub const PROXY_SCHEME_CHOICES: [&str; 2] = ["http", "socks5"];
+/// Proxy hostname or IP address (no scheme or port).
+pub const PROXY_HOST: &str = "proxy_host";
+/// Proxy TCP port, 1..=65535.
+pub const PROXY_PORT: &str = "proxy_port";
+/// Optional proxy username; password is stored in the system keychain, never in SQLite.
+pub const PROXY_USER: &str = "proxy_user";
+
 // Notifications (N1 to N13) and their sounds (S2 to S6), all kept and acted on by chatd.
 
 /// N1. Off: chatd posts no message notification. Counts and the badge keep working.
@@ -118,6 +132,13 @@ pub const NOTIFY_DIRECT: &str = "notify_direct";
 pub const NOTIFY_GROUPS: &str = "notify_groups";
 pub const NOTIFY_MENTIONS: &str = "notify_mentions";
 pub const NOTIFY_TINY: &str = "notify_tiny";
+/// Reactions to my messages: `off`, `direct` (in direct messages), or `everywhere`.
+pub const NOTIFY_REACTIONS: &str = "notify_reactions";
+pub const REACTION_NOTIFY_CHOICES: [&str; 3] = ["off", "direct", "everywhere"];
+/// Replies in threads I follow (`Filing::followed`).
+pub const NOTIFY_THREADS: &str = "notify_threads";
+/// Comma- or newline-separated keywords that trigger a notification on word boundaries.
+pub const NOTIFY_KEYWORDS: &str = "notify_keywords";
 /// N4. What a notification shows: `full`, `sender` or `nothing`. The default is `sender`: the
 /// sender and "New message", no text. A row is stored only when it differs from the default, so
 /// a person who chose `full` under the old default (`full`) has no row and reads `sender` now.
@@ -194,12 +215,27 @@ enum Kind {
     Until,
     /// A custom sound's name, in its `sound:<id>` scope.
     CustomSound,
+    /// A short list of comma/newline-separated notification keywords.
+    Keywords,
+    /// A hostname or IP address for a custom proxy.
+    Host,
+    /// A TCP port number, 1..=65535.
+    Port,
+    /// An optional proxy username.
+    User,
 }
 
 fn kind(key: &str) -> Option<Kind> {
     Some(match key {
         KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION => Kind::Switch(true),
-        NOTIFY | NOTIFY_DIRECT | NOTIFY_GROUPS | NOTIFY_MENTIONS | NOTIFY_TINY | CALLS_THROUGH | FLASH | BADGE | RINGBACK => Kind::Switch(true),
+        NOTIFY | NOTIFY_DIRECT | NOTIFY_GROUPS | NOTIFY_MENTIONS | NOTIFY_TINY | NOTIFY_THREADS | CALLS_THROUGH | FLASH | BADGE | RINGBACK => Kind::Switch(true),
+        NOTIFY_REACTIONS => Kind::Word(&REACTION_NOTIFY_CHOICES, "off"),
+        NOTIFY_KEYWORDS => Kind::Keywords,
+        PROXY_MODE => Kind::Word(&PROXY_MODE_CHOICES, "system"),
+        PROXY_SCHEME => Kind::Word(&PROXY_SCHEME_CHOICES, "http"),
+        PROXY_HOST => Kind::Host,
+        PROXY_PORT => Kind::Port,
+        PROXY_USER => Kind::User,
         QUIET_HOURS => Kind::Switch(false),
         QUIET_FROM => Kind::Minute(22 * 60),
         QUIET_TO => Kind::Minute(8 * 60),
@@ -306,6 +342,10 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Minute(_)) => value.parse::<u32>().is_ok_and(|n| n < 24 * 60),
         Some(Kind::Until) => value == "resume" || value.parse::<u64>().is_ok(),
         Some(Kind::CustomSound) => !value.is_empty() && value.len() <= 48 && !value.chars().any(char::is_control),
+        Some(Kind::Keywords) => value.len() <= 500 && !value.chars().any(|c| c.is_control() && c != '\n'),
+        Some(Kind::Host) => !value.is_empty() && value.len() <= 253 && !value.chars().any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '@'),
+        Some(Kind::Port) => value.parse::<u16>().is_ok_and(|p| p > 0),
+        Some(Kind::User) => value.len() <= 128 && !value.chars().any(|c| c.is_control() || c == '@' || c == ':'),
         None => false,
     }
 }
@@ -710,6 +750,118 @@ impl Values {
     pub fn ringback(&self) -> bool {
         self.on(RINGBACK)
     }
+
+    /// Configured notification keywords, trimmed and non-empty.
+    pub fn keywords(&self) -> Vec<String> {
+        let Some(raw) = self.stored(GLOBAL, NOTIFY_KEYWORDS) else {
+            return Vec::new();
+        };
+        raw.split([',', '\n'])
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The active network proxy configuration.
+    pub fn proxy(&self) -> ProxyConfig {
+        let mode = match self.word(GLOBAL, PROXY_MODE) {
+            "none" => ProxyMode::None,
+            "custom" => ProxyMode::Custom,
+            _ => ProxyMode::System,
+        };
+        let scheme = match self.word(GLOBAL, PROXY_SCHEME) {
+            "socks5" => ProxyScheme::Socks5,
+            _ => ProxyScheme::Http,
+        };
+        let host = self.stored(GLOBAL, PROXY_HOST).unwrap_or("").to_owned();
+        let port = self.stored(GLOBAL, PROXY_PORT).and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+        let user = self.stored(GLOBAL, PROXY_USER).filter(|u| !u.is_empty()).map(str::to_owned);
+        ProxyConfig { mode, scheme, host, port, user }
+    }
+}
+
+/// Network proxy mode (`Settings › General › Network`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProxyMode {
+    #[default]
+    System,
+    None,
+    Custom,
+}
+
+/// Protocol for a custom proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProxyScheme {
+    #[default]
+    Http,
+    Socks5,
+}
+
+/// Resolved proxy configuration read from settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyConfig {
+    pub mode: ProxyMode,
+    pub scheme: ProxyScheme,
+    pub host: String,
+    pub port: u16,
+    pub user: Option<String>,
+}
+
+impl ProxyConfig {
+    /// Returns the proxy URL for `Custom` mode, or an error if `Custom` is incomplete (fail closed).
+    pub fn custom_url(&self, password: Option<&str>) -> Result<Option<String>, String> {
+        if self.mode != ProxyMode::Custom {
+            return Ok(None);
+        }
+        let host = self.host.trim();
+        if host.is_empty() || self.port == 0 {
+            return Err("Custom proxy is enabled but host or port is missing.".to_owned());
+        }
+        let scheme = match self.scheme {
+            ProxyScheme::Http => "http",
+            ProxyScheme::Socks5 => "socks5",
+        };
+        let auth = match (self.user.as_deref().filter(|u| !u.is_empty()), password.filter(|p| !p.is_empty())) {
+            (Some(u), Some(p)) => format!("{u}:{p}@"),
+            (Some(u), None) => format!("{u}@"),
+            _ => String::new(),
+        };
+        let host_fmt = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        Ok(Some(format!("{scheme}://{auth}{host_fmt}:{}", self.port)))
+    }
+}
+
+/// Whether `text` contains any keyword in `keywords`, case-insensitively and on word boundaries.
+pub fn keyword_matches(text: &str, keywords: &[String]) -> bool {
+    if text.is_empty() || keywords.is_empty() {
+        return false;
+    }
+    let hay = text.to_lowercase();
+    for kw in keywords {
+        let needle = kw.trim().to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut start = 0;
+        while let Some(rel) = hay[start..].find(&needle) {
+            let at = start + rel;
+            let end = at + needle.len();
+            let left_ok = at == 0 || !hay[..at].chars().next_back().is_some_and(char::is_alphanumeric);
+            let right_ok = end == hay.len() || !hay[end..].chars().next().is_some_and(char::is_alphanumeric);
+            if left_ok && right_ok {
+                return true;
+            }
+            // Advance by one char to find subsequent occurrences.
+            let step = hay[at..].chars().next().map_or(1, char::len_utf8);
+            start = at + step;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -991,5 +1143,62 @@ mod tests {
         let mut values = Values::default();
         values.set(GLOBAL, RINGBACK, Some("off".into()));
         assert!(!values.ringback());
+    }
+
+    #[test]
+    fn reactions_followed_threads_and_keywords_settings_validate_and_match_word_boundaries() {
+        let mut values = Values::default();
+        assert_eq!(values.word(GLOBAL, NOTIFY_REACTIONS), "off");
+        assert!(values.on(NOTIFY_THREADS));
+        assert!(values.keywords().is_empty());
+        for word in ["off", "direct", "everywhere"] {
+            assert!(valid(GLOBAL, NOTIFY_REACTIONS, word), "{word}");
+        }
+        assert!(!valid(GLOBAL, NOTIFY_REACTIONS, "all"));
+        assert!(valid(GLOBAL, NOTIFY_THREADS, "off"));
+        assert!(valid(GLOBAL, NOTIFY_KEYWORDS, "deploy, incident, Alice"));
+        assert!(!valid(GLOBAL, NOTIFY_KEYWORDS, "bad\x07bell"));
+
+        values.set(GLOBAL, NOTIFY_KEYWORDS, Some("deploy, incident,  cat ".into()));
+        let kws = values.keywords();
+        assert_eq!(kws, ["deploy", "incident", "cat"]);
+        assert!(keyword_matches("Time to DEPLOY now!", &kws));
+        assert!(keyword_matches("An incident occurred.", &kws));
+        assert!(keyword_matches("cat!", &kws));
+        assert!(!keyword_matches("catch the ball", &kws), "must match whole word");
+        assert!(!keyword_matches("redeploying", &kws), "must match whole word");
+        assert!(!keyword_matches("", &kws));
+    }
+
+    #[test]
+    fn proxy_settings_validate_and_custom_mode_fails_closed_when_incomplete() {
+        let mut values = Values::default();
+        assert_eq!(values.proxy().mode, ProxyMode::System);
+        assert_eq!(values.proxy().custom_url(None), Ok(None));
+
+        for mode in ["system", "none", "custom"] {
+            assert!(valid(GLOBAL, PROXY_MODE, mode), "{mode}");
+        }
+        assert!(!valid(GLOBAL, PROXY_MODE, "direct"));
+        assert!(valid(GLOBAL, PROXY_SCHEME, "http") && valid(GLOBAL, PROXY_SCHEME, "socks5"));
+        assert!(!valid(GLOBAL, PROXY_SCHEME, "ftp"));
+        assert!(valid(GLOBAL, PROXY_HOST, "proxy.corp.local") && !valid(GLOBAL, PROXY_HOST, "http://bad/path"));
+        assert!(valid(GLOBAL, PROXY_PORT, "1080") && !valid(GLOBAL, PROXY_PORT, "0") && !valid(GLOBAL, PROXY_PORT, "70000"));
+        assert!(valid(GLOBAL, PROXY_USER, "alice") && !valid(GLOBAL, PROXY_USER, "bad:user"));
+
+        // Custom mode without host/port must fail closed.
+        values.set(GLOBAL, PROXY_MODE, Some("custom".into()));
+        assert!(values.proxy().custom_url(None).is_err(), "incomplete custom proxy must fail closed");
+
+        values.set(GLOBAL, PROXY_SCHEME, Some("socks5".into()));
+        values.set(GLOBAL, PROXY_HOST, Some("127.0.0.1".into()));
+        values.set(GLOBAL, PROXY_PORT, Some("1080".into()));
+        assert_eq!(values.proxy().custom_url(None).unwrap().as_deref(), Some("socks5://127.0.0.1:1080"));
+
+        values.set(GLOBAL, PROXY_USER, Some("alice".into()));
+        assert_eq!(
+            values.proxy().custom_url(Some("s3cret")).unwrap().as_deref(),
+            Some("socks5://alice:s3cret@127.0.0.1:1080")
+        );
     }
 }

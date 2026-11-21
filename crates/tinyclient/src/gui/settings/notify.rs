@@ -22,6 +22,7 @@ const QUIET_STEP: u32 = 30;
 pub fn choices(id: &str) -> Option<(&'static str, &'static [&'static str], &'static [&'static str])> {
     Some(match id {
         "N2" => (keys::NOTIFY_ABOUT, &keys::ABOUT_CHOICES, &["Direct messages and mentions", "All messages"]),
+        "NR" => (keys::NOTIFY_REACTIONS, &keys::REACTION_NOTIFY_CHOICES, &["Off", "In direct messages", "Everywhere"]),
         "N4" => (keys::PREVIEW, &keys::PREVIEW_CHOICES, &["Sender and message", "Sender only", "Nothing"]),
         "NL" => (keys::PREVIEW_LOCKED, &keys::PREVIEW_CHOICES, &["Sender and message", "Sender only", "Nothing"]),
         "N5" => (keys::CALLS, &keys::CALLS_CHOICES, &["Ring", "Silently", "Don't notify"]),
@@ -41,6 +42,7 @@ fn switch_of(id: &str) -> Option<(&'static str, bool)> {
         "NG" => (keys::NOTIFY_GROUPS, true),
         "NM" => (keys::NOTIFY_MENTIONS, true),
         "NT" => (keys::NOTIFY_TINY, true),
+        "NF" => (keys::NOTIFY_THREADS, true),
         "N8" => (keys::QUIET_HOURS, false),
         "N9" => (keys::CALLS_THROUGH, true),
         "N10" => (keys::FLASH, true),
@@ -110,7 +112,7 @@ impl SettingsWindow {
         let on = values.on(keys::NOTIFY);
         let mut groups = vec![self.group_of(&["N1", "N2"], None, window, cx).child(caption("Conversations you muted never notify. Do Not Disturb you set in Slack or Discord is followed here."))];
         if on {
-            groups.push(self.group_of(&["ND", "NG", "NM", "NT"], Some("Notify for"), window, cx));
+            groups.push(self.group_of(&["ND", "NG", "NM", "NT", "NR", "NF", "NK"], Some("Notify for"), window, cx));
             groups.push(self.group_of(&["N4", "NL"], Some("Privacy"), window, cx));
         }
         groups.push(self.group_of(&["N5", "N6"], Some("Calls"), window, cx).child(caption("Ringing follows Incoming calls even when notifications are off.")));
@@ -230,9 +232,38 @@ impl SettingsWindow {
         Some(match id {
             "N7" => self.pause_row(&values, cx),
             "N13" => self.test_row(cx),
+            "NK" => self.keywords_row(cx),
             "SV" => row(rows::find(id).map_or("", |row| row.label), None, self.slider_control(id, cx)),
             _ => return None,
         })
+    }
+
+    pub(super) fn save_keywords(&mut self, cx: &mut Context<Self>) {
+        let raw = self.notify_keywords.read(cx).text().trim().to_owned();
+        let stored = (!raw.is_empty()).then_some(raw);
+        self.set("NK", GLOBAL.into(), keys::NOTIFY_KEYWORDS, stored, cx);
+    }
+
+    fn keywords_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let field = div()
+            .w(px(190.))
+            .h(px(28.))
+            .px(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::field())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .items_center()
+            .child(self.notify_keywords.clone());
+        let save = button("nk-save", ButtonKind::Secondary, "Save")
+            .on_click(cx.listener(|this, _, _, cx| this.save_keywords(cx)));
+        let control = div().flex().items_center().gap(px(6.)).child(field).child(save);
+        row(
+            rows::find("NK").map_or("Keywords", |r| r.label),
+            Some("Comma-separated words, matched on whole words.".into()),
+            control,
+        )
     }
 
     fn word_second(&self, id: &str, values: &Values) -> Option<String> {

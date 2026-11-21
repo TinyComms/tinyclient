@@ -36,13 +36,21 @@ pub enum Float {
     Leave(Conversation),
     /// Asked once before clearing history or deleting a chat on the network.
     ClearHistory { conversation: Conversation, delete_chat: bool, revoke: bool },
+    /// Confirm sheet before reporting a message, person, or conversation to the network.
+    Report {
+        target: protocol::ReportTarget,
+        name: String,
+        link: String,
+        reason: protocol::ReportReason,
+        block: bool,
+    },
 }
 
 impl Float {
     fn person(&self) -> Option<&Key> {
         match self {
             Float::Card(person) | Float::Menu(person) | Float::Person { person, .. } | Float::Confirm(person, _) => Some(person),
-            Float::Conversation { .. } | Float::Leave(_) | Float::ClearHistory { .. } => None,
+            Float::Conversation { .. } | Float::Leave(_) | Float::ClearHistory { .. } | Float::Report { .. } => None,
         }
     }
 }
@@ -548,6 +556,23 @@ impl Floating {
                     this.close(cx);
                 })))
             }
+            Item::Report => {
+                let target = person.map(|p| (p.key.clone(), p.name.clone(), p.link.clone()));
+                div().child(menu_item_danger("menu-report", Some("icons/triangle-alert.svg"), "Report…").on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some((key, name, link)) = target.clone() {
+                        this.turn_to(
+                            Float::Report {
+                                target: protocol::ReportTarget::Person(key),
+                                name,
+                                link,
+                                reason: protocol::ReportReason::Spam,
+                                block: false,
+                            },
+                            cx,
+                        );
+                    }
+                })))
+            }
             Item::Leave => {
                 let row = conversation.cloned();
                 let words = if row.as_ref().is_some_and(|row| row.kind == protocol::ConversationKind::Group) { "Leave group" } else { "Leave" };
@@ -693,6 +718,125 @@ impl Floating {
             .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
             .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
     }
+
+    fn confirm_report(
+        &self,
+        target: protocol::ReportTarget,
+        name: String,
+        link: String,
+        reason: protocol::ReportReason,
+        block: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let network = target.account().network.label();
+        let size = window.viewport_size();
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let mut reasons = div().mt(px(12.)).flex().flex_wrap().gap(px(6.));
+        for (ix, candidate) in protocol::ReportReason::ALL.into_iter().enumerate() {
+            let active = candidate == reason;
+            let t = target.clone();
+            let n = name.clone();
+            let l = link.clone();
+            reasons = reasons.child(
+                div()
+                    .id(("report-reason", ix))
+                    .h(px(26.))
+                    .px(px(10.))
+                    .rounded(px(theme::R_CHIP))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_small()
+                    .bg(if active { theme::accent_soft() } else { theme::hover() })
+                    .border_1()
+                    .border_color(if active { theme::accent() } else { theme::border() })
+                    .text_color(if active { theme::accent_text() } else { theme::text() })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.turn_to(
+                            Float::Report { target: t.clone(), name: n.clone(), link: l.clone(), reason: candidate, block },
+                            cx,
+                        );
+                    }))
+                    .child(candidate.label()),
+            );
+        }
+        let toggle_target = target.clone();
+        let toggle_name = name.clone();
+        let toggle_link = link.clone();
+        let block_row = div()
+            .id("report-also-block")
+            .mt(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .cursor_pointer()
+            .text_size(px(13.))
+            .text_color(theme::text())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.turn_to(
+                    Float::Report {
+                        target: toggle_target.clone(),
+                        name: toggle_name.clone(),
+                        link: toggle_link.clone(),
+                        reason,
+                        block: !block,
+                    },
+                    cx,
+                );
+            }))
+            .child(crate::gui::components::glyph(
+                if block { "icons/square-check.svg" } else { "icons/square.svg" },
+                16.,
+                if block { theme::danger() } else { theme::text_soft() },
+            ))
+            .child(format!("Also block {name}"));
+
+        let send_target = target.clone();
+        let fallback_link = link.clone();
+        let panel = div()
+            .w(px(wide))
+            .p(px(20.))
+            .rounded(px(theme::R_MODAL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            .flex()
+            .flex_col()
+            .child(div().type_title().child(format!("Report {name} to {network}?")))
+            .child(modal_body(format!("Choose a reason. If {network} does not accept reports from here, tinyclient will open it in {network}.")))
+            .child(reasons)
+            .child(block_row)
+            .child(
+                modal_buttons()
+                    .child(button("report-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+                    .child(button("report-send", ButtonKind::Danger, "Report").on_click(cx.listener(move |this, _, _, cx| {
+                        let req = Request::Report {
+                            target: send_target.clone(),
+                            reason,
+                            note: String::new(),
+                            block,
+                        };
+                        let fallback = fallback_link.clone();
+                        this.close(cx);
+                        super::ask_later(cx, req, move |answer, cx| {
+                            if matches!(answer, Ok(Response::Error { code: protocol::ErrorCode::Unsupported, .. })) && !fallback.is_empty() {
+                                cx.open_url(&fallback);
+                            }
+                        });
+                    }))),
+            );
+        div()
+            .w(size.width)
+            .h(size.height)
+            .relative()
+            .child(scrim().id("report-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+    }
 }
 
 impl Render for Floating {
@@ -721,6 +865,9 @@ impl Render for Floating {
             }
             (Float::ClearHistory { conversation, delete_chat, revoke }, _) => {
                 (self.confirm_clear_history(conversation, *delete_chat, *revoke, window, cx), true)
+            }
+            (Float::Report { target, name, link, reason, block }, _) => {
+                (self.confirm_report(target.clone(), name.clone(), link.clone(), *reason, *block, window, cx), true)
             }
             _ => return div(),
         };

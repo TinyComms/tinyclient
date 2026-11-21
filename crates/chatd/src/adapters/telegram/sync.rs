@@ -353,6 +353,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gif_file: false,
         mention_format: protocol::MentionFormat::Plain,
         mention_spans: true,
+        ..Default::default()
     }
 }
 

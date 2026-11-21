@@ -139,12 +139,21 @@ impl SettingsWindow {
                         .into_any_element()
                 } else {
                     let account = (*account).clone();
-                    touch(button(("sign-out", ix + 10 * network as usize), ButtonKind::Ghost, "Sign out…"))
+                    let can_edit = account.link == Link::Connected && account.can.can_edit_profile();
+                    let edit_btn = can_edit.then(|| {
+                        let acc = account.clone();
+                        touch(button(("edit-profile", ix + 10 * network as usize), ButtonKind::Secondary, "Edit profile…"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm = Some(Confirm::EditProfile(Box::new(acc.clone())));
+                                cx.notify();
+                            }))
+                    });
+                    let sign_out_btn = touch(button(("sign-out", ix + 10 * network as usize), ButtonKind::Ghost, "Sign out…"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.confirm = Some(Confirm::SignOut(Box::new(account.clone())));
                             cx.notify();
-                        }))
-                        .into_any_element()
+                        }));
+                    div().flex().items_center().gap(px(6.)).children(edit_btn).child(sign_out_btn).into_any_element()
                 };
                 let name: SharedString = if account.name.is_empty() { network_name(network).into() } else { account.name.clone().into() };
                 let line = format!("{} · {}", network_name(network), state);
@@ -198,5 +207,97 @@ impl SettingsWindow {
             })),
             cx,
         )
+    }
+
+    /// Own-profile editor modal: shows only fields supported by `account.can`.
+    pub(super) fn edit_profile_modal(&self, account: &AccountStatus, cx: &mut Context<Self>) -> Div {
+        let network = network_name(account.key.network);
+        let key = account.key.clone();
+        let can = account.can;
+        let field_box = |label: &'static str, input: gpui::Entity<crate::gui::input::TextInput>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().type_small().text_color(theme::text_soft()).child(label))
+                .child(
+                    div()
+                        .h(px(30.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::field())
+                        .border_1()
+                        .border_color(theme::border())
+                        .flex()
+                        .items_center()
+                        .child(input),
+                )
+        };
+        let mut fields = div().flex().flex_col().gap(px(10.));
+        if can.profile_name {
+            fields = fields.child(field_box("Display name", self.profile_name.clone()));
+        }
+        if can.profile_about {
+            fields = fields.child(field_box("About", self.profile_about.clone()));
+        }
+        if can.profile_pronouns {
+            fields = fields.child(field_box("Pronouns", self.profile_pronouns.clone()));
+        }
+        if can.profile_avatar {
+            let avatar_key = key.clone();
+            fields = fields.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_small().text_color(theme::text_soft()).child("Profile picture"))
+                    .child(button("profile-pick-avatar", ButtonKind::Secondary, "Choose picture…").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let avatar_key = avatar_key.clone();
+                            let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                files: true,
+                                directories: false,
+                                multiple: false,
+                                prompt: Some("Choose profile picture".into()),
+                            });
+                            cx.spawn(async move |this, cx| {
+                                if let Ok(Ok(Some(paths))) = asked.await {
+                                    if let Some(path) = paths.into_iter().next() {
+                                        let path_str = path.to_string_lossy().into_owned();
+                                        let req = protocol::Request::SetAvatar { account: avatar_key, path: path_str };
+                                        let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                                        let _ = this.update(cx, |_, cx| cx.notify());
+                                    }
+                                }
+                            })
+                            .detach();
+                        },
+                    ))),
+            );
+        }
+        let save_key = key.clone();
+        let save = button("profile-save", ButtonKind::Primary, "Save").on_click(cx.listener(move |this, _, _, cx| {
+            let name = can.profile_name.then(|| this.profile_name.read(cx).text().trim().to_owned()).filter(|s| !s.is_empty());
+            let about = can.profile_about.then(|| this.profile_about.read(cx).text().trim().to_owned());
+            let pronouns = can.profile_pronouns.then(|| this.profile_pronouns.read(cx).text().trim().to_owned());
+            let req = protocol::Request::SetProfile {
+                account: save_key.clone(),
+                name,
+                about,
+                pronouns,
+                emoji: None,
+                username: None,
+                photo: false,
+            };
+            this.confirm = None;
+            this.off_thread(cx, move || crate::client::ask(&req), |_, _, cx| cx.notify());
+        }));
+        let cancel = button("profile-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+            this.confirm = None;
+            cx.notify();
+        }));
+        crate::gui::components::modal(format!("Edit {network} profile"))
+            .child(fields)
+            .child(crate::gui::components::modal_buttons().child(cancel).child(save))
     }
 }

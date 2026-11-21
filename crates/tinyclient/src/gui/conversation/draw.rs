@@ -2336,7 +2336,7 @@ impl Pane {
             .w(px(240.))
             .h(px(4.))
             .rounded(px(2.))
-            .bg(gpui::rgba(0xffffff1a))
+            .bg(theme::border())
             .child(div().h_full().w(px(240. * done)).rounded(px(2.)).bg(theme::accent()));
         let cancel = div()
             .id("cancel-upload")
