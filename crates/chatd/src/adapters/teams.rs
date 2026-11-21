@@ -327,6 +327,8 @@ struct State {
     pinned_chats: Vec<String>,
     /// Per-conversation notification level as reported by Teams.
     notify: HashMap<String, protocol::Notify>,
+    /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
+    scheduled: HashMap<String, i64>,
 }
 
 /// What a call presents.
@@ -563,6 +565,25 @@ fn seconds(iso: &str) -> i64 {
     let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
     days * 86_400 + hour * 3600 + minute * 60 + second
+}
+
+/// ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.000Z`) from Unix seconds.
+pub(super) fn iso_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400) + 719_468;
+    let secs = unix_secs.rem_euclid(86_400);
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.000Z")
 }
 
 /// 16 bytes nobody can guess, as a version 4 UUID.
@@ -896,6 +917,7 @@ impl Teams {
             close_direct: true,
             clear_history: true,
             suppress_embeds: true,
+            schedule: true,
             forward: false,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,

@@ -547,7 +547,11 @@ impl Teams {
             0 => seconds(raw["composetime"].as_str().or(raw["originalarrivaltime"].as_str()).unwrap_or("")),
             sent => sent,
         };
-        let mut message = Message::plain(id.clone(), name.clone(), "", sent, from == me);
+        let scheduled_at = props["scheduledTime"].as_str().map(seconds).filter(|at| *at > 0);
+        let is_scheduled = scheduled_at.is_some_and(|at| kind == "Scheduled" || at > sent);
+        let msg_id = if is_scheduled { format!("scheduled:{id}") } else { id.clone() };
+        let msg_sent = if is_scheduled { scheduled_at.unwrap_or(sent) } else { sent };
+        let mut message = Message::plain(msg_id, name.clone(), "", msg_sent, from == me);
         message.sender.bot = from.starts_with("28:");
         message.sender.avatar = self.picture(&from, &name);
         message.sender.id = from;
@@ -1258,8 +1262,15 @@ impl Teams {
     }
 
     pub(super) fn edit(&self, conversation: &str, id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
+        let raw_id = id.strip_prefix("scheduled:").unwrap_or(id);
         let stored = self.ctx.stored_message(conversation, id)?;
-        let meta = self.state().own_meta.get(&(conversation.to_owned(), id.to_owned())).cloned();
+        let (meta, scheduled_at) = {
+            let state = self.state();
+            (
+                state.own_meta.get(&(conversation.to_owned(), raw_id.to_owned())).cloned(),
+                state.scheduled.get(raw_id).copied(),
+            )
+        };
         let (kept_subject, body_text) = match meta.as_ref().and_then(|meta| meta.subject.as_deref()) {
             Some(subject) => {
                 let bold_line = format!("**{subject}**\n");
@@ -1301,7 +1312,7 @@ impl Teams {
             content = format!("{}{content}", quote_markup(quote));
         }
         let mut body = self.body(&now_ms().to_string(), &content);
-        if mentions_json.is_some() || kept_subject.is_some() {
+        if mentions_json.is_some() || kept_subject.is_some() || scheduled_at.is_some() {
             let mut props = serde_json::Map::new();
             if let Some(encoded) = mentions_json {
                 props.insert("mentions".to_owned(), Value::String(encoded));
@@ -1309,9 +1320,12 @@ impl Teams {
             if let Some(subject) = &kept_subject {
                 props.insert("subject".to_owned(), Value::String(subject.clone()));
             }
+            if let Some(at) = scheduled_at {
+                props.insert("scheduledTime".to_owned(), Value::String(super::iso_utc(at)));
+            }
             body["properties"] = Value::Object(props);
         }
-        self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
+        self.chat("PUT", &self.message_path(conversation, raw_id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
             let (mut shown, mut spans) = html::styled(body_text);
             if !rebased_mentions.is_empty() && shown == body_text {
@@ -1335,12 +1349,17 @@ impl Teams {
     }
 
     pub(super) fn delete(&self, conversation: &str, id: &str) -> Result<(), Fault> {
-        let path = format!("{}?behavior=softDelete", self.message_path(conversation, id));
+        let raw_id = id.strip_prefix("scheduled:").unwrap_or(id);
+        let path = format!("{}?behavior=softDelete", self.message_path(conversation, raw_id));
         self.chat("DELETE", &path, Body::None, false)?;
+        self.state().scheduled.remove(raw_id);
         self.ctx.deleted(conversation, id)?;
+        if raw_id != id {
+            self.ctx.deleted(conversation, raw_id)?;
+        }
         // A post deleted in its channel is gone from the top of its chain too.
         if chain_of(conversation).is_none() {
-            self.ctx.deleted(&chain_id(conversation, id), id)?;
+            self.ctx.deleted(&chain_id(conversation, raw_id), raw_id)?;
         }
         Ok(())
     }

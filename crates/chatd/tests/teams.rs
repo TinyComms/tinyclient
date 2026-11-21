@@ -1883,3 +1883,88 @@ fn notification_levels_read_write_and_live_update() {
         world.conversation(&grp1).filter(|row| row.muted)
     });
 }
+
+#[test]
+fn scheduled_chat_message_send_edit_cancel_and_channel_refusal() {
+    let world = World::start();
+    world.ready();
+
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.schedule);
+
+    let chat = key(CHAT_ANA);
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+
+    // 1. Schedule a message in a chat.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000970000001".to_owned(),
+        text: "Remind me in an hour".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let scheduled = world.until("scheduled message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000970000001") && m.state == SendState::Sent)
+    });
+    assert!(scheduled.id.starts_with("scheduled:"), "got id {}", scheduled.id);
+    assert_eq!(scheduled.sent, future_ts);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 2. Edit the scheduled message preserves scheduledTime and targets the raw message id.
+    let raw_id = scheduled.id.trim_start_matches("scheduled:").to_owned();
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            text: "Updated reminder".to_owned(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let edited_call = world.fake.calls("PUT", &format!("{CHAT_ANA}/messages/{raw_id}")).pop().unwrap();
+    assert!(edited_call.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 3. Cancel (delete) the scheduled message sends DELETE for the raw id and removes it.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", &format!("{CHAT_ANA}/messages/{raw_id}")).is_empty());
+    assert!(world.message(&chat, &scheduled.id).is_none());
+
+    // 4. Scheduling in a channel is refused cleanly without posting to Teams.
+    let general = key(GENERAL);
+    let posts_before = world.fake.calls("POST", &format!("{GENERAL}/messages")).len();
+    match world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "1760000970000002".to_owned(),
+        text: "Channel schedule attempt".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let failed = world.until("channel scheduled send fails", || {
+        world.messages(&general).into_iter().find(|m| {
+            m.client_id.as_deref() == Some("1760000970000002") && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    assert!(matches!(failed.state, SendState::Failed { ref reason } if reason.contains("channels")));
+    assert_eq!(world.fake.calls("POST", &format!("{GENERAL}/messages")).len(), posts_before);
+}
