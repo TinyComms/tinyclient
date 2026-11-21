@@ -102,6 +102,7 @@ struct Saved {
 pub enum Event {
     Ready,
     Chats(Vec<Chat>),
+    Settings(Vec<bugle::SimCard>),
     Message(bugle::Note),
     Typing {
         conversation: String,
@@ -132,6 +133,7 @@ trait Drive: Send + Sync {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
     fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String>;
@@ -141,6 +143,7 @@ trait Drive: Send + Sync {
         caption: &str,
         parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
     /// Asks the phone to send again a copy it already has.
@@ -203,9 +206,10 @@ impl Drive for LiveDrive {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        self.inner.send(conversation, text, reply, noted)
+        self.inner.send(conversation, text, reply, sim, noted)
     }
     fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String> {
         self.inner.upload_bytes(packed, mime)
@@ -216,9 +220,10 @@ impl Drive for LiveDrive {
         caption: &str,
         parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        self.inner.send_media(conversation, caption, parts, reply, noted)
+        self.inner.send_media(conversation, caption, parts, reply, sim, noted)
     }
     fn resend(&self, message: &str) -> Result<(), String> {
         self.inner.resend(message)
@@ -514,6 +519,7 @@ struct ScheduledSend {
     client_id: String,
     text: String,
     reply: Option<String>,
+    sim: Option<String>,
     at: i64,
 }
 
@@ -544,6 +550,8 @@ struct WaitingSend {
     since: i64,
     /// The message this one answers, when the chat is RCS. Empty otherwise.
     reply: Option<String>,
+    /// Explicit SIM id chosen by the user for this send, if any.
+    sim: Option<String>,
 }
 
 /// How far one conversation has been read this session. `started` means the phone said there
@@ -611,6 +619,8 @@ struct Account {
     contacts_loaded: std::sync::atomic::AtomicBool,
     /// Locally scheduled texts waiting for their send time while chatd runs.
     scheduled: Mutex<Vec<ScheduledSend>>,
+    /// SIM cards reported by the phone's settings update for this session.
+    sims: Mutex<Vec<bugle::SimCard>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -700,6 +710,7 @@ fn connect(
         contacts: Mutex::default(),
         contacts_loaded: std::sync::atomic::AtomicBool::new(false),
         scheduled: Mutex::default(),
+        sims: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: bugle::FILE_CAP,
@@ -943,8 +954,65 @@ fn seal(account: &Account, conversation: &str, on: bool) {
     let _ = account.ctx.conversation(&row(&chat));
 }
 
+fn apply_settings(account: &Account, sims: Vec<bugle::SimCard>) {
+    if sims.is_empty() {
+        return;
+    }
+    if let Some(primary) = sims.first() {
+        let mut parts = Vec::new();
+        if !primary.carrier.trim().is_empty() {
+            parts.push(primary.carrier.trim().to_owned());
+        }
+        if !primary.number.trim().is_empty() {
+            parts.push(mask_phone(primary.number.trim()));
+        }
+        let label = if parts.is_empty() {
+            if account.name.is_empty() {
+                "Messages".to_owned()
+            } else {
+                account.name.clone()
+            }
+        } else {
+            parts.join(" · ")
+        };
+        let _ = account.ctx.describe(&label, &account.me);
+    }
+    let options: Vec<protocol::SendAs> = if sims.len() > 1 {
+        sims.iter()
+            .map(|sim| {
+                let mut detail = if sim.rcs { "RCS" } else { "SMS" }.to_owned();
+                if !sim.number.trim().is_empty() {
+                    detail.push_str(" · ");
+                    detail.push_str(&mask_phone(sim.number.trim()));
+                }
+                protocol::SendAs {
+                    id: sim.id.clone(),
+                    label: sim.label(),
+                    color: sim.color,
+                    detail,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    *account.sims.lock().unwrap_or_else(|p| p.into_inner()) = sims;
+    account.ctx.send_as(options);
+}
+
+fn sim_label(account: &Account, sim_id: &str) -> String {
+    let sims = account.sims.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(sim) = sims.iter().find(|s| s.id == sim_id) {
+        return sim.label();
+    }
+    sim_id.to_owned()
+}
+
 fn apply(account: &Account, event: Event) {
     match event {
+        Event::Settings(sims) => {
+            apply_settings(account, sims);
+        }
         Event::Chats(chats) => {
             let chats = remember(account, &chats);
             let mut people = Vec::new();
@@ -1329,6 +1397,9 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
     message.edited = note.edited;
     message.edited_at = note.edited_at;
     message.starred = note.starred;
+    if let Some(sim_id) = note.sim.as_deref() {
+        message.sent_via = Some(sim_label(account, sim_id));
+    }
     if !note.reply.is_empty() {
         message.reply_to = Some(quoted(account, &note.conversation, &note.reply, page));
     }
@@ -2070,8 +2141,8 @@ fn serve(account: &Arc<Account>, command: Command) {
             reply_to,
         } => {
             // If this client_id was scheduled locally, treat a direct Send as "send now".
-            let _ = take_scheduled(account, &conversation_id, &client_id);
-            post_text(account, &conversation_id, &client_id, text, reply_to);
+            let sim = take_scheduled(account, &conversation_id, &client_id).and_then(|s| s.sim);
+            post_text(account, &conversation_id, &client_id, text, reply_to, sim);
         }
         Command::SendWith {
             conversation_id,
@@ -2080,6 +2151,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             reply_to,
             with,
         } => {
+            let sim = with.send_as.clone();
             if let Some(at) = with.schedule {
                 if !with.files.is_empty() {
                     ctx.sent(
@@ -2088,10 +2160,10 @@ fn serve(account: &Arc<Account>, command: Command) {
                         Err("Messages schedules text only, not files.".into()),
                     );
                 } else {
-                    schedule_text(account, &conversation_id, &client_id, text, reply_to, at);
+                    schedule_text(account, &conversation_id, &client_id, text, reply_to, sim, at);
                 }
             } else if with.files.is_empty() {
-                post_text(account, &conversation_id, &client_id, text, reply_to);
+                post_text(account, &conversation_id, &client_id, text, reply_to, sim);
             } else {
                 warn_mms(account, &conversation_id, &client_id, &with.files);
                 let reply = carried_reply(account, &conversation_id, reply_to);
@@ -2114,6 +2186,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                             &caption,
                             reply.as_deref(),
                             voice.as_ref(),
+                            sim.as_deref(),
                         )
                     },
                 );
@@ -2491,6 +2564,7 @@ fn deliver_files(
     caption: &str,
     reply: Option<&str>,
     voice: Option<&protocol::VoiceNote>,
+    sim: Option<&str>,
 ) -> Result<Message, String> {
     let carrier = carrier_of(account, conversation);
     let staged: Vec<(String, u64, std::path::PathBuf)> = upload
@@ -2593,7 +2667,7 @@ fn deliver_files(
         .collect();
     let sent = account
         .drive
-        .send_media(conversation, caption, &parts, reply, &mut |id| {
+        .send_media(conversation, caption, &parts, reply, sim, &mut |id| {
             keep_copy(account, client_id, id);
         });
     if sent.is_err() {
@@ -2606,6 +2680,9 @@ fn deliver_files(
     }
     let id = sent?;
     let mut message = outgoing(account, client_id.to_owned(), caption.to_owned());
+    if let Some(sim_id) = sim.filter(|s| !s.is_empty()) {
+        message.sent_via = Some(sim_label(account, sim_id));
+    }
     if let Some(reply_id) = reply {
         message.reply_to = Some(quoted(account, conversation, reply_id, &[]));
     }
@@ -2993,13 +3070,21 @@ fn hold(account: &Account, item: WaitingSend) {
     account.ctx.sent(&conversation, &client_id, Err(WAITING.to_owned()));
 }
 
-fn post_text(account: &Account, conversation: &str, client_id: &str, text: String, reply: Option<String>) {
+fn post_text(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: String,
+    reply: Option<String>,
+    sim: Option<String>,
+) {
     let item = WaitingSend {
         conversation: conversation.to_owned(),
         client_id: client_id.to_owned(),
         text,
         since: crate::hub::now(),
         reply: carried_reply(account, conversation, reply),
+        sim,
     };
     post(account, item);
 }
@@ -3035,7 +3120,7 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
         account.drive.resend(&copy)?;
         return Ok(finish(account, &item.client_id, carried(account, item)));
     }
-    let sent = account.drive.send(&item.conversation, &item.text, reply, &mut |id| {
+    let sent = account.drive.send(&item.conversation, &item.text, reply, item.sim.as_deref(), &mut |id| {
         keep_copy(account, &item.client_id, id);
     });
     if sent.is_err() {
@@ -3048,7 +3133,10 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
 /// The shell's id stays the stored row. The phone's id is only for a later retry.
 fn carried(account: &Account, item: &WaitingSend) -> Message {
     let id = item.client_id.clone();
-    let message = outgoing(account, id, item.text.clone());
+    let mut message = outgoing(account, id, item.text.clone());
+    if let Some(sim_id) = item.sim.as_deref().filter(|s| !s.is_empty()) {
+        message.sent_via = Some(sim_label(account, sim_id));
+    }
     with_reply(account, message, item)
 }
 
@@ -3248,6 +3336,7 @@ fn schedule_text(
     client_id: &str,
     text: String,
     reply: Option<String>,
+    sim: Option<String>,
     at: i64,
 ) {
     let now = clock_now();
@@ -3263,6 +3352,9 @@ fn schedule_text(
     pending.state = SendState::Pending;
     pending.waiting = true;
     pending.client_id = Some(client_id.to_owned());
+    if let Some(sim_id) = sim.as_deref().filter(|s| !s.is_empty()) {
+        pending.sent_via = Some(sim_label(account, sim_id));
+    }
     if let Some(id) = reply.as_deref() {
         pending.reply_to = Some(quoted(account, conversation, id, &[]));
     }
@@ -3277,6 +3369,7 @@ fn schedule_text(
         client_id: client_id.to_owned(),
         text,
         reply,
+        sim,
         at,
     });
 }
@@ -3328,6 +3421,7 @@ fn drain_scheduled(account: &Account) {
                 text: item.text,
                 since: now,
                 reply: item.reply,
+                sim: item.sim,
             },
         );
     }

@@ -725,7 +725,14 @@ fn oldest_cursor(chats: &[Chat]) -> Option<Cursor> {
     Some(Cursor { id: oldest.id.clone(), millis: oldest.updated.saturating_mul(1000) })
 }
 
-fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str, reply: Option<&str>) -> Vec<u8> {
+fn send_request(
+    conversation: &str,
+    text: &str,
+    tmp: &str,
+    mine: &str,
+    reply: Option<&str>,
+    sim: Option<&str>,
+) -> Vec<u8> {
     let mut content = Buf::new();
     content.text(1, text);
     let mut info = Buf::new();
@@ -742,6 +749,11 @@ fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str, reply: Op
     let mut req = Buf::new();
     req.text(2, conversation);
     req.msg(3, &payload.0);
+    if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+        let mut sim_payload = Buf::new();
+        sim_payload.text(1, sim_id);
+        req.msg(4, &sim_payload.0);
+    }
     req.text(5, tmp);
     // `SendMessageRequest.reply`, field 8: `ReplyPayload.messageID`. Absent on a plain send.
     if let Some(id) = reply.filter(|id| !id.is_empty()) {
@@ -1045,6 +1057,7 @@ fn send_media_request(
     mine: &str,
     parts: &[MediaPart<'_>],
     reply: Option<&str>,
+    sim: Option<&str>,
 ) -> Vec<u8> {
     let mut payload = Buf::new();
     payload.text(1, tmp);
@@ -1081,6 +1094,11 @@ fn send_media_request(
     let mut req = Buf::new();
     req.text(2, conversation);
     req.msg(3, &payload.0);
+    if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+        let mut sim_payload = Buf::new();
+        sim_payload.text(1, sim_id);
+        req.msg(4, &sim_payload.0);
+    }
     req.text(5, tmp);
     if let Some(id) = reply.filter(|id| !id.is_empty()) {
         let mut quoted = Buf::new();
@@ -1157,6 +1175,33 @@ fn unix_seconds(raw: i64) -> i64 {
         raw / 1_000
     } else {
         raw
+    }
+}
+
+/// One SIM card reported by the phone in `SettingsUpdate` (field 5 of `UpdateEvents`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SimCard {
+    /// Subscription / participant id carried in `SIMPayload`.
+    pub id: String,
+    /// 1-based slot number (e.g. 1, 2).
+    pub slot: u32,
+    /// Carrier display name (e.g. "T-Mobile", "Work").
+    pub carrier: String,
+    /// Phone number for this SIM, when reported by the phone.
+    pub number: String,
+    /// SIM colour (`0xRRGGBB`), when reported by the phone.
+    pub color: Option<u32>,
+    /// Whether RCS is enabled on this SIM.
+    pub rcs: bool,
+}
+
+impl SimCard {
+    pub fn label(&self) -> String {
+        if !self.carrier.trim().is_empty() {
+            self.carrier.trim().to_owned()
+        } else {
+            format!("SIM {}", self.slot.max(1))
+        }
     }
 }
 
@@ -1338,6 +1383,8 @@ pub struct Note {
     pub starred: bool,
     /// True when the phone reports this message as scheduled (`status == 16`).
     pub scheduled: bool,
+    /// SIM subscription / participant id reported on this message, when present.
+    pub sim: Option<String>,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -2027,12 +2074,13 @@ impl Session {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         let mine = self.mine_of(conversation);
         let tmp = uuid();
         noted(&tmp);
-        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine, reply), 2)?;
+        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine, reply, sim), 2)?;
         refused(&bytes)?;
         Ok(tmp)
     }
@@ -2056,6 +2104,7 @@ impl Session {
         caption: &str,
         parts: &[MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         let mine = self.mine_of(conversation);
@@ -2063,7 +2112,7 @@ impl Session {
         noted(&tmp);
         let bytes = self.rpc(
             3,
-            &send_media_request(conversation, caption, &tmp, &mine, parts, reply),
+            &send_media_request(conversation, caption, &tmp, &mine, parts, reply, sim),
             2,
         )?;
         refused(&bytes)?;
@@ -2673,6 +2722,129 @@ fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters:
             _ => {}
         }
     }
+    if let Some(settings) = field(&list, 5) {
+        let sims = decode_settings(&settings.bytes);
+        if !sims.is_empty() {
+            let _ = events.send(crate::adapters::messages::Event::Settings(sims));
+        }
+    }
+}
+
+/// Decodes `SettingsUpdate` (field 5 of `UpdateEvents`) into the phone's SIM card list.
+/// Supports both Bugle's nested `SIMCard { 1: { 1: id, 2: slot }, 2: color, 3: { 1: carrier, 2: number, 5: rcs }, 4: rcs }`
+/// and flat `SIMCard { 1: id, 2: slot, 3: carrier, 4: number, 5: color, 6: rcs }` layouts.
+fn decode_settings(bytes: &[u8]) -> Vec<SimCard> {
+    let list = fields(bytes);
+    let mut sims = Vec::new();
+    for item in list.iter().filter(|f| f.number == 2 || f.number == 3) {
+        if item.bytes.is_empty() {
+            continue;
+        }
+        let card = fields(&item.bytes);
+        let (id, mut slot) = if let Some(f1) = field(&card, 1) {
+            if f1.varint.is_some() {
+                (f1.varint.unwrap().to_string(), 0)
+            } else {
+                let inner = fields(&f1.bytes);
+                let nested_id = field_text(&inner, 1);
+                let nested_slot = field_int(&inner, 2) as u32;
+                if !nested_id.is_empty() {
+                    (nested_id, nested_slot)
+                } else {
+                    (String::from_utf8_lossy(&f1.bytes).into_owned(), 0)
+                }
+            }
+        } else {
+            (String::new(), 0)
+        };
+        let mut carrier = String::new();
+        let mut number = String::new();
+        let mut color = None;
+        let mut rcs = false;
+
+        if let Some(f2) = field(&card, 2) {
+            if let Some(v) = f2.varint {
+                if v <= 8 && slot == 0 {
+                    slot = v as u32;
+                } else if v > 8 {
+                    color = Some((v as u32) & 0x00FF_FFFF);
+                }
+            } else if !f2.bytes.is_empty() {
+                color = parse_hex_color(&String::from_utf8_lossy(&f2.bytes));
+            }
+        }
+        if let Some(f3) = field(&card, 3).filter(|f| !f.bytes.is_empty()) {
+            let sub = fields(&f3.bytes);
+            let sub_carrier = field_text(&sub, 1);
+            let sub_number = field_text(&sub, 2);
+            if !sub_carrier.is_empty() || !sub_number.is_empty() {
+                carrier = sub_carrier;
+                number = sub_number;
+                if slot == 0 {
+                    slot = field_int(&sub, 3) as u32;
+                }
+                if color.is_none() {
+                    let c = field_int(&sub, 4);
+                    if c != 0 {
+                        color = Some((c as u32) & 0x00FF_FFFF);
+                    }
+                }
+                if field_int(&sub, 5) != 0 {
+                    rcs = true;
+                }
+            } else {
+                carrier = String::from_utf8_lossy(&f3.bytes).into_owned();
+            }
+        }
+        if number.is_empty() {
+            if let Some(f4) = field(&card, 4) {
+                if let Some(v) = f4.varint {
+                    rcs |= v != 0;
+                } else if !f4.bytes.is_empty() {
+                    let text = String::from_utf8_lossy(&f4.bytes).into_owned();
+                    if text.chars().any(|c| c.is_ascii_digit()) {
+                        number = text;
+                    } else {
+                        let sub = fields(&f4.bytes);
+                        rcs |= field_int(&sub, 1) != 0;
+                    }
+                }
+            }
+        } else if let Some(f4) = field(&card, 4) {
+            if let Some(v) = f4.varint {
+                rcs |= v != 0;
+            }
+        }
+        if color.is_none() {
+            if let Some(f5) = field(&card, 5) {
+                if let Some(v) = f5.varint {
+                    if v != 0 {
+                        color = Some((v as u32) & 0x00FF_FFFF);
+                    }
+                } else if !f5.bytes.is_empty() {
+                    color = parse_hex_color(&String::from_utf8_lossy(&f5.bytes));
+                }
+            }
+        }
+        if field_int(&card, 6) != 0 {
+            rcs = true;
+        }
+        if !id.is_empty() || !carrier.is_empty() || !number.is_empty() {
+            if slot == 0 {
+                slot = (sims.len() + 1) as u32;
+            }
+            let id = if id.is_empty() { format!("sim-{slot}") } else { id };
+            sims.push(SimCard {
+                id,
+                slot,
+                carrier,
+                number,
+                color,
+                rcs,
+            });
+        }
+    }
+    sims
 }
 
 /// The lab sets `TINYCLIENT_PROVE=messages-unread`. A build from before this ignores that
@@ -3160,6 +3332,18 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             .unwrap_or_default();
         let (edited, edited_at) = decode_edit_status(&msg);
         let starred = field_int(&msg, 24) != 0;
+        let sim = field(&msg, 29)
+            .or_else(|| field(&msg, 17))
+            .and_then(|f| {
+                if let Some(v) = f.varint {
+                    (v != 0).then(|| v.to_string())
+                } else if !f.bytes.is_empty() {
+                    let s = String::from_utf8_lossy(&f.bytes).into_owned();
+                    (!s.is_empty()).then_some(s)
+                } else {
+                    None
+                }
+            });
         if text.is_empty()
             && file
             && location.is_none()
@@ -3199,6 +3383,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             edited_at,
             starred,
             scheduled,
+            sim,
         });
     }
     notes
@@ -3317,12 +3502,12 @@ pub(super) fn prove_message_reply() -> Result<(), String> {
     if allows_reply(1) || allows_reply(0) || !allows_reply(2) {
         return Err("a reply was allowed outside an RCS chat".into());
     }
-    let asked = fields(&send_request("rcs-chat", "On my way", "tmp-1", "me", Some("m-orig")));
+    let asked = fields(&send_request("rcs-chat", "On my way", "tmp-1", "me", Some("m-orig"), None));
     let quoted = fields(&field_bytes(&asked, 8));
     if field_text(&quoted, 1) != "m-orig" {
         return Err("the send dropped the message it answers".into());
     }
-    let plain = fields(&send_request("sms-chat", "On my way", "tmp-2", "me", None));
+    let plain = fields(&send_request("sms-chat", "On my way", "tmp-2", "me", None, None));
     if field(&plain, 8).is_some() {
         return Err("a plain send carried a reply".into());
     }
@@ -3341,6 +3526,7 @@ pub(super) fn prove_message_reply() -> Result<(), String> {
             duration_secs: None,
         }],
         Some("m-orig"),
+        None,
     ));
     if field_text(&fields(&field_bytes(&media, 8)), 1) != "m-orig" {
         return Err("the file send dropped the message it answers".into());
@@ -3532,7 +3718,7 @@ pub(super) fn prove_several_files() -> Result<(), String> {
             duration_secs: None,
         },
     ];
-    let bytes = send_media_request("phone-grace", "picnic", "tmp", "phone-ada", &parts, None);
+    let bytes = send_media_request("phone-grace", "picnic", "tmp", "phone-ada", &parts, None, None);
     let payload = fields(&field_bytes(&fields(&bytes), 3));
     let mut media = 0;
     let mut caption = 0;
@@ -4105,7 +4291,7 @@ mod tests {
             voice: true,
             duration_secs: Some(12),
         };
-        let bytes = send_media_request("c-rcs", "", "tmp-v", "me", &[part], None);
+        let bytes = send_media_request("c-rcs", "", "tmp-v", "me", &[part], None, None);
         let payload = fields(&field_bytes(&fields(&bytes), 3));
         let info = payload.iter().find(|f| f.number == 10).expect("media info");
         let media = fields(&field_bytes(&fields(&info.bytes), 3));
@@ -4176,5 +4362,44 @@ mod tests {
         assert!(notes[0].scheduled);
         assert_eq!(notes[0].sent, 1_800_000_000);
         assert_eq!(progress(notes[0].status), Progress::Pending);
+    }
+
+    #[test]
+    fn settings_update_decodes_dual_sims_and_send_carries_sim_only_when_chosen() {
+        let mut sim1 = Buf::new();
+        sim1.text(1, "sim-personal");
+        sim1.int(2, 1);
+        sim1.text(3, "T-Mobile");
+        sim1.text(4, "+1 555 010 0001");
+        sim1.int(5, 0x4285F4);
+        sim1.int(6, 1);
+        let mut sim2 = Buf::new();
+        sim2.text(1, "sim-work");
+        sim2.int(2, 2);
+        sim2.text(3, "Work");
+        sim2.text(4, "+1 555 010 0099");
+        sim2.int(5, 0x34A853);
+        sim2.int(6, 0);
+        let mut settings = Buf::new();
+        settings.msg(2, &sim1.0);
+        settings.msg(2, &sim2.0);
+        let sims = decode_settings(&settings.0);
+        assert_eq!(sims.len(), 2);
+        assert_eq!(sims[0].id, "sim-personal");
+        assert_eq!(sims[0].slot, 1);
+        assert_eq!(sims[0].carrier, "T-Mobile");
+        assert_eq!(sims[0].number, "+1 555 010 0001");
+        assert_eq!(sims[0].color, Some(0x4285F4));
+        assert!(sims[0].rcs);
+        assert_eq!(sims[1].id, "sim-work");
+        assert_eq!(sims[1].slot, 2);
+        assert_eq!(sims[1].label(), "Work");
+        assert!(!sims[1].rcs);
+
+        let default_req = fields(&send_request("c1", "hi", "t1", "me", None, None));
+        assert!(field(&default_req, 4).is_none(), "default send must not override SIM");
+
+        let sim2_req = fields(&send_request("c1", "hi", "t2", "me", None, Some("sim-work")));
+        assert_eq!(field_text(&fields(&field_bytes(&sim2_req, 4)), 1), "sim-work");
     }
 }

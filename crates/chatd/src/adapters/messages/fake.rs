@@ -360,6 +360,7 @@ fn note(
         edited_at: None,
         starred: false,
         scheduled: false,
+        sim: None,
     }
 }
 
@@ -646,6 +647,45 @@ fn steer(line: &str) -> Vec<Event> {
             updated.edited = true;
             updated.edited_at = Some(crate::hub::now());
             vec![Event::Message(updated)]
+        }
+        "dual-sim" => {
+            vec![Event::Settings(vec![
+                crate::adapters::messages::bugle::SimCard {
+                    id: "sim-1".into(),
+                    slot: 1,
+                    carrier: "T-Mobile".into(),
+                    number: "+1 555 010 0001".into(),
+                    color: Some(0x4285F4),
+                    rcs: true,
+                },
+                crate::adapters::messages::bugle::SimCard {
+                    id: "sim-2".into(),
+                    slot: 2,
+                    carrier: "Work".into(),
+                    number: "+1 555 010 0099".into(),
+                    color: Some(0x34A853),
+                    rcs: false,
+                },
+            ])]
+        }
+        "incoming-sim" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let sim_id = words.next().unwrap_or("sim-2").to_owned();
+            let text = rest(3);
+            let mut msg = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-sim-{sim_id}"),
+                &text,
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            msg.sim = Some(sim_id);
+            vec![Event::Message(msg)]
         }
         "phone-scheduled" => {
             let Some((author, _)) = who(words.next().unwrap_or("")) else {
@@ -1092,6 +1132,7 @@ impl Drive for Fake {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         self.unanswered()?;
@@ -1103,6 +1144,9 @@ impl Drive for Fake {
         record(&format!("send {conversation} {text}"));
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
+        }
+        if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+            record(&format!("sim {conversation} {sim_id}"));
         }
         Ok(relay_id)
     }
@@ -1122,6 +1166,7 @@ impl Drive for Fake {
         caption: &str,
         parts: &[MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         self.unanswered()?;
@@ -1146,6 +1191,9 @@ impl Drive for Fake {
         }
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
+        }
+        if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+            record(&format!("sim {conversation} {sim_id}"));
         }
         Ok(relay_id)
     }

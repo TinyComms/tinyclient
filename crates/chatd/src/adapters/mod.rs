@@ -1312,6 +1312,11 @@ impl Context {
         self.hub.set_capabilities(&self.account, can);
     }
 
+    /// Selectable sending identities or lines on this account (e.g. dual-SIM cards).
+    pub fn send_as(&self, options: Vec<protocol::SendAs>) {
+        self.hub.set_send_as(&self.account, options);
+    }
+
     /// How far a `SendWith`'s files have gone, in bytes of all of them. Call as often as is
     /// convenient: the shell is told at most four times a second.
     pub fn upload(&self, conversation_id: &str, client_id: &str, sent: u64, total: u64) {

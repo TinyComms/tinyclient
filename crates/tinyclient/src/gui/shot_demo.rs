@@ -152,6 +152,7 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
             reactions: true,
             ..Capabilities::default()
         },
+        send_as: Vec::new(),
     }
 }
 

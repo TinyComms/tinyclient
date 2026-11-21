@@ -922,6 +922,21 @@ impl Pane {
                                 .child(format!("✨ {effect}")),
                         )
                 }))
+                .children(message.sent_via.as_deref().map(|via| {
+                    div()
+                        .pt(px(2.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child(via.to_owned()),
+                        )
+                }))
                 .children(message.card.as_deref().map(|card| self.app_card(message, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(self.cards(message, window, cx));

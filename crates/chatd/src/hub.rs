@@ -116,6 +116,8 @@ pub struct Linked {
     pub required: String,
     /// What it may send, as the adapter last said.
     pub can: Capabilities,
+    /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
+    pub send_as: Vec<protocol::SendAs>,
 }
 
 /// The session reads at start, and whatever is waiting on the keychain.
@@ -441,6 +443,7 @@ impl Hub {
                         reconnecting,
                         required: String::new(),
                         can: Capabilities::default(),
+                        send_as: Vec::new(),
                     });
                     link == Link::Connected
                 }
@@ -489,6 +492,21 @@ impl Hub {
 
     pub fn capabilities(&self, account: &AccountKey) -> Capabilities {
         lock(&self.links).iter().find(|linked| linked.account == *account).map_or_else(Capabilities::default, |linked| linked.can)
+    }
+
+    /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
+    pub fn set_send_as(&self, account: &AccountKey, send_as: Vec<protocol::SendAs>) {
+        {
+            let mut links = lock(&self.links);
+            let Some(linked) = links.iter_mut().find(|linked| linked.account == *account) else {
+                return;
+            };
+            if linked.send_as == send_as {
+                return;
+            }
+            linked.send_as = send_as;
+        }
+        self.changed(Change::Status);
     }
 
     // Notifications.

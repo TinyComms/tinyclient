@@ -2408,6 +2408,7 @@ pub(crate) mod tests {
             presence: Presence::Unknown,
             status: String::new(),
             can: Default::default(),
+            send_as: Vec::new(),
         }
     }
 

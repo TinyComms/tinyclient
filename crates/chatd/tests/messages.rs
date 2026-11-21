@@ -2484,3 +2484,78 @@ fn scheduled_send_waits_until_clock_reaches_time_supports_cancel_and_reports_mis
     assert_eq!(from_phone.state, SendState::Pending);
     assert!(from_phone.waiting);
 }
+
+#[test]
+fn dual_sim_settings_publish_chooser_and_send_with_sim_2_carries_sim() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Before settings update, no send_as chooser is offered.
+    let before = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages status");
+    assert!(before.send_as.is_empty());
+
+    // 2. Settings update with two SIMs publishes the chooser and updates the account label
+    //    with the primary SIM's carrier and masked number.
+    world.steer("dual-sim");
+    let after = world.until("dual-sim send_as published", || {
+        world
+            .status()
+            .0
+            .into_iter()
+            .find(|a| a.key == account() && a.send_as.len() == 2)
+    });
+    assert!(after.name.contains("T-Mobile"), "account label should include carrier: {:?}", after.name);
+    assert!(after.name.contains("01"), "account label should include last 2 digits: {:?}", after.name);
+    assert!(!after.name.contains("555"), "account label must mask phone number: {:?}", after.name);
+    assert_eq!(after.send_as[0].id, "sim-1");
+    assert_eq!(after.send_as[0].label, "T-Mobile");
+    assert!(after.send_as[0].detail.contains("RCS"));
+    assert_eq!(after.send_as[1].id, "sim-2");
+    assert_eq!(after.send_as[1].label, "Work");
+    assert!(after.send_as[1].detail.contains("SMS"));
+
+    // 3. Plain send with no explicit SIM choice must NOT override SIM.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sim-default".into(),
+        text: "Default line".into(),
+        reply_to: None,
+        with: Outgoing::default(),
+    });
+    world.heard(&format!("send {GRACE} Default line"));
+    assert!(
+        !world.calls().iter().any(|c| c.starts_with(&format!("sim {GRACE} "))),
+        "default send must not pass a SIM override"
+    );
+
+    // 4. Send with SIM 2 explicitly picked carries sim-2 in the request and marks sent_via.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sim-2".into(),
+        text: "From work SIM".into(),
+        reply_to: None,
+        with: Outgoing {
+            send_as: Some("sim-2".into()),
+            ..Outgoing::default()
+        },
+    });
+    world.heard(&format!("send {GRACE} From work SIM"));
+    world.heard(&format!("sim {GRACE} sim-2"));
+    let sent = world.until("sim-2 message stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sim-2" && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.sent_via.as_deref(), Some("Work"));
+
+    // 5. Incoming message reporting SIM 2 resolves its label onto sent_via.
+    world.steer("incoming-sim grace sim-2 Work reply");
+    let incoming = world.arrived(GRACE, "Work reply");
+    assert_eq!(incoming.sent_via.as_deref(), Some("Work"));
+}
