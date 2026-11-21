@@ -453,6 +453,9 @@ pub struct ConversationRights {
     /// May change this conversation's picture (`Request::ConversationPicture`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit_picture: bool,
+    /// May create, edit, close, pin, or delete topics in a forum (`Request::TopicCreate`, `Request::TopicUpdate`, `Request::TopicDelete`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_topics: bool,
 }
 
 impl ConversationRights {
@@ -464,6 +467,7 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
+    const MANAGE_TOPICS: i64 = 1 << 8;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -499,6 +503,9 @@ impl ConversationRights {
         if self.edit_picture {
             bits |= Self::EDIT_PICTURE;
         }
+        if self.manage_topics {
+            bits |= Self::MANAGE_TOPICS;
+        }
         bits
     }
 
@@ -512,6 +519,7 @@ impl ConversationRights {
             rename: (bits & Self::RENAME) != 0,
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+            manage_topics: (bits & Self::MANAGE_TOPICS) != 0,
         }
     }
 }

@@ -958,17 +958,42 @@ impl Chat {
     /// open lands on. The landing's topics are asked of the network once first, and the
     /// answer waits for them, so it is named on what Telegram says now and not on what an
     /// earlier open left in the cache.
-    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool) -> Response {
+    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool, query: Option<String>) -> Response {
         if !self.shows(&forum.account()) {
             // Same refusal as Tree. An empty Conversations page looks like a real empty forum.
             return hidden_list();
         }
+        let limit = limit.min(PAGE_LIMIT);
+        let query = query.map(|q| q.trim().to_owned()).filter(|q| !q.is_empty());
+        let mut remote_total: Option<u32> = None;
         if landing && offset == 0 {
             let _ = self.ask(&forum.account(), |reply| Command::OpenForum { conversation_id: forum.id.clone(), reply });
+        } else if !landing {
+            if let Ok(total) = self.ask(&forum.account(), |reply| Command::LoadTopics {
+                conversation_id: forum.id.clone(),
+                query: query.clone(),
+                offset,
+                limit,
+                reply,
+            }) {
+                remote_total = Some(total);
+            }
         }
-        let read = if landing { self.hub.store().landing(&forum) } else { self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) };
+        let read = if landing {
+            self.hub.store().landing(&forum)
+        } else if let Some(ref q) = query {
+            self.hub.store().topics_matching(&forum, q, offset, limit)
+        } else {
+            self.hub.store().topics(&forum, offset, limit)
+        };
         match read {
-            Ok((conversations, total)) => Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() },
+            Ok((conversations, total)) => {
+                let total = match (query.is_none(), remote_total) {
+                    (true, Some(remote)) => total.max(remote),
+                    _ => total,
+                };
+                Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
+            }
             Err(err) => internal(err),
         }
     }
@@ -2742,7 +2767,52 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
+            Request::Topics { forum, offset, limit, landing, query } => self.topics(forum, offset, limit, landing, query),
+            Request::TopicCreate { forum, title, icon_color, icon_emoji_id } => {
+                if let Err(refused) = self.online(&forum.account()) {
+                    return *refused;
+                }
+                match self.ask(&forum.account(), |reply| Command::TopicCreate {
+                    conversation_id: forum.id.clone(),
+                    title,
+                    icon_color,
+                    icon_emoji_id,
+                    reply,
+                }) {
+                    Ok(topic_id) => {
+                        let key = Key::new(&forum.account(), topic_id);
+                        match self.hub.store().conversation(&key) {
+                            Ok(Some(row)) => Response::Conversation { conversation: Box::new(self.row(row)) },
+                            Ok(None) => error(ErrorCode::NotFound, "topic not found after creation"),
+                            Err(err) => internal(err),
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::TopicUpdate { topic, title, icon_emoji_id, closed, hidden, pinned } => {
+                self.act(&topic, |conversation_id, reply| Command::TopicUpdate {
+                    conversation_id,
+                    title,
+                    icon_emoji_id,
+                    closed,
+                    hidden,
+                    pinned,
+                    reply,
+                })
+            }
+            Request::TopicDelete { topic } => {
+                self.act(&topic, |conversation_id, reply| Command::TopicDelete { conversation_id, reply })
+            }
+            Request::TopicIcons { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::TopicIcons { reply }) {
+                    Ok(page) => Response::Catalog { items: page.items, cursor: page.cursor },
+                    Err(refused) => *refused,
+                }
+            }
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),

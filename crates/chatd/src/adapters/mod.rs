@@ -574,6 +574,42 @@ pub enum Command {
         order: Vec<String>,
         reply: Reply<()>,
     },
+    /// Fetch additional or searched topics for a forum (Telegram `messages.getForumTopics`).
+    /// Answers with the network's total topic count for the query/forum.
+    LoadTopics {
+        conversation_id: String,
+        query: Option<String>,
+        offset: u32,
+        limit: u32,
+        reply: Reply<u32>,
+    },
+    /// Create a topic in a forum; answers with the new topic's conversation id.
+    TopicCreate {
+        conversation_id: String,
+        title: String,
+        icon_color: Option<i32>,
+        icon_emoji_id: Option<String>,
+        reply: Reply<String>,
+    },
+    /// Edit a forum topic (rename, icon, close/reopen, hide, pin/unpin).
+    TopicUpdate {
+        conversation_id: String,
+        title: Option<String>,
+        icon_emoji_id: Option<String>,
+        closed: Option<bool>,
+        hidden: Option<bool>,
+        pinned: Option<bool>,
+        reply: Reply<()>,
+    },
+    /// Delete a forum topic and its history.
+    TopicDelete {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Fetch default forum topic icons.
+    TopicIcons {
+        reply: Reply<CatalogPage>,
+    },
     /// Fetch network-suggested chat folders.
     SuggestedFolders {
         reply: Reply<Vec<protocol::SuggestedFolder>>,
@@ -879,6 +915,8 @@ impl Command {
             | Command::SetDefaultDisappearing { reply, .. }
             | Command::FolderDelete { reply, .. }
             | Command::FoldersReorder { reply, .. }
+            | Command::TopicUpdate { reply, .. }
+            | Command::TopicDelete { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
             | Command::CloseDirect { reply, .. }
@@ -893,6 +931,9 @@ impl Command {
             }
             Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

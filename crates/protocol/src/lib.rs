@@ -1432,6 +1432,40 @@ pub enum Request {
         limit: u32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         landing: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Creates a new topic in a forum (Telegram `messages.createForumTopic`). Answers with
+    /// [`Response::Conversation`] for the newly created topic row.
+    TopicCreate {
+        forum: Key,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_color: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_emoji_id: Option<String>,
+    },
+    /// Edits a forum topic: rename, icon, close/reopen, hide/unhide General, or pin/unpin.
+    TopicUpdate {
+        topic: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_emoji_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hidden: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+    },
+    /// Deletes a forum topic and its history (Telegram `messages.deleteTopicHistory`).
+    TopicDelete {
+        topic: Key,
+    },
+    /// Lists the default forum topic icons offered by the network (`inputStickerSetEmojiDefaultTopicIcons`).
+    TopicIcons {
+        account: AccountKey,
     },
     /// Voice channels and calls with a friend in them now, across Spaces: the Discord home's
     /// "In voice". From what chatd holds live; at most 50.
@@ -3655,6 +3689,7 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            manage_topics: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }

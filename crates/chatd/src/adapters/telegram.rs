@@ -277,6 +277,8 @@ struct Live {
     /// Photo albums still arriving or open, so a later item, edit, reaction or deletion
     /// finds the row they share.
     albums: VecDeque<live::HeldAlbum>,
+    /// Forum topic paging cursors per forum: `(offset_date, offset_id, offset_topic, loaded, total, done)`.
+    topic_pages: HashMap<Who, (i32, i32, i32, u32, u32, bool)>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -717,6 +719,10 @@ fn offline(ctx: &Context, command: Command) {
         Command::FolderSave { reply, .. } => drop(reply.send(Err(down()))),
         Command::FolderDelete { reply, .. } | Command::FoldersReorder { reply, .. } => drop(reply.send(Err(down()))),
         Command::SuggestedFolders { reply } => drop(reply.send(Err(down()))),
+        Command::LoadTopics { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicCreate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicUpdate { reply, .. } | Command::TopicDelete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicIcons { reply } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
@@ -758,6 +764,26 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::OpenForum { conversation_id, reply } => {
             sync::backfill(account, &conversation_id);
             let _ = reply.send(Ok(()));
+        }
+        Command::LoadTopics { conversation_id, query, offset, limit, reply } => {
+            let _ = reply.send(sync::load_topics(account, &conversation_id, query.as_deref(), offset, limit).map_err(refused));
+        }
+        Command::TopicCreate { conversation_id, title, icon_color, icon_emoji_id, reply } => {
+            let _ = reply.send(
+                sync::create_topic(account, &conversation_id, &title, icon_color, icon_emoji_id.as_deref()).map_err(refused),
+            );
+        }
+        Command::TopicUpdate { conversation_id, title, icon_emoji_id, closed, hidden, pinned, reply } => {
+            let _ = reply.send(
+                sync::update_topic(account, &conversation_id, title.as_deref(), icon_emoji_id.as_deref(), closed, hidden, pinned)
+                    .map_err(refused),
+            );
+        }
+        Command::TopicDelete { conversation_id, reply } => {
+            let _ = reply.send(sync::delete_topic(account, &conversation_id).map_err(refused));
+        }
+        Command::TopicIcons { reply } => {
+            let _ = reply.send(catalog::topic_icons(account).map_err(refused));
         }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),

@@ -236,6 +236,24 @@ fn emojis(account: &Account, at: usize) -> Result<CatalogPage, Fault> {
     Ok(CatalogPage { items, cursor })
 }
 
+/// Lists Telegram's default forum topic icon set (`inputStickerSetEmojiDefaultTopicIcons`).
+pub(super) fn topic_icons(account: &Account) -> Result<CatalogPage, Fault> {
+    let request = tl::functions::messages::GetStickerSet {
+        stickerset: tl::enums::InputStickerSet::EmojiDefaultTopicIcons,
+        hash: 0,
+    };
+    let items = match account.ask(&request)? {
+        tl::enums::messages::StickerSet::Set(set) => set
+            .documents
+            .iter()
+            .take(protocol::CATALOG_LIMIT)
+            .filter_map(|document| emoji_item(account, document, "Topic icons"))
+            .collect(),
+        tl::enums::messages::StickerSet::NotModified => Vec::new(),
+    };
+    Ok(CatalogPage { items, cursor: None })
+}
+
 fn saved_gifs(account: &Account) -> Result<CatalogPage, Fault> {
     let tl::enums::messages::SavedGifs::Gifs(found) = account.ask(&tl::functions::messages::GetSavedGifs { hash: 0 })? else {
         return Ok(CatalogPage::default());

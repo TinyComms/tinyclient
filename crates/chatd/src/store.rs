@@ -2060,6 +2060,26 @@ impl Store {
         Ok((rows, total))
     }
 
+    /// A forum's topics whose title matches `query` (case-insensitive substring).
+    pub fn topics_matching(&self, forum: &Key, query: &str, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+        let pattern = format!("%{}%", query.to_lowercase());
+        let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden AND lower(c.title) LIKE ?4";
+        let total = self.db.query_row(
+            &format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"),
+            params![word(&forum.network), forum.account, forum.id, pattern],
+            |row| row.get(0),
+        )?;
+        let rows = self
+            .db
+            .prepare(&format!(
+                "{CONVERSATION} WHERE {belongs}
+                 ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?5 OFFSET ?6"
+            ))?
+            .query_map(params![word(&forum.network), forum.account, forum.id, pattern, limit, offset], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((rows, total))
+    }
+
     /// The topic of a forum that opening it lands on, as a page of one. Telegram lands on the
     /// newest unread (a mention counts as unread here, as everywhere), else General, its own
     /// first topic (`polish/03` §2), once its topics were asked of the network. Discord's posts

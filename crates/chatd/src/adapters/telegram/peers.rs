@@ -284,6 +284,13 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 &channel.banned_rights,
                 Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
             );
+            let topics_banned = matches!(
+                &channel.default_banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.manage_topics
+            ) || matches!(
+                &channel.banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.manage_topics
+            );
             let active = !channel.left;
             let rights = protocol::ConversationRights {
                 pin: active
@@ -294,6 +301,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                     },
                 delete_others: active && (channel.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (channel.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
+                manage_topics: active && channel.forum && (channel.creator || admin.is_some_and(|r| r.manage_topics) || !topics_banned),
                 ..protocol::ConversationRights::default()
             };
             let known = Known {

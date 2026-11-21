@@ -332,8 +332,23 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
         return;
     };
     if let tl::enums::Message::Service(svc) = raw {
-        if let tl::enums::MessageAction::SetMessagesTtl(ttl) = &svc.action {
-            let _ = account.ctx.disappearing(&conversation, (ttl.period > 0).then_some(ttl.period as u32));
+        match &svc.action {
+            tl::enums::MessageAction::SetMessagesTtl(ttl) => {
+                let _ = account.ctx.disappearing(&conversation, (ttl.period > 0).then_some(ttl.period as u32));
+            }
+            tl::enums::MessageAction::TopicCreate(created) => {
+                let forum = Who::of(&svc.peer_id);
+                sync::note_topic_create(account, forum, svc.id, &created.title, created.icon_color, created.icon_emoji_id, i64::from(svc.date));
+            }
+            tl::enums::MessageAction::TopicEdit(edited) => {
+                let forum = Who::of(&svc.peer_id);
+                let topic_id = svc.reply_to.as_ref().and_then(|r| match r {
+                    tl::enums::MessageReplyHeader::Header(h) => h.reply_to_top_id.or(h.reply_to_msg_id),
+                    _ => None,
+                }).unwrap_or(1);
+                sync::note_topic_edit(account, forum, topic_id, edited.title.as_deref(), edited.icon_emoji_id, edited.closed, edited.hidden);
+            }
+            _ => {}
         }
     }
     let watching = account.ctx.watching();
@@ -574,6 +589,12 @@ pub(super) fn apply(account: &Account, update: &Update) {
             read(account, &conversation, seen.max_id, seen.still_unread_count);
         }
         Update::ReadChannelInbox(seen) => read(account, &Who::Channel(seen.channel_id).text(), seen.max_id, seen.still_unread_count),
+        Update::PinnedForumTopic(p) => sync::note_topic_pin(account, Who::of(&p.peer), p.topic_id, p.pinned),
+        Update::PinnedForumTopics(p) => {
+            if let Some(order) = &p.order {
+                sync::note_topic_pins(account, Who::of(&p.peer), order);
+            }
+        }
         Update::ChatParticipantDelete(changed) if changed.user_id == account.me => left(account, Who::Group(changed.chat_id)),
         Update::ChannelParticipant(changed) if changed.user_id == account.me => {
             use tl::enums::ChannelParticipant;

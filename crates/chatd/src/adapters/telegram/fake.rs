@@ -491,6 +491,21 @@ fn packed(member: &[u8]) -> Vec<u8> {
     held
 }
 
+#[derive(Clone)]
+struct FakeTopic {
+    id: i32,
+    title: String,
+    date: i32,
+    top_message: i32,
+    unread: i32,
+    icon_color: i32,
+    icon_emoji_id: Option<i64>,
+    closed: bool,
+    pinned: bool,
+    hidden: bool,
+    my: bool,
+}
+
 struct World {
     signed_in: bool,
     /// Messages by conversation, oldest first by id.
@@ -568,6 +583,8 @@ struct World {
     default_ttl: i32,
     /// Custom/mutated dialog filters once modified via `UpdateDialogFilter` / `UpdateDialogFiltersOrder`.
     custom_folders: Option<Vec<tl::enums::DialogFilter>>,
+    /// Mutable forum topics per forum channel (initialized on demand for `WORKSHOP`).
+    forum_topics: HashMap<Who, Vec<FakeTopic>>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -640,6 +657,7 @@ impl World {
             ttl_periods: HashMap::new(),
             default_ttl: 0,
             custom_folders: None,
+            forum_topics: HashMap::new(),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1001,51 +1019,102 @@ fn discussion_answer(place: &str, unread: i32, left: bool) -> Result<Vec<u8>, Fa
 /// whole. This runs on its own always-outlined body so the dispatcher above stays under a
 /// debug build's 256 KiB connection stack.
 #[inline(never)]
-fn topics_answer(world: &mut World, forum: Who) -> Result<Vec<u8>, Fault> {
-    // One topic, as Telegram's list carries it: the account has read the topic up to what
-    // its last ReadDiscussion said, and a read past its newest post is a read whole. The
-    // date is the topic's own; the caller reads the activity from the messages the answer
-    // carries.
-    let topic = |world: &World, id: i32, title: &str, top: i32, date: i32, unread: i32, icon: i64| {
-        let read = world.topic_reads.get(&(forum, id)).copied().unwrap_or(0);
-        let unread = if read >= top { 0 } else { unread };
-        let mut topic: tl::types::ForumTopic = blank(&[
-            &put(1u32),
-            &put(id),
-            &put(date),
-            &put(forum.peer()),
-            &put(title.to_owned()),
-            &put(3i32),
-            &put(icon),
-            &put(top),
-            &put(read),
-            &put(0i32),
-            &put(unread),
-            &put(0i32),
-            &put(0i32),
-            &put(0i32),
-            &put(Who::User(TOBIN).peer()),
-            &put(settings(None)),
-        ]);
-        topic.my = false;
-        tl::enums::ForumTopic::Topic(topic)
+fn topics_answer(world: &mut World, forum: Who, request: &tl::functions::messages::GetForumTopics) -> Result<Vec<u8>, Fault> {
+    let held = |messages: &BTreeMap<String, BTreeMap<i32, tl::enums::Message>>, id: i32| {
+        messages.get(&key(forum, Some(id))).and_then(|list| list.values().next_back().cloned())
     };
-    let held = |world: &World, id: i32| world.messages.get(&key(forum, Some(id))).and_then(|list| list.values().next_back().cloned());
-    let newest = held(world, TOOLS);
-    let top = match &newest {
+    let newest = held(&world.messages, TOOLS);
+    let top_tools = match &newest {
         Some(tl::enums::Message::Message(message)) => message.id,
         _ => 41,
     };
-    // The topics Telegram lists first, which here is their activity: Jigs newest.
-    let messages: Vec<tl::enums::Message> = held(world, JIGS).into_iter().chain(newest).collect();
+    let extra_topics: usize = std::env::var("TINYCLIENT_TELEGRAM_TOPICS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let list = world.forum_topics.entry(forum).or_insert_with(|| {
+        let mut base = vec![
+            FakeTopic { id: JIGS, title: "Jigs".to_owned(), date: t0() - 200, top_message: JIGS, unread: 2, icon_color: 3, icon_emoji_id: Some(5000), closed: false, pinned: false, hidden: false, my: false },
+            FakeTopic { id: TOOLS, title: "Tools".to_owned(), date: t0() - 40_000, top_message: top_tools, unread: 1, icon_color: 3, icon_emoji_id: Some(5001), closed: false, pinned: false, hidden: false, my: false },
+            FakeTopic { id: 1, title: "General".to_owned(), date: t0() - 90_000, top_message: 1, unread: 0, icon_color: 3, icon_emoji_id: Some(5002), closed: false, pinned: false, hidden: false, my: false },
+        ];
+        if extra_topics > base.len() {
+            let need = extra_topics - base.len();
+            for i in 0..need {
+                let id = 200 + i as i32;
+                base.push(FakeTopic {
+                    id,
+                    title: format!("Topic #{:03}", i + 4),
+                    date: t0() - 100_000 - (i as i32) * 60,
+                    top_message: id,
+                    unread: 0,
+                    icon_color: 3,
+                    icon_emoji_id: None,
+                    closed: false,
+                    pinned: false,
+                    hidden: false,
+                    my: false,
+                });
+            }
+        }
+        base
+    });
+    if let Some(t) = list.iter_mut().find(|t| t.id == TOOLS) {
+        t.top_message = top_tools;
+    }
+    let query = request.q.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
+    let mut ordered: Vec<FakeTopic> = list
+        .iter()
+        .filter(|t| query.as_ref().is_none_or(|q| t.title.to_lowercase().contains(q)))
+        .cloned()
+        .collect();
+    ordered.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.date.cmp(&a.date)).then_with(|| b.id.cmp(&a.id)));
+    let total = ordered.len() as i32;
+    let start = if request.offset_topic != 0 {
+        ordered
+            .iter()
+            .position(|t| t.id == request.offset_topic)
+            .map_or(ordered.len(), |at| at + 1)
+    } else {
+        0
+    };
+    let limit = if request.limit <= 0 { 50 } else { request.limit as usize };
+    let slice: Vec<FakeTopic> = ordered.into_iter().skip(start).take(limit).collect();
+    let topics: Vec<tl::enums::ForumTopic> = slice
+        .iter()
+        .map(|ft| {
+            let read = world.topic_reads.get(&(forum, ft.id)).copied().unwrap_or(0);
+            let unread = if read >= ft.top_message { 0 } else { ft.unread };
+            let mut topic: tl::types::ForumTopic = blank(&[
+                &put(0u32),
+                &put(ft.id),
+                &put(ft.date),
+                &put(forum.peer()),
+                &put(ft.title.clone()),
+                &put(ft.icon_color),
+                &put(ft.top_message),
+                &put(read),
+                &put(0i32),
+                &put(unread),
+                &put(0i32),
+                &put(0i32),
+                &put(0i32),
+                &put(Who::User(TOBIN).peer()),
+                &put(settings(None)),
+            ]);
+            topic.icon_emoji_id = ft.icon_emoji_id;
+            topic.closed = ft.closed;
+            topic.pinned = ft.pinned;
+            topic.hidden = ft.hidden;
+            topic.my = ft.my;
+            tl::enums::ForumTopic::Topic(topic)
+        })
+        .collect();
+    let messages: Vec<tl::enums::Message> = held(&world.messages, JIGS).into_iter().chain(newest).collect();
     let found = tl::types::messages::ForumTopics {
         order_by_create_date: false,
-        count: 3,
-        topics: vec![
-            topic(world, JIGS, "Jigs", JIGS, t0() - 200, 2, 5000),
-            topic(world, TOOLS, "Tools", top, t0() - 40_000, 1, 5001),
-            topic(world, 1, "General", 1, t0() - 90_000, 0, 5002),
-        ],
+        count: total,
+        topics,
         messages,
         chats: chats(),
         users: users(),
@@ -2529,8 +2598,123 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {
             let forum = input_who(&request.peer);
-            self.log(&format!("GetForumTopics {}", forum.text()));
-            return topics_answer(self, forum);
+            if request.q.is_none() && request.offset_topic == 0 {
+                self.log(&format!("GetForumTopics {}", forum.text()));
+            } else {
+                self.log(&format!(
+                    "GetForumTopics {} offset={} q={:?}",
+                    forum.text(),
+                    request.offset_topic,
+                    request.q
+                ));
+            }
+            return topics_answer(self, forum, &request);
+        }
+        if let Some(request) = asked::<f::messages::CreateForumTopic>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!("CreateForumTopic {} {}", forum.text(), request.title));
+            self.next += 1;
+            let id = self.next;
+            let now = crate::hub::now() as i32;
+            let ft = FakeTopic {
+                id,
+                title: request.title.clone(),
+                date: now,
+                top_message: id,
+                unread: 0,
+                icon_color: request.icon_color.unwrap_or(0x6FB9F0),
+                icon_emoji_id: request.icon_emoji_id,
+                closed: false,
+                pinned: false,
+                hidden: false,
+                my: true,
+            };
+            self.forum_topics.entry(forum).or_default().push(ft);
+            let service = tl::types::MessageService {
+                out: true,
+                mentioned: false,
+                media_unread: false,
+                reactions_are_possible: false,
+                silent: false,
+                post: false,
+                legacy: false,
+                id,
+                from_id: Some(Who::User(ME).peer()),
+                peer_id: forum.peer(),
+                saved_peer_id: None,
+                reply_to: None,
+                date: now,
+                action: tl::types::MessageActionTopicCreate {
+                    title_missing: false,
+                    title: request.title,
+                    icon_color: request.icon_color.unwrap_or(0x6FB9F0),
+                    icon_emoji_id: request.icon_emoji_id,
+                }
+                .into(),
+                reactions: None,
+                ttl_period: None,
+            };
+            let upd: tl::enums::Update =
+                tl::types::UpdateNewChannelMessage { message: service.into(), pts: 0, pts_count: 0 }.into();
+            return answer(updates(vec![
+                tl::types::UpdateMessageId { id, random_id: request.random_id }.into(),
+                upd,
+            ]));
+        }
+        if let Some(request) = asked::<f::messages::EditForumTopic>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!(
+                "EditForumTopic {} {} title={:?} closed={:?} hidden={:?}",
+                forum.text(),
+                request.topic_id,
+                request.title,
+                request.closed,
+                request.hidden
+            ));
+            if let Some(list) = self.forum_topics.get_mut(&forum) {
+                if let Some(ft) = list.iter_mut().find(|t| t.id == request.topic_id) {
+                    if let Some(ref title) = request.title {
+                        ft.title = title.clone();
+                    }
+                    if let Some(icon) = request.icon_emoji_id {
+                        ft.icon_emoji_id = (icon != 0).then_some(icon);
+                    }
+                    if let Some(closed) = request.closed {
+                        ft.closed = closed;
+                    }
+                    if let Some(hidden) = request.hidden {
+                        ft.hidden = hidden;
+                    }
+                }
+            }
+            return answer(updates(Vec::new()));
+        }
+        if let Some(request) = asked::<f::messages::UpdatePinnedForumTopic>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!("UpdatePinnedForumTopic {} {} {}", forum.text(), request.topic_id, request.pinned));
+            if let Some(list) = self.forum_topics.get_mut(&forum) {
+                if let Some(ft) = list.iter_mut().find(|t| t.id == request.topic_id) {
+                    ft.pinned = request.pinned;
+                }
+            }
+            let upd: tl::enums::Update = tl::types::UpdatePinnedForumTopic {
+                pinned: request.pinned,
+                peer: forum.peer(),
+                topic_id: request.topic_id,
+            }
+            .into();
+            return answer(updates(vec![upd]));
+        }
+        if let Some(request) = asked::<f::messages::DeleteTopicHistory>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!("DeleteTopicHistory {} {}", forum.text(), request.top_msg_id));
+            if let Some(list) = self.forum_topics.get_mut(&forum) {
+                list.retain(|t| t.id != request.top_msg_id);
+            }
+            self.messages.remove(&key(forum, Some(request.top_msg_id)));
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 1, pts_count: 1, offset: 0 },
+            ));
         }
         if let Some(request) = asked::<f::messages::GetSponsoredMessages>(body) {
             self.log(&format!("GetSponsoredMessages {}", input_who(&request.peer).text()));
@@ -3365,6 +3549,28 @@ impl World {
             return Some(answer(tl::enums::messages::Reactions::Reactions(found)));
         }
         if let Some(request) = asked::<f::messages::GetStickerSet>(body) {
+            if matches!(&request.stickerset, tl::enums::InputStickerSet::EmojiDefaultTopicIcons) {
+                self.log("GetStickerSet topic-icons");
+                let set: tl::types::StickerSet = blank(&[
+                    &put(0u32),
+                    &put(920i64),
+                    &put(921i64),
+                    &put("Topic Icons".to_owned()),
+                    &put("topic_icons".to_owned()),
+                    &put(2i32),
+                    &put(1i32),
+                ]);
+                let found = tl::types::messages::StickerSet {
+                    set: set.into(),
+                    packs: Vec::new(),
+                    keywords: Vec::new(),
+                    documents: vec![
+                        custom_emoji(6_501, "\u{1F527}").into(),
+                        custom_emoji(6_502, "\u{1F4CC}").into(),
+                    ],
+                };
+                return Some(answer(tl::enums::messages::StickerSet::Set(found)));
+            }
             let emoji = matches!(&request.stickerset, tl::enums::InputStickerSet::Id(set) if set.id == 910);
             if emoji {
                 self.log("GetStickerSet emoji");

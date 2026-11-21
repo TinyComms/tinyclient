@@ -78,6 +78,10 @@ impl Fault {
                 "FILTER_TITLE_EMPTY" => "Give the folder a name.".to_owned(),
                 "FILTER_INCLUDE_EMPTY" => "Include at least one chat or chat type in the folder.".to_owned(),
                 "FILTER_ID_INVALID" => "That folder no longer exists.".to_owned(),
+                "TOPIC_CLOSED" => "This topic is closed.".to_owned(),
+                "TOPIC_DELETED" => "This topic was deleted.".to_owned(),
+                "TOPIC_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
+                "TOPIC_ID_INVALID" => "That topic no longer exists.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.
                 name if name.ends_with("_TOO_MUCH") => "This needs Telegram Premium.".to_owned(),

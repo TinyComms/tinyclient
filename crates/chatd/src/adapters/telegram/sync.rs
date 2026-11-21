@@ -1040,17 +1040,14 @@ pub(super) fn avatar(account: &Account, who: Who) -> Option<Want> {
     })
 }
 
-/// A forum's topics, as `Thread` rows under it. Returns how many it has.
-fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
-    let request = tl::functions::messages::GetForumTopics {
-        peer: account.input(forum)?,
-        q: None,
-        offset_date: 0,
-        offset_id: 0,
-        offset_topic: 0,
-        limit: TOPICS,
-    };
-    let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+/// Writes one page of forum topics into the store and returns `(written, last_cursor)` where
+/// `last_cursor` is `(offset_date, offset_id, offset_topic)` for the next `GetForumTopics` page.
+fn record_topics(
+    account: &Account,
+    forum: Who,
+    found: &tl::types::messages::ForumTopics,
+    base_index: i32,
+) -> (usize, Option<(i32, i32, i32)>) {
     account.learn(&found.users, &found.chats);
     let dates: HashMap<i32, i64> = found
         .messages
@@ -1062,6 +1059,7 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         })
         .collect();
     let (mut count, mut pinned) = (0, 0);
+    let mut last_cursor = None;
     for (at, topic) in found.topics.iter().enumerate() {
         let tl::enums::ForumTopic::Topic(topic) = topic else {
             continue;
@@ -1077,25 +1075,294 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         thread.parent = Some(forum.text());
         thread.root = Some(topic.id.to_string());
         // Pinned topics first, then as Telegram lists them: the most recently active first.
-        thread.position = at as i32 - if topic.pinned { TOPICS } else { 0 };
+        thread.position = base_index + at as i32 - if topic.pinned { TOPICS } else { 0 };
         thread.read_only = topic.closed && !topic.my;
         // The forum's own pins, in Telegram's order.
         let pin = topic.pinned.then(|| {
             pinned += 1;
             pinned - 1
         });
-        thread.filing = Some(Filing { pin, ..Filing::default() });
+        thread.filing = Some(Filing { pin, hidden: topic.hidden, ..Filing::default() });
+        let updated = dates.get(&topic.top_message).copied().unwrap_or(i64::from(topic.date));
+        last_cursor = Some((updated as i32, topic.top_message, topic.id));
         if account.ctx.conversation(&thread).is_err() {
             continue;
         }
         count += 1;
         let read = (topic.read_inbox_max_id > 0).then(|| topic.read_inbox_max_id.to_string());
-        let updated = dates.get(&topic.top_message).copied().unwrap_or(i64::from(topic.date));
         let _ = account.ctx.counts(&id, topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
         let _ = account.ctx.muted(&id, muted(account, forum, &topic.notify_settings));
     }
     fetch_icons(account, forum, &found.topics);
+    (count, last_cursor)
+}
+
+/// A forum's first page of topics, as `Thread` rows under it. Returns how many it has.
+fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
+    let request = tl::functions::messages::GetForumTopics {
+        peer: account.input(forum)?,
+        q: None,
+        offset_date: 0,
+        offset_id: 0,
+        offset_topic: 0,
+        limit: TOPICS,
+    };
+    let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+    let total = found.count.max(0) as u32;
+    let (count, last) = record_topics(account, forum, &found, 0);
+    let done = count == 0 || (count as i32) < TOPICS || (count as u32) >= total;
+    if let Some((d, mid, tid)) = last {
+        account.live().topic_pages.insert(forum, (d, mid, tid, count as u32, total, done));
+    } else {
+        account.live().topic_pages.insert(forum, (0, 0, 0, count as u32, total, true));
+    }
     Ok(count)
+}
+
+/// Loads additional pages or searches topics in a forum (`messages.getForumTopics`).
+/// Returns the network's total topic count for the forum/query.
+pub(super) fn load_topics(
+    account: &Account,
+    conversation_id: &str,
+    query: Option<&str>,
+    offset: u32,
+    limit: u32,
+) -> Result<u32, Fault> {
+    let Some((forum, None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None });
+    };
+    let peer = account.input(forum)?;
+    if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
+        let request = tl::functions::messages::GetForumTopics {
+            peer,
+            q: Some(q.to_owned()),
+            offset_date: 0,
+            offset_id: 0,
+            offset_topic: 0,
+            limit: limit.clamp(1, 100) as i32,
+        };
+        let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+        record_topics(account, forum, &found, 0);
+        return Ok(found.count.max(0) as u32);
+    }
+
+    let wanted = offset.saturating_add(limit);
+    loop {
+        let state = account.live().topic_pages.get(&forum).copied();
+        let (offset_date, offset_id, offset_topic, loaded, total, done) = match state {
+            Some(s) => s,
+            None => (0, 0, 0, 0, 0, false),
+        };
+        if done || (loaded >= wanted && loaded > 0) {
+            return Ok(total.max(loaded));
+        }
+        let page_size = TOPICS;
+        let request = tl::functions::messages::GetForumTopics {
+            peer: peer.clone(),
+            q: None,
+            offset_date,
+            offset_id,
+            offset_topic,
+            limit: page_size,
+        };
+        let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+        let remote_total = found.count.max(0) as u32;
+        let (count, last) = record_topics(account, forum, &found, loaded as i32);
+        let new_loaded = loaded.saturating_add(count as u32);
+        let advanced = last.is_some_and(|(d, mid, tid)| (d, mid, tid) != (offset_date, offset_id, offset_topic));
+        let now_done = count == 0 || !advanced || (count as i32) < page_size || new_loaded >= remote_total;
+        let (nd, nmid, ntid) = last.unwrap_or((offset_date, offset_id, offset_topic));
+        account.live().topic_pages.insert(forum, (nd, nmid, ntid, new_loaded, remote_total, now_done));
+        if now_done || new_loaded >= wanted {
+            return Ok(remote_total.max(new_loaded));
+        }
+    }
+}
+
+fn parse_emoji_id(raw: Option<&str>) -> Option<i64> {
+    raw.and_then(|s| s.strip_prefix('e').unwrap_or(s).parse::<i64>().ok())
+}
+
+/// Creates a new forum topic (`messages.createForumTopic`). Returns its conversation id.
+pub(super) fn create_topic(
+    account: &Account,
+    forum_id: &str,
+    title: &str,
+    icon_color: Option<i32>,
+    icon_emoji_id: Option<&str>,
+) -> Result<String, Fault> {
+    let Some((forum, None)) = Who::parse(forum_id) else {
+        return Err(Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None });
+    };
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(Fault::Rpc { code: 400, name: "TOPIC_TITLE_EMPTY".to_owned(), value: None });
+    }
+    let peer = account.input(forum)?;
+    let emoji_id = parse_emoji_id(icon_emoji_id);
+    let random_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos() as i64);
+    let answer = account.ask(&tl::functions::messages::CreateForumTopic {
+        title_missing: false,
+        peer,
+        title: trimmed.to_owned(),
+        icon_color,
+        icon_emoji_id: emoji_id,
+        random_id,
+        send_as: None,
+    })?;
+    let mut topic_id: Option<i32> = None;
+    let updates_list: &[tl::enums::Update] = match &answer {
+        tl::enums::Updates::Updates(all) => &all.updates,
+        tl::enums::Updates::Combined(all) => &all.updates,
+        _ => &[],
+    };
+    for upd in updates_list {
+        match upd {
+            tl::enums::Update::NewChannelMessage(new) => {
+                if let tl::enums::Message::Service(svc) = &new.message {
+                    if matches!(svc.action, tl::enums::MessageAction::TopicCreate(_)) {
+                        topic_id = Some(svc.id);
+                        break;
+                    }
+                }
+            }
+            tl::enums::Update::MessageId(named) if named.random_id == random_id => {
+                topic_id = Some(named.id);
+            }
+            _ => {}
+        }
+    }
+    let topic_id = topic_id.ok_or_else(|| Fault::Net("Telegram did not name the new topic.".to_owned()))?;
+    note_topic_create(account, forum, topic_id, trimmed, icon_color.unwrap_or(0x6FB9F0), emoji_id, now());
+    live::answered(account, &answer);
+    Ok(thread_id(forum, topic_id))
+}
+
+/// Edits a forum topic (title, icon, closed, hidden, pinned).
+pub(super) fn update_topic(
+    account: &Account,
+    topic_conv_id: &str,
+    title: Option<&str>,
+    icon_emoji_id: Option<&str>,
+    closed: Option<bool>,
+    hidden: Option<bool>,
+    pinned: Option<bool>,
+) -> Result<(), Fault> {
+    let Some((forum, Some(topic_id))) = Who::parse(topic_conv_id) else {
+        return Err(Fault::Rpc { code: 400, name: "TOPIC_ID_INVALID".to_owned(), value: None });
+    };
+    let peer = account.input(forum)?;
+    let emoji_id = parse_emoji_id(icon_emoji_id);
+    if title.is_some() || emoji_id.is_some() || closed.is_some() || hidden.is_some() {
+        let answer = account.ask(&tl::functions::messages::EditForumTopic {
+            peer: peer.clone(),
+            topic_id,
+            title: title.map(|t| t.trim().to_owned()),
+            icon_emoji_id: emoji_id,
+            closed,
+            hidden,
+        })?;
+        note_topic_edit(account, forum, topic_id, title.map(str::trim), emoji_id, closed, hidden);
+        live::answered(account, &answer);
+    }
+    if let Some(pin) = pinned {
+        let answer = account.ask(&tl::functions::messages::UpdatePinnedForumTopic {
+            peer,
+            topic_id,
+            pinned: pin,
+        })?;
+        note_topic_pin(account, forum, topic_id, pin);
+        live::answered(account, &answer);
+    }
+    Ok(())
+}
+
+/// Deletes a forum topic and all its messages (`messages.deleteTopicHistory`).
+pub(super) fn delete_topic(account: &Account, topic_conv_id: &str) -> Result<(), Fault> {
+    let Some((forum, Some(topic_id))) = Who::parse(topic_conv_id) else {
+        return Err(Fault::Rpc { code: 400, name: "TOPIC_ID_INVALID".to_owned(), value: None });
+    };
+    let peer = account.input(forum)?;
+    for _ in 0..200 {
+        let tl::enums::messages::AffectedHistory::History(affected) =
+            account.ask(&tl::functions::messages::DeleteTopicHistory { peer: peer.clone(), top_msg_id: topic_id })?;
+        if affected.offset == 0 {
+            break;
+        }
+    }
+    let _ = account.ctx.conversation_gone(topic_conv_id);
+    Ok(())
+}
+
+/// Applies a live or locally created `MessageAction::TopicCreate` into the store.
+pub(super) fn note_topic_create(
+    account: &Account,
+    forum: Who,
+    topic_id: i32,
+    title: &str,
+    icon_color: i32,
+    icon_emoji_id: Option<i64>,
+    updated: i64,
+) {
+    let id = thread_id(forum, topic_id);
+    let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, title.to_owned());
+    thread.icon = Some(icon_color);
+    if let Some(icon) = icon_emoji_id {
+        thread.avatar = Some(format!("e{icon}"));
+    }
+    thread.parent = Some(forum.text());
+    thread.root = Some(topic_id.to_string());
+    let _ = account.ctx.conversation(&thread);
+    let _ = account.ctx.counts(&id, 0, 0, None, updated);
+}
+
+/// Applies a live or locally edited `MessageAction::TopicEdit` into the store.
+pub(super) fn note_topic_edit(
+    account: &Account,
+    forum: Who,
+    topic_id: i32,
+    title: Option<&str>,
+    icon_emoji_id: Option<i64>,
+    closed: Option<bool>,
+    hidden: Option<bool>,
+) {
+    let id = thread_id(forum, topic_id);
+    let existing = account.ctx.known(&id).ok().flatten();
+    let final_title = title
+        .map(str::to_owned)
+        .or_else(|| existing.as_ref().map(|c| c.title.clone()))
+        .unwrap_or_else(|| format!("Topic {topic_id}"));
+    let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, final_title);
+    thread.parent = Some(forum.text());
+    thread.root = Some(topic_id.to_string());
+    thread.icon = existing.as_ref().and_then(|c| c.topic_icon);
+    thread.avatar = match icon_emoji_id {
+        Some(0) => None,
+        Some(icon) => Some(format!("e{icon}")),
+        None => existing.as_ref().and_then(|c| c.avatar.as_ref().map(|a| a.id.clone())),
+    };
+    thread.read_only = closed.unwrap_or_else(|| existing.as_ref().is_some_and(|c| c.read_only));
+    let _ = account.ctx.conversation(&thread);
+    if let Some(is_hidden) = hidden {
+        let pin = existing.as_ref().and_then(|c| c.pin);
+        let _ = account.ctx.filing(&id, &Filing { pin, hidden: is_hidden, ..Filing::default() });
+    }
+}
+
+/// Applies a topic pin/unpin update to the store.
+pub(super) fn note_topic_pin(account: &Account, forum: Who, topic_id: i32, pinned: bool) {
+    let id = thread_id(forum, topic_id);
+    let _ = account.ctx.filing(&id, &Filing { pin: pinned.then_some(0), ..Filing::default() });
+}
+
+/// Applies an ordered list of pinned topic ids (`Update::PinnedForumTopics`).
+pub(super) fn note_topic_pins(account: &Account, forum: Who, order: &[i32]) {
+    for (idx, &topic_id) in order.iter().enumerate() {
+        let id = thread_id(forum, topic_id);
+        let _ = account.ctx.filing(&id, &Filing { pin: Some(idx as i32), ..Filing::default() });
+    }
 }
 
 /// An emoji document asked whole: the animated file itself (its Lottie play), so the tile

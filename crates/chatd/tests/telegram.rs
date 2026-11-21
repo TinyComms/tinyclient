@@ -517,7 +517,7 @@ fn a_forum_opens_on_the_newest_unread_topic_else_general() {
     world.connected();
     // Opening the forum reads its topics and lands on the newest unread: Jigs here, active
     // after the unread Tools, General read all along (polish/03 §2, story T8).
-    let landing = || Request::Topics { forum: key("c9002"), offset: 0, limit: 1, landing: true };
+    let landing = || Request::Topics { forum: key("c9002"), offset: 0, limit: 1, landing: true, query: None };
     let Response::Conversations { conversations, .. } = world.ask(landing()) else {
         panic!("no landing");
     };
@@ -525,7 +525,7 @@ fn a_forum_opens_on_the_newest_unread_topic_else_general() {
     assert_eq!((conversations[0].key.id.as_str(), conversations[0].title.as_str(), conversations[0].parent.as_deref()), ("c9002_55", "Jigs", Some("c9002")));
     // What the topics drill lists: the network's pins first (none is pinned), then the
     // activity, a count on every row.
-    let drill = Request::Topics { forum: key("c9002"), offset: 0, limit: 10, landing: false };
+    let drill = Request::Topics { forum: key("c9002"), offset: 0, limit: 10, landing: false, query: None };
     let Response::Conversations { conversations: topics, total, .. } = world.ask(drill) else {
         panic!("no topics");
     };
@@ -4018,4 +4018,107 @@ fn chat_folders_create_edit_add_reorder_suggest_and_delete() {
         }
         other => panic!("expected limit error, got {other:?}"),
     }
+}
+
+#[test]
+fn forum_topics_crud_search_icons_and_paging_past_fifty() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_TOPICS", "120")]);
+    world.connected();
+
+    // Workshop forum carries manage_topics right.
+    let forum = world.conversation("c9002").expect("Workshop forum row");
+    assert!(forum.rights.manage_topics, "expected manage_topics on Workshop: {:?}", forum.rights);
+
+    // Paging past 50 topics loads all 120 topics via GetForumTopics cursor paging.
+    let p1 = match world.ask(Request::Topics { forum: key("c9002"), offset: 0, limit: 50, landing: false, query: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 50);
+            conversations
+        }
+        other => panic!("expected page 1 Conversations, got {other:?}"),
+    };
+    let p2 = match world.ask(Request::Topics { forum: key("c9002"), offset: 50, limit: 50, landing: false, query: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 50);
+            conversations
+        }
+        other => panic!("expected page 2 Conversations, got {other:?}"),
+    };
+    let p3 = match world.ask(Request::Topics { forum: key("c9002"), offset: 100, limit: 50, landing: false, query: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 20);
+            conversations
+        }
+        other => panic!("expected page 3 Conversations, got {other:?}"),
+    };
+    let unique: std::collections::HashSet<String> = p1
+        .into_iter()
+        .chain(p2)
+        .chain(p3)
+        .map(|c| c.key.id)
+        .collect();
+    assert_eq!(unique.len(), 120, "all 120 forum topics must be reachable past the first 50");
+
+    // Searching topics filters via GetForumTopics `q`.
+    match world.ask(Request::Topics {
+        forum: key("c9002"),
+        offset: 0,
+        limit: 20,
+        landing: false,
+        query: Some("Topic #115".into()),
+    }) {
+        Response::Conversations { conversations, .. } => {
+            assert_eq!(conversations.len(), 1, "{conversations:?}");
+            assert_eq!(conversations[0].title, "Topic #115");
+        }
+        other => panic!("expected searched topics, got {other:?}"),
+    }
+
+    // Default topic icons catalog.
+    match world.ask(Request::TopicIcons { account: account() }) {
+        Response::Catalog { items, .. } => {
+            assert!(items.iter().any(|i| i.id == "e6501"), "{items:?}");
+        }
+        other => panic!("expected TopicIcons Catalog, got {other:?}"),
+    }
+
+    // Create a new topic.
+    let created = match world.ask(Request::TopicCreate {
+        forum: key("c9002"),
+        title: "Sharpening".into(),
+        icon_color: Some(0x6FB9F0),
+        icon_emoji_id: Some("e6501".into()),
+    }) {
+        Response::Conversation { conversation } => *conversation,
+        other => panic!("expected created topic Conversation, got {other:?}"),
+    };
+    assert_eq!(created.title, "Sharpening");
+    assert_eq!(created.parent.as_deref(), Some("c9002"));
+    assert!(world.calls().iter().any(|c| c == "CreateForumTopic c9002 Sharpening"));
+
+    // Rename, close, and pin the topic.
+    assert_eq!(
+        world.ask(Request::TopicUpdate {
+            topic: created.key.clone(),
+            title: Some("Chisels".into()),
+            icon_emoji_id: None,
+            closed: Some(true),
+            hidden: None,
+            pinned: Some(true),
+        }),
+        Response::Ok
+    );
+    let updated = world.until("topic renamed, closed, and pinned", || {
+        world.conversation(&created.key.id).filter(|c| c.title == "Chisels" && c.read_only && c.pin.is_some())
+    });
+    assert_eq!(updated.title, "Chisels");
+    assert!(updated.read_only);
+    assert!(updated.pin.is_some());
+
+    // Delete the topic.
+    assert_eq!(world.ask(Request::TopicDelete { topic: created.key.clone() }), Response::Ok);
+    world.until("deleted topic gone", || world.conversation(&created.key.id).is_none().then_some(()));
 }
