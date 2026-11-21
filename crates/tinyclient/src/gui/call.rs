@@ -2169,6 +2169,7 @@ mod tests {
             handoff_tooltip(Network::Teams),
             "Teams calls open in the Teams app. tinyclient doesn't carry them."
         );
+    }
 
     #[test]
     fn call_go_target_opens_only_known_tiny_rooms_on_server_page() {

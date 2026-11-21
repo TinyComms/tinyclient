@@ -4044,6 +4044,7 @@ fn upload_limit_honors_server_boost_tier() {
             spoiler: false,
             as_file: false,
             original: false,
+            media: None,
         }],
         ..Default::default()
     };

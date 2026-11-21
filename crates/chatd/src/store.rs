@@ -1615,6 +1615,9 @@ impl Store {
                         opted_out: row.get(19)?,
                         icon: row.get(20)?,
                         filing: None,
+                        max_file_bytes: 0,
+                        read_only_reason: String::new(),
+                        spam: false,
                     },
                 ))
             })?

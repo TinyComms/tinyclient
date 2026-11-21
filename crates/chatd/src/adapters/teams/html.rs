@@ -1179,7 +1179,7 @@ pub(super) fn compose_with_mentions(text: &str, spans: &[Span]) -> (String, Vec<
         })
         .collect();
     if live.is_empty() {
-        return (compose(text), Vec::new());
+        return (compose_rich(text).0, Vec::new());
     }
     live.sort_by_key(|(start, _, _, _)| *start);
     let mut out = String::with_capacity(text.len() + live.len() * 80);
@@ -1191,7 +1191,7 @@ pub(super) fn compose_with_mentions(text: &str, spans: &[Span]) -> (String, Vec<
             continue;
         }
         if start > cursor {
-            inline_into(&mut out, &normalized(&text[cursor..start]));
+            inline_into(&mut out, &normalized(&text[cursor..start]), &mut Vec::new());
         }
         let item_id = mentions.len().to_string();
         let display = text[start..end].trim_start_matches('@');
@@ -1215,7 +1215,7 @@ pub(super) fn compose_with_mentions(text: &str, spans: &[Span]) -> (String, Vec<
         cursor = end;
     }
     if cursor < text.len() {
-        inline_into(&mut out, &normalized(&text[cursor..]));
+        inline_into(&mut out, &normalized(&text[cursor..]), &mut Vec::new());
     }
     out.push_str("</p>");
     (out, mentions)
