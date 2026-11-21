@@ -3817,3 +3817,43 @@ fn save_and_unsave_gif() {
     };
     assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
 }
+
+#[test]
+fn clicking_a_telegram_username_resolves_once_and_caches_result() {
+    let world = World::signed_in();
+    world.connected();
+
+    // Resolving an uncached @username calls contacts.resolveUsername once and creates the chat row.
+    let Response::Resolved { conversation, title, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/forest_wren".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(conversation, Some(key("u7010")));
+    assert_eq!(title, "Forest Wren");
+    assert_eq!(world.called("ResolveUsername forest_wren"), 1);
+
+    // Clicking the same username again hits cache without repeating the flood-limited RPC.
+    let Response::Resolved { conversation: again, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/forest_wren".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(again, Some(key("u7010")));
+    assert_eq!(world.called("ResolveUsername forest_wren"), 1);
+
+    // Unknown usernames cache the miss so repeated clicks do not hammer ResolveUsername.
+    let Response::Resolved { conversation: missing, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/nobody_here_495".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(missing, None);
+    let Response::Resolved { conversation: missing_again, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/nobody_here_495".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(missing_again, None);
+    assert_eq!(world.called("ResolveUsername nobody_here_495"), 1);
+}

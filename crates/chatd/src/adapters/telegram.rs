@@ -277,6 +277,9 @@ struct Live {
     /// Photo albums still arriving or open, so a later item, edit, reaction or deletion
     /// finds the row they share.
     albums: VecDeque<live::HeldAlbum>,
+    /// Cached `contacts.resolveUsername` lookups (lowercased bare username -> peer or miss),
+    /// populated only on explicit clicks so repeated clicks never repeat flood-limited RPCs.
+    resolved_usernames: HashMap<String, Option<Who>>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -724,6 +727,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ResolveUsername { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -798,6 +802,9 @@ fn serve(account: &Arc<Account>, command: Command) {
             // A channel on screen is searched too. The contact search above already stands.
             members::search_open(account, &query);
             ctx.searched(&query);
+        }
+        Command::ResolveUsername { username, reply } => {
+            let _ = reply.send(resolve_username(account, &username).map_err(refused));
         }
         Command::Members { conversation_id, offset, limit, reply } => {
             let _ = reply.send(members::list(account, &conversation_id, offset, limit).map_err(refused));
@@ -919,6 +926,58 @@ fn serve(account: &Arc<Account>, command: Command) {
         // `Fetch`es to the adapter.
         other => other.unsupported(ctx),
     }
+}
+
+const RESOLVED_CACHE: usize = 256;
+
+/// Resolves a public Telegram `@username` on click, checking the local directory and
+/// in-connection cache before issuing `contacts.resolveUsername`. Never joins a channel.
+fn resolve_username(account: &Account, username: &str) -> Result<Option<(String, String)>, Fault> {
+    let bare = username.trim().trim_start_matches('@');
+    if !(3..=32).contains(&bare.len()) || !bare.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+        return Ok(None);
+    }
+    let lower = bare.to_ascii_lowercase();
+    let who = if let Some(known) = account.dir().find_by_handle(bare) {
+        Some(known)
+    } else if let Some(cached) = account.live().resolved_usernames.get(&lower).copied() {
+        cached
+    } else {
+        let request = tl::functions::contacts::ResolveUsername { username: bare.to_owned(), referer: None };
+        match wire::call(account.wire.as_ref(), &request) {
+            Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) => {
+                account.learn(&found.users, &found.chats);
+                let peer = Who::of(&found.peer);
+                let mut live = account.live();
+                if live.resolved_usernames.len() >= RESOLVED_CACHE {
+                    live.resolved_usernames.clear();
+                }
+                live.resolved_usernames.insert(lower, Some(peer));
+                Some(peer)
+            }
+            Err(fault) if fault.is("USERNAME_NOT_OCCUPIED") || fault.is("USERNAME_INVALID") => {
+                let mut live = account.live();
+                if live.resolved_usernames.len() >= RESOLVED_CACHE {
+                    live.resolved_usernames.clear();
+                }
+                live.resolved_usernames.insert(lower, None);
+                None
+            }
+            Err(fault) => return Err(fault),
+        }
+    };
+    let Some(who) = who else {
+        return Ok(None);
+    };
+    let recorded = if matches!(who, Who::User(_)) || sync::member(account, who) {
+        sync::ensure_row(account, who, None)
+    } else {
+        sync::ensure_preview_row(account, who)
+    };
+    if !recorded {
+        return Ok(None);
+    }
+    Ok(Some((who.text(), account.dir().name(who))))
 }
 
 fn mark_read(account: &Account, conversation: &str, message: &str) {

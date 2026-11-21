@@ -145,8 +145,17 @@ pub fn spans(text: &str, entities: &[MessageEntity]) -> Vec<Span> {
             E::Url(_) if said.contains("://") => Style::Link { url: said.to_owned() },
             E::Url(_) => Style::Link { url: format!("https://{said}") },
             E::Email(_) => Style::Link { url: format!("mailto:{said}") },
-            // A mention by username names nobody the account has an id for: it opens in Telegram.
-            E::Mention(_) => Style::Link { url: format!("https://t.me/{}", said.trim_start_matches('@')) },
+            // A mention by username resolves in-app on click (`contacts.resolveUsername`, cached).
+            E::Mention(_) => {
+                let username = said.trim_start_matches('@');
+                if username.is_empty() {
+                    continue;
+                }
+                Style::Username { username: username.to_owned() }
+            }
+            E::Hashtag(_) | E::Cashtag(_) => Style::Hashtag,
+            E::BotCommand(_) => Style::Command,
+            E::Phone(_) | E::BankCard(_) => Style::Copyable,
             E::MentionName(named) => Style::Mention { kind: MentionKind::User, id: Who::User(named.user_id).text() },
             // A send names the person with an input user. The echo carries that until Telegram
             // stores the incoming form.
@@ -3291,11 +3300,40 @@ mod tests {
             styles,
             vec![
                 Style::Link { url: "https://t.me/x".into() },
-                Style::Link { url: "https://t.me/wren".into() },
+                Style::Username { username: "wren".into() },
                 Style::Mention { kind: MentionKind::User, id: "u42".into() },
                 Style::CodeBlock { language: "rust".into() },
                 Style::Quote,
                 Style::Spoiler,
+                Style::Hashtag,
+            ]
+        );
+    }
+
+    #[test]
+    fn clickable_telegram_entities_map_to_interactive_spans() {
+        let text = "#rust $BTC /start@trail_bot @wren +15550100777 4111-1111";
+        let entities = vec![
+            tl::types::MessageEntityHashtag { offset: 0, length: 5 }.into(),
+            tl::types::MessageEntityCashtag { offset: 6, length: 4 }.into(),
+            tl::types::MessageEntityBotCommand { offset: 11, length: 16 }.into(),
+            tl::types::MessageEntityMention { offset: 28, length: 5 }.into(),
+            tl::types::MessageEntityPhone { offset: 34, length: 12 }.into(),
+            tl::types::MessageEntityBankCard { offset: 47, length: 9 }.into(),
+        ];
+        let mapped: Vec<(&str, Style)> = spans(text, &entities)
+            .into_iter()
+            .map(|span| (&text[span.start as usize..span.end as usize], span.style))
+            .collect();
+        assert_eq!(
+            mapped,
+            vec![
+                ("#rust", Style::Hashtag),
+                ("$BTC", Style::Hashtag),
+                ("/start@trail_bot", Style::Command),
+                ("@wren", Style::Username { username: "wren".into() }),
+                ("+15550100777", Style::Copyable),
+                ("4111-1111", Style::Copyable),
             ]
         );
     }

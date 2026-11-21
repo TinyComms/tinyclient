@@ -384,6 +384,9 @@ pub enum Command {
     Watch(Arc<Watching>),
     /// Search the network's directory. Results go to [`Context::people`]; at most 25.
     SearchPeople(String),
+    /// Resolve a public `@username` on click (cached on the adapter; never joins a chat).
+    /// Answers `Some((conversation_id, title))` when found.
+    ResolveUsername { username: String, reply: Reply<Option<(String, String)>> },
     Members {
         conversation_id: String,
         offset: u32,
@@ -824,6 +827,7 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ResolveUsername { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MembersAdd { reply, .. }
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }

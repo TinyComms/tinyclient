@@ -2115,7 +2115,30 @@ impl Chat {
                 message_id: parsed.message_id,
                 title: conv.title,
             },
-            Ok(None) => Response::Resolved { conversation: None, message_id: None, title: String::new() },
+            Ok(None) => {
+                if parsed.network == Network::Telegram && parsed.space.is_none() {
+                    let accounts: Vec<AccountKey> = self
+                        .hub
+                        .links()
+                        .into_iter()
+                        .filter(|linked| linked.account.network == Network::Telegram && linked.link == Link::Connected)
+                        .map(|linked| linked.account)
+                        .collect();
+                    for account in accounts {
+                        if let Ok(Some((id, title))) = self.ask(&account, |reply| Command::ResolveUsername {
+                            username: parsed.channel.clone(),
+                            reply,
+                        }) {
+                            return Response::Resolved {
+                                conversation: Some(Key::new(&account, id)),
+                                message_id: parsed.message_id,
+                                title,
+                            };
+                        }
+                    }
+                }
+                Response::Resolved { conversation: None, message_id: None, title: String::new() }
+            }
             Err(err) => internal(err),
         }
     }

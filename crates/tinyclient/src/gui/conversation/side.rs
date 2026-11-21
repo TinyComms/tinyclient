@@ -159,6 +159,15 @@ fn fresh_page(scope: Scope, words: &str) -> SearchPage {
     SearchPage { scope, words: words.to_owned(), ..SearchPage::default() }
 }
 
+/// Resets an open search page to a new scope and query (e.g. clicking a hashtag).
+fn apply_search_query(page: &mut SearchPage, scope: Scope, words: &str) {
+    page.scope = scope;
+    page.words = words.to_owned();
+    page.hits = None;
+    page.picked = None;
+    page.reset_network();
+}
+
 /// The user's word for what went wrong asking the network.
 fn asked_words(code: protocol::ErrorCode, detail: &str) -> String {
     if detail.contains("does not understand") {
@@ -671,6 +680,31 @@ impl Shell {
         if let Some(field) = &self.conversation_state.side.search_input {
             window.focus(&field.input.focus_handle(cx), cx);
         }
+        cx.notify();
+    }
+
+    /// Opens the search pane (or updates it when already open) pre-filled with `words`
+    /// (for example when clicking a `#hashtag` or `$CASHTAG` in a message).
+    pub(in crate::gui) fn open_search_with(&mut self, scope: Scope, words: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let scope = if scope == Scope::Conversation && self.open_key().is_none() {
+            Scope::Everywhere
+        } else {
+            scope
+        };
+        if !matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
+            self.conversation_state.side.search = None;
+            self.conversation_state.side.search_input = None;
+            self.new_search_with(scope, words, window, cx);
+            return;
+        }
+        if let Some(page) = self.conversation_state.side.search.as_mut() {
+            apply_search_query(page, scope, words);
+        }
+        if let Some(field) = &self.conversation_state.side.search_input {
+            field.input.update(cx, |input, cx| input.set_text(words, cx));
+            window.focus(&field.input.focus_handle(cx), cx);
+        }
+        self.reask_search(cx);
         cx.notify();
     }
 
@@ -2068,5 +2102,28 @@ mod tests {
 
         // Prefix-only insertion does not add a trailing space so completion continues immediately.
         assert_eq!(apply_search_completion("deploy ", "from:"), "deploy from:");
+    }
+
+    #[test]
+    fn hashtag_click_fills_search_field_and_resets_previous_hits() {
+        let mut page = fresh_page(Scope::Conversation, "#rust");
+        assert_eq!((page.scope, page.words.as_str()), (Scope::Conversation, "#rust"));
+        assert!(page.hits.is_none());
+
+        page.hits = Some(vec![MessageHit {
+            conversation: key("u7002"),
+            message_id: "10".into(),
+            sent: 100,
+            sender: "Odalys".into(),
+            snippet: "learning #rust".into(),
+            title: "Odalys".into(),
+            space_title: String::new(),
+            outgoing: false,
+        }]);
+        page.picked = Some((key("u7002"), "10".into()));
+
+        apply_search_query(&mut page, Scope::Conversation, "$BTC");
+        assert_eq!((page.scope, page.words.as_str()), (Scope::Conversation, "$BTC"));
+        assert!(page.hits.is_none() && page.picked.is_none() && page.network.is_none());
     }
 }

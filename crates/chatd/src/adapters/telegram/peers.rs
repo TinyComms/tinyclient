@@ -364,6 +364,18 @@ impl Directory {
         self.map.iter().filter_map(|(who, known)| match who { Who::User(id) => Some((*id, known.clone())), _ => None }).collect()
     }
 
+    /// Finds a known peer (user or channel) by public username, case-insensitively.
+    pub fn find_by_handle(&self, handle: &str) -> Option<Who> {
+        let bare = handle.trim().trim_start_matches('@');
+        if bare.is_empty() {
+            return None;
+        }
+        self.map
+            .iter()
+            .find(|(_, known)| !known.handle.is_empty() && known.handle.eq_ignore_ascii_case(bare))
+            .map(|(who, _)| *who)
+    }
+
     pub fn name(&self, who: Who) -> String {
         self.map.get(&who).map_or_else(|| "Unknown".to_owned(), |known| known.name.clone())
     }

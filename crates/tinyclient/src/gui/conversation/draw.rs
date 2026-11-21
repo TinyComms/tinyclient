@@ -8,7 +8,7 @@ use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
 use super::media::{self, Fit, Shape as MediaShape};
-use super::rich::{self, Block, Inline, Jumbo};
+use super::rich::{self, Block, Inline, Jumbo, RunAction};
 use super::rows::Item;
 use super::text::{Look, Rich, TextEvent};
 use super::tokens::{self, Metrics, MEASURE};
@@ -1652,7 +1652,7 @@ impl Pane {
                     cx.notify();
                 }
             }
-            TextEvent::Click(run, alt) => {
+            TextEvent::Click(run_ix, alt) => {
                 let Some(message) = self.find(id) else {
                     return;
                 };
@@ -1664,7 +1664,14 @@ impl Pane {
                     Some(Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. }) => inline,
                     _ => return,
                 };
-                let Some(run) = inline.runs.get(run) else {
+                let run_text = inline
+                    .ranges()
+                    .nth(run_ix)
+                    .and_then(|(range, _)| inline.text.get(range))
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                let Some(run) = inline.runs.get(run_ix) else {
                     return;
                 };
                 if run.mark {
@@ -1686,6 +1693,44 @@ impl Pane {
                         }
                     }
                     self.open_link(url, alt, window, cx);
+                } else if let Some(action) = &run.action {
+                    match action {
+                        RunAction::Hashtag if !run_text.is_empty() => {
+                            let _ = self.shell.update(cx, |shell, cx| {
+                                shell.open_search_with(super::side::Scope::Conversation, &run_text, window, cx);
+                            });
+                        }
+                        RunAction::Command if !run_text.is_empty() => {
+                            if let Some(conversation) = self.key().cloned() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_millis());
+                                let request = Request::Send {
+                                    conversation,
+                                    client_id: format!("cmd-{now}"),
+                                    text: run_text,
+                                    reply_to: None,
+                                    with: protocol::Outgoing::default(),
+                                };
+                                cx.spawn(async move |this, cx| {
+                                    let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                                    if let Ok(Response::Error { detail, .. }) = answer {
+                                        let _ = this.update(cx, |this, cx| this.say(detail, cx));
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
+                        RunAction::Username(username) if !username.is_empty() => {
+                            let url = format!("https://t.me/{username}");
+                            self.open_link(&url, alt, window, cx);
+                        }
+                        RunAction::Copyable if !run_text.is_empty() => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(run_text.clone()));
+                            let _ = self.shell.update(cx, |shell, cx| shell.toast(None, format!("Copied {run_text}"), cx));
+                        }
+                        _ => {}
+                    }
                 } else if let Some((MentionKind::User, person)) = &run.mention {
                     let (Some(person), at) = (self.person(person), window.mouse_position()) else {
                         return;

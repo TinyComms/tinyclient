@@ -113,7 +113,7 @@ impl Rich {
             if run.code {
                 boxes.push((range.clone(), tokens::code_inline().into_color()));
             }
-            if run.link.is_some() {
+            if run.link.is_some() || run.action.is_some() {
                 color = tokens::link().into_color();
                 underline |= look.hovered == Some(ix);
                 hot.push((range.clone(), ix));
