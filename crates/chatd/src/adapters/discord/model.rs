@@ -52,8 +52,31 @@ pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;
 pub const CHANGE_NICKNAME: u64 = 1 << 26;
+pub const MANAGE_NICKNAMES: u64 = 1 << 27;
 pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const MODERATE_MEMBERS: u64 = 1 << 40;
 pub const PIN_MESSAGES: u64 = 1 << 51;
+
+/// Formats Unix seconds as UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) for Discord REST bodies.
+pub fn iso_timestamp(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let secs = unix_secs.rem_euclid(86_400);
+    let hour = secs / 3_600;
+    let minute = (secs % 3_600) / 60;
+    let second = secs % 60;
+    // Howard Hinnant's civil_from_days algorithm.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
 pub fn user_link(id: &str) -> String {
@@ -261,6 +284,13 @@ pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
     (
         sized(format!("icon:{guild}:{hash}"), MediaKind::Icon, 96),
         format!("{}/icons/{guild}/{hash}.webp?size=96{}", cdn(), moving(hash)),
+    )
+}
+
+pub fn role_icon(role: &str, hash: &str) -> (MediaFile, String) {
+    (
+        sized(format!("roleicon:{role}:{hash}"), MediaKind::Icon, 48),
+        format!("{}/role-icons/{role}/{hash}.webp?size=48", cdn()),
     )
 }
 
@@ -482,6 +512,17 @@ pub struct Role {
     pub name: String,
     #[serde(default, deserialize_with = "lenient_u64")]
     pub permissions: u64,
+    #[serde(default, deserialize_with = "nullable")]
+    pub position: i32,
+    #[serde(default, deserialize_with = "nullable")]
+    pub color: u32,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub unicode_emoji: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default, deserialize_with = "nullable")]
+    pub hoist: bool,
 }
 
 /// What newer sessions wrap a guild's own fields in.
@@ -695,6 +736,9 @@ pub struct ChannelOverride {
     /// `OPT_IN_ENABLED` and the like.
     #[serde(default, deserialize_with = "nullable")]
     pub flags: u32,
+    /// Category collapse state synced with Discord.
+    #[serde(default)]
+    pub collapsed: Option<bool>,
 }
 
 fn inherit() -> u8 {
@@ -962,7 +1006,7 @@ impl Emoji {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct Attachment {
     pub id: String,
     #[serde(default)]

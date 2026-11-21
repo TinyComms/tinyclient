@@ -170,6 +170,49 @@ struct Quiet {
     /// categories that set their own.
     level: u8,
     levels: HashMap<String, u8>,
+    /// Categories collapsed in Discord (`channel_overrides[].collapsed == true`).
+    collapsed: HashSet<String>,
+}
+
+/// Coalesces rapid category collapse/expand clicks per guild so a burst is one PATCH.
+const COLLAPSE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+pub(super) struct CollapseQueue {
+    pending: HashMap<String, (HashMap<String, bool>, Instant)>,
+}
+
+impl CollapseQueue {
+    pub(super) fn push(&mut self, guild: &str, category: &str, collapsed: bool, now: Instant) {
+        let entry = self.pending.entry(guild.to_owned()).or_insert_with(|| (HashMap::new(), now));
+        entry.0.insert(category.to_owned(), collapsed);
+        entry.1 = now;
+    }
+
+    pub(super) fn take_due(&mut self, now: Instant) -> Vec<(String, HashMap<String, bool>)> {
+        let due_guilds: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, at))| now.saturating_duration_since(*at) >= COLLAPSE_DEBOUNCE)
+            .map(|(guild, _)| guild.clone())
+            .collect();
+        due_guilds
+            .into_iter()
+            .filter_map(|guild| self.pending.remove(&guild).map(|(map, _)| (guild, map)))
+            .collect()
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
+pub(super) fn collapse_settings_body(overrides: &HashMap<String, bool>) -> Value {
+    let mut map = serde_json::Map::new();
+    for (category, collapsed) in overrides {
+        map.insert(category.clone(), json!({"collapsed": collapsed}));
+    }
+    json!({"channel_overrides": map})
 }
 
 /// One of a server's custom emoji or stickers, kept for the picker: about 40 bytes each.
@@ -183,22 +226,31 @@ struct Pickable {
     roles: Box<[u64]>,
 }
 
-struct RoleInfo {
-    name: String,
-    permissions: u64,
+#[derive(Clone, Debug, Default)]
+pub(super) struct RoleInfo {
+    pub name: String,
+    pub permissions: u64,
+    pub position: i32,
+    pub color: u32,
+    pub icon: Option<String>,
+    pub unicode_emoji: Option<String>,
 }
 
 /// What is kept of a server once its tree is in the store.
+#[derive(Default)]
 struct GuildInfo {
     name: String,
     icon: Option<String>,
     owner: bool,
+    owner_id: String,
     /// Where it sits in the user's own order.
     position: i32,
     /// Unix seconds. A channel never read is unread only for what came after this.
     joined: i64,
     roles: HashMap<u64, RoleInfo>,
     my_roles: Vec<u64>,
+    /// Cached member role IDs (user_id -> role IDs) for role colors/icons & moderation hierarchy.
+    member_roles: HashMap<String, Vec<u64>>,
     /// Category id to its position and name, to place a channel created later and to write
     /// its header when the first channel we may see appears under it.
     categories: HashMap<String, (i32, String)>,
@@ -214,6 +266,116 @@ struct GuildInfo {
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
+}
+
+impl GuildInfo {
+    /// Stores a member's role IDs (bounded so huge servers never grow unbounded).
+    pub(super) fn set_member_roles(&mut self, user_id: &str, roles: Vec<u64>) {
+        if self.member_roles.len() >= 2048 && !self.member_roles.contains_key(user_id) {
+            self.member_roles.clear();
+        }
+        self.member_roles.insert(user_id.to_owned(), roles);
+    }
+
+    /// Resolves the top colored role (highest `(position, id)` with non-zero `color`) and
+    /// top role icon/emoji (highest `(position, id)` with `icon` or non-empty `unicode_emoji`).
+    pub(super) fn resolve_role_style(&self, role_ids: &[u64]) -> (Option<u32>, Option<(protocol::MediaFile, String)>, Option<String>) {
+        let color = role_ids
+            .iter()
+            .filter_map(|id| self.roles.get(id).filter(|r| r.color != 0).map(|r| ((r.position, *id), r.color)))
+            .max_by_key(|(rank, _)| *rank)
+            .map(|(_, color)| color);
+        let top_badge = role_ids
+            .iter()
+            .filter_map(|id| {
+                let r = self.roles.get(id)?;
+                let has_icon = r.icon.as_deref().is_some_and(|h| !h.is_empty());
+                let has_emoji = r.unicode_emoji.as_deref().is_some_and(|e| !e.is_empty());
+                (has_icon || has_emoji).then_some(((r.position, *id), *id, r))
+            })
+            .max_by_key(|(rank, _, _)| *rank);
+        let (icon, emoji) = match top_badge {
+            Some((_, role_id, role)) => {
+                if let Some(hash) = role.icon.as_deref().filter(|h| !h.is_empty()) {
+                    (Some(model::role_icon(&role_id.to_string(), hash)), None)
+                } else {
+                    (None, role.unicode_emoji.clone().filter(|e| !e.is_empty()))
+                }
+            }
+            None => (None, None),
+        };
+        (color, icon, emoji)
+    }
+
+    pub(super) fn member_role_style(&self, user_id: &str) -> (Option<u32>, Option<(protocol::MediaFile, String)>, Option<String>) {
+        let Some(roles) = self.member_roles.get(user_id) else {
+            return (None, None, None);
+        };
+        self.resolve_role_style(roles)
+    }
+
+    /// Computed guild-level permissions for our account (owner or ADMINISTRATOR => u64::MAX).
+    pub(super) fn guild_permissions(&self, guild_id: &str) -> u64 {
+        if self.owner {
+            return u64::MAX;
+        }
+        let everyone = number(guild_id);
+        let of = |role: &u64| self.roles.get(role).map_or(0, |r| r.permissions);
+        let perms = self.my_roles.iter().fold(of(&everyone), |acc, r| acc | of(r));
+        if perms & model::ADMINISTRATOR != 0 {
+            u64::MAX
+        } else {
+            perms
+        }
+    }
+
+    /// Highest role position among `role_ids`, or 0 when none.
+    pub(super) fn highest_role_position(&self, role_ids: &[u64]) -> i32 {
+        role_ids
+            .iter()
+            .filter_map(|id| self.roles.get(id).map(|r| r.position))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Checks whether our account has both the required permission bit and role hierarchy
+    /// to perform `action` on `target_id` in `guild_id`.
+    pub(super) fn can_moderate(
+        &self,
+        guild_id: &str,
+        me: &str,
+        target_id: &str,
+        action: &protocol::ModerateAction,
+    ) -> Result<(), &'static str> {
+        if target_id == me {
+            return Err("You cannot moderate yourself.");
+        }
+        if !self.owner_id.is_empty() && target_id == self.owner_id {
+            return Err("Cannot moderate the server owner.");
+        }
+        let perms = self.guild_permissions(guild_id);
+        let (needed, missing_msg) = match action {
+            protocol::ModerateAction::Kick => (model::KICK_MEMBERS, "You don't have permission to kick members."),
+            protocol::ModerateAction::Ban { .. } => (model::BAN_MEMBERS, "You don't have permission to ban members."),
+            protocol::ModerateAction::Timeout { .. } | protocol::ModerateAction::Untimeout => {
+                (model::MODERATE_MEMBERS, "You don't have permission to time out members.")
+            }
+            protocol::ModerateAction::Nick { .. } => (model::MANAGE_NICKNAMES, "You don't have permission to change nicknames."),
+        };
+        if perms & needed == 0 {
+            return Err(missing_msg);
+        }
+        if !self.owner {
+            if let Some(target_roles) = self.member_roles.get(target_id) {
+                let my_top = self.highest_role_position(&self.my_roles);
+                let their_top = self.highest_role_position(target_roles);
+                if my_top <= their_top {
+                    return Err("Cannot moderate a member with an equal or higher role.");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The gateway session, to resume it after a dropped socket.
@@ -368,6 +530,8 @@ struct State {
     acks: HashMap<String, Ack>,
     /// Age-gated (NSFW) channel ids, kept so recent mentions skip them.
     nsfw_channels: HashSet<String>,
+    /// Debounced category collapse/expand writes waiting to PATCH guild settings.
+    collapses: CollapseQueue,
 }
 
 /// One channel's read acknowledgements.
@@ -667,7 +831,28 @@ impl Discord {
             names: &lookup,
             author,
         };
-        let (mut message, files) = content::message(posted, &place);
+        let (mut message, mut files) = content::message(posted, &place);
+        if let (Some(guild_id), None) = (guild, posted.webhook_id.as_ref()) {
+            let author_id = &message.sender.id;
+            if !author_id.is_empty() {
+                let mut state = crate::hub::lock(&self.state);
+                if let Some(info) = state.guilds.get_mut(guild_id) {
+                    let (color, icon, emoji) = if let Some(member) = posted.member.as_ref().filter(|m| !m.roles.is_empty()) {
+                        let role_ids: Vec<u64> = member.roles.iter().map(|r| number(r)).collect();
+                        info.set_member_roles(author_id, role_ids.clone());
+                        info.resolve_role_style(&role_ids)
+                    } else {
+                        info.member_role_style(author_id)
+                    };
+                    message.sender.role_color = color;
+                    message.sender.role_emoji = emoji;
+                    if let Some((file, url)) = icon {
+                        message.sender.role_icon = Some(file.clone());
+                        files.files.push((file, url));
+                    }
+                }
+            }
+        }
         message.mentions_me = self.mentions_me(posted, guild, kind, &me);
         (message, files)
     }
@@ -1169,16 +1354,15 @@ impl Discord {
     ) -> Result<Vec<(String, Result<(), String>)>, Refusal> {
         let mut results = Vec::with_capacity(targets.len());
         let note = note.trim();
+        let from_guild = self.ctx.known(from).ok().flatten().and_then(|c| self.guild_of(&c));
         for target in targets {
+            if self.ctx.known(target).ok().flatten().is_some_and(|c| c.read_only) {
+                results.push((target.clone(), Err("This conversation is read-only.".to_owned())));
+                continue;
+            }
             let mut err: Option<String> = None;
             for mid in message_ids {
-                let body = serde_json::json!({
-                    "message_reference": {
-                        "type": 1,
-                        "channel_id": from,
-                        "message_id": mid,
-                    }
-                });
+                let body = forward_message_body(from, mid, from_guild.as_deref());
                 if let Err(e) = self.call("POST", &format!("/channels/{target}/messages"), Some(body)) {
                     err = Some(match refusal(e) {
                         Refusal::Refused(why) => why,
@@ -1199,6 +1383,30 @@ impl Discord {
             results.push((target.clone(), err.map_or(Ok(()), Err)));
         }
         Ok(results)
+    }
+
+    /// Files one message with Discord Trust & Safety. One try: a 429 or a captcha is the answer,
+    /// not a reason to ask again. A person or a server is left to Discord's own app.
+    fn file_report(&self, target: &protocol::ReportTarget, reason: protocol::ReportReason) -> Result<(), Refusal> {
+        let protocol::ReportTarget::Message { conversation, message_id } = target else {
+            return Err(Refusal::Unsupported);
+        };
+        let Some((variant, breadcrumbs)) = message_report(reason) else {
+            return Err(Refusal::Refused(
+                "Discord has no general report for this. Pick spam, harassment, violence, illegal content, or impersonation.".into(),
+            ));
+        };
+        let body = json!({
+            "version": "1.0",
+            "variant": variant,
+            "language": "en",
+            "breadcrumbs": breadcrumbs,
+            "elements": {},
+            "channel_id": conversation.id,
+            "message_id": message_id,
+            "name": "message",
+        });
+        self.rest.call_once_with("POST", "/reporting/message", Some(body), &[]).map(drop).map_err(refusal)
     }
 
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
@@ -1569,16 +1777,8 @@ impl Discord {
 
     /// Discord's "mark inbox read": one request, up to 50 channels. `reads` is `(channel, message)`.
     fn ack_bulk(&self, reads: &[(String, String)]) -> Result<(), Refused> {
-        for chunk in reads.chunks(50) {
-            let states: Vec<Value> = chunk
-                .iter()
-                .filter(|(_, message)| !message.is_empty())
-                .map(|(channel, message)| json!({"channel_id": channel, "message_id": message, "read_state_type": 0}))
-                .collect();
-            if states.is_empty() {
-                continue;
-            }
-            self.call("POST", "/read-states/ack-bulk", Some(json!({"read_states": states})))?;
+        for body in ack_bulk_payloads(reads) {
+            self.call("POST", "/read-states/ack-bulk", Some(body))?;
         }
         Ok(())
     }
@@ -1841,6 +2041,39 @@ impl Discord {
         Ok(voice::handoff_link(guild.as_deref(), channel))
     }
 
+    fn queue_collapse(&self, guild: &str, category: &str, collapsed: bool) {
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                if collapsed {
+                    info.quiet.collapsed.insert(category.to_owned());
+                } else {
+                    info.quiet.collapsed.remove(category);
+                }
+            } else {
+                return;
+            }
+            state.collapses.push(guild, category, collapsed, Instant::now());
+        }
+        self.outbox.wake.signal();
+    }
+
+    pub(super) fn collapse_tick(&self) -> bool {
+        let (due, remaining) = {
+            let mut state = crate::hub::lock(&self.state);
+            let due = state.collapses.take_due(Instant::now());
+            (due, state.collapses.has_pending())
+        };
+        for (guild, overrides) in due {
+            let body = collapse_settings_body(&overrides);
+            let path = format!("/users/@me/guilds/{guild}/settings");
+            if let Err(refused) = self.call("PATCH", &path, Some(body)) {
+                self.log("collapse", refused);
+            }
+        }
+        remaining
+    }
+
     fn command(&self, command: Command) {
         // Everything but these is the user doing something, which is what an adapter that
         // stopped asking for a session was waiting for. The screen moving counts when it moved
@@ -1893,6 +2126,9 @@ impl Discord {
                 }
             }
             Command::OpenSpace(space) => self.open_space(&space),
+            Command::Collapse { space_id, group_id, collapsed } => {
+                self.queue_collapse(&space_id, &group_id, collapsed);
+            }
             // Opening a forum asks Discord nothing: its posts arrive on the socket as threads,
             // so the store the landing reads is as current as the link. Telegram needs this
             // ask because it lists a forum's topics only on demand.
@@ -1932,6 +2168,12 @@ impl Discord {
             Command::SetFriendNickname { person_id, nickname, reply } => {
                 answer(reply, self.set_friend_nickname(&person_id, nickname))
             }
+            Command::Moderate { space_id, person_id, action, reason, reply } => {
+                answer(reply, self.moderate(&space_id, &person_id, action, &reason))
+            }
+            Command::Unban { space_id, person_id, reason, reply } => {
+                answer(reply, self.unban(&space_id, &person_id, &reason))
+            }
             Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
             Command::SetProfile { name, about, pronouns, accent, banner, space_id, reply } => {
                 answer(reply, self.set_profile(name, about, pronouns, accent, banner, space_id))
@@ -1944,7 +2186,7 @@ impl Discord {
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
             Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
-            Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::SetMute { conversation_id, notify, until, reply } => answer(reply, self.set_mute(&conversation_id, notify, until)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
@@ -1958,6 +2200,8 @@ impl Discord {
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
+            Command::Report { target, reason, note: _, block: _, reply } => answer(reply, self.file_report(&target, reason)),
+            Command::ReportReasons { target, reply } => answer(reply, report_reasons(&target)),
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
             }
@@ -2034,6 +2278,108 @@ fn fresh_folder_id(folders: &[proto::GuildFolder]) -> i64 {
         id = id.saturating_add(1);
     }
     id
+}
+/// Message-menu node ids (`POST /reporting/message`). A path Discord does not have is a 400,
+/// so Other is refused. Illegal content uses the illicit-goods leaf, not a child-safety one.
+fn message_report(reason: protocol::ReportReason) -> Option<(&'static str, &'static [u64])> {
+    match reason {
+        protocol::ReportReason::Spam => Some(("98", &[7, 98])),
+        protocol::ReportReason::Harassment => Some(("101", &[7, 76, 101])),
+        protocol::ReportReason::Violence => Some(("117", &[7, 90, 117])),
+        protocol::ReportReason::Illegal => Some(("124", &[7, 80, 124])),
+        protocol::ReportReason::Impersonation => Some(("163", &[7, 80, 121, 163])),
+        protocol::ReportReason::Other => None,
+    }
+}
+
+/// The body `POST /channels/{target}/messages` sends for one forwarded message.
+fn forward_message_body(from: &str, message_id: &str, guild: Option<&str>) -> Value {
+    let mut reference = json!({
+        "type": 1,
+        "channel_id": from,
+        "message_id": message_id,
+    });
+    if let Some(guild) = guild {
+        reference["guild_id"] = json!(guild);
+    }
+    json!({
+        "content": "",
+        "message_reference": reference,
+    })
+}
+
+/// `TINYCLIENT_PROVE=discord-forward-report`. A forward is an empty type-1 reference, a
+/// report uses a captured message-menu leaf, and every snapshot is shown.
+pub(super) fn prove_forward_report() -> Result<(), String> {
+    let body = forward_message_body("4101", "1300000000000000100", Some("4000"));
+    let reference = &body["message_reference"];
+    if body["content"] != ""
+        || reference["type"] != 1
+        || reference["channel_id"] != "4101"
+        || reference["message_id"] != "1300000000000000100"
+        || reference["guild_id"] != "4000"
+    {
+        return Err("a forward is an empty message with a type-1 reference and the source guild".to_owned());
+    }
+    let (variant, crumbs) = message_report(protocol::ReportReason::Spam).ok_or("spam is a message report")?;
+    if variant != "98" || crumbs != [7, 98] {
+        return Err("spam uses the captured message-menu leaf".to_owned());
+    }
+    if message_report(protocol::ReportReason::Other).is_some() {
+        return Err("Discord has no general report, so Other is refused".to_owned());
+    }
+
+    struct Known;
+    impl Names for Known {
+        fn user(&self, _: &str) -> Option<String> { None }
+        fn role(&self, _: &str) -> Option<String> { None }
+        fn channel(&self, id: &str) -> Option<String> { (id == "4101").then(|| "general".to_owned()) }
+        fn space(&self, id: &str) -> Option<String> { (id == "4000").then(|| "Rustaceans".to_owned()) }
+    }
+    let account = protocol::AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+    let place = Place { account: &account, me: "me", guild: None, names: &Known, author: None };
+    let snap = |text: &str, id: &str| Posted {
+        content: Some(text.to_owned()),
+        attachments: Some(vec![model::Attachment { id: id.into(), filename: format!("{id}.txt"), size: 12, url: format!("https://cdn.discordapp.com/attachments/4101/{id}/{id}.txt"), ..Default::default() }]),
+        ..Default::default()
+    };
+    let posted = Posted {
+        id: "1300000000000000999".into(),
+        channel_id: "3001".into(),
+        message_reference: Some(model::Reference {
+            kind: 1,
+            channel_id: Some("4101".into()),
+            message_id: Some("1300000000000000100".into()),
+            guild_id: Some("4000".into()),
+        }),
+        message_snapshots: vec![
+            model::Snapshot { message: Box::new(snap("First snapshot", "1")) },
+            model::Snapshot { message: Box::new(snap("Second snapshot", "2")) },
+        ],
+        ..Default::default()
+    };
+    let (msg, _) = content::message(&posted, &place);
+    if !msg.text.contains("First snapshot") || !msg.text.contains("Second snapshot") || msg.attachments.len() != 2 {
+        return Err("every forwarded snapshot and its file is shown".to_owned());
+    }
+    let forwarded = msg.forwarded.as_ref().ok_or("a type-1 reference names where it came from")?;
+    if forwarded.from_title != "#general" || forwarded.from_space != "Rustaceans" {
+        return Err("a forward names the channel and the server".to_owned());
+    }
+    Ok(())
+}
+
+fn report_reasons(target: &protocol::ReportTarget) -> Result<Vec<protocol::ReportReason>, Refusal> {
+    match target {
+        protocol::ReportTarget::Message { .. } => Ok(vec![
+            protocol::ReportReason::Spam,
+            protocol::ReportReason::Harassment,
+            protocol::ReportReason::Violence,
+            protocol::ReportReason::Illegal,
+            protocol::ReportReason::Impersonation,
+        ]),
+        _ => Err(Refusal::Unsupported),
+    }
 }
 
 /// Discord's thread name: one line, at most 100 characters. Empty becomes "Thread".
@@ -2178,6 +2524,25 @@ fn answer<T>(reply: Reply<T>, outcome: Result<T, Refusal>) {
     let _ = reply.send(outcome);
 }
 
+/// Builds `POST /read-states/ack-bulk` request bodies in chunks of 50, skipping empty message ids.
+pub(super) fn ack_bulk_payloads(reads: &[(String, String)]) -> Vec<Value> {
+    let valid: Vec<(&str, &str)> = reads
+        .iter()
+        .filter(|(_, message)| !message.is_empty())
+        .map(|(channel, message)| (channel.as_str(), message.as_str()))
+        .collect();
+    valid
+        .chunks(50)
+        .map(|chunk| {
+            let states: Vec<Value> = chunk
+                .iter()
+                .map(|(channel, message)| json!({"channel_id": channel, "message_id": message, "read_state_type": 0}))
+                .collect();
+            json!({"read_states": states})
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2238,5 +2603,25 @@ mod tests {
         assert!(msg(Refused::Status { status: 403, code: 40007, message: String::new(), retry_after: None }).contains("banned"));
         assert!(msg(Refused::Status { status: 400, code: 30001, message: String::new(), retry_after: None }).contains("server limit"));
         assert!(msg(Refused::Challenge).contains("captcha"));
+    }
+
+    #[test]
+    fn ack_bulk_payloads_chunk_at_50_and_skip_empty_message_ids() {
+        let mut reads: Vec<(String, String)> = (1..=55)
+            .map(|i| (format!("chan{i}"), format!("msg{i}")))
+            .collect();
+        reads.push(("empty_chan".into(), String::new()));
+        let payloads = ack_bulk_payloads(&reads);
+        assert_eq!(payloads.len(), 2, "55 valid reads split into chunks of 50 and 5");
+        assert_eq!(payloads[0]["read_states"].as_array().unwrap().len(), 50);
+        assert_eq!(payloads[1]["read_states"].as_array().unwrap().len(), 5);
+        assert_eq!(payloads[0]["read_states"][0]["channel_id"], "chan1");
+        assert_eq!(payloads[0]["read_states"][0]["message_id"], "msg1");
+        assert_eq!(payloads[0]["read_states"][0]["read_state_type"], 0);
+    }
+
+    #[test]
+    fn forward_report_prove_passes() {
+        prove_forward_report().expect("forward and report");
     }
 }

@@ -534,12 +534,37 @@ impl MemberList {
                         .flex_col()
                         .child(
                             div()
-                                .truncate()
-                                // A phone's names are the size the other pages' rows are (Details, a
-                                // profile, the sidebar): 16, not the desktop's interface size scaled.
-                                .map(|name| if phone { name.type_body() } else { name.type_ui() })
-                                .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
-                                .child(label),
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .map(|name| if phone { name.type_body() } else { name.type_ui() })
+                                        .text_color(if away {
+                                            theme::text_faint()
+                                        } else if let Some(color) = person.role_color {
+                                            theme::role_color(color)
+                                        } else if phone {
+                                            theme::text()
+                                        } else {
+                                            theme::text_soft()
+                                        })
+                                        .child(label),
+                                )
+                                .children(person.role_icon.as_ref().and_then(|file| file.path.as_deref()).filter(|path| !path.is_empty()).map(|path| {
+                                    gpui::img(std::path::PathBuf::from(path))
+                                        .size(px(14.))
+                                        .rounded(px(3.))
+                                        .flex_none()
+                                }))
+                                .children(person.role_icon.is_none().then(|| {
+                                    person.role_emoji.as_deref().filter(|emoji| !emoji.is_empty()).map(|emoji| {
+                                        div().flex_none().text_size(px(13.)).line_height(px(14.)).child(emoji.to_owned())
+                                    })
+                                }).flatten()),
                         )
                         .when(show_second, |col| {
                             col.child(

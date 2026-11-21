@@ -1741,7 +1741,7 @@ fn marking_a_message_unread_moves_the_marker_back_and_a_manual_ack_does_too() {
 fn marking_everything_read_tells_discord_in_one_bulk_ack() {
     let world = World::start();
     assert!(world.conversation("3001").unread > 0);
-    assert_eq!(world.ask(Request::MarkAllRead { network: None, space: None }), Response::Ok);
+    assert_eq!(world.ask(Request::MarkAllRead { network: None, space: None, folder: None }), Response::Ok);
     assert_eq!(world.conversation("3001").unread, 0);
     let bulk = wait("the bulk ack", || {
         let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
@@ -1763,7 +1763,7 @@ fn marking_one_space_read_leaves_the_other_spaces_badges_alone() {
         (four > 0 && five > 0 && dm > 0).then_some(())
     });
     assert_eq!(
-        world.ask(Request::MarkAllRead { network: Some(Network::Discord), space: Some(world.key("4000")) }),
+        world.ask(Request::MarkAllRead { network: Some(Network::Discord), space: Some(world.key("4000")), folder: None }),
         Response::Ok
     );
     assert_eq!(world.conversation("4101").unread, 0, "the space's channels are read");
@@ -5545,4 +5545,176 @@ fn recent_mentions_fetch_filter_and_dismiss() {
         Response::Ok
     );
     assert_eq!(world.discord.requests_to("DELETE", "/users/@me/mentions/1300000000000090001").len(), 1);
+}
+
+#[test]
+fn forward_message_sends_type_1_reference_with_guild_id_content_note_and_refuses_read_only() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add a read-only channel 4199 in guild 4000 (SEND_MESSAGES = 2048 denied for @everyone).
+    ready["guilds"][0]["channels"].as_array_mut().unwrap().push(json!({
+        "id": "4199",
+        "type": 0,
+        "name": "readonly-log",
+        "position": 9,
+        "parent_id": "4100",
+        "permission_overwrites": [
+            {"id": "4000", "type": 0, "allow": "0", "deny": "2048"}
+        ]
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Advertises Capabilities::forward.
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap().can,
+        other => panic!("expected Status, got {other:?}"),
+    };
+    assert!(caps.forward, "Discord must advertise Capabilities::forward");
+
+    // Forward from guild channel 4101 to DM 3001 and read-only channel 4199 with an optional note.
+    let resp = world.ask(Request::Forward {
+        from: world.key("4101"),
+        message_ids: vec!["1300000000000000100".into()],
+        to: vec![world.key("3001"), world.key("4199")],
+        note: "See above!".into(),
+    });
+    match resp {
+        Response::Forwarded { results } => {
+            assert_eq!(results.len(), 2);
+            assert!(results[0].ok, "DM forward should succeed: {:?}", results[0]);
+            assert!(!results[1].ok, "read-only channel forward must be refused: {:?}", results[1]);
+            assert!(
+                results[1].error.as_deref().unwrap_or("").to_ascii_lowercase().contains("read-only"),
+                "expected read-only error, got {:?}",
+                results[1].error
+            );
+        }
+        other => panic!("expected Response::Forwarded, got {other:?}"),
+    }
+
+    // No HTTP POST should have been sent to read-only channel 4199.
+    assert!(world.discord.requests_to("POST", "/channels/4199/messages").is_empty());
+
+    // DM 3001 receives native forward (type: 1, content: "", guild_id: "4000") + follow-up note.
+    let dm_posts = world.discord.requests_to("POST", "/channels/3001/messages");
+    assert_eq!(dm_posts.len(), 2, "expected forward + note POSTs, got {dm_posts:?}");
+    assert_eq!(dm_posts[0].body["content"], json!(""));
+    assert_eq!(dm_posts[0].body["message_reference"]["type"], json!(1));
+    assert_eq!(dm_posts[0].body["message_reference"]["channel_id"], json!("4101"));
+    assert_eq!(dm_posts[0].body["message_reference"]["message_id"], json!("1300000000000000100"));
+    assert_eq!(dm_posts[0].body["message_reference"]["guild_id"], json!("4000"));
+    assert_eq!(dm_posts[1].body["content"], json!("See above!"));
+}
+
+#[test]
+fn report_message_posts_once_and_does_not_retry_rate_limit_or_captcha() {
+    let world = World::start();
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap().can,
+        other => panic!("expected Status, got {other:?}"),
+    };
+    assert!(can.abuse_reports, "Discord must advertise Capabilities::abuse_reports");
+
+    let target = protocol::ReportTarget::Message {
+        conversation: world.key("3001"),
+        message_id: "1300000010000000010".into(),
+    };
+    match world.ask(Request::ReportReasons { target: target.clone() }) {
+        Response::ReportReasons { reasons } => {
+            assert_eq!(
+                reasons,
+                vec![
+                    protocol::ReportReason::Spam,
+                    protocol::ReportReason::Harassment,
+                    protocol::ReportReason::Violence,
+                    protocol::ReportReason::Illegal,
+                    protocol::ReportReason::Impersonation,
+                ],
+                "only reasons with a real Discord message-report path"
+            );
+        }
+        other => panic!("expected ReportReasons, got {other:?}"),
+    }
+
+    world.discord.script("/reporting/message", 200, json!({"report_id": "9001"}));
+    let reported = world.ask(Request::Report {
+        target: target.clone(),
+        reason: protocol::ReportReason::Spam,
+        note: "unsolicited links".into(),
+        block: false,
+    });
+    assert!(matches!(reported, Response::Ok), "expected Ok reporting a message, got {reported:?}");
+    let posts = world.discord.requests_to("POST", "/reporting/message");
+    assert_eq!(posts.len(), 1, "one report is one POST, got {posts:?}");
+    assert_eq!(
+        posts[0].body,
+        json!({
+            "version": "1.0",
+            "variant": "98",
+            "language": "en",
+            "breadcrumbs": [7, 98],
+            "elements": {},
+            "channel_id": "3001",
+            "message_id": "1300000010000000010",
+            "name": "message",
+        })
+    );
+
+    world.discord.script("/reporting/message", 200, json!({"report_id": "9002"}));
+    let reported = world.ask(Request::Report {
+        target: target.clone(),
+        reason: protocol::ReportReason::Impersonation,
+        note: String::new(),
+        block: false,
+    });
+    assert!(matches!(reported, Response::Ok), "expected Ok reporting impersonation, got {reported:?}");
+    let posts = world.discord.requests_to("POST", "/reporting/message");
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[1].body["variant"], json!("163"));
+    assert_eq!(posts[1].body["breadcrumbs"], json!([7, 80, 121, 163]));
+
+    // A captcha fails this report only. It is not retried, and the session stays usable.
+    let captcha = json!({"captcha_key": ["captcha-required"], "captcha_sitekey": "a9b5fb07", "captcha_service": "hcaptcha"});
+    world.discord.script("/reporting/message", 400, captcha);
+    match world.ask(Request::Report {
+        target: target.clone(),
+        reason: protocol::ReportReason::Spam,
+        note: String::new(),
+        block: false,
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(
+                detail.to_lowercase().contains("check") || detail.to_lowercase().contains("captcha"),
+                "expected a captcha refusal, got {detail}"
+            );
+        }
+        other => panic!("expected captcha refusal, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("POST", "/reporting/message").len(), 3, "captcha is not retried");
+    assert!(world.required().is_empty(), "a report captcha must not lock the session: {:?}", world.required());
+    world.send("3002", "1730000000000000099", "still here", None);
+    assert_eq!(world.outcome("3002", "1730000000000000099").state, SendState::Sent);
+
+    // A 429 is not waited out. A success queued behind it must stay unused.
+    let limited = json!({"message": "You are being rate limited.", "retry_after": 0.3, "global": false});
+    world.discord.script("/reporting/message", 429, limited);
+    world.discord.script("/reporting/message", 200, json!({"report_id": "should-not-be-used"}));
+    match world.ask(Request::Report {
+        target,
+        reason: protocol::ReportReason::Spam,
+        note: String::new(),
+        block: false,
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.to_lowercase().contains("rate"), "expected a rate-limit refusal, got {detail}");
+        }
+        other => panic!("expected rate-limit refusal, got {other:?}"),
+    }
+    assert_eq!(
+        world.discord.requests_to("POST", "/reporting/message").len(),
+        4,
+        "a 429 on a report must not be retried"
+    );
 }

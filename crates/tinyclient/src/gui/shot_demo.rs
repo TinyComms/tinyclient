@@ -217,10 +217,10 @@ fn me_on(account: &AccountKey) -> Person {
 
 fn sender(id: &str) -> Sender {
     if id == ME {
-        return Sender { id: ME.into(), name: ME_NAME.into(), avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")), bot: false };
+        return Sender { id: ME.into(), name: ME_NAME.into(), avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")), bot: false, ..Sender::default() };
     }
     let who = who(id).expect("a person of the fixture");
-    Sender { id: id.into(), name: who.name.into(), avatar: who.photo.map(|name| face(who.id, name)), bot: false }
+    Sender { id: id.into(), name: who.name.into(), avatar: who.photo.map(|name| face(who.id, name)), bot: false, ..Sender::default() }
 }
 
 // Conversations.
