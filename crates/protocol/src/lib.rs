@@ -1682,9 +1682,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clear_at: Option<i64>,
     },
-    /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
-    /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is
-    /// the account that accepts a name, about, and about emoji.
+    /// Our own profile on one account. `None` leaves that part. An empty about, emoji,
+    /// username, or birthday clears it where supported. Signal accepts name, about, and about
+    /// emoji (refusing username/photo); Telegram accepts name, about, username, emoji status,
+    /// and birthday (and uses `SetAvatar` for profile photos).
     SetProfile {
         account: AccountKey,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1697,6 +1698,8 @@ pub enum Request {
         emoji: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        birthday: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         photo: bool,
     },

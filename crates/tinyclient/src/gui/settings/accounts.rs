@@ -424,36 +424,70 @@ impl SettingsWindow {
         if can.profile_pronouns {
             fields = fields.child(field_box("Pronouns", self.profile_pronouns.clone()));
         }
+        if can.profile_username {
+            fields = fields.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(field_box("Username", self.profile_username.clone()))
+                    .child(
+                        div()
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child("Changing or clearing your @username releases your old link immediately."),
+                    ),
+            );
+        }
+        if can.profile_birthday {
+            fields = fields.child(field_box("Birthday", self.profile_birthday.clone()));
+        }
+        if can.rich_status && key.network == Network::Telegram {
+            fields = fields.child(field_box("Emoji status (Premium)", self.profile_emoji_status.clone()));
+        }
         if can.profile_avatar {
             let avatar_key = key.clone();
+            let clear_key = key.clone();
             fields = fields.child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(div().type_small().text_color(theme::text_soft()).child("Profile picture"))
-                    .child(button("profile-pick-avatar", ButtonKind::Secondary, "Choose picture…").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            let avatar_key = avatar_key.clone();
-                            let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
-                                files: true,
-                                directories: false,
-                                multiple: false,
-                                prompt: Some("Choose profile picture".into()),
-                            });
-                            cx.spawn(async move |this, cx| {
-                                if let Ok(Ok(Some(paths))) = asked.await {
-                                    if let Some(path) = paths.into_iter().next() {
-                                        let path_str = path.to_string_lossy().into_owned();
-                                        let req = protocol::Request::SetAvatar { account: avatar_key, path: path_str };
-                                        let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
-                                        let _ = this.update(cx, |_, cx| cx.notify());
-                                    }
-                                }
-                            })
-                            .detach();
-                        },
-                    ))),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(button("profile-pick-avatar", ButtonKind::Secondary, "Choose picture…").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let avatar_key = avatar_key.clone();
+                                    let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                        files: true,
+                                        directories: false,
+                                        multiple: false,
+                                        prompt: Some("Choose profile picture".into()),
+                                    });
+                                    cx.spawn(async move |this, cx| {
+                                        if let Ok(Ok(Some(paths))) = asked.await {
+                                            if let Some(path) = paths.into_iter().next() {
+                                                let path_str = path.to_string_lossy().into_owned();
+                                                let req = protocol::Request::SetAvatar { account: avatar_key, path: path_str };
+                                                let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                                                let _ = this.update(cx, |_, cx| cx.notify());
+                                            }
+                                        }
+                                    })
+                                    .detach();
+                                },
+                            )))
+                            .child(button("profile-clear-avatar", ButtonKind::Ghost, "Remove").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let req = protocol::Request::SetAvatar { account: clear_key.clone(), path: String::new() };
+                                    this.off_thread(cx, move || crate::client::ask(&req), |_, _, cx| cx.notify());
+                                },
+                            ))),
+                    ),
             );
         }
         let save_key = key.clone();
@@ -461,13 +495,25 @@ impl SettingsWindow {
             let name = can.profile_name.then(|| this.profile_name.read(cx).text().trim().to_owned()).filter(|s| !s.is_empty());
             let about = can.profile_about.then(|| this.profile_about.read(cx).text().trim().to_owned());
             let pronouns = can.profile_pronouns.then(|| this.profile_pronouns.read(cx).text().trim().to_owned());
+            let username = can
+                .profile_username
+                .then(|| this.profile_username.read(cx).text().trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let birthday = can
+                .profile_birthday
+                .then(|| this.profile_birthday.read(cx).text().trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let emoji = (can.rich_status && save_key.network == Network::Telegram)
+                .then(|| this.profile_emoji_status.read(cx).text().trim().to_owned())
+                .filter(|s| !s.is_empty());
             let req = protocol::Request::SetProfile {
                 account: save_key.clone(),
                 name,
                 about,
                 pronouns,
-                emoji: None,
-                username: None,
+                emoji,
+                username,
+                birthday,
                 photo: false,
             };
             this.confirm = None;

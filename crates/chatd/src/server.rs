@@ -1838,6 +1838,7 @@ impl Chat {
         pronouns: Option<String>,
         emoji: Option<String>,
         username: Option<String>,
+        birthday: Option<String>,
         photo: bool,
     ) -> Response {
         if account.network == Network::Signal {
@@ -1862,7 +1863,15 @@ impl Chat {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        match self.ask(&account, |reply| Command::SetProfile { name, about, pronouns, reply }) {
+        match self.ask(&account, |reply| Command::SetProfile {
+            name,
+            about,
+            pronouns,
+            username,
+            emoji,
+            birthday,
+            reply,
+        }) {
             Ok(()) => {
                 self.forget_own_profile(&account, None);
                 Response::Ok
@@ -3339,8 +3348,8 @@ impl Chat {
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
-            Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
-                self.set_profile(account, name, about, pronouns, emoji, username, photo)
+            Request::SetProfile { account, name, about, pronouns, emoji, username, birthday, photo } => {
+                self.set_profile(account, name, about, pronouns, emoji, username, birthday, photo)
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),

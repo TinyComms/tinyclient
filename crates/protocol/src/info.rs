@@ -604,6 +604,10 @@ pub struct Capabilities {
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_avatar: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_username: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_birthday: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub profile_nickname: bool,
     /// Most chats this account may pin on the network (`Request::File`). 0: cannot pin.
     /// Telegram allows 5 without Premium and 10 with Premium.
@@ -882,7 +886,13 @@ impl Capabilities {
 
     /// True if any own-profile field (name, about, pronouns, avatar) can be edited on this network.
     pub fn can_edit_profile(&self) -> bool {
-        self.profile_name || self.profile_about || self.profile_pronouns || self.profile_avatar
+        self.profile_name
+            || self.profile_about
+            || self.profile_pronouns
+            || self.profile_avatar
+            || self.profile_username
+            || self.profile_birthday
+            || self.rich_status
     }
 }
 
@@ -1148,6 +1158,7 @@ mod tests {
                 pronouns: Some("she/her".into()),
                 emoji: None,
                 username: None,
+                birthday: None,
                 photo: false,
             },
             Request::SetAvatar { account: account.clone(), path: "/tmp/avatar.png".into() },

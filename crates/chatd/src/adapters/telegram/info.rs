@@ -260,6 +260,169 @@ pub(super) fn set_disappearing(account: &Account, conversation: &str, seconds: u
     Ok(())
 }
 
+/// Parses `"YYYY-MM-DD"`, `"MM-DD"`, `"--MM-DD"`, or empty string (clear) into Telegram's `Birthday`.
+pub(super) fn parse_birthday(raw: &str) -> Result<Option<tl::enums::Birthday>, Fault> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let stripped = trimmed.strip_prefix("--").unwrap_or(trimmed);
+    let parts: Vec<&str> = stripped.split('-').collect();
+    let (year, month, day) = match parts.as_slice() {
+        [y, m, d] => {
+            let y: i32 = y.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let m: i32 = m.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let d: i32 = d.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            if !(1900..=2100).contains(&y) {
+                return Err(Fault::Net("Birthday year must be between 1900 and 2100.".to_owned()));
+            }
+            (Some(y), m, d)
+        }
+        [m, d] => {
+            let m: i32 = m.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let d: i32 = d.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            (None, m, d)
+        }
+        _ => return Err(Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned())),
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(Fault::Net("Enter a valid calendar date for birthday.".to_owned()));
+    }
+    Ok(Some(tl::types::Birthday { day, month, year }.into()))
+}
+
+/// Parses a custom emoji status specifier (`""` clears; `"5002"` or `"e5002"` sets by document id).
+pub(super) fn parse_emoji_status(raw: &str, until: Option<i64>) -> Result<tl::enums::EmojiStatus, Fault> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(tl::enums::EmojiStatus::Empty);
+    }
+    let digits = trimmed.strip_prefix('e').unwrap_or(trimmed);
+    let document_id = digits
+        .parse::<i64>()
+        .map_err(|_| Fault::Net("Choose a custom emoji id for your Telegram emoji status.".to_owned()))?;
+    let until = until.and_then(|ts| i32::try_from(ts).ok()).filter(|&ts| ts > 0);
+    Ok(tl::types::EmojiStatus { document_id, until }.into())
+}
+
+fn refresh_own_identity(account: &Account) {
+    let (name, premium) = {
+        let dir = account.dir();
+        (dir.name(Who::User(account.me)), dir.get(Who::User(account.me)).is_some_and(|known| known.premium))
+    };
+    if !name.is_empty() {
+        let shown = if premium { format!("{name} · Premium") } else { name };
+        let _ = account.ctx.describe(&shown, &Who::User(account.me).text());
+    }
+}
+
+/// Updates our own Telegram profile fields: name, bio, username, birthday, and/or emoji status.
+pub(super) fn set_profile(
+    account: &Account,
+    name: Option<String>,
+    about: Option<String>,
+    username: Option<String>,
+    emoji: Option<String>,
+    birthday: Option<String>,
+) -> Result<(), Fault> {
+    if name.is_some() || about.is_some() {
+        let (first_name, last_name) = match name {
+            Some(ref full) => {
+                let trimmed = full.trim();
+                if trimmed.is_empty() {
+                    return Err(Fault::Net("First name cannot be empty.".to_owned()));
+                }
+                let (first, last) = super::split_name(trimmed);
+                (Some(first), Some(last))
+            }
+            None => (None, None),
+        };
+        let updated = account.ask(&tl::functions::account::UpdateProfile {
+            first_name,
+            last_name,
+            about: about.map(|s| s.trim().to_owned()),
+        })?;
+        account.learn(&[updated], &[]);
+        refresh_own_identity(account);
+    }
+    if let Some(raw_username) = username {
+        let bare = raw_username.trim().trim_start_matches('@').to_owned();
+        if !bare.is_empty() {
+            let valid = (5..=32).contains(&bare.len()) && bare.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if !valid {
+                return Err(Fault::Net("Telegram usernames must be 5–32 letters, digits, or underscores.".to_owned()));
+            }
+            let available = account.ask(&tl::functions::account::CheckUsername { username: bare.clone() })?;
+            if !available {
+                return Err(Fault::Net(format!("@{bare} is already taken or unavailable.")));
+            }
+        }
+        let updated = account.ask(&tl::functions::account::UpdateUsername { username: bare })?;
+        account.learn(&[updated], &[]);
+        refresh_own_identity(account);
+    }
+    if let Some(raw_birthday) = birthday {
+        let parsed = parse_birthday(&raw_birthday)?;
+        account.ask(&tl::functions::account::UpdateBirthday { birthday: parsed })?;
+    }
+    if let Some(raw_emoji) = emoji {
+        set_emoji_status(account, &raw_emoji, None)?;
+    }
+    Ok(())
+}
+
+/// Sets or clears our Telegram Premium emoji status (`account.updateEmojiStatus`).
+/// Never calls `account.updateStatus { offline: true }`.
+pub(super) fn set_emoji_status(account: &Account, raw: &str, until: Option<i64>) -> Result<(), Fault> {
+    let status = parse_emoji_status(raw, until)?;
+    match account.ask(&tl::functions::account::UpdateEmojiStatus { emoji_status: status }) {
+        Ok(_) => Ok(()),
+        Err(fault) if fault.is("PREMIUM_ACCOUNT_REQUIRED") => {
+            Err(Fault::Net("Setting an emoji status requires Telegram Premium.".to_owned()))
+        }
+        Err(fault) => Err(fault),
+    }
+}
+
+/// Uploads a new profile photo (`photos.uploadProfilePhoto`) or deletes the current one
+/// (`photos.getUserPhotos` + `photos.deletePhotos`) when `path` is empty.
+pub(super) fn set_avatar(account: &Account, path: &str) -> Result<(), Fault> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        let listed = account.ask(&tl::functions::photos::GetUserPhotos {
+            user_id: tl::enums::InputUser::UserSelf,
+            offset: 0,
+            max_id: 0,
+            limit: 1,
+        })?;
+        let photos = match listed {
+            tl::enums::photos::Photos::Photos(p) => p.photos,
+            tl::enums::photos::Photos::Slice(p) => p.photos,
+        };
+        if let Some(tl::enums::Photo::Photo(first)) = photos.into_iter().next() {
+            let input: tl::enums::InputPhoto = tl::types::InputPhoto {
+                id: first.id,
+                access_hash: first.access_hash,
+                file_reference: first.file_reference,
+            }
+            .into();
+            account.ask(&tl::functions::photos::DeletePhotos { id: vec![input] })?;
+        }
+        return Ok(());
+    }
+    let file = super::send::upload_input_file(account, "own-avatar", trimmed).map_err(Fault::Net)?;
+    let tl::enums::photos::Photo::Photo(saved) = account.ask(&tl::functions::photos::UploadProfilePhoto {
+        fallback: false,
+        bot: None,
+        file: Some(file),
+        video: None,
+        video_start_ts: None,
+        video_emoji_markup: None,
+    })?;
+    account.learn(&saved.users, &[]);
+    Ok(())
+}
+
 /// The network's own mute. Telegram has no "mentions only" for a chat: a muted chat still
 /// counts its mentions, so that is what `Mentions` sets (unverified that every app notifies them).
 /// `until` is when that mute ends, as Unix seconds. Absent is muted until it is turned off.
@@ -1010,5 +1173,27 @@ mod tests {
         assert_eq!(pick_report_option(&opts, protocol::ReportReason::Spam).as_deref(), Some(&b"spam"[..]));
         assert_eq!(pick_report_option(&opts, protocol::ReportReason::Violence).as_deref(), Some(&b"violence"[..]));
         assert_eq!(pick_report_option(&opts, protocol::ReportReason::Impersonation).as_deref(), Some(&b"other"[..]));
+    }
+
+    #[test]
+    fn parse_birthday_and_emoji_status_validate_inputs() {
+        assert_eq!(parse_birthday("").unwrap(), None);
+        assert_eq!(
+            parse_birthday("1994-03-14").unwrap(),
+            Some(tl::types::Birthday { day: 14, month: 3, year: Some(1994) }.into())
+        );
+        assert_eq!(
+            parse_birthday("--07-04").unwrap(),
+            Some(tl::types::Birthday { day: 4, month: 7, year: None }.into())
+        );
+        assert!(parse_birthday("1994-13-01").is_err());
+        assert!(parse_birthday("not-a-date").is_err());
+
+        assert_eq!(parse_emoji_status("", None).unwrap(), tl::enums::EmojiStatus::Empty);
+        assert_eq!(
+            parse_emoji_status("e5002", Some(1_800_000_000)).unwrap(),
+            tl::types::EmojiStatus { document_id: 5002, until: Some(1_800_000_000) }.into()
+        );
+        assert!(parse_emoji_status("not_an_id", None).is_err());
     }
 }

@@ -3963,3 +3963,98 @@ fn replace_media_and_edit_caption_formatting() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn edit_own_profile_name_bio_username_avatar_birthday_and_emoji_status() {
+    let world = World::signed_in();
+    world.connected();
+
+    let me = key("u7001");
+    let account = me.account();
+
+    // Update name, bio, username, and birthday in one SetProfile call.
+    assert_eq!(
+        world.ask(Request::SetProfile {
+            account: account.clone(),
+            name: Some("Mira Vance".into()),
+            about: Some("Alpine maps and trails".into()),
+            pronouns: None,
+            emoji: None,
+            username: Some("@mira_vance".into()),
+            birthday: Some("1994-03-14".into()),
+            photo: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UpdateProfile Mira Vance | Alpine maps and trails"), 1);
+    assert_eq!(world.called("CheckUsername mira_vance"), 1);
+    assert_eq!(world.called("UpdateUsername mira_vance"), 1);
+    assert_eq!(world.called("UpdateBirthday 1994-3-14"), 1);
+
+    // Own profile card reflects the updated name, bio, username, and birthday.
+    let Response::Profile { person, about } = world.ask(Request::Profile { person: me.clone(), space: None }) else {
+        panic!("expected Profile");
+    };
+    assert_eq!(person.name, "Mira Vance");
+    assert_eq!(about.bio, "Alpine maps and trails");
+    assert!(about.fields.iter().any(|(k, v)| k == "Username" && v == "@mira_vance"), "{:?}", about.fields);
+    assert!(about.fields.iter().any(|(k, v)| k == "Birthday" && v == "14 March 1994"), "{:?}", about.fields);
+
+    // Taken username is checked and refused cleanly without calling UpdateUsername.
+    let taken = world.ask(Request::SetProfile {
+        account: account.clone(),
+        name: None,
+        about: None,
+        pronouns: None,
+        emoji: None,
+        username: Some("taken_name".into()),
+        birthday: None,
+        photo: false,
+    });
+    assert!(matches!(taken, Response::Error { code: ErrorCode::Refused, .. }), "{taken:?}");
+    assert_eq!(world.called("UpdateUsername taken_name"), 0);
+
+    // Upload a new profile photo and then remove it via SetAvatar.
+    let dir = std::env::temp_dir().join(format!("tinyclient-tg-avatar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let avatar = dir.join("me.jpg");
+    std::fs::write(&avatar, vec![5u8; 2_048]).unwrap();
+    assert_eq!(
+        world.ask(Request::SetAvatar {
+            account: account.clone(),
+            path: avatar.to_string_lossy().into_owned(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UploadProfilePhoto"), 1);
+    assert_eq!(world.ask(Request::SetAvatar { account: account.clone(), path: String::new() }), Response::Ok);
+    assert_eq!(world.called("GetUserPhotos"), 1);
+    assert_eq!(world.called("DeletePhotos 1"), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Non-Premium account setting emoji status gets a clear Premium refusal and never sends UpdateStatus offline.
+    let emoji_err = world.ask(Request::SetPresence {
+        account: account.clone(),
+        presence: Presence::Online,
+        status: None,
+        status_emoji: Some("5002".into()),
+        clear_at: Some(1_800_000_000),
+    });
+    assert!(
+        matches!(emoji_err, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("Premium")),
+        "{emoji_err:?}"
+    );
+    // Clearing emoji status succeeds cleanly.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: None,
+            status_emoji: Some(String::new()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UpdateEmojiStatus clear"), 1);
+    assert_eq!(world.called("UpdateStatus"), 0, "never send account.updateStatus offline from status edits");
+}

@@ -727,7 +727,7 @@ impl Demo {
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
             }
-            Command::SetProfile { name: _, about, pronouns: _, reply } => {
+            Command::SetProfile { about, reply, .. } => {
                 if let Some(about) = about {
                     let (presence, _) = demo.hub.shown(&demo.key(&demo.me.id));
                     demo.ctx.presence(&demo.me.id, presence, &about, true);

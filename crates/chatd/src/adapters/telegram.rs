@@ -726,6 +726,9 @@ fn offline(ctx: &Context, command: Command) {
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SetProfile { reply, .. } | Command::SetAvatar { reply, .. } | Command::SetPresence { reply, .. } => {
+            drop(reply.send(Err(down())))
+        }
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
         Command::ResolveUsername { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
@@ -825,6 +828,21 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ProfileIn { person_id, space_id, reply } => {
             let _ = reply.send(info::profile_in(account, &person_id, &space_id).map_err(refused));
+        }
+        Command::SetProfile { name, about, pronouns: _, username, emoji, birthday, reply } => {
+            let _ = reply.send(info::set_profile(account, name, about, username, emoji, birthday).map_err(refused));
+        }
+        Command::SetAvatar { path, reply } => {
+            let _ = reply.send(info::set_avatar(account, &path).map_err(refused));
+        }
+        Command::SetPresence { status_emoji, clear_at, reply, .. } => {
+            // Telegram has no manual offline/away switch (and must never send updateStatus offline);
+            // the status slot carries Telegram Premium emoji status with an optional expiry timer.
+            let outcome = match status_emoji {
+                Some(emoji) => info::set_emoji_status(account, &emoji, clear_at).map_err(refused),
+                None => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(outcome);
         }
         Command::ConversationInfo { conversation_id, reply } => {
             let _ = reply.send(info::conversation(account, &conversation_id).map_err(refused));

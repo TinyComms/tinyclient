@@ -765,6 +765,9 @@ pub enum Command {
         name: Option<String>,
         about: Option<String>,
         pronouns: Option<String>,
+        username: Option<String>,
+        emoji: Option<String>,
+        birthday: Option<String>,
         reply: Reply<()>,
     },
     /// Set (or clear, when `path` is empty) our own profile picture from a local file path.

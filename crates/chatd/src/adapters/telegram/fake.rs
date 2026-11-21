@@ -562,6 +562,15 @@ struct World {
     noforwards: HashSet<Who>,
     /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
     saved_gifs: Vec<i64>,
+    /// Mutable own-profile fields updated by `account.updateProfile`, `updateUsername`,
+    /// `updateBirthday`, `updateEmojiStatus`, and `photos.uploadProfilePhoto`/`deletePhotos`.
+    me_first: String,
+    me_last: String,
+    me_username: String,
+    me_about: String,
+    me_birthday: Option<tl::enums::Birthday>,
+    me_emoji_status: Option<i64>,
+    me_photo_id: Option<i64>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -631,6 +640,13 @@ impl World {
             large_broke: false,
             noforwards: HashSet::new(),
             saved_gifs: vec![6_200],
+            me_first: "Mira".to_owned(),
+            me_last: "Kessler".to_owned(),
+            me_username: "mira_k".to_owned(),
+            me_about: "Maps, mostly.".to_owned(),
+            me_birthday: None,
+            me_emoji_status: None,
+            me_photo_id: Some(5_001),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -779,16 +795,26 @@ impl World {
     }
 
     fn self_user(&self) -> tl::types::User {
-        let (id, first, last) = if self.as_other {
-            (7_101, "Lea".to_owned(), "Hart".to_owned())
+        let (id, first, last, username) = if self.as_other {
+            (7_101, "Lea".to_owned(), "Hart".to_owned(), String::new())
         } else if self.me != ME && self.me != 0 {
             let mut parts = self.me_name.splitn(2, ' ');
-            (self.me, parts.next().unwrap_or("Account").to_owned(), parts.next().unwrap_or("").to_owned())
+            (self.me, parts.next().unwrap_or("Account").to_owned(), parts.next().unwrap_or("").to_owned(), String::new())
         } else {
-            return user(ME, "Mira", "Kessler", "mira_k");
+            (ME, self.me_first.clone(), self.me_last.clone(), self.me_username.clone())
         };
-        let mut person = user(id, &first, &last, "");
+        let mut person = user(id, &first, &last, &username);
         person.is_self = true;
+        if id == ME {
+            if let Some(pid) = self.me_photo_id {
+                person.photo = Some(
+                    tl::types::UserProfilePhoto { has_video: false, personal: false, photo_id: pid, stripped_thumb: None, dc_id: 2 }.into(),
+                );
+            }
+            if let Some(doc_id) = self.me_emoji_status {
+                person.emoji_status = Some(tl::types::EmojiStatus { document_id: doc_id, until: None }.into());
+            }
+        }
         person
     }
 
@@ -2706,6 +2732,13 @@ impl World {
             full.phone_calls_private = phone_priv;
             full.video_calls_available = video_avail;
             let mut people = users();
+            if id == ME {
+                full.about = Some(self.me_about.clone());
+                full.birthday = self.me_birthday.clone();
+                if let Some(slot) = people.iter_mut().find(|one| matches!(one, tl::enums::User::User(u) if u.id == ME)) {
+                    *slot = self.self_user().into();
+                }
+            }
             if id == TOBIN {
                 full.birthday = Some(tl::types::Birthday { day: 14, month: 3, year: None }.into());
                 full.business_location = Some(tl::types::BusinessLocation { geo_point: None, address: "The hut".to_owned() }.into());
@@ -2723,6 +2756,88 @@ impl World {
             }
             let found = tl::types::users::UserFull { full_user: full.into(), chats: Vec::new(), users: people };
             return answer(tl::enums::users::UserFull::Full(found));
+        }
+        if let Some(request) = asked::<f::account::UpdateProfile>(body) {
+            if let Some(first) = request.first_name {
+                self.me_first = first;
+            }
+            if let Some(last) = request.last_name {
+                self.me_last = last;
+            }
+            if let Some(about) = request.about {
+                self.me_about = about;
+            }
+            self.log(&format!("UpdateProfile {} {} | {}", self.me_first, self.me_last, self.me_about));
+            return answer(tl::enums::User::from(self.self_user()));
+        }
+        if let Some(request) = asked::<f::account::CheckUsername>(body) {
+            self.log(&format!("CheckUsername {}", request.username));
+            let ok = !matches!(request.username.to_ascii_lowercase().as_str(), "taken_name" | "odalys");
+            return answer(ok);
+        }
+        if let Some(request) = asked::<f::account::UpdateUsername>(body) {
+            self.log(&format!("UpdateUsername {}", request.username));
+            self.me_username = request.username;
+            return answer(tl::enums::User::from(self.self_user()));
+        }
+        if let Some(request) = asked::<f::account::UpdateBirthday>(body) {
+            self.me_birthday = request.birthday.clone();
+            let note = match &request.birthday {
+                Some(tl::enums::Birthday::Birthday(b)) => format!("{}-{}-{}", b.year.unwrap_or(0), b.month, b.day),
+                None => "clear".to_owned(),
+            };
+            self.log(&format!("UpdateBirthday {note}"));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::account::UpdateEmojiStatus>(body) {
+            let premium = self.self_user().premium;
+            match request.emoji_status {
+                tl::enums::EmojiStatus::Empty => {
+                    self.me_emoji_status = None;
+                    self.log("UpdateEmojiStatus clear");
+                    return answer(true);
+                }
+                tl::enums::EmojiStatus::Status(st) => {
+                    if !premium {
+                        return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+                    }
+                    self.me_emoji_status = Some(st.document_id);
+                    self.log(&format!("UpdateEmojiStatus {} until={:?}", st.document_id, st.until));
+                    return answer(true);
+                }
+                _ => return answer(true),
+            }
+        }
+        if asked::<f::photos::UploadProfilePhoto>(body).is_some() {
+            self.me_photo_id = Some(6_900);
+            self.log("UploadProfilePhoto");
+            let saved = tl::types::photos::Photo {
+                photo: photo(6_900),
+                users: vec![self.self_user().into()],
+            };
+            return answer(tl::enums::photos::Photo::Photo(saved));
+        }
+        if asked::<f::photos::GetUserPhotos>(body).is_some() {
+            self.log("GetUserPhotos");
+            let photos: Vec<tl::enums::Photo> = self.me_photo_id.map(photo).into_iter().collect();
+            let listed = tl::types::photos::Photos {
+                photos,
+                users: vec![self.self_user().into()],
+            };
+            return answer(tl::enums::photos::Photos::Photos(listed));
+        }
+        if let Some(request) = asked::<f::photos::DeletePhotos>(body) {
+            self.log(&format!("DeletePhotos {}", request.id.len()));
+            self.me_photo_id = None;
+            let ids: Vec<i64> = request
+                .id
+                .into_iter()
+                .filter_map(|p| match p {
+                    tl::enums::InputPhoto::Photo(p) => Some(p.id),
+                    _ => None,
+                })
+                .collect();
+            return answer(ids);
         }
         if let Some(request) = asked::<f::messages::GetCommonChats>(body) {
             let id = match &request.user_id {
