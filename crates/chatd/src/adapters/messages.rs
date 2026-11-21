@@ -12,7 +12,10 @@ mod fake;
 mod media;
 pub mod signin;
 
-use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, SharedPage, Signed};
+use super::{
+    keep_connected, serve_commands, Command, Context, ConversationAbout, Failure, Members, Refusal,
+    SharedPage, Signed,
+};
 use crate::blobs;
 use crate::blobs::upload;
 use crate::session;
@@ -685,6 +688,22 @@ fn connect(
     ended
 }
 
+fn peer_phone(chat: &Chat) -> Option<String> {
+    if chat.group {
+        return None;
+    }
+    let raw = chat
+        .participants
+        .iter()
+        .find(|p| !p.is_me && !p.number.is_empty())
+        .map(|p| p.number.as_str())?;
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '+')
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 fn row(chat: &Chat) -> ConversationRow {
     let kind = if chat.group {
         ConversationKind::Group
@@ -694,8 +713,12 @@ fn row(chat: &Chat) -> ConversationRow {
     let mut row = ConversationRow::new(chat.id.clone(), kind, chat.title.clone());
     row.listed = true;
     row.private = !chat.group;
-    // A call stays on the phone. The row opens messages.google.com.
-    row.call = protocol::CallSupport::Handoff;
+    // A 1:1 chat with a phone number hands off to the OS `tel:` handler; groups have no call button.
+    row.call = if peer_phone(chat).is_some() {
+        protocol::CallSupport::Handoff
+    } else {
+        protocol::CallSupport::None
+    };
     if !chat.group && !chat.mine.is_empty() {
         row.peer = Some(chat.id.clone());
     }
@@ -731,6 +754,7 @@ fn file_as(account: &Account, id: &str, status: u64) {
             updated: 0,
             phones: false,
             status,
+            participants: Vec::new(),
         });
         chat.status = status;
         chat
@@ -767,6 +791,9 @@ fn remember(account: &Account, incoming: &[Chat]) -> Vec<Chat> {
             if chat.status == 0 {
                 chat.status = had.status;
             }
+            if chat.participants.is_empty() {
+                chat.participants = had.participants.clone();
+            }
         }
         held.insert(chat.id.clone(), chat.clone());
         kept.push(chat);
@@ -791,6 +818,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
             updated: 0,
             phones: false,
             status: 0,
+            participants: Vec::new(),
         });
         chat.phones = on;
         chat.clone()
@@ -865,6 +893,7 @@ fn apply(account: &Account, event: Event) {
                     updated: 0,
                     phones: false,
                     status: 0,
+                    participants: Vec::new(),
                 };
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));
@@ -885,15 +914,13 @@ fn apply(account: &Account, event: Event) {
             name,
             started,
         } => {
+            let (person_id, resolved_name) = resolve_typist(account, &conversation, &by, &name);
             if started {
-                let name = if name.is_empty() {
-                    "Someone".into()
-                } else {
-                    name
-                };
-                account.ctx.typing(&conversation, &by, &name, TYPING_SHOWN);
+                account
+                    .ctx
+                    .typing(&conversation, &person_id, &resolved_name, TYPING_SHOWN);
             } else {
-                account.ctx.typing_stopped(&conversation, &by);
+                account.ctx.typing_stopped(&conversation, &person_id);
             }
             nudge(account);
         }
@@ -902,6 +929,72 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Ready | Event::Closed(_) | Event::Ended(_) => {}
     }
+}
+
+fn digits_only(text: &str) -> String {
+    text.chars().filter(char::is_ascii_digit).collect()
+}
+
+fn looks_like_number(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().any(|c| c.is_ascii_digit())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' ' | '.'))
+}
+
+fn resolve_typist(account: &Account, conversation: &str, by: &str, name: &str) -> (String, String) {
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned();
+    if let Some(chat) = chat {
+        if !chat.group {
+            let display = if !chat.title.is_empty() && !looks_like_number(&chat.title) {
+                chat.title.clone()
+            } else if let Some(found) = chat
+                .participants
+                .iter()
+                .find(|p| !p.is_me && !p.name.is_empty() && !looks_like_number(&p.name))
+            {
+                found.name.clone()
+            } else if !name.is_empty() && !looks_like_number(name) {
+                name.to_owned()
+            } else {
+                "Someone".to_owned()
+            };
+            return (chat.id, display);
+        }
+        let by_digits = digits_only(by);
+        if let Some(participant) = chat.participants.iter().find(|p| {
+            (!p.id.is_empty() && p.id == by)
+                || (!p.number.is_empty() && p.number == by)
+                || (!by_digits.is_empty()
+                    && !p.number.is_empty()
+                    && digits_only(&p.number) == by_digits)
+        }) {
+            let pid = if !participant.id.is_empty() {
+                participant.id.clone()
+            } else {
+                by.to_owned()
+            };
+            let display = if !participant.name.is_empty() && !looks_like_number(&participant.name) {
+                participant.name.clone()
+            } else {
+                "Someone".to_owned()
+            };
+            return (pid, display);
+        }
+    }
+    let display = if !name.is_empty() && !looks_like_number(name) {
+        name.to_owned()
+    } else {
+        "Someone".to_owned()
+    };
+    (by.to_owned(), display)
 }
 
 fn saw(account: &Account, note: &bugle::Note) {
@@ -1621,8 +1714,29 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answer.map_err(Refusal::Refused));
         }
-        Command::Handoff { reply, .. } => {
-            let _ = reply.send(Ok("https://messages.google.com/web/".to_owned()));
+        Command::Members {
+            conversation_id,
+            offset,
+            limit,
+            reply,
+        } => {
+            let _ = reply.send(members(account, &conversation_id, offset, limit));
+        }
+        Command::ConversationInfo {
+            conversation_id,
+            reply,
+        } => {
+            let _ = reply.send(conversation_info(account, &conversation_id));
+        }
+        Command::Handoff { conversation_id, reply } => {
+            let url = account
+                .chats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&conversation_id)
+                .and_then(peer_phone)
+                .map(|number| format!("tel:{number}"));
+            let _ = reply.send(url.ok_or(Refusal::Unsupported));
         }
         Command::SignOut(reply) => {
             if let Err(why) = account.drive.unpair() {
@@ -2509,6 +2623,70 @@ fn ask_fill(account: &Account) {
 
 /// Media, files and links from the messages already read. Only once this chat has been read back
 /// to its start, so the list is the whole chat and not a page that was still loading.
+fn members(
+    account: &Account,
+    conversation: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Members, Refusal> {
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned()
+        .ok_or_else(|| Refusal::Refused("no such conversation".into()))?;
+    let slice = chat
+        .participants
+        .iter()
+        .skip(offset as usize)
+        .take(limit as usize);
+    let members = slice
+        .map(|participant| {
+            let id = if !participant.id.is_empty() {
+                participant.id.clone()
+            } else if !participant.number.is_empty() {
+                participant.number.clone()
+            } else {
+                conversation.to_owned()
+            };
+            let name = if !participant.name.is_empty() {
+                participant.name.clone()
+            } else if participant.is_me && !account.name.is_empty() {
+                account.name.clone()
+            } else if !participant.number.is_empty() {
+                participant.number.clone()
+            } else {
+                "Messages".to_owned()
+            };
+            protocol::Person::new(account.ctx.key(&id), name)
+        })
+        .collect();
+    Ok(Members {
+        pending: false,
+        sections: Vec::new(),
+        members,
+    })
+}
+
+fn conversation_info(
+    account: &Account,
+    conversation: &str,
+) -> Result<ConversationAbout, Refusal> {
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned()
+        .ok_or_else(|| Refusal::Refused("no such conversation".into()))?;
+    let members = (!chat.participants.is_empty()).then_some(chat.participants.len() as u32);
+    Ok(ConversationAbout {
+        members,
+        ..ConversationAbout::default()
+    })
+}
+
 fn shared(
     account: &Account,
     conversation: &str,

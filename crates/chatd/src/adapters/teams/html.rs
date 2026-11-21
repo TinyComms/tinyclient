@@ -1155,6 +1155,72 @@ pub(super) fn compose(text: &str) -> String {
     compose_rich(text).0
 }
 
+/// Composes HTML with Teams `<span itemscope="" itemtype="http://schema.skype.com/Mention" itemid="N">`
+/// markup and returns the matching `properties.mentions` JSON entries for explicit mention spans.
+pub(super) fn compose_with_mentions(text: &str, spans: &[Span]) -> (String, Vec<serde_json::Value>) {
+    let mut live: Vec<(usize, usize, MentionKind, &str)> = spans
+        .iter()
+        .filter_map(|span| {
+            let Style::Mention { kind, id } = &span.style else {
+                return None;
+            };
+            let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
+                return None;
+            };
+            if start >= end
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+                || id.is_empty()
+            {
+                return None;
+            }
+            Some((start, end, *kind, id.as_str()))
+        })
+        .collect();
+    if live.is_empty() {
+        return (compose(text), Vec::new());
+    }
+    live.sort_by_key(|(start, _, _, _)| *start);
+    let mut out = String::with_capacity(text.len() + live.len() * 80);
+    out.push_str("<p>");
+    let mut mentions = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end, kind, id) in live {
+        if start < cursor {
+            continue;
+        }
+        if start > cursor {
+            inline_into(&mut out, &normalized(&text[cursor..start]));
+        }
+        let item_id = mentions.len().to_string();
+        let display = text[start..end].trim_start_matches('@');
+        let mention_type = match kind {
+            MentionKind::User => "person",
+            MentionKind::Role => "tag",
+            MentionKind::Channel | MentionKind::Everyone => "channel",
+        };
+        out.push_str("<span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"");
+        out.push_str(&item_id);
+        out.push_str("\">");
+        escape_text(&mut out, display, false);
+        out.push_str("</span>");
+        mentions.push(serde_json::json!({
+            "@type": MENTION,
+            "itemid": item_id,
+            "mri": id,
+            "mentionType": mention_type,
+            "displayName": display,
+        }));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        inline_into(&mut out, &normalized(&text[cursor..]));
+    }
+    out.push_str("</p>");
+    (out, mentions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,5 +1414,29 @@ mod tests {
         let (shown, spans) = styled("**today**");
         assert_eq!(shown, "today");
         assert!(spans.iter().any(|span| span.style == Style::Bold));
+    }
+
+    #[test]
+    fn compose_with_mentions_writes_mention_markup_and_properties() {
+        let text = "hi @Ana Ruiz, check this";
+        let start = text.find("@Ana Ruiz").unwrap() as u32;
+        let end = start + "@Ana Ruiz".len() as u32;
+        let (html, mentions) = compose_with_mentions(
+            text,
+            &[Span {
+                start,
+                end,
+                style: Style::Mention { kind: MentionKind::User, id: "8:orgid:ana".into() },
+            }],
+        );
+        assert_eq!(
+            html,
+            "<p>hi <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Ana Ruiz</span>, check this</p>"
+        );
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0]["itemid"], "0");
+        assert_eq!(mentions[0]["mri"], "8:orgid:ana");
+        assert_eq!(mentions[0]["mentionType"], "person");
+        assert_eq!(mentions[0]["displayName"], "Ana Ruiz");
     }
 }

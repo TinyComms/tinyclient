@@ -67,6 +67,17 @@ pub fn source(network: Network, tab: Tab, page: &Page) -> Source {
     // CONTRACT: Teams has no confirmed route to a chat's files, so its list is never searched.
     match network {
         Network::Teams => Source { line, search: false, open_in: true },
+        // Signal keeps nothing on its servers; the local cache is all there is.
+        Network::Signal => {
+            let line = match (tab, count) {
+                (Tab::Kind(SharedKind::Media | SharedKind::Files), 0) => {
+                    "Photos and files from Signal are not shown yet".to_owned()
+                }
+                (_, 0) => "From messages on this computer".to_owned(),
+                (_, count) => format!("From messages on this computer · {count}"),
+            };
+            Source { line, search: false, open_in: false }
+        }
         // Tiny and Messages have no shared search. Slack has no links list, so that tab
         // must not offer a search that the network refuses and then wipes the cache.
         Network::Tiny | Network::Messages => Source { line, search: false, open_in: false },
@@ -83,7 +94,7 @@ pub fn tab_count(page: &Page) -> Option<u32> {
 /// The tabs a network has. Pinned is hidden where the network does not serve it.
 pub fn tabs(network: Network) -> Vec<Tab> {
     let mut tabs = vec![Tab::Kind(SharedKind::Media), Tab::Kind(SharedKind::Files), Tab::Kind(SharedKind::Links)];
-    if !matches!(network, Network::Teams | Network::Messages | Network::Tiny) {
+    if !matches!(network, Network::Teams | Network::Messages | Network::Tiny | Network::Signal) {
         tabs.push(Tab::Pinned);
     }
     tabs
@@ -512,6 +523,26 @@ mod tests {
         assert!(!source(Network::Slack, Tab::Kind(SharedKind::Links), &slack_links).search);
         assert!(source(Network::Slack, Tab::Kind(SharedKind::Files), &slack_links).search);
         assert!(!source(Network::Messages, Tab::Kind(SharedKind::Media), &slack_links).search);
+    }
+
+    #[test]
+    fn signal_has_no_pinned_tab_or_shared_search() {
+        assert_eq!(tabs(Network::Signal).len(), 3);
+        assert!(!tabs(Network::Signal).contains(&Tab::Pinned));
+        let empty = Page { read: true, ..Page::default() };
+        let cached = Page { items: vec![item(), item()], read: true, ..Page::default() };
+        let media = source(Network::Signal, Tab::Kind(SharedKind::Media), &empty);
+        assert!(!media.search && !media.open_in);
+        assert_eq!(media.line, "Photos and files from Signal are not shown yet");
+        let files = source(Network::Signal, Tab::Kind(SharedKind::Files), &empty);
+        assert!(!files.search && !files.open_in);
+        assert_eq!(files.line, "Photos and files from Signal are not shown yet");
+        let links_empty = source(Network::Signal, Tab::Kind(SharedKind::Links), &empty);
+        assert!(!links_empty.search && !links_empty.open_in);
+        assert_eq!(links_empty.line, "From messages on this computer");
+        let links_cached = source(Network::Signal, Tab::Kind(SharedKind::Links), &cached);
+        assert!(!links_cached.search && !links_cached.open_in);
+        assert_eq!(links_cached.line, "From messages on this computer · 2");
     }
 
     #[test]

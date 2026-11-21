@@ -130,13 +130,7 @@ pub const STORE_WAITING_LINE: &str = if cfg!(target_os = "macos") {
 };
 
 /// Settings search, when someone looks for a language setting.
-pub const FOLLOWS_LANGUAGE: &str = if cfg!(target_os = "macos") {
-    "tinyclient follows the language of macOS."
-} else if cfg!(windows) {
-    "tinyclient follows the language of Windows."
-} else {
-    "tinyclient follows the language of the system."
-};
+pub const FOLLOWS_LANGUAGE: &str = "tinyclient is in English only for now. Dates and times follow your system.";
 
 /// Settings search, when someone looks for sync.
 pub const SETTINGS_STAY: &str = if cfg!(target_os = "macos") {
@@ -570,6 +564,7 @@ mod tests {
         assert_eq!(STORE_WAITING_LINE.ends_with("The prompt may be behind this window."), !cfg!(windows));
         assert!(APPEARANCE_CAPTION.starts_with("Text size is also ⌘+, ⌘− and ⌘0."));
 
+        assert_eq!(FOLLOWS_LANGUAGE, "tinyclient is in English only for now. Dates and times follow your system.");
         if cfg!(target_os = "macos") {
             assert_eq!(SIGN_IN_KEPT, "Your sign-in is kept in the macOS keychain on this Mac.");
             assert_eq!(REVEAL, "Show in Finder");
@@ -577,7 +572,6 @@ mod tests {
             assert_eq!(OPEN_PICTURE, "Open in Preview");
             assert_eq!(STORE_WAITING, "Waiting for keychain access");
             assert!(STORE_WAITING_LINE.contains("Always Allow"));
-            assert_eq!(FOLLOWS_LANGUAGE, "tinyclient follows the language of macOS.");
             assert!(APPEARANCE_CAPTION.ends_with("Reduce Motion follows System Settings."));
             assert!(SHORTCUTS_CAPTION.contains("Click a row"));
             assert!(SHORTCUTS_CAPTION.contains("Reset"));
@@ -626,7 +620,6 @@ mod tests {
                 assert_eq!(OPEN_PICTURE, "Open");
                 assert_eq!(STORE_WAITING, "Waiting for keyring access");
                 assert!(STORE_WAITING_LINE.contains("system keyring"));
-                assert_eq!(FOLLOWS_LANGUAGE, "tinyclient follows the language of the system.");
             }
         }
     }

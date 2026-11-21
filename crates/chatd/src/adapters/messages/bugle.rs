@@ -1097,6 +1097,15 @@ fn unix_seconds(raw: i64) -> i64 {
     }
 }
 
+/// One participant of a Messages conversation, as reported by the phone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Participant {
+    pub id: String,
+    pub name: String,
+    pub number: String,
+    pub is_me: bool,
+}
+
 #[derive(Clone)]
 pub struct Chat {
     pub id: String,
@@ -1118,6 +1127,8 @@ pub struct Chat {
     /// `Conversation.status`, field 12. 0 when the phone did not say, which keeps the status
     /// already stored. 3 is DELETED.
     pub status: u64,
+    /// Participants reported on this conversation (id, name, number, is_me).
+    pub participants: Vec<Participant>,
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -2550,6 +2561,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let status = field_int(&conv, 12);
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
+        let mut participants = Vec::new();
         for person in conv.iter().filter(|field| field.number == 20) {
             let participant = fields(&person.bytes);
             let info = fields(&field_bytes(&participant, 1));
@@ -2562,19 +2574,32 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
                     full
                 }
             };
+            let number = {
+                let raw = field_text(&participant, 15);
+                if raw.is_empty() {
+                    field_text(&info, 2)
+                } else {
+                    raw
+                }
+            };
             let is_me = field_int(&participant, 6) != 0;
             if !is_me && !group && peer.is_empty() {
                 peer = pid.clone();
             }
             if is_me && !pid.is_empty() {
-                mine = pid;
+                mine = pid.clone();
             } else if title.is_empty() && !name.is_empty() && !group {
-                title = name;
-            } else if title.is_empty() && !group {
-                let number = field_text(&participant, 15);
-                if !number.is_empty() {
-                    title = number;
-                }
+                title = name.clone();
+            } else if title.is_empty() && !group && !number.is_empty() {
+                title = number.clone();
+            }
+            if !pid.is_empty() || !name.is_empty() || !number.is_empty() {
+                participants.push(Participant {
+                    id: pid,
+                    name,
+                    number,
+                    is_me,
+                });
             }
         }
         if title.is_empty() {
@@ -2595,6 +2620,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             updated: unix_seconds(field_int(&conv, 5) as i64),
             phones: false,
             status,
+            participants,
         });
     }
     chats

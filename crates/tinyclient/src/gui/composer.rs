@@ -905,7 +905,7 @@ impl Composer {
         }
         let network = target.key.network;
         let emoticons = super::app::prefs::choices().emoticons;
-        let wired = length::wire_text(&field, &self.tokens, network, emoticons);
+        let (wired, mention_spans) = length::wire_with_spans(&field, &self.tokens, network, emoticons);
         let Some(as_file) = self.stage_over_limit(&field, &wired, &target, cx) else {
             return;
         };
@@ -955,7 +955,7 @@ impl Composer {
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
-            spans: Vec::new(),
+            spans: if as_file { Vec::new() } else { mention_spans },
             poll: None,
         };
         let (shown, wire) = match as_file {
@@ -1868,7 +1868,7 @@ impl Composer {
             return;
         }
         let key = target.key.clone();
-        let wire = length::wire_text(&field, &self.tokens, key.network, false);
+        let (wire, spans) = length::wire_with_spans(&field, &self.tokens, key.network, false);
         if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
             self.caption = Some((words, Tone::Refused));
             cx.notify();
@@ -1878,7 +1878,7 @@ impl Composer {
             conversation: key.clone(),
             message_id: id.clone(),
             text: wire,
-            spans: Vec::new(),
+            spans,
         };
         self.sending = true;
         cx.notify();

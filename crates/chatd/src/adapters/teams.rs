@@ -914,8 +914,8 @@ impl Teams {
                 let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
-            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
-                let _ = reply.send(self.edit(&conversation_id, &message_id, &text).map_err(refuse));
+            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+                let _ = reply.send(self.edit(&conversation_id, &message_id, &text, &spans).map_err(refuse));
             }
             Command::Delete { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));

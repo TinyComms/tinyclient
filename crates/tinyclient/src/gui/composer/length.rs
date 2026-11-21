@@ -15,6 +15,36 @@ pub fn wire_text(field: &str, tokens: &[Token], network: Network, emoticons: boo
     }
 }
 
+/// The wire text plus structured mention spans adjusted to the trimmed wire text.
+pub fn wire_with_spans(
+    field: &str,
+    tokens: &[Token],
+    network: Network,
+    emoticons: bool,
+) -> (String, Vec<protocol::Span>) {
+    let wired = wire_text(field, tokens, network, emoticons);
+    if !matches!(network, Network::Telegram | Network::Teams | Network::Signal) || tokens.is_empty() {
+        return (wired, Vec::new());
+    }
+    let lead = field.len() - field.trim_start().len();
+    let mut shifted = Vec::new();
+    for token in tokens {
+        if field.get(token.range.clone()) != Some(token.label.as_str()) {
+            continue;
+        }
+        if token.range.start < lead {
+            continue;
+        }
+        let start = token.range.start - lead;
+        let end = token.range.end - lead;
+        if wired.get(start..end) == Some(token.label.as_str()) {
+            shifted.push(Token { range: start..end, ..token.clone() });
+        }
+    }
+    let spans = mention::spans(&wired, &shifted, network);
+    (wired, spans)
+}
+
 pub fn over(counted: usize, limit: u32) -> bool {
     limit > 0 && counted > limit as usize
 }

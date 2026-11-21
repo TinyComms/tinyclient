@@ -989,21 +989,27 @@ impl Teams {
     /// in that chain. A reply to a message in a chat quotes it, as Teams does; a reply to a
     /// post in a channel goes into the post's chain and is shown in the channel as a reply.
     pub(super) fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
-        let outcome = self.posted(conversation, client_id, text, reply_to).map_err(super::reason);
+        self.post_with_spans(conversation, client_id, text, reply_to, &[]);
+    }
+
+    pub(super) fn post_with_spans(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[Span]) {
+        let outcome = self.posted_with(conversation, client_id, text, reply_to, spans, None).map_err(super::reason);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
-    fn posted(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
-        self.posted_with(conversation, client_id, text, reply_to, None)
-    }
-
     /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mut properties: Option<Value>) -> Result<Message, Fault> {
-        let (mut content, mentions) = html::compose_rich(text);
-        if !mentions.is_empty() {
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], mut properties: Option<Value>) -> Result<Message, Fault> {
+        let (mut content, mentions_json) = if !mention_spans.is_empty() {
+            let (c, m) = html::compose_with_mentions(text, mention_spans);
+            (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
+        } else {
+            let (c, m) = html::compose_rich(text);
+            (c, (!m.is_empty()).then(|| html::mentions_property(&m)))
+        };
+        if let Some(encoded) = mentions_json {
             let props = properties.get_or_insert_with(|| json!({}));
             if let Some(map) = props.as_object_mut() {
-                map.insert("mentions".to_owned(), Value::String(html::mentions_property(&mentions)));
+                map.insert("mentions".to_owned(), Value::String(encoded));
             }
         }
         let mut target = conversation.to_owned();
@@ -1030,7 +1036,10 @@ impl Teams {
         let me = self.me();
         let name = self.own_name();
         let sent = millis(&id) / 1000;
-        let (shown, spans) = html::styled(text);
+        let (shown, mut spans) = html::styled(text);
+        if !mention_spans.is_empty() && shown == text {
+            spans.extend(mention_spans.iter().cloned());
+        }
         let mut message = Message::plain(id, name.clone(), shown, sent, true);
         message.spans = spans;
         message.sender.avatar = self.picture(&me, &name);
@@ -1050,7 +1059,7 @@ impl Teams {
         format!("/v1/users/ME/conversations/{}/messages/{}", escaped(conversation), escaped(id))
     }
 
-    pub(super) fn edit(&self, conversation: &str, id: &str, text: &str) -> Result<(), Fault> {
+    pub(super) fn edit(&self, conversation: &str, id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
         let stored = self.ctx.stored_message(conversation, id)?;
         let meta = self.state().own_meta.get(&(conversation.to_owned(), id.to_owned())).cloned();
         let (kept_subject, body_text) = match meta.as_ref().and_then(|meta| meta.subject.as_deref()) {
@@ -1070,7 +1079,13 @@ impl Teams {
             }
             None => (None, text),
         };
-        let (mut content, mentions) = html::compose_rich(body_text);
+        let (mut content, mentions_json) = if !mention_spans.is_empty() && kept_subject.is_none() {
+            let (c, m) = html::compose_with_mentions(body_text, mention_spans);
+            (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
+        } else {
+            let (c, m) = html::compose_rich(body_text);
+            (c, (!m.is_empty()).then(|| html::mentions_property(&m)))
+        };
         if let Some(images_html) = meta.as_ref().map(|meta| meta.images_html.as_str()).filter(|html| !html.is_empty()) {
             content.push_str(images_html);
         }
@@ -1079,10 +1094,10 @@ impl Teams {
             content = format!("{}{content}", quote_markup(quote));
         }
         let mut body = self.body(&now_ms().to_string(), &content);
-        if !mentions.is_empty() || kept_subject.is_some() {
+        if mentions_json.is_some() || kept_subject.is_some() {
             let mut props = serde_json::Map::new();
-            if !mentions.is_empty() {
-                props.insert("mentions".to_owned(), Value::String(html::mentions_property(&mentions)));
+            if let Some(encoded) = mentions_json {
+                props.insert("mentions".to_owned(), Value::String(encoded));
             }
             if let Some(subject) = &kept_subject {
                 props.insert("subject".to_owned(), Value::String(subject.clone()));
@@ -1092,6 +1107,9 @@ impl Teams {
         self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
             let (mut shown, mut spans) = html::styled(body_text);
+            if !mention_spans.is_empty() && shown == body_text {
+                spans.extend(mention_spans.iter().cloned());
+            }
             if let Some(subject) = &kept_subject {
                 let shift = (subject.len() + usize::from(!shown.is_empty())) as u32;
                 for span in &mut spans {

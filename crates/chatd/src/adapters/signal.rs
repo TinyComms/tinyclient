@@ -538,6 +538,10 @@ struct Live {
     typing: bool,
     /// File sends, by the time Signal gave them, so the phone's copy does not replace the file.
     echoed: VecDeque<u64>,
+    /// Disappearing-messages timer per conversation id.
+    timers: HashMap<String, wire::Timer>,
+    /// Incoming unread messages that carry a disappearing-messages timer, keyed by (conversation, message_id).
+    expiring: HashMap<(String, String), u32>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -615,6 +619,32 @@ impl Live {
 
     fn echoed_file(&self, sent: u64) -> bool {
         self.echoed.contains(&sent)
+    }
+
+    fn note_timer(&mut self, conversation: &str, seconds: u32, version: u32) {
+        if seconds == 0 {
+            self.timers.remove(conversation);
+        } else {
+            self.timers.insert(conversation.to_owned(), wire::Timer { seconds, version });
+        }
+    }
+
+    fn timer_of(&self, conversation: &str) -> wire::Timer {
+        self.timers.get(conversation).copied().unwrap_or_default()
+    }
+
+    fn remember_expiring(&mut self, conversation: &str, message_id: &str, seconds: u32) {
+        if seconds == 0 {
+            return;
+        }
+        if self.expiring.len() >= REACTIONS_KEPT {
+            self.expiring.clear();
+        }
+        self.expiring.insert((conversation.to_owned(), message_id.to_owned()), seconds);
+    }
+
+    fn take_expiring(&mut self, conversation: &str, message_id: &str) -> Option<u32> {
+        self.expiring.remove(&(conversation.to_owned(), message_id.to_owned()))
     }
 
     /// Records a person's reaction, answering the one it replaced. Both memory and the file on
@@ -963,7 +993,14 @@ fn apply(account: &Account, event: Event) {
         Event::Groups(groups) => {
             for group in groups {
                 let peer = Peer::Group(group.id.clone());
-                account.live().groups.insert(peer.conversation(), group.member_ids.clone());
+                let conv = peer.conversation();
+                {
+                    let mut live = account.live();
+                    live.groups.insert(conv.clone(), group.member_ids.clone());
+                    if group.timer_secs > 0 {
+                        live.note_timer(&conv, group.timer_secs, 0);
+                    }
+                }
                 let mut row = row(&peer, &group.title);
                 row.topic = group.description.chars().take(300).collect();
                 row.read_only = !group.member;
@@ -1027,7 +1064,17 @@ fn apply(account: &Account, event: Event) {
             if outgoing && (account.live().echoed_file(text.sent) || files::replace_outgoing_sync(had_file)) {
                 return;
             }
-            let message = message(account, &text, outgoing);
+            let mut message = message(account, &text, outgoing);
+            if text.expire_timer > 0 || text.expire_timer_version > 0 {
+                account.live().note_timer(&conversation, text.expire_timer, text.expire_timer_version);
+            }
+            if text.expire_timer > 0 {
+                if outgoing {
+                    message.expires_at = Some(crate::hub::now() + i64::from(text.expire_timer));
+                } else {
+                    account.live().remember_expiring(&conversation, &message.id, text.expire_timer);
+                }
+            }
             if outgoing {
                 account.live().sent(text.sent, &conversation);
             } else {
@@ -1144,6 +1191,23 @@ fn apply(account: &Account, event: Event) {
             live.read_receipts = read_receipts;
             live.typing = typing;
         }
+        Event::TimerChanged { peer, seconds, version } => {
+            let conversation = peer.conversation();
+            account.live().note_timer(&conversation, seconds, version);
+            if let Peer::Direct(aci) = &peer {
+                let title = account.live().names.get(aci).cloned().unwrap_or_default();
+                ensure_row(account, &peer, &title);
+            }
+            let line = if seconds == 0 {
+                "Disappearing messages are off".to_owned()
+            } else {
+                format!("Disappearing messages are set to {}", duration(seconds))
+            };
+            let sent_ms = now_ms();
+            let mut msg = Message::plain(format!("signal-timer-{sent_ms}"), String::new(), line, (sent_ms / 1_000) as i64, false);
+            msg.kind = MessageKind::System;
+            let _ = ctx.message(&conversation, &msg);
+        }
         Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
     }
 }
@@ -1162,15 +1226,26 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
                     .map(move |(author, sent)| (conversation.clone(), *sent, author.clone()))
             })
             .collect();
-        for (conversation, sent, author) in held {
-            match touched.iter_mut().find(|(c, _, _)| *c == conversation) {
-                Some(seen) if seen.1 < sent => *seen = (conversation, sent, author),
+        for (conversation, sent, author) in &held {
+            match touched.iter_mut().find(|(c, _, _)| c == conversation) {
+                Some(seen) if seen.1 < *sent => *seen = (conversation.clone(), *sent, author.clone()),
                 Some(_) => {}
-                None => touched.push((conversation, sent, author)),
+                None => touched.push((conversation.clone(), *sent, author.clone())),
             }
         }
         for (conversation, upto, _) in &touched {
             live.read_upto(conversation, *upto);
+        }
+        let mut to_expire = Vec::new();
+        for (conversation, sent, author) in held {
+            let msg_id = wire::message_id(sent, &author);
+            if let Some(secs) = live.take_expiring(&conversation, &msg_id) {
+                to_expire.push((conversation, msg_id, secs));
+            }
+        }
+        drop(live);
+        for (conversation, msg_id, secs) in to_expire {
+            start_expiry(account, &conversation, &msg_id, secs);
         }
     }
     for (conversation, upto, author) in touched {
@@ -1364,7 +1439,7 @@ fn serve(account: &Arc<Account>, command: Command) {
     match command {
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
         Command::Send { conversation_id, client_id, text, reply_to } => {
-            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref());
+            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[]);
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -1384,10 +1459,10 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
-        Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let answered = match poll_action(&text) {
                 Some(act) => poll_act(account, &conversation_id, &message_id, act),
-                None => edit(account, &conversation_id, &message_id, &text),
+                None => edit(account, &conversation_id, &message_id, &text, &spans),
             };
             let _ = reply.send(answered.map_err(refused));
         }
@@ -1541,15 +1616,19 @@ fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Re
     })
 }
 
-fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
+fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span]) -> Result<Message, Fault> {
     let to = peer(conversation)?;
-    let (plain, ranges) = style::parse(text);
-    let spans = style::spans(&plain, &ranges);
+    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
+    let shown = style::apply(&wire_body, &ranges, &account.me);
     let quote = quote_of(account, conversation, reply_to)?;
-    let sent = account.wire.send(&to, Body::Text { text: plain.clone(), quote: quote.clone(), ranges })?;
+    let timer = account.live().timer_of(conversation);
+    let sent = account.wire.send(&to, Body::Text { text: wire_body, quote: quote.clone(), ranges, timer })?;
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: plain, spans, quote, ..Text::default() };
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: shown.text, spans: shown.spans, quote, ..Text::default() };
     let mut message = message(account, &words, true);
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
     if !account.live().read_receipts {
         message.receipt_note = RECEIPTS_OFF.to_owned();
     }
@@ -1578,7 +1657,7 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
         return;
     }
     if with.files.is_empty() {
-        let outcome = send_text(account, conversation, text, reply_to).map_err(|fault| fault.words());
+        let outcome = send_text(account, conversation, text, reply_to, &with.spans).map_err(|fault| fault.words());
         account.ctx.sent(conversation, client_id, outcome);
         return;
     }
@@ -1621,7 +1700,8 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     // Write each file to disk first, then move that one copy to Signal. Cloning `prepared`
     // would keep every payload in memory a second time for the whole upload.
     let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
-    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared }) {
+    let timer = account.live().timer_of(conversation);
+    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared, timer }) {
         Ok(sent) => sent,
         Err(fault) => {
             forget_landed(&attachments);
@@ -1632,6 +1712,9 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     account.live().sent(sent, conversation);
     let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
     let mut message = message(account, &words, true);
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
     message.attachments = attachments;
     Ok(message)
 }
@@ -1692,18 +1775,19 @@ fn own(account: &Account, message_id: &str) -> Result<u64, Fault> {
     Ok(sent)
 }
 
-fn edit(account: &Account, conversation: &str, message_id: &str, text: &str) -> Result<(), Fault> {
+fn edit(account: &Account, conversation: &str, message_id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
     let to = peer(conversation)?;
     let sent = own(account, message_id)?;
     if !can(sent, now_ms(), true, conversation == account.me).edit {
         return Err(Fault::Refused("This message can no longer be edited.".to_owned()));
     }
-    let (plain, ranges) = style::parse(text);
-    let spans = style::spans(&plain, &ranges);
-    account.wire.send(&to, Body::Edit { target: sent, text: plain.clone(), ranges })?;
+    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
+    let shown = style::apply(&wire_body, &ranges, &account.me);
+    let timer = account.live().timer_of(conversation);
+    account.wire.send(&to, Body::Edit { target: sent, text: wire_body, ranges, timer })?;
     if let Ok(Some(mut message)) = account.ctx.stored_message(conversation, message_id) {
-        message.text = plain;
-        message.spans = spans;
+        message.text = shown.text;
+        message.spans = shown.spans;
         message.edited = true;
         let _ = account.ctx.message(conversation, &message);
     }
@@ -1731,19 +1815,46 @@ fn note_to_self(account: &Account, peer: &Peer) -> bool {
     matches!(peer, Peer::Direct(aci) if aci == &account.me)
 }
 
+fn start_expiry(account: &Account, conversation: &str, message_id: &str, seconds: u32) {
+    if seconds == 0 {
+        return;
+    }
+    if let Ok(Some(mut stored)) = account.ctx.stored_message(conversation, message_id) {
+        if stored.expires_at.is_none() {
+            stored.expires_at = Some(crate::hub::now() + i64::from(seconds));
+            let _ = account.ctx.message(conversation, &stored);
+        }
+    }
+}
+
 /// The user read up to a message: the user's other devices are told, and the authors too when
 /// the user's Signal settings send read receipts.
 fn mark_read(account: &Account, conversation: &str, message_id: &str) {
     let Ok((upto, author)) = target(message_id) else {
         return;
     };
-    let (mut read, receipts) = {
+    let (mut read, receipts, mut to_expire) = {
         let mut live = account.live();
-        (live.read_upto(conversation, upto), live.read_receipts)
+        let read = live.read_upto(conversation, upto);
+        let mut to_expire = Vec::new();
+        for (a, s) in &read {
+            let mid = wire::message_id(*s, a);
+            if let Some(secs) = live.take_expiring(conversation, &mid) {
+                to_expire.push((mid, secs));
+            }
+        }
+        (read, live.read_receipts, to_expire)
     };
     // Unread from before chatd started is not remembered: the message read stands for it.
     if read.is_empty() && author != account.me {
+        let mid = wire::message_id(upto, &author);
+        if let Some(secs) = account.live().take_expiring(conversation, &mid) {
+            to_expire.push((mid, secs));
+        }
         read.push((author, upto));
+    }
+    for (mid, secs) in to_expire {
+        start_expiry(account, conversation, &mid, secs);
     }
     if read.is_empty() {
         return;
@@ -1904,9 +2015,14 @@ fn chosen(poll: &Poll, indexes: &[u32]) -> Result<Vec<u32>, Fault> {
 fn send_poll(account: &Account, conversation: &str, draft: &PollDraft, _reply_to: Option<&str>) -> Result<Message, Fault> {
     let to = peer(conversation)?;
     let (question, options, multiple) = checked_draft(draft)?;
-    let sent = account.wire.send(&to, Body::Poll { question: question.clone(), options: options.clone(), multiple })?;
+    let timer = account.live().timer_of(conversation);
+    let sent = account.wire.send(&to, Body::Poll { question: question.clone(), options: options.clone(), multiple, timer })?;
     account.live().sent(sent, conversation);
-    Ok(with_poll(account, &account.me, &account.name, sent, true, Poll::open(question, options, multiple)))
+    let mut message = with_poll(account, &account.me, &account.name, sent, true, Poll::open(question, options, multiple));
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
+    Ok(message)
 }
 
 fn poll_act(account: &Account, conversation: &str, message_id: &str, act: PollAct) -> Result<(), Fault> {

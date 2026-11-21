@@ -628,8 +628,8 @@ pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabiliti
 
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
 pub fn can_leave(conversation: &Conversation) -> bool {
-    // A linked Signal device cannot leave a group. The item stays off until it can.
-    if conversation.key.network == Network::Signal {
+    // A linked Signal device and paired Messages cannot leave a group. The item stays off until they can.
+    if matches!(conversation.key.network, Network::Signal | Network::Messages) {
         return false;
     }
     conversation.kind == ConversationKind::Group
@@ -1125,6 +1125,7 @@ mod tests {
         assert_eq!(conversation_tag(&signal, None), None);
         assert_eq!(notify_control(&signal), NotifyControl::Held("Set on your phone"));
         assert!(!can_leave(&row(Network::Signal, ConversationKind::Group)));
+        assert!(!can_leave(&row(Network::Messages, ConversationKind::Group)));
         assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));
         assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
         info.external = "Northwind".into();
