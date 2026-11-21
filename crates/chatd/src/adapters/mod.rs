@@ -629,6 +629,21 @@ pub enum Command {
         cursor: Option<String>,
         reply: Reply<ChannelThreadsPage>,
     },
+    /// Rename, archive/reopen, lock/unlock, or update auto-archive/slowmode on a thread (Discord).
+    ThreadUpdate {
+        conversation_id: String,
+        name: Option<String>,
+        archived: Option<bool>,
+        locked: Option<bool>,
+        auto_archive_minutes: Option<u32>,
+        slowmode_seconds: Option<u32>,
+        reply: Reply<()>,
+    },
+    /// Delete a thread channel (Discord `DELETE /channels/{thread}`).
+    DeleteThread {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -886,7 +901,9 @@ impl Command {
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
             | Command::FollowThread { reply, .. }
-            | Command::ChannelThreads { reply, .. } => {
+            | Command::ChannelThreads { reply, .. }
+            | Command::ThreadUpdate { reply, .. }
+            | Command::DeleteThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

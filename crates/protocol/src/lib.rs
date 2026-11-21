@@ -580,6 +580,9 @@ pub struct Conversation {
     /// kept live by chatd and rides on the row when read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slowmode_until: Option<i64>,
+    /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -651,6 +654,7 @@ impl Conversation {
             joined: true,
             slowmode_seconds: 0,
             slowmode_until: None,
+            locked: false,
         }
     }
 
@@ -1440,6 +1444,25 @@ pub enum Request {
         query: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+    },
+    /// Rename, archive/reopen, lock/unlock, or update auto-archive/slowmode on a thread (Discord).
+    /// Only fields that are `Some` are sent to the network.
+    ThreadUpdate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locked: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_archive_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slowmode_seconds: Option<u32>,
+    },
+    /// Delete a thread channel (Discord `DELETE /channels/{thread}`).
+    DeleteThread {
+        conversation: Key,
     },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.

@@ -2798,6 +2798,42 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::ThreadUpdate {
+                conversation,
+                name,
+                archived,
+                locked,
+                auto_archive_minutes,
+                slowmode_seconds,
+            } => {
+                if let Some(ref title) = name {
+                    if title.trim().is_empty() {
+                        return error(ErrorCode::Refused, "Enter a name for the thread.");
+                    }
+                }
+                if let Some(minutes) = auto_archive_minutes {
+                    if !matches!(minutes, 60 | 1440 | 4320 | 10080) {
+                        return error(ErrorCode::Refused, "Unsupported auto-archive duration.");
+                    }
+                }
+                if let Some(secs) = slowmode_seconds {
+                    if secs > 21_600 {
+                        return error(ErrorCode::Refused, "Slowmode cannot exceed 6 hours.");
+                    }
+                }
+                self.act(&conversation, |conversation_id, reply| Command::ThreadUpdate {
+                    conversation_id,
+                    name,
+                    archived,
+                    locked,
+                    auto_archive_minutes,
+                    slowmode_seconds,
+                    reply,
+                })
+            }
+            Request::DeleteThread { conversation } => {
+                self.act(&conversation, |conversation_id, reply| Command::DeleteThread { conversation_id, reply })
+            }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),

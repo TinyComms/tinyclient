@@ -437,7 +437,9 @@ impl Discord {
             let clock = now();
             let timed_out = info.timed_out(clock);
             let mut thread_rights = *parent_rights;
+            let is_owner = thread.owner_id.as_deref() == Some(me);
             thread_rights.add_members = timed_out.is_none() && (thread_rights.send_in_threads || thread_rights.manage_threads);
+            thread_rights.rename = timed_out.is_none() && (thread_rights.manage_threads || is_owner);
             let locked = thread.thread_metadata.as_ref().is_some_and(|m| m.locked);
             let (read_only, read_only_reason) = if let Some(until) = timed_out {
                 (true, timeout_reason(until, clock))
@@ -455,6 +457,7 @@ impl Discord {
                 read_only_reason,
                 rights: thread_rights,
                 slowmode_seconds: if slowmode_exempt(*parent_perms, true) { 0 } else { thread.rate_limit_per_user },
+                locked,
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
                     followed: true,
@@ -1333,8 +1336,11 @@ impl Discord {
             .as_deref()
             .and_then(|guild| self.channel_permissions(guild, &parent.key.id))
             .map_or(parent.rights.delete_others, |perms| slowmode_exempt(perms, true));
+        let me = self.me();
+        let is_owner = thread.owner_id.as_deref() == Some(me.as_str());
         let mut thread_rights = parent.rights;
         thread_rights.add_members = thread_rights.send_in_threads || thread_rights.manage_threads;
+        thread_rights.rename = thread_rights.manage_threads || is_owner;
         let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
         let locked = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.locked);
         let followed = joined || thread.member.is_some() || known.as_ref().is_some_and(|k| k.followed);
@@ -1351,6 +1357,7 @@ impl Discord {
             read_only_reason,
             rights: thread_rights,
             slowmode_seconds: if exempt { 0 } else { thread.rate_limit_per_user },
+            locked,
             filing: Some(Filing {
                 archived,
                 followed,

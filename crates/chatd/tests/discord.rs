@@ -452,6 +452,61 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         }
         ("PUT", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
         ("DELETE", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
+        ("PATCH", ["channels", _thread, "thread-members", "@me", "settings"]) => (
+            200,
+            json!({
+                "flags": seen.body["flags"].as_u64().unwrap_or(2),
+                "muted": seen.body["muted"].as_bool().unwrap_or(false),
+                "mute_config": seen.body["mute_config"],
+            }),
+        ),
+        ("GET", ["channels", thread, "thread-members"]) => (
+            200,
+            json!([
+                {
+                    "id": thread,
+                    "user_id": "1000",
+                    "member": {
+                        "user": me(),
+                        "nick": "jscroggins",
+                        "roles": ["4010"]
+                    }
+                },
+                {
+                    "id": thread,
+                    "user_id": "2001",
+                    "member": {
+                        "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"},
+                        "nick": null,
+                        "roles": []
+                    }
+                }
+            ]),
+        ),
+        ("PATCH", ["channels", thread]) => {
+            let name = seen.body["name"].as_str().unwrap_or("thread-updated");
+            let archived = seen.body["archived"].as_bool().unwrap_or(false);
+            let locked = seen.body["locked"].as_bool().unwrap_or(false);
+            let auto_archive = seen.body["auto_archive_duration"].as_u64().unwrap_or(1440);
+            let rate_limit = seen.body["rate_limit_per_user"].as_u64().unwrap_or(0);
+            (
+                200,
+                json!({
+                    "id": thread,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": "4101",
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "rate_limit_per_user": rate_limit,
+                    "thread_metadata": {
+                        "archived": archived,
+                        "locked": locked,
+                        "auto_archive_duration": auto_archive
+                    }
+                }),
+            )
+        }
         ("GET", ["channels", channel, "threads", "search"]) => {
             let mut threads = vec![
                 json!({
@@ -5623,4 +5678,131 @@ fn browse_active_and_archived_channel_threads_and_join_leave_with_events() {
         "removed_member_ids": ["1000"]
     }));
     wait("left via THREAD_MEMBERS_UPDATE", || (!world.conversation("4510").followed).then_some(()));
+}
+
+#[test]
+fn thread_settings_rename_archive_lock_delete_notifications_and_members() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("thread 4500 loaded", || (world.conversation("4500").key.id == "4500").then_some(()));
+
+    // 1. Thread member list hits GET /channels/4500/thread-members?with_member=true.
+    let members = world.ask(Request::Members {
+        conversation: world.key("4500"),
+        offset: 0,
+        limit: 50,
+    });
+    let Response::Members { members: list, sections, .. } = members else { panic!("{members:?}") };
+    assert_eq!(sections[0].count, 2);
+    let ids: Vec<&str> = list.iter().map(|p| p.key.id.as_str()).collect();
+    assert_eq!(ids, ["1000", "2001"]);
+    let fetched = world.discord.requests_to("GET", "/channels/4500/thread-members");
+    assert_eq!(fetched.len(), 1);
+    assert!(fetched[0].path.contains("with_member=true"), "{}", fetched[0].path);
+
+    // 2. Thread notification setting hits PATCH /channels/4500/thread-members/@me/settings.
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: world.key("4500"),
+            notify: protocol::Notify::Mentions,
+            until: None,
+        }),
+        Response::Ok
+    );
+    let notif = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
+    assert_eq!(notif.len(), 1);
+    assert_eq!(notif[0].body["flags"], json!(4));
+    assert_eq!(notif[0].body["muted"], json!(false));
+    assert!(!world.conversation("4500").muted);
+
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: world.key("4500"),
+            notify: protocol::Notify::Nothing,
+            until: None,
+        }),
+        Response::Ok
+    );
+    let notif = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
+    assert_eq!(notif.len(), 2);
+    assert_eq!(notif[1].body["flags"], json!(8));
+    assert_eq!(notif[1].body["muted"], json!(true));
+    assert!(world.conversation("4500").muted);
+
+    // 3. ThreadUpdate PATCH sends only the specified fields (rename, slowmode, auto-archive, archive, lock).
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: Some("Renamed thread".into()),
+            archived: None,
+            locked: None,
+            auto_archive_minutes: Some(4320),
+            slowmode_seconds: Some(15),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/channels/4500");
+    let thread_patches: Vec<_> = patches.iter().filter(|r| r.path == "/channels/4500").collect();
+    assert_eq!(thread_patches.len(), 1);
+    assert_eq!(thread_patches[0].body["name"], json!("Renamed thread"));
+    assert_eq!(thread_patches[0].body["auto_archive_duration"], json!(4320));
+    assert_eq!(thread_patches[0].body["rate_limit_per_user"], json!(15));
+    assert!(thread_patches[0].body.get("archived").is_none());
+    assert!(thread_patches[0].body.get("locked").is_none());
+    let updated = world.conversation("4500");
+    assert_eq!(updated.title, "Renamed thread");
+    assert_eq!(updated.slowmode_seconds, 15);
+
+    // 4. Locking a thread without MANAGE_THREADS marks it read_only with "This thread is locked.".
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: None,
+            archived: Some(true),
+            locked: Some(true),
+            auto_archive_minutes: None,
+            slowmode_seconds: None,
+        }),
+        Response::Ok
+    );
+    let locked = world.conversation("4500");
+    assert!(locked.archived);
+    assert!(locked.locked);
+    assert!(locked.read_only);
+    assert_eq!(locked.read_only_reason, "This thread is locked.");
+
+    // 5. With MANAGE_THREADS, a moderator can still post in a locked thread (not read_only) and delete it.
+    let manage_threads: u64 = 1 << 34;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": manage_threads.to_string()}
+    }));
+    wait("manage_threads granted on 4101", || {
+        world.conversation("4101").rights.manage_threads.then_some(())
+    });
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: None,
+            archived: Some(false),
+            locked: Some(true),
+            auto_archive_minutes: None,
+            slowmode_seconds: None,
+        }),
+        Response::Ok
+    );
+    let mod_locked = world.conversation("4500");
+    assert!(mod_locked.locked && !mod_locked.archived);
+    assert!(!mod_locked.read_only, "moderator with MANAGE_THREADS is not blocked by thread lock");
+
+    // 6. DeleteThread hits DELETE /channels/4500 and removes the conversation.
+    assert_eq!(
+        world.ask(Request::DeleteThread { conversation: world.key("4500") }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/4500").len(), 1);
+    assert!(matches!(
+        world.ask(Request::Conversation { conversation: world.key("4500") }),
+        Response::Error { code: ErrorCode::NotFound, .. }
+    ));
 }

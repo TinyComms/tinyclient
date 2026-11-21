@@ -413,6 +413,52 @@ impl Discord {
         Some(Members { pending: false, sections: vec![MemberSection { name: "Members".into(), count }], members })
     }
 
+    /// Fetches the member list of a Discord thread (`GET /channels/{thread}/thread-members?with_member=true`).
+    fn thread_members(&self, thread: &str, offset: u32, limit: u32) -> Result<Members, Refusal> {
+        #[derive(Deserialize)]
+        struct ThreadMember {
+            #[serde(default)]
+            user_id: Option<String>,
+            #[serde(default)]
+            member: Option<Member>,
+        }
+        let body = self
+            .call("GET", &format!("/channels/{thread}/thread-members?with_member=true"), None)
+            .map_err(super::refusal)?;
+        let entries: Vec<ThreadMember> = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let mut files = Vec::new();
+        let mut all = Vec::with_capacity(entries.len());
+        let known_users = self.state.lock().unwrap().users.clone();
+        let relations = self.state.lock().unwrap().relations.clone();
+        for entry in entries {
+            if let Some(member) = entry.member.as_ref() {
+                if let Some((mut person, _, _)) = self.person(member, &mut files) {
+                    person.relation = relations.get(&person.key.id).copied().unwrap_or_default();
+                    all.push(person);
+                    continue;
+                }
+            }
+            if let Some(uid) = entry.user_id.filter(|id| !id.is_empty()) {
+                let name = known_users.get(&uid).cloned().unwrap_or_else(|| uid.clone());
+                let mut person = Person::new(self.ctx.key(&uid), name);
+                person.link = super::model::user_link(&uid);
+                person.relation = relations.get(&uid).copied().unwrap_or_default();
+                all.push(person);
+            }
+        }
+        if let Err(err) = self.ctx.media(&files) {
+            self.log("thread members", err);
+        }
+        let count = all.len() as u32;
+        let members = all.into_iter().skip(offset as usize).take(limit.clamp(1, WINDOW) as usize).collect();
+        Ok(Members {
+            pending: false,
+            sections: vec![MemberSection { name: "Members".into(), count }],
+            members,
+        })
+    }
+
     /// Reads the current cache immediately. Only Watch controls the live viewport;
     /// a cache miss is pending data, never a request that blocks later scrolling.
     pub(super) fn members(&self, channel: String, offset: u32, limit: u32, reply: Reply<Members>) {
@@ -420,12 +466,12 @@ impl Discord {
             return answer(reply, Ok(list));
         }
         let conversation = self.ctx.known(&channel).ok().flatten();
+        if conversation.as_ref().is_some_and(|conversation| conversation.kind == ConversationKind::Thread) {
+            return answer(reply, self.thread_members(&channel, offset, limit));
+        }
         let guild = conversation.as_ref().and_then(|conversation| self.guild_of(conversation));
         let in_tree = conversation.as_ref().is_some_and(|conversation| conversation.space.is_some());
         let (Some(guild), true) = (guild, in_tree) else { return answer(reply, Err(Refusal::Unsupported)); };
-        if conversation.is_some_and(|conversation| conversation.kind == ConversationKind::Thread) {
-            return answer(reply, Err(Refusal::Unsupported));
-        }
         let (groups, members, pending) = {
             let mut state = self.state.lock().unwrap();
             if !state.guilds.contains_key(&guild) {

@@ -185,6 +185,7 @@ const TABLES: &str = "
         joined INTEGER NOT NULL DEFAULT 1,
         call_video INTEGER NOT NULL DEFAULT 0,
         slowmode_seconds INTEGER NOT NULL DEFAULT 0,
+        locked INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -304,7 +305,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.slowmode_seconds
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.slowmode_seconds, c.locked
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -413,6 +414,8 @@ pub struct ConversationRow {
     pub joined: bool,
     /// Slowmode interval in seconds (`0` when off or when this account is exempt).
     pub slowmode_seconds: u32,
+    /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
+    pub locked: bool,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -516,6 +519,7 @@ impl ConversationRow {
             can_pin: false,
             joined: true,
             slowmode_seconds: 0,
+            locked: false,
         }
     }
 }
@@ -760,6 +764,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         call_video: row.get(59)?,
         slowmode_seconds: row.get(60)?,
         slowmode_until: None,
+        locked: row.get(61)?,
     })
 }
 
@@ -924,9 +929,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, slowmode_seconds)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, slowmode_seconds, locked)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -947,6 +952,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              joined = excluded.joined,
              call_video = excluded.call_video,
              slowmode_seconds = excluded.slowmode_seconds,
+             locked = excluded.locked,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -994,6 +1000,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.joined,
             row.call_video,
             row.slowmode_seconds,
+            row.locked,
         ],
     )?;
     Ok(())
@@ -1084,6 +1091,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "slowmode_seconds")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN slowmode_seconds INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !column(db, "conversation", "locked")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(true)
 }
 
@@ -1160,6 +1170,9 @@ impl Store {
         }
         if !column(&store.db, "conversation", "slowmode_seconds")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN slowmode_seconds INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "locked")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
         }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
@@ -1832,7 +1845,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, slowmode_seconds
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, slowmode_seconds, locked
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1886,6 +1899,7 @@ impl Store {
                         joined: row.get(28)?,
                         call_video: row.get(29)?,
                         slowmode_seconds: row.get(30)?,
+                        locked: row.get(31)?,
                     },
                 ))
             })?

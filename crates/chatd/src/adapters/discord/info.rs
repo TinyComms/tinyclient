@@ -249,6 +249,21 @@ impl Discord {
     /// settings whole, which are applied as if they came from the gateway.
     pub(super) fn set_mute(&self, channel: &str, notify: Notify) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind == ConversationKind::Thread {
+            let (flags, muted) = match notify {
+                Notify::All => (2u32, false),
+                Notify::Mentions => (4u32, false),
+                Notify::Nothing => (8u32, true),
+            };
+            let body = json!({
+                "flags": flags,
+                "muted": muted,
+                "mute_config": {"end_time": null, "selected_time_window": -1},
+            });
+            self.call("PATCH", &format!("/channels/{channel}/thread-members/@me/settings"), Some(body))
+                .map_err(refusal)?;
+            return self.ctx.muted(channel, notify == Notify::Nothing).map_err(refused);
+        }
         let guild = self.guild_of(&known);
         let mut setting = match notify {
             Notify::All => json!({"muted": false, "message_notifications": 0}),

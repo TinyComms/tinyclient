@@ -1014,6 +1014,7 @@ mod tests {
             joined: true,
             slowmode_seconds: 0,
             slowmode_until: None,
+            locked: false,
         }
     }
 

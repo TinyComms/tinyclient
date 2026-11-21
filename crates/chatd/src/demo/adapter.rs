@@ -1038,6 +1038,8 @@ impl Demo {
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ThreadUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

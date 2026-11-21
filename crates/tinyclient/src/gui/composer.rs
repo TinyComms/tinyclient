@@ -318,6 +318,10 @@ struct Target {
     slowmode_until: Option<i64>,
     /// Per-conversation rights (used for Discord thread creation in the composer).
     rights: protocol::ConversationRights,
+    /// Thread is archived (Discord).
+    archived: bool,
+    /// Thread is locked by a moderator (Discord).
+    locked: bool,
 }
 
 /// Why nothing can be typed here, when that is so.
@@ -486,6 +490,11 @@ struct ThreadComposer {
     auto_archive_minutes: u32,
 }
 
+struct ThreadSettings {
+    name: Entity<TextInput>,
+    confirm_delete: bool,
+}
+
 struct Editing {
     id: String,
     /// The message as it was put in the field: saving this unchanged is a cancel.
@@ -639,6 +648,8 @@ pub struct Composer {
     poll_composer: Option<PollComposer>,
     /// Inline Discord thread creation form when the user clicks "Create thread".
     thread_composer: Option<ThreadComposer>,
+    /// Inline Discord thread management panel when the user clicks "Thread settings".
+    thread_settings: Option<ThreadSettings>,
     /// Explicit per-conversation `send_as` choice (e.g. SIM card on a dual-SIM phone).
     /// Never changed unless the user explicitly clicks the selector.
     send_as: HashMap<Key, String>,
@@ -749,6 +760,7 @@ impl Composer {
             pending_file: None,
             poll_composer: None,
             thread_composer: None,
+            thread_settings: None,
             send_as: HashMap::new(),
             importance: protocol::Importance::Normal,
             broadcast: false,
@@ -872,6 +884,7 @@ impl Composer {
         self.schedule_at = None;
         self.draft_timer = None;
         self.thread_composer = None;
+        self.thread_settings = None;
         self.close_picker(cx);
         self.chip_menu = None;
         let files = std::mem::take(&mut self.tray);
@@ -998,8 +1011,8 @@ impl Composer {
         } else if self.chip_menu.take().is_some() || self.send_menu {
             self.send_menu = false;
             self.schedule_day = None;
-        } else if self.thread_composer.take().is_some() {
-            // Closed inline thread composer.
+        } else if self.thread_composer.take().is_some() || self.thread_settings.take().is_some() {
+            // Closed inline thread panel.
         } else if self.editing.is_some() {
             self.end_edit(cx);
         } else if self.reply.take().is_some() {
@@ -2035,6 +2048,258 @@ impl Composer {
                             button("thread-submit", if ready { ButtonKind::Primary } else { ButtonKind::Ghost }, "Create thread")
                                 .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_thread(cx)))),
                         ),
+                ),
+        )
+    }
+
+    fn toggle_thread_settings(&mut self, cx: &mut Context<Self>) {
+        if self.thread_settings.is_some() {
+            self.thread_settings = None;
+            cx.notify();
+            return;
+        }
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        if target.key.network != Network::Discord
+            || target.kind != ConversationKind::Thread
+            || !(target.rights.manage_threads || target.rights.rename)
+        {
+            return;
+        }
+        let current_title = target.title.clone();
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new("Thread name", cx);
+            input.set_text(&current_title, cx);
+            input
+        });
+        self.thread_settings = Some(ThreadSettings { name, confirm_delete: false });
+        cx.notify();
+    }
+
+    fn send_thread_update(
+        &mut self,
+        name: Option<String>,
+        archived: Option<bool>,
+        locked: Option<bool>,
+        auto_archive_minutes: Option<u32>,
+        slowmode_seconds: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.target.clone() else { return };
+        if !live() {
+            return;
+        }
+        let conversation = target.key.clone();
+        let request = Request::ThreadUpdate {
+            conversation: conversation.clone(),
+            name,
+            archived,
+            locked,
+            auto_archive_minutes,
+            slowmode_seconds,
+        };
+        cx.spawn(async move |composer, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = composer.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.shell_later(cx, move |shell, cx| shell.refresh_row(conversation, cx));
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+                Ok(_) => {
+                    this.shell_later(cx, |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), "Could not update thread.".to_owned(), cx)
+                    });
+                }
+                Err(err) => {
+                    let detail = crate::client::trouble_words("thread", &err);
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_delete_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        self.thread_settings = None;
+        cx.notify();
+        if !live() {
+            return;
+        }
+        let request = Request::DeleteThread { conversation: target.key };
+        cx.spawn(async move |composer, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = composer.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error { detail, .. }) => {
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+                Ok(_) => {
+                    this.shell_later(cx, |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), "Could not delete thread.".to_owned(), cx)
+                    });
+                }
+                Err(err) => {
+                    let detail = crate::client::trouble_words("thread", &err);
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn thread_settings_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let form = self.thread_settings.as_ref()?;
+        let target = self.target.as_ref()?;
+        let can_manage = target.rights.manage_threads;
+        let archived = target.archived;
+        let locked = target.locked;
+        let name_ready = !form.name.read(cx).text().trim().is_empty();
+        let durations: [(u32, &'static str); 4] = [(60, "1h"), (1440, "24h"), (4320, "3d"), (10080, "1w")];
+        let mut archive_row = div().flex().items_center().gap(px(4.)).child(
+            div().type_small().text_color(theme::text_faint()).child("Auto-archive:"),
+        );
+        for (mins, label) in durations {
+            archive_row = archive_row.child(
+                div()
+                    .id(("thread-set-archive", mins as usize))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CHIP))
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.send_thread_update(None, None, None, Some(mins), None, cx);
+                    }))
+                    .child(label),
+            );
+        }
+        let slowmodes: [(u32, &'static str); 5] = [(0, "Off"), (5, "5s"), (15, "15s"), (30, "30s"), (60, "1m")];
+        let mut slow_row = div().flex().items_center().gap(px(4.)).child(
+            div().type_small().text_color(theme::text_faint()).child("Slowmode:"),
+        );
+        for (secs, label) in slowmodes {
+            let active = target.slowmode_seconds == secs;
+            slow_row = slow_row.child(
+                div()
+                    .id(("thread-set-slow", secs as usize))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CHIP))
+                    .type_small()
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(theme::selected()).text_color(theme::text()))
+                    .when(!active, |el| el.text_color(theme::text_soft()).hover(|s| s.bg(theme::hover())))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.send_thread_update(None, None, None, None, Some(secs), cx);
+                    }))
+                    .child(label),
+            );
+        }
+        let rename_row = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .type_ui()
+                    .child(form.name.clone()),
+            )
+            .child(
+                button("thread-rename-save", if name_ready { ButtonKind::Primary } else { ButtonKind::Ghost }, "Rename")
+                    .when(name_ready, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(form) = this.thread_settings.as_ref() {
+                                let name = form.name.read(cx).text().trim().to_owned();
+                                if !name.is_empty() {
+                                    this.send_thread_update(Some(name), None, None, None, None, cx);
+                                }
+                            }
+                        }))
+                    }),
+            );
+        let delete_btn = can_manage.then(|| {
+            if form.confirm_delete {
+                button("thread-delete-confirm", ButtonKind::Danger, "Confirm delete")
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_delete_thread(cx)))
+            } else {
+                button("thread-delete", ButtonKind::Ghost, "Delete thread").on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(form) = this.thread_settings.as_mut() {
+                        form.confirm_delete = true;
+                        cx.notify();
+                    }
+                }))
+            }
+        });
+        let lock_btn = can_manage.then(|| {
+            button("thread-lock-toggle", ButtonKind::Secondary, if locked { "Unlock" } else { "Lock" })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.send_thread_update(None, None, Some(!locked), None, None, cx);
+                }))
+        });
+        Some(
+            div()
+                .mb(px(6.))
+                .p(px(10.))
+                .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Thread settings"))
+                        .child(button("thread-settings-close", ButtonKind::Ghost, "Done").on_click(cx.listener(|this, _, _, cx| {
+                            this.thread_settings = None;
+                            cx.notify();
+                        }))),
+                )
+                .child(rename_row)
+                .child(archive_row)
+                .when(can_manage, |panel| panel.child(slow_row))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            button(
+                                "thread-archive-toggle",
+                                ButtonKind::Secondary,
+                                if archived { "Reopen thread" } else { "Close thread" },
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.send_thread_update(None, Some(!archived), None, None, None, cx);
+                            })),
+                        )
+                        .children(lock_btn)
+                        .children(delete_btn),
                 ),
         )
     }
@@ -3630,6 +3895,10 @@ impl Composer {
                 .then(|| slowmode_words(target.slowmode_seconds, target.slowmode_until, now()).map(|words| (words, Tone::Note)))
                 .flatten()
         };
+        let archived_thread = || {
+            (unlocked && target.kind == ConversationKind::Thread && target.archived)
+                .then(|| ("This thread is archived. Send a message to reopen it.".to_owned(), Tone::Note))
+        };
         let said = self
             .caption
             .clone()
@@ -3638,6 +3907,7 @@ impl Composer {
             .or_else(slowmode_active)
             .or_else(note)
             .or_else(|| (unlocked && target.link == Link::Offline).then(offline))
+            .or_else(archived_thread)
             .or_else(slowmode_quiet);
         let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
@@ -4221,6 +4491,7 @@ impl Render for Composer {
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
             .children(self.thread_composer_panel(cx))
+            .children(self.thread_settings_panel(cx))
             .child(div().relative().child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))
             .children(self.picker_layer(window, cx))
@@ -4299,6 +4570,8 @@ impl Shell {
             slowmode_seconds: open.slowmode_seconds,
             slowmode_until: open.slowmode_until,
             rights: open.rights,
+            archived: open.archived,
+            locked: open.locked,
         };
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));
@@ -4333,6 +4606,8 @@ impl Shell {
             slowmode_seconds: 0,
             slowmode_until: None,
             rights: protocol::ConversationRights::default(),
+            archived: false,
+            locked: false,
         };
         let composer = self.composer_in(true, cx);
         // A thread's row is not handed over, so its draft is the one this window remembers.
@@ -4341,6 +4616,11 @@ impl Shell {
     }
 
     // Hooks for the conversation and the window.
+
+    /// Opens or closes the inline thread settings panel on the main composer.
+    pub(super) fn composer_toggle_thread_settings(&mut self, cx: &mut Context<Self>) {
+        self.composer_in(false, cx).update(cx, |composer, cx| composer.toggle_thread_settings(cx));
+    }
 
     /// Puts one of my messages in the open conversation's composer to be edited.
     #[allow(dead_code)]
@@ -4977,6 +5257,8 @@ mod tests {
             slowmode_seconds: 0,
             slowmode_until: None,
             rights: protocol::ConversationRights::default(),
+            archived: false,
+            locked: false,
         }
     }
 

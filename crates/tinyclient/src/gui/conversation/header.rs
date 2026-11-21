@@ -94,6 +94,15 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_threads(cx)))
         });
+        let thread_settings = (open.key.network == Network::Discord
+            && open.kind == ConversationKind::Thread
+            && (open.rights.manage_threads || open.rights.rename))
+        .then(|| {
+            icon_button("thread-settings", "icons/pencil.svg", false)
+                .tooltip(tip("Thread settings", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.composer_toggle_thread_settings(cx)))
+        });
         let thread_membership = (open.key.network == Network::Discord && open.kind == ConversationKind::Thread).then(|| {
             let key = open.key.clone();
             let joined = open.followed;
@@ -238,7 +247,7 @@ impl Shell {
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(threads_btn).child(search).children(members).children(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(thread_settings).children(threads_btn).child(search).children(members).children(details))
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the

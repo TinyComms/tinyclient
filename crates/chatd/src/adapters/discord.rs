@@ -307,6 +307,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.spam = known.spam;
     row.rights = known.rights;
     row.slowmode_seconds = known.slowmode_seconds;
+    row.locked = known.locked;
     row
 }
 
@@ -1948,7 +1949,9 @@ impl Discord {
             row.private = thread.kind == model::PRIVATE_THREAD;
             row.rights = parent.rights;
             row.rights.add_members = parent.rights.send_in_threads || parent.rights.manage_threads;
+            row.rights.rename = parent.rights.manage_threads || thread.owner_id.as_deref() == Some(self.me().as_str());
             row.slowmode_seconds = if exempt { 0 } else { thread.rate_limit_per_user };
+            row.locked = is_locked;
             if is_locked && !row.rights.manage_threads {
                 row.read_only = true;
                 row.read_only_reason = "This thread is locked.".to_owned();
@@ -1998,6 +2001,94 @@ impl Discord {
             cursor: next_cursor,
             more,
         })
+    }
+
+    /// Updates a Discord thread (`PATCH /channels/{thread}`) with only the provided fields.
+    fn thread_update(
+        &self,
+        thread_id: &str,
+        name: Option<String>,
+        archived: Option<bool>,
+        locked: Option<bool>,
+        auto_archive_minutes: Option<u32>,
+        slowmode_seconds: Option<u32>,
+    ) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(thread_id)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This thread is gone.".to_owned()))?;
+        if known.kind != ConversationKind::Thread {
+            return Err(refuse("Only threads can be updated here.".to_owned()));
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(name) = name {
+            body.insert("name".to_owned(), json!(thread_name(&name)));
+        }
+        if let Some(archived) = archived {
+            body.insert("archived".to_owned(), json!(archived));
+        }
+        if let Some(locked) = locked {
+            body.insert("locked".to_owned(), json!(locked));
+        }
+        if let Some(minutes) = auto_archive_minutes {
+            body.insert("auto_archive_duration".to_owned(), json!(minutes));
+        }
+        if let Some(secs) = slowmode_seconds {
+            body.insert("rate_limit_per_user".to_owned(), json!(secs));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        let answer = self
+            .call("PATCH", &format!("/channels/{thread_id}"), Some(Value::Object(body)))
+            .map_err(refusal)?;
+        let mut updated: model::Channel = serde_json::from_str(&answer)
+            .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+        if updated.id.is_empty() {
+            updated.id = thread_id.to_owned();
+        }
+        if updated.parent_id.is_none() {
+            updated.parent_id = known.parent.clone();
+        }
+        self.thread_changed(updated, known.followed).map_err(|failed| match failed {
+            Failure::SignedOut(why) | Failure::Dropped(why) => refuse(why),
+        })?;
+        self.ctx.info_stale(thread_id);
+        Ok(())
+    }
+
+    /// Deletes a Discord thread (`DELETE /channels/{thread}`).
+    fn delete_thread(&self, thread_id: &str) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(thread_id)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This thread is gone.".to_owned()))?;
+        if known.kind != ConversationKind::Thread {
+            return Err(refuse("Only threads can be deleted here.".to_owned()));
+        }
+        self.call("DELETE", &format!("/channels/{thread_id}"), None).map_err(refusal)?;
+        let guild = self.guild_of(&known);
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.covered.remove(thread_id);
+            if let Some(info) = guild.as_deref().and_then(|g| state.guilds.get_mut(g)) {
+                info.channels.retain(|(id, _)| *id != number(thread_id));
+            }
+        }
+        if let Some(guild) = guild {
+            let note = format!("threads:{guild}");
+            let before = self.ctx.note(&note).unwrap_or_default();
+            let after: Vec<&str> = before.split(',').filter(|id| !id.is_empty() && *id != thread_id).collect();
+            let after = after.join(",");
+            if after != before {
+                self.ctx.set_note(&note, &after);
+            }
+        }
+        self.ctx.conversation_gone(thread_id).map_err(|err| refuse(err.to_string()))
     }
 
     /// The thread's conversation, when it is not recorded yet. Its root is the message it hangs
@@ -2290,6 +2381,21 @@ impl Discord {
             }
             Command::ChannelThreads { conversation_id, archived, query, cursor, reply } => {
                 answer(reply, self.channel_threads(&conversation_id, archived, &query, cursor.as_deref()))
+            }
+            Command::ThreadUpdate {
+                conversation_id,
+                name,
+                archived,
+                locked,
+                auto_archive_minutes,
+                slowmode_seconds,
+                reply,
+            } => answer(
+                reply,
+                self.thread_update(&conversation_id, name, archived, locked, auto_archive_minutes, slowmode_seconds),
+            ),
+            Command::DeleteThread { conversation_id, reply } => {
+                answer(reply, self.delete_thread(&conversation_id))
             }
             Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
             Command::StartThread {
