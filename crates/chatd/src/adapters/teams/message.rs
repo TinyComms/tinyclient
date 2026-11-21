@@ -841,6 +841,7 @@ impl Teams {
             sender: quote.name,
             snippet: quote.preview.chars().take(120).collect(),
             deleted: false,
+            thumb: None,
         });
         // Forwarded message: from HTML `schema.skype.com/Forward` block and/or `properties.forwardedMessage`.
         let fwd_prop = forwarded_property(props);
@@ -1405,6 +1406,7 @@ impl Teams {
             sender: stored.sender.name,
             snippet: stored.text.chars().take(120).collect(),
             deleted: false,
+            thumb: None,
         }))
     }
 
@@ -1963,6 +1965,7 @@ mod tests {
             snippet: "is it \"green\"?".into(),
             person: None,
             deleted: false,
+            thumb: None,
         };
         struct None_;
         impl Lookup for None_ {

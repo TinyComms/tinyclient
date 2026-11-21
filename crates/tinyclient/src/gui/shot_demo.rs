@@ -361,6 +361,7 @@ fn carpool(key: &Key) -> Vec<Message> {
         snippet: "No allergies here. I'll bring the field guide and the spare loupe.".into(),
         person: Some(Key::new(&key.account(), ME)),
         deleted: false,
+        thumb: None,
     });
     let i = at(&mut all, "m17");
     all[i].attachments = vec![Attachment {

@@ -118,6 +118,7 @@ impl Demo {
             sender: quoted.sender.name,
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
+            thumb: None,
         });
         message
     }

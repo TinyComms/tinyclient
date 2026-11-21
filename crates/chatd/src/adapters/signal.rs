@@ -41,7 +41,7 @@ pub mod signin;
 mod vault;
 mod wire;
 
-use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
+use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, SharedPage, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, Filing, FolderRow, PersonDetails, PersonRow};
@@ -736,6 +736,19 @@ struct Live {
     /// `{support}/signal/{aci}.pins`. Empty when nothing is kept on disk.
     pins_path: PathBuf,
     pins_loaded: bool,
+    /// Received encrypted attachment pointers waiting to be downloaded on `Command::Wanted`.
+    held_attachments: HashMap<String, HeldAttachment>,
+    held_order: VecDeque<String>,
+}
+
+/// One received Signal attachment pointer remembered for lazy download/decrypt on `Command::Wanted`.
+#[derive(Clone)]
+struct HeldAttachment {
+    pointer: wire::Pointer,
+    file: MediaFile,
+    address: String,
+    conversation: String,
+    message_id: String,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -987,6 +1000,18 @@ impl Live {
             write_pins(&self.pins_path, &self.pinned_messages);
         }
         expired
+    }
+
+    fn remember_attachment(&mut self, id: String, held: HeldAttachment) {
+        if !self.held_attachments.contains_key(&id) {
+            while self.held_order.len() >= REACTIONS_KEPT {
+                if let Some(old) = self.held_order.pop_front() {
+                    self.held_attachments.remove(&old);
+                }
+            }
+            self.held_order.push_back(id.clone());
+        }
+        self.held_attachments.insert(id, held);
     }
 
     fn pins_for(&mut self, conversation: &str) -> Vec<PinRecord> {
@@ -1328,7 +1353,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
 }
 
 /// A message as the contract has it.
-fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
+fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -> Message {
     let author = if outgoing { account.me.as_str() } else { text.author.as_str() };
     let name = if outgoing {
         account.name.clone()
@@ -1343,7 +1368,8 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
         (None, _) => (text.text.clone(), Some(0)),
     };
     let sent = i64::try_from(text.sent / 1_000).unwrap_or(0);
-    let mut message = Message::plain(wire::message_id(text.sent, author), name, words, sent, outgoing);
+    let msg_id = wire::message_id(text.sent, author);
+    let mut message = Message::plain(msg_id.clone(), name, words, sent, outgoing);
     message.sender.id = author.to_owned();
     message.mentions_me = text.mentions_me && !outgoing;
     if let Some(shift) = shift {
@@ -1351,6 +1377,61 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
     }
     if text.unsupported.is_some() {
         message.kind = MessageKind::Unsupported { link: String::new() };
+    }
+    if !text.attachments.is_empty() {
+        let mut to_register = Vec::with_capacity(text.attachments.len());
+        for (idx, ptr) in text.attachments.iter().enumerate() {
+            let media_id = format!("signal:att:{}:{}:{idx}", text.sent, author);
+            let address = format!("signal://attachment/{media_id}");
+            let kind = files::attachment_kind(&ptr.content_type, ptr.flags);
+            let mut media = MediaFile::new(media_id.clone(), kind);
+            media.width = ptr.width;
+            media.height = ptr.height;
+            media.bytes = u64::from(ptr.size);
+            to_register.push((media.clone(), address.clone()));
+            account.live().remember_attachment(
+                media_id.clone(),
+                HeldAttachment {
+                    pointer: ptr.clone(),
+                    file: media.clone(),
+                    address,
+                    conversation: conversation.to_owned(),
+                    message_id: msg_id.clone(),
+                },
+            );
+            let preview_bytes = if !ptr.thumbnail.is_empty() && crate::blobs::is_picture(&ptr.thumbnail) {
+                Some(ptr.thumbnail.clone())
+            } else if let Some(hash) = ptr.blurhash.as_deref() {
+                files::decode_blurhash_jpeg(hash, ptr.width, ptr.height)
+            } else {
+                None
+            };
+            let preview = preview_bytes.and_then(|bytes| {
+                let mut prev = MediaFile::new(format!("{media_id}:preview"), MediaKind::Image);
+                prev.bytes = bytes.len() as u64;
+                account
+                    .ctx
+                    .landed(&prev, &format!("signal://preview/{media_id}"), &bytes)
+            });
+            let att_name = if !ptr.file_name.trim().is_empty() {
+                ptr.file_name.trim().to_owned()
+            } else {
+                files::default_filename(&ptr.content_type, ptr.flags).to_owned()
+            };
+            if message.text.is_empty() && !ptr.caption.is_empty() {
+                message.text = ptr.caption.clone();
+            }
+            let mut attachment = Attachment::new(att_name, media);
+            attachment.mime = ptr.content_type.clone();
+            if kind == MediaKind::Video {
+                attachment.thumb = preview.clone();
+            }
+            attachment.preview = preview;
+            message.attachments.push(attachment);
+        }
+        if !to_register.is_empty() {
+            let _ = account.ctx.media(&to_register);
+        }
     }
     message.contacts = text.contacts.clone();
     for (idx, preview) in text.previews.iter().enumerate() {
@@ -1400,19 +1481,50 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
             ..protocol::Card::default()
         }));
     }
-    message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, quote));
+    message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, conversation, &msg_id, quote));
     message
 }
 
-fn reply_to(account: &Account, quote: &Quote) -> ReplyTo {
+fn reply_to(account: &Account, conversation: &str, msg_id: &str, quote: &Quote) -> ReplyTo {
     let sender = if quote.author == account.me { account.name.clone() } else { account.live().name(&quote.author) };
-    let snippet = crate::store::without_spoilers(&quote.text, &quote.spans);
+    let mut snippet = crate::store::without_spoilers(&quote.text, &quote.spans);
+    let mut thumb = None;
+    if let Some(first) = quote.attachments.first() {
+        if snippet.trim().is_empty() {
+            snippet = files::attachment_label(&first.content_type, &first.file_name, 0);
+        }
+        if let Some(ptr) = &first.thumbnail {
+            let thumb_id = format!("signal:quote:{}:{}:{msg_id}", quote.sent, quote.author);
+            let address = format!("signal://attachment/{thumb_id}");
+            let mut mf = MediaFile::new(thumb_id.clone(), MediaKind::Image);
+            mf.width = ptr.width;
+            mf.height = ptr.height;
+            mf.bytes = u64::from(ptr.size);
+            if !ptr.thumbnail.is_empty() && crate::blobs::is_picture(&ptr.thumbnail) {
+                thumb = account.ctx.landed(&mf, &address, &ptr.thumbnail);
+            } else {
+                let _ = account.ctx.media(&[(mf.clone(), address.clone())]);
+                account.live().remember_attachment(
+                    thumb_id,
+                    HeldAttachment {
+                        pointer: ptr.clone(),
+                        file: mf.clone(),
+                        address,
+                        conversation: conversation.to_owned(),
+                        message_id: msg_id.to_owned(),
+                    },
+                );
+                thumb = Some(mf);
+            }
+        }
+    }
     ReplyTo {
         id: wire::message_id(quote.sent, &quote.author),
         sender,
         snippet: snippet.chars().take(200).collect(),
         person: Some(account.ctx.key(&quote.author)),
         deleted: false,
+        thumb,
     }
 }
 
@@ -1581,7 +1693,7 @@ fn apply(account: &Account, event: Event) {
             if outgoing && (account.live().echoed_file(text.sent) || files::replace_outgoing_sync(had_file)) {
                 return;
             }
-            let mut message = message(account, &text, outgoing);
+            let mut message = message(account, &conversation, &text, outgoing);
             let mut needs_filing = false;
             if !outgoing {
                 let (suppress_mention, unarchived) = {
@@ -1681,7 +1793,7 @@ fn apply(account: &Account, event: Event) {
                     }
                 }
             }
-            let message = with_poll(account, &author, &name, sent, outgoing, Poll::open(question, options, multiple));
+            let message = with_poll(account, &conversation, &author, &name, sent, outgoing, Poll::open(question, options, multiple));
             if outgoing {
                 account.live().sent(sent, &conversation);
             } else {
@@ -2645,6 +2757,15 @@ fn offline(ctx: &Context, command: Command) {
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
+        Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+            let key = ctx.key(&conversation_id);
+            let res = match ctx.hub.store().shared(&key, kind, before.as_deref(), limit) {
+                Ok(Some((items, more))) => Ok(SharedPage { items, more, total: None }),
+                Ok(None) => Err(Refusal::Refused("no such conversation".into())),
+                Err(err) => Err(Refusal::Refused(err.to_string())),
+            };
+            let _ = reply.send(res);
+        }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         other => other.unsupported(ctx),
     }
@@ -2934,6 +3055,10 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Handoff { conversation_id, reply } => {
             let _ = reply.send(call_link_handoff(account, &conversation_id));
+        }
+        Command::Wanted(ids) => wanted(account, &ids),
+        Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+            let _ = reply.send(shared(account, &conversation_id, kind, before.as_deref(), limit));
         }
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
@@ -3768,12 +3893,64 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
         quote,
         ..Text::default()
     };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
     message.attachments = vec![attachment];
     Ok(message)
+}
+
+/// Streams and decrypts wanted Signal attachments off the command thread into chatd's media cache.
+fn wanted(account: &Arc<Account>, ids: &[String]) {
+    let jobs: Vec<(String, HeldAttachment)> = {
+        let live = account.live();
+        ids.iter()
+            .filter_map(|id| live.held_attachments.get(id).cloned().map(|h| (id.clone(), h)))
+            .collect()
+    };
+    if jobs.is_empty() {
+        return;
+    }
+    let account = Arc::clone(account);
+    let spawned = std::thread::Builder::new().name("signal-media".into()).spawn(move || {
+        let media_root = protocol::support_dir().join("media");
+        for (id, held) in jobs {
+            let dest = crate::blobs::path_of(&media_root, &account.ctx.account, &id).with_extension("sigpart");
+            match account.wire.download_attachment(&held.pointer, &dest) {
+                Ok(bytes) => {
+                    let _ = account.ctx.landed_from_part(&held.file, &held.address, &dest, bytes);
+                }
+                Err(Fault::Refused(why)) => {
+                    let _ = std::fs::remove_file(&dest);
+                    account.ctx.media_failed(&id, &why);
+                }
+                Err(fault) => {
+                    let _ = std::fs::remove_file(&dest);
+                    tracing::warn!("chatd: Signal: attachment {id}: {}", super::net::redact(&fault.to_string()));
+                }
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("chatd: Signal: media thread: {err}");
+    }
+}
+
+/// Answers the shared Media / Files / Links tab from chatd's local message store for Signal.
+fn shared(
+    account: &Account,
+    conversation: &str,
+    kind: protocol::SharedKind,
+    before: Option<&str>,
+    limit: u32,
+) -> Result<SharedPage, Refusal> {
+    let key = account.ctx.key(conversation);
+    match account.ctx.hub.store().shared(&key, kind, before, limit) {
+        Ok(Some((items, more))) => Ok(SharedPage { items, more, total: None }),
+        Ok(None) => Err(Refusal::Refused("no such conversation".into())),
+        Err(err) => Err(Refusal::Refused(err.to_string())),
+    }
 }
 
 /// The pictures of the people and groups on screen (rows, people, the open conversation): each
@@ -3843,7 +4020,7 @@ fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Re
         Some((sent, author)) => {
             let stored = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten();
             let (text, spans) = stored.map_or_else(|| (String::new(), Vec::new()), |message| (quoted_words(&message.text), message.spans));
-            Some(Quote { sent, author, text, spans })
+            Some(Quote { sent, author, text, spans, attachments: Vec::new() })
         }
         None => None,
     })
@@ -3916,7 +4093,7 @@ fn send_text(
         previews,
         ..Text::default()
     };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
@@ -4016,7 +4193,7 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
         quote,
         ..Text::default()
     };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
@@ -4251,10 +4428,10 @@ fn checked_draft(draft: &PollDraft) -> Result<(String, Vec<String>, bool), Fault
     Ok((question.to_owned(), options, draft.multiple))
 }
 
-fn with_poll(account: &Account, author: &str, name: &str, sent: u64, outgoing: bool, mut poll: Poll) -> Message {
+fn with_poll(account: &Account, conversation: &str, author: &str, name: &str, sent: u64, outgoing: bool, mut poll: Poll) -> Message {
     protocol::clip(&mut poll.question, POLL_CHARS);
     let words = Text { author: author.to_owned(), name: name.to_owned(), sent, text: format!("Poll: {}", poll.question), ..Text::default() };
-    let mut message = message(account, &words, outgoing);
+    let mut message = message(account, conversation, &words, outgoing);
     message.poll = Some(Box::new(poll));
     message
 }
@@ -4330,7 +4507,7 @@ fn send_contact(account: &Account, conversation: &str, contact: protocol::Shared
     let sent = account.wire.send(&to, Body::Contact { contact: contact.clone(), timer })?;
     account.live().sent(sent, conversation);
     let words = Text { author: account.me.clone(), name: account.name.clone(), sent, contacts: vec![contact], ..Text::default() };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
@@ -4343,7 +4520,7 @@ fn send_poll(account: &Account, conversation: &str, draft: &PollDraft, _reply_to
     let timer = account.live().timer_of(conversation);
     let sent = account.wire.send(&to, Body::Poll { question: question.clone(), options: options.clone(), multiple, timer })?;
     account.live().sent(sent, conversation);
-    let mut message = with_poll(account, &account.me, &account.name, sent, true, Poll::open(question, options, multiple));
+    let mut message = with_poll(account, conversation, &account.me, &account.name, sent, true, Poll::open(question, options, multiple));
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }

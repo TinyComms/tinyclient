@@ -1548,6 +1548,7 @@ fn quoted(account: &Account, conversation: &str, id: &str, page: &[bugle::Note])
             sender: stored.sender.name,
             person,
             deleted: stored.deleted,
+            thumb: None,
         };
     }
     if let Some(note) = page.iter().find(|note| note.id == id && note.phones.is_none()) {
@@ -1564,6 +1565,7 @@ fn quoted(account: &Account, conversation: &str, id: &str, page: &[bugle::Note])
             snippet: note.text.chars().take(120).collect(),
             person: (!person_id.is_empty()).then(|| account.ctx.key(person_id)),
             deleted: false,
+            thumb: None,
         };
     }
     ReplyTo {
@@ -1572,6 +1574,7 @@ fn quoted(account: &Account, conversation: &str, id: &str, page: &[bugle::Note])
         snippet: String::new(),
         person: None,
         deleted: false,
+        thumb: None,
     }
 }
 

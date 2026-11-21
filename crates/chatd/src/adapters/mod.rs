@@ -1621,6 +1621,38 @@ impl Context {
         Some(landed)
     }
 
+    /// Commits a file the adapter already streamed and decrypted onto disk at `part` (never
+    /// holding large payloads in memory), moving it into the account's media directory,
+    /// recording it as landed in the store, and announcing `Change::Media`.
+    pub fn landed_from_part(&self, file: &MediaFile, address: &str, part: &std::path::Path, bytes: u64) -> Option<MediaFile> {
+        let media = protocol::support_dir().join("media");
+        let path = crate::blobs::path_of(&media, &self.account, &file.id);
+        std::fs::create_dir_all(crate::blobs::dir_under(&media, &self.account)).ok()?;
+        if std::fs::rename(part, &path).is_err() {
+            if std::fs::copy(part, &path).is_err() {
+                let _ = std::fs::remove_file(part);
+                return None;
+            }
+            let _ = std::fs::remove_file(part);
+        }
+        let landed = {
+            let mut store = self.hub.store();
+            store.register_media(&self.account, &[(file.clone(), address.to_owned())]).ok()?;
+            store.media_landed(&self.account, &file.id, &path.to_string_lossy(), bytes, now()).ok()??
+        };
+        self.hub.changed(Change::Media { account: self.account.clone(), file: landed.clone() });
+        Some(landed)
+    }
+
+    /// Records a permanent fetch failure for an adapter-managed file (such as an expired Signal
+    /// CDN attachment) and announces `Change::Media` so the shell shows the reason.
+    pub fn media_failed(&self, id: &str, reason: &str) {
+        let failed = self.hub.store().media_failed(&self.account, id, reason).ok().flatten();
+        if let Some(file) = failed {
+            self.hub.changed(Change::Media { account: self.account.clone(), file });
+        }
+    }
+
     /// A picture kept with [`Context::landed`] is the avatar of the row and of the person this
     /// id names, whichever are recorded. Rows and people the adapter records later should name
     /// it too, or they take it away again.

@@ -397,6 +397,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         snippet: "Frost on the cushion moss this morning.".to_owned(),
         person: Some(Key::new(account, who(INES).id.clone())),
         deleted: false,
+        thumb: None,
     });
     feed.push(reply);
     // An answer to something that has since been deleted.
@@ -407,6 +408,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         snippet: String::new(),
         person: Some(Key::new(account, who(WREN).id.clone())),
         deleted: true,
+        thumb: None,
     });
     feed.push(orphan);
 

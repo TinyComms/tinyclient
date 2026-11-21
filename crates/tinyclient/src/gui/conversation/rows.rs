@@ -216,7 +216,7 @@ mod tests {
             said("4", "Mara", t + 61 + 2 * GROUP_SECONDS),
             said("5", "Dev", t + 62 + 2 * GROUP_SECONDS),
             with(said("6", "Dev", t + 63 + 2 * GROUP_SECONDS), |m| {
-                m.reply_to = Some(ReplyTo { deleted: false, person: None, id: "1".into(), sender: "Mara".into(), snippet: "hello".into() });
+                m.reply_to = Some(ReplyTo { deleted: false, person: None, id: "1".into(), sender: "Mara".into(), snippet: "hello".into(), thumb: None });
             }),
             with(said("7", "Dev", t + 64 + 2 * GROUP_SECONDS), |m| m.kind = MessageKind::System),
             said("8", "Dev", t + 65 + 2 * GROUP_SECONDS),

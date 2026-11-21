@@ -12,7 +12,8 @@ use super::wire::{
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
-    Peer, PersonProfile, Quote, SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
+    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, StorageAccount, StorageContact, StorageGroup,
+    StorageSnapshot, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -95,6 +96,7 @@ enum Ask {
     SafetyNumber { aci: String, answer: Sender<Result<Option<SafetyNumber>, Fault>> },
     SetVerified { aci: String, state: IdentityState, answer: Sender<Result<(), Fault>> },
     PersonProfile { aci: String, answer: Sender<Result<PersonProfile, Fault>> },
+    DownloadAttachment { pointer: Pointer, dest: std::path::PathBuf, answer: Sender<Result<u64, Fault>> },
 }
 
 pub struct Real {
@@ -302,10 +304,62 @@ fn payment_note(payment: &data_message::Payment) -> Option<&str> {
     }
 }
 
+fn pointer_of(ptr: &presage::proto::AttachmentPointer) -> Pointer {
+    let (cdn_id, cdn_key) = match &ptr.attachment_identifier {
+        Some(presage::proto::attachment_pointer::AttachmentIdentifier::CdnId(id)) => (Some(*id), None),
+        Some(presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(key)) => (None, Some(key.clone())),
+        None => (None, None),
+    };
+    Pointer {
+        cdn_number: ptr.cdn_number.unwrap_or(0),
+        cdn_id,
+        cdn_key,
+        content_type: ptr.content_type.clone().unwrap_or_default(),
+        key: ptr.key.clone().unwrap_or_default(),
+        size: ptr.size.unwrap_or(0),
+        digest: ptr.digest.clone().unwrap_or_default(),
+        file_name: ptr.file_name.clone().unwrap_or_default(),
+        flags: ptr.flags.unwrap_or(0),
+        width: ptr.width.unwrap_or(0),
+        height: ptr.height.unwrap_or(0),
+        caption: ptr.caption.clone().unwrap_or_default(),
+        blurhash: ptr.blur_hash.clone().filter(|h| !h.is_empty()),
+        thumbnail: ptr.thumbnail.clone().unwrap_or_default(),
+        upload_timestamp: ptr.upload_timestamp.unwrap_or(0),
+        url: None,
+    }
+}
+
+fn proto_pointer_of(pointer: &Pointer) -> Option<presage::proto::AttachmentPointer> {
+    let attachment_identifier = if let Some(key) = pointer.cdn_key.as_ref().filter(|k| !k.is_empty()) {
+        Some(presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(key.clone()))
+    } else {
+        pointer.cdn_id.map(presage::proto::attachment_pointer::AttachmentIdentifier::CdnId)
+    }?;
+    Some(presage::proto::AttachmentPointer {
+        attachment_identifier: Some(attachment_identifier),
+        content_type: (!pointer.content_type.is_empty()).then(|| pointer.content_type.clone()),
+        key: (!pointer.key.is_empty()).then(|| pointer.key.clone()),
+        size: (pointer.size > 0).then_some(pointer.size),
+        digest: (!pointer.digest.is_empty()).then(|| pointer.digest.clone()),
+        file_name: (!pointer.file_name.is_empty()).then(|| pointer.file_name.clone()),
+        flags: (pointer.flags > 0).then_some(pointer.flags),
+        width: (pointer.width > 0).then_some(pointer.width),
+        height: (pointer.height > 0).then_some(pointer.height),
+        caption: (!pointer.caption.is_empty()).then(|| pointer.caption.clone()),
+        blur_hash: pointer.blurhash.clone(),
+        thumbnail: (!pointer.thumbnail.is_empty()).then(|| pointer.thumbnail.clone()),
+        upload_timestamp: (pointer.upload_timestamp > 0).then_some(pointer.upload_timestamp),
+        cdn_number: Some(pointer.cdn_number),
+        ..Default::default()
+    })
+}
+
 /// What a message that is not drawn here says, in words. A view-once photo or video is named
 /// before its attachment: it opens once, on the phone, so "Photo" would promise a file that is
 /// not here to open and say nothing of why (#748). A long text is drawn: it is the message's own
-/// words, not a file (#728).
+/// words, not a file (#728). Downloadable attachments are drawn inline (#740); only a bare
+/// pointer with no CDN identifier falls back to a label.
 fn unsupported_label(message: &DataMessage) -> Option<String> {
     if message.is_view_once.unwrap_or(false) {
         let kind = message.attachments.first().and_then(|attachment| attachment.content_type.as_deref());
@@ -315,6 +369,9 @@ fn unsupported_label(message: &DataMessage) -> Option<String> {
         return None;
     }
     if let Some(attachment) = message.attachments.first() {
+        if attachment.attachment_identifier.is_some() {
+            return None;
+        }
         if attachment.flags.unwrap_or(0) & 8 != 0 {
             return Some("GIF".to_owned());
         }
@@ -644,6 +701,24 @@ impl Wire for Real {
     /// proxy (NEVER directly from chatd, preserving IP privacy parity with Signal Desktop).
     fn fetch_link_preview(&self, url: &str) -> Result<Option<LinkPreview>, Fault> {
         Ok(fetch_preview_via_signal_proxy(url))
+    }
+
+    fn download_attachment(&self, pointer: &Pointer, dest: &std::path::Path) -> Result<u64, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let (answer, answered) = channel();
+        self.asks
+            .send(Ask::DownloadAttachment {
+                pointer: pointer.clone(),
+                dest: dest.to_path_buf(),
+                answer,
+            })
+            .map_err(|_| Fault::Net("closed".into()))?;
+        // Large attachments/videos may take longer than a short RPC answer.
+        answered
+            .recv_timeout(Duration::from_secs(300))
+            .map_err(|_| Fault::Net("no answer".into()))?
     }
 
     fn close(&self) {
@@ -1173,9 +1248,34 @@ impl Session {
                 let qbody = quote.text.clone().unwrap_or_default();
                 let qranges = self.ranges_of(&quote.body_ranges).await;
                 let quoted = style::apply(&qbody, &qranges, &self.me);
-                Some(Quote { sent: quote.id.unwrap_or(0), author: quote.author_aci.clone().unwrap_or_default(), text: quoted.text, spans: quoted.spans })
+                let qattachments = quote
+                    .attachments
+                    .iter()
+                    .map(|att| QuotedAttachment {
+                        content_type: att.content_type.clone().unwrap_or_default(),
+                        file_name: att.file_name.clone().unwrap_or_default(),
+                        thumbnail: att.thumbnail.as_ref().map(pointer_of).filter(Pointer::downloadable),
+                    })
+                    .collect();
+                Some(Quote {
+                    sent: quote.id.unwrap_or(0),
+                    author: quote.author_aci.clone().unwrap_or_default(),
+                    text: quoted.text,
+                    spans: quoted.spans,
+                    attachments: qattachments,
+                })
             }
             None => None,
+        };
+        let attachments = if message.is_view_once.unwrap_or(false) || long_text(message) {
+            Vec::new()
+        } else {
+            message
+                .attachments
+                .iter()
+                .map(pointer_of)
+                .filter(Pointer::downloadable)
+                .collect()
         };
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
         let contacts = message.contact.iter().map(shared_contact_of).collect();
@@ -1222,6 +1322,7 @@ impl Session {
             expire_timer_version: message.expire_timer_version.unwrap_or(0),
             contacts,
             previews,
+            attachments,
         }
     }
 
@@ -1750,7 +1851,74 @@ impl Session {
             Ask::PersonProfile { aci, answer } => {
                 let _ = answer.send(self.person_profile(&aci).await);
             }
+            Ask::DownloadAttachment { pointer, dest, answer } => {
+                let _ = answer.send(self.download_attachment(&pointer, &dest).await);
+            }
         }
+    }
+
+    async fn download_attachment(&mut self, pointer: &Pointer, dest: &std::path::Path) -> Result<u64, Fault> {
+        use futures::AsyncReadExt;
+        use std::io::Write;
+
+        let proto = proto_pointer_of(pointer).ok_or_else(|| Fault::Refused("No longer available".to_owned()))?;
+        let credentials = self.credentials()?;
+        let mut push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
+        let mut stream = match push.get_attachment(&proto).await {
+            Ok(s) => s,
+            Err(ServiceError::UnhandledResponseCode { status, .. })
+                if matches!(status.as_u16(), 403 | 404 | 410) =>
+            {
+                return Err(Fault::Refused("No longer available".to_owned()));
+            }
+            Err(ServiceError::SendError { reason })
+                if reason.contains("404") || reason.contains("410") || reason.contains("403") =>
+            {
+                return Err(Fault::Refused("No longer available".to_owned()));
+            }
+            Err(err) => return Err(Fault::Net(err.to_string())),
+        };
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        let enc_path = dest.with_extension("sigenc");
+        {
+            let mut enc_file = protocol::private::create(&enc_path).map_err(|err| Fault::Net(err.to_string()))?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0u64;
+            let cap = super::files::MAX_FILE_BYTES + 1024 * 1024;
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total = total.saturating_add(n as u64);
+                        if total > cap {
+                            drop(enc_file);
+                            let _ = std::fs::remove_file(&enc_path);
+                            return Err(Fault::Refused("Attachment exceeds Signal's size limit.".to_owned()));
+                        }
+                        if let Err(err) = enc_file.write_all(&buf[..n]) {
+                            drop(enc_file);
+                            let _ = std::fs::remove_file(&enc_path);
+                            return Err(Fault::Net(err.to_string()));
+                        }
+                    }
+                    Err(err) => {
+                        drop(enc_file);
+                        let _ = std::fs::remove_file(&enc_path);
+                        return Err(Fault::Net(err.to_string()));
+                    }
+                }
+            }
+        }
+        let key = pointer.key.clone();
+        let digest = pointer.digest.clone();
+        let size = pointer.size;
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || super::files::decrypt_attachment_file(&enc_path, &key, &digest, size, &dest))
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?
+            .map_err(Fault::Refused)
     }
 
     async fn person_profile(&mut self, aci: &str) -> Result<PersonProfile, Fault> {

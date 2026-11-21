@@ -483,6 +483,63 @@ pub enum MessageRequestAction {
     BlockAndSpam,
 }
 
+/// Signal `AttachmentPointer.Flags` bitmask constants (`SignalService.proto`).
+pub const FLAG_VOICE_MESSAGE: u32 = 1;
+pub const FLAG_BORDERLESS: u32 = 2;
+pub const FLAG_GIF: u32 = 8;
+
+/// An encrypted attachment pointer carried on a Signal `DataMessage` or `Quote`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pointer {
+    pub cdn_number: u32,
+    pub cdn_id: Option<u64>,
+    pub cdn_key: Option<String>,
+    pub content_type: String,
+    /// 64-byte attachment key (`aes_key[0..32] || hmac_key[32..64]`).
+    pub key: Vec<u8>,
+    /// Unpadded plaintext size in bytes (0 when omitted).
+    pub size: u32,
+    /// SHA-256 digest of the encrypted blob on Signal's CDN.
+    pub digest: Vec<u8>,
+    pub file_name: String,
+    /// Bitmask of `FLAG_VOICE_MESSAGE`, `FLAG_BORDERLESS`, `FLAG_GIF`.
+    pub flags: u32,
+    pub width: u32,
+    pub height: u32,
+    pub caption: String,
+    pub blurhash: Option<String>,
+    /// Inline small thumbnail bytes if the sender included them.
+    pub thumbnail: Vec<u8>,
+    pub upload_timestamp: u64,
+    /// Direct URL override used by local CDN stubs in scripted tests (never set by real Signal).
+    pub url: Option<String>,
+}
+
+impl Pointer {
+    /// True when this pointer identifies a downloadable blob on Signal's CDN or a local stub.
+    pub fn downloadable(&self) -> bool {
+        self.cdn_id.is_some()
+            || self.cdn_key.as_deref().is_some_and(|k| !k.is_empty())
+            || self.url.as_deref().is_some_and(|u| !u.is_empty())
+    }
+
+    pub fn is_voice(&self) -> bool {
+        self.flags & FLAG_VOICE_MESSAGE != 0
+    }
+
+    pub fn is_gif(&self) -> bool {
+        self.flags & FLAG_GIF != 0 || self.content_type.eq_ignore_ascii_case("image/gif")
+    }
+}
+
+/// An attachment preview inside a Signal `DataMessage.quote`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuotedAttachment {
+    pub content_type: String,
+    pub file_name: String,
+    pub thumbnail: Option<Pointer>,
+}
+
 /// The earlier message a message answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Quote {
@@ -491,6 +548,8 @@ pub struct Quote {
     pub text: String,
     /// Styles of `text` after any mention in the quote was substituted.
     pub spans: Vec<Span>,
+    /// Quoted attachment metadata and optional thumbnail pointers (`Quote.attachments`).
+    pub attachments: Vec<QuotedAttachment>,
 }
 
 /// One link preview carried on a Signal `DataMessage.preview`.
@@ -565,6 +624,8 @@ pub struct Text {
     pub contacts: Vec<protocol::SharedContact>,
     /// Link previews attached to this message (`DataMessage.preview`).
     pub previews: Vec<LinkPreview>,
+    /// Encrypted media/file attachments carried on this message (`DataMessage.attachments`).
+    pub attachments: Vec<Pointer>,
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -1030,6 +1091,12 @@ pub trait Wire: Send + Sync {
     /// Fetches a link preview strictly through Signal's content proxy (NEVER directly).
     fn fetch_link_preview(&self, _url: &str) -> Result<Option<LinkPreview>, Fault> {
         Ok(None)
+    }
+    /// Streams an encrypted attachment from Signal's CDN, verifies its SHA-256 digest and
+    /// HMAC-SHA256, and writes the decrypted plaintext to `dest` without buffering the whole
+    /// file in memory. Returns the decrypted plaintext byte length.
+    fn download_attachment(&self, _pointer: &Pointer, _dest: &std::path::Path) -> Result<u64, Fault> {
+        Err(Fault::Refused("No longer available".to_owned()))
     }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);

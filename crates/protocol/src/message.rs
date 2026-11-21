@@ -246,7 +246,7 @@ pub struct Reactor {
 }
 
 /// The earlier message this one answers, as one line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyTo {
     pub id: String,
     pub sender: String,
@@ -257,6 +257,9 @@ pub struct ReplyTo {
     /// The message answered has been deleted. `snippet` is then empty.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deleted: bool,
+    /// Thumbnail of a quoted picture or video (`Quote.attachments` on Signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumb: Option<MediaFile>,
 }
 
 /// The thread hanging off this message. Its replies are not in the conversation's own pages.
@@ -945,6 +948,7 @@ impl Message {
             .chain(cards)
             .chain(self.reactions.iter().filter_map(|reaction| reaction.file.as_ref()))
             .chain(emoji)
+            .chain(self.reply_to.as_ref().and_then(|reply| reply.thumb.as_ref()))
             .chain(&self.sender.avatar)
     }
 
@@ -969,6 +973,7 @@ impl Message {
             .chain(cards)
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
+            .chain(self.reply_to.as_mut().and_then(|reply| reply.thumb.as_mut()))
             .chain(&mut self.sender.avatar)
     }
 }
@@ -1096,5 +1101,27 @@ mod tests {
         msg.announcement = true;
         let wire = serde_json::to_string(&msg).unwrap();
         assert!(serde_json::from_str::<Message>(&wire).unwrap().announcement);
+    }
+
+    #[test]
+    fn reply_to_thumb_is_backward_compatible_and_in_files() {
+        let legacy = r#"{"id":"1","sender":"Grace","snippet":"Photo"}"#;
+        let parsed: ReplyTo = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.thumb, None);
+        assert!(!serde_json::to_string(&parsed).unwrap().contains("thumb"));
+
+        let mut msg = Message::plain("m4", "Ada", "Nice shot!", 1_700_000_000, false);
+        msg.reply_to = Some(ReplyTo {
+            id: "1".into(),
+            sender: "Grace".into(),
+            snippet: "Photo".into(),
+            person: None,
+            deleted: false,
+            thumb: Some(MediaFile::new("signal:quote:1", MediaKind::Image)),
+        });
+        assert_eq!(msg.files().count(), 1);
+        assert_eq!(msg.files().next().unwrap().id, "signal:quote:1");
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap().reply_to, msg.reply_to);
     }
 }

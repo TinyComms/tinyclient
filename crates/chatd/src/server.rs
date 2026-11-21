@@ -1438,6 +1438,7 @@ impl Chat {
             sender: quoted.sender.name,
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
+            thumb: None,
         });
         if let Some(draft) = &with.poll {
             let mut question = draft.question.clone();

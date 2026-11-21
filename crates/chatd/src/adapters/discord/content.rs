@@ -854,6 +854,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             id: original.id.clone(),
             sender: sender_name(original),
             snippet: snippet(original, place.names),
+            thumb: None,
         }),
         // The original was deleted, or Discord did not include it.
         (Some(reference), None) if reference.kind == 0 && kind == 19 => reference.message_id.as_ref().map(|id| ReplyTo {
@@ -862,6 +863,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             id: id.clone(),
             sender: String::new(),
             snippet: String::new(),
+            thumb: None,
         }),
         _ => None,
     };

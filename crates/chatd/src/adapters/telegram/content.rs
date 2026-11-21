@@ -2170,8 +2170,9 @@ pub(super) fn line_for(reply: i32, known: Option<&(String, String, String)>, not
             snippet: text.chars().take(120).collect(),
             person: None,
             deleted: false,
+            thumb: None,
         },
-        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false },
+        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false, thumb: None },
     };
     let Some(note) = note else {
         return line;
@@ -4091,6 +4092,7 @@ mod tests {
             snippet: "Bring the rope tomorrow and the map from the hut please".into(),
             person: None,
             deleted: false,
+            thumb: None,
         });
         quote_pin(&mut quoted);
         assert_eq!(quoted.text, "Ada pinned \"Bring the rope tomorrow and the map from…\"");

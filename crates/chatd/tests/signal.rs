@@ -357,9 +357,12 @@ fn a_group_mention_counts_and_what_cannot_be_drawn_says_so() {
     let mention = world.arrived(CLUB, &id(T0 + 2_000, GRACE));
     assert!(mention.mentions_me && mention.text == "@Ada Quill you're dealing", "{mention:?}");
     assert_eq!(world.conversation(CLUB).unwrap().mentions, 1);
-    world.steer(&format!("photo grace {}", T0 + 3_000));
-    let photo = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
-    assert_eq!((photo.text.as_str(), &photo.kind), ("Photo", &MessageKind::Unsupported { link: String::new() }));
+    world.steer(&format!("giftbadge grace {}", T0 + 3_000));
+    let badge = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    assert_eq!(
+        (badge.text.as_str(), &badge.kind),
+        ("Gift badge · open Signal on your phone to redeem", &MessageKind::Unsupported { link: String::new() })
+    );
     // The group's reply goes to the group.
     world.send(CLUB, "2001", "I am.", None);
     world.heard(&format!("send {CLUB} text I am."));
@@ -380,10 +383,13 @@ fn a_view_once_message_says_where_it_opens_instead_of_promising_the_media() {
     world.steer(&format!("viewonce-video grace {}", T0 + 5_000));
     let video = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
     assert_eq!(video.text.as_str(), "View-once video · open it on your phone");
-    // A photo without the flag is still only labelled.
+    // A normal photo without the view-once flag arrives as a real image attachment with a BlurHash preview.
     world.steer(&format!("photo grace {}", T0 + 6_000));
     let photo = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
-    assert_eq!(photo.text.as_str(), "Photo");
+    assert_eq!(photo.kind, MessageKind::Normal);
+    assert_eq!(photo.attachments.len(), 1);
+    assert_eq!(photo.attachments[0].file.kind, protocol::MediaKind::Image);
+    assert!(photo.attachments[0].preview.is_some(), "photo should carry an instant BlurHash preview");
 }
 
 #[test]
@@ -2670,4 +2676,311 @@ fn group_at_mentions_send_and_edit_as_ufffc_with_utf16_body_ranges_and_echo_name
         "expected edit wire body with U+FFFC and Mention(ALAN):8+1, calls: {:?}",
         world.calls()
     );
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Encrypts `plaintext` with Signal's attachment cipher (AES-256-CBC + HMAC-SHA256 + SHA-256 digest).
+fn encrypt_signal_blob(plaintext: &[u8], key: &[u8; 64], iv: &[u8; 16]) -> (Vec<u8>, [u8; 32]) {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::Aes256;
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let aes = Aes256::new_from_slice(&key[..32]).unwrap();
+    let pad = 16 - (plaintext.len() % 16);
+    let mut out = Vec::with_capacity(16 + plaintext.len() + pad + 32);
+    out.extend_from_slice(iv);
+    let mut prev = *iv;
+    let mut chunks = plaintext.chunks_exact(16);
+    for chunk in &mut chunks {
+        let mut block = [0u8; 16];
+        for i in 0..16 {
+            block[i] = chunk[i] ^ prev[i];
+        }
+        aes.encrypt_block((&mut block).into());
+        out.extend_from_slice(&block);
+        prev = block;
+    }
+    let rem = chunks.remainder();
+    let mut last = [pad as u8; 16];
+    last[..rem.len()].copy_from_slice(rem);
+    for i in 0..16 {
+        last[i] ^= prev[i];
+    }
+    aes.encrypt_block((&mut last).into());
+    out.extend_from_slice(&last);
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[32..64]).unwrap();
+    mac.update(&out);
+    out.extend_from_slice(&mac.finalize().into_bytes());
+
+    let digest: [u8; 32] = Sha256::digest(&out).into();
+    (out, digest)
+}
+
+/// Spawns a tiny local HTTP stub serving `routes` (path -> body bytes, or 404 when absent).
+fn spawn_cdn_stub(routes: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if let Some((_, body)) = routes.iter().find(|(p, _)| p == path) {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(body);
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    let _ = stream.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{addr}"), stop)
+}
+
+#[test]
+fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_and_populate_shared_media() {
+    let photo_plain = b"\xff\xd8\xff\xe0FAKE-JPEG-PHOTO-PAYLOAD-740\xff\xd9".to_vec();
+    let video_plain = b"\x00\x00\x00\x18ftypmp42FAKE-VIDEO-PAYLOAD-740".to_vec();
+    let gif_plain = b"\x00\x00\x00\x18ftypmp42FAKE-GIF-PAYLOAD-740".to_vec();
+    let pdf_plain = b"%PDF-1.7\n1 0 obj << /Title (Q4 Report) >> endobj\n%%EOF".to_vec();
+    let album1_plain = b"\xff\xd8\xff\xe0ALBUM-ONE\xff\xd9".to_vec();
+    let album2_plain = b"\xff\xd8\xff\xe0ALBUM-TWO\xff\xd9".to_vec();
+    let quote_thumb_plain = b"\xff\xd8\xff\xe0QUOTED-THUMB\xff\xd9".to_vec();
+
+    let key_photo = [0x11u8; 64];
+    let key_video = [0x22u8; 64];
+    let key_gif = [0x33u8; 64];
+    let key_pdf = [0x44u8; 64];
+    let key_a1 = [0x55u8; 64];
+    let key_a2 = [0x66u8; 64];
+    let key_qt = [0x77u8; 64];
+    let iv = [0xabu8; 16];
+
+    let (photo_enc, photo_dig) = encrypt_signal_blob(&photo_plain, &key_photo, &iv);
+    let (video_enc, video_dig) = encrypt_signal_blob(&video_plain, &key_video, &iv);
+    let (gif_enc, gif_dig) = encrypt_signal_blob(&gif_plain, &key_gif, &iv);
+    let (pdf_enc, pdf_dig) = encrypt_signal_blob(&pdf_plain, &key_pdf, &iv);
+    let (a1_enc, a1_dig) = encrypt_signal_blob(&album1_plain, &key_a1, &iv);
+    let (a2_enc, a2_dig) = encrypt_signal_blob(&album2_plain, &key_a2, &iv);
+    let (qt_enc, qt_dig) = encrypt_signal_blob(&quote_thumb_plain, &key_qt, &iv);
+
+    let (base, stop_cdn) = spawn_cdn_stub(vec![
+        ("/photo.enc".into(), photo_enc),
+        ("/video.enc".into(), video_enc),
+        ("/gif.enc".into(), gif_enc),
+        ("/report.enc".into(), pdf_enc),
+        ("/a1.enc".into(), a1_enc),
+        ("/a2.enc".into(), a2_enc),
+        ("/qt.enc".into(), qt_enc),
+    ]);
+
+    let world = World::linked();
+    world.connected();
+
+    // 1. Photo with BlurHash + caption
+    world.steer(&format!(
+        "media grace {} image/jpeg 1200 900 0 sunset.jpg {base}/photo.enc {} {} 00TI:j | Sunset over the bay",
+        T0 + 1_000,
+        hex_of(&key_photo),
+        hex_of(&photo_dig),
+    ));
+    let photo_msg = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    assert_eq!(photo_msg.kind, MessageKind::Normal);
+    assert_eq!(photo_msg.text, "Sunset over the bay");
+    assert_eq!(photo_msg.attachments.len(), 1);
+    let photo_att = &photo_msg.attachments[0];
+    assert_eq!(photo_att.file.kind, protocol::MediaKind::Image);
+    assert_eq!((photo_att.file.width, photo_att.file.height), (1200, 900));
+    assert!(photo_att.preview.as_ref().and_then(|p| p.path.as_ref()).is_some(), "BlurHash preview should land immediately");
+
+    // Trigger download + decrypt via Request::Fetch
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![photo_att.file.id.clone()], size: None, retry: false });
+    let photo_path = world.until("photo decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == photo_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&photo_path).unwrap(), photo_plain);
+
+    // 2. Video with BlurHash poster thumb
+    world.steer(&format!(
+        "media grace {} video/mp4 1920 1080 0 clip.mp4 {base}/video.enc {} {} 00TI:j",
+        T0 + 2_000,
+        hex_of(&key_video),
+        hex_of(&video_dig),
+    ));
+    let video_msg = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
+    assert_eq!(video_msg.attachments[0].file.kind, protocol::MediaKind::Video);
+    assert!(video_msg.attachments[0].thumb.is_some(), "video with BlurHash should expose a poster thumb");
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![video_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let video_path = world.until("video decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == video_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&video_path).unwrap(), video_plain);
+
+    // 3. GIF (FLAG_GIF = 8)
+    world.steer(&format!(
+        "media grace {} video/mp4 480 270 8 wave.mp4 {base}/gif.enc {} {}",
+        T0 + 3_000,
+        hex_of(&key_gif),
+        hex_of(&gif_dig),
+    ));
+    let gif_msg = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    assert_eq!(gif_msg.attachments[0].file.kind, protocol::MediaKind::Gif);
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gif_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let gif_path = world.until("gif decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == gif_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&gif_path).unwrap(), gif_plain);
+
+    // 4. Document / PDF file with original filename
+    world.steer(&format!(
+        "media grace {} application/pdf 0 0 0 report.pdf {base}/report.enc {} {} - | Q4 summary",
+        T0 + 4_000,
+        hex_of(&key_pdf),
+        hex_of(&pdf_dig),
+    ));
+    let pdf_msg = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    assert_eq!(pdf_msg.attachments[0].file.kind, protocol::MediaKind::File);
+    assert_eq!(pdf_msg.attachments[0].name, "report.pdf");
+    assert_eq!(pdf_msg.text, "Q4 summary");
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![pdf_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let pdf_path = world.until("pdf decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == pdf_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&pdf_path).unwrap(), pdf_plain);
+
+    // 5. Multi-attachment album
+    world.steer(&format!(
+        "album grace {} image/jpeg|one.jpg|{base}/a1.enc|{}|{} ; image/jpeg|two.jpg|{base}/a2.enc|{}|{}",
+        T0 + 5_000,
+        hex_of(&key_a1),
+        hex_of(&a1_dig),
+        hex_of(&key_a2),
+        hex_of(&a2_dig),
+    ));
+    let album_msg = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!(album_msg.attachments.len(), 2);
+    for att in &album_msg.attachments {
+        let _ = world.ask(Request::Fetch { account: account(), ids: vec![att.file.id.clone()], size: None, retry: false });
+    }
+    let album_paths = world.until("both album photos decrypted", || {
+        let m = world.messages(GRACE).into_iter().find(|m| m.id == album_msg.id)?;
+        let p0 = m.attachments.first()?.file.path.clone()?;
+        let p1 = m.attachments.get(1)?.file.path.clone()?;
+        Some((p0, p1))
+    });
+    assert_eq!(std::fs::read(&album_paths.0).unwrap(), album1_plain);
+    assert_eq!(std::fs::read(&album_paths.1).unwrap(), album2_plain);
+
+    // 6. Quoted photo reply carries ReplyTo::thumb and decrypts it
+    world.steer(&format!(
+        "quote-photo grace {} {} {base}/qt.enc {} {} | Love this shot!",
+        T0 + 6_000,
+        T0 + 1_000,
+        hex_of(&key_qt),
+        hex_of(&qt_dig),
+    ));
+    let quote_msg = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    let reply = quote_msg.reply_to.as_ref().expect("quoted photo reply_to");
+    assert_eq!(reply.snippet, "Photo");
+    let thumb = reply.thumb.as_ref().expect("quoted photo thumbnail");
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![thumb.id.clone()], size: None, retry: false });
+    let thumb_path = world.until("quoted thumbnail decrypted", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == quote_msg.id)
+            .and_then(|m| m.reply_to?.thumb?.path)
+    });
+    assert_eq!(std::fs::read(&thumb_path).unwrap(), quote_thumb_plain);
+
+    // 7. Expired CDN attachment reports "No longer available"
+    world.steer(&format!(
+        "media grace {} image/jpeg 640 480 0 gone.jpg {base}/missing-404.enc {} {}",
+        T0 + 7_000,
+        hex_of(&key_photo),
+        hex_of(&photo_dig),
+    ));
+    let gone_msg = world.arrived(GRACE, &id(T0 + 7_000, GRACE));
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gone_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let failed_reason = world.until("expired attachment marked failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == gone_msg.id)
+            .and_then(|m| m.attachments.first()?.file.failed.clone())
+    });
+    assert_eq!(failed_reason, "No longer available");
+
+    // 8. Request::Shared returns Media (photos/videos/gifs) and Files (PDF)
+    let Response::Shared { items: media_items, .. } = world.ask(Request::Shared {
+        conversation: key(GRACE),
+        kind: protocol::SharedKind::Media,
+        before: None,
+        limit: 50,
+        search: false,
+    }) else {
+        panic!("expected Response::Shared for SharedKind::Media");
+    };
+    assert!(media_items.iter().any(|m| m.message_id == photo_msg.id), "photo should appear in SharedKind::Media");
+    assert!(media_items.iter().any(|m| m.message_id == video_msg.id), "video should appear in SharedKind::Media");
+    assert!(media_items.iter().any(|m| m.message_id == album_msg.id), "album should appear in SharedKind::Media");
+
+    let Response::Shared { items: file_items, .. } = world.ask(Request::Shared {
+        conversation: key(GRACE),
+        kind: protocol::SharedKind::Files,
+        before: None,
+        limit: 50,
+        search: false,
+    }) else {
+        panic!("expected Response::Shared for SharedKind::Files");
+    };
+    assert!(file_items.iter().any(|m| m.message_id == pdf_msg.id), "PDF should appear in SharedKind::Files");
+
+    stop_cdn.store(true, Ordering::Relaxed);
 }

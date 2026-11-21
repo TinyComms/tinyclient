@@ -266,11 +266,12 @@ pub struct Blobs {
     cache: Arc<Cache>,
 }
 
-/// Whether `address` is Telegram's name for a file it kept over its own session, which no host
-/// serves. Signal's and Messages' names are refused with a reason as before: Signal does not
-/// answer `Command::Wanted`, and Messages answers it with a download each time it hears it.
-fn kept_by_telegram(address: &str) -> bool {
+/// Whether `address` is an adapter-managed file fetched over the adapter's own session
+/// (`Command::Wanted`), rather than an open/session HTTP URL the generic cache fetches.
+fn kept_by_adapter(address: &str) -> bool {
     address.starts_with("tg://file/")
+        || address.starts_with("signal://attachment/")
+        || address.starts_with("signal://sticker/")
 }
 
 /// A test's override. Read only in a scratch directory, like the sessions in `session::load`.
@@ -498,10 +499,9 @@ impl Cache {
                 if file.path.is_some() || file.failed.is_some() || queue.fetching.contains(&key) {
                     continue;
                 }
-                // Telegram's name for where it got the file over its own session. Fetching it
-                // could only fail, and the failure would stand in the box where the picture is
-                // about to land: it waits for Telegram instead.
-                if kept_by_telegram(url) {
+                // Adapter-managed encrypted or session-fetched media (Telegram, Signal):
+                // hand it off to `Command::Wanted` so the adapter fetches and decrypts it.
+                if kept_by_adapter(url) {
                     theirs.push(file.id.clone());
                     continue;
                 }
@@ -718,9 +718,9 @@ impl Cache {
     /// Makes the directory and the store agree, once, at start. A file no row points to is
     /// removed, parts of interrupted downloads included; a row whose file is gone loses its path.
     fn reconcile(&self) {
-        // The cache's own refusal of Telegram's name for a file was an older chatd trying to
+        // The cache's own refusal of an adapter-managed name was an older chatd trying to
         // fetch it itself. Any other failure recorded there is the file's own and stands.
-        let refused = |why: &str, url: &str| kept_by_telegram(url) && why.ends_with("does not serve files from that address.");
+        let refused = |why: &str, url: &str| kept_by_adapter(url) && why.ends_with("does not serve files from that address.");
         match self.hub.store().media_forgive(|why, url| fetch::passing(why) || refused(why, url)) {
             Ok(0) => {}
             Ok(forgiven) => tracing::warn!("chatd: media: {forgiven} files that failed for a moment's trouble, or that only Telegram fetches, will be fetched again"),
@@ -1048,13 +1048,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_file_telegram_kept_is_left_to_telegram() {
-        assert!(kept_by_telegram("tg://file/p6014m"));
+    fn only_a_file_kept_by_an_adapter_is_left_to_the_adapter() {
+        assert!(kept_by_adapter("tg://file/p6014m"));
+        assert!(kept_by_adapter("signal://attachment/signal:att:1:u:0"));
+        assert!(kept_by_adapter("signal://sticker/pack/1"));
         // Everything else is the cache's to fetch, or to refuse with a reason, as before: an
         // address on the web, a link Telegram would open, and the other adapters' own names.
         let others = ["https://cdn.discordapp.com/a.png", "http://127.0.0.1:9/x", "tg://user?id=7002", "signal://avatar/u1", "messages://file/m1", ""];
         for address in others {
-            assert!(!kept_by_telegram(address), "{address}");
+            assert!(!kept_by_adapter(address), "{address}");
         }
     }
 

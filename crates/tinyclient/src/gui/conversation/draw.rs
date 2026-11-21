@@ -2896,6 +2896,21 @@ impl Pane {
             };
             self.face(plate, file.as_ref(), 16., Shape::Person, window, cx)
         });
+        let thumb = (!gone).then(|| {
+            let file = reply.thumb.as_ref()?;
+            let edge = media::square_size(18., window.scale_factor());
+            match self.still(file, edge, edge, Some(1.), cx) {
+                Picture::Ready(image) => Some(
+                    div()
+                        .flex_none()
+                        .size(px(18.))
+                        .rounded(px(3.))
+                        .overflow_hidden()
+                        .child(anim::picture(image, ObjectFit::Cover, 3., Play::Hover)),
+                ),
+                _ => None,
+            }
+        }).flatten();
         // The elbow runs from the middle of the avatar column up and across to the quote.
         let reach = metrics.avatar / 2. + metrics.gap - 4.;
         div()
@@ -2930,6 +2945,7 @@ impl Pane {
             .children((!gone).then(|| {
                 div().flex_none().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(reply.sender.clone())
             }))
+            .children(thumb)
             .child(div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet))
     }
 
