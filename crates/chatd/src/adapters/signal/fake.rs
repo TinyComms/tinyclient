@@ -52,6 +52,7 @@ use super::wire::{
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
     Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, StorageSnapshot, Text, Wire, FLAG_GIF,
+    FLAG_VOICE_MESSAGE,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -1182,6 +1183,40 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
             };
             vec![Event::Message { peer: direct(author), text, outgoing: false }]
         }
+        "voice" => {
+            // Format: voice WHO SENT [URL KEY_HEX DIGEST_HEX]
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let url_or_key = next();
+            let key = unhex_bytes(next());
+            let digest = unhex_bytes(next());
+            let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                (Some(url_or_key.to_owned()), None)
+            } else if !url_or_key.is_empty() {
+                (None, Some(url_or_key.to_owned()))
+            } else {
+                (None, Some("fake-voice".to_owned()))
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                attachments: vec![Pointer {
+                    cdn_key,
+                    content_type: "audio/mp4".to_owned(),
+                    file_name: "voice-message.m4a".to_owned(),
+                    flags: FLAG_VOICE_MESSAGE,
+                    key,
+                    digest,
+                    url,
+                    ..Pointer::default()
+                }],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -1260,7 +1295,8 @@ impl Wire for Fake {
             }
             Body::Files { text, quote, ranges, files, timer } => {
                 let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
-                format!("{}{}{}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), noted(ranges), exp(*timer))
+                let voice = if files.iter().any(|f| f.voice) { " voice=true" } else { "" };
+                format!("{}{}{}{voice}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), noted(ranges), exp(*timer))
             }
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
             Body::Edit { target, text, ranges, timer } => format!("send {} edit {target} {text}{}{}", describe(to), noted(ranges), exp(*timer)),
@@ -1316,6 +1352,12 @@ impl Wire for Fake {
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
         let read: Vec<String> = read.iter().map(|(author, sent)| format!("{sent}-{author}")).collect();
         record(&format!("read receipts={receipts} {}", read.join(",")));
+        Ok(())
+    }
+
+    fn viewed(&self, viewed: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
+        let items: Vec<String> = viewed.iter().map(|(author, sent)| format!("{sent}-{author}")).collect();
+        record(&format!("viewed receipts={receipts} {}", items.join(",")));
         Ok(())
     }
 
@@ -1900,7 +1942,31 @@ impl Wire for Fake {
             }
             Some(key) => {
                 record(&format!("attachment-download {key}"));
-                let bytes: Vec<u8> = if pointer.flags & FLAG_GIF != 0 || pointer.content_type == "image/gif" {
+                let bytes: Vec<u8> = if pointer.flags & FLAG_VOICE_MESSAGE != 0 || pointer.content_type.starts_with("audio/") {
+                    // Valid 2-second 8 kHz 16-bit mono PCM WAV so both voice_facts and mediad parse real duration & waveform.
+                    let sample_rate: u32 = 8_000;
+                    let num_samples: usize = 16_000;
+                    let data_len = (num_samples * 2) as u32;
+                    let mut wav = Vec::with_capacity(44 + data_len as usize);
+                    wav.extend_from_slice(b"RIFF");
+                    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+                    wav.extend_from_slice(b"WAVEfmt ");
+                    wav.extend_from_slice(&16u32.to_le_bytes());
+                    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+                    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+                    wav.extend_from_slice(&sample_rate.to_le_bytes());
+                    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+                    wav.extend_from_slice(&2u16.to_le_bytes());
+                    wav.extend_from_slice(&16u16.to_le_bytes());
+                    wav.extend_from_slice(b"data");
+                    wav.extend_from_slice(&data_len.to_le_bytes());
+                    for i in 0..num_samples {
+                        let env = ((i % 2000) as f32 / 2000.0 * std::f32::consts::PI).sin();
+                        let sample = (env * 18_000.0 * ((i as f32) * 0.25).sin()) as i16;
+                        wav.extend_from_slice(&sample.to_le_bytes());
+                    }
+                    wav
+                } else if pointer.flags & FLAG_GIF != 0 || pointer.content_type == "image/gif" {
                     b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;".to_vec()
                 } else if pointer.content_type.starts_with("image/") {
                     // Valid 1x1 PNG

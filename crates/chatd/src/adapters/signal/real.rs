@@ -65,6 +65,7 @@ enum Ask {
     Send { to: Peer, body: Body, answer: Sender<Result<u64, Fault>> },
     Typing { to: Peer, started: bool },
     Read { read: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
+    Viewed { viewed: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
     Unlink { answer: Sender<Result<(), Fault>> },
     Picture { of: Peer, answer: Sender<Result<Option<Vec<u8>>, Fault>> },
     Card { answer: Sender<Result<OwnCard, Fault>> },
@@ -510,6 +511,10 @@ impl Wire for Real {
 
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
         self.ask(|answer| Ask::Read { read: read.to_vec(), receipts, answer })
+    }
+
+    fn viewed(&self, viewed: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::Viewed { viewed: viewed.to_vec(), receipts, answer })
     }
 
     fn unlink(&self) -> Result<(), Fault> {
@@ -1758,6 +1763,9 @@ impl Session {
             Ask::Read { read, receipts, answer } => {
                 let _ = answer.send(self.read(read, receipts).await);
             }
+            Ask::Viewed { viewed, receipts, answer } => {
+                let _ = answer.send(self.viewed(viewed, receipts).await);
+            }
             Ask::Unlink { answer } => {
                 let _ = answer.send(self.unlink().await);
             }
@@ -2827,6 +2835,7 @@ impl Session {
                 for file in files {
                     let name = file.name.clone();
                     let gif = file.gif || file.mime == "image/gif";
+                    let voice = file.voice;
                     let thumb = file.thumb;
                     let spec = AttachmentSpec {
                         content_type: file.mime,
@@ -2835,6 +2844,7 @@ impl Session {
                         width: (file.width > 0).then_some(file.width),
                         height: (file.height > 0).then_some(file.height),
                         blur_hash: file.blurhash,
+                        voice_note: voice.then_some(true),
                         ..AttachmentSpec::default()
                     };
                     let uploaded = self.manager.upload_attachment(spec, file.bytes).await.map_err(fault)?;
@@ -2844,7 +2854,11 @@ impl Session {
                     }
                     if gif {
                         // SignalService.proto AttachmentPointer.Flags.GIF.
-                        pointer.flags = Some(pointer.flags.unwrap_or(0) | 8);
+                        pointer.flags = Some(pointer.flags.unwrap_or(0) | super::wire::FLAG_GIF);
+                    }
+                    if voice {
+                        // SignalService.proto AttachmentPointer.Flags.VOICE_MESSAGE.
+                        pointer.flags = Some(pointer.flags.unwrap_or(0) | super::wire::FLAG_VOICE_MESSAGE);
                     }
                     attachments.push(pointer);
                 }
@@ -2989,6 +3003,33 @@ impl Session {
         }
         let sync = SyncMessage {
             read: read.into_iter().map(|(author, sent)| sync_message::Read { sender_aci: Some(author), timestamp: Some(sent), ..Default::default() }).collect(),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.sync_to_self(sync).await
+    }
+
+    /// Viewed receipts for played voice notes or stories (when receipts are enabled), plus a
+    /// `SyncMessage.viewed` sync to our other linked devices.
+    async fn viewed(&mut self, viewed: Vec<(String, u64)>, receipts: bool) -> Result<(), Fault> {
+        if receipts {
+            let mut by_author: HashMap<String, Vec<u64>> = HashMap::new();
+            for (author, sent) in &viewed {
+                by_author.entry(author.clone()).or_default().push(*sent);
+            }
+            for (author, timestamp) in by_author {
+                let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Viewed.into()), timestamp };
+                let _ = self.deliver(&Peer::Direct(author), ContentBody::ReceiptMessage(receipt), now_ms()).await;
+            }
+        }
+        let sync = SyncMessage {
+            viewed: viewed
+                .into_iter()
+                .map(|(author, sent)| sync_message::Viewed {
+                    sender_aci: Some(author),
+                    timestamp: Some(sent),
+                    ..Default::default()
+                })
+                .collect(),
             ..SyncMessage::with_padding(&mut rand::rng())
         };
         self.sync_to_self(sync).await

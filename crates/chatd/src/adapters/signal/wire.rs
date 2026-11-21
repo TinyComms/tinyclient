@@ -900,6 +900,8 @@ pub struct File {
     pub blurhash: Option<String>,
     /// True for animated GIFs (including looping MP4 GIFs from the GIF picker).
     pub gif: bool,
+    /// True for recorded voice messages (`AttachmentPointer.Flags.VOICE_MESSAGE`).
+    pub voice: bool,
 }
 
 /// What is sent.
@@ -975,6 +977,11 @@ pub trait Wire: Send + Sync {
     /// The user read these (author, sent): the user's other devices are told, and with `receipts`
     /// the authors too.
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault>;
+    /// The user played/viewed these (author, sent) voice notes or stories: synced to our other
+    /// devices, and with `receipts` sends `ReceiptMessage::Type::Viewed` to the authors too.
+    fn viewed(&self, _viewed: &[(String, u64)], _receipts: bool) -> Result<(), Fault> {
+        Ok(())
+    }
     /// Removes this device from the account, and what it kept here with it.
     fn unlink(&self) -> Result<(), Fault>;
     /// A person's profile picture or a group's, opened: `None` when they have none, or we hold

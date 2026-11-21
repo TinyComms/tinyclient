@@ -35,8 +35,8 @@ pub fn refused(with: &Outgoing) -> Option<String> {
     if with.schedule.is_some() {
         return Some("Signal can't send a message later.".into());
     }
-    if with.voice.is_some() {
-        return Some("A voice note can't be sent to Signal from here.".into());
+    if with.voice.is_some() && with.files.len() != 1 {
+        return Some("A voice note needs one audio file.".into());
     }
     if let Some(pick) = &with.pick {
         if pick.kind != protocol::CatalogKind::Gifs {
@@ -192,6 +192,7 @@ pub fn prepare(name: &str, mime: &str, bytes: Vec<u8>, keep: bool) -> File {
         thumb,
         blurhash,
         gif,
+        voice: false,
     }
 }
 
@@ -790,6 +791,256 @@ fn decrypt_verified_enc_file(
     Ok(written)
 }
 
+/// Extracts `(duration_secs, waveform_bars)` from a decrypted voice note (WAV, Ogg/Opus, or
+/// MP4/M4A). Always returns a non-zero duration (>= 1 s) and non-empty waveform bars bounded to
+/// `protocol::WAVEFORM_LIMIT` so the UI renders every Signal voice note with a waveform player.
+pub fn voice_facts(_mime: &str, bytes: &[u8]) -> (u32, Vec<u8>) {
+    const BARS: usize = 48;
+    if bytes.is_empty() {
+        return (1, vec![20; 32]);
+    }
+    if let Some(parsed) = wav_facts(bytes, BARS) {
+        return parsed;
+    }
+    if let Some(parsed) = ogg_facts(bytes, BARS) {
+        return parsed;
+    }
+    if let Some(parsed) = mp4_facts(bytes, BARS) {
+        return parsed;
+    }
+    // Generic fallback: estimate duration (~4 KB/s for voice AAC/Opus) and compute chunk energy.
+    let dur = ((bytes.len() as u64 + 3_999) / 4_000).max(1) as u32;
+    (dur, byte_energy_bars(bytes, BARS))
+}
+
+fn wav_facts(bytes: &[u8], bars: usize) -> Option<(u32, Vec<u8>)> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut sample_rate = 0u32;
+    let mut channels = 1u16;
+    let mut bits_per_sample = 16u16;
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= bytes.len() {
+        let tag = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let body_start = pos + 8;
+        let body_end = body_start.saturating_add(size).min(bytes.len());
+        let body = &bytes[body_start..body_end];
+        if tag == b"fmt " && body.len() >= 16 {
+            channels = u16::from_le_bytes(body[2..4].try_into().ok()?).max(1);
+            sample_rate = u32::from_le_bytes(body[4..8].try_into().ok()?);
+            bits_per_sample = u16::from_le_bytes(body[14..16].try_into().ok()?).max(8);
+        } else if tag == b"data" {
+            data = Some(body);
+        }
+        pos = body_start.saturating_add(size).saturating_add(size & 1);
+    }
+    let pcm = data?;
+    let bytes_per_sec = u64::from(sample_rate) * u64::from(channels) * u64::from(bits_per_sample / 8);
+    if bytes_per_sec == 0 {
+        return None;
+    }
+    let dur = ((pcm.len() as u64 + bytes_per_sec / 2) / bytes_per_sec).max(1) as u32;
+    let wave = if bits_per_sample == 16 && pcm.len() >= 2 {
+        pcm16_waveform(pcm, bars)
+    } else {
+        byte_energy_bars(pcm, bars)
+    };
+    Some((dur, wave))
+}
+
+fn pcm16_waveform(pcm: &[u8], bars: usize) -> Vec<u8> {
+    let total_samples = pcm.len() / 2;
+    let count = bars.min(protocol::WAVEFORM_LIMIT).max(1);
+    let step = (total_samples / count).max(1);
+    let mut peaks = Vec::with_capacity(count);
+    let mut max_peak = 1.0f32;
+    for i in 0..count {
+        let start = i * step;
+        let end = ((i + 1) * step).min(total_samples);
+        if start >= end {
+            peaks.push(0.0);
+            continue;
+        }
+        let mut sum_sq = 0.0f64;
+        for s in start..end {
+            let sample = i16::from_le_bytes([pcm[s * 2], pcm[s * 2 + 1]]) as f64;
+            sum_sq += sample * sample;
+        }
+        let rms = (sum_sq / (end - start) as f64).sqrt() as f32;
+        max_peak = max_peak.max(rms);
+        peaks.push(rms);
+    }
+    peaks
+        .into_iter()
+        .map(|p| ((p / max_peak * 235.0) as u8).saturating_add(20))
+        .collect()
+}
+
+fn ogg_facts(bytes: &[u8], bars: usize) -> Option<(u32, Vec<u8>)> {
+    if bytes.len() < 28 || &bytes[0..4] != b"OggS" {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut max_granule = 0u64;
+    let mut page_energies: Vec<u32> = Vec::new();
+    while pos + 27 <= bytes.len() && &bytes[pos..pos + 4] == b"OggS" {
+        let granule = u64::from_le_bytes(bytes[pos + 6..pos + 14].try_into().ok()?);
+        if granule != u64::MAX {
+            max_granule = max_granule.max(granule);
+        }
+        let segments = bytes[pos + 26] as usize;
+        if pos + 27 + segments > bytes.len() {
+            break;
+        }
+        let payload_len: usize = bytes[pos + 27..pos + 27 + segments].iter().map(|&b| b as usize).sum();
+        let payload_start = pos + 27 + segments;
+        let payload_end = payload_start.saturating_add(payload_len).min(bytes.len());
+        if payload_end > payload_start {
+            page_energies.push((payload_end - payload_start) as u32);
+        }
+        pos = payload_end;
+    }
+    // Opus in Ogg always uses a 48 kHz granule clock (RFC 7845).
+    let dur = if max_granule > 0 {
+        ((max_granule + 24_000) / 48_000).max(1) as u32
+    } else {
+        ((bytes.len() as u64 + 3_999) / 4_000).max(1) as u32
+    };
+    let wave = if page_energies.len() >= 4 {
+        resample_u32_bars(&page_energies, bars)
+    } else {
+        byte_energy_bars(bytes, bars)
+    };
+    Some((dur, wave))
+}
+
+fn mp4_facts(bytes: &[u8], bars: usize) -> Option<(u32, Vec<u8>)> {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return None;
+    }
+    let mut duration_secs: Option<u32> = None;
+    let mut mdat_slice: Option<&[u8]> = None;
+    let mut stsz_samples: Vec<u32> = Vec::new();
+    scan_mp4_boxes(bytes, 0, &mut duration_secs, &mut mdat_slice, &mut stsz_samples);
+    let dur = duration_secs.unwrap_or_else(|| ((bytes.len() as u64 + 3_999) / 4_000).max(1) as u32);
+    let wave = if stsz_samples.len() >= 4 {
+        resample_u32_bars(&stsz_samples, bars)
+    } else if let Some(mdat) = mdat_slice.filter(|s| !s.is_empty()) {
+        byte_energy_bars(mdat, bars)
+    } else {
+        byte_energy_bars(bytes, bars)
+    };
+    Some((dur.max(1), wave))
+}
+
+fn scan_mp4_boxes<'a>(
+    bytes: &'a [u8],
+    depth: u8,
+    duration_secs: &mut Option<u32>,
+    mdat: &mut Option<&'a [u8]>,
+    stsz_samples: &mut Vec<u32>,
+) {
+    if depth > 6 {
+        return;
+    }
+    let mut pos = 0usize;
+    while pos + 8 <= bytes.len() {
+        let size32 = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let tag = &bytes[pos + 4..pos + 8];
+        let (hdr, size) = if size32 == 1 && pos + 16 <= bytes.len() {
+            let size64 = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap_or([0; 8])) as usize;
+            (16usize, size64)
+        } else if size32 == 0 {
+            (8usize, bytes.len() - pos)
+        } else {
+            (8usize, size32)
+        };
+        if size < hdr || pos.saturating_add(size) > bytes.len() {
+            break;
+        }
+        let body = &bytes[pos + hdr..pos + size];
+        match tag {
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                scan_mp4_boxes(body, depth + 1, duration_secs, mdat, stsz_samples);
+            }
+            b"mvhd" if body.len() >= 20 => {
+                let version = body[0];
+                if version == 0 && body.len() >= 20 {
+                    let timescale = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+                    let dur = u32::from_be_bytes([body[16], body[17], body[18], body[19]]);
+                    if timescale > 0 {
+                        *duration_secs = Some(((u64::from(dur) + u64::from(timescale) / 2) / u64::from(timescale)).max(1) as u32);
+                    }
+                } else if version == 1 && body.len() >= 32 {
+                    let timescale = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
+                    let dur = u64::from_be_bytes(body[24..32].try_into().unwrap_or([0; 8]));
+                    if timescale > 0 {
+                        *duration_secs = Some(((dur + u64::from(timescale) / 2) / u64::from(timescale)).max(1) as u32);
+                    }
+                }
+            }
+            b"stsz" if body.len() >= 12 && stsz_samples.is_empty() => {
+                let sample_size = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                let count = u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as usize;
+                if sample_size == 0 {
+                    let avail = ((body.len() - 12) / 4).min(count).min(8_192);
+                    for i in 0..avail {
+                        let off = 12 + i * 4;
+                        stsz_samples.push(u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]));
+                    }
+                }
+            }
+            b"mdat" if mdat.is_none() => {
+                *mdat = Some(body);
+            }
+            _ => {}
+        }
+        pos += size;
+    }
+}
+
+fn resample_u32_bars(values: &[u32], bars: usize) -> Vec<u8> {
+    let count = bars.min(protocol::WAVEFORM_LIMIT).max(1);
+    let mut buckets = Vec::with_capacity(count);
+    let mut max_val = 1u64;
+    for i in 0..count {
+        let start = i * values.len() / count;
+        let end = ((i + 1) * values.len() / count).max(start + 1).min(values.len());
+        let avg = values[start..end].iter().map(|&v| u64::from(v)).sum::<u64>() / (end - start).max(1) as u64;
+        max_val = max_val.max(avg);
+        buckets.push(avg);
+    }
+    buckets
+        .into_iter()
+        .map(|v| ((v * 235 / max_val) as u8).saturating_add(20))
+        .collect()
+}
+
+fn byte_energy_bars(bytes: &[u8], bars: usize) -> Vec<u8> {
+    let count = bars.min(protocol::WAVEFORM_LIMIT).max(1);
+    let mut buckets = Vec::with_capacity(count);
+    let mut max_val = 1u64;
+    for i in 0..count {
+        let start = i * bytes.len() / count;
+        let end = ((i + 1) * bytes.len() / count).max(start + 1).min(bytes.len());
+        let slice = &bytes[start..end];
+        let mut energy = 0u64;
+        for w in slice.windows(2) {
+            energy += u64::from(w[0].abs_diff(w[1]));
+        }
+        let avg = energy / slice.len().max(1) as u64;
+        max_val = max_val.max(avg);
+        buckets.push(avg);
+    }
+    buckets
+        .into_iter()
+        .map(|v| ((v * 235 / max_val) as u8).saturating_add(20))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,5 +1115,68 @@ mod tests {
         let jpeg = decode_blurhash_jpeg("00TI:j", 640, 480).expect("valid blurhash jpeg");
         assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]), "JPEG SOI marker");
         assert!(decode_blurhash_jpeg("bad", 10, 10).is_none());
+    }
+
+    #[test]
+    fn voice_facts_extracts_duration_and_waveform_for_wav_ogg_and_mp4() {
+        // 1. WAV (3 seconds at 8 kHz 16-bit mono)
+        let sr: u32 = 8_000;
+        let samples = 24_000usize;
+        let data_len = (samples * 2) as u32;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&sr.to_le_bytes());
+        wav.extend_from_slice(&(sr * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..samples {
+            let s = ((i as f32 * 0.1).sin() * 12_000.0) as i16;
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        let (dur, wave) = voice_facts("audio/wav", &wav);
+        assert_eq!(dur, 3);
+        assert!(!wave.is_empty() && wave.len() <= protocol::WAVEFORM_LIMIT);
+
+        // 2. Ogg/Opus (granule = 48_000 * 5 => 5 seconds)
+        let mut ogg = Vec::new();
+        for page in 0..4u64 {
+            ogg.extend_from_slice(b"OggS");
+            ogg.push(0); // version
+            ogg.push(0); // header type
+            ogg.extend_from_slice(&((page + 1) * 60_000).to_le_bytes()); // granule -> last is 240_000 = 5s
+            ogg.extend_from_slice(&1u32.to_le_bytes()); // serial
+            ogg.extend_from_slice(&(page as u32).to_le_bytes()); // seq
+            ogg.extend_from_slice(&0u32.to_le_bytes()); // crc
+            ogg.push(1); // 1 segment
+            ogg.push((40 + page * 20) as u8);
+            ogg.extend(std::iter::repeat_n(0x55u8, 40 + (page as usize) * 20));
+        }
+        let (ogg_dur, ogg_wave) = voice_facts("audio/ogg", &ogg);
+        assert_eq!(ogg_dur, 5);
+        assert!(!ogg_wave.is_empty() && ogg_wave.len() <= protocol::WAVEFORM_LIMIT);
+
+        // 3. MP4/M4A (ftyp + moov/mvhd timescale=1000, duration=7000 => 7 seconds)
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&16u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypM4A \x00\x00\x00\x00");
+        let mut mvhd = vec![0u8; 28];
+        mvhd[0..4].copy_from_slice(&28u32.to_be_bytes());
+        mvhd[4..8].copy_from_slice(b"mvhd");
+        mvhd[20..24].copy_from_slice(&1000u32.to_be_bytes()); // timescale at body[12..16]
+        mvhd[24..28].copy_from_slice(&7000u32.to_be_bytes()); // duration at body[16..20]
+        let moov_len = (8 + mvhd.len()) as u32;
+        mp4.extend_from_slice(&moov_len.to_be_bytes());
+        mp4.extend_from_slice(b"moov");
+        mp4.extend_from_slice(&mvhd);
+        let (mp4_dur, mp4_wave) = voice_facts("audio/mp4", &mp4);
+        assert_eq!(mp4_dur, 7);
+        assert!(!mp4_wave.is_empty() && mp4_wave.len() <= protocol::WAVEFORM_LIMIT);
     }
 }

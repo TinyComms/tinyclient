@@ -282,6 +282,8 @@ pub enum Command {
     /// Tell the network the marker moved back. `message_id` is the last message that still
     /// counts as read (possibly empty). `mentions` is how many unread messages name the user.
     MarkUnread { conversation_id: String, message_id: String, mentions: u32 },
+    /// Tell the network the user played/viewed a voice message or story (`Viewed` receipt on Signal).
+    Viewed { conversation_id: String, message_id: String },
     /// Tell Discord several conversations are read, in one request. Other networks ignore it.
     AckBulk { reads: Vec<(String, String)> },
     /// Send, with `client_id` as the network's nonce. Always answer through [`Context::sent`].

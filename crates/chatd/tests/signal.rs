@@ -2984,3 +2984,119 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
 
     stop_cdn.store(true, Ordering::Relaxed);
 }
+
+#[test]
+fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent() {
+    let world = World::linked();
+    world.connected();
+
+    // Signal advertises voice_notes capability.
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|s| s.key == account()).expect("Signal account");
+    assert!(signal.can.voice_notes, "Signal should advertise Capabilities::voice_notes");
+
+    // 1. Incoming voice note arrives as MediaKind::Audio with non-empty initial waveform.
+    world.steer(&format!("voice grace {}", T0 + 10_000));
+    let voice_msg = world.arrived(GRACE, &id(T0 + 10_000, GRACE));
+    assert_eq!(voice_msg.kind, MessageKind::Normal);
+    assert_eq!(voice_msg.attachments.len(), 1);
+    assert_eq!(voice_msg.attachments[0].file.kind, protocol::MediaKind::Audio);
+    assert!(!voice_msg.attachments[0].waveform.is_empty(), "voice note should render as Shape::Voice");
+
+    // 2. Fetching the voice note decrypts/lands it and populates exact duration (2s WAV) and waveform.
+    let file_id = voice_msg.attachments[0].file.id.clone();
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let landed = world.until("voice message downloaded with real duration", || {
+        let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
+        let att = msg.attachments.first()?;
+        (att.file.path.is_some() && att.duration == 2 && att.waveform.len() == 48).then(|| att.clone())
+    });
+    let voice_path = landed.file.path.clone().unwrap();
+
+    // 3. Starting playback sends a Signal `viewed` receipt with receipts=true.
+    let play_resp = world.ask(Request::Play(protocol::PlayRequest::Start {
+        account: account(),
+        file: file_id.clone(),
+        path: voice_path.clone(),
+        conversation: key(GRACE),
+        message: voice_msg.id.clone(),
+        title: "Voice message".into(),
+        at: Some(0),
+        rate: 100,
+        output: None,
+    }));
+    assert_eq!(play_resp, Response::Ok);
+    world.heard(&format!("viewed receipts=true {}", voice_msg.id));
+    let _ = world.ask(Request::Play(protocol::PlayRequest::Stop));
+
+    // With receipts off on Signal, playing sends viewed sync with receipts=false.
+    world.steer("receipts off");
+    world.steer(&format!("voice alan {}", T0 + 11_000));
+    let alan_voice = world.arrived(ALAN, &id(T0 + 11_000, ALAN));
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec![alan_voice.attachments[0].file.id.clone()],
+        size: None,
+        retry: false,
+    });
+    let alan_path = world.until("alan voice landed", || {
+        world
+            .messages(ALAN)
+            .into_iter()
+            .find(|m| m.id == alan_voice.id)
+            .and_then(|m| m.attachments.first()?.file.path.clone())
+    });
+    assert_eq!(
+        world.ask(Request::Play(protocol::PlayRequest::Start {
+            account: account(),
+            file: alan_voice.attachments[0].file.id.clone(),
+            path: alan_path,
+            conversation: key(ALAN),
+            message: alan_voice.id.clone(),
+            title: "Voice message".into(),
+            at: Some(0),
+            rate: 100,
+            output: None,
+        })),
+        Response::Ok
+    );
+    world.heard(&format!("viewed receipts=false {}", alan_voice.id));
+    let _ = world.ask(Request::Play(protocol::PlayRequest::Stop));
+
+    // 4. Sending a recorded voice note goes to Signal with voice=true and keeps duration + waveform.
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let recorded_path = outbox.join("note.ogg");
+    std::fs::write(&recorded_path, b"OggSfake-opus-voice-note-payload").unwrap();
+    let sent_resp = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "voice-send-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: recorded_path.to_string_lossy().into_owned(),
+                name: "voice-message.ogg".into(),
+                spoiler: false,
+                view_once: false,
+                as_file: false,
+                original: false,
+                media: None,
+            }],
+            voice: Some(protocol::VoiceNote { duration: 4_200, waveform: vec![40, 120, 200, 90] }),
+            ..Outgoing::default()
+        },
+    });
+    assert!(matches!(sent_resp, Response::Sent { .. }), "expected Sent, got {sent_resp:?}");
+    world.heard(&format!("send {GRACE} files voice-message.ogg voice=true"));
+    let echoed = world.until("sent voice note stored with waveform and duration", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("voice-send-1") && m.id != "voice-send-1")
+    });
+    assert_eq!(echoed.attachments.len(), 1);
+    assert_eq!(echoed.attachments[0].file.kind, protocol::MediaKind::Audio);
+    assert_eq!(echoed.attachments[0].duration, 5);
+    assert_eq!(echoed.attachments[0].waveform, vec![40, 120, 200, 90]);
+}

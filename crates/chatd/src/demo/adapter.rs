@@ -1039,6 +1039,7 @@ impl Demo {
             | Command::OpenThreads(_)
             | Command::MarkRead { .. }
             | Command::MarkUnread { .. }
+            | Command::Viewed { .. }
             | Command::AckBulk { .. }
             | Command::Typing { .. }
             | Command::FollowLink { .. }

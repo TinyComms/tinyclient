@@ -1426,6 +1426,10 @@ fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -
             if kind == MediaKind::Video {
                 attachment.thumb = preview.clone();
             }
+            if ptr.is_voice() {
+                attachment.duration = 1;
+                attachment.waveform = vec![24; 32];
+            }
             attachment.preview = preview;
             message.attachments.push(attachment);
         }
@@ -2788,6 +2792,7 @@ fn capabilities(link_previews: bool) -> protocol::Capabilities {
         edit_window: (SEND_WINDOW_MS / 1_000) as u32,
         max_file_bytes: files.max_file_bytes,
         max_files: files.max_files,
+        voice_notes: true,
         gifs: true,
         reply: true,
         edit: true,
@@ -2833,6 +2838,9 @@ fn serve(account: &Arc<Account>, command: Command) {
             if !account.live().folders.is_empty() {
                 sync_filing(account, &conversation_id);
             }
+        }
+        Command::Viewed { conversation_id, message_id } => {
+            viewed(account, &conversation_id, &message_id);
         }
         Command::SetMute { conversation_id, notify, until, reply } => {
             let outcome = (|| -> Result<(), Refusal> {
@@ -3870,6 +3878,7 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
         thumb: Vec::new(),
         blurhash: None,
         gif: true,
+        voice: false,
     };
     let quote = quote_of(account, conversation, reply_to)?;
     let attachment = show_file(account, client_id, 0, &gif_file);
@@ -3919,7 +3928,24 @@ fn wanted(account: &Arc<Account>, ids: &[String]) {
             let dest = crate::blobs::path_of(&media_root, &account.ctx.account, &id).with_extension("sigpart");
             match account.wire.download_attachment(&held.pointer, &dest) {
                 Ok(bytes) => {
-                    let _ = account.ctx.landed_from_part(&held.file, &held.address, &dest, bytes);
+                    if let Some(landed) = account.ctx.landed_from_part(&held.file, &held.address, &dest, bytes) {
+                        if held.pointer.is_voice() {
+                            if let Some(path) = landed.path.as_deref() {
+                                if let Ok(raw) = std::fs::read(path) {
+                                    let (duration, waveform) = files::voice_facts(&held.pointer.content_type, &raw);
+                                    if let Ok(Some(mut msg)) = account.ctx.stored_message(&held.conversation, &held.message_id) {
+                                        if let Some(att) = msg.attachments.iter_mut().find(|a| a.file.id == id) {
+                                            att.duration = duration;
+                                            att.waveform = waveform;
+                                            att.file.path = Some(path.to_owned());
+                                            att.file.bytes = bytes;
+                                            let _ = account.ctx.message(&held.conversation, &msg);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(Fault::Refused(why)) => {
                     let _ = std::fs::remove_file(&dest);
@@ -4139,14 +4165,23 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
     let text = text.to_owned();
     let reply_to = reply_to.map(str::to_owned);
     let client_id_owned = client_id.to_owned();
+    let voice = with.voice;
     let ctx = account.ctx.clone();
     let conversation_id = conversation.clone();
     upload::spawn(&ctx, &conversation_id, client_id, &with.files, move |upload| {
-        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), upload)
+        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), voice, upload)
     });
 }
 
-fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, upload: &mut Upload) -> Result<Message, String> {
+fn send_files(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    voice: Option<protocol::VoiceNote>,
+    upload: &mut Upload,
+) -> Result<Message, String> {
     if upload.files().len() > files::MAX_FILES as usize {
         return Err(format!("Signal takes at most {} files in one message.", files::MAX_FILES));
     }
@@ -4155,7 +4190,7 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     for at in 0..count {
         let name = upload.files()[at].name.clone();
         let mime = upload.files()[at].mime.to_owned();
-        let keep = upload.files()[at].as_file || upload.files()[at].original;
+        let keep = upload.files()[at].as_file || upload.files()[at].original || voice.is_some();
         let len = upload.files()[at].bytes;
         if let Some(why) = files::too_big(&name, len) {
             return Err(why);
@@ -4165,14 +4200,26 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
             bytes.extend_from_slice(part.bytes);
             Ok(())
         })?;
-        prepared.push(files::prepare(&name, &mime, bytes, keep));
+        let mut file = files::prepare(&name, &mime, bytes, keep);
+        if voice.is_some() && at + 1 == count {
+            file.voice = true;
+            if !file.mime.starts_with("audio/") {
+                file.mime = "audio/ogg".to_owned();
+            }
+        }
+        prepared.push(file);
     }
     upload.check()?;
     let to = peer(conversation).map_err(|fault| fault.words())?;
     let quote = quote_of(account, conversation, reply_to).map_err(|fault| fault.words())?;
     // Write each file to disk first, then move that one copy to Signal. Cloning `prepared`
     // would keep every payload in memory a second time for the whole upload.
-    let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
+    let mut attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
+    if let (Some(note), Some(att)) = (voice, attachments.last_mut()) {
+        att.file.kind = MediaKind::Audio;
+        att.duration = ((note.duration + 999) / 1_000).max(1);
+        att.waveform = if note.waveform.is_empty() { vec![24; 32] } else { note.waveform };
+    }
     let timer = account.live().timer_of(conversation);
     let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, &[]);
     let sent = match account.wire.send(&to, Body::Files { text: wire_body, quote: quote.clone(), ranges, files: prepared, timer }) {
@@ -4347,6 +4394,25 @@ fn mark_read(account: &Account, conversation: &str, message_id: &str) {
     }
     if let Err(fault) = account.wire.read(&read, receipts) {
         tracing::warn!("chatd: Signal: read: {}", super::net::redact(&fault.to_string()));
+    }
+}
+
+/// The user played a voice message or viewed a story: syncs to other linked devices and sends a
+/// `Viewed` receipt to the author when read receipts are enabled on both the Signal account and
+/// this device.
+fn viewed(account: &Account, conversation: &str, message_id: &str) {
+    if account.live().requests.contains(conversation) {
+        return;
+    }
+    let Ok((sent, author)) = target(message_id) else {
+        return;
+    };
+    if author == account.me {
+        return;
+    }
+    let receipts = account.live().read_receipts && account.ctx.hub.settings().receipts(&account.ctx.account);
+    if let Err(fault) = account.wire.viewed(&[(author, sent)], receipts) {
+        tracing::warn!("chatd: Signal: viewed: {}", super::net::redact(&fault.to_string()));
     }
 }
 
