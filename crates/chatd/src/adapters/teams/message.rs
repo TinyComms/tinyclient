@@ -1235,7 +1235,67 @@ impl Teams {
         let (messages, older) = self.page(conversation, PAGE, "startTime=1")?;
         self.remember_cursor(conversation, &messages, &older);
         self.record(conversation, &messages, !older.is_empty())?;
+        self.recount_unread(conversation, &messages)?;
         self.seen_by(conversation)
+    }
+
+    /// Counts actual unread messages newer than the consumption horizon on a freshly fetched
+    /// newest page (capped at [`PAGE`]), replacing Teams' boolean "1" from the initial list.
+    fn recount_unread(&self, conversation: &str, raws: &[Value]) -> Result<(), Fault> {
+        if chain_of(conversation).is_some() {
+            return Ok(());
+        }
+        let Some(row) = self.ctx.known(conversation)? else {
+            return Ok(());
+        };
+        if row.unread == 0 {
+            return Ok(());
+        }
+        let read_ms = row.last_read.as_deref().map(millis).unwrap_or(0);
+        let channel = row.kind == ConversationKind::Channel;
+        let mut page_msgs = Vec::new();
+        for raw in raws {
+            let root = placed(raw).and_then(|(_, root)| root);
+            if let Read::Message(message) = self.read(conversation, raw) {
+                if channel && root.as_deref().is_some_and(|r| r != message.id) {
+                    continue;
+                }
+                if message.kind != MessageKind::System {
+                    page_msgs.push(*message);
+                }
+            }
+        }
+        let cutoff_ms = if read_ms > 0 {
+            read_ms
+        } else {
+            // Without an explicit horizon, anything at or before my own newest message is read.
+            page_msgs
+                .iter()
+                .filter(|m| m.outgoing)
+                .map(|m| millis(&m.id))
+                .max()
+                .unwrap_or(0)
+        };
+        let mut unread = 0u32;
+        let mut mentions = 0u32;
+        for m in &page_msgs {
+            if !m.outgoing && millis(&m.id) > cutoff_ms {
+                unread = unread.saturating_add(1).min(PAGE);
+                if m.mentions_me {
+                    mentions = mentions.saturating_add(1).min(PAGE);
+                }
+            }
+        }
+        if unread > 0 && (unread != row.unread || mentions > row.mentions) {
+            self.ctx.counts(
+                conversation,
+                unread,
+                row.mentions.max(mentions),
+                row.last_read.as_deref(),
+                row.updated,
+            )?;
+        }
+        Ok(())
     }
 
     /// Every reply stored in a chain, once its first page has been reached.

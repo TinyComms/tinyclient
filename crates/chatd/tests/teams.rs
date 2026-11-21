@@ -190,6 +190,10 @@ struct Fake {
     heard: Mutex<Vec<String>>,
     pushed: AtomicU32,
     posted: AtomicU32,
+    /// Optional overrides for tests that need custom chats, pages, or multi-page activity streams.
+    extra_chats: Mutex<Vec<Value>>,
+    extra_pages: Mutex<HashMap<String, Value>>,
+    activity_pages: Mutex<Option<(Value, Value)>>,
 }
 
 impl Fake {
@@ -206,6 +210,9 @@ impl Fake {
             heard: Mutex::default(),
             pushed: AtomicU32::new(0),
             posted: AtomicU32::new(0),
+            extra_chats: Mutex::default(),
+            extra_pages: Mutex::default(),
+            activity_pages: Mutex::default(),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -320,7 +327,16 @@ impl Fake {
                 authz["tokens"]["skypeToken"] = skype.into();
                 ok(authz)
             }
-            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => ok(self.fixture("teams.users.me").unwrap()),
+            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => {
+                let mut list = self.fixture("teams.users.me").unwrap();
+                let extras = self.extra_chats.lock().unwrap().clone();
+                if !extras.is_empty() {
+                    if let Some(chats) = list["chats"].as_array_mut() {
+                        chats.extend(extras);
+                    }
+                }
+                ok(list)
+            }
             "/v4/a" if header("x-skypetoken") == skype => ok(json!({
                 "socketio": format!("{}/", self.base), "surl": format!("{}/v4/f/abc123/", self.base),
                 "url": format!("{}/v4/f/abc123/", self.base), "ttl": 587_000, "ccid": "cc-1",
@@ -458,6 +474,14 @@ impl Fake {
             ("GET", "messages") => {
                 if let Some(root) = [LONG, JUMP].into_iter().find(|root| conversation == format!("{GENERAL};messageid={root}")) {
                     return ok(long_chain(root, &call.query));
+                }
+                if conversation == "48:notifications" {
+                    if let Some((page1, page2)) = self.activity_pages.lock().unwrap().clone() {
+                        return ok(if call.query.contains("syncState=actpage2") { page2 } else { page1 });
+                    }
+                }
+                if let Some(custom) = self.extra_pages.lock().unwrap().get(conversation).cloned() {
+                    return ok(custom);
                 }
                 let older = call.query.contains("syncState=3e30cursor1") || call.query.contains("endTime=");
                 let name = match conversation {
@@ -644,8 +668,13 @@ fn chain() -> Key {
 
 impl World {
     fn start() -> World {
+        World::start_with(|_| {})
+    }
+
+    fn start_with(configure: impl FnOnce(&Fake)) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let fake = Fake::start();
+        configure(&fake);
         // Short path: a unix socket address holds about 100 bytes. On Windows "/tmp" has no drive; chatd takes only absolute paths.
         let dir = std::path::absolute(format!("/tmp/tinyclient-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -845,8 +874,8 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
         ]
     );
     assert!(rows.iter().all(|row| row.space.is_none()), "a chat is in no Space");
-    // Teams supplies a boolean unread flag; only mentions support a numeric badge.
-    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Dot));
+    // Direct chats show their actual unread count; channels show a dot unless mentioned.
+    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Count(1)));
     assert_eq!(rows[0].avatar.as_ref().map(|avatar| (avatar.kind, avatar.width)), Some((MediaKind::Avatar, 64)));
     assert_eq!((rows[0].preview.as_str(), rows[0].preview_from.as_str(), rows[0].preview_mine), ("Can you look at the deploy?", "Ana Ruiz", false));
     assert!(rows[2].muted && rows[2].unread == 0, "muted by me, and what I said last is not unread");
@@ -2058,4 +2087,159 @@ fn link_previews_are_parsed_from_properties_links_and_unfurled_via_teams_on_send
         .find(|c| c.json()["clientmessageid"] == suppressed_id)
         .expect("suppressed POST");
     assert!(post2.json()["properties"]["links"].is_null());
+}
+
+#[test]
+fn unread_counts_seven_messages_mark_unread_writes_earlier_horizon_and_activity_pages_past_50() {
+    const CHAT_SEVEN: &str = "19:seven_unread@thread.v2";
+    const HORIZON: u64 = 1_760_000_900_000;
+
+    // Build a chat with 7 unread messages newer than its consumptionHorizon (plus 2 older ones)
+    // and a 2-page activity feed (50 entries on page 1 + 1 unread mention on page 2).
+    let world = World::start_with(|fake| {
+        let mut msgs = Vec::new();
+        for i in (1..=7u64).rev() {
+            let id = HORIZON + i * 1_000;
+            msgs.push(message(CHAT_SEVEN, None, id, BEN, "Ben Okafor", &format!("<p>unread #{i}</p>")));
+        }
+        msgs.push(message(CHAT_SEVEN, None, HORIZON, BEN, "Ben Okafor", "<p>at horizon</p>"));
+        msgs.push(message(CHAT_SEVEN, None, HORIZON - 1_000, ME, "Me Myself", "<p>earlier</p>"));
+        fake.extra_pages
+            .lock()
+            .unwrap()
+            .insert(CHAT_SEVEN.to_owned(), json!({"messages": msgs, "_metadata": {}}));
+        fake.extra_chats.lock().unwrap().push(json!({
+            "id": CHAT_SEVEN,
+            "members": [
+                {"isMuted": false, "mri": ME, "role": "Admin"},
+                {"isMuted": false, "mri": BEN, "role": "Admin"}
+            ],
+            "title": "Seven unread",
+            "isRead": false,
+            "isOneOnOne": false,
+            "hidden": false,
+            "isLastMessageFromMe": false,
+            "chatType": "chat",
+            "consumptionHorizon": {
+                "originalArrivalTime": HORIZON,
+                "timeStamp": HORIZON + 500,
+                "clientMessageId": "1"
+            },
+            "lastMessage": {
+                "messageType": "RichText/Html",
+                "content": "<p>unread #7</p>",
+                "id": (HORIZON + 7_000).to_string(),
+                "imDisplayName": "Ben Okafor",
+                "from": BEN
+            }
+        }));
+
+        // 50 activity items on page 1 (reactions), plus a mention for 19:grp1@thread.v2 on page 2.
+        let page1_items: Vec<Value> = (0..50u64)
+            .map(|i| {
+                json!({
+                    "id": (1_760_000_950_000u64 - i * 10).to_string(),
+                    "type": "Message",
+                    "messagetype": "Text",
+                    "contenttype": "text",
+                    "content": "",
+                    "conversationid": "48:notifications",
+                    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+                    "from": BEN,
+                    "properties": {
+                        "activity": json!({
+                            "activityType": "reaction",
+                            "sourceThreadId": "19:grp1@thread.v2",
+                            "sourceMessageId": 1_759_600_000_000u64 + i,
+                        }).to_string()
+                    }
+                })
+            })
+            .collect();
+        let page1 = json!({
+            "messages": page1_items,
+            "_metadata": {
+                "backwardLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications/messages?syncState=actpage2"
+            }
+        });
+        let page2 = json!({
+            "messages": [{
+                "id": "1760000940000",
+                "type": "Message",
+                "messagetype": "Text",
+                "contenttype": "text",
+                "content": "",
+                "conversationid": "48:notifications",
+                "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+                "from": BEN,
+                "properties": {
+                    "activity": json!({
+                        "activityType": "mention",
+                        "sourceThreadId": "19:grp1@thread.v2",
+                        "sourceMessageId": 1_759_700_000_000u64,
+                    }).to_string()
+                }
+            }],
+            "_metadata": {}
+        });
+        *fake.activity_pages.lock().unwrap() = Some((page1, page2));
+    });
+    world.ready();
+
+    // 1. The warmed chat with 7 messages past its consumption horizon lists with unread == 7 and Count(7).
+    let seven = key(CHAT_SEVEN);
+    let counted = world.until("chat with 7 unread messages", || {
+        world.conversation(&seven).filter(|row| row.unread == 7)
+    });
+    assert_eq!(counted.unread, 7);
+    assert_eq!(counted.badge(), Badge::Count(7));
+
+    // 2. Activity stream paged past 50 and picked up the mention on page 2.
+    let grp1 = key("19:grp1@thread.v2");
+    world.until("page-2 mention counted", || world.conversation(&grp1).filter(|row| row.mentions == 1));
+    let activity_calls = world.fake.calls("GET", "/48:notifications/messages");
+    assert_eq!(activity_calls.len(), 2, "expected 2 pages of activity feed");
+    assert!(activity_calls[1].query.contains("syncState=actpage2"), "{}", activity_calls[1].query);
+
+    // 3. Mark read, then MarkUnread from message #5: Teams receives the earlier consumptionhorizon (#4).
+    let msg_7 = (HORIZON + 7_000).to_string();
+    let msg_5 = (HORIZON + 5_000).to_string();
+    let msg_4 = (HORIZON + 4_000).to_string();
+    assert_eq!(world.ask(Request::MarkRead { conversation: seven.clone(), message_id: msg_7.clone() }), Response::Ok);
+    world.until("mark read horizon sent", || {
+        world.fake.calls("PUT", &format!("{CHAT_SEVEN}/properties")).into_iter().find(|c| {
+            c.json()["consumptionhorizon"].as_str().is_some_and(|h| h.starts_with(&format!("{msg_7};")))
+        })
+    });
+    assert_eq!(world.conversation(&seven).unwrap().unread, 0);
+
+    assert_eq!(world.ask(Request::MarkUnread { conversation: seven.clone(), message_id: msg_5.clone() }), Response::Ok);
+    let rewound = world.until("mark unread horizon sent", || {
+        world.fake.calls("PUT", &format!("{CHAT_SEVEN}/properties")).into_iter().find(|c| {
+            c.json()["consumptionhorizon"].as_str().is_some_and(|h| h.starts_with(&format!("{msg_4};")))
+        })
+    });
+    assert_eq!(rewound.query, "name=consumptionhorizon");
+    let rewound_json = rewound.json();
+    let parts: Vec<&str> = rewound_json["consumptionhorizon"].as_str().unwrap().split(';').collect();
+    assert_eq!((parts.len(), parts[0], parts[2]), (3, msg_4.as_str(), msg_4.as_str()));
+    assert_eq!(world.conversation(&seven).unwrap().unread, 3, "messages #5, #6, #7 are unread");
+
+    // 4. Inbound ConversationUpdate from another device rolling the marker back to #2 sets unread to 5.
+    let msg_2 = (HORIZON + 2_000).to_string();
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": CHAT_SEVEN,
+            "type": "Conversation",
+            "version": 1_760_000_999_000u64,
+            "properties": {"consumptionhorizon": format!("{msg_2};1760000999000;{msg_2}")},
+            "lastMessage": {"id": msg_7, "type": "Message", "messagetype": "RichText/Html"}
+        }),
+        false,
+    );
+    let rolled = world.until("remote mark-unread rollback applied", || {
+        world.conversation(&seven).filter(|row| row.unread == 5 && row.last_read.as_deref() == Some(msg_2.as_str()))
+    });
+    assert_eq!(rolled.badge(), Badge::Count(5));
 }

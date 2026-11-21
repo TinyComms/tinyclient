@@ -216,8 +216,7 @@ impl Teams {
         self.report(handled.map_err(Failure::from));
     }
 
-    /// `ConversationUpdate`: the read marker moved on another device. Unverified: no client
-    /// read handles it; the shape is the conversation object the read marker is written to.
+    /// `ConversationUpdate`: the read marker moved on another device (forward or rolled back).
     fn read_elsewhere(&self, conversation: &Value) -> Result<(), Fault> {
         let horizon = conversation["properties"]["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
         let (Some(id), Some(read)) = (conversation["id"].as_str(), horizon.filter(|read| super::millis(read) > 0)) else {
@@ -226,12 +225,18 @@ impl Teams {
         let Some(row) = self.ctx.known(id)? else {
             return Ok(());
         };
+        let read_ms = super::millis(read);
+        let prev_ms = row.last_read.as_deref().map(super::millis).unwrap_or(0);
         let newest = match conversation["lastMessage"]["id"].as_str() {
             Some(newest) => Some(newest.to_owned()),
             None => self.ctx.newest(id)?,
         };
-        if newest.is_some_and(|newest| super::millis(&newest) > super::millis(read)) {
-            self.ctx.counts(id, row.unread, row.mentions, Some(read), 0)?;
+        let behind = newest.as_deref().is_some_and(|newest| super::millis(newest) > read_ms);
+        if read_ms < prev_ms || behind {
+            self.ctx.manual_ack(id, read, None)?;
+            if behind && self.ctx.known(id)?.is_some_and(|after| after.unread == 0) {
+                self.ctx.mark_unread(id)?;
+            }
         } else {
             self.ctx.counts(id, 0, 0, Some(read), 0)?;
         }

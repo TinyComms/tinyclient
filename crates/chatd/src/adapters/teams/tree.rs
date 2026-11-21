@@ -17,8 +17,10 @@ const OLD_CHATS: &str = "chats";
 const NOTES: &str = "48:notes";
 /// Teams' Activity stream: mentions, replies and reactions, as messages of a conversation.
 const ACTIVITY: &str = "48:notifications";
-/// The Activity stream's page read at connect.
+/// The Activity stream's page read at connect, and maximum pages walked when all entries on a
+/// page are newer than the last run.
 const ACTIVITY_PAGE: u32 = 50;
+const ACTIVITY_MAX_PAGES: usize = 5;
 /// The longest a reply chain's title is: the start of its post.
 const CHAIN_TITLE: usize = 40;
 /// Unread chats whose newest page is fetched after connecting, paced, so their rows have a
@@ -57,7 +59,18 @@ struct Counted {
 fn counted(entry: &Value, me: &str) -> Counted {
     let last = &entry["lastMessage"];
     let newest = id_of(&last["id"]);
-    let read = id_of(&entry["consumptionHorizon"]["originalArrivalTime"]);
+    let read = {
+        let obj = id_of(&entry["consumptionHorizon"]["originalArrivalTime"]);
+        if millis(&obj) > 0 {
+            obj
+        } else {
+            entry["properties"]["consumptionhorizon"]
+                .as_str()
+                .and_then(|h| h.split(';').next())
+                .unwrap_or("")
+                .to_owned()
+        }
+    };
     let from = text(last, "from");
     let mine = entry["isLastMessageFromMe"] == true || (!me.is_empty() && from.rsplit('/').next() == Some(me));
     let unread = if mine || millis(&newest) == 0 {
@@ -272,33 +285,56 @@ impl Teams {
         }
     }
 
-    /// The Activity stream's newest page, once at connect: each mention of me newer than its
-    /// conversation's read marker counts, so mentions that came while tinyclient was closed are
-    /// not lost. Unverified: the shape of an activity (`properties.activity`), read off the web
-    /// client's own reading of this stream.
+    /// The Activity stream at connect: each mention of me newer than its conversation's read
+    /// marker counts, so mentions that came while tinyclient was closed are not lost. Pages past
+    /// 50 when every entry on a full page is newer than the last run (capped at [`ACTIVITY_MAX_PAGES`]).
     fn activity_feed(&self) -> Result<(), Fault> {
-        let (items, _) = self.page(ACTIVITY, ACTIVITY_PAGE, "startTime=1")?;
+        let last_seen_ms = self.ctx.note("activity_cursor").as_deref().map(millis).unwrap_or(0);
+        let mut newest_seen_ms = last_seen_ms;
         let mut found: HashMap<String, Vec<String>> = HashMap::new();
-        for item in &items {
-            let activity = match &item["properties"]["activity"] {
-                Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
-                other => other.clone(),
-            };
-            let kind = text(&activity, "activityType").to_ascii_lowercase();
-            if !kind.contains("mention") {
-                continue;
+        let mut window = "startTime=1".to_owned();
+
+        for _ in 0..ACTIVITY_MAX_PAGES {
+            let (items, older) = self.page(ACTIVITY, ACTIVITY_PAGE, &window)?;
+            if items.is_empty() {
+                break;
             }
-            let (thread, message) = (text(&activity, "sourceThreadId"), id_of(&activity["sourceMessageId"]));
-            if thread.is_empty() || millis(&message) == 0 {
-                continue;
+            let mut all_newer = true;
+            for item in &items {
+                let item_ms = millis(&id_of(&item["id"]));
+                if item_ms > newest_seen_ms {
+                    newest_seen_ms = item_ms;
+                }
+                if last_seen_ms > 0 && item_ms > 0 && item_ms <= last_seen_ms {
+                    all_newer = false;
+                }
+                let activity = match &item["properties"]["activity"] {
+                    Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+                    other => other.clone(),
+                };
+                let kind = text(&activity, "activityType").to_ascii_lowercase();
+                if !kind.contains("mention") {
+                    continue;
+                }
+                let (thread, message) = (text(&activity, "sourceThreadId"), id_of(&activity["sourceMessageId"]));
+                if thread.is_empty() || millis(&message) == 0 {
+                    continue;
+                }
+                // A mention in a reply chain is the chain's.
+                let chain = id_of(&activity["sourceReplyChainId"]);
+                let place = if millis(&chain) > 0 && chain != message { chain_id(thread, &chain) } else { thread.to_owned() };
+                let ids = found.entry(place).or_default();
+                if !ids.contains(&message) {
+                    ids.push(message);
+                }
             }
-            // A mention in a reply chain is the chain's.
-            let chain = id_of(&activity["sourceReplyChainId"]);
-            let place = if millis(&chain) > 0 && chain != message { chain_id(thread, &chain) } else { thread.to_owned() };
-            let ids = found.entry(place).or_default();
-            if !ids.contains(&message) {
-                ids.push(message);
+            if items.len() < ACTIVITY_PAGE as usize || older.is_empty() || !all_newer {
+                break;
             }
+            window = format!("startTime=1&syncState={older}");
+        }
+        if newest_seen_ms > last_seen_ms {
+            self.ctx.set_note("activity_cursor", &newest_seen_ms.to_string());
         }
         for (place, messages) in found {
             let Some(row) = self.ctx.known(&place)?.or(self.ctx.known(thread_of(&place))?) else {

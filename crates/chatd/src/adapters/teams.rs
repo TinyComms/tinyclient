@@ -935,6 +935,9 @@ impl Teams {
             Command::HistoryAround { conversation_id, around } => self.report(self.around(&conversation_id, &around).map_err(Failure::from)),
             Command::OpenSpace(_) | Command::OpenHome => self.report(self.open_space().map_err(Failure::from)),
             Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id).map_err(Failure::from)),
+            Command::MarkUnread { conversation_id, message_id, mentions: _ } => {
+                self.report(self.mark_unread(&conversation_id, &message_id).map_err(Failure::from))
+            }
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 self.post(&conversation_id, &client_id, &text, reply_to.as_deref())
             }
@@ -1066,6 +1069,29 @@ impl Teams {
         if let Some((channel, root)) = chain_of(conversation) {
             self.clear_chain_unread(channel, root)?;
         }
+        Ok(())
+    }
+
+    /// Moves the read marker back on Teams by writing `consumptionhorizon` to the message before
+    /// the chosen unread message (or just before the oldest stored message when empty).
+    fn mark_unread(&self, conversation: &str, message: &str) -> Result<(), Fault> {
+        let horizon_id = if millis(message) >= 1_000_000_000_000 {
+            message.to_owned()
+        } else {
+            let earliest = self
+                .ctx
+                .stored_ids(conversation, "", "9999999999999999", 1)?
+                .into_iter()
+                .next()
+                .or_else(|| self.ctx.newest(conversation).ok().flatten());
+            match earliest.as_deref().map(millis).filter(|ms| *ms > 1) {
+                Some(ms) => (ms - 1).to_string(),
+                None => "1".to_owned(),
+            }
+        };
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread_of(conversation)));
+        let horizon = json!({"consumptionhorizon": format!("{horizon_id};{};{horizon_id}", now_ms())});
+        self.chat("PUT", &path, Body::Json(&horizon), true)?;
         Ok(())
     }
 }
