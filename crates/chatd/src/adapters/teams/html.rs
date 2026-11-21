@@ -11,6 +11,7 @@ const FORWARD: &str = "http://schema.skype.com/Forward";
 const EMOJI: &str = "http://schema.skype.com/Emoji";
 const CUSTOM_EMOJI: &str = "http://schema.skype.com/CustomEmoji";
 const GIPHY: &str = "http://schema.skype.com/Giphy";
+const STICKER: &str = "http://schema.skype.com/Sticker";
 
 /// What the text cannot say for itself, answered by the adapter.
 pub(super) trait Lookup {
@@ -81,6 +82,8 @@ pub(super) struct Parsed {
     pub images: Vec<Image>,
     /// GIFs from Teams' Giphy button, on Giphy's own host.
     pub gifs: Vec<Image>,
+    /// Stickers and memes from Teams' sticker picker, hosted on Teams' media store.
+    pub stickers: Vec<Image>,
     /// Embedded voice messages and video clips (`<URIObject type="Audio.*" | "Video.*">`).
     pub clips: Vec<MediaClip>,
     pub quote: Option<Quote>,
@@ -465,6 +468,15 @@ impl Builder<'_> {
             // Teams' own client loads these from Giphy too, so fetching one says no more than
             // reading the message there does.
             self.out.gifs.push(Image {
+                src: src.to_owned(),
+                width: pixels(attrs, "width"),
+                height: pixels(attrs, "height"),
+                name: alt.to_owned(),
+            });
+            return;
+        }
+        if kind == STICKER && self.lookup.hosted(src) {
+            self.out.stickers.push(Image {
                 src: src.to_owned(),
                 width: pixels(attrs, "width"),
                 height: pixels(attrs, "height"),
@@ -1805,5 +1817,24 @@ mod tests {
         assert_eq!(parse_duration_secs("PT1M12S", false), 72);
         assert_eq!(parse_duration_secs("0:02:03.4", false), 123);
         assert_eq!(parse_duration_secs("9500", true), 10);
+    }
+
+    #[test]
+    fn sticker_images_from_teams_hosts_parse_as_stickers() {
+        let parsed = read(
+            "<p><img itemtype=\"http://schema.skype.com/Sticker\" \
+             src=\"https://eu-api.asm.skype.com/v1/objects/sticker-1/views/imgo\" \
+             width=\"180\" height=\"180\" alt=\"Ship It\"></p>",
+        );
+        assert_eq!(parsed.stickers.len(), 1);
+        assert_eq!(parsed.stickers[0].name, "Ship It");
+        assert_eq!(parsed.stickers[0].width, 180);
+        assert!(parsed.images.is_empty());
+
+        let untrusted = read(
+            "<p><img itemtype=\"http://schema.skype.com/Sticker\" \
+             src=\"https://evil.example/sticker.png\" alt=\"Bad\"></p>",
+        );
+        assert!(untrusted.stickers.is_empty());
     }
 }

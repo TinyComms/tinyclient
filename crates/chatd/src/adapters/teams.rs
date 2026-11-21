@@ -144,6 +144,7 @@ pub fn prove_team_info() -> Result<(), String> {
     people::prove_team_roster()
 }
 mod people;
+mod picker;
 mod push;
 mod send;
 mod tree;
@@ -343,6 +344,11 @@ struct State {
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
     scheduled: HashMap<String, i64>,
+    /// Tenant policy flags learned from `authz` settings.
+    giphy_disabled: bool,
+    stickers_disabled: bool,
+    /// Dimensions and alt titles remembered for GIFs and stickers from the picker catalog.
+    catalog_meta: HashMap<String, (u32, u32, String)>,
 }
 
 /// What a call presents.
@@ -814,6 +820,17 @@ impl Teams {
             if let Some(me) = me {
                 state.me = me;
             }
+            let disabled = |keys: &[&str]| {
+                [&body["regionSettings"], &body["tenantSettings"], &body["featureSettings"]]
+                    .into_iter()
+                    .any(|bag| keys.iter().any(|k| bag[*k] == Value::Bool(false)))
+            };
+            if disabled(&["isGiphyEnabled", "allowGiphy", "giphyEnabled"]) {
+                state.giphy_disabled = true;
+            }
+            if disabled(&["isStickersEnabled", "allowStickers", "stickersEnabled"]) {
+                state.stickers_disabled = true;
+            }
             return Ok((token.to_owned(), place));
         }
         Err(refused.unwrap_or(Fault::Net("authz".to_owned())))
@@ -939,6 +956,10 @@ impl Teams {
         self.ctx.describe(&self.session.name, &self.me())?;
         let mut push = self.open()?;
         self.ctx.link(Link::Connected);
+        let (giphy_disabled, stickers_disabled) = {
+            let state = self.state();
+            (state.giphy_disabled, state.stickers_disabled)
+        };
         // Files are off until they can be shared with the chat's members only. The OneDrive path
         // below made an organization-wide link, which is not what the Teams app does and shows
         // up in a company's audit logs.
@@ -956,6 +977,8 @@ impl Teams {
             suppress_embeds: true,
             schedule: true,
             voice_notes: true,
+            gifs: !giphy_disabled && self.cloud == TeamsCloud::Worldwide,
+            stickers: !stickers_disabled,
             forward: true,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
@@ -1064,6 +1087,11 @@ impl Teams {
             }
             Command::Handoff { conversation_id, reply } => {
                 let _ = reply.send(Ok(self.call_link(&conversation_id)));
+            }
+            Command::Catalog { kind, query, cursor, reply, .. }
+                if matches!(kind, protocol::CatalogKind::Gifs | protocol::CatalogKind::Stickers) =>
+            {
+                let _ = reply.send(self.catalog(kind, &query, cursor.as_deref()).map_err(refuse));
             }
             // The refresh token is Microsoft's to revoke, from the account's own security
             // page; no client read ends it from here. Signing out forgets it.

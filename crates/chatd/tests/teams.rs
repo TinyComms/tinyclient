@@ -579,6 +579,75 @@ impl Fake {
             let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
         }
+        if call.path.ends_with("/beta/giphy/trending") || call.path.ends_with("/beta/giphy/search") {
+            let query = call
+                .query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("q="))
+                .map(unescape)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let all = vec![
+                json!({
+                    "id": "gif-cat",
+                    "title": "Happy Cat",
+                    "images": {
+                        "original": {"url": "https://media4.giphy.com/media/cat123/giphy.gif", "width": "320", "height": "200"},
+                        "fixed_height_small": {"url": format!("{}/ams/v1/objects/gif-cat/views/imgo", self.base), "width": "160", "height": "100"}
+                    }
+                }),
+                json!({
+                    "id": "gif-ship",
+                    "title": "Ship It Rocket",
+                    "images": {
+                        "original": {"url": "https://media2.giphy.com/media/ship456/giphy.gif", "width": "400", "height": "225"},
+                        "fixed_height_small": {"url": format!("{}/ams/v1/objects/gif-ship/views/imgo", self.base), "width": "178", "height": "100"}
+                    }
+                }),
+            ];
+            let data: Vec<Value> = if query.is_empty() {
+                all
+            } else {
+                all.into_iter()
+                    .filter(|item| item["title"].as_str().unwrap_or("").to_ascii_lowercase().contains(&query))
+                    .collect()
+            };
+            let count = data.len();
+            return ok(json!({
+                "data": data,
+                "pagination": {"offset": 0, "count": count, "total_count": count + 10}
+            }));
+        }
+        if call.path.ends_with("/beta/stickers") {
+            return ok(json!({
+                "packs": [
+                    {
+                        "name": "Office drama",
+                        "stickers": [
+                            {
+                                "id": "stk-coffee",
+                                "name": "Need Coffee",
+                                "imageUrl": format!("{}/ams/v1/objects/stk-coffee/views/imgo", self.base),
+                                "width": 180,
+                                "height": 180
+                            }
+                        ]
+                    },
+                    {
+                        "name": "Memes",
+                        "stickers": [
+                            {
+                                "id": "stk-ship",
+                                "name": "LGTM Ship It",
+                                "imageUrl": format!("{}/ams/v1/objects/stk-ship/views/imgo", self.base),
+                                "width": 200,
+                                "height": 200
+                            }
+                        ]
+                    }
+                ]
+            }));
+        }
         if call.path.ends_with("/v1/urlpreview") {
             let asked = call.json();
             let url = asked["url"].as_str().unwrap_or("");
@@ -2538,6 +2607,129 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
     };
     assert!(matches!(world.ask(plain_file), Response::Error { .. }));
     let _ = std::fs::remove_file(&clip_path);
+}
+
+#[test]
+fn gif_search_and_stickers_work_in_catalog_and_send() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Commercial Teams advertises both GIFs and stickers.
+    let status = world.account(HOME);
+    assert!(status.can.gifs, "Teams should advertise GIF picker");
+    assert!(status.can.stickers, "Teams should advertise Stickers picker");
+
+    // 2. Trending GIFs and searched GIFs come from Teams' middle-tier Giphy proxy.
+    let Response::Catalog { items: trending, cursor } = world.ask(Request::Catalog {
+        account: ana.account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog for trending GIFs");
+    };
+    assert_eq!(trending.len(), 2);
+    assert_eq!(trending[0].pack, "Trending");
+    assert!(cursor.is_some());
+
+    let Response::Catalog { items: searched, .. } = world.ask(Request::Catalog {
+        account: ana.account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: "rocket".to_owned(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog for GIF search");
+    };
+    assert_eq!(searched.len(), 1);
+    assert_eq!(searched[0].name, "Ship It Rocket");
+    let chosen_gif = searched[0].id.clone();
+
+    // 3. Picking a GIF posts Teams' Giphy HTML img and produces a GIF attachment.
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: ana.clone(),
+            client_id: "1760000999000623".to_owned(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                pick: Some(protocol::Pick { kind: protocol::CatalogKind::Gifs, id: chosen_gif.clone() }),
+                ..protocol::Outgoing::default()
+            },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent_gif = world.until("sent GIF message", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000623") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent_gif.attachments.len(), 1);
+    assert_eq!(sent_gif.attachments[0].file.kind, MediaKind::Gif);
+    let gif_post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000623")
+        .expect("GIF POST");
+    let gif_html = gif_post.json()["content"].as_str().unwrap_or("").to_owned();
+    assert!(gif_html.contains("http://schema.skype.com/Giphy"), "{gif_html}");
+    assert!(gif_html.contains(&chosen_gif), "{gif_html}");
+
+    // 4. Sticker & meme packs are listed, filtered by query, and sent as Sticker markup.
+    let Response::Catalog { items: stickers, .. } = world.ask(Request::Catalog {
+        account: ana.account(),
+        kind: protocol::CatalogKind::Stickers,
+        space: None,
+        query: "meme".to_owned(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog for stickers");
+    };
+    assert_eq!(stickers.len(), 1);
+    assert_eq!(stickers[0].pack, "Memes");
+    assert_eq!(stickers[0].name, "LGTM Ship It");
+    let chosen_sticker = stickers[0].id.clone();
+
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: ana.clone(),
+            client_id: "1760000999000624".to_owned(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                pick: Some(protocol::Pick { kind: protocol::CatalogKind::Stickers, id: chosen_sticker.clone() }),
+                ..protocol::Outgoing::default()
+            },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent_sticker = world.until("sent sticker message", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000624") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent_sticker.attachments.len(), 1);
+    assert!(sent_sticker.attachments[0].sticker);
+    let sticker_post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000624")
+        .expect("Sticker POST");
+    assert!(sticker_post.json()["content"].as_str().unwrap_or("").contains("http://schema.skype.com/Sticker"));
+
+    // 5. GCC High cloud does not enable external Giphy while keeping Teams-hosted stickers.
+    let gov = World::start_with_cloud(Some("gcc_high"));
+    gov.ready();
+    let gov_status = gov.account(HOME);
+    assert!(!gov_status.can.gifs, "GCC High must not advertise worldwide Giphy");
+    assert!(gov_status.can.stickers, "GCC High keeps Teams-hosted stickers");
 }
 
 

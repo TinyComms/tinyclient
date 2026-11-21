@@ -11,9 +11,10 @@
 //! - Sharing: Teams grants the chat's members access one by one; an organization link is
 //!   asked for here instead, which a tenant may forbid.
 
-use super::{escaped, Audience, Auth, Body, Fault, Teams};
+use super::cloud::TeamsCloud;
+use super::{escaped, html, picker, Audience, Auth, Body, Fault, Teams};
 use crate::blobs::upload::{self, Target, Upload};
-use protocol::{Attachment, MediaFile, MediaKind, Message, Outgoing};
+use protocol::{Attachment, CatalogKind, MediaFile, MediaKind, Message, Outgoing, Pick};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -24,6 +25,11 @@ const FOLDER: &str = "Microsoft Teams Chat Files";
 
 impl Teams {
     pub(super) fn send_with(self: &Arc<Self>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
+        if let Some(pick) = &with.pick {
+            let outcome = self.send_pick(conversation, client_id, text, reply_to, pick, &with);
+            self.ctx.sent(conversation, client_id, outcome);
+            return;
+        }
         if let Some(at) = with.schedule {
             let outcome = self.schedule_chat(conversation, client_id, text, reply_to, at, &with);
             self.ctx.sent(conversation, client_id, outcome);
@@ -50,6 +56,88 @@ impl Teams {
         upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
             teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &outgoing, up)
         });
+    }
+
+    /// Sends a GIF or sticker chosen from the composer picker as Teams `RichText/Html` markup.
+    fn send_pick(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick: &Pick, with: &Outgoing) -> Result<Message, String> {
+        let url = pick.id.trim();
+        let (width, height, alt) = self
+            .state()
+            .catalog_meta
+            .get(url)
+            .cloned()
+            .unwrap_or_else(|| match pick.kind {
+                CatalogKind::Gifs => (240, 180, "GIF".to_owned()),
+                _ => (180, 180, "Sticker".to_owned()),
+            });
+        let prefix = if text.trim().is_empty() {
+            String::new()
+        } else {
+            html::compose(text)
+        };
+        match pick.kind {
+            CatalogKind::Gifs => {
+                if self.state().giphy_disabled || self.cloud != TeamsCloud::Worldwide {
+                    return Err("GIFs are disabled by your Teams organization.".to_owned());
+                }
+                if !(html::giphy(url) || self.ours(url)) {
+                    return Err("That GIF is not from Giphy or Teams.".to_owned());
+                }
+                let alt = if alt.trim().is_empty() { "GIF".to_owned() } else { alt };
+                let img = format!(
+                    "<p><img itemtype=\"http://schema.skype.com/Giphy\" src=\"{}\" width=\"{width}\" height=\"{height}\" alt=\"{}\"></p>",
+                    xml_attr(url),
+                    xml_attr(&alt)
+                );
+                let content = format!("{prefix}{img}");
+                let file = MediaFile {
+                    width,
+                    height,
+                    ..MediaFile::new(format!("gif:sent:{:x}", picker::fnv(url)), MediaKind::Gif)
+                };
+                if let Err(err) = self.ctx.media(&[(file.clone(), url.to_owned())]) {
+                    tracing::warn!("chatd: Teams: {err}");
+                }
+                let attachment = Attachment {
+                    thumb: Some(file.clone()),
+                    mime: "image/gif".to_owned(),
+                    ..Attachment::new(alt, file)
+                };
+                self.post_raw_message(conversation, client_id, "RichText/Html", &content, reply_to, with, None, vec![attachment])
+                    .map_err(super::reason)
+            }
+            CatalogKind::Stickers => {
+                if self.state().stickers_disabled {
+                    return Err("Stickers are disabled by your Teams organization.".to_owned());
+                }
+                if !(self.pictures(url) || self.ours(url)) {
+                    return Err("That sticker is not hosted by Teams.".to_owned());
+                }
+                let alt = if alt.trim().is_empty() { "Sticker".to_owned() } else { alt };
+                let img = format!(
+                    "<p><img itemtype=\"http://schema.skype.com/Sticker\" src=\"{}\" width=\"{width}\" height=\"{height}\" alt=\"{}\"></p>",
+                    xml_attr(url),
+                    xml_attr(&alt)
+                );
+                let content = format!("{prefix}{img}");
+                let file = MediaFile {
+                    width,
+                    height,
+                    ..MediaFile::new(format!("sticker:sent:{:x}", picker::fnv(url)), MediaKind::Image)
+                };
+                if let Err(err) = self.ctx.media(&[(file.clone(), url.to_owned())]) {
+                    tracing::warn!("chatd: Teams: {err}");
+                }
+                let attachment = Attachment {
+                    thumb: Some(file.clone()),
+                    sticker: true,
+                    ..Attachment::new(alt, file)
+                };
+                self.post_raw_message(conversation, client_id, "RichText/Html", &content, reply_to, with, None, vec![attachment])
+                    .map_err(super::reason)
+            }
+            CatalogKind::Emoji => Err("Custom emoji are inserted into text, not sent as picks.".to_owned()),
+        }
     }
 
     /// Schedules a text message for future delivery in a Teams chat.

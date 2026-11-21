@@ -788,6 +788,20 @@ impl Teams {
         for gif in parsed.gifs {
             message.attachments.push(giphy_gif(&gif, &mut media));
         }
+        for sticker in parsed.stickers {
+            let file = MediaFile {
+                width: sticker.width,
+                height: sticker.height,
+                ..MediaFile::new(format!("sticker:{:x}", super::picker::fnv(&sticker.src)), MediaKind::Image)
+            };
+            media.push((file.clone(), sticker.src.clone()));
+            let named = if sticker.name.trim().is_empty() { "Sticker" } else { sticker.name.trim() };
+            message.attachments.push(Attachment {
+                thumb: Some(file.clone()),
+                sticker: true,
+                ..Attachment::new(named, file)
+            });
+        }
         let is_voice_msg = matches!(kind, "RichText/Media_AudioMsg" | "RichText/Media_VoiceClip");
         let is_video_msg = matches!(kind, "RichText/Media_Video" | "RichText/Media_VideoClip");
         let mut saw_voice_clip = is_voice_msg;
