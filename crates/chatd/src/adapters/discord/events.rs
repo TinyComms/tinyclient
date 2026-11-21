@@ -228,6 +228,7 @@ impl Discord {
             "INTERACTION_CREATE" | "INTERACTION_SUCCESS" => self.interaction_settled(from_str(data)?),
             "INTERACTION_FAILURE" => self.interaction_failed(from_str(data)?),
             "INTERACTION_MODAL_CREATE" => self.interaction_modal_create(from_str(data)?),
+            "APPLICATION_COMMAND_AUTOCOMPLETE_RESPONSE" => self.autocomplete_response(data),
             _ => {}
         }
         Ok(())

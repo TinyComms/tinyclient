@@ -390,6 +390,25 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             shared.push("MESSAGE_CREATE", message.clone());
             (200, message)
         }
+        ("PATCH", ["guilds", _, "members", "@me"]) => (200, json!({"nick": seen.body["nick"]})),
+        ("POST", ["channels", channel, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 0,
+                    "member_count": 1,
+                    "thread_metadata": {"archived": false, "locked": false},
+                }),
+            )
+        }
         ("POST", ["channels", channel, "messages", _message, "threads"]) => {
             let id = shared.snowflake();
             let name = seen.body["name"].as_str().unwrap_or("Thread");
@@ -414,6 +433,16 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
         ("POST", ["interactions"]) => {
             let nonce = seen.body["nonce"].as_str().unwrap_or("").to_owned();
+            if seen.body["type"].as_u64() == Some(4) {
+                shared.push(
+                    "APPLICATION_COMMAND_AUTOCOMPLETE_RESPONSE",
+                    json!({
+                        "nonce": nonce,
+                        "choices": [{"name": "staging", "value": "staging"}, {"name": "seven", "value": 7}]
+                    }),
+                );
+                return (204, Value::Null);
+            }
             let custom_id = seen.body["data"]["custom_id"].as_str().unwrap_or("");
             if custom_id == "open_feedback_modal" {
                 shared.push(
@@ -5300,4 +5329,215 @@ fn discord_buttons_selects_and_modals_round_trip() {
         })
     });
     assert!(failed_reason.contains("did not respond"));
+}
+
+#[test]
+fn slash_commands_fetch_the_index_and_post_type_2() {
+    let world = World::start();
+    let channel = world.key("4101");
+    world.discord.script(
+        "/guilds/4000/application-command-index",
+        200,
+        json!({
+            "applications": [{"id": "555", "name": "Lightbulb"}],
+            "application_commands": [
+                {"id": "9001", "application_id": "555", "version": "3", "type": 1, "name": "deploy", "description": "Ship it",
+                 "options": [{"type": 3, "name": "env", "description": "Where", "required": true, "autocomplete": true}]},
+                {"id": "9002", "application_id": "555", "version": "1", "type": 3, "name": "Pin"}
+            ],
+            "version": "42"
+        }),
+    );
+    world.discord.script(
+        "/users/@me/application-command-index",
+        200,
+        json!({
+            "applications": [{"id": "777", "name": "Hue"}],
+            "application_commands": [
+                {"id": "9003", "application_id": "777", "version": "1", "type": 1, "name": "hue", "description": "Tint"}
+            ],
+            "version": "7"
+        }),
+    );
+    world.discord.script(
+        "/channels/3002/application-command-index",
+        200,
+        json!({
+            "applications": [{"id": "888", "name": "DM Bot"}],
+            "application_commands": [
+                {"id": "9004", "application_id": "888", "version": "1", "type": 1, "name": "whisper", "description": "Quiet"}
+            ],
+            "version": "1"
+        }),
+    );
+
+    let Response::Commands { commands } = world.ask(Request::Commands {
+        conversation: channel.clone(),
+        query: String::new(),
+        kind: Some(protocol::CommandKind::ChatInput),
+    }) else {
+        panic!("commands");
+    };
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4000/application-command-index").len(), 1);
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/application-command-index").len(), 1);
+    assert!(commands.iter().any(|cmd| cmd.id == "builtin:shrug" && cmd.built_in));
+    let deploy = commands.iter().find(|cmd| cmd.name == "deploy").unwrap();
+    assert_eq!(deploy.application_id, "555");
+    assert_eq!(deploy.app_name, "Lightbulb");
+    assert_eq!(deploy.version, "3");
+    assert!(deploy.options[0].autocomplete);
+    assert!(commands.iter().any(|cmd| cmd.name == "hue" && cmd.app_name == "Hue"));
+    assert!(commands.iter().all(|cmd| cmd.kind == protocol::CommandKind::ChatInput));
+
+    let Response::Commands { commands: again } = world.ask(Request::Commands {
+        conversation: channel.clone(),
+        query: "dep".into(),
+        kind: Some(protocol::CommandKind::ChatInput),
+    }) else {
+        panic!("filtered");
+    };
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4000/application-command-index").len(), 1);
+    assert!(again.iter().any(|cmd| cmd.name == "deploy"));
+    assert!(again.iter().all(|cmd| cmd.name != "shrug" && cmd.name != "hue"));
+
+    let Response::Commands { commands: menus } = world.ask(Request::Commands {
+        conversation: channel.clone(),
+        query: String::new(),
+        kind: Some(protocol::CommandKind::Message),
+    }) else {
+        panic!("message commands");
+    };
+    assert!(menus.iter().any(|cmd| cmd.name == "Pin" && cmd.kind == protocol::CommandKind::Message));
+    assert!(menus.iter().all(|cmd| !cmd.built_in));
+
+    let Response::Commands { commands: dm } = world.ask(Request::Commands {
+        conversation: world.key("3002"),
+        query: String::new(),
+        kind: Some(protocol::CommandKind::ChatInput),
+    }) else {
+        panic!("dm commands");
+    };
+    assert_eq!(world.discord.requests_to("GET", "/channels/3002/application-command-index").len(), 1);
+    assert!(dm.iter().any(|cmd| cmd.name == "whisper"));
+    assert!(dm.iter().all(|cmd| cmd.name != "deploy"));
+
+    assert_eq!(
+        world.ask(Request::RunCommand {
+            conversation: channel.clone(),
+            command_id: deploy.id.clone(),
+            application_id: deploy.application_id.clone(),
+            version: deploy.version.clone(),
+            kind: protocol::CommandKind::ChatInput,
+            name: deploy.name.clone(),
+            arguments: vec![protocol::CommandArg {
+                name: "env".into(),
+                value: "staging".into(),
+                kind: protocol::CommandOptionKind::String,
+            }],
+            target_id: None,
+            files: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let posted = &world.discord.requests_to("POST", "/interactions").last().unwrap().body;
+    assert_eq!(posted["type"], 2);
+    assert_eq!(posted["application_id"], "555");
+    assert_eq!(posted["channel_id"], "4101");
+    assert_eq!(posted["guild_id"], "4000");
+    assert_eq!(posted["session_id"], "session-one");
+    assert_eq!(posted["data"]["id"], "9001");
+    assert_eq!(posted["data"]["type"], 1);
+    assert_eq!(posted["data"]["name"], "deploy");
+    assert_eq!(posted["data"]["version"], "3");
+    assert_eq!(posted["data"]["options"][0]["type"], 3);
+    assert_eq!(posted["data"]["options"][0]["name"], "env");
+    assert_eq!(posted["data"]["options"][0]["value"], "staging");
+    assert!(posted["nonce"].as_str().unwrap().chars().all(|c| c.is_ascii_digit()));
+
+    let Response::CommandChoices { choices } = world.ask(Request::CommandAutocomplete {
+        conversation: channel.clone(),
+        command_id: deploy.id.clone(),
+        application_id: deploy.application_id.clone(),
+        version: deploy.version.clone(),
+        name: deploy.name.clone(),
+        options: vec![protocol::CommandArg {
+            name: "env".into(),
+            value: "st".into(),
+            kind: protocol::CommandOptionKind::String,
+        }],
+        focused: "env".into(),
+    }) else {
+        panic!("choices");
+    };
+    assert_eq!(choices[0].value, "staging");
+    assert_eq!(choices[1].name, "seven");
+    assert_eq!(choices[1].value, "7");
+    let asked = &world.discord.requests_to("POST", "/interactions").last().unwrap().body;
+    assert_eq!(asked["type"], 4);
+    assert_eq!(asked["data"]["options"][0]["focused"], true);
+    assert_eq!(asked["data"]["options"][0]["value"], "st");
+
+    let before = world.discord.requests_to("POST", "/interactions").len();
+    assert_eq!(
+        world.ask(Request::RunCommand {
+            conversation: channel.clone(),
+            command_id: "builtin:shrug".into(),
+            application_id: String::new(),
+            version: String::new(),
+            kind: protocol::CommandKind::ChatInput,
+            name: "shrug".into(),
+            arguments: vec![protocol::CommandArg {
+                name: "text".into(),
+                value: "well".into(),
+                kind: protocol::CommandOptionKind::String,
+            }],
+            target_id: None,
+            files: Vec::new(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("POST", "/interactions").len(), before);
+    let sent = world.discord.requests_to("POST", "/channels/4101/messages");
+    let message = sent.iter().rev().find(|seen| seen.path == "/channels/4101/messages").unwrap();
+    assert_eq!(message.body["content"], "well ¯\\_(ツ)_/¯");
+
+    assert_eq!(
+        world.ask(Request::RunCommand {
+            conversation: channel.clone(),
+            command_id: "builtin:nick".into(),
+            application_id: String::new(),
+            version: String::new(),
+            kind: protocol::CommandKind::ChatInput,
+            name: "nick".into(),
+            arguments: vec![protocol::CommandArg {
+                name: "nick".into(),
+                value: "Sammy".into(),
+                kind: protocol::CommandOptionKind::String,
+            }],
+            target_id: None,
+            files: Vec::new(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PATCH", "/guilds/4000/members/@me").last().unwrap().body["nick"], "Sammy");
+
+    assert_eq!(
+        world.ask(Request::RunCommand {
+            conversation: channel.clone(),
+            command_id: "builtin:thread".into(),
+            application_id: String::new(),
+            version: String::new(),
+            kind: protocol::CommandKind::ChatInput,
+            name: "thread".into(),
+            arguments: vec![protocol::CommandArg {
+                name: "name".into(),
+                value: "release plan".into(),
+                kind: protocol::CommandOptionKind::String,
+            }],
+            target_id: None,
+            files: Vec::new(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("POST", "/channels/4101/threads").last().unwrap().body["name"], "release plan");
 }

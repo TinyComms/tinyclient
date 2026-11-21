@@ -19,6 +19,7 @@ pub(super) fn prove_code_colors() -> Result<(), String> {
 /// Its socket waits are shared with the Tiny server's live socket.
 pub(super) mod gateway;
 mod info;
+mod commands;
 mod interactions;
 mod members;
 mod model;
@@ -365,6 +366,10 @@ struct State {
     acks: HashMap<String, Ack>,
     /// In-flight interaction nonces waiting on gateway settlement or modal popups.
     pending_interactions: HashMap<String, interactions::PendingInteraction>,
+    /// Application-command indexes for this session: `guild:{id}`, `dm:{channel}`, or `user`.
+    command_index: HashMap<String, Vec<protocol::AppCommand>>,
+    /// Autocomplete waiters keyed by interaction nonce. The command thread waits; the gateway sends.
+    autocomplete: HashMap<String, std::sync::mpsc::Sender<Vec<protocol::CommandChoice>>>,
 }
 
 /// One channel's read acknowledgements.
@@ -1942,6 +1947,47 @@ impl Discord {
                     &element_type,
                     &value,
                     values,
+                ),
+            ),
+            Command::Commands { conversation_id, query, kind, reply } => {
+                answer(reply, self.commands(&conversation_id, &query, kind))
+            }
+            Command::CommandAutocomplete {
+                conversation_id,
+                command_id,
+                application_id,
+                version,
+                name,
+                options,
+                focused,
+                reply,
+            } => answer(
+                reply,
+                self.command_autocomplete(&conversation_id, &command_id, &application_id, &version, &name, &options, &focused),
+            ),
+            Command::RunCommand {
+                conversation_id,
+                command_id,
+                application_id,
+                version,
+                kind,
+                name,
+                arguments,
+                target_id,
+                files,
+                reply,
+            } => answer(
+                reply,
+                self.run_command(
+                    &conversation_id,
+                    &command_id,
+                    &application_id,
+                    &version,
+                    kind,
+                    &name,
+                    &arguments,
+                    target_id.as_deref(),
+                    &files,
                 ),
             ),
             Command::ModalSubmit {

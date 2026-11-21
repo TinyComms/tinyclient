@@ -100,6 +100,8 @@ pub enum MentionKind {
     Role,
     /// Everyone, here, channel.
     Everyone,
+    /// A slash command `</name:id>`. `id` is the command's id; the text is `/name`.
+    Command,
 }
 
 /// How a range of a message's text is drawn. Block styles (`CodeBlock`, `Quote`, `ListItem`)

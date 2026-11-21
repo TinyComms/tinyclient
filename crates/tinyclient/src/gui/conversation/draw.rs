@@ -1694,6 +1694,16 @@ impl Pane {
                         return;
                     };
                     let _ = self.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
+                } else if matches!(run.mention, Some((MentionKind::Command, _))) {
+                    let shown = inline
+                        .ranges()
+                        .find(|(_, one)| std::ptr::eq(*one, run))
+                        .map(|(range, _)| &inline.text[range])
+                        .unwrap_or("");
+                    let name = shown.trim().trim_start_matches('/').to_owned();
+                    if !name.is_empty() {
+                        let _ = self.shell.update(cx, |shell, cx| shell.composer_fill_command(&name, window, cx));
+                    }
                 }
                 // LATER: a click on a channel mention opens the channel; it needs the channel's
                 // row, which the sidebar holds.

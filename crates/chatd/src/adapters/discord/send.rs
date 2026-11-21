@@ -140,7 +140,7 @@ impl Discord {
     /// Uploads each file to the address Discord hands out for it and answers what the message
     /// names them by. Nothing is asked when there are no files. What already went up is taken
     /// back when a later file fails or the send is cancelled, as the web client does.
-    fn upload(&self, channel: &str, up: &mut Upload) -> Result<Vec<Value>, String> {
+    pub(super) fn upload(&self, channel: &str, up: &mut Upload) -> Result<Vec<Value>, String> {
         if up.files().is_empty() {
             return Ok(Vec::new());
         }

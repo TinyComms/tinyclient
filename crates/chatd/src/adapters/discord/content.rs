@@ -168,10 +168,10 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         rich.text.push_str(&timestamp(unix.parse().ok()?, style));
     } else if let Some(command) = inner.strip_prefix('/') {
         let (name, id) = command.rsplit_once(':')?;
-        if !digits(id) {
+        if !digits(id) || name.is_empty() {
             return None;
         }
-        rich.text.push_str(&format!("/{name}"));
+        mention(rich, format!("/{name}"), MentionKind::Command, id);
     } else if inner.starts_with("https://") || inner.starts_with("http://") {
         rich.text.push_str(inner);
         rich.span(start, Style::Link { url: inner.to_owned() });
@@ -1627,12 +1627,14 @@ mod tests {
 
     #[test]
     fn mentions_read_as_names_and_emoji_as_their_name() {
-        let rich = parsed("<@7> <@!9> in <#5> cc <@&3> @everyone <:party:42> <a:spin:43>");
-        assert_eq!(rich.text, "@Priya @someone in #deploys cc @mods @everyone :party: :spin:");
+        let rich = parsed("<@7> <@!9> in <#5> cc <@&3> @everyone <:party:42> <a:spin:43> </ship:123>");
+        assert_eq!(rich.text, "@Priya @someone in #deploys cc @mods @everyone :party: :spin: /ship");
         let user = Style::Mention { kind: MentionKind::User, id: "7".into() };
         assert_eq!(styled(&rich, &user), ["@Priya"]);
         let everyone = Style::Mention { kind: MentionKind::Everyone, id: "everyone".into() };
         assert_eq!(styled(&rich, &everyone), ["@everyone"]);
+        let command = Style::Mention { kind: MentionKind::Command, id: "123".into() };
+        assert_eq!(styled(&rich, &command), ["/ship"]);
         let emoji: Vec<&str> = rich.files.files.iter().map(|(file, _)| file.id.as_str()).collect();
         assert_eq!(emoji, ["emoji:42", "emoji:43"]);
     }

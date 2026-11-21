@@ -651,12 +651,15 @@ fn element(slice: &str, active: &[&Span], exact: &[&Span]) -> Value {
         _ => None,
     }) {
         let value = match kind {
-            MentionKind::User => json!({"type": "user", "user_id": id}),
-            MentionKind::Channel => json!({"type": "channel", "channel_id": id}),
-            MentionKind::Role => json!({"type": "usergroup", "usergroup_id": id}),
-            MentionKind::Everyone => json!({"type": "broadcast", "range": id}),
+            MentionKind::User => Some(json!({"type": "user", "user_id": id})),
+            MentionKind::Channel => Some(json!({"type": "channel", "channel_id": id})),
+            MentionKind::Role => Some(json!({"type": "usergroup", "usergroup_id": id})),
+            MentionKind::Everyone => Some(json!({"type": "broadcast", "range": id})),
+            MentionKind::Command => None,
         };
-        return marked(value);
+        if let Some(value) = value {
+            return marked(value);
+        }
     }
     if let Some(Style::Link { url }) = exact.iter().find_map(|span| match &span.style {
         style @ Style::Link { .. } => Some(style),

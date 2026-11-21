@@ -4359,7 +4359,6 @@ impl Shell {
     }
 
     /// Pre-fills `/name ` in the open conversation's composer (e.g. when clicking a `</name:id>` mention).
-    #[allow(dead_code)]
     pub(super) fn composer_fill_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(composer) = self.composer_state.main.get().filter(|composer| composer.read(cx).can_type()).cloned() else {
             return;

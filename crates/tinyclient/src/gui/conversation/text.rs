@@ -125,7 +125,7 @@ impl Rich {
                 let mine = match kind {
                     MentionKind::User => !look.me.is_empty() && id == look.me,
                     MentionKind::Everyone | MentionKind::Role => look.mentions_me,
-                    MentionKind::Channel => false,
+                    MentionKind::Channel | MentionKind::Command => false,
                 };
                 face.weight = FontWeight::MEDIUM;
                 color = if mine { gpui::white() } else { tokens::link().into_color() };
