@@ -297,6 +297,17 @@ struct State {
     abouts: HashMap<String, About>,
     /// Active Slack reminder ids keyed by `(channel_id, message_id)` so cancel calls `reminders.delete`.
     reminders: HashMap<(String, String), String>,
+    /// Synced Slack drafts keyed by conversation id (`C0…` or `C0…:root_ts`).
+    drafts: HashMap<String, SlackDraft>,
+    /// Unix seconds of the latest local draft edit per conversation (conflict rule: newest wins).
+    local_draft_at: HashMap<String, i64>,
+}
+
+/// Remote draft metadata tracked so subsequent edits call `drafts.update` and clears call `drafts.delete`.
+#[derive(Clone, Debug)]
+struct SlackDraft {
+    id: String,
+    client_last_updated_ts: String,
 }
 
 /// `users.info` is asked about one person at most this often.
@@ -1007,6 +1018,8 @@ impl Slack {
                 self.subteam_updated(event);
                 Ok(())
             }
+            "draft_saved" => self.draft_saved(event),
+            "draft_deleted" | "draft_sent" => self.draft_deleted(event),
             "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
             "error" => {
                 let error = &event["error"];
@@ -1090,12 +1103,22 @@ impl Slack {
             if message.thread.is_some() {
                 self.thread_known(channel, &message.id)?;
             }
+            if self.me.get().is_some_and(|me| me == &message.sender.id) {
+                if self.state().drafts.remove(channel).is_some() {
+                    self.ctx.draft(channel, "")?;
+                }
+            }
             self.ctx.message(channel, &message)?;
             return Ok(());
         };
         // A reply lives in its thread, not in the channel's own pages.
         let thread = thread_id(channel, root);
         self.thread_known(channel, root)?;
+        if self.me.get().is_some_and(|me| me == &message.sender.id) {
+            if self.state().drafts.remove(&thread).is_some() {
+                self.ctx.draft(&thread, "")?;
+            }
+        }
         if message.mentions_me {
             // A mention is the one thing in a thread that needs me whether or not I follow it.
             self.ctx.message(&thread, &message)?;
@@ -1233,6 +1256,9 @@ impl Slack {
                 return Ok(());
             }
             let counted = self.state().warm.remove(conversation);
+            if counted.is_none() && self.ctx.known(conversation)?.is_none() {
+                return Ok(());
+            }
             if !self.known(conversation)? {
                 return Ok(());
             }
@@ -1511,6 +1537,7 @@ impl Slack {
             }
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
             Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
+            Command::Draft { conversation_id, text } => self.report(self.sync_draft(&conversation_id, &text)),
             Command::Watch(_) => self.watch(),
             Command::SearchPeople(query) => self.search(&query),
             Command::Members { conversation_id, offset, limit, reply } => {
@@ -1582,10 +1609,14 @@ impl Slack {
             self.tell_partners();
             self.load_usergroups();
             self.load_dnd();
-            return match self.ctx.note("tree") {
+            let result = match self.ctx.note("tree") {
                 Some(_) => self.resync(),
                 None => self.load_tree(),
             };
+            if result.is_ok() {
+                self.load_drafts();
+            }
+            return result;
         }
         match loaded {
             Some(at) if at.elapsed() < TREE_FRESH => Ok(()),
@@ -1787,6 +1818,7 @@ impl Slack {
             return Err(Fault::Slack("not_a_channel".to_owned()));
         }
         self.api("conversations.close", &[("channel", conversation_id)])?;
+        self.state().warm.remove(conversation_id);
         self.forget_partner(conversation_id);
         self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
     }
@@ -1801,6 +1833,7 @@ impl Slack {
             return self.close_direct(conversation_id);
         }
         self.api("conversations.leave", &[("channel", conversation_id)])?;
+        self.state().warm.remove(conversation_id);
         self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
     }
 
@@ -2169,6 +2202,281 @@ impl Slack {
         }
         self.state().abouts.insert(person.to_owned(), about.clone());
         about
+    }
+
+    /// Reads active Slack drafts once on connect/resync and hydrates the store.
+    /// Conflict rule: newest edit wins; never overwrite a non-empty local draft with an older remote one.
+    fn load_drafts(&self) {
+        let Ok(listed) = self.api("drafts.list", &[("is_active", "true")]) else {
+            return;
+        };
+        for draft in listed["drafts"].as_array().into_iter().flatten() {
+            let _ = self.apply_remote_draft(draft);
+        }
+    }
+
+    /// Syncs a local draft edit to Slack via `drafts.create` / `drafts.update` / `drafts.delete`.
+    fn sync_draft(&self, conversation_id: &str, text: &str) -> Result<(), Failure> {
+        let now = crate::hub::now();
+        self.state().local_draft_at.insert(conversation_id.to_owned(), now);
+        if text.trim().is_empty() {
+            let existing = self.state().drafts.remove(conversation_id);
+            if let Some(draft) = existing {
+                let _ = self.api(
+                    "drafts.delete",
+                    &[
+                        ("draft_id", draft.id.as_str()),
+                        ("client_last_updated_ts", draft.client_last_updated_ts.as_str()),
+                    ],
+                );
+            }
+            return Ok(());
+        }
+        let blocks = draft_blocks_json(text);
+        let destinations = draft_destinations_json(conversation_id);
+        let ts_now = format!("{now}.000000");
+        let existing = self.state().drafts.get(conversation_id).cloned();
+        let response = match existing {
+            Some(ref draft) => self.api(
+                "drafts.update",
+                &[
+                    ("draft_id", draft.id.as_str()),
+                    ("blocks", blocks.as_str()),
+                    ("destinations", destinations.as_str()),
+                    ("client_last_updated_ts", ts_now.as_str()),
+                    ("is_from_composer", "false"),
+                ],
+            ),
+            None => self.api(
+                "drafts.create",
+                &[
+                    ("blocks", blocks.as_str()),
+                    ("destinations", destinations.as_str()),
+                    ("is_from_composer", "false"),
+                ],
+            ),
+        };
+        let body = response?;
+        let returned = &body["draft"];
+        let id = returned["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| existing.map(|d| d.id))
+            .unwrap_or_default();
+        let (ts_str, _) = draft_updated_ts(returned);
+        let client_last_updated_ts = if ts_str.is_empty() { ts_now } else { ts_str };
+        if !id.is_empty() {
+            self.state().drafts.insert(
+                conversation_id.to_owned(),
+                SlackDraft {
+                    id,
+                    client_last_updated_ts,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Live `draft_saved` socket event: updates or clears the conversation's draft.
+    fn draft_saved(&self, event: &Value) -> Result<(), Failure> {
+        let draft = if event["draft"].is_object() { &event["draft"] } else { event };
+        self.apply_remote_draft(draft)
+    }
+
+    /// Live `draft_deleted` / `draft_sent` socket event: clears the matching conversation's draft.
+    fn draft_deleted(&self, event: &Value) -> Result<(), Failure> {
+        let draft = if event["draft"].is_object() { &event["draft"] } else { event };
+        let draft_id = event["draft_id"]
+            .as_str()
+            .or_else(|| draft["id"].as_str())
+            .unwrap_or("");
+        let conv_id = draft_conversation_id(draft).or_else(|| {
+            if draft_id.is_empty() {
+                return None;
+            }
+            self.state()
+                .drafts
+                .iter()
+                .find(|(_, d)| d.id == draft_id)
+                .map(|(conv, _)| conv.clone())
+        });
+        if let Some(conv_id) = conv_id {
+            self.state().drafts.remove(&conv_id);
+            self.ctx.draft(&conv_id, "")?;
+        }
+        Ok(())
+    }
+
+    /// Applies one remote Slack draft object (from `drafts.list` or `draft_saved`) with conflict checks.
+    fn apply_remote_draft(&self, draft: &Value) -> Result<(), Failure> {
+        let Some(conv_id) = draft_conversation_id(draft) else {
+            return Ok(());
+        };
+        if let Some((channel, root)) = thread_of(&conv_id) {
+            if self.ctx.known(channel)?.is_none() {
+                return Ok(());
+            }
+            self.thread_known(channel, root)?;
+        }
+        let Some(stored) = self.ctx.known(&conv_id)? else {
+            return Ok(());
+        };
+        let text = extract_draft_text(draft);
+        let cleared = draft["is_deleted"] == true || draft["is_sent"] == true || text.trim().is_empty();
+        if cleared {
+            self.state().drafts.remove(&conv_id);
+            if !stored.draft.is_empty() {
+                self.ctx.draft(&conv_id, "")?;
+            }
+            return Ok(());
+        }
+        let (ts_str, remote_updated_at) = draft_updated_ts(draft);
+        let local_at = self.state().local_draft_at.get(&conv_id).copied();
+        if !should_apply_remote_draft(&stored.draft, local_at, remote_updated_at) {
+            return Ok(());
+        }
+        if let Some(id) = draft["id"].as_str().filter(|s| !s.is_empty()) {
+            self.state().drafts.insert(
+                conv_id.clone(),
+                SlackDraft {
+                    id: id.to_owned(),
+                    client_last_updated_ts: ts_str,
+                },
+            );
+        }
+        self.ctx.draft(&conv_id, &text)?;
+        Ok(())
+    }
+}
+
+/// Builds Slack `rich_text` blocks JSON for a plain-text draft.
+fn draft_blocks_json(text: &str) -> String {
+    json!([{
+        "type": "rich_text",
+        "elements": [{
+            "type": "rich_text_section",
+            "elements": [{
+                "type": "text",
+                "text": text,
+            }]
+        }]
+    }])
+    .to_string()
+}
+
+/// Builds Slack `destinations` JSON for a channel or thread draft.
+fn draft_destinations_json(conversation_id: &str) -> String {
+    match thread_of(conversation_id) {
+        Some((channel, root)) => json!([{"channel_id": channel, "thread_ts": root}]).to_string(),
+        None => json!([{"channel_id": conversation_id}]).to_string(),
+    }
+}
+
+/// Resolves a Slack draft's destination into our conversation id (`C0…` or `C0…:root_ts`).
+fn draft_conversation_id(draft: &Value) -> Option<String> {
+    if let Some(dest) = draft["destinations"].as_array().and_then(|arr| arr.first()) {
+        if let Some(channel) = dest["channel_id"].as_str().filter(|s| !s.is_empty()) {
+            return Some(match dest["thread_ts"].as_str().filter(|s| !s.is_empty()) {
+                Some(root) => thread_id(channel, root),
+                None => channel.to_owned(),
+            });
+        }
+    }
+    let channel = draft["channel_id"].as_str().filter(|s| !s.is_empty())?;
+    Some(match draft["thread_ts"].as_str().filter(|s| !s.is_empty()) {
+        Some(root) => thread_id(channel, root),
+        None => channel.to_owned(),
+    })
+}
+
+/// Extracts plain text from a Slack draft's `blocks` (rich_text) or `text` fallback.
+fn extract_draft_text(draft: &Value) -> String {
+    let mut out = String::new();
+    if let Some(blocks) = draft["blocks"].as_array() {
+        for block in blocks {
+            if let Some(sections) = block["elements"].as_array() {
+                for section in sections {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    if let Some(elems) = section["elements"].as_array() {
+                        for elem in elems {
+                            match elem["type"].as_str().unwrap_or("") {
+                                "text" => {
+                                    if let Some(t) = elem["text"].as_str() {
+                                        out.push_str(t);
+                                    }
+                                }
+                                "link" => {
+                                    if let Some(t) = elem["text"].as_str().or_else(|| elem["url"].as_str()) {
+                                        out.push_str(t);
+                                    }
+                                }
+                                "emoji" => {
+                                    if let Some(name) = elem["name"].as_str() {
+                                        out.push(':');
+                                        out.push_str(name);
+                                        out.push(':');
+                                    }
+                                }
+                                "user" => {
+                                    if let Some(id) = elem["user_id"].as_str() {
+                                        out.push_str(&format!("<@{id}>"));
+                                    }
+                                }
+                                "channel" => {
+                                    if let Some(id) = elem["channel_id"].as_str() {
+                                        out.push_str(&format!("<#{id}>"));
+                                    }
+                                }
+                                "broadcast" => {
+                                    if let Some(range) = elem["range"].as_str() {
+                                        out.push_str(&format!("@{range}"));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        draft["text"].as_str().unwrap_or("").to_owned()
+    } else {
+        out
+    }
+}
+
+/// Reads the draft's last-updated timestamp string and unix seconds.
+fn draft_updated_ts(draft: &Value) -> (String, i64) {
+    for key in ["client_last_updated_ts", "last_updated_ts", "date_created"] {
+        if let Some(s) = draft[key].as_str().filter(|s| !s.is_empty()) {
+            return (s.to_owned(), seconds(s));
+        }
+        if let Some(n) = draft[key].as_i64().filter(|n| *n > 0) {
+            return (format!("{n}.000000"), n);
+        }
+        if let Some(f) = draft[key].as_f64().filter(|f| *f > 0.0) {
+            return (format!("{f:.6}"), f as i64);
+        }
+    }
+    (String::new(), 0)
+}
+
+/// Conflict rule: newest edit wins; never overwrite a non-empty local draft with an older remote one.
+fn should_apply_remote_draft(local_text: &str, local_updated_at: Option<i64>, remote_updated_at: i64) -> bool {
+    if local_text.is_empty() {
+        return true;
+    }
+    if remote_updated_at <= 0 {
+        return false;
+    }
+    match local_updated_at {
+        Some(local_at) => remote_updated_at > local_at,
+        None => true,
     }
 }
 
@@ -2690,5 +2998,31 @@ mod tests {
         assert!(!tree::matches_keyword("deployment finished", &words));
         assert!(!tree::matches_keyword("redeploy", &words));
         assert!(!tree::matches_keyword("hello world", &words));
+    }
+
+    #[test]
+    fn slack_draft_helpers_extract_text_destinations_and_apply_conflict_rule() {
+        let blocks: Value = serde_json::from_str(&draft_blocks_json("Hello Slack")).unwrap();
+        let draft = json!({
+            "id": "Dr1",
+            "client_last_updated_ts": "1760000900.000000",
+            "destinations": [{"channel_id": "C0GEN"}],
+            "blocks": blocks,
+        });
+        assert_eq!(extract_draft_text(&draft), "Hello Slack");
+        assert_eq!(draft_conversation_id(&draft).as_deref(), Some("C0GEN"));
+        assert_eq!(draft_updated_ts(&draft), ("1760000900.000000".to_owned(), 1760000900));
+
+        let thread_dest: Value = serde_json::from_str(&draft_destinations_json("C0GEN:1760000200.000200")).unwrap();
+        assert_eq!(thread_dest[0]["channel_id"], "C0GEN");
+        assert_eq!(thread_dest[0]["thread_ts"], "1760000200.000200");
+
+        // Conflict rule: newest edit wins; never overwrite non-empty local draft with older/undated remote.
+        assert!(should_apply_remote_draft("", Some(100), 50));
+        assert!(!should_apply_remote_draft("local", Some(100), 90));
+        assert!(!should_apply_remote_draft("local", Some(100), 100));
+        assert!(should_apply_remote_draft("local", Some(100), 120));
+        assert!(!should_apply_remote_draft("local", None, 0));
+        assert!(should_apply_remote_draft("local", None, 120));
     }
 }

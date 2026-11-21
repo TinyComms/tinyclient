@@ -130,6 +130,8 @@ struct Fake {
     dnd_info: Mutex<Option<Value>>,
     /// Channel bookmarks keyed by channel_id.
     bookmarks: Mutex<HashMap<String, Vec<Value>>>,
+    /// Optional override for `drafts.list` response.
+    drafts_list: Mutex<Option<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -181,6 +183,7 @@ impl Fake {
                     json!({"id": "Bk2", "channel_id": "C0GEN", "title": "Team Canvas", "link": "https://alpha.slack.com/docs/T01ALPHA/F0CANVAS", "emoji": "", "type": "canvas"}),
                 ],
             )])),
+            drafts_list: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -511,6 +514,39 @@ impl Fake {
             "reminders.complete" | "reminders.delete" => {
                 if param("reminder").is_empty() {
                     return refused("not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "drafts.list" => self.drafts_list.lock().unwrap().clone().or_else(|| Some(json!({
+                "ok": true,
+                "drafts": []
+            }))),
+            "drafts.create" => Some(json!({
+                "ok": true,
+                "draft": {
+                    "id": "Dr01LOCAL",
+                    "client_last_updated_ts": "1760000900.000000",
+                    "destinations": serde_json::from_str::<Value>(param("destinations")).unwrap_or(json!([])),
+                    "blocks": serde_json::from_str::<Value>(param("blocks")).unwrap_or(json!([])),
+                }
+            })),
+            "drafts.update" => {
+                if param("draft_id").is_empty() {
+                    return refused("draft_not_found");
+                }
+                Some(json!({
+                    "ok": true,
+                    "draft": {
+                        "id": param("draft_id"),
+                        "client_last_updated_ts": "1760000910.000000",
+                        "destinations": serde_json::from_str::<Value>(param("destinations")).unwrap_or(json!([])),
+                        "blocks": serde_json::from_str::<Value>(param("blocks")).unwrap_or(json!([])),
+                    }
+                }))
+            }
+            "drafts.delete" => {
+                if param("draft_id").is_empty() {
+                    return refused("draft_not_found");
                 }
                 Some(json!({"ok": true}))
             }
@@ -2381,6 +2417,7 @@ fn connecting_asks_little_spaces_what_it_warms_and_a_reconnect_asks_less() {
             ("client.counts", connections),
             ("conversations.history", history),
             ("dnd.info", connections),
+            ("drafts.list", connections),
             ("edge:users/info", 1),
             ("team.info", 1),
             ("usergroups.list", connections),
@@ -4381,5 +4418,84 @@ fn slack_rich_status_emoji_expiration_and_custom_emoji_read() {
         };
         let ana = people.into_iter().find(|p| p.key.id == "U0ANA")?;
         (ana.emoji == ":partyparrot:" && ana.status.contains("Deploying")).then_some(())
+    });
+}
+
+#[test]
+fn slack_drafts_sync_create_update_delete_and_live_events() {
+    let world = World::start_with(|fake| {
+        *fake.drafts_list.lock().unwrap() = Some(json!({
+            "ok": true,
+            "drafts": [{
+                "id": "Dr01REMOTE",
+                "client_last_updated_ts": "1760000800.000000",
+                "destinations": [{"channel_id": "C0DEP"}],
+                "blocks": [{
+                    "type": "rich_text",
+                    "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "Hydrated from Slack"}]
+                    }]
+                }]
+            }]
+        }));
+    });
+    world.ready();
+
+    let dep = alpha("C0DEP");
+    let general = alpha("C0GEN");
+
+    // 1. drafts.list on connect hydrates C0DEP's draft.
+    world.until("C0DEP draft hydrated from drafts.list", || {
+        let row = world.conversation(&dep)?;
+        (row.draft == "Hydrated from Slack").then_some(())
+    });
+
+    // 2. Writing a draft on C0GEN calls drafts.create, updating calls drafts.update, clearing calls drafts.delete.
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: "First draft".into() }), Response::Ok);
+    world.until("drafts.create called", || (!world.fake.calls(ALPHA, "drafts.create").is_empty()).then_some(()));
+    let created = world.fake.calls(ALPHA, "drafts.create").pop().unwrap();
+    assert!(created.params["destinations"].contains("C0GEN"));
+    assert!(created.params["blocks"].contains("First draft"));
+
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: "Edited draft".into() }), Response::Ok);
+    world.until("drafts.update called", || (!world.fake.calls(ALPHA, "drafts.update").is_empty()).then_some(()));
+    let updated = world.fake.calls(ALPHA, "drafts.update").pop().unwrap();
+    assert_eq!(updated.params["draft_id"], "Dr01LOCAL");
+    assert!(updated.params["blocks"].contains("Edited draft"));
+
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: String::new() }), Response::Ok);
+    world.until("drafts.delete called", || (!world.fake.calls(ALPHA, "drafts.delete").is_empty()).then_some(()));
+    let deleted = world.fake.calls(ALPHA, "drafts.delete").pop().unwrap();
+    assert_eq!(deleted.params["draft_id"], "Dr01LOCAL");
+
+    // 3. Live draft_saved and draft_deleted socket events sync into the store.
+    world.fake.push(ALPHA, json!({
+        "type": "draft_saved",
+        "draft": {
+            "id": "Dr02LIVE",
+            "client_last_updated_ts": "1999999999.000000",
+            "destinations": [{"channel_id": "C0GEN"}],
+            "blocks": [{
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [{"type": "text", "text": "Typed on phone"}]
+                }]
+            }]
+        }
+    }));
+    world.until("live draft_saved synced", || {
+        let row = world.conversation(&general)?;
+        (row.draft == "Typed on phone").then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "draft_deleted",
+        "draft_id": "Dr02LIVE"
+    }));
+    world.until("live draft_deleted cleared", || {
+        let row = world.conversation(&general)?;
+        row.draft.is_empty().then_some(())
     });
 }
