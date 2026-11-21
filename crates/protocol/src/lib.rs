@@ -516,6 +516,9 @@ pub struct Conversation {
     /// My newest message is still going.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sending: bool,
+    /// Per-conversation upload limit override, in bytes (e.g. a boosted Discord server). 0: use account's `Capabilities::max_file_bytes`.
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub max_file_bytes: u64,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -576,6 +579,7 @@ impl Conversation {
             seen: false,
             delivered: false,
             sending: false,
+            max_file_bytes: 0,
         }
     }
 

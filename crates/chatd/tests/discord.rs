@@ -4013,3 +4013,58 @@ fn call_roster_reports_camera_and_screen_share_separately() {
     assert_eq!((occupants.0.streaming, occupants.0.camera), (true, false));
     assert_eq!((occupants.1.streaming, occupants.1.camera), (false, true));
 }
+
+#[test]
+fn upload_limit_honors_server_boost_tier() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["properties"]["premium_tier"] = json!(3);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let files_dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let big = files_dir.join("boosted.bin");
+    std::fs::File::create(&big).unwrap().set_len(40 << 20).unwrap();
+    let outgoing = || protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: big.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+        }],
+        ..Default::default()
+    };
+
+    // Tier-0 server (5000 / channel 5001): 40 MB is refused locally at the 10 MB free limit.
+    let refused = world.ask(Request::Send {
+        conversation: world.key("5001"),
+        client_id: "390001".into(),
+        text: String::new(),
+        reply_to: None,
+        with: outgoing(),
+    });
+    match refused {
+        Response::Error { detail, .. } => assert_eq!(detail, "boosted.bin is too big for Discord (limit 10 MB)."),
+        other => panic!("tier-0 server should refuse 40 MB, got {other:?}"),
+    }
+
+    // Tier-3 server (4000 / channel 4101): 40 MB passes the local check (100 MB limit).
+    let accepted = world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "390002".into(),
+        text: String::new(),
+        reply_to: None,
+        with: outgoing(),
+    });
+    match accepted {
+        Response::Sent { .. } => {}
+        other => panic!("tier-3 server should accept 40 MB, got {other:?}"),
+    }
+    wait("attachment slot request on tier-3 server", || {
+        let asked = world.discord.requests_to("POST", "/channels/4101/attachments");
+        (!asked.is_empty()).then_some(asked)
+    });
+}

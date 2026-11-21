@@ -3285,6 +3285,10 @@ impl Shell {
         let link = if staged("offline") || staged("waiting") { Link::Offline } else { link };
         #[cfg(not(feature = "gui-shot"))]
         let kind = open.kind;
+        let mut can = self.can_of(&open.key);
+        if open.max_file_bytes > 0 {
+            can.max_file_bytes = can.max_file_bytes.max(open.max_file_bytes);
+        }
         let target = Target {
             key: open.key.clone(),
             title: open.title.clone(),
@@ -3292,7 +3296,7 @@ impl Shell {
             link,
             space: open.space.clone(),
             read_only: open.read_only,
-            can: self.can_of(&open.key),
+            can,
         };
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));

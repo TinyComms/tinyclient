@@ -208,6 +208,8 @@ struct GuildInfo {
     quiet: Quiet,
     /// Our own nickname there.
     nick: String,
+    /// Server boost tier (0..=3), which can raise the file upload limit for everyone in it.
+    premium_tier: u8,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
 }
@@ -298,6 +300,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.mark = known.mark;
     row.opted_out = known.opted_out;
     row.limit = known.limit;
+    row.max_file_bytes = known.max_file_bytes;
     row
 }
 

@@ -239,6 +239,7 @@ impl GuildInfo {
             read_only: written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0,
             private: self.private(guild, channel),
             opted_out: self.quiet.opted_out(&channel.id, parent),
+            max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
             ..ConversationRow::new(&channel.id, kind, name)
         })
     }
@@ -285,6 +286,7 @@ impl Discord {
             channels: Vec::new(),
             quiet,
             nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
+            premium_tier: guild.premium_tier().unwrap_or(0),
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
                     id: emoji.id.clone()?,
@@ -1046,7 +1048,7 @@ impl Discord {
 
     /// A server renamed or given a new icon. The payload names only what it wants shown.
     pub(super) fn guild_updated(&self, guild: Guild) -> Result<(), Failure> {
-        {
+        let tier_changed = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(&guild.id) else {
                 return Ok(());
@@ -1055,6 +1057,16 @@ impl Discord {
                 info.name = guild.name().to_owned();
             }
             info.icon = guild.icon().map(str::to_owned);
+            match guild.premium_tier() {
+                Some(tier) if tier != info.premium_tier => {
+                    info.premium_tier = tier;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if tier_changed {
+            self.replant(&guild.id)?;
         }
         Ok(self.spaces()?)
     }

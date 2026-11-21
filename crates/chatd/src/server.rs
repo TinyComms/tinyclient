@@ -1200,7 +1200,7 @@ impl Chat {
                 return error(ErrorCode::Refused, "A poll can't carry a file.");
             }
         }
-        if let Err(refused) = self.allowed(&account, &with) {
+        if let Err(refused) = self.allowed(&conversation, &with) {
             return *refused;
         }
         if let Err(err) = self.ensure_thread(&conversation) {
@@ -1333,14 +1333,22 @@ impl Chat {
 
     /// What the account may send, checked before anything is stored: a file too large or too
     /// many is refused here, naming the limit, and the network hears nothing.
-    fn allowed(&self, account: &AccountKey, with: &Outgoing) -> Result<(), Refused> {
+    fn allowed(&self, conversation: &Key, with: &Outgoing) -> Result<(), Refused> {
+        let account = conversation.account();
         let refuse = |why: String| Err(Box::new(error(ErrorCode::Refused, why)));
         let name = account.network.label();
-        let can = self.hub.capabilities(account);
+        let can = self.hub.capabilities(&account);
         if with.files.is_empty() {
             return Ok(());
         }
-        if can.max_file_bytes == 0 {
+        let max_file_bytes = self
+            .hub
+            .store()
+            .conversation(conversation)
+            .ok()
+            .flatten()
+            .map_or(can.max_file_bytes, |row| can.max_file_bytes.max(row.max_file_bytes));
+        if max_file_bytes == 0 {
             return refuse(format!("Files can't be sent to {name} from tinyclient yet."));
         }
         let most = (can.max_files.max(1) as usize).min(protocol::ATTACHMENTS_LIMIT);
@@ -1357,8 +1365,8 @@ impl Chat {
             };
             match std::fs::metadata(&real) {
                 Ok(meta) if meta.is_dir() => return refuse(format!("{named}: folders can't be sent. Zip it first.")),
-                Ok(meta) if meta.len() > can.max_file_bytes => {
-                    return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(can.max_file_bytes)))
+                Ok(meta) if meta.len() > max_file_bytes => {
+                    return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(max_file_bytes)))
                 }
                 Ok(_) => {}
                 Err(_) => return refuse(format!("{named} is no longer there.")),

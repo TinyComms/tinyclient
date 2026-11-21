@@ -409,6 +409,8 @@ pub struct GuildProperties {
     pub icon: Option<String>,
     #[serde(default)]
     pub owner_id: Option<String>,
+    #[serde(default)]
+    pub premium_tier: Option<u8>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -422,6 +424,8 @@ pub struct Guild {
     pub icon: Option<String>,
     #[serde(default)]
     pub owner_id: Option<String>,
+    #[serde(default)]
+    pub premium_tier: Option<u8>,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -513,6 +517,11 @@ impl Guild {
     pub fn owner(&self) -> &str {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.owner_id.as_deref());
         wrapped.or(self.owner_id.as_deref()).unwrap_or("")
+    }
+
+    pub fn premium_tier(&self) -> Option<u8> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.premium_tier);
+        wrapped.or(self.premium_tier)
     }
 }
 

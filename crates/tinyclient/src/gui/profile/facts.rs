@@ -879,6 +879,7 @@ mod tests {
             seen: false,
             delivered: false,
             sending: false,
+            max_file_bytes: 0,
         }
     }
 
