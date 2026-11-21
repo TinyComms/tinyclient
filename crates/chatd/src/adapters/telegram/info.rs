@@ -1051,6 +1051,43 @@ pub(super) fn giveaway_info(account: &Account, conversation: &str, msg_id: i32) 
     Ok(result)
 }
 
+/// Play on a game message. Telegram returns a web address for this user; the shell opens it
+/// outside the app. The address is not logged.
+pub(super) fn game_play(account: &Account, conversation: &str, msg_id: i32) -> Result<protocol::ActionResult, Fault> {
+    let peer = game_peer(account, conversation, msg_id)?;
+    let answer = account.ask(&tl::functions::messages::GetBotCallbackAnswer {
+        game: true,
+        peer,
+        msg_id,
+        data: None,
+        password: None,
+    })?;
+    let tl::enums::messages::BotCallbackAnswer::Answer(answer) = answer;
+    Ok(super::content::game_launch(&answer))
+}
+
+/// High scores for the game on `msg_id`, around this account.
+pub(super) fn game_scores(account: &Account, conversation: &str, msg_id: i32) -> Result<protocol::ActionResult, Fault> {
+    let peer = game_peer(account, conversation, msg_id)?;
+    let scores = account.ask(&tl::functions::messages::GetGameHighScores {
+        peer,
+        id: msg_id,
+        user_id: tl::enums::InputUser::UserSelf,
+    })?;
+    let tl::enums::messages::HighScores::Scores(scores) = scores;
+    Ok(super::content::game_high_scores(&scores))
+}
+
+fn game_peer(account: &Account, conversation: &str, msg_id: i32) -> Result<tl::enums::InputPeer, Fault> {
+    if msg_id <= 0 {
+        return Err(invalid("MESSAGE_ID_INVALID"));
+    }
+    let Some((who, _)) = Who::parse(conversation) else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    account.input(who)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

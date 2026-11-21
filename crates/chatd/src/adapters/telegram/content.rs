@@ -1299,10 +1299,6 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
             let tl::enums::Poll::Poll(poll) = &media.poll;
             format!("Poll: {}", plain(&poll.question))
         }
-        MessageMedia::Game(media) => {
-            let tl::enums::Game::Game(game) = &media.game;
-            format!("Game: {}", game.title)
-        }
         MessageMedia::Invoice(invoice) => format!("Invoice: {}", invoice.title),
         MessageMedia::Story(_) => "Story".to_owned(),
         MessageMedia::PaidMedia(_) => "Paid media".to_owned(),
@@ -1639,6 +1635,109 @@ fn giveaway_card(dir: &Directory, media: &MessageMedia, msg_id: i32) -> Option<(
     }
 }
 
+/// A bot game: the picture, title and description Telegram already sent, and two buttons.
+/// Play asks `messages.getBotCallbackAnswer { game: true }` and opens that web address outside
+/// the app. High scores asks `messages.getGameHighScores`. The reply keyboard is not mapped,
+/// so the button says Play rather than a label this message did not carry. The game's
+/// animation document stays with Telegram: it is not a video to play here.
+fn game_card(media: &tl::types::MessageMediaGame, msg_id: i32, wants: &mut Vec<Want>) -> (Card, Vec<MessageControl>, Option<Attachment>) {
+    let tl::enums::Game::Game(game) = &media.game;
+    let mut card = Card {
+        author: "Game".to_owned(),
+        title: game.title.clone(),
+        text: game.description.clone(),
+        footer: "Opens in your browser".to_owned(),
+        ..Card::default()
+    };
+    let picture = match &game.photo {
+        tl::enums::Photo::Photo(picture) => photo(picture, false, wants),
+        _ => None,
+    };
+    if let Some(picture) = &picture {
+        card.image = picture.thumb.clone().or_else(|| Some(picture.file.clone()));
+    }
+    let button = |action_id: &str, label: &str, style: ControlStyle| MessageControl {
+        block_id: String::new(),
+        action_id: action_id.to_owned(),
+        element_type: "telegram_game".to_owned(),
+        label: label.to_owned(),
+        value: msg_id.to_string(),
+        confirm: None,
+        kind: ControlKind::Button { url: String::new(), style },
+    };
+    let controls = vec![
+        button("tg:game", "Play", ControlStyle::Primary),
+        button("tg:game_scores", "High scores", ControlStyle::Default),
+    ];
+    (card, controls, picture)
+}
+
+/// What Play opens. A web address is handed to the shell with no title, so it opens in the
+/// system browser. Anything else is dropped. The address can carry a per-user token; it is
+/// not written to a log here.
+pub(super) fn game_launch(answer: &tl::types::messages::BotCallbackAnswer) -> protocol::ActionResult {
+    let mut result = protocol::ActionResult {
+        text: answer.message.clone().unwrap_or_default(),
+        url: answer.url.clone(),
+        url_label: "Play".to_owned(),
+        alert: answer.alert,
+        title: if answer.alert { "Game".to_owned() } else { String::new() },
+        ..protocol::ActionResult::default()
+    };
+    let offered = result.url.clone();
+    result.bound();
+    if result.url.is_none() && result.text.is_empty() && offered.is_some() {
+        result.text = "The game link is not a web address.".to_owned();
+    }
+    result
+}
+
+/// The leaderboard `messages.getGameHighScores` already returned. Names come from the users
+/// in that answer. A missing name stays "User N". Nothing here asks the network again.
+pub(super) fn game_high_scores(scores: &tl::types::messages::HighScores) -> protocol::ActionResult {
+    let mut result = protocol::ActionResult {
+        title: "High scores".to_owned(),
+        alert: true,
+        ..protocol::ActionResult::default()
+    };
+    if scores.scores.is_empty() {
+        result.text = "No scores yet.".to_owned();
+        return result;
+    }
+    for row in scores.scores.iter().take(24) {
+        let tl::enums::HighScore::Score(row) = row;
+        result.fields.push((format!("{}. {}", row.pos.max(0), score_name(&scores.users, row.user_id)), row.score.to_string()));
+    }
+    result.bound();
+    result
+}
+
+fn score_name(users: &[tl::enums::User], id: i64) -> String {
+    for user in users {
+        let tl::enums::User::User(user) = user else {
+            continue;
+        };
+        if user.id != id {
+            continue;
+        }
+        if user.deleted {
+            return "Deleted Account".to_owned();
+        }
+        let first = user.first_name.as_deref().unwrap_or("").trim();
+        let last = user.last_name.as_deref().unwrap_or("").trim();
+        let name = match (first.is_empty(), last.is_empty()) {
+            (false, false) => format!("{first} {last}"),
+            (false, true) => first.to_owned(),
+            (true, false) => last.to_owned(),
+            (true, true) => user.username.clone().unwrap_or_default(),
+        };
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    format!("User {id}")
+}
+
 /// The card for an invoice or a paid-media preview. The message stays a hand-off: paying and
 /// buying Stars stay in Telegram's own app, and no card number is read or stored here.
 fn detail_card(media: &MessageMedia) -> Option<Card> {
@@ -1972,7 +2071,9 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         A::ChannelMigrateFrom(migrated) => named(format!("This group was upgraded from \"{}\"", migrated.title)),
         A::PinMessage => named(format!("{who} pinned a message")),
         A::HistoryClear => named("History was cleared".to_owned()),
-        A::GameScore(game) => named(format!("{who} scored {}", game.score)),
+        // The action names a game id and a score, not a title. Mapping does not ask the network,
+        // and there is no local title, so the line does not invent one.
+        A::GameScore(game) => named(format!("{who} scored {} in a game", game.score)),
         A::PaymentSent(paid) => named(match price_of(&paid.currency, paid.total_amount) {
             Some(price) => format!("{who} sent a payment of {price}"),
             None => format!("{who} sent a payment"),
@@ -2274,6 +2375,12 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         message.card = Some(Box::new(card));
                         message.controls.extend(controls);
                     }
+                }
+                Some(MessageMedia::Game(media)) => {
+                    let (card, controls, picture) = game_card(media, raw.id, &mut wants);
+                    message.card = Some(Box::new(card));
+                    message.controls.extend(controls);
+                    message.attachments.extend(picture);
                 }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
@@ -3353,6 +3460,118 @@ pub(super) fn prove_giveaways() -> Result<(), String> {
     }
     if format_utc(1_700_000_000) != "2023-11-14 22:12 UTC" {
         return Err(format!("a giveaway date is wrong, got {}", format_utc(1_700_000_000)));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-games check. A game message is a card with its picture, title and
+/// description, Play asks for a web address, and a score line does not invent a title.
+/// A build from before this says only "Game: …".
+pub(super) fn prove_games() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    let photo = tl::types::Photo {
+        has_stickers: false,
+        id: 42,
+        access_hash: 7,
+        file_reference: vec![1, 2],
+        date: 1_700_000_000,
+        sizes: vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 180, size: 4_000 }.into()],
+        video_sizes: None,
+        dc_id: 2,
+    };
+    message.media = Some(
+        tl::types::MessageMediaGame {
+            game: tl::types::Game {
+                id: 9,
+                access_hash: 3,
+                short_name: "ridge".into(),
+                title: "Ridge Run".into(),
+                description: "A lap around the ridge".into(),
+                photo: photo.into(),
+                document: None,
+            }
+            .into(),
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the game maps")?;
+    let card = mapped.message.card.ok_or("a game is a card")?;
+    if card.title != "Ridge Run" || card.text != "A lap around the ridge" || card.author != "Game" {
+        return Err(format!("the game card is unnamed, got {} / {}", card.title, card.text));
+    }
+    if card.image.as_ref().map(|image| image.id.as_str()) != Some("p42m") {
+        return Err("the game card has no picture".into());
+    }
+    if mapped.message.attachments.first().map(|file| file.file.id.as_str()) != Some("p42m") {
+        return Err("the game picture is not on the message".into());
+    }
+    if !mapped.wants.iter().any(|want| want.file.id == "p42m") {
+        return Err("the game picture is not fetched".into());
+    }
+    match mapped.message.controls.as_slice() {
+        [play, scores]
+            if play.action_id == "tg:game"
+                && play.label == "Play"
+                && play.value == "9"
+                && scores.action_id == "tg:game_scores"
+                && scores.label == "High scores"
+                && scores.value == "9" => {}
+        _ => return Err("a game has no Play and high scores".into()),
+    }
+    if matches!(mapped.message.kind, MessageKind::Unsupported { .. }) {
+        return Err("a game still opens only in Telegram".into());
+    }
+
+    let opened = game_launch(&tl::types::messages::BotCallbackAnswer {
+        alert: false,
+        has_url: true,
+        native_ui: false,
+        message: None,
+        url: Some("https://games.example/play?user=9".into()),
+        cache_time: 0,
+    });
+    if opened.alert || !opened.title.is_empty() || !opened.fields.is_empty() {
+        return Err("a game address would not open in the browser".into());
+    }
+    if opened.url.as_deref() != Some("https://games.example/play?user=9") {
+        return Err("the play address was not kept".into());
+    }
+    let refused = game_launch(&tl::types::messages::BotCallbackAnswer {
+        alert: false,
+        has_url: true,
+        native_ui: false,
+        message: None,
+        url: Some("javascript:alert(1)".into()),
+        cache_time: 0,
+    });
+    if refused.url.is_some() || refused.text.is_empty() {
+        return Err("a game link that is not a web address was kept".into());
+    }
+
+    let mut player = Vec::new();
+    0u32.serialize(&mut player);
+    0u32.serialize(&mut player);
+    9i64.serialize(&mut player);
+    let mut ada = tl::types::User::from_bytes(&player).map_err(|_| "a player reads back".to_owned())?;
+    ada.first_name = Some("Ada".into());
+    let board = game_high_scores(&tl::types::messages::HighScores {
+        scores: vec![tl::types::HighScore { pos: 1, user_id: 9, score: 40 }.into()],
+        users: vec![ada.into()],
+    });
+    if board.title != "High scores" || board.fields.first().map(|(label, value)| (label.as_str(), value.as_str())) != Some(("1. Ada", "40")) {
+        return Err(format!("the high scores are unnamed, got {:?}", board.fields));
+    }
+    let (line, known) = action(&Directory::new(1), "Ada", &tl::types::MessageActionGameScore { game_id: 9, score: 40 }.into());
+    if !known || line != "Ada scored 40 in a game" {
+        return Err(format!("a score invented a title, got {line}"));
     }
     Ok(())
 }
@@ -4461,7 +4680,7 @@ mod tests {
         );
         let call = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
         assert_eq!(said(tl::types::MessageActionGroupCallScheduled { call, schedule_date: 1_700_000_000 }.into()), "Ada scheduled a video chat");
-        assert_eq!(said(tl::types::MessageActionGameScore { game_id: 1, score: 40 }.into()), "Ada scored 40");
+        assert_eq!(said(tl::types::MessageActionGameScore { game_id: 1, score: 40 }.into()), "Ada scored 40 in a game");
         assert_eq!(
             said(tl::types::MessageActionRequestedPeer { button_id: 1, peers: vec![Who::User(9).peer()] }.into()),
             "Ada shared a chat"
@@ -4522,6 +4741,11 @@ mod tests {
     #[test]
     fn giveaway_media_maps_to_card_fields() {
         prove_giveaways().unwrap();
+    }
+
+    #[test]
+    fn a_bot_game_is_a_card_with_a_play_link() {
+        prove_games().unwrap();
     }
 
     fn text_message(text: &str, reply_to: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {

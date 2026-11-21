@@ -884,6 +884,14 @@ fn serve(account: &Arc<Account>, command: Command) {
                     let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
                     info::giveaway_info(account, &conversation_id, target_id).map(Some).map_err(refused)
                 }
+                "tg:game" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::game_play(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:game_scores" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::game_scores(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
                 _ => Err(Refusal::Unsupported),
             };
             let _ = reply.send(answer);
@@ -1526,6 +1534,11 @@ pub fn prove_telegram_invoices() -> Result<(), String> {
 /// The lab's telegram-giveaways driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_giveaways() -> Result<(), String> {
     content::prove_giveaways()
+}
+
+/// The lab's telegram-games driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_games() -> Result<(), String> {
+    content::prove_games()
 }
 
 pub fn prove_telegram_round() -> Result<(), String> {
