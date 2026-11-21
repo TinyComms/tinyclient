@@ -3105,9 +3105,9 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
 #[test]
 fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
     let plain = b"not-a-real-voice-note".to_vec();
-    let key = [0x5au8; 64];
+    let media_key = [0x5au8; 64];
     let iv = [0x11u8; 16];
-    let (enc, digest) = encrypt_signal_blob(&plain, &key, &iv);
+    let (enc, digest) = encrypt_signal_blob(&plain, &media_key, &iv);
     let mut bad = digest;
     bad[0] ^= 0xff;
     let (base, stop_cdn) = spawn_cdn_stub(vec![("/bad-voice.enc".into(), enc)]);
@@ -3117,7 +3117,7 @@ fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
     let sent = T0 + 40_000;
     world.steer(&format!(
         "voice grace {sent} {base}/bad-voice.enc {} {}",
-        hex_of(&key),
+        hex_of(&media_key),
         hex_of(&bad),
     ));
     let voice_msg = world.arrived(GRACE, &id(sent, GRACE));
