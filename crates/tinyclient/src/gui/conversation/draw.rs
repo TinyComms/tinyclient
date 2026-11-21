@@ -922,7 +922,22 @@ impl Pane {
                                 .child(format!("✨ {effect}")),
                         )
                 }))
-                .children(message.card.as_deref().map(|card| self.app_card(card)))
+                .children(message.sent_via.as_deref().map(|via| {
+                    div()
+                        .pt(px(2.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child(via.to_owned()),
+                        )
+                }))
+                .children(message.card.as_deref().map(|card| self.app_card(message, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
                 .children(self.cards(message, window, cx));
@@ -2130,7 +2145,7 @@ impl Pane {
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
-    fn app_card(&self, card: &Card) -> AnyElement {
+    fn app_card(&self, message: &Message, card: &Card, cx: &mut Context<Self>) -> AnyElement {
         let bar = match media::card_tone(card.color) {
             media::Tone::Positive => theme::positive(),
             media::Tone::Danger => theme::danger(),
@@ -2146,6 +2161,85 @@ impl Pane {
                 .child(div().truncate().type_small().text_color(theme::text_faint()).child(label.clone()))
                 .child(div().type_ui().child(value.clone()))
         };
+        let maps_url = (card.footer == "Open in Maps").then(|| maps_url_for_card(card)).flatten();
+        let vcard_path = (card.footer == "Contact card").then(|| {
+            message
+                .attachments
+                .iter()
+                .find(|a| a.mime.to_ascii_lowercase().contains("vcard") || a.name.to_ascii_lowercase().ends_with(".vcf"))
+                .and_then(|a| a.file.path.clone())
+        }).flatten();
+        let footer_el: Option<AnyElement> = if let Some(url) = maps_url {
+            Some(
+                div()
+                    .mt(px(4.))
+                    .flex()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("card-maps-{}", message.id)))
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(theme::accent())
+                            .hover(|s| s.underline())
+                            .child("Open in Maps")
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&url);
+                            }),
+                    )
+                    .into_any_element(),
+            )
+        } else if card.footer == "Contact card" {
+            let save_path = vcard_path.clone();
+            let text_path = vcard_path.clone();
+            let account = self.open.as_ref().map(|o| o.key.account());
+            let mut row = div().mt(px(4.)).flex().items_center().gap(px(12.));
+            if let (Some(path), Some(account)) = (text_path, account) {
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("card-text-number-{}", message.id)))
+                        .cursor_pointer()
+                        .type_small()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(theme::accent())
+                        .hover(|s| s.underline())
+                        .child("Text this number")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(phone) = first_vcard_phone(&path) {
+                                let person = protocol::Person::new(
+                                    protocol::Key::new(&account, phone),
+                                    String::new(),
+                                );
+                                let _ = this.shell.update(cx, |shell, cx| shell.start_direct(&person, cx));
+                            }
+                        })),
+                );
+            }
+            if let Some(path) = save_path {
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("card-save-vcard-{}", message.id)))
+                        .cursor_pointer()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .hover(|s| s.underline())
+                        .child("Save file")
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.reveal_path(std::path::Path::new(&path));
+                        }),
+                );
+            } else {
+                row = row.child(div().type_small().text_color(theme::text_faint()).child(card.footer.clone()));
+            }
+            Some(row.into_any_element())
+        } else if !card.footer.is_empty() {
+            Some(div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone()).into_any_element())
+        } else {
+            None
+        };
         let words = div()
             .flex_1()
             .min_w_0()
@@ -2157,7 +2251,7 @@ impl Pane {
             .children((!card.title.is_empty()).then(|| div().type_body().font_weight(theme::SEMIBOLD).child(card.title.clone())))
             .children((!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone())))
             .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
-            .children((!card.footer.is_empty()).then(|| div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone())));
+            .children(footer_el);
         let framed = div()
             // The column's width on a phone, so its wrapped words measure against it (`card`).
             .w(px(if self.metrics == Metrics::PHONE { self.media_width() } else { 440. }))
@@ -3190,6 +3284,63 @@ mod tests {
         assert_eq!(expiry_label(7_300, 100), Some("2h".into()));
         assert_eq!(expiry_label(172_900, 100), Some("2d".into()));
     }
+
+    #[test]
+    fn maps_url_extracted_from_location_card() {
+        let card = Card {
+            title: "Ferry Building".into(),
+            text: "1 Ferry Building\ngeo:37.7749,-122.4194".into(),
+            fields: vec![
+                ("Latitude".into(), "37.7749".into()),
+                ("Longitude".into(), "-122.4194".into()),
+            ],
+            footer: "Open in Maps".into(),
+            color: None,
+            sponsored: false,
+        };
+        assert_eq!(
+            maps_url_for_card(&card).as_deref(),
+            Some("https://maps.google.com/?q=37.7749,-122.4194")
+        );
+    }
+}
+
+/// Extracts a Google Maps URL from a location card's `geo:` line or Latitude/Longitude fields.
+fn maps_url_for_card(card: &Card) -> Option<String> {
+    for line in card.text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("geo:") {
+            let coords = rest.split([';', '?', ' ']).next().unwrap_or("").trim();
+            if coords.contains(',') {
+                return Some(format!("https://maps.google.com/?q={coords}"));
+            }
+        }
+    }
+    let lat = card.fields.iter().find(|(k, _)| k == "Latitude").map(|(_, v)| v.trim());
+    let lng = card.fields.iter().find(|(k, _)| k == "Longitude").map(|(_, v)| v.trim());
+    if let (Some(lat), Some(lng)) = (lat, lng) {
+        if !lat.is_empty() && !lng.is_empty() {
+            return Some(format!("https://maps.google.com/?q={lat},{lng}"));
+        }
+    }
+    None
+}
+
+/// Reads the first `TEL` phone number from a downloaded `.vcf` file on disk.
+fn first_vcard_phone(path: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some((key, val)) = line.split_once(':') {
+            let prop = key.split(';').next().unwrap_or("").trim();
+            if prop.eq_ignore_ascii_case("TEL") {
+                let clean = val.trim().strip_prefix("tel:").unwrap_or(val.trim()).trim();
+                if !clean.is_empty() {
+                    return Some(clean.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Short remaining-time label for a disappearing message's `expires_at` timestamp.

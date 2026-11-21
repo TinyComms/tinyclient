@@ -759,6 +759,22 @@ pub struct PollDraft {
     pub anonymous: bool,
 }
 
+/// One selectable sending identity or line on an account (e.g. a SIM card on a dual-SIM phone,
+/// or a channel send-as alias).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendAs {
+    /// Adapter-opaque id carried back in `Outgoing::send_as`.
+    pub id: String,
+    /// Short display label shown beside the composer (e.g. carrier name or "SIM 2").
+    pub label: String,
+    /// Optional accent colour (`0xRRGGBB`), e.g. SIM colour from the phone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    /// Optional secondary detail (e.g. "RCS" / "SMS" or masked number).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
 /// message leaves it off the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,6 +821,10 @@ pub struct Outgoing {
     /// Optional contact card to share (Signal, Telegram).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<crate::SharedContact>,
+    /// Optional sending identity or line id from `AccountStatus::send_as` (e.g. a SIM card on a
+    /// dual-SIM phone). `None` keeps the conversation's default line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_as: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -823,6 +843,7 @@ impl Default for Outgoing {
             broadcast: false,
             effect: None,
             contact: None,
+            send_as: None,
         }
     }
 }
@@ -935,5 +956,30 @@ mod tests {
         let got_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(got_resp, resp);
         assert_eq!(ReportReason::ALL.len(), 6);
+    }
+
+    #[test]
+    fn send_as_round_trips_and_stays_off_wire_when_unset() {
+        let plain = Outgoing::default();
+        assert!(plain.is_plain());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("send_as"));
+
+        let chosen = Outgoing {
+            send_as: Some("sim-2".into()),
+            ..Outgoing::default()
+        };
+        assert!(!chosen.is_plain());
+        let wire = serde_json::to_string(&chosen).unwrap();
+        let back: Outgoing = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, chosen);
+
+        let opt = SendAs {
+            id: "sim-2".into(),
+            label: "Work".into(),
+            color: Some(0x34A853),
+            detail: "SMS · +1 •••• ••99".into(),
+        };
+        let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
+        assert_eq!(back_opt, opt);
     }
 }

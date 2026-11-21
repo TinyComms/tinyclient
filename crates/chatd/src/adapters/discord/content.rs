@@ -912,6 +912,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         importance: protocol::Importance::Normal,
         effect: None,
         contacts: Vec::new(),
+        sent_via: None,
     };
     (message, rich.files)
 }

@@ -265,6 +265,8 @@ struct Target {
     special: protocol::Special,
     /// What the account may send.
     can: Capabilities,
+    /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
+    send_as: Vec<protocol::SendAs>,
 }
 
 /// Why nothing can be typed here, when that is so.
@@ -572,6 +574,9 @@ pub struct Composer {
     pending_file: Option<(Key, String)>,
     /// Inline poll creation form when the user clicks "Create poll".
     poll_composer: Option<PollComposer>,
+    /// Explicit per-conversation `send_as` choice (e.g. SIM card on a dual-SIM phone).
+    /// Never changed unless the user explicitly clicks the selector.
+    send_as: HashMap<Key, String>,
     /// Per-message send options (Issue #776): Teams importance, Slack thread broadcast, Telegram effect.
     importance: protocol::Importance,
     broadcast: bool,
@@ -667,6 +672,7 @@ impl Composer {
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
             poll_composer: None,
+            send_as: HashMap::new(),
             importance: protocol::Importance::Normal,
             broadcast: false,
             effect: None,
@@ -995,6 +1001,7 @@ impl Composer {
             broadcast: controls.broadcast && self.thread && self.broadcast,
             effect: if controls.effects { self.effect.clone() } else { None },
             contact: None,
+            send_as: self.send_as.get(&target.key).cloned(),
         };
         self.importance = protocol::Importance::Normal;
         self.broadcast = false;
@@ -2992,6 +2999,52 @@ impl Composer {
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
         let mic = self.mic_button(controls.voice, cx);
+        let sim_btn = self
+            .target
+            .as_ref()
+            .filter(|t| t.send_as.len() > 1 && self.editing.is_none())
+            .map(|target| {
+                let key = target.key.clone();
+                let options = target.send_as.clone();
+                let current_id = self.send_as.get(&key);
+                let idx = current_id
+                    .and_then(|id| options.iter().position(|o| o.id == *id))
+                    .unwrap_or(0);
+                let active = &options[idx];
+                let next_id = options[(idx + 1) % options.len()].id.clone();
+                let tip_text = if active.detail.is_empty() {
+                    format!("Sending via {} (click to switch)", active.label)
+                } else {
+                    format!("Sending via {} · {} (click to switch)", active.label, active.detail)
+                };
+                div()
+                    .id("send-as")
+                    .h(px(card_control()))
+                    .px(px(8.))
+                    .flex_none()
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme::border_strong()))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .tooltip(tip(tip_text, None))
+                    .children(active.color.map(|rgb| {
+                        div()
+                            .size(px(7.))
+                            .rounded_full()
+                            .bg(gpui::rgb(rgb))
+                    }))
+                    .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(active.label.clone()))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.send_as.insert(key.clone(), next_id.clone());
+                        cx.notify();
+                    }))
+            });
         let anchors = self.anchors.clone();
         let phone = crate::gui::phone::active();
         // A phone's send is the desktop's filled square drawn at 36 inside a 44 pt target, so a
@@ -3068,6 +3121,7 @@ impl Composer {
                 .gap(px(2.))
                 .children(attach)
                 .child(field)
+                .children(sim_btn)
                 .children(mic)
                 .children(smile)
                 .child(send)
@@ -3082,6 +3136,7 @@ impl Composer {
                 .children(attach.map(|attach| attach.mr(px(4.))))
                 .children(poll_btn.map(|btn| btn.mr(px(4.))))
                 .child(field)
+                .children(sim_btn.map(|btn| btn.mr(px(4.))))
                 .children(gif.map(|gif| gif.mr(px(2.))))
                 .children(mic.map(|mic| mic.mr(px(2.))))
                 .children(smile.map(|smile| smile.mr(px(4.))))
@@ -3331,6 +3386,9 @@ impl Composer {
                 let presets = schedule::presets(now);
                 if controls.silent && !presets.is_empty() {
                     items = items.child(menu_separator());
+                }
+                if self.target.as_ref().is_some_and(|t| t.key.network == Network::Messages) {
+                    items = items.child(menu_label("Sends while this computer is on and your phone is reachable."));
                 }
                 for (index, moment) in presets.into_iter().enumerate() {
                     let at = moment.at;
@@ -3739,6 +3797,14 @@ impl Shell {
         self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&conversation.account())).map(|account| account.can).unwrap_or_default()
     }
 
+    fn send_as_of(&self, conversation: &Key) -> Vec<protocol::SendAs> {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.account(&conversation.account()))
+            .map(|account| account.send_as.clone())
+            .unwrap_or_default()
+    }
+
     /// The composer dock of the open conversation.
     pub(super) fn composer(&self, open: &Conversation, link: Link, cx: &mut Context<Self>) -> Div {
         self.people_state.attach(cx);
@@ -3772,6 +3838,7 @@ impl Shell {
             blocked_peer,
             special: open.special,
             can,
+            send_as: self.send_as_of(&open.key),
         };
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));
@@ -3801,6 +3868,7 @@ impl Shell {
             blocked_peer: None,
             special: protocol::Special::None,
             can: self.can_of(thread),
+            send_as: self.send_as_of(thread),
         };
         let composer = self.composer_in(true, cx);
         // A thread's row is not handed over, so its draft is the one this window remembers.

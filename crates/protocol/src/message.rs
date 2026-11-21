@@ -641,6 +641,9 @@ pub struct Message {
     /// Shared contact cards carried on this message (Signal, Telegram).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contacts: Vec<SharedContact>,
+    /// Short label of the sending line or identity when reported (e.g. carrier name or "SIM 2").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_via: Option<String>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -737,6 +740,7 @@ impl Message {
             importance: crate::Importance::Normal,
             effect: None,
             contacts: Vec::new(),
+            sent_via: None,
         }
     }
 
@@ -804,6 +808,9 @@ impl Message {
         clip(&mut self.receipt_note, 200);
         if let Some(effect) = &mut self.effect {
             clip(effect, 64);
+        }
+        if let Some(via) = &mut self.sent_via {
+            clip(via, 64);
         }
     }
 

@@ -688,6 +688,7 @@ impl Chat {
                     presence,
                     status,
                     can: linked.map_or_else(Capabilities::default, |linked| linked.can),
+                    send_as: linked.map_or_else(Vec::new, |linked| linked.send_as.clone()),
                 }
             })
             .collect();

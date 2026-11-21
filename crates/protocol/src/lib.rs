@@ -213,6 +213,10 @@ pub struct AccountStatus {
     /// reports them.
     #[serde(default, skip_serializing_if = "Capabilities::is_none")]
     pub can: Capabilities,
+    /// Selectable sending identities or lines on this account (e.g. dual-SIM cards on Messages).
+    /// Empty when the account has only one line or does not offer a chooser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub send_as: Vec<SendAs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
