@@ -652,6 +652,14 @@ impl Teams {
         }
     }
 
+    /// Parses a raw Teams message JSON into a `Message`, if it is a displayable message.
+    pub(super) fn read_message(&self, conversation: &str, raw: &Value) -> Option<Message> {
+        match self.read(conversation, raw) {
+            Read::Message(msg) => Some(*msg),
+            _ => None,
+        }
+    }
+
     /// Reads one message object. `conversation` is where it will be recorded.
     fn read(&self, conversation: &str, raw: &Value) -> Read {
         let id = id_of(&raw["id"]);
@@ -694,6 +702,39 @@ impl Teams {
         message.edited = set(&props["edittime"]);
         message.edited_at = props["edittime"].as_str().filter(|_| message.edited).map(seconds).filter(|at| *at > 0);
         message.importance = importance_of(&props["importance"]);
+        let pin_entry = {
+            let state = self.state();
+            let thread = thread_of(conversation);
+            let pinned_match = state
+                .pinned_messages
+                .get(thread)
+                .and_then(|list| list.iter().find(|e| e.message_id == id))
+                .cloned();
+            let saved = state.saved_ids.contains(&id);
+            (pinned_match, saved)
+        };
+        if props["pinned"] == true
+            || props["pinned"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || pin_entry.0.is_some()
+        {
+            message.pinned = true;
+            if let Some(entry) = pin_entry.0 {
+                message.pinned_by = entry.pinned_by.and_then(|who| {
+                    if who.starts_with("8:") || who.starts_with("28:") {
+                        self.name_of(&who).or(Some(who))
+                    } else {
+                        Some(who)
+                    }
+                });
+                message.pinned_at = entry.pinned_at;
+            }
+        }
+        if props["saved"] == true
+            || props["saved"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || pin_entry.1
+        {
+            message.starred = true;
+        }
         let content = raw["content"].as_str().unwrap_or("");
         match kind {
             "Event/Call" => {

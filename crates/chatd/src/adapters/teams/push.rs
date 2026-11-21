@@ -204,7 +204,7 @@ impl Teams {
             match (body["type"].as_str(), body["resourceType"].as_str()) {
                 (Some("EventMessage"), Some("NewMessage")) => self.heard(&body["resource"], true),
                 (Some("EventMessage"), Some("MessageUpdate")) => self.heard(&body["resource"], false),
-                (Some("EventMessage"), Some("ConversationUpdate")) => self.read_elsewhere(&body["resource"]),
+                (Some("EventMessage"), Some("ConversationUpdate" | "ThreadUpdate")) => self.read_elsewhere(&body["resource"]),
                 _ => Ok(()),
             }
         } else if path.ends_with("/TeamsUnifiedPresenceService") || path.ends_with("/unifiedPresenceService") {
@@ -259,6 +259,11 @@ impl Teams {
                 ..crate::store::Filing::default()
             };
             self.ctx.filing(id, &filing)?;
+        }
+        if props.get("pinnedMessages").is_some() || props.get("pinnedMessageIds").is_some() {
+            let entries = super::info::parse_pinned_messages(props);
+            self.apply_pinned_update(id, entries)?;
+            self.ctx.info_stale(id);
         }
         if let Some(level) = super::info::parse_notify(props, super::tree::is_channel(id)) {
             self.state().notify.insert(id.to_owned(), level);

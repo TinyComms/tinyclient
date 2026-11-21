@@ -339,6 +339,10 @@ struct State {
     file_props: HashMap<(String, String), Vec<Value>>,
     /// Chat ids pinned in Teams, in Teams' own order.
     pinned_chats: Vec<String>,
+    /// Pinned messages per conversation/thread id.
+    pinned_messages: HashMap<String, Vec<info::PinnedEntry>>,
+    /// Saved (bookmarked) message ids for this account.
+    saved_ids: HashSet<String>,
     /// Per-conversation notification level as reported by Teams.
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
@@ -927,7 +931,8 @@ impl Teams {
             edit: true,
             delete: true,
             threads: true,
-            pins: false,
+            pins: true,
+            save_messages: true,
             pin_chats: 15,
             close_direct: true,
             clear_history: true,
@@ -1016,6 +1021,18 @@ impl Teams {
             }
             Command::File { conversation_id, pinned, archived: _, folder_add: _, folder_remove: _, reply } => {
                 let _ = reply.send(self.file_chat(&conversation_id, pinned).map_err(refuse));
+            }
+            Command::Pinned { conversation_id, reply } => {
+                let _ = reply.send(self.pinned_messages(&conversation_id).map_err(refuse));
+            }
+            Command::Pin { conversation_id, message_id, pinned, notify: _, me_only: _, reply } => {
+                let _ = reply.send(self.pin_message(&conversation_id, &message_id, pinned).map_err(refuse));
+            }
+            Command::StarMessage { conversation_id, message_id, starred, reply } => {
+                let _ = reply.send(self.save_message(&conversation_id, &message_id, starred).map_err(refuse));
+            }
+            Command::StarredMessages { conversation_id, limit, reply } => {
+                let _ = reply.send(self.saved_messages(conversation_id.as_deref(), limit).map_err(refuse));
             }
             Command::CloseDirect { conversation_id, reply } => {
                 let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));

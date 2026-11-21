@@ -190,6 +190,10 @@ struct Fake {
     heard: Mutex<Vec<String>>,
     pushed: AtomicU32,
     posted: AtomicU32,
+    /// Dynamic thread pinnedMessages JSON per thread id (for #655).
+    pinned: Mutex<HashMap<String, Value>>,
+    /// Saved messages in 48:saved (for #655).
+    saved: Mutex<Vec<Value>>,
 }
 
 impl Fake {
@@ -206,6 +210,25 @@ impl Fake {
             heard: Mutex::default(),
             pushed: AtomicU32::new(0),
             posted: AtomicU32::new(0),
+            pinned: Mutex::new(HashMap::from([(
+                CHAT_ANA.to_owned(),
+                json!([{"messageId": "1760000500100", "pinnedBy": ANA, "pinnedTime": 1_760_000_500_200u64}]),
+            )])),
+            saved: Mutex::new(vec![json!({
+                "id": "1760000500100",
+                "type": "Message",
+                "messagetype": "RichText/Html",
+                "contenttype": "text",
+                "content": "<p>Saved deploy checklist</p>",
+                "conversationid": "48:saved",
+                "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+                "imdisplayname": "Ana Ruiz",
+                "composetime": iso(1_760_000_500_100),
+                "properties": {
+                    "sourceConversationId": CHAT_ANA,
+                    "sourceMessageId": "1760000500100"
+                }
+            })]),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -422,12 +445,32 @@ impl Fake {
             if call.method == "DELETE" && thread.contains("/members/") {
                 return ok(json!({}));
             }
-            let described = match thread {
+            if call.method == "PUT" {
+                if let Some(tid) = thread.strip_suffix("/properties") {
+                    if call.query.contains("name=pinnedMessages") {
+                        let raw = call.json()["pinnedMessages"].as_str().unwrap_or("[]").to_owned();
+                        let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!([]));
+                        self.pinned.lock().unwrap().insert(tid.to_owned(), parsed);
+                        return ok(json!({}));
+                    }
+                }
+            }
+            let mut described = match thread {
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
+                CHAT_ANA => Some(json!({
+                    "id": thread,
+                    "properties": {"threadType": "chat", "uniquerosterthread": "true"},
+                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
+                })),
                 "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
                 _ => None,
             };
+            if let Some(desc) = described.as_mut() {
+                if let Some(pins) = self.pinned.lock().unwrap().get(thread) {
+                    desc["properties"]["pinnedMessages"] = json!(pins.to_string());
+                }
+            }
             return described.map_or_else(|| answer("404 Not Found", json!({"errorCode": 404, "message": "no such thread"})), ok);
         }
         let Some(rest) = path.strip_prefix("/v1/users/ME/conversations/") else {
@@ -454,13 +497,51 @@ impl Fake {
                     }
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
                     "48:notifications" => "messages.activity",
+                    "48:saved" => {
+                        let msgs = self.saved.lock().unwrap().clone();
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
+                    }
                     _ => return ok(json!({"messages": [], "_metadata": {}})),
                 };
                 ok(self.fixture(name).unwrap())
             }
+            ("GET", rest_msg) if rest_msg.starts_with("messages/") => {
+                let mid = rest_msg.trim_start_matches("messages/");
+                let id_num = mid.parse::<u64>().unwrap_or(1_760_000_500_100);
+                ok(message(conversation, None, id_num, ANA, "Ana Ruiz", &format!("<p>Fetched message {mid}</p>")))
+            }
             ("POST", "messages") => self.post(call, conversation),
             ("PUT", "properties") => ok(json!({})),
             ("DELETE", "") => ok(json!({})),
+            ("PUT", rest_msg) if conversation == "48:saved" && rest_msg.starts_with("messages/") => {
+                let mid = rest_msg.trim_start_matches("messages/").to_owned();
+                let body = call.json();
+                let src_conv = body["sourceConversationId"].as_str().unwrap_or(CHAT_ANA).to_owned();
+                let mut saved = self.saved.lock().unwrap();
+                saved.retain(|m| m["id"].as_str() != Some(mid.as_str()));
+                let id_num = mid.parse::<u64>().unwrap_or(1_760_000_500_900);
+                saved.push(json!({
+                    "id": mid,
+                    "type": "Message",
+                    "messagetype": "RichText/Html",
+                    "contenttype": "text",
+                    "content": format!("<p>Saved item {mid}</p>"),
+                    "conversationid": "48:saved",
+                    "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+                    "imdisplayname": "Ana Ruiz",
+                    "composetime": iso(id_num),
+                    "properties": {
+                        "sourceConversationId": src_conv,
+                        "sourceMessageId": mid
+                    }
+                }));
+                ok(json!({}))
+            }
+            ("DELETE", rest_msg) if conversation == "48:saved" && rest_msg.starts_with("messages/") => {
+                let mid = rest_msg.trim_start_matches("messages/");
+                self.saved.lock().unwrap().retain(|m| m["id"].as_str() != Some(mid));
+                ok(json!({}))
+            }
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
             _ => answer("404 Not Found", json!({"errorCode": 404, "message": "not here"})),
         }
@@ -2339,5 +2420,129 @@ fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance(
         .find(|c| c.json()["clientmessageid"] == "1760000999000628")
         .expect("urgent POST");
     assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
+}
+
+#[test]
+fn pinned_and_saved_messages_read_write_and_push_update() {
+    let world = World::start();
+    world.ready();
+
+    let caps = world.account(HOME).can;
+    assert!(caps.pins && caps.save_messages);
+
+    let ana = key(CHAT_ANA);
+    let general = key(GENERAL);
+    world.open(&ana, 3);
+    world.open(&general, 6);
+
+    // 1. Conversation info reports pinned count, and Pinned returns pinned messages with metadata.
+    let info = match world.ask(Request::ConversationInfo { conversation: ana.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(info.pinned, Some(1));
+
+    let pinned = match world.ask(Request::Pinned { conversation: ana.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].id, "1760000500100");
+    assert!(pinned[0].pinned);
+    assert_eq!(pinned[0].pinned_by.as_deref(), Some("Ana Ruiz"));
+    assert_eq!(pinned[0].pinned_at, Some(1_760_000_500));
+
+    // 2. Pinning a post in a channel writes properties.pinnedMessages and marks it pinned.
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            pinned: true,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    let pin_call = world.fake.calls("PUT", &format!("{GENERAL}/properties")).pop().expect("pin PUT");
+    assert!(pin_call.query.contains("name=pinnedMessages"));
+    assert!(pin_call.json()["pinnedMessages"].as_str().unwrap_or("").contains("1760000100100"));
+    assert!(world.message(&general, "1760000100100").unwrap().pinned);
+
+    let gen_pinned = match world.ask(Request::Pinned { conversation: general.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(gen_pinned.len(), 1);
+    assert_eq!(gen_pinned[0].id, "1760000100100");
+
+    // 3. Unpinning removes it from properties.pinnedMessages and clears pinned flag.
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            pinned: false,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    assert!(!world.message(&general, "1760000100100").unwrap().pinned);
+
+    // 4. Live ThreadUpdate push with pinnedMessages updates local store.
+    world.fake.push(
+        "ThreadUpdate",
+        json!({
+            "id": GENERAL,
+            "properties": {
+                "pinnedMessages": json!([{"messageId": "1760000200200", "pinnedBy": BEN, "pinnedTime": 1_760_000_600_000u64}]).to_string()
+            }
+        }),
+        false,
+    );
+    world.until("live pinned push applied", || {
+        world.message(&general, "1760000200200").filter(|m| m.pinned)
+    });
+
+    // 5. Saved messages: StarredMessages reads 48:saved, StarMessage saves and unsaves.
+    let saved = match world.ask(Request::StarredMessages {
+        account: ana.account(),
+        conversation: None,
+        limit: 50,
+    }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].id, "1760000500100");
+    assert!(saved[0].starred);
+
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            starred: true,
+        }),
+        Response::Ok
+    );
+    assert!(world.message(&general, "1760000100100").unwrap().starred);
+    let saved_after = match world.ask(Request::StarredMessages {
+        account: ana.account(),
+        conversation: None,
+        limit: 50,
+    }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(saved_after.len(), 2);
+
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            starred: false,
+        }),
+        Response::Ok
+    );
+    assert!(!world.message(&general, "1760000100100").unwrap().starred);
 }
 

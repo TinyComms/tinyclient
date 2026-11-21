@@ -185,14 +185,20 @@ impl Teams {
             let rows: Vec<ConversationRow> = channels
                 .iter()
                 .enumerate()
-                .map(|(position, channel)| ConversationRow {
-                    space: Some(id.to_owned()),
-                    position: position as i32,
-                    call: CallSupport::Handoff,
-                    private: channel["channelType"].as_u64().is_some_and(|kind| kind != 0),
-                    read_only: team["isArchived"] == true || channel["isArchived"] == true,
-                    opted_out: hidden(channel),
-                    ..ConversationRow::new(text(channel, "id"), ConversationKind::Channel, text(channel, "displayName"))
+                .map(|(position, channel)| {
+                    let read_only = team["isArchived"] == true || channel["isArchived"] == true;
+                    let mut row = ConversationRow {
+                        space: Some(id.to_owned()),
+                        position: position as i32,
+                        call: CallSupport::Handoff,
+                        private: channel["channelType"].as_u64().is_some_and(|kind| kind != 0),
+                        read_only,
+                        opted_out: hidden(channel),
+                        can_pin: !read_only,
+                        ..ConversationRow::new(text(channel, "id"), ConversationKind::Channel, text(channel, "displayName"))
+                    };
+                    row.rights.pin = !read_only;
+                    row
                 })
                 .collect();
             self.ctx.tree(id, &[], &rows)?;
@@ -332,14 +338,17 @@ impl Teams {
             true => self.picture(&me, &title),
             false => partner.and_then(|partner| self.picture(partner, &title)),
         };
-        ConversationRow {
+        let mut row = ConversationRow {
             avatar: avatar.map(|file| file.id),
             peer: partner.filter(|_| !bot).map(str::to_owned),
             call: if bot || notes { CallSupport::None } else { CallSupport::Handoff },
             bot,
             special: if notes { Special::Saved } else { Special::None },
+            can_pin: !notes,
             ..ConversationRow::new(id, kind, title)
-        }
+        };
+        row.rights.pin = !notes;
+        row
     }
 
     /// The Activity stream at connect: each mention of me newer than its conversation's read
