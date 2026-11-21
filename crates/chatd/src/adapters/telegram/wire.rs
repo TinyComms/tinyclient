@@ -74,6 +74,10 @@ impl Fault {
                 "CALL_PROTOCOL_COMPAT_LAYER_INVALID" => "This call protocol version isn't supported.".to_owned(),
                 "PARTICIPANT_VERSION_OUTDATED" => "The other person's Telegram app needs an update for this call.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
+                "FILTERS_TOO_MUCH" => "You've reached Telegram's 10-folder limit. Delete a folder or upgrade to Telegram Premium for more.".to_owned(),
+                "FILTER_TITLE_EMPTY" => "Give the folder a name.".to_owned(),
+                "FILTER_INCLUDE_EMPTY" => "Include at least one chat or chat type in the folder.".to_owned(),
+                "FILTER_ID_INVALID" => "That folder no longer exists.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.
                 name if name.ends_with("_TOO_MUCH") => "This needs Telegram Premium.".to_owned(),

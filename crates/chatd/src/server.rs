@@ -2677,6 +2677,42 @@ impl Chat {
                 Ok(folders) => Response::Folders { folders },
                 Err(err) => internal(err),
             },
+            Request::FolderSave { account, folder } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::FolderSave { folder, reply }) {
+                    Ok(folder) => Response::Folder { folder },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::FolderDelete { account, folder_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::FolderDelete { folder_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::FoldersReorder { account, order } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::FoldersReorder { order, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SuggestedFolders { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SuggestedFolders { reply }) {
+                    Ok(folders) => Response::SuggestedFolders { folders },
+                    Err(refused) => *refused,
+                }
+            }
             Request::Threads { space, offset, limit } => {
                 if !self.shows(&space.account()) {
                     // Same refusal as Tree. An empty Conversations page looks like a real empty list.

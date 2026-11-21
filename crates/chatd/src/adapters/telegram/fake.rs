@@ -566,6 +566,8 @@ struct World {
     ttl_periods: HashMap<Who, i32>,
     /// Account-wide default auto-delete timer for new chats (`messages.get/setDefaultHistoryTTL`).
     default_ttl: i32,
+    /// Custom/mutated dialog filters once modified via `UpdateDialogFilter` / `UpdateDialogFiltersOrder`.
+    custom_folders: Option<Vec<tl::enums::DialogFilter>>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -637,6 +639,7 @@ impl World {
             saved_gifs: vec![6_200],
             ttl_periods: HashMap::new(),
             default_ttl: 0,
+            custom_folders: None,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -2214,8 +2217,107 @@ impl World {
         }
         if asked::<f::messages::GetDialogFilters>(body).is_some() {
             self.log("GetDialogFilters");
-            let filters = vec![tl::enums::DialogFilter::Default, self.folder(WORK), self.folder(FAMILY)];
+            let mut filters = vec![tl::enums::DialogFilter::Default];
+            if let Some(custom) = &self.custom_folders {
+                filters.extend(custom.iter().cloned());
+            } else {
+                filters.push(self.folder(WORK));
+                filters.push(self.folder(FAMILY));
+            }
             return answer(tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters { tags_enabled: false, filters }));
+        }
+        if let Some(request) = asked::<f::messages::UpdateDialogFilter>(body) {
+            let folders = self.custom_folders.get_or_insert_with(|| vec![self.folder(WORK), self.folder(FAMILY)]);
+            let id_of = |f: &tl::enums::DialogFilter| match f {
+                tl::enums::DialogFilter::Filter(f) => Some(f.id),
+                tl::enums::DialogFilter::Chatlist(c) => Some(c.id),
+                tl::enums::DialogFilter::Default => None,
+            };
+            match request.filter {
+                None => {
+                    self.log(&format!("UpdateDialogFilter {} delete", request.id));
+                    folders.retain(|f| id_of(f) != Some(request.id));
+                    return answer(true);
+                }
+                Some(filter) => {
+                    let (title_text, empty_include) = match &filter {
+                        tl::enums::DialogFilter::Filter(f) => {
+                            let tl::enums::TextWithEntities::Entities(t) = &f.title;
+                            let any_kind = f.contacts || f.non_contacts || f.groups || f.broadcasts || f.bots;
+                            let any_peer = !f.include_peers.is_empty() || !f.pinned_peers.is_empty();
+                            (t.text.clone(), !any_kind && !any_peer)
+                        }
+                        tl::enums::DialogFilter::Chatlist(c) => {
+                            let tl::enums::TextWithEntities::Entities(t) = &c.title;
+                            (t.text.clone(), c.include_peers.is_empty() && c.pinned_peers.is_empty())
+                        }
+                        tl::enums::DialogFilter::Default => (String::new(), true),
+                    };
+                    if title_text.trim().is_empty() {
+                        return Err(rpc(400, "FILTER_TITLE_EMPTY", None));
+                    }
+                    if empty_include {
+                        return Err(rpc(400, "FILTER_INCLUDE_EMPTY", None));
+                    }
+                    let existing = folders.iter().position(|f| id_of(f) == Some(request.id));
+                    let premium = std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1");
+                    let limit = if premium { 30 } else { 10 };
+                    if existing.is_none() && folders.len() >= limit {
+                        self.log(&format!("UpdateDialogFilter {} refused FILTERS_TOO_MUCH", request.id));
+                        return Err(rpc(400, "FILTERS_TOO_MUCH", None));
+                    }
+                    self.log(&format!("UpdateDialogFilter {} {}", request.id, title_text));
+                    if let Some(pos) = existing {
+                        folders[pos] = filter;
+                    } else {
+                        folders.push(filter);
+                    }
+                    return answer(true);
+                }
+            }
+        }
+        if let Some(request) = asked::<f::messages::UpdateDialogFiltersOrder>(body) {
+            self.log(&format!(
+                "UpdateDialogFiltersOrder {}",
+                request.order.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+            ));
+            let folders = self.custom_folders.get_or_insert_with(|| vec![self.folder(WORK), self.folder(FAMILY)]);
+            let id_of = |f: &tl::enums::DialogFilter| match f {
+                tl::enums::DialogFilter::Filter(f) => f.id,
+                tl::enums::DialogFilter::Chatlist(c) => c.id,
+                tl::enums::DialogFilter::Default => 0,
+            };
+            folders.sort_by_key(|f| request.order.iter().position(|id| *id == id_of(f)).unwrap_or(usize::MAX));
+            return answer(true);
+        }
+        if asked::<f::messages::GetSuggestedDialogFilters>(body).is_some() {
+            self.log("GetSuggestedDialogFilters");
+            let make = |id: i32, name: &str, contacts: bool, exclude_read: bool, desc: &str| {
+                let title = tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                    text: name.to_owned(),
+                    entities: Vec::new(),
+                });
+                let mut filter: tl::types::DialogFilter = blank(&[
+                    &put(0u32),
+                    &put(id),
+                    &put(title),
+                    &put(Vec::<tl::enums::InputPeer>::new()),
+                    &put(Vec::<tl::enums::InputPeer>::new()),
+                    &put(Vec::<tl::enums::InputPeer>::new()),
+                ]);
+                filter.contacts = contacts;
+                filter.non_contacts = !contacts;
+                filter.groups = exclude_read;
+                filter.exclude_read = exclude_read;
+                tl::enums::DialogFilterSuggested::Suggested(tl::types::DialogFilterSuggested {
+                    filter: filter.into(),
+                    description: desc.to_owned(),
+                })
+            };
+            return answer(vec![
+                make(100, "Unread", false, true, "Only unread chats."),
+                make(101, "Personal", true, false, "Only private chats with contacts."),
+            ]);
         }
         if let Some(request) = asked::<f::messages::GetPinnedDialogs>(body) {
             self.log(&format!("GetPinnedDialogs {}", request.folder_id));

@@ -1570,6 +1570,25 @@ pub enum Request {
         account: AccountKey,
         seconds: u32,
     },
+    /// Creates or edits a chat folder on the network (Telegram `messages.updateDialogFilter`).
+    FolderSave {
+        account: AccountKey,
+        folder: FolderSpec,
+    },
+    /// Deletes a chat folder on the network (Telegram `messages.updateDialogFilter` with no filter).
+    FolderDelete {
+        account: AccountKey,
+        folder_id: String,
+    },
+    /// Reorders an account's chat folders (Telegram `messages.updateDialogFiltersOrder`).
+    FoldersReorder {
+        account: AccountKey,
+        order: Vec<String>,
+    },
+    /// Lists network-suggested chat folders (Telegram `messages.getSuggestedDialogFilters`).
+    SuggestedFolders {
+        account: AccountKey,
+    },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
     Leave {
         conversation: Key,
@@ -3120,6 +3139,14 @@ pub enum Response {
     DefaultDisappearing {
         seconds: u32,
     },
+    /// A created or updated chat folder (`Request::FolderSave`).
+    Folder {
+        folder: Folder,
+    },
+    /// Suggested chat folders (`Request::SuggestedFolders`).
+    SuggestedFolders {
+        folders: Vec<SuggestedFolder>,
+    },
 }
 
 /// The phone's app-private data directory, set once by the mobile entry (`set_support_dir`).
@@ -3568,6 +3595,33 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_def).unwrap()).unwrap(), set_def);
         let resp = Response::DefaultDisappearing { seconds: 604_800 };
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+    }
+
+    #[test]
+    fn folder_crud_requests_and_responses_round_trip() {
+        let acct = AccountKey { network: Network::Telegram, account: "7001".into() };
+        let spec = FolderSpec {
+            id: None,
+            name: "Hiking".into(),
+            emoticon: Some("⛰".into()),
+            include: vec!["u7002".into(), "g8001".into()],
+            exclude: vec!["u7003".into()],
+            pinned: vec!["u7002".into()],
+            contacts: true,
+            ..FolderSpec::default()
+        };
+        let save = Request::FolderSave { account: acct.clone(), folder: spec.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&save).unwrap()).unwrap(), save);
+        let del = Request::FolderDelete { account: acct.clone(), folder_id: "4".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&del).unwrap()).unwrap(), del);
+        let reorder = Request::FoldersReorder { account: acct.clone(), order: vec!["4".into(), "2".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&reorder).unwrap()).unwrap(), reorder);
+        let sug = Request::SuggestedFolders { account: acct.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&sug).unwrap()).unwrap(), sug);
+        let resp_sug = Response::SuggestedFolders {
+            folders: vec![SuggestedFolder { spec, description: "Trail chats".into() }],
+        };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp_sug).unwrap()).unwrap(), resp_sug);
     }
 
     #[test]

@@ -227,6 +227,52 @@ pub struct Folder {
     pub mentions: u32,
 }
 
+/// Specification for creating or editing a chat folder (Telegram `dialogFilter`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSpec {
+    /// Existing folder id when editing; `None` creates a new folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Folder title (max 12 characters on Telegram).
+    pub name: String,
+    /// Optional icon / emoticon label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoticon: Option<String>,
+    /// Explicit chat IDs always included in the folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    /// Explicit chat IDs excluded from the folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Pinned chat IDs in this folder, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub contacts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub non_contacts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcasts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bots: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_read: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_archived: bool,
+}
+
+/// A suggested chat folder offered by the network (Telegram `messages.getSuggestedDialogFilters`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestedFolder {
+    pub spec: FolderSpec,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
 /// How a phone number or address on a profile is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

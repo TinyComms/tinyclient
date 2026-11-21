@@ -559,6 +559,25 @@ pub enum Command {
         seconds: u32,
         reply: Reply<()>,
     },
+    /// Create or edit a chat folder on the network (Telegram `messages.updateDialogFilter`).
+    FolderSave {
+        folder: protocol::FolderSpec,
+        reply: Reply<protocol::Folder>,
+    },
+    /// Delete a chat folder on the network.
+    FolderDelete {
+        folder_id: String,
+        reply: Reply<()>,
+    },
+    /// Reorder chat folders on the network.
+    FoldersReorder {
+        order: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Fetch network-suggested chat folders.
+    SuggestedFolders {
+        reply: Reply<Vec<protocol::SuggestedFolder>>,
+    },
     /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
@@ -858,6 +877,8 @@ impl Command {
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::SetDefaultDisappearing { reply, .. }
+            | Command::FolderDelete { reply, .. }
+            | Command::FoldersReorder { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
             | Command::CloseDirect { reply, .. }
@@ -871,6 +892,8 @@ impl Command {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

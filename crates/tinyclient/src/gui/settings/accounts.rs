@@ -455,7 +455,158 @@ impl SettingsWindow {
                 )
                 .child(ttl_control),
         );
+        box_div = box_div.child(self.telegram_folders_rows(account, ix, cx));
         box_div
+    }
+
+    fn load_telegram_folders(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_folders_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    match crate::client::ask(&protocol::Request::Folders { network: Network::Telegram }) {
+                        Ok(protocol::Response::Folders { folders }) => {
+                            let mut mine: Vec<_> = folders.into_iter().filter(|f| f.key.account() == acc).collect();
+                            mine.sort_by_key(|f| f.position);
+                            Some(mine)
+                        }
+                        _ => None,
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(folders) = loaded {
+                    this.tg_folders.insert(account, folders);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn telegram_folders_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_telegram_folders(account.key.clone(), cx);
+        let folders = self.tg_folders.get(&account.key).cloned().unwrap_or_default();
+        let mut list = div().flex().flex_col().gap(px(6.));
+        for (f_ix, folder) in folders.iter().enumerate() {
+            let acc_up = account.key.clone();
+            let acc_down = account.key.clone();
+            let acc_del = account.key.clone();
+            let fid = folder.key.id.clone();
+            let order_ids: Vec<String> = folders.iter().map(|f| f.key.id.clone()).collect();
+            let up_btn = (f_ix > 0).then(|| {
+                let mut next = order_ids.clone();
+                next.swap(f_ix - 1, f_ix);
+                button(("tg-folder-up", ix * 100 + f_ix), ButtonKind::Ghost, "↑").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let req = protocol::Request::FoldersReorder { account: acc_up.clone(), order: next.clone() };
+                        let acc = acc_up.clone();
+                        this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
+                            this.tg_folders_requested.remove(&acc);
+                            this.load_telegram_folders(acc, cx);
+                        });
+                    },
+                ))
+            });
+            let down_btn = (f_ix + 1 < folders.len()).then(|| {
+                let mut next = order_ids.clone();
+                next.swap(f_ix, f_ix + 1);
+                button(("tg-folder-down", ix * 100 + f_ix), ButtonKind::Ghost, "↓").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let req = protocol::Request::FoldersReorder { account: acc_down.clone(), order: next.clone() };
+                        let acc = acc_down.clone();
+                        this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
+                            this.tg_folders_requested.remove(&acc);
+                            this.load_telegram_folders(acc, cx);
+                        });
+                    },
+                ))
+            });
+            let del_btn = button(("tg-folder-del", ix * 100 + f_ix), ButtonKind::Ghost, "Delete").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    let req = protocol::Request::FolderDelete { account: acc_del.clone(), folder_id: fid.clone() };
+                    let acc = acc_del.clone();
+                    this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
+                        this.tg_folders_requested.remove(&acc);
+                        this.load_telegram_folders(acc, cx);
+                    });
+                },
+            ));
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.))
+                    .child(div().type_ui().text_color(theme::text()).truncate().child(folder.name.clone()))
+                    .child(div().flex().items_center().gap(px(4.)).children(up_btn).children(down_btn).child(del_btn)),
+            );
+        }
+        let acc_create = account.key.clone();
+        let create_row = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(28.))
+                    .px(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::field())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .child(self.tg_folder_name.clone()),
+            )
+            .child(button(("tg-folder-add", ix), ButtonKind::Secondary, "Create folder").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    let name = this.tg_folder_name.read(cx).text().trim().to_owned();
+                    if name.is_empty() {
+                        this.tg_folder_error = Some("Give the folder a name.".to_owned());
+                        cx.notify();
+                        return;
+                    }
+                    this.tg_folder_error = None;
+                    let spec = protocol::FolderSpec {
+                        name,
+                        contacts: true,
+                        groups: true,
+                        ..protocol::FolderSpec::default()
+                    };
+                    let req = protocol::Request::FolderSave { account: acc_create.clone(), folder: spec };
+                    let acc = acc_create.clone();
+                    this.off_thread(cx, move || crate::client::ask(&req), move |this, answer, cx| {
+                        match answer {
+                            Ok(protocol::Response::Error { detail, .. }) => this.tg_folder_error = Some(detail),
+                            Ok(_) => {
+                                this.tg_folder_name.update(cx, |input, cx| input.clear(cx));
+                                this.tg_folders_requested.remove(&acc);
+                                this.load_telegram_folders(acc, cx);
+                            }
+                            Err(err) => this.tg_folder_error = Some(err.to_string()),
+                        }
+                        cx.notify();
+                    });
+                },
+            )));
+        div().child(rule()).child(
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_ui().text_color(theme::text()).child("Chat folders"))
+                .child(list)
+                .child(create_row)
+                .children(self.tg_folder_error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone()))),
+        )
     }
 
     pub(super) fn sign_out(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {

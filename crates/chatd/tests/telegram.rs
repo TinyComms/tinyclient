@@ -3879,3 +3879,143 @@ fn auto_delete_timer_chat_and_default() {
     assert!(world.calls().iter().any(|c| c == "GetDefaultHistoryTtl"));
     assert!(world.calls().iter().any(|c| c == "SetDefaultHistoryTtl 86400"));
 }
+
+#[test]
+fn chat_folders_create_edit_add_reorder_suggest_and_delete() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.folders_edit, "Telegram must advertise folders_edit capability");
+
+    // Create a new folder containing Odalys and Trail crew.
+    let created = match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            name: "Hiking".into(),
+            include: vec!["u7002".into(), "g8001".into()],
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Folder { folder } => folder,
+        other => panic!("expected Folder, got {other:?}"),
+    };
+    assert_eq!(created.name, "Hiking");
+    let fid = created.key.id.clone();
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFilter {fid} Hiking")));
+
+    // Folders list includes it, and both chats report membership in Conversation::folders.
+    let folders = match world.ask(Request::Folders { network: Network::Telegram }) {
+        Response::Folders { folders } => folders,
+        other => panic!("expected Folders, got {other:?}"),
+    };
+    assert!(folders.iter().any(|f| f.key.id == fid && f.name == "Hiking"), "{folders:?}");
+    let odalys = world.until("Odalys in Hiking folder", || {
+        world.conversation("u7002").filter(|c| c.folders.contains(&fid))
+    });
+    assert!(odalys.folders.contains(&fid));
+    let crew = world.until("Crew in Hiking folder", || {
+        world.conversation("g8001").filter(|c| c.folders.contains(&fid))
+    });
+    assert!(crew.folders.contains(&fid));
+
+    // Edit/rename the folder.
+    match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            id: Some(fid.clone()),
+            name: "Trails".into(),
+            include: vec!["u7002".into(), "g8001".into()],
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Folder { folder } => assert_eq!((folder.key.id.as_str(), folder.name.as_str()), (fid.as_str(), "Trails")),
+        other => panic!("expected renamed Folder, got {other:?}"),
+    }
+
+    // Add Tobin to the folder via Request::File, then remove him.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key("u7003"),
+            pinned: None,
+            archived: None,
+            folder_add: Some(fid.clone()),
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    world.until("Tobin added to Trails", || {
+        world.conversation("u7003").filter(|c| c.folders.contains(&fid))
+    });
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key("u7003"),
+            pinned: None,
+            archived: None,
+            folder_add: None,
+            folder_remove: Some(fid.clone()),
+        }),
+        Response::Ok
+    );
+    world.until("Tobin removed from Trails", || {
+        world.conversation("u7003").filter(|c| !c.folders.contains(&fid))
+    });
+
+    // Reorder folders so the new folder is first.
+    let order = vec![fid.clone(), "3".into(), "2".into()];
+    assert_eq!(
+        world.ask(Request::FoldersReorder { account: account(), order: order.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFiltersOrder {fid},3,2")));
+    let reordered = match world.ask(Request::Folders { network: Network::Telegram }) {
+        Response::Folders { folders } => folders,
+        other => panic!("expected Folders, got {other:?}"),
+    };
+    assert_eq!(reordered.first().map(|f| f.key.id.as_str()), Some(fid.as_str()), "{reordered:?}");
+
+    // Suggested folders returns Telegram's suggestions.
+    match world.ask(Request::SuggestedFolders { account: account() }) {
+        Response::SuggestedFolders { folders } => {
+            assert!(folders.iter().any(|s| s.spec.name == "Unread"), "{folders:?}");
+        }
+        other => panic!("expected SuggestedFolders, got {other:?}"),
+    }
+
+    // Delete the folder and verify it disappears from Folders and from Odalys's row.
+    assert_eq!(
+        world.ask(Request::FolderDelete { account: account(), folder_id: fid.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFilter {fid} delete")));
+    world.until("Odalys left deleted folder", || {
+        world.conversation("u7002").filter(|c| !c.folders.contains(&fid))
+    });
+
+    // Free account folder limit (10 folders) gives a clear message mentioning limit / Premium.
+    for i in 0..8 {
+        assert!(matches!(
+            world.ask(Request::FolderSave {
+                account: account(),
+                folder: protocol::FolderSpec {
+                    name: format!("Extra {i}"),
+                    contacts: true,
+                    ..protocol::FolderSpec::default()
+                },
+            }),
+            Response::Folder { .. }
+        ));
+    }
+    match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            name: "Overflow".into(),
+            contacts: true,
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.contains("10-folder") || detail.contains("Premium"), "{detail}");
+        }
+        other => panic!("expected limit error, got {other:?}"),
+    }
+}

@@ -714,6 +714,9 @@ fn offline(ctx: &Context, command: Command) {
         | Command::Leave { reply, .. }
         | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(down()))),
+        Command::FolderSave { reply, .. } => drop(reply.send(Err(down()))),
+        Command::FolderDelete { reply, .. } | Command::FoldersReorder { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SuggestedFolders { reply } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
@@ -847,6 +850,18 @@ fn serve(account: &Arc<Account>, command: Command) {
                 filing::file(account, &conversation_id, pinned, archived, folder_add.as_deref(), folder_remove.as_deref())
                     .map_err(refused),
             );
+        }
+        Command::FolderSave { folder, reply } => {
+            let _ = reply.send(filing::save_folder(account, &folder).map_err(refused));
+        }
+        Command::FolderDelete { folder_id, reply } => {
+            let _ = reply.send(filing::delete_folder(account, &folder_id).map_err(refused));
+        }
+        Command::FoldersReorder { order, reply } => {
+            let _ = reply.send(filing::reorder_folders(account, &order).map_err(refused));
+        }
+        Command::SuggestedFolders { reply } => {
+            let _ = reply.send(filing::suggested_folders(account).map_err(refused));
         }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));

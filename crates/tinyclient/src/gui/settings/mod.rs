@@ -415,6 +415,11 @@ pub struct SettingsWindow {
     /// Loaded Telegram account default auto-delete timer (`GetDefaultDisappearing`).
     pub(super) tg_default_ttl: HashMap<protocol::AccountKey, u32>,
     pub(super) tg_default_ttl_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Loaded Telegram chat folders for Settings › Accounts folder management.
+    pub(super) tg_folders: HashMap<protocol::AccountKey, Vec<protocol::Folder>>,
+    pub(super) tg_folders_requested: std::collections::HashSet<protocol::AccountKey>,
+    pub(super) tg_folder_name: Entity<TextInput>,
+    pub(super) tg_folder_error: Option<String>,
     /// Drawn as the phone's page: a list of sections, then one section at a time.
     pub(super) phone: bool,
     /// On a phone: the list of sections is on show, not `section`.
@@ -492,6 +497,7 @@ impl SettingsWindow {
         let profile_name = cx.new(|cx| TextInput::new("Display name", cx));
         let profile_about = cx.new(|cx| TextInput::new("About me", cx));
         let profile_pronouns = cx.new(|cx| TextInput::new("Pronouns", cx));
+        let tg_folder_name = cx.new(|cx| TextInput::new("New folder name", cx));
         #[cfg(target_os = "linux")]
         let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
@@ -561,6 +567,10 @@ impl SettingsWindow {
             tg_privacy_requested: std::collections::HashSet::new(),
             tg_default_ttl: HashMap::new(),
             tg_default_ttl_requested: std::collections::HashSet::new(),
+            tg_folders: HashMap::new(),
+            tg_folders_requested: std::collections::HashSet::new(),
+            tg_folder_name,
+            tg_folder_error: None,
             phone,
             listing: phone,
             shown: phone,
