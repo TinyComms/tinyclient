@@ -4129,3 +4129,64 @@ fn server_timeout_marks_rows_read_only_and_lifts_when_cleared() {
     assert!(lifted.read_only_reason.is_empty(), "clearing timeout must clear read_only_reason");
     assert_eq!(world.conversation("4201").call, CallSupport::Native, "voice join returns when timeout lifts");
 }
+
+#[test]
+fn voice_channel_respects_connect_permission_and_user_limit() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["roles"][0]["permissions"] = json!("36769344");
+    let channels = ready["guilds"][0]["channels"].as_array_mut().unwrap();
+    for ch in channels.iter_mut() {
+        if ch["id"] == "4201" {
+            ch["user_limit"] = json!(2);
+        }
+    }
+    channels.push(json!({
+        "id": "4203",
+        "type": 2,
+        "name": "VIP",
+        "position": 2,
+        "parent_id": "4200",
+        "bitrate": 64000,
+        "user_limit": 0,
+        "permission_overwrites": [
+            {"id": "4000", "type": 0, "allow": "0", "deny": "1048576"}
+        ]
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    assert_eq!(world.conversation("4203").call, CallSupport::None, "voice channel without CONNECT must not offer Join");
+    assert_eq!(world.conversation("4201").call, CallSupport::Native, "voice channel with CONNECT offers Join");
+
+    // Fill Lounge (limit 2): 2002 is already there from READY; add 2006.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false
+        }),
+    );
+    world.ask(Request::Watch(Watching { space: Some(world.key("4000")), ..Watching::default() }));
+    wait("Lounge to have 2 occupants", || {
+        let Response::Tree { conversations, .. } = world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) else {
+            return None;
+        };
+        conversations.into_iter().find(|r| r.key.id == "4201")?.occupants.filter(|o| o.total == 2)
+    });
+
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    let failed = wait("full voice channel refusal", || {
+        let Response::Status { call, .. } = world.ask(Request::Status) else { return None };
+        let call = call?;
+        matches!(call.state, CallState::Failed { .. }).then_some(call)
+    });
+    match failed.state {
+        CallState::Failed { detail, .. } => {
+            assert!(detail.contains("full"), "expected full channel refusal, got {detail:?}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(world.discord.frames_of(4).is_empty(), "must not send op 4 when channel is full");
+}

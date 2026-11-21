@@ -4,7 +4,7 @@
 use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
-    ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, SEND_MESSAGES, VIEW_CHANNEL,
+    ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, CONNECT, SEND_MESSAGES, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -257,10 +257,12 @@ impl GuildInfo {
         let written = matches!(kind, ConversationKind::Channel | ConversationKind::Announcement);
         let clock = now();
         let timed_out = self.timed_out(clock);
+        let perms = self.permissions(guild, me, channel);
+        let can_connect = perms & CONNECT != 0;
         let read_only_reason = timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default();
-        let read_only = timed_out.is_some() || (written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0);
-        let call = if timed_out.is_some() {
-            protocol::CallSupport::None
+        let read_only = timed_out.is_some() || (written && perms & SEND_MESSAGES == 0);
+        let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
+            CallSupport::None
         } else {
             super::voice::support(channel.kind)
         };
@@ -273,7 +275,7 @@ impl GuildInfo {
             topic: one_line(channel.topic.as_deref()),
             read_only,
             read_only_reason,
-            private: self.private(guild, channel),
+            private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
             opted_out: self.quiet.opted_out(&channel.id, parent),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
             ..ConversationRow::new(&channel.id, kind, name)

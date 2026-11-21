@@ -30,7 +30,7 @@ const NO_ANSWER: &str = "Nobody picked up.";
 // CONTRACT: `CallFailure` has one reason, `NoAnswer`, for "declined" and "rang out".
 const DECLINED: &str = "They declined the call.";
 const REMOVED: &str = "Discord took you out of the call. You were removed, or the channel is gone.";
-const NO_SESSION: &str = "No reply from Discord after 10 seconds.";
+const NO_SESSION: &str = "No reply from Discord after 15 seconds.";
 
 /// What pressing the call button of a server channel does. A voice channel is joined here. A
 /// stage is not: a listener there cannot simply speak, so it opens in Discord.
@@ -655,6 +655,44 @@ impl Discord {
             return refuse("This conversation has no call tinyclient can join.");
         }
         let guild = conversation.space.clone();
+        let mut can_speak = true;
+        if let Some(guild_id) = guild.as_deref() {
+            let kept_channel = self
+                .ctx
+                .note(&format!("kept:{guild_id}"))
+                .and_then(|kept| serde_json::from_str::<Vec<model::Kept>>(&kept).ok())
+                .and_then(|kept| kept.into_iter().find(|ch| ch.id == conversation_id))
+                .map(model::Kept::channel);
+            let me = self.me();
+            let clock = crate::hub::now();
+            let state = self.state.lock().unwrap();
+            let mut can_move = false;
+            if let Some(info) = state.guilds.get(guild_id) {
+                if let Some(until) = info.timed_out(clock) {
+                    return refuse(&super::ready::timeout_reason(until, clock));
+                }
+                if let Some(ch) = kept_channel.as_ref() {
+                    let perms = info.permissions(guild_id, &me, ch);
+                    if perms & model::CONNECT == 0 {
+                        return refuse("You don't have permission to connect to this voice channel.");
+                    }
+                    can_move = perms & model::MOVE_MEMBERS != 0;
+                    can_speak = perms & model::SPEAK != 0;
+                }
+            }
+            if conversation.limit > 0 && !can_move {
+                let others = state
+                    .voice
+                    .states
+                    .iter()
+                    .filter(|(user, heard)| heard.channel == conversation_id && user.as_str() != state.me)
+                    .count();
+                if others >= conversation.limit as usize {
+                    return refuse("This channel is full.");
+                }
+            }
+        }
+        let start_muted = !can_speak;
         let ring = {
             let mut state = self.state.lock().unwrap();
             let ring = direct && !state.voice.calls.contains(conversation_id);
@@ -665,7 +703,7 @@ impl Discord {
                 server: None,
                 reported: false,
                 since: Instant::now(),
-                muted: false,
+                muted: start_muted,
                 deafened: false,
                 ring,
                 saw_ringing: false,
@@ -681,7 +719,7 @@ impl Discord {
         if ring {
             self.ctx.ringing_out(conversation_id);
         }
-        self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), false, false, false));
+        self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), start_muted, false, false));
         // Whoever is already there, before anyone's state changes.
         self.roster();
         self.occupancy(BTreeSet::from([conversation_id.to_owned()]));
