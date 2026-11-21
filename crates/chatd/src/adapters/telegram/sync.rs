@@ -360,6 +360,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         disappearing: true,
         effects: false,
         view_once: false,
+        blocks: true,
         ..Capabilities::default()
     }
 }

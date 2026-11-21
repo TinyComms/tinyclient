@@ -50,6 +50,7 @@ fn launch_invite(args: &[String]) -> Option<String> {
         .find(|arg| {
             (arg.starts_with("tinyclient://join#") && protocol::parse_invite_link(arg).is_some())
                 || protocol::parse_room_link(arg).is_some()
+                || protocol::parse_message_link(arg).is_some()
         })
         .cloned()
 }

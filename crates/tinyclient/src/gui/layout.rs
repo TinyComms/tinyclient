@@ -1120,8 +1120,8 @@ impl Shell {
         let star = key.clone();
         let words = if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" };
         items.push(act("row-star", "icons/pin.svg", words.into(), Box::new(move |this, cx| this.star(star.clone(), !starred, cx))));
-        // CONTRACT: muting has a request on Discord, Slack, Teams and Telegram (chatd's adapters).
-        if matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Telegram) {
+        // CONTRACT: muting has a request on Discord, Slack, Teams and Telegram, and is kept locally on Tiny.
+        if matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Telegram | Network::Tiny) {
             let (muted, mute) = (row.muted, key.clone());
             let (icon, words) = if muted { ("icons/bell.svg", "Unmute notifications") } else { ("icons/bell-off.svg", "Mute notifications") };
             items.push(act("row-mute", icon, words.into(), Box::new(move |this, cx| this.set_row_mute(mute.clone(), !muted, cx))));

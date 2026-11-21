@@ -180,6 +180,8 @@ const TABLES: &str = "
         spam INTEGER NOT NULL DEFAULT 0,
         rights INTEGER NOT NULL DEFAULT 0,
         disappearing INTEGER,
+        moderate INTEGER NOT NULL DEFAULT 0,
+        can_pin INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -299,7 +301,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -398,6 +400,10 @@ pub struct ConversationRow {
     pub rights: protocol::ConversationRights,
     /// Disappearing-messages timer in seconds (`None` leaves stored value unchanged on upsert).
     pub disappearing: Option<u32>,
+    /// This account may delete other members' messages in this conversation.
+    pub moderate: bool,
+    /// This account may pin and unpin messages in this conversation.
+    pub can_pin: bool,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -496,6 +502,8 @@ impl ConversationRow {
             spam: false,
             rights: protocol::ConversationRights::default(),
             disappearing: None,
+            moderate: false,
+            can_pin: false,
         }
     }
 }
@@ -734,6 +742,8 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         spam: row.get(53)?,
         rights: protocol::ConversationRights::from_bits(row.get(54)?),
         disappearing: row.get::<_, Option<i64>>(55)?.and_then(|v| (v > 0).then_some(v as u32)),
+        moderate: row.get(56)?,
+        can_pin: row.get(57)?,
     })
 }
 
@@ -889,9 +899,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -907,6 +917,8 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              spam = excluded.spam,
              rights = CASE WHEN excluded.rights = 0 THEN rights ELSE excluded.rights END,
              disappearing = COALESCE(excluded.disappearing, disappearing),
+             moderate = excluded.moderate,
+             can_pin = excluded.can_pin,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -949,6 +961,8 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.spam,
             row.rights.to_bits(),
             row.disappearing.map(i64::from),
+            row.moderate,
+            row.can_pin,
         ],
     )?;
     Ok(())
@@ -1023,6 +1037,12 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     }
     if !column(db, "conversation", "disappearing")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN disappearing INTEGER")?;
+    }
+    if !column(db, "conversation", "moderate")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN moderate INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "can_pin")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN can_pin INTEGER NOT NULL DEFAULT 0")?;
     }
     Ok(true)
 }
@@ -1750,7 +1770,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1799,6 +1819,8 @@ impl Store {
                         spam: row.get(23)?,
                         rights: protocol::ConversationRights::from_bits(row.get(24)?),
                         disappearing: row.get::<_, Option<i64>>(25)?.and_then(|v| (v > 0).then_some(v as u32)),
+                        moderate: row.get(26)?,
+                        can_pin: row.get(27)?,
                     },
                 ))
             })?
@@ -3415,6 +3437,54 @@ impl Store {
                 self.ingest(conversation, &reply, false)?;
             }
         }
+        Ok(true)
+    }
+
+    /// Marks a message as removed by a moderator: keeps a tombstone with `moderated = true`
+    /// and clears its text, attachments, reactions, and earlier revisions.
+    pub fn delete_message_moderated(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        self.forget_revisions(conversation, id)?;
+        if message.deleted && message.moderated {
+            return Ok(false);
+        }
+        message.tombstone();
+        message.moderated = true;
+        self.ingest(conversation, &message, false)?;
+        let naming = format!("\"reply_to\":{{\"id\":{}", serde_json::to_string(id).map_err(broken)?);
+        let replies: Vec<String> = self
+            .db
+            .prepare(
+                "SELECT id FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND instr(body, ?4) > 0",
+            )?
+            .query_map(params![word(&conversation.network), conversation.account, conversation.id, naming], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for reply in replies {
+            let Some(mut reply) = self.message(conversation, &reply)? else {
+                continue;
+            };
+            if let Some(quoted) = reply.reply_to.as_mut().filter(|quoted| quoted.id == id) {
+                quoted.deleted = true;
+                quoted.snippet.clear();
+                self.ingest(conversation, &reply, false)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Updates a stored message's `pinned` flag. Returns true if the stored message changed.
+    pub fn set_pinned(&mut self, conversation: &Key, id: &str, pinned: bool) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        if message.pinned == pinned {
+            return Ok(false);
+        }
+        message.pinned = pinned;
+        self.ingest(conversation, &message, false)?;
         Ok(true)
     }
 

@@ -551,6 +551,9 @@ pub struct Capabilities {
     /// This account supports super / burst reactions (`Request::React { burst: true }`, Discord Nitro).
     #[serde(default, skip_serializing_if = "is_false")]
     pub burst_reactions: bool,
+    /// This account supports blocking and unblocking people (`Request::Relate` with Block/Unblock).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blocks: bool,
 }
 
 /// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.

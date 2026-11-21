@@ -151,6 +151,10 @@ struct Open {
     can: protocol::Capabilities,
     /// Per-conversation moderation and management rights for this account.
     rights: protocol::ConversationRights,
+    /// This account may delete other members' messages in this conversation.
+    moderate: bool,
+    /// This account may pin and unpin messages in this conversation.
+    can_pin: bool,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -315,6 +319,8 @@ pub struct Pane {
     poll_results: HashSet<String>,
     /// Long code blocks opened, by message and block.
     expanded: HashSet<(String, usize)>,
+    /// Blocked channel messages explicitly revealed by clicking "Show".
+    revealed_blocked: HashSet<String>,
     /// Coloured code, by message and block, so a scroll does not colour the same block again.
     code_colors: HashMap<(String, usize), (u64, Rc<highlight::Lit>)>,
     /// Blocks whose colouring is already running off this thread.
@@ -428,6 +434,7 @@ impl Pane {
             shown: HashSet::new(),
             poll_results: HashSet::new(),
             expanded: HashSet::new(),
+            revealed_blocked: HashSet::new(),
             code_colors: HashMap::new(),
             code_coloring: HashSet::new(),
             copied: None,
@@ -520,12 +527,16 @@ impl Pane {
                 || open.receipt != receipt
                 || open.can != can
                 || open.rights != conversation.rights
+                || open.moderate != conversation.moderate
+                || open.can_pin != conversation.can_pin
             {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
                 open.receipt = receipt;
                 open.can = can;
                 open.rights = conversation.rights;
+                open.moderate = conversation.moderate;
+                open.can_pin = conversation.can_pin;
                 cx.notify();
             }
             return;
@@ -542,6 +553,8 @@ impl Pane {
             open.picture = picture;
             open.receipt = receipt;
             open.rights = conversation.rights;
+            open.moderate = conversation.moderate;
+            open.can_pin = conversation.can_pin;
         }
     }
 
@@ -591,6 +604,8 @@ impl Pane {
             receipt: None,
             can,
             rights,
+            moderate: false,
+            can_pin: false,
             started: Instant::now(),
         });
         self.window = pages::Window::default();
@@ -616,6 +631,7 @@ impl Pane {
         self.revealed.clear();
         self.shown.clear();
         self.expanded.clear();
+        self.revealed_blocked.clear();
         self.code_colors.clear();
         self.multi_select.clear();
         self.code_coloring.clear();
@@ -1706,7 +1722,7 @@ impl Render for Pane {
 }
 
 impl Shell {
-    fn pane(&self, cx: &mut Context<Self>) -> Entity<Pane> {
+    pub(in crate::gui) fn pane(&self, cx: &mut Context<Self>) -> Entity<Pane> {
         let pane = self
             .conversation_state
             .pane

@@ -242,7 +242,9 @@ pub fn decide_ring(values: &Values, conversation: &Key, moment: &Moment) -> Opti
 }
 
 /// `direct` is a one-to-one conversation. A Tiny direct rings even when Tiny server
-/// notifications are off, the same way a Tiny direct message does.
+/// notifications are off, the same way a Tiny direct message does. A muted direct message
+/// (conversation-scoped `NOTIFY_ABOUT = "off"`) still rings for calls; only silencing the whole
+/// account or turning incoming calls off stops it.
 pub fn decide_ring_in(
     values: &Values,
     conversation: &Key,
@@ -250,7 +252,12 @@ pub fn decide_ring_in(
     direct: bool,
 ) -> Option<Verdict> {
     let calls = values.word(GLOBAL, settings::CALLS);
-    if calls == "off" || level(values, conversation) == "off" || moment.dnd {
+    let silenced = if direct {
+        values.stored(&settings::account_scope(&conversation.account()), settings::NOTIFY_ABOUT) == Some("off")
+    } else {
+        level(values, conversation) == "off"
+    };
+    if calls == "off" || silenced || moment.dnd {
         return None;
     }
     if conversation.network == Network::Tiny && !direct && !values.on(settings::NOTIFY_TINY) {
@@ -865,6 +872,18 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 let Ok(Some(row)) = hub.store().conversation(&conversation) else {
                     continue;
                 };
+                // Never notify for messages from a blocked person (channels or directs, including mentions).
+                let sender_id = if !message.sender.id.is_empty() {
+                    Some(message.sender.id.as_str())
+                } else {
+                    row.peer.as_deref()
+                };
+                if let Some(id) = sender_id {
+                    let person_key = Key::new(&conversation.account(), id);
+                    if hub.store().person(&person_key).ok().flatten().is_some_and(|p| p.relation == protocol::Relation::Blocked) {
+                        continue;
+                    }
+                }
                 let at = Instant::now();
                 let mut moment = moment(hub, &conversation, &notes, at);
                 if decide(&values, &row, &message, &moment).is_none() {
@@ -930,6 +949,17 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 let (verdict, place) = match &ringing {
                     Some(key) => {
                         let row = hub.store().conversation(key).ok().flatten();
+                        let blocked_peer = row
+                            .as_ref()
+                            .and_then(|row| row.peer.as_deref())
+                            .is_some_and(|peer| {
+                                let person_key = Key::new(&key.account(), peer);
+                                hub.store()
+                                    .person(&person_key)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|p| p.relation == protocol::Relation::Blocked)
+                            });
                         let direct = row.as_ref().is_some_and(|row| row.kind.is_direct());
                         let place = row
                             .filter(|row| row.kind != ConversationKind::Direct)
@@ -939,7 +969,12 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                             dnd: dnd(hub, key),
                             ..moment(hub, key, &notes, Instant::now())
                         };
-                        (decide_ring_in(&values, key, &moment, direct), place)
+                        let verdict = if blocked_peer {
+                            None
+                        } else {
+                            decide_ring_in(&values, key, &moment, direct)
+                        };
+                        (verdict, place)
                     }
                     None => (None, String::new()),
                 };

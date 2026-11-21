@@ -515,10 +515,21 @@ impl Chat {
         if !allowed {
             return error(ErrorCode::Refused, format!("{key} cannot be {value:?} here"));
         }
-        if let Err(err) = self.hub.set_setting(&scope, &key, value) {
+        if let Err(err) = self.hub.set_setting(&scope, &key, value.clone()) {
             return internal(err);
         }
         match key.as_str() {
+            settings::NOTIFY_ABOUT => {
+                if let Some(conversation) = settings::conversation_key_of(&scope) {
+                    if conversation.network == Network::Tiny {
+                        let muted = value.as_deref() == Some("off");
+                        if self.hub.store().set_muted(&conversation, muted).unwrap_or(false) {
+                            self.hub.changed(Change::Conversation { conversation });
+                            self.hub.changed(Change::Status);
+                        }
+                    }
+                }
+            }
             settings::KEEP_DAYS => self.hub.prune_soon(),
             settings::CACHE_MB => self.blobs.cap_changed(),
             settings::SOUNDS

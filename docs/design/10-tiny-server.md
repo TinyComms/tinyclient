@@ -150,7 +150,7 @@ Opens on right-click wherever a person is drawn: a seat, a tile, the member list
 260 wide. Head: avatar 28, name in role colour, their top role (or `You`). The name opens
 Profile, the same modal as a click on the row. There is no Profile row. Then:
 
-- Change picture, for me. Message, for anyone else.
+- Change picture, for me. Message, for anyone else, and Call when the server advertises `direct_calls`, the person is not a bot, and I am not already in a call with them.
 - **For you** (anyone but me): volume, a slider 0 to 200 % with a tick at 100 that it snaps to
   within 4 %, its value at the right; Mute for me, or Unmute for me once they are muted, with
   the volume icon. Sent as `CallGain` when let go: chatd keeps it per account (`gain:<user id>`)

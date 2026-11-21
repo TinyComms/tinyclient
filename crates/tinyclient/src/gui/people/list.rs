@@ -223,6 +223,7 @@ pub fn around_line(person: &Person, status: &str, in_call: bool, title: bool) ->
 pub fn chips(scope: Option<Network>, pending: usize) -> Vec<Chip> {
     match scope {
         Some(Network::Discord) => vec![Chip::Online, Chip::All, Chip::Pending, Chip::Blocked],
+        Some(Network::Tiny) => vec![Chip::Online, Chip::All, Chip::Blocked],
         None if pending > 0 => vec![Chip::Online, Chip::All, Chip::Pending],
         _ => vec![Chip::Online, Chip::All],
     }
@@ -1024,7 +1025,7 @@ impl PeopleList {
         } else {
             match (self.chip, self.scope) {
                 (Chip::Pending, _) => ("No pending requests".to_owned(), "Requests you get or send show up here.".to_owned()),
-                (Chip::Blocked, _) => ("Nobody is blocked".to_owned(), "People you block in Discord show up here.".to_owned()),
+                (Chip::Blocked, _) => ("Nobody is blocked".to_owned(), "People you block show up here.".to_owned()),
                 (Chip::Online, Some(Network::Discord)) => ("No friends online".to_owned(), "Friends who come online show up here.".to_owned()),
                 (_, Some(Network::Discord)) => ("No friends on Discord yet".to_owned(), "Friends you add in Discord appear here.".to_owned()),
                 (_, Some(Network::Telegram)) => ("No contacts yet".to_owned(), "Type a @username to find someone.".to_owned()),

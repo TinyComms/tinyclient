@@ -871,6 +871,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         seal: protocol::Seal::Plain,
         card,
         deleted: false,
+        moderated: false,
         forwarded: forwarded_from,
         id: posted.id.clone(),
         sender: Sender {

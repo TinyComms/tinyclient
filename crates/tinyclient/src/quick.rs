@@ -67,11 +67,12 @@ pub fn launch_action(args: &[String]) -> Option<QuickAction> {
     QuickAction::from_index(value("--dock-action")?.parse().ok()?)
 }
 
-/// What the single-instance handoff accepts: an invite link, a room link, or a quick action's.
+/// What the single-instance handoff accepts: an invite link, a room link, a message link, or a quick action's.
 pub fn handoff(payload: &str) -> bool {
     parse_link(payload).is_some()
         || (payload.starts_with("tinyclient://join#") && protocol::parse_invite_link(payload).is_some())
         || protocol::parse_room_link(payload).is_some()
+        || protocol::parse_message_link(payload).is_some()
 }
 
 #[cfg(test)]

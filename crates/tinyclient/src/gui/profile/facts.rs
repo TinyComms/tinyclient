@@ -36,6 +36,8 @@ pub struct Seen {
     pub online: bool,
     /// The account supports closing a direct conversation (`Request::CloseDirect`).
     pub close_direct: bool,
+    /// The account supports blocking and unblocking people (`Capabilities::blocks`).
+    pub can_block: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,12 +564,14 @@ pub enum Item {
     Leave,
 }
 
-/// Remove friend and Block, where the network has them.
-// CONTRACT: nothing says which networks can block or unfriend; friends exist where a network
-// reports one, and Block is offered where the network has a blocked list (Discord, Telegram).
+/// Remove friend and Block, where the network (or account capabilities) has them.
 pub fn offers(person: &Person) -> (bool, bool) {
+    offers_with(person, false)
+}
+
+pub fn offers_with(person: &Person, can_block: bool) -> (bool, bool) {
     let remove = person.relation == Relation::Friend && person.key.network == Network::Discord;
-    let block = matches!(person.key.network, Network::Discord | Network::Telegram)
+    let block = (matches!(person.key.network, Network::Discord | Network::Telegram) || can_block)
         && person.relation != Relation::Blocked
         && !person.bot;
     (remove, block)
@@ -589,8 +593,8 @@ fn tidy(mut items: Vec<Item>) -> Vec<Item> {
 /// already opens them in the network's app; a row's menu has no foot, so it says it here.
 pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<Item> {
     let mut items = Vec::new();
-    // Signal, Messages, and Tiny do not serve mute. A switch that snaps back is left out.
-    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Signal | Network::Messages | Network::Tiny)) {
+    // Signal and Messages do not serve mute. A switch that snaps back is left out.
+    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Signal | Network::Messages)) {
         items.extend([Item::Mute { muted }, Item::Separator]);
     }
     if !person.handle.trim_start_matches('@').is_empty() {
@@ -609,7 +613,7 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if seen.in_their_dm && seen.direct.is_some() && seen.close_direct {
         items.push(Item::CloseDirect);
     }
-    let (remove, block) = offers(person);
+    let (remove, block) = offers_with(person, seen.can_block);
     items.push(Item::Separator);
     if remove {
         items.push(Item::RemoveFriend);
@@ -623,7 +627,9 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     }
     if block {
         items.push(Item::Block);
-    } else if person.relation == Relation::Blocked && matches!(person.key.network, Network::Discord | Network::Telegram) {
+    } else if person.relation == Relation::Blocked
+        && (matches!(person.key.network, Network::Discord | Network::Telegram) || seen.can_block)
+    {
         items.push(Item::Unblock);
     }
     if !person.bot && (block || matches!(person.key.network, Network::Signal | Network::Messages | Network::Teams)) {
@@ -773,6 +779,7 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
             format!("Block {name} on {net}?"),
             match network {
                 Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them from their profile or Blocked.".to_owned(),
+                Network::Tiny => "They won't be able to message or call you, and their messages in channels are hidden. You can unblock them from their profile or Blocked.".to_owned(),
                 _ => format!("They won't be able to message or call you on {net}. You can unblock them in {net}."),
             },
             "Block",
@@ -797,20 +804,30 @@ pub enum NotifyControl {
     Switch,
     /// All · Mentions · Nothing: channels on Discord and Slack. Teams is All · Nothing.
     Segmented,
+    /// On or off, stored locally on this device (Tiny DMs and groups).
+    LocalSwitch,
+    /// All · Mentions · Nothing, stored locally on this device (Tiny channels).
+    LocalSegmented,
     /// The phone or the server owns this. The words are shown and nothing is sent.
     Held(&'static str),
 }
 
 pub fn notify_control(conversation: &Conversation) -> NotifyControl {
+    let channel = matches!(
+        conversation.kind,
+        ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
+    );
     match conversation.key.network {
         Network::Signal => NotifyControl::Held("Set on your phone"),
         Network::Messages => NotifyControl::Held("Stays on your phone"),
-        Network::Tiny => NotifyControl::Held("Not available on Tiny"),
+        Network::Tiny => {
+            if channel {
+                NotifyControl::LocalSegmented
+            } else {
+                NotifyControl::LocalSwitch
+            }
+        }
         _ => {
-            let channel = matches!(
-                conversation.kind,
-                ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
-            );
             if channel && conversation.key.network != Network::Telegram {
                 NotifyControl::Segmented
             } else {
@@ -969,10 +986,12 @@ mod tests {
             spam: false,
             rights: Default::default(),
             disappearing: None,
+            moderate: false,
+            can_pin: false,
         }
     }
 
-    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true, close_direct: true };
+    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true, close_direct: true, can_block: false };
 
     #[test]
     fn friendship_buttons_follow_discord_relationship_state() {
@@ -1022,7 +1041,7 @@ mod tests {
 
     #[test]
     fn calls_are_native_handed_off_or_absent_by_network_and_never_for_apps() {
-        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false };
+        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false, can_block: false };
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(actions(&tess, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Huddle in Slack".into())));
         let omar = person(Network::Teams, Relation::Contact);
@@ -1129,7 +1148,7 @@ mod tests {
     #[test]
     fn menus_follow_the_designs_order_and_destructive_items_come_last() {
         let juno = person(Network::Discord, Relation::Friend);
-        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true };
+        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true, can_block: false };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
             vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block, Item::Report]
@@ -1236,6 +1255,8 @@ mod tests {
         assert!(!can_leave(&row(Network::Messages, ConversationKind::Group)));
         assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));
         assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
+        assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Channel)), NotifyControl::LocalSegmented);
+        assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Direct)), NotifyControl::LocalSwitch);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
         info.creator = "Dev Patel".into();
@@ -1328,5 +1349,15 @@ mod tests {
         assert!(!items.iter().any(|item| matches!(item, Item::Mute { .. })), "Tiny has no mute");
         assert!(!items.contains(&Item::RemoveFriend));
         assert!(!items.contains(&Item::Block));
+
+        // On a Tiny server with blocks capability, Block (or Unblock) is offered, except for bots.
+        let with_blocks = Seen { can_block: true, ..seen };
+        assert!(person_menu(&p, &with_blocks, false, false).contains(&Item::Block));
+        p.relation = Relation::Blocked;
+        let blocked_menu = person_menu(&p, &with_blocks, false, false);
+        assert!(!blocked_menu.contains(&Item::Block) && blocked_menu.contains(&Item::Unblock));
+        p.relation = Relation::None;
+        p.bot = true;
+        assert!(!person_menu(&p, &with_blocks, false, false).contains(&Item::Block));
     }
 }

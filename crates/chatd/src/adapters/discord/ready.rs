@@ -830,6 +830,7 @@ impl Discord {
             mention_format: protocol::MentionFormat::Discord,
             mention_spans: false,
             burst_reactions: false,
+            blocks: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;

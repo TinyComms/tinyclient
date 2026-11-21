@@ -534,6 +534,12 @@ pub struct Conversation {
     /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disappearing: Option<u32>,
+    /// This account may delete other members' messages in this conversation (Tiny `manage_messages`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub moderate: bool,
+    /// This account may pin and unpin messages in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_pin: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -599,6 +605,8 @@ impl Conversation {
             spam: false,
             rights: ConversationRights::default(),
             disappearing: None,
+            moderate: false,
+            can_pin: false,
         }
     }
 

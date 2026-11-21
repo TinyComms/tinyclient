@@ -49,7 +49,8 @@ pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: 
             Some(format!("https://discord.com/channels/{place}/{channel}/{id}"))
         }
         protocol::Network::Slack => space.map(|team| format!("slack://channel?team={team}&id={channel}&message={id}")),
-        protocol::Network::Telegram | protocol::Network::Teams | protocol::Network::Signal | protocol::Network::Messages | protocol::Network::Tiny => None,
+        protocol::Network::Tiny => space.and_then(|origin| protocol::message_link(origin, channel, id)),
+        protocol::Network::Telegram | protocol::Network::Teams | protocol::Network::Signal | protocol::Network::Messages => None,
     }
 }
 
@@ -126,6 +127,14 @@ impl Pane {
     /// or message on a signed-in network, asks chatd to resolve it and opens it in-app; otherwise
     /// falls through to the external browser. Alt-click (`external == true`) always opens outside.
     pub(super) fn open_link(&mut self, url: &str, external: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !external {
+            if let Some((origin, conversation_id, message_id)) = protocol::parse_message_link(url) {
+                let _ = self.shell.update(cx, |shell, cx| {
+                    shell.tiny_open_message_link(&origin, &conversation_id, &message_id, cx);
+                });
+                return;
+            }
+        }
         if !external && protocol::link::parse_network_link(url).is_some() {
             let owned = url.to_owned();
             let request = protocol::Request::Resolve { url: owned.clone() };

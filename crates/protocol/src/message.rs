@@ -557,6 +557,9 @@ pub struct Message {
     /// is gone; the row stays so the thread has somewhere to hang.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deleted: bool,
+    /// Removed by a moderator rather than the author (Tiny `deleted_by`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub moderated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
     /// Unix seconds of the last edit, from a network that hands one over. `None`: never
@@ -690,6 +693,7 @@ impl Message {
             card: None,
             poll: None,
             deleted: false,
+            moderated: false,
             edited: false,
             edited_at: None,
             prior_text: None,
