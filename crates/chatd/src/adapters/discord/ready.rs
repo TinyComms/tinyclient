@@ -826,11 +826,16 @@ impl Discord {
             forward: true,
             polls: None,
             reactions: true,
+            reactors: true,
             gif_file: false,
             mention_format: protocol::MentionFormat::Discord,
             mention_spans: false,
             burst_reactions: false,
             blocks: true,
+            add_friend_by_username: true,
+            friend_nickname: true,
+            join_space_by_invite: true,
+            leave_space: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;

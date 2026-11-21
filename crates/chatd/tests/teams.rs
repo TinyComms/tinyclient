@@ -445,6 +445,13 @@ impl Fake {
                     GENERAL => "messages.general",
                     DEPLOYS => "messages.deploys",
                     CHAT_ANA => "messages.ana",
+                    "19:grp1@thread.v2" => {
+                        let msgs: Vec<Value> = (1..=8u64)
+                            .rev()
+                            .map(|i| message("19:grp1@thread.v2", None, 1_759_500_000_000 + i * 100, BEN, "Ben Okafor", &format!("<p>update {i}</p>")))
+                            .collect();
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
+                    }
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
                     "48:notifications" => "messages.activity",
                     _ => return ok(json!({"messages": [], "_metadata": {}})),
@@ -453,6 +460,7 @@ impl Fake {
             }
             ("POST", "messages") => self.post(call, conversation),
             ("PUT", "properties") => ok(json!({})),
+            ("DELETE", "") => ok(json!({})),
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
             _ => answer("404 Not Found", json!({"errorCode": 404, "message": "not here"})),
         }
@@ -528,6 +536,19 @@ impl Fake {
             let query = call.body.to_lowercase();
             let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
+        }
+        if call.path.ends_with("/v1/urlpreview") {
+            let asked = call.json();
+            let url = asked["url"].as_str().unwrap_or("");
+            if url == "https://example.com/release" {
+                return ok(json!({
+                    "url": url,
+                    "title": "TinyClient Release",
+                    "description": "Wave 4D Teams improvements",
+                    "siteName": "Example",
+                    "previewImage": format!("{}/ams/v1/objects/preview-1/views/imgo", self.base),
+                }));
+            }
         }
         answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
     }
@@ -1687,4 +1708,350 @@ fn reply_to_my_channel_post_marks_chain_and_channel_unread_while_untouched_post_
         world.message(&deploys, &mine.id).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.unread == 0))
     });
     assert_eq!(read_post.thread.unwrap().unread, 0);
+}
+
+#[test]
+fn chat_pin_hide_and_delete_sync_with_teams() {
+    let world = World::start();
+    world.ready();
+
+    // Capabilities advertise chat pinning, hiding (close_direct), and deleting (clear_history).
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.pin_chats > 0 && caps.close_direct && caps.clear_history);
+
+    let grp1 = key("19:grp1@thread.v2");
+    let grp2 = key("19:grp2@thread.v2");
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Pin grp1 and grp2 in order.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let pinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((pinned_call.query.as_str(), pinned_call.json()), ("name=pinned", json!({"pinned": "true"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, Some(0));
+
+    assert_eq!(
+        world.ask(Request::File { conversation: grp2.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&grp2).unwrap().pin, Some(1));
+
+    // Unpin grp1.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(false), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let unpinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((unpinned_call.query.as_str(), unpinned_call.json()), ("name=pinned", json!({"pinned": "false"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Hide grp1 via CloseDirect; it becomes hidden and writes hidden=true.
+    assert_eq!(world.ask(Request::CloseDirect { conversation: grp1.clone() }), Response::Ok);
+    let hidden_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((hidden_call.query.as_str(), hidden_call.json()), ("name=hidden", json!({"hidden": "true"})));
+    assert!(world.conversation(&grp1).unwrap().hidden);
+
+    // A ConversationUpdate from another device unhides grp1 and pins it.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"hidden": "false", "pinned": "true"}}),
+        false,
+    );
+    world.until("grp1 unhidden and pinned by push", || {
+        world.conversation(&grp1).filter(|row| !row.hidden && row.pin.is_some())
+    });
+
+    // Delete grp1 for me only via ClearHistory { delete_chat: true }.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: grp1.clone(), delete_chat: true, revoke: false }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", "19:grp1@thread.v2").is_empty());
+    assert!(world.conversation(&grp1).is_none());
+
+    // Channels cannot be deleted as chats.
+    assert!(matches!(
+        world.ask(Request::ClearHistory { conversation: key(GENERAL), delete_chat: true, revoke: false }),
+        Response::Error { .. }
+    ));
+}
+
+#[test]
+fn link_previews_received_sent_and_opted_out() {
+    let world = World::start();
+    world.ready();
+
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.suppress_embeds);
+
+    // 1. Received message with web link preview and M365 file link card.
+    let chat = key(CHAT_ANA);
+    let mut incoming = message(CHAT_ANA, None, 1_760_000_950_000, ANA, "Ana Ruiz", "<p>See https://example.com/doc</p>");
+    incoming["properties"]["links"] = json!(json!([
+        {
+            "url": "https://example.com/doc",
+            "title": "Architecture Doc",
+            "description": "Design overview",
+            "siteName": "Example",
+            "previewImage": format!("{}/ams/v1/objects/img-1/views/imgo", world.fake.base),
+        },
+        {
+            "url": "https://contoso.sharepoint.com/:w:/s/Platform/Doc1",
+            "fileName": "Spec.docx",
+            "fileType": "docx",
+            "description": "Shared specification"
+        }
+    ]).to_string());
+    world.fake.push("NewMessage", incoming, false);
+    let received = world.until("received message with previews", || world.message(&chat, "1760000950000"));
+    assert_eq!(received.previews.len(), 2);
+    assert_eq!((received.previews[0].title.as_str(), received.previews[0].site.as_str()), ("Architecture Doc", "Example"));
+    assert!(received.previews[0].image.is_some());
+    assert_eq!((received.previews[1].title.as_str(), received.previews[1].site.as_str()), ("Spec.docx", "Word · SharePoint"));
+
+    // 2. Sent message with a URL unfurls through Teams' middle tier and attaches properties.links.
+    world.send(&chat, "1760000960000001", "Check https://example.com/release");
+    let sent = world.until("sent message with preview", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000001") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.previews.len(), 1);
+    assert_eq!(sent.previews[0].title, "TinyClient Release");
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["links"].as_str().unwrap_or("").contains("TinyClient Release"));
+
+    // 3. Opting out via suppress_embeds skips unfurl and omits properties.links.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000960000002".to_owned(),
+        text: "No preview https://example.com/release".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { suppress_embeds: true, ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let opted_out = world.until("opted-out message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000002") && m.state == SendState::Sent)
+    });
+    assert!(opted_out.previews.is_empty());
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1, "suppress_embeds must not call urlpreview");
+    let posted2 = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted2.json()["properties"]["links"].is_null());
+}
+
+#[test]
+fn notification_levels_read_write_and_live_update() {
+    let world = World::start();
+    world.ready();
+
+    let general = key(GENERAL);
+    let grp1 = key("19:grp1@thread.v2");
+
+    // Unmuted channel with no explicit override starts at All; setting Mentions updates both alerts and channelNotificationSettings.
+    let info = match world.ask(Request::ConversationInfo { conversation: general.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(info.notify, protocol::Notify::All);
+
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "false", "mentions": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "off" && c.json()["channelNotificationSettings"]["mentions"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update channel back to All: writes alerts=true and channelNotificationSettings allPosts=bannerAndFeed.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update chat to Mentions: writes alerts=false + mentions=true and does NOT mark row muted.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let grp_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((grp_call.query.as_str(), grp_call.json()), ("name=alerts", json!({"alerts": "false", "mentions": "true"})));
+    assert!(!world.conversation(&grp1).unwrap().muted);
+
+    // Live ConversationUpdate push muting grp1 reflects in row.muted.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"alerts": "false"}}),
+        false,
+    );
+    world.until("grp1 muted by ConversationUpdate", || {
+        world.conversation(&grp1).filter(|row| row.muted)
+    });
+}
+
+#[test]
+fn scheduled_chat_message_send_edit_cancel_and_channel_refusal() {
+    let world = World::start();
+    world.ready();
+
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.schedule);
+
+    let chat = key(CHAT_ANA);
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+
+    // 1. Schedule a message in a chat.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000970000001".to_owned(),
+        text: "Remind me in an hour".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let scheduled = world.until("scheduled message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000970000001") && m.state == SendState::Sent)
+    });
+    assert!(scheduled.id.starts_with("scheduled:"), "got id {}", scheduled.id);
+    assert_eq!(scheduled.sent, future_ts);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 2. Edit the scheduled message preserves scheduledTime and targets the raw message id.
+    let raw_id = scheduled.id.trim_start_matches("scheduled:").to_owned();
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            text: "Updated reminder".to_owned(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let edited_call = world.fake.calls("PUT", &format!("{CHAT_ANA}/messages/{raw_id}")).pop().unwrap();
+    assert!(edited_call.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 3. Cancel (delete) the scheduled message sends DELETE for the raw id and removes it.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", &format!("{CHAT_ANA}/messages/{raw_id}")).is_empty());
+    assert!(world.message(&chat, &scheduled.id).is_none());
+
+    // 4. Scheduling in a channel is refused cleanly without posting to Teams.
+    let general = key(GENERAL);
+    let posts_before = world.fake.calls("POST", &format!("{GENERAL}/messages")).len();
+    match world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "1760000970000002".to_owned(),
+        text: "Channel schedule attempt".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let failed = world.until("channel scheduled send fails", || {
+        world.messages(&general).into_iter().find(|m| {
+            m.client_id.as_deref() == Some("1760000970000002") && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    assert!(matches!(failed.state, SendState::Failed { ref reason } if reason.contains("channels")));
+    assert_eq!(world.fake.calls("POST", &format!("{GENERAL}/messages")).len(), posts_before);
+}
+
+#[test]
+fn unread_count_from_horizon_and_mark_unread_sync() {
+    let world = World::start();
+    world.ready();
+
+    let grp1 = key("19:grp1@thread.v2");
+
+    // 1. Set consumption horizon at msg 1 (1759500000100), then open grp1 (8 messages: 100..=800).
+    //    Backfill counts the 7 messages past the horizon instead of collapsing to 1.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": "1759500000100;1759500000150;1759500000100"},
+            "lastMessage": {"id": "1759500000800"}
+        }),
+        false,
+    );
+    world.until("grp1 horizon recorded", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000100"))
+    });
+    world.open(&grp1, 8);
+    let counted = world.until("grp1 unread count refined to 7", || {
+        world.conversation(&grp1).filter(|row| row.unread == 7)
+    });
+    assert_eq!(counted.unread, 7);
+
+    // 2. Mark read at msg 8, then MarkUnread from msg 5 (1759500000500) -> writes prior msg (1759500000400) to Teams.
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    world.until("MarkRead PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000800;")
+        })
+    });
+    assert_eq!(world.ask(Request::MarkUnread { conversation: grp1.clone(), message_id: "1759500000500".into() }), Response::Ok);
+    let unread_call = world.until("MarkUnread PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;")
+        })
+    });
+    assert!(unread_call.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;"));
+
+    // 3. Another device moving consumptionhorizon backwards via ConversationUpdate rewinds last_read and unread count
+    //    (with a clientTimestamp newer than our local MarkRead write).
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    let newer_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": format!("1759500000300;{newer_ts};1759500000300")},
+            "lastMessage": {"id": "1759500000800"}
+        }),
+        false,
+    );
+    let rewound = world.until("grp1 rewound to 5 unread", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000300") && row.unread == 5)
+    });
+    assert_eq!(rewound.unread, 5);
 }

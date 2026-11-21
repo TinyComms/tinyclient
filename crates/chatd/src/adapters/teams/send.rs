@@ -24,21 +24,51 @@ const FOLDER: &str = "Microsoft Teams Chat Files";
 
 impl Teams {
     pub(super) fn send_with(self: &Arc<Self>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
-        if with.files.is_empty() {
-            // Teams has no silent or scheduled send, and the shell offers none; a pick has no
-            // catalog here. What is left is the text and any mention spans.
-            self.post_with_spans(conversation, client_id, text, reply_to, &with.spans);
+        if let Some(at) = with.schedule {
+            let outcome = self.schedule_chat(conversation, client_id, text, reply_to, at, &with);
+            self.ctx.sent(conversation, client_id, outcome);
             return;
         }
-        let (teams, conversation_id, client, text, reply, spans) = (self.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned), with.spans);
-        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &spans, up));
+        if with.files.is_empty() {
+            // Text with optional mention spans and link-preview opt-out.
+            self.post_with_options(conversation, client_id, text, reply_to, &with.spans, with.suppress_embeds);
+            return;
+        }
+        let (teams, conversation_id, client, text, reply, spans, suppress) = (self.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned), with.spans, with.suppress_embeds);
+        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &spans, suppress, up));
+    }
+
+    /// Schedules a text message for future delivery in a Teams chat.
+    /// Teams supports scheduled send in chats only; channels and reply chains are refused.
+    fn schedule_chat(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, at: i64, with: &Outgoing) -> Result<Message, String> {
+        let thread = super::thread_of(conversation);
+        if super::tree::is_channel(thread) || super::chain_of(conversation).is_some() {
+            return Err("Teams only supports scheduling messages in chats, not channels.".to_owned());
+        }
+        if !with.files.is_empty() {
+            return Err("Teams scheduled messages support text only.".to_owned());
+        }
+        let now = crate::hub::now();
+        if at <= now {
+            return Err("Scheduled send time must be in the future.".to_owned());
+        }
+        let scheduled_iso = super::iso_utc(at);
+        let props = json!({"scheduledTime": scheduled_iso});
+        let mut message = self
+            .posted_with(conversation, client_id, text, reply_to, &with.spans, with.suppress_embeds, Some(props))
+            .map_err(super::reason)?;
+        let raw_id = message.id.clone();
+        self.state().scheduled.insert(raw_id.clone(), at);
+        message.id = format!("scheduled:{raw_id}");
+        message.sent = at;
+        Ok(message)
     }
 
     pub(super) fn cancel_send(&self, client_id: &str) {
         upload::cancel(&self.ctx.account, client_id);
     }
 
-    fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[protocol::Span], up: &mut Upload) -> Result<Message, String> {
+    fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[protocol::Span], suppress_embeds: bool, up: &mut Upload) -> Result<Message, String> {
         let mut named = Vec::new();
         let mut attachments = Vec::new();
         for at in 0..up.files().len() {
@@ -48,7 +78,7 @@ impl Teams {
         }
         up.check()?;
         let properties = json!({"files": Value::Array(named).to_string()});
-        let mut message = self.posted_with(conversation, client_id, text, reply_to, spans, Some(properties)).map_err(super::reason)?;
+        let mut message = self.posted_with(conversation, client_id, text, reply_to, spans, suppress_embeds, Some(properties)).map_err(super::reason)?;
         message.attachments = attachments;
         Ok(message)
     }
@@ -98,5 +128,18 @@ impl Teams {
             tracing::warn!("chatd: Teams: {err}");
         }
         Ok((entry, Attachment::new(name, file)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{iso_utc, seconds};
+
+    #[test]
+    fn iso_utc_round_trips_with_seconds() {
+        let ts = 1_800_000_000;
+        let formatted = iso_utc(ts);
+        assert_eq!(formatted, "2027-01-15T08:00:00.000Z");
+        assert_eq!(seconds(&formatted), ts);
     }
 }

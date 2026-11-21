@@ -139,10 +139,7 @@ pub(in crate::gui) fn set_local_notify(key: &Key, notify: Notify, cx: &mut gpui:
 
 /// Notifications' segmented choice for a channel.
 fn notify_segments(pane: &InfoPane, row: &Conversation, local: bool, cx: &mut Context<InfoPane>) -> Div {
-    let shown = if local { local_notify_shown(row) } else { pane.notify_shown(row) };
-    // Teams stores anything other than All as muted, so Mentions would silence the channel.
-    let teams = row.key.network == Network::Teams;
-    let now = if teams && shown == Notify::Mentions { Notify::Nothing } else { shown };
+    let now = if local { local_notify_shown(row) } else { pane.notify_shown(row) };
     let choice = |ix: usize, words: &'static str, notify: Notify, cx: &mut Context<InfoPane>| {
         let key = row.key.clone();
         segment(("details-notify", ix), words, now == notify)
@@ -156,11 +153,10 @@ fn notify_segments(pane: &InfoPane, row: &Conversation, local: bool, cx: &mut Co
                 }
             }))
     };
-    let mut choices = segmented().child(choice(0, "All", Notify::All, cx));
-    if !teams {
-        choices = choices.child(choice(1, "Mentions", Notify::Mentions, cx));
-    }
-    choices.child(choice(2, "Nothing", Notify::Nothing, cx))
+    segmented()
+        .child(choice(0, "All", Notify::All, cx))
+        .child(choice(1, "Mentions", Notify::Mentions, cx))
+        .child(choice(2, "Nothing", Notify::Nothing, cx))
 }
 
 fn head_picture(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Div {

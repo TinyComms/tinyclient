@@ -38,6 +38,8 @@ pub struct Seen {
     pub close_direct: bool,
     /// The account supports blocking and unblocking people (`Capabilities::blocks`).
     pub can_block: bool,
+    /// The account supports setting a private nickname on a friend (`Capabilities::friend_nickname`).
+    pub can_friend_nickname: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +568,7 @@ pub enum Item {
     OpenIn,
     CloseDirect,
     Separator,
+    FriendNickname,
     RemoveFriend,
     IgnoreUser,
     UnignoreUser,
@@ -626,6 +629,9 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     }
     let (remove, block) = offers_with(person, seen.can_block);
     items.push(Item::Separator);
+    if person.relation == Relation::Friend && seen.can_friend_nickname && seen.online {
+        items.push(Item::FriendNickname);
+    }
     if remove {
         items.push(Item::RemoveFriend);
     }
@@ -649,14 +655,18 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     tidy(items)
 }
 
-/// A direct conversation whose account serves `CloseDirect` (Discord, Messages).
+/// A conversation whose account serves `CloseDirect` (Discord, Messages, Teams chats).
 pub fn can_close_direct(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
-    conversation.kind == ConversationKind::Direct && can.close_direct
+    can.close_direct
+        && (conversation.kind == ConversationKind::Direct
+            || (conversation.key.network == Network::Teams && conversation.space.is_none()))
 }
 
-/// A conversation whose account serves `ClearHistory` (Telegram) and is not read-only.
+/// A conversation whose account serves `ClearHistory` (Telegram, Teams chats) and is not read-only.
 pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
-    can.clear_history && !conversation.read_only
+    can.clear_history
+        && !conversation.read_only
+        && !(conversation.key.network == Network::Teams && conversation.space.is_some())
 }
 
 /// A conversation whose account lets the user pin/unpin it on the network (`Request::File`).
@@ -1005,7 +1015,7 @@ mod tests {
         }
     }
 
-    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true, close_direct: true, can_block: false };
+    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true, close_direct: true, can_block: false, can_friend_nickname: false };
 
     #[test]
     fn friendship_buttons_follow_discord_relationship_state() {
@@ -1055,7 +1065,7 @@ mod tests {
 
     #[test]
     fn calls_are_native_handed_off_or_absent_by_network_and_never_for_apps() {
-        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false, can_block: false };
+        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false, can_block: false, can_friend_nickname: false };
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(actions(&tess, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Huddle in Slack".into())));
         let omar = person(Network::Teams, Relation::Contact);
@@ -1164,7 +1174,7 @@ mod tests {
     #[test]
     fn menus_follow_the_designs_order_and_destructive_items_come_last() {
         let juno = person(Network::Discord, Relation::Friend);
-        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true, can_block: false };
+        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true, can_block: false, can_friend_nickname: false };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
             vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block, Item::Report]

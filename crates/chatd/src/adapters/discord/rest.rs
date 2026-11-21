@@ -369,7 +369,8 @@ impl Rest {
         }
         match (method, body) {
             ("GET", _) => dressed!(agent.get(url)).call(),
-            ("DELETE", _) => dressed!(agent.delete(url)).call(),
+            ("DELETE", Some(body)) => dressed!(agent.delete(url).force_send_body()).send_json(body),
+            ("DELETE", None) => dressed!(agent.delete(url)).call(),
             ("PUT", Some(body)) => dressed!(agent.put(url)).send_json(body),
             ("PUT", None) => dressed!(agent.put(url)).send_empty(),
             ("PATCH", Some(body)) => dressed!(agent.patch(url)).send_json(body),
@@ -387,6 +388,25 @@ impl Rest {
     /// so a caller parses it straight into what it needs. A 429 is waited out in full and
     /// tried once more, then reported.
     pub fn call_with(&self, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> Result<String, Refused> {
+        self.call_inner(method, path, body, extra, true, true)
+    }
+
+    /// One-shot call for anti-abuse sensitive endpoints (friend requests, server invites): never
+    /// retries on HTTP 429, and a CAPTCHA fails only this request without locking the rest of the
+    /// Discord session.
+    pub fn call_once_with(&self, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> Result<String, Refused> {
+        self.call_inner(method, path, body, extra, false, false)
+    }
+
+    fn call_inner(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        extra: &[(&str, &str)],
+        retry_429: bool,
+        session_captcha: bool,
+    ) -> Result<String, Refused> {
         if self.challenged.load(Ordering::Relaxed) {
             return Err(Refused::Challenge);
         }
@@ -423,7 +443,9 @@ impl Rest {
             let code = problem["code"].as_u64().unwrap_or(0);
             let retry_after = problem["retry_after"].as_f64();
             if problem.get("captcha_key").is_some() || problem.get("captcha_sitekey").is_some() {
-                self.challenge("Discord asked for a captcha. Finish it in Discord, then sign in here again.");
+                if session_captcha {
+                    self.challenge("Discord asked for a captcha. Finish it in Discord, then sign in here again.");
+                }
                 return Err(Refused::Challenge);
             }
             match status {
@@ -443,7 +465,7 @@ impl Rest {
                     }
                     let window = Window { remaining: 0, resets: until };
                     crate::hub::lock(&self.windows).insert(route.clone(), window);
-                    if waited || limit.wait > PATIENCE || self.paused().is_some() {
+                    if !retry_429 || waited || limit.wait > PATIENCE || self.paused().is_some() {
                         return Err(Refused::Limited(limit.wait));
                     }
                     waited = true;
