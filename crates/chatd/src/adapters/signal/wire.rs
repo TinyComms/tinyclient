@@ -445,6 +445,58 @@ pub struct StorageAccount {
     pub universal_expire_timer: u32,
     #[serde(default)]
     pub note_to_self_marked_unread: bool,
+    /// True when the user turned Signal Stories off in their account settings.
+    #[serde(default)]
+    pub stories_disabled: Option<bool>,
+    /// True when story view receipts (`storyViewReceiptsEnabled`) are enabled on the account.
+    #[serde(default)]
+    pub story_view_receipts: Option<bool>,
+}
+
+/// One Signal story distribution list (`StoryDistributionListRecord` from Storage Service).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoryDistributionList {
+    /// Hex-encoded 16-byte distribution list identifier (`00000000...` is "My Story").
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// Recipient ACIs named in this list (excluded when `is_block_list == true`, included otherwise).
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    #[serde(default)]
+    pub allows_replies: bool,
+    /// When true (the default for "My Story" with exceptions), send to all contacts EXCEPT
+    /// `recipients`. When false (an allowlist / custom list), send ONLY to `recipients`.
+    #[serde(default)]
+    pub is_block_list: bool,
+}
+
+/// Resolves the exact sorted, deduplicated set of recipient ACIs permitted to receive a story
+/// posted to `list`, strictly enforcing allowlist vs blocklist semantics and never leaking to
+/// blocked contacts or ourselves.
+pub fn resolve_story_recipients(
+    list: &StoryDistributionList,
+    all_contacts: &[String],
+    blocked: &std::collections::HashSet<String>,
+    me: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = if list.is_block_list {
+        let excluded: std::collections::HashSet<&str> = list.recipients.iter().map(String::as_str).collect();
+        all_contacts
+            .iter()
+            .filter(|aci| is_aci(aci) && aci.as_str() != me && !blocked.contains(aci.as_str()) && !excluded.contains(aci.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        list.recipients
+            .iter()
+            .filter(|aci| is_aci(aci) && aci.as_str() != me && !blocked.contains(aci.as_str()))
+            .cloned()
+            .collect()
+    };
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Full read-only snapshot decrypted from Signal's Storage Service manifest.
@@ -456,6 +508,8 @@ pub struct StorageSnapshot {
     pub groups: Vec<StorageGroup>,
     #[serde(default)]
     pub account: Option<StorageAccount>,
+    #[serde(default)]
+    pub distribution_lists: Vec<StoryDistributionList>,
 }
 
 /// One Signal chat folder from the storage service (`ChatFolderRecord`).
@@ -628,6 +682,40 @@ pub struct Text {
     pub attachments: Vec<Pointer>,
     /// Optional Signal sticker (`DataMessage.sticker`).
     pub sticker: Option<Sticker>,
+    /// Story this message replies to (`DataMessage.story_context`).
+    pub story_context: Option<StoryContext>,
+}
+
+/// Reference to the Signal story that a reply or reaction targets (`DataMessage.story_context`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryContext {
+    pub author: String,
+    pub sent: u64,
+}
+
+/// Text content and styling of a Signal text story (`TextAttachment`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryText {
+    pub text: String,
+    pub style: String,
+    pub fg_color: u32,
+    pub bg_color: u32,
+    pub gradient_colors: Vec<u32>,
+    pub preview: Option<LinkPreview>,
+}
+
+/// One incoming or synced Signal Story (`ContentBody::StoryMessage`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryMessageData {
+    pub author: String,
+    pub name: String,
+    pub sent: u64,
+    /// Public hex group id when posted to a group story (`StoryMessage.group`).
+    pub group_id: Option<String>,
+    pub allows_replies: bool,
+    pub file: Option<Pointer>,
+    pub text: Option<StoryText>,
+    pub outgoing: bool,
 }
 
 /// One sticker carried on a Signal `DataMessage.sticker`.
@@ -871,6 +959,12 @@ pub enum Event {
     StickerPacks(Vec<StickerPackInfo>),
     /// Another linked device installed or removed a sticker pack (`SyncMessage.stickerPackOperation`).
     StickerPackOp { pack_id: String, pack_key: String, install: bool },
+    /// A Signal story (`ContentBody::StoryMessage`), lasting 24 hours from `sent`.
+    Story(StoryMessageData),
+    /// A reaction to a Signal story (`DataMessage.reaction` + `DataMessage.story_context`).
+    StoryReaction { peer: Peer, by: String, story_author: String, story_sent: u64, emoji: String, removed: bool },
+    /// Account-level story toggles (`stories_disabled`, `story_view_receipts`).
+    StoriesSettings { disabled: bool, view_receipts: bool },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -1030,6 +1124,29 @@ pub enum Body {
         content_type: String,
         quote: Option<Quote>,
         timer: Timer,
+    },
+    /// Reply to a Signal story (`DataMessage.story_context`).
+    StoryReply {
+        story_author: String,
+        story_sent: u64,
+        text: String,
+        ranges: Vec<Range>,
+        timer: Timer,
+    },
+    /// React to a Signal story (`DataMessage.reaction` + `DataMessage.story_context`).
+    StoryReact {
+        story_author: String,
+        story_sent: u64,
+        emoji: String,
+        remove: bool,
+    },
+    /// Post a new Signal story (`ContentBody::StoryMessage`) to resolved recipients or a group.
+    PostStory {
+        recipients: Vec<String>,
+        group_id: Option<String>,
+        text: Option<StoryText>,
+        file: Option<File>,
+        allows_replies: bool,
     },
 }
 
@@ -1406,5 +1523,43 @@ mod tests {
         assert!(parse_sticker_pack_url(&url.replace("https://", "http://")).is_none());
         assert!(parse_sticker_pack_url(&url.replace("signal.art", "evil.example")).is_none());
         assert!(parse_sticker_pack_url("https://signal.art/addstickers/#pack_id=1234&pack_key=abcd").is_none());
+    }
+
+    #[test]
+    fn story_distribution_list_enforces_allowlist_blocklist_and_blocked_privacy() {
+        let me = "0f6c2a3e-1b4d-4e5f-8a9b-0c1d2e3f4a5b";
+        let alice = "11111111-0000-4000-8000-000000000001";
+        let bob = "22222222-0000-4000-8000-000000000002";
+        let carol = "33333333-0000-4000-8000-000000000003";
+        let dave = "44444444-0000-4000-8000-000000000004";
+        let contacts = vec![me.to_owned(), alice.to_owned(), bob.to_owned(), carol.to_owned(), dave.to_owned()];
+        let mut blocked = std::collections::HashSet::new();
+        blocked.insert(dave.to_owned());
+
+        // Blocklist mode ("My Story except Bob"): includes Alice and Carol, excludes Bob, blocked Dave, and self.
+        let my_story = StoryDistributionList {
+            id: "00000000000000000000000000000000".into(),
+            name: "My Story".into(),
+            recipients: vec![bob.to_owned()],
+            allows_replies: true,
+            is_block_list: true,
+        };
+        assert_eq!(
+            resolve_story_recipients(&my_story, &contacts, &blocked, me),
+            vec![alice.to_owned(), carol.to_owned()]
+        );
+
+        // Allowlist mode ("Close friends: Alice & Dave"): includes only Alice (Dave is blocked; Bob & Carol never receive it).
+        let custom = StoryDistributionList {
+            id: "abcdef0123456789abcdef0123456789".into(),
+            name: "Close friends".into(),
+            recipients: vec![alice.to_owned(), dave.to_owned(), alice.to_owned(), me.to_owned()],
+            allows_replies: false,
+            is_block_list: false,
+        };
+        assert_eq!(
+            resolve_story_recipients(&custom, &contacts, &blocked, me),
+            vec![alice.to_owned()]
+        );
     }
 }

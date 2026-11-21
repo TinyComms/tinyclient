@@ -2171,13 +2171,15 @@ pub(super) fn line_for(reply: i32, known: Option<&(String, String, String)>, not
             person: None,
             deleted: false,
             thumb: None,
+            story: false,
         },
-        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false, thumb: None },
+        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false, thumb: None, story: false },
     };
     let Some(note) = note else {
         return line;
     };
     if note.story {
+        line.story = true;
         line.snippet = "Story".to_owned();
         if !note.author.is_empty() {
             line.sender = note.author.clone();
@@ -4093,6 +4095,7 @@ mod tests {
             person: None,
             deleted: false,
             thumb: None,
+            story: false,
         });
         quote_pin(&mut quoted);
         assert_eq!(quoted.text, "Ada pinned \"Bring the rope tomorrow and the map from…\"");

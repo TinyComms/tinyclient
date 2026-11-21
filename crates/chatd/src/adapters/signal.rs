@@ -131,6 +131,42 @@ const STICKER_PACK_PREVIEW: &str = "\u{1}signal-sticker-preview\u{1}";
 const STICKER_PACK_INSTALL: &str = "\u{1}signal-sticker-install\u{1}";
 const STICKER_PACK_REMOVE: &str = "\u{1}signal-sticker-remove\u{1}";
 
+/// Dedicated conversation id holding active Signal Stories (24h lifetime).
+pub const STORIES_CONVERSATION: &str = "stories";
+/// Signal Stories expire 24 hours after they were posted.
+const STORY_LIFETIME_SECS: i64 = 86_400;
+/// Signal Story actions packed into `Handoff.conversation_id`:
+const STORY_VIEW: &str = "\u{1}signal-story-view\u{1}";
+const STORY_REPLY: &str = "\u{1}signal-story-reply\u{1}";
+const STORY_REACT: &str = "\u{1}signal-story-react\u{1}";
+const STORY_POST: &str = "\u{1}signal-story-post\u{1}";
+const STORY_TOGGLE: &str = "\u{1}signal-story-toggle\u{1}";
+
+/// Packs a Signal story view request (marks viewed & sends `Viewed` receipt when enabled) for `Request::Handoff`.
+pub fn story_view_command(author: &str, sent: u64) -> String {
+    format!("{STORY_VIEW}{author}|{sent}")
+}
+
+/// Packs a Signal story reply (`DataMessage.story_context`) for `Request::Handoff`.
+pub fn story_reply_command(author: &str, sent: u64, group_id: Option<&str>, text: &str) -> String {
+    format!("{STORY_REPLY}{author}|{sent}|{}|{text}", group_id.unwrap_or(""))
+}
+
+/// Packs a Signal story reaction (`DataMessage.reaction` + `story_context`) for `Request::Handoff`.
+pub fn story_react_command(author: &str, sent: u64, group_id: Option<&str>, emoji: &str) -> String {
+    format!("{STORY_REACT}{author}|{sent}|{}|{emoji}", group_id.unwrap_or(""))
+}
+
+/// Packs a Signal story post (distribution list id/name or `g.<hex>` group) for `Request::Handoff`.
+pub fn story_post_command(target: &str, allows_replies: bool, bg_hex: &str, text: &str) -> String {
+    format!("{STORY_POST}{target}|{}|{bg_hex}|{text}", u8::from(allows_replies))
+}
+
+/// Packs a Signal stories on/off toggle for `Request::Handoff`.
+pub fn story_toggle_command(enabled: bool) -> String {
+    format!("{STORY_TOGGLE}{}", if enabled { "on" } else { "off" })
+}
+
 /// Packs a Signal sticker-pack preview request for `Request::Handoff`.
 pub fn sticker_pack_preview_command(url_or_pair: &str) -> String {
     format!("{STICKER_PACK_PREVIEW}{url_or_pair}")
@@ -767,6 +803,26 @@ struct Live {
     stickers_loaded: bool,
     /// Sticker catalog preview tiles waiting to be downloaded on `Command::Wanted`.
     held_stickers: HashMap<String, HeldSticker>,
+    /// True when Signal Stories are turned off on this account.
+    stories_disabled: bool,
+    /// True when story view receipts (`storyViewReceiptsEnabled`) are enabled.
+    story_view_receipts: bool,
+    /// Synced Signal story distribution lists (`StoryDistributionListRecord`).
+    story_lists: Vec<wire::StoryDistributionList>,
+    /// Active stories remembered for reply snippet attribution, permission checks, and viewer tracking.
+    stories: HashMap<String, HeldStory>,
+}
+
+/// Metadata for one active Signal story (expires 24 hours after `sent`).
+#[derive(Clone)]
+struct HeldStory {
+    author: String,
+    sent: u64,
+    group_id: Option<String>,
+    allows_replies: bool,
+    snippet: String,
+    expires_at: i64,
+    viewed_by: Vec<String>,
 }
 
 /// One sticker catalog preview tile remembered for lazy download/decrypt on `Command::Wanted`.
@@ -1588,7 +1644,35 @@ fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -
             ..protocol::Card::default()
         }));
     }
-    message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, conversation, &msg_id, quote));
+    message.reply_to = text
+        .quote
+        .as_ref()
+        .map(|quote| reply_to(account, conversation, &msg_id, quote))
+        .or_else(|| {
+            let ctx = text.story_context.as_ref()?;
+            let story_id = wire::message_id(ctx.sent, &ctx.author);
+            let sender = if ctx.author == account.me {
+                account.name.clone()
+            } else {
+                account.live().name(&ctx.author)
+            };
+            let snippet = account
+                .live()
+                .stories
+                .get(&story_id)
+                .map(|s| s.snippet.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Story".to_owned());
+            Some(ReplyTo {
+                id: story_id,
+                sender,
+                snippet: snippet.chars().take(200).collect(),
+                person: Some(account.ctx.key(&ctx.author)),
+                deleted: false,
+                thumb: None,
+                story: true,
+            })
+        });
     message
 }
 
@@ -1632,6 +1716,7 @@ fn reply_to(account: &Account, conversation: &str, msg_id: &str, quote: &Quote) 
         person: Some(account.ctx.key(&quote.author)),
         deleted: false,
         thumb,
+        story: false,
     }
 }
 
@@ -2333,8 +2418,45 @@ fn apply(account: &Account, event: Event) {
             }
             account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
         }
+        Event::Story(story) => apply_story(account, story),
+        Event::StoryReaction { by, story_author, story_sent, emoji, removed, .. } => {
+            if account.live().stories_disabled {
+                return;
+            }
+            let story_id = wire::message_id(story_sent, &story_author);
+            let mine = by == account.me;
+            let prior = account.live().react(&story_id, &by, (!removed).then_some(emoji.as_str()));
+            if let Some(old) = prior {
+                let _ = ctx.reacted(
+                    STORIES_CONVERSATION,
+                    &story_id,
+                    &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()] },
+                    false,
+                );
+            }
+            let _ = ctx.reacted(
+                STORIES_CONVERSATION,
+                &story_id,
+                &Reaction { emoji, file: None, count: 1, mine, who: vec![by] },
+                !removed,
+            );
+        }
+        Event::StoriesSettings { disabled, view_receipts } => {
+            {
+                let mut live = account.live();
+                live.stories_disabled = disabled;
+                live.story_view_receipts = view_receipts;
+                if disabled {
+                    live.stories.clear();
+                }
+            }
+            if disabled {
+                let _ = ctx.forget_conversation(STORIES_CONVERSATION);
+            }
+        }
         Event::Caught => {
             prune_expired_pins(account);
+            prune_expired_stories(account);
         }
         Event::Closed(_) | Event::Ended(_) => {}
     }
@@ -2350,9 +2472,29 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     let mut people_rows: Vec<PersonRow> = Vec::new();
     let mut seed_rows: Vec<(Peer, String)> = Vec::new();
     let mut updated_link_previews: Option<bool> = None;
+    let mut disabled_stories = false;
     {
         let mut live = account.live();
+        if !snapshot.distribution_lists.is_empty() {
+            for list in snapshot.distribution_lists {
+                if let Some(existing) = live.story_lists.iter_mut().find(|l| l.id == list.id) {
+                    *existing = list;
+                } else if live.story_lists.len() < 64 {
+                    live.story_lists.push(list);
+                }
+            }
+        }
         if let Some(acct) = snapshot.account {
+            if let Some(disabled) = acct.stories_disabled {
+                live.stories_disabled = disabled;
+                if disabled {
+                    live.stories.clear();
+                    disabled_stories = true;
+                }
+            }
+            if let Some(receipts) = acct.story_view_receipts {
+                live.story_view_receipts = receipts;
+            }
             if let Some(keep) = acct.keep_muted_archived {
                 live.keep_muted_archived = keep;
             }
@@ -2542,6 +2684,152 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     if let Some(lp) = updated_link_previews {
         ctx.capabilities(capabilities(lp));
     }
+    if disabled_stories {
+        let _ = ctx.forget_conversation(STORIES_CONVERSATION);
+    }
+}
+
+fn ensure_stories_row(account: &Account) {
+    if matches!(account.ctx.known(STORIES_CONVERSATION), Ok(Some(_))) {
+        return;
+    }
+    let mut row = ConversationRow::new(STORIES_CONVERSATION.to_owned(), ConversationKind::Channel, "Stories");
+    row.listed = true;
+    row.private = true;
+    row.topic = "Active Signal stories expire after 24 hours".to_owned();
+    let _ = account.ctx.conversation(&row);
+}
+
+fn prune_expired_stories(account: &Account) {
+    let now_secs = crate::hub::now();
+    let mut expired = Vec::new();
+    account.live().stories.retain(|id, story| {
+        if story.expires_at <= now_secs {
+            expired.push(id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    for id in expired {
+        let _ = account.ctx.deleted(STORIES_CONVERSATION, &id);
+    }
+}
+
+fn apply_story(account: &Account, story: wire::StoryMessageData) {
+    {
+        let live = account.live();
+        if live.stories_disabled || live.blocked.contains(&story.author) {
+            return;
+        }
+        if let Some(gid) = &story.group_id {
+            if live.blocked.contains(&Peer::Group(gid.clone()).conversation()) {
+                return;
+            }
+        }
+    }
+    let sent_secs = i64::try_from(story.sent / 1_000).unwrap_or(0);
+    let expires_at = sent_secs.saturating_add(STORY_LIFETIME_SECS);
+    if expires_at <= crate::hub::now() {
+        return;
+    }
+    ensure_stories_row(account);
+    let msg_id = wire::message_id(story.sent, &story.author);
+    let author_name = if story.outgoing || story.author == account.me {
+        account.name.clone()
+    } else if !story.name.is_empty() {
+        story.name.clone()
+    } else {
+        account.live().name(&story.author)
+    };
+    let group_label = story.group_id.as_deref().map(|gid| {
+        let conv = Peer::Group(gid.to_owned()).conversation();
+        account
+            .live()
+            .group_info
+            .get(&conv)
+            .map(|g| g.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Group story".to_owned())
+    });
+
+    let mut body_text = String::new();
+    let mut snippet = String::new();
+    let mut msg = Message::plain(msg_id.clone(), author_name, "", sent_secs, story.outgoing);
+    msg.sender.id = story.author.clone();
+    msg.expires_at = Some(expires_at);
+
+    if let Some(st) = &story.text {
+        body_text = st.text.clone();
+        snippet = st.text.clone();
+        msg.text = body_text;
+        msg.card = Some(Box::new(protocol::Card {
+            author: group_label.unwrap_or_else(|| "Story".to_owned()),
+            title: String::new(),
+            text: st.text.clone(),
+            color: Some(st.bg_color & 0x00ff_ffff),
+            footer: if story.allows_replies {
+                "Story · replies allowed".to_owned()
+            } else {
+                "Story · replies off".to_owned()
+            },
+            ..protocol::Card::default()
+        }));
+        if let Some(preview) = &st.preview {
+            if preview.url.starts_with("https://") || preview.url.starts_with("http://") {
+                msg.previews.push(protocol::Preview {
+                    url: preview.url.clone(),
+                    site: crate::adapters::tiny::preview::real_host(&preview.url),
+                    title: preview.title.clone(),
+                    description: preview.description.clone(),
+                    image: None,
+                });
+            }
+        }
+    } else if let Some(ptr) = &story.file {
+        let kind = files::attachment_kind(&ptr.content_type, ptr.flags);
+        let file_id = format!("signal:story:{}:{}", story.sent, story.author);
+        let address = format!("signal://attachment/{file_id}");
+        let mut mf = MediaFile::new(file_id.clone(), kind);
+        mf.width = ptr.width;
+        mf.height = ptr.height;
+        mf.bytes = u64::from(ptr.size);
+        let _ = account.ctx.media(&[(mf.clone(), address.clone())]);
+        account.live().remember_attachment(
+            file_id,
+            HeldAttachment {
+                pointer: ptr.clone(),
+                file: mf.clone(),
+                address,
+                conversation: STORIES_CONVERSATION.to_owned(),
+                message_id: msg_id.clone(),
+            },
+        );
+        let name = if !ptr.file_name.is_empty() {
+            ptr.file_name.clone()
+        } else {
+            files::attachment_label(&ptr.content_type, "", ptr.flags)
+        };
+        snippet = if !ptr.caption.is_empty() { ptr.caption.clone() } else { name.clone() };
+        msg.text = ptr.caption.clone();
+        let mut att = Attachment::new(name, mf);
+        att.mime = ptr.content_type.clone();
+        msg.attachments.push(att);
+    }
+
+    account.live().stories.insert(
+        msg_id.clone(),
+        HeldStory {
+            author: story.author,
+            sent: story.sent,
+            group_id: story.group_id,
+            allows_replies: story.allows_replies,
+            snippet,
+            expires_at,
+            viewed_by: Vec::new(),
+        },
+    );
+    let _ = account.ctx.message(STORIES_CONVERSATION, &msg);
 }
 
 /// The user read messages on another device: the rows they were in are read up to there.
@@ -4098,6 +4386,248 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
         }
         account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
         return Ok("removed".to_owned());
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_VIEW) {
+        let mut parts = arg.splitn(2, '|');
+        let author = parts.next().unwrap_or("").trim();
+        let sent: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
+        if !wire::is_aci(author) {
+            return Err(Refusal::Refused("Invalid story author.".into()));
+        }
+        let (disabled, send_receipts) = {
+            let live = account.live();
+            (live.stories_disabled, live.story_view_receipts)
+        };
+        if disabled {
+            return Err(Refusal::Refused("Stories are turned off.".into()));
+        }
+        if author != account.me {
+            account
+                .wire
+                .viewed(&[(author.to_owned(), sent)], send_receipts)
+                .map_err(refused)?;
+        }
+        return Ok("viewed".to_owned());
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_REPLY) {
+        let mut parts = arg.splitn(4, '|');
+        let author = parts.next().unwrap_or("").trim();
+        let sent: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
+        let group_str = parts.next().unwrap_or("").trim();
+        let reply_text = parts.next().unwrap_or("").trim();
+        if !wire::is_aci(author) || reply_text.is_empty() {
+            return Err(Refusal::Refused("A story reply needs text.".into()));
+        }
+        let story_id = wire::message_id(sent, author);
+        let (disabled, allowed, story_group, snippet) = {
+            let live = account.live();
+            let held = live.stories.get(&story_id);
+            (
+                live.stories_disabled,
+                held.map_or(true, |s| s.allows_replies),
+                held.and_then(|s| s.group_id.clone()),
+                held.map(|s| s.snippet.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Story".to_owned()),
+            )
+        };
+        if disabled {
+            return Err(Refusal::Refused("Stories are turned off.".into()));
+        }
+        if !allowed {
+            return Err(Refusal::Refused("Replies are turned off for this story.".into()));
+        }
+        let target_group = if !group_str.is_empty() {
+            Some(group_str.strip_prefix("g.").unwrap_or(group_str).to_owned())
+        } else {
+            story_group
+        };
+        let to = match &target_group {
+            Some(gid) => Peer::Group(gid.clone()),
+            None => Peer::Direct(author.to_owned()),
+        };
+        let conv = to.conversation();
+        let timer = account.live().timer_of(&conv);
+        let (wire_body, ranges, shown) = format_outgoing_body(account, &to, reply_text, &[]);
+        let reply_sent = account
+            .wire
+            .send(
+                &to,
+                Body::StoryReply {
+                    story_author: author.to_owned(),
+                    story_sent: sent,
+                    text: wire_body,
+                    ranges,
+                    timer,
+                },
+            )
+            .map_err(refused)?;
+        let target_name = if author == account.me { account.name.clone() } else { account.live().name(author) };
+        ensure_row(account, &to, &target_name);
+        let msg_id = wire::message_id(reply_sent, &account.me);
+        let mut msg = Message::plain(msg_id.clone(), account.name.clone(), shown.text, (reply_sent / 1_000) as i64, true);
+        msg.sender.id = account.me.clone();
+        msg.spans = shown.spans;
+        msg.reply_to = Some(ReplyTo {
+            id: story_id,
+            sender: target_name,
+            snippet: snippet.chars().take(200).collect(),
+            person: Some(account.ctx.key(author)),
+            deleted: false,
+            thumb: None,
+            story: true,
+        });
+        let _ = account.ctx.message(&conv, &msg);
+        return Ok(msg_id);
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_REACT) {
+        let mut parts = arg.splitn(4, '|');
+        let author = parts.next().unwrap_or("").trim();
+        let sent: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
+        let group_str = parts.next().unwrap_or("").trim();
+        let emoji = parts.next().unwrap_or("").trim();
+        if !wire::is_aci(author) || emoji.is_empty() {
+            return Err(Refusal::Refused("A story reaction needs an emoji.".into()));
+        }
+        if account.live().stories_disabled {
+            return Err(Refusal::Refused("Stories are turned off.".into()));
+        }
+        let story_id = wire::message_id(sent, author);
+        let target_group = if !group_str.is_empty() {
+            Some(group_str.strip_prefix("g.").unwrap_or(group_str).to_owned())
+        } else {
+            account.live().stories.get(&story_id).and_then(|s| s.group_id.clone())
+        };
+        let to = match &target_group {
+            Some(gid) => Peer::Group(gid.clone()),
+            None => Peer::Direct(author.to_owned()),
+        };
+        account
+            .wire
+            .send(
+                &to,
+                Body::StoryReact {
+                    story_author: author.to_owned(),
+                    story_sent: sent,
+                    emoji: emoji.to_owned(),
+                    remove: false,
+                },
+            )
+            .map_err(refused)?;
+        let _ = account.ctx.reacted(
+            STORIES_CONVERSATION,
+            &story_id,
+            &Reaction { emoji: emoji.to_owned(), file: None, count: 1, mine: true, who: vec![account.me.clone()] },
+            true,
+        );
+        return Ok(story_id);
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_POST) {
+        let mut parts = arg.splitn(4, '|');
+        let target = parts.next().unwrap_or("").trim();
+        let allows_replies = parts.next().unwrap_or("1").trim() != "0";
+        let bg_hex = parts.next().unwrap_or("224488").trim().trim_start_matches('#');
+        let text = parts.next().unwrap_or("").trim();
+        if text.is_empty() {
+            return Err(Refusal::Refused("A text story can't be empty.".into()));
+        }
+        let bg_color = u32::from_str_radix(bg_hex, 16).unwrap_or(0x0022_4488) | 0xff00_0000;
+        let (disabled, group_id, recipients) = {
+            let live = account.live();
+            if live.stories_disabled {
+                (true, None, Vec::new())
+            } else if let Some(Peer::Group(gid)) = Peer::parse(target) {
+                (false, Some(gid), Vec::new())
+            } else {
+                let all_contacts: Vec<String> = live.contacts.iter().cloned().collect();
+                let list = live
+                    .story_lists
+                    .iter()
+                    .find(|l| {
+                        l.id.eq_ignore_ascii_case(target)
+                            || l.name.eq_ignore_ascii_case(target)
+                            || (target.is_empty() || target.eq_ignore_ascii_case("my-story"))
+                                && (l.id == "00000000000000000000000000000000" || l.name.eq_ignore_ascii_case("My Story"))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| wire::StoryDistributionList {
+                        id: "00000000000000000000000000000000".to_owned(),
+                        name: "My Story".to_owned(),
+                        recipients: Vec::new(),
+                        allows_replies,
+                        is_block_list: true,
+                    });
+                let resolved = wire::resolve_story_recipients(&list, &all_contacts, &live.blocked, &account.me);
+                (false, None, resolved)
+            }
+        };
+        if disabled {
+            return Err(Refusal::Refused("Stories are turned off.".into()));
+        }
+        if group_id.is_none() && recipients.is_empty() {
+            return Err(Refusal::Refused("No recipients in this story audience.".into()));
+        }
+        let story_text = wire::StoryText {
+            text: text.to_owned(),
+            style: "BOLD".to_owned(),
+            fg_color: 0xffff_ffff,
+            bg_color,
+            gradient_colors: Vec::new(),
+            preview: None,
+        };
+        let peer_anchor = match &group_id {
+            Some(gid) => Peer::Group(gid.clone()),
+            None => Peer::Direct(account.me.clone()),
+        };
+        let posted_ms = account
+            .wire
+            .send(
+                &peer_anchor,
+                Body::PostStory {
+                    recipients,
+                    group_id: group_id.clone(),
+                    text: Some(story_text.clone()),
+                    file: None,
+                    allows_replies,
+                },
+            )
+            .map_err(refused)?;
+        apply_story(
+            account,
+            wire::StoryMessageData {
+                author: account.me.clone(),
+                name: account.name.clone(),
+                sent: posted_ms,
+                group_id,
+                allows_replies,
+                file: None,
+                text: Some(story_text),
+                outgoing: true,
+            },
+        );
+        return Ok(wire::message_id(posted_ms, &account.me));
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_TOGGLE) {
+        let on = arg.trim().eq_ignore_ascii_case("on") || arg.trim() == "1" || arg.trim().eq_ignore_ascii_case("true");
+        {
+            let mut live = account.live();
+            live.stories_disabled = !on;
+            if !on {
+                live.stories.clear();
+            }
+        }
+        if !on {
+            let _ = account.ctx.forget_conversation(STORIES_CONVERSATION);
+            return Ok("stories_off".to_owned());
+        }
+        return Ok("stories_on".to_owned());
     }
     Err(Refusal::Unsupported)
 }

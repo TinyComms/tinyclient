@@ -52,7 +52,8 @@ use super::wire::{
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
     Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
-    StorageSnapshot, Text, Wire, FLAG_GIF, FLAG_VOICE_MESSAGE,
+    StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText, Text, Wire, FLAG_GIF,
+    FLAG_VOICE_MESSAGE,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -1298,6 +1299,160 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
             };
             vec![Event::Message { peer: direct(author), text, outgoing: false }]
         }
+        "story" => {
+            // Format: story WHO SENT text|file [group=club] [replies=on|off] [bg=RRGGBB] | PAYLOAD
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let kind = next();
+            let payload = rest(line, 4);
+            let (opts_str, body_str) = match payload.split_once('|') {
+                Some((o, b)) => (o.trim(), b.trim()),
+                None => ("", payload.trim()),
+            };
+            let mut group_id = None;
+            let mut allows_replies = true;
+            let mut bg_color = 0xff22_4488u32;
+            for tok in opts_str.split_whitespace() {
+                if let Some((k, v)) = tok.split_once('=') {
+                    match (k, v) {
+                        ("group", "club") => group_id = Some(CLUB.to_owned()),
+                        ("group", hex) if !hex.is_empty() => group_id = Some(hex.to_owned()),
+                        ("replies", "off" | "false" | "0") => allows_replies = false,
+                        ("replies", "on" | "true" | "1") => allows_replies = true,
+                        ("bg", hex) => {
+                            if let Ok(c) = u32::from_str_radix(hex.trim_start_matches('#'), 16) {
+                                bg_color = c;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let (text, file) = if kind == "file" {
+                let mut toks = body_str.split_whitespace();
+                let mime = toks.next().unwrap_or("image/jpeg").to_owned();
+                let url_or_key = toks.next().unwrap_or("fake-story-photo").to_owned();
+                let key = unhex_bytes(toks.next().unwrap_or(""));
+                let digest = unhex_bytes(toks.next().unwrap_or(""));
+                let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                    (Some(url_or_key), None)
+                } else {
+                    (None, Some(url_or_key))
+                };
+                (
+                    None,
+                    Some(Pointer {
+                        cdn_key,
+                        content_type: mime,
+                        key,
+                        digest,
+                        file_name: "story.jpg".to_owned(),
+                        width: 1080,
+                        height: 1920,
+                        url,
+                        ..Pointer::default()
+                    }),
+                )
+            } else {
+                (
+                    Some(StoryText {
+                        text: body_str.to_owned(),
+                        style: "BOLD".to_owned(),
+                        fg_color: 0xffff_ffff,
+                        bg_color,
+                        gradient_colors: Vec::new(),
+                        preview: None,
+                    }),
+                    None,
+                )
+            };
+            vec![Event::Story(StoryMessageData {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                group_id,
+                allows_replies,
+                file,
+                text,
+                outgoing: false,
+            })]
+        }
+        "story-reply" => {
+            // Format: story-reply WHO SENT STORY_AUTHOR STORY_SENT TEXT...
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let story_author = match next() {
+                "me" => ME.to_owned(),
+                other => who(other).map(|(id, _)| id.to_owned()).unwrap_or_else(|| other.to_owned()),
+            };
+            let story_sent = next().parse().unwrap_or(T0);
+            let body = rest(line, 5);
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                text: body,
+                story_context: Some(StoryContext { author: story_author, sent: story_sent }),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "story-react" => {
+            // Format: story-react WHO STORY_AUTHOR STORY_SENT EMOJI
+            let Some((by, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let story_author = match next() {
+                "me" => ME.to_owned(),
+                other => who(other).map(|(id, _)| id.to_owned()).unwrap_or_else(|| other.to_owned()),
+            };
+            let story_sent = next().parse().unwrap_or(T0);
+            let emoji = next().to_owned();
+            vec![Event::StoryReaction {
+                peer: direct(by),
+                by: by.into(),
+                story_author,
+                story_sent,
+                emoji,
+                removed: false,
+            }]
+        }
+        "stories-off" => vec![Event::StoriesSettings { disabled: true, view_receipts: false }],
+        "stories-on" => vec![Event::StoriesSettings { disabled: false, view_receipts: true }],
+        "story-receipts" => {
+            let on = next() != "off";
+            vec![Event::StoriesSettings { disabled: false, view_receipts: on }]
+        }
+        "story-list" => {
+            // Format: story-list ID NAME block|allow replies=on|off who1,who2
+            let id = next().to_owned();
+            let name = next().replace('_', " ");
+            let is_block_list = next() == "block";
+            let allows_replies = next() != "replies=off";
+            let recipients: Vec<String> = next()
+                .split(',')
+                .filter(|s| !s.is_empty() && *s != "-")
+                .filter_map(|tok| {
+                    who(tok)
+                        .map(|(id, _)| id.to_owned())
+                        .or_else(|| super::wire::is_aci(tok).then(|| tok.to_owned()))
+                })
+                .collect();
+            vec![Event::StorageSync(StorageSnapshot {
+                distribution_lists: vec![StoryDistributionList {
+                    id,
+                    name,
+                    recipients,
+                    allows_replies,
+                    is_block_list,
+                }],
+                ..StorageSnapshot::default()
+            })]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -1398,6 +1553,31 @@ impl Wire for Fake {
             Body::Sticker { pack_id, sticker_id, emoji, timer, .. } => {
                 format!("send {} sticker {pack_id}:{sticker_id} {emoji}{}", describe(to), exp(*timer))
             }
+            Body::StoryReply { story_author, story_sent, text, ranges, timer } => {
+                format!(
+                    "send {} story-reply {story_sent}-{story_author} {text}{}{}",
+                    describe(to),
+                    noted(ranges),
+                    exp(*timer)
+                )
+            }
+            Body::StoryReact { story_author, story_sent, emoji, remove } => {
+                format!("send {} story-react {story_sent}-{story_author} {emoji} remove={remove}", describe(to))
+            }
+            Body::PostStory { recipients, group_id, text, file, allows_replies } => {
+                let target = match group_id {
+                    Some(g) => format!("group=g.{g}"),
+                    None => format!("recipients={}", recipients.join(",")),
+                };
+                let body_desc = if let Some(t) = text {
+                    format!("text={}", t.text)
+                } else if let Some(f) = file {
+                    format!("file={}", f.name)
+                } else {
+                    "empty".to_owned()
+                };
+                format!("post-story {target} replies={allows_replies} {body_desc}")
+            }
         };
         record(&line);
         if let Peer::Direct(aci) = to {
@@ -1420,6 +1600,12 @@ impl Wire for Fake {
             if let Some(person) = self.fail_one.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
                 self.missed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(person);
             }
+        }
+        if matches!(body, Body::PostStory { .. }) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(T0, |d| d.as_millis() as u64);
+            return Ok(now);
         }
         Ok(self.clock.fetch_add(1_000, Ordering::Relaxed))
     }

@@ -2882,11 +2882,21 @@ impl Pane {
     fn reply_line(&mut self, reply: &protocol::ReplyTo, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics;
         let target = reply.id.clone();
-        let gone = reply.deleted || (reply.sender.is_empty() && reply.snippet.is_empty());
-        let snippet = match (gone, reply.snippet.is_empty()) {
-            (true, _) => "Original message was deleted".to_owned(),
-            (false, true) => "Attachment".to_owned(),
-            (false, false) => reply.snippet.replace('\n', " "),
+        let gone = reply.deleted || (!reply.story && reply.sender.is_empty() && reply.snippet.is_empty());
+        let label = if reply.story {
+            if reply.sender.is_empty() || reply.sender.eq_ignore_ascii_case("You") {
+                "Replied to your story".to_owned()
+            } else {
+                format!("Replied to {}'s story", reply.sender)
+            }
+        } else {
+            reply.sender.clone()
+        };
+        let snippet = match (gone, reply.snippet.is_empty(), reply.story) {
+            (true, _, _) => "Original message was deleted".to_owned(),
+            (false, true, true) => String::new(),
+            (false, true, false) => "Attachment".to_owned(),
+            (false, false, _) => reply.snippet.replace('\n', " "),
         };
         let face = (!gone).then(|| {
             let (_, file) = reply.person.as_ref().map(|person| self.who(person, cx)).unwrap_or_default();
@@ -2942,11 +2952,13 @@ impl Pane {
                 ),
             )
             .children(face)
-            .children((!gone).then(|| {
-                div().flex_none().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(reply.sender.clone())
+            .children((!gone && !label.is_empty()).then(|| {
+                div().flex_none().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(label)
             }))
             .children(thumb)
-            .child(div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet))
+            .children((!snippet.is_empty()).then(|| {
+                div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet)
+            }))
     }
 
     /// A channel post's footer: how many people saw it, as Telegram's apps say it. Telegram

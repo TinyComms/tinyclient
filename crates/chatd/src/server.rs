@@ -1439,6 +1439,7 @@ impl Chat {
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
             thumb: None,
+            story: false,
         });
         if let Some(draft) = &with.poll {
             let mut question = draft.question.clone();

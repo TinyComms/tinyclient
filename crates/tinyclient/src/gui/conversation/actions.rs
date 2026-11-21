@@ -2756,6 +2756,7 @@ mod tests {
             person: None,
             deleted: false,
             thumb: None,
+            story: false,
         });
         assert!(!can(&broadcast, &slack_caps(), none, channel, false, 1_100).thread, "a channel copy of a reply belongs to its parent's thread");
         let mut pending = theirs.clone();

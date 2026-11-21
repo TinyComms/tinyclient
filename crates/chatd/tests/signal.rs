@@ -3253,3 +3253,109 @@ fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
     assert_eq!(world.ask(Request::Handoff { conversation: key(&remove_cmd) }), Response::Link { url: "removed".into() });
     world.heard(&format!("sticker-pack-remove {pack_id}"));
 }
+
+#[test]
+fn stories_receive_expire_reply_react_view_post_with_distribution_lists_and_toggle_off() {
+    let mut world = World::new();
+    world.linked();
+    world.connected();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let fresh_ts = now_ms - 60_000;
+    let expired_ts = now_ms - 25 * 3_600 * 1_000;
+
+    // 1. Fresh text story from Grace lands in the "stories" conversation with a 24h expiry.
+    world.steer(&format!("story grace {fresh_ts} text replies=on bg=112233 | Good morning from the trail!"));
+    let story_msg = world.arrived("stories", &id(fresh_ts, GRACE));
+    assert_eq!(story_msg.text, "Good morning from the trail!");
+    assert_eq!(story_msg.expires_at, Some((fresh_ts / 1_000) as i64 + 86_400));
+    assert_eq!(story_msg.card.as_deref().map(|c| c.footer.as_str()), Some("Story · replies allowed"));
+
+    // 2. Story older than 24 hours is dropped immediately on arrival.
+    world.steer(&format!("story grace {expired_ts} text | Yesterday's expired story"));
+    let fresh_ts2 = fresh_ts + 1_000;
+    world.steer(&format!("story alan {fresh_ts2} text replies=off | No replies here"));
+    let alan_story = world.arrived("stories", &id(fresh_ts2, ALAN));
+    assert_eq!(alan_story.card.as_deref().map(|c| c.footer.as_str()), Some("Story · replies off"));
+    let all_stories = world.messages("stories");
+    assert!(
+        !all_stories.iter().any(|m| m.id == id(expired_ts, GRACE)),
+        "expired story (>24h old) must not be kept"
+    );
+
+    // 3. Incoming story reply in 1:1 chat sets reply_to.story == true and carries the story snippet.
+    let reply_ts = fresh_ts + 2_000;
+    world.steer(&format!("story-reply grace {reply_ts} grace {fresh_ts} Looks sunny!"));
+    let reply_msg = world.arrived(GRACE, &id(reply_ts, GRACE));
+    let rto = reply_msg.reply_to.as_ref().expect("story reply must set reply_to");
+    assert!(rto.story, "story reply must set reply_to.story = true");
+    assert_eq!(rto.id, id(fresh_ts, GRACE));
+    assert!(rto.snippet.contains("Good morning from the trail!"), "snippet: {}", rto.snippet);
+
+    // 4. Incoming story reaction lands on the story message.
+    world.steer(&format!("story-react alan grace {fresh_ts} 🔥"));
+    world.until("story reaction appears", || {
+        world
+            .messages("stories")
+            .into_iter()
+            .find(|m| m.id == id(fresh_ts, GRACE))
+            .filter(|m| m.reactions.iter().any(|r| r.emoji == "🔥"))
+    });
+
+    // 5. Viewing a story honors storyViewReceiptsEnabled (off -> receipts=false, on -> receipts=true).
+    world.steer("story-receipts off");
+    world.steer(&format!("incoming grace {} sync-fence-1", T0 + 30_000));
+    world.arrived(GRACE, &id(T0 + 30_000, GRACE));
+    let view_cmd = format!("\u{1}signal-story-view\u{1}{GRACE}|{fresh_ts}");
+    assert_eq!(world.ask(Request::Handoff { conversation: key(&view_cmd) }), Response::Link { url: "viewed".into() });
+    world.heard(&format!("viewed receipts=false {fresh_ts}-{GRACE}"));
+
+    world.steer("story-receipts on");
+    world.steer(&format!("incoming grace {} sync-fence-2", T0 + 31_000));
+    world.arrived(GRACE, &id(T0 + 31_000, GRACE));
+    assert_eq!(world.ask(Request::Handoff { conversation: key(&view_cmd) }), Response::Link { url: "viewed".into() });
+    world.heard(&format!("viewed receipts=true {fresh_ts}-{GRACE}"));
+
+    // 6. Replying to a story that allows replies succeeds & records reply_to.story == true;
+    //    replying to a story with allows_replies == false is refused.
+    let reply_cmd = format!("\u{1}signal-story-reply\u{1}{GRACE}|{fresh_ts}||Awesome view!");
+    assert!(matches!(world.ask(Request::Handoff { conversation: key(&reply_cmd) }), Response::Link { .. }));
+    world.heard(&format!("send {GRACE} story-reply {fresh_ts}-{GRACE} Awesome view!"));
+
+    let blocked_reply_cmd = format!("\u{1}signal-story-reply\u{1}{ALAN}|{fresh_ts2}||Should fail");
+    assert!(
+        matches!(world.ask(Request::Handoff { conversation: key(&blocked_reply_cmd) }), Response::Error { .. }),
+        "reply to a story with replies=off must be refused"
+    );
+
+    // 7. Distribution lists enforce allowlist / blocklist privacy when posting a story.
+    // Blocklist excluding Alan -> only Grace receives it (never Alan).
+    world.steer("story-list 00000000000000000000000000000000 My_Story block replies=on alan");
+    world.steer("story-list 11111111111111111111111111111111 Close_Friends allow replies=on alan");
+    world.steer(&format!("incoming grace {} sync-fence-3", T0 + 32_000));
+    world.arrived(GRACE, &id(T0 + 32_000, GRACE));
+
+    let post_my = format!("\u{1}signal-story-post\u{1}My Story|1|224488|Hello My Story");
+    assert!(matches!(world.ask(Request::Handoff { conversation: key(&post_my) }), Response::Link { .. }));
+    world.heard(&format!("post-story recipients={GRACE} replies=true text=Hello My Story"));
+
+    let post_close = format!("\u{1}signal-story-post\u{1}Close Friends|0|aa3344|Secret update");
+    assert!(matches!(world.ask(Request::Handoff { conversation: key(&post_close) }), Response::Link { .. }));
+    world.heard(&format!("post-story recipients={ALAN} replies=false text=Secret update"));
+
+    // 8. Turning stories off removes the stories feed, drops incoming stories, and refuses posting.
+    let toggle_off = "\u{1}signal-story-toggle\u{1}off";
+    assert_eq!(world.ask(Request::Handoff { conversation: key(toggle_off) }), Response::Link { url: "stories_off".into() });
+    let after_off_ts = fresh_ts + 5_000;
+    world.steer(&format!("story grace {after_off_ts} text | Should be ignored"));
+    world.steer(&format!("incoming grace {} sync-fence-4", T0 + 33_000));
+    world.arrived(GRACE, &id(T0 + 33_000, GRACE));
+    assert!(world.messages("stories").is_empty(), "incoming stories must be dropped when stories are off");
+    assert!(
+        matches!(world.ask(Request::Handoff { conversation: key(&post_my) }), Response::Error { .. }),
+        "posting a story must be refused when stories are off"
+    );
+}

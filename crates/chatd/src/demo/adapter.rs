@@ -119,6 +119,7 @@ impl Demo {
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
             thumb: None,
+            story: false,
         });
         message
     }

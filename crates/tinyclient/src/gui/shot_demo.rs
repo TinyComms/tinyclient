@@ -362,6 +362,7 @@ fn carpool(key: &Key) -> Vec<Message> {
         person: Some(Key::new(&key.account(), ME)),
         deleted: false,
         thumb: None,
+        story: false,
     });
     let i = at(&mut all, "m17");
     all[i].attachments = vec![Attachment {

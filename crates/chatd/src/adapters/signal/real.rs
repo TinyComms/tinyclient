@@ -13,7 +13,8 @@ use super::wire::{
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
     Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
-    StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
+    StorageAccount, StorageContact, StorageGroup, StorageSnapshot, StoryContext, StoryDistributionList,
+    StoryMessageData, StoryText, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -932,6 +933,7 @@ impl Session {
         let mut groups = Vec::new();
         let mut account_record: Option<StorageAccount> = None;
         let mut folders = Vec::new();
+        let mut distribution_lists = Vec::new();
         for record in records {
             match record.record {
                 Some(storage_record::Record::Contact(contact)) => {
@@ -1031,12 +1033,44 @@ impl Session {
                             _ => {}
                         }
                     }
+                    let story_view_receipts = match presage::proto::OptionalBool::try_from(account.story_view_receipts_enabled) {
+                        Ok(presage::proto::OptionalBool::Enabled) => Some(true),
+                        Ok(presage::proto::OptionalBool::Disabled) => Some(false),
+                        _ => None,
+                    };
                     account_record = Some(StorageAccount {
                         pinned: pins,
                         keep_muted_archived: Some(account.keep_muted_chats_archived),
                         link_previews: Some(account.link_previews),
                         universal_expire_timer: account.universal_expire_timer,
                         note_to_self_marked_unread: account.note_to_self_marked_unread,
+                        stories_disabled: Some(account.stories_disabled),
+                        story_view_receipts,
+                    });
+                }
+                Some(storage_record::Record::StoryDistributionList(list)) => {
+                    if list.deleted_at_timestamp != 0 {
+                        continue;
+                    }
+                    let mut recipients: Vec<String> = Vec::new();
+                    for raw in list.recipient_service_ids {
+                        if super::wire::is_aci(&raw) && !recipients.contains(&raw) {
+                            recipients.push(raw);
+                        }
+                    }
+                    for raw in list.recipient_service_ids_binary {
+                        if let Some(aci) = aci_bytes(&raw) {
+                            if !recipients.contains(&aci) {
+                                recipients.push(aci);
+                            }
+                        }
+                    }
+                    distribution_lists.push(StoryDistributionList {
+                        id: hex(&list.identifier),
+                        name: list.name,
+                        recipients,
+                        allows_replies: list.allows_replies,
+                        is_block_list: list.is_block_list,
                     });
                 }
                 Some(storage_record::Record::ChatFolder(folder)) => {
@@ -1081,11 +1115,12 @@ impl Session {
                 _ => {}
             }
         }
-        if !contacts.is_empty() || !groups.is_empty() || account_record.is_some() {
+        if !contacts.is_empty() || !groups.is_empty() || account_record.is_some() || !distribution_lists.is_empty() {
             self.tell(Event::StorageSync(StorageSnapshot {
                 contacts,
                 groups,
                 account: account_record,
+                distribution_lists,
             }));
         }
         if !folders.is_empty() {
@@ -1378,6 +1413,16 @@ impl Session {
                 image_height,
             });
         }
+        let story_context = message.story_context.as_ref().and_then(|ctx| {
+            let author = ctx
+                .author_aci
+                .as_deref()
+                .filter(|a| super::wire::is_aci(a))
+                .map(str::to_owned)
+                .or_else(|| ctx.author_aci_binary.as_deref().and_then(aci_bytes))?;
+            let sent = ctx.sent_timestamp.filter(|&ts| ts > 0)?;
+            Some(StoryContext { author, sent })
+        });
         Text {
             author: author.to_owned(),
             name,
@@ -1393,6 +1438,7 @@ impl Session {
             previews,
             attachments,
             sticker,
+            story_context,
         }
     }
 
@@ -1430,6 +1476,27 @@ impl Session {
             return;
         }
         if let Some(reaction) = &message.reaction {
+            if let Some(ctx) = &message.story_context {
+                let story_author = ctx
+                    .author_aci
+                    .as_deref()
+                    .filter(|a| super::wire::is_aci(a))
+                    .map(str::to_owned)
+                    .or_else(|| ctx.author_aci_binary.as_deref().and_then(aci_bytes))
+                    .unwrap_or_default();
+                let story_sent = ctx.sent_timestamp.unwrap_or(0);
+                if !story_author.is_empty() && story_sent > 0 {
+                    self.tell(Event::StoryReaction {
+                        peer,
+                        by: author.to_owned(),
+                        story_author,
+                        story_sent,
+                        emoji: reaction.emoji.clone().unwrap_or_default(),
+                        removed: reaction.remove.unwrap_or(false),
+                    });
+                    return;
+                }
+            }
             let target_author = reaction.target_author_aci.clone().unwrap_or_default();
             self.tell(Event::Reacted {
                 peer,
@@ -1556,8 +1623,85 @@ impl Session {
                 self.tell(Event::Typing { peer, by: sender, name, started });
             }
             ContentBody::CallMessage(message) => self.call_message(message, sender, sent).await,
+            ContentBody::StoryMessage(story) => {
+                let outgoing = sender == self.me;
+                self.story_message(story, &sender, sent, outgoing).await;
+            }
             _ => {}
         }
+    }
+
+    async fn story_message(&mut self, story: presage::proto::StoryMessage, author: &str, sent: u64, outgoing: bool) {
+        let group_id = story
+            .group
+            .as_ref()
+            .and_then(|g| g.master_key.as_deref())
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+            .map(|k| group_id(&k));
+        let name = if author == self.me { String::new() } else { self.name_of(author).await };
+        let allows_replies = story.allows_replies.unwrap_or(true);
+        let (file, text) = match story.attachment {
+            Some(presage::proto::story_message::Attachment::FileAttachment(ptr)) => {
+                (Some(pointer_of(&ptr)).filter(Pointer::downloadable), None)
+            }
+            Some(presage::proto::story_message::Attachment::TextAttachment(ta)) => {
+                let style = ta
+                    .text_style
+                    .and_then(|v| presage::proto::text_attachment::Style::try_from(v).ok())
+                    .map(|s| s.as_str_name().to_owned())
+                    .unwrap_or_else(|| "DEFAULT".to_owned());
+                let (bg_color, gradient_colors) = match ta.background {
+                    Some(presage::proto::text_attachment::Background::Color(c)) => (c, Vec::new()),
+                    Some(presage::proto::text_attachment::Background::Gradient(g)) => {
+                        let first = g.colors.first().copied().or(g.start_color).unwrap_or(0);
+                        let colors = if !g.colors.is_empty() {
+                            g.colors
+                        } else {
+                            g.start_color.into_iter().chain(g.end_color).collect()
+                        };
+                        (first, colors)
+                    }
+                    None => (ta.text_background_color.unwrap_or(0), Vec::new()),
+                };
+                let preview = ta.preview.and_then(|p| {
+                    let url = p.url.unwrap_or_default();
+                    if !(url.starts_with("https://") || url.starts_with("http://")) {
+                        return None;
+                    }
+                    Some(LinkPreview {
+                        url,
+                        title: p.title.unwrap_or_default(),
+                        description: p.description.unwrap_or_default(),
+                        date: p.date.unwrap_or(0),
+                        image: None,
+                        image_width: 0,
+                        image_height: 0,
+                    })
+                });
+                (
+                    None,
+                    Some(StoryText {
+                        text: ta.text.unwrap_or_default(),
+                        style,
+                        fg_color: ta.text_foreground_color.unwrap_or(0xffff_ffff),
+                        bg_color,
+                        gradient_colors,
+                        preview,
+                    }),
+                )
+            }
+            None => return,
+        };
+        self.tell(Event::Story(StoryMessageData {
+            author: author.to_owned(),
+            name,
+            sent,
+            group_id,
+            allows_replies,
+            file,
+            text,
+            outgoing,
+        }));
     }
 
     /// A call. The offer rings, and the hangup or busy with its id ends the ring. An offer of
@@ -1593,6 +1737,10 @@ impl Session {
                 let peer = self.peer(message.group_v2.as_ref(), destination.as_deref().unwrap_or(&me)).await;
                 let at = sent.timestamp.or(message.timestamp).unwrap_or(0);
                 self.data(message, &me, peer, at, true).await;
+            }
+            if let Some(story) = &sent.story_message {
+                let at = sent.timestamp.unwrap_or_else(now_ms);
+                self.story_message(story.clone(), &me, at, true).await;
             }
             if let Some(EditMessage { target_sent_timestamp, data_message: Some(message) }) = &sent.edit_message {
                 let peer = self.peer(message.group_v2.as_ref(), destination.as_deref().unwrap_or(&me)).await;
@@ -3233,6 +3381,113 @@ impl Session {
                     expire_timer_version: (timer.version > 0).then_some(timer.version),
                     ..Default::default()
                 })
+            }
+            Body::StoryReply { story_author, story_sent, text, ranges, timer } => {
+                let author_bin = Uuid::parse_str(&story_author).ok().map(|u| u.as_bytes().to_vec());
+                ContentBody::DataMessage(DataMessage {
+                    body: Some(text),
+                    body_ranges: proto_ranges(&ranges),
+                    story_context: Some(data_message::StoryContext {
+                        author_aci: Some(story_author),
+                        author_aci_binary: author_bin,
+                        sent_timestamp: Some(story_sent),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
+                    ..Default::default()
+                })
+            }
+            Body::StoryReact { story_author, story_sent, emoji, remove } => {
+                let author_bin = Uuid::parse_str(&story_author).ok().map(|u| u.as_bytes().to_vec());
+                ContentBody::DataMessage(DataMessage {
+                    reaction: Some(data_message::Reaction {
+                        emoji: Some(emoji),
+                        remove: Some(remove),
+                        target_author_aci: Some(story_author.clone()),
+                        target_sent_timestamp: Some(story_sent),
+                        ..Default::default()
+                    }),
+                    story_context: Some(data_message::StoryContext {
+                        author_aci: Some(story_author),
+                        author_aci_binary: author_bin,
+                        sent_timestamp: Some(story_sent),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
+            Body::PostStory { recipients, group_id, text, file, allows_replies } => {
+                let attachment = if let Some(file) = file {
+                    let name = file.name.clone();
+                    let spec = AttachmentSpec {
+                        content_type: file.mime,
+                        length: file.bytes.len(),
+                        file_name: Some(name.clone()),
+                        width: (file.width > 0).then_some(file.width),
+                        height: (file.height > 0).then_some(file.height),
+                        blur_hash: file.blurhash,
+                        ..AttachmentSpec::default()
+                    };
+                    let uploaded = self.manager.upload_attachment(spec, file.bytes).await.map_err(fault)?;
+                    let pointer = uploaded.map_err(|err| attachment_refused(&name, &err))?;
+                    Some(presage::proto::story_message::Attachment::FileAttachment(pointer))
+                } else if let Some(st) = text {
+                    let style = presage::proto::text_attachment::Style::from_str_name(&st.style)
+                        .unwrap_or(presage::proto::text_attachment::Style::Default);
+                    let background = if st.gradient_colors.len() >= 2 {
+                        Some(presage::proto::text_attachment::Background::Gradient(
+                            presage::proto::text_attachment::Gradient {
+                                start_color: st.gradient_colors.first().copied(),
+                                end_color: st.gradient_colors.last().copied(),
+                                angle: Some(180),
+                                colors: st.gradient_colors,
+                                positions: Vec::new(),
+                            },
+                        ))
+                    } else {
+                        Some(presage::proto::text_attachment::Background::Color(st.bg_color))
+                    };
+                    Some(presage::proto::story_message::Attachment::TextAttachment(
+                        presage::proto::TextAttachment {
+                            text: Some(st.text),
+                            text_style: Some(style.into()),
+                            text_foreground_color: Some(st.fg_color),
+                            text_background_color: None,
+                            preview: st.preview.map(|p| presage::proto::Preview {
+                                url: Some(p.url),
+                                title: (!p.title.is_empty()).then_some(p.title),
+                                description: (!p.description.is_empty()).then_some(p.description),
+                                date: (p.date > 0).then_some(p.date),
+                                image: None,
+                            }),
+                            background,
+                        },
+                    ))
+                } else {
+                    return Err(Fault::Refused("A story needs text or a photo/video.".to_owned()));
+                };
+                let story_group = match &group_id {
+                    Some(gid) => self.group_context(&Peer::Group(gid.clone()))?,
+                    None => None,
+                };
+                let story_msg = presage::proto::StoryMessage {
+                    profile_key: Some(self.manager.registration_data().profile_key().bytes.to_vec()),
+                    group: story_group,
+                    allows_replies: Some(allows_replies),
+                    body_ranges: Vec::new(),
+                    attachment,
+                };
+                if let Some(gid) = group_id {
+                    self.deliver(&Peer::Group(gid), ContentBody::StoryMessage(story_msg), at).await?;
+                } else {
+                    for aci in recipients {
+                        let _ = self.deliver(&Peer::Direct(aci), ContentBody::StoryMessage(story_msg.clone()), at).await;
+                    }
+                }
+                return Ok(at);
             }
         };
         self.deliver(to, content, at).await?;

@@ -260,6 +260,10 @@ pub struct ReplyTo {
     /// Thumbnail of a quoted picture or video (`Quote.attachments` on Signal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb: Option<MediaFile>,
+    /// True when this message answers a Story (`DataMessage.story_context` on Signal, or a
+    /// Telegram story reply) rather than a regular message in the conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub story: bool,
 }
 
 /// The thread hanging off this message. Its replies are not in the conversation's own pages.
@@ -1118,10 +1122,20 @@ mod tests {
             person: None,
             deleted: false,
             thumb: Some(MediaFile::new("signal:quote:1", MediaKind::Image)),
+            story: false,
         });
         assert_eq!(msg.files().count(), 1);
         assert_eq!(msg.files().next().unwrap().id, "signal:quote:1");
         let wire = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&wire).unwrap().reply_to, msg.reply_to);
+
+        // Story reply flag is backward-compatible and omitted when false.
+        assert!(!parsed.story);
+        assert!(!serde_json::to_string(&parsed).unwrap().contains("story"));
+        let mut story_reply = parsed;
+        story_reply.story = true;
+        let story_wire = serde_json::to_string(&story_reply).unwrap();
+        assert!(story_wire.contains(r#""story":true"#));
+        assert!(serde_json::from_str::<ReplyTo>(&story_wire).unwrap().story);
     }
 }
