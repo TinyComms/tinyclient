@@ -94,6 +94,8 @@ pub struct Known {
     pub contact: bool,
     /// A channel proper: only its owners post.
     pub broadcast: bool,
+    /// A supergroup. Telegram still addresses it as a channel. The groups auto-download gate uses this.
+    pub megagroup: bool,
     pub forum: bool,
     /// Membership from a full chat description. A partial channel does not say.
     pub member: Option<bool>,
@@ -327,6 +329,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 name: channel.title.clone(),
                 handle: first_username(&channel.username, &channel.usernames),
                 broadcast: channel.broadcast,
+                megagroup: channel.megagroup,
                 forum: channel.forum,
                 member: (!channel.min).then_some(!channel.left),
                 read_only: channel.left || restricted,
@@ -352,6 +355,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 hash: Some(channel.access_hash),
                 name: channel.title.clone(),
                 broadcast: channel.broadcast,
+                megagroup: channel.megagroup,
                 member: Some(false),
                 read_only: true,
                 ..Known::default()
@@ -399,13 +403,16 @@ pub struct DownloadRules {
 impl DownloadRules {
     /// Whether a full file that would otherwise wait for the viewer should be fetched now.
     /// A zero size, a chat kind that is off, or a cap of zero stays held.
-    pub fn fetch_full(self, who: Who, class: DownloadClass, bytes: u64) -> bool {
+    /// `megagroup` is Telegram's flag on a channel. A supergroup follows the groups gate.
+    /// A broadcast channel follows the channels gate.
+    pub fn fetch_full(self, who: Who, megagroup: bool, class: DownloadClass, bytes: u64) -> bool {
         if bytes == 0 {
             return false;
         }
         let chat_on = match who {
             Who::User(_) => self.private_chats,
             Who::Group(_) => self.groups,
+            Who::Channel(_) if megagroup => self.groups,
             Who::Channel(_) => self.channels,
         };
         if !chat_on {
@@ -424,7 +431,8 @@ impl DownloadRules {
 pub struct Directory {
     map: HashMap<Who, Known>,
     pub me: i64,
-    /// Honored when a message's full file is classified. Off until settings are read.
+    /// Honored when a message's full file is classified. The stored gates are applied when the
+    /// account connects, before a message is mapped. Until then every gate is off.
     pub download: DownloadRules,
 }
 
@@ -711,6 +719,9 @@ mod tests {
     #[test]
     fn a_megagroup_members_cannot_post_in_is_read_only_and_its_admins_still_can() {
         let mut members = megagroup("/g/'s Tech Memes Chat");
+        let (_, known) = of_chat(&members.clone().into()).expect("a megagroup");
+        assert!(known.megagroup);
+        assert!(!known.broadcast);
         members.default_banned_rights = Some(ban_send(0));
         assert!(read_only(members.clone().into()));
 

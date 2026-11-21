@@ -594,6 +594,8 @@ struct World {
     download: [tl::types::AutoDownloadSettings; 3],
     /// The next `account.saveAutoDownloadSettings` returns `PREMIUM_ACCOUNT_REQUIRED`.
     download_refuse: bool,
+    /// `account.getAutoDownloadSettings` fails, so a save must not write a preset.
+    download_unread: bool,
     /// Channel id this account's one boost slot is applied to.
     boost_peer: Option<i64>,
     boost_level: i32,
@@ -693,9 +695,15 @@ impl World {
             download: [
                 download_preset(true, 0, 0, 0),
                 download_preset(false, 102_400, 512_000, 0),
-                download_preset(false, 1_048_576, 10_485_760, 1_048_576),
+                {
+                    let mut high = download_preset(false, 1_048_576, 10_485_760, 1_048_576);
+                    high.video_preload_large = true;
+                    high.video_upload_maxbitrate = 64;
+                    high
+                },
             ],
             download_refuse: false,
+            download_unread: false,
             boost_peer: None,
             boost_level: 3,
             boost_count: 12,
@@ -1660,6 +1668,10 @@ impl World {
             }
             "autodownload-refuse" => {
                 self.download_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "autodownload-unread" => {
+                self.download_unread = words.next().map_or(true, |v| v != "0" && v != "off");
                 Vec::new()
             }
             "boost-refuse" => {
@@ -2990,6 +3002,10 @@ impl World {
             return answer(tl::enums::account::PrivacyRules::Rules(found));
         }
         if asked::<f::account::GetAutoDownloadSettings>(body).is_some() {
+            if self.download_unread {
+                self.log("account.getAutoDownloadSettings unread");
+                return Err(rpc(400, "CONNECTION_NOT_INITED", None));
+            }
             self.log("account.getAutoDownloadSettings");
             let found = tl::types::account::AutoDownloadSettings {
                 low: tl::enums::AutoDownloadSettings::Settings(self.download[0].clone()),
@@ -3007,8 +3023,9 @@ impl World {
             let slot = if request.low { 0 } else if request.high { 2 } else { 1 };
             let which = ["low", "medium", "high"][slot];
             self.log(&format!(
-                "account.saveAutoDownloadSettings {which} photo={} video={} file={}",
-                settings.photo_size_max, settings.video_size_max, settings.file_size_max
+                "account.saveAutoDownloadSettings {which} photo={} video={} file={} preload={} bitrate={}",
+                settings.photo_size_max, settings.video_size_max, settings.file_size_max,
+                u8::from(settings.video_preload_large), settings.video_upload_maxbitrate
             ));
             self.download[slot] = settings.clone();
             return answer(true);

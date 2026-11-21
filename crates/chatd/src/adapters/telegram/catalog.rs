@@ -84,7 +84,7 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
     };
     let mut wants = Vec::new();
     // A picker tile is a still. Default rules keep the full file held until a message shows it.
-    let attachment = content::document(&media, document, &mut wants, Who::User(0), DownloadRules::default());
+    let attachment = content::document(&media, document, &mut wants, Who::User(0), false, DownloadRules::default());
     let name = document.attributes.iter().find_map(|attribute| match attribute {
         tl::enums::DocumentAttribute::Sticker(sticker) => Some(sticker.alt.clone()),
         _ => None,

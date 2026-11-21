@@ -3625,7 +3625,7 @@ fn privacy_last_seen_sets_contacts_with_one_exception_and_a_premium_refusal() {
 #[test]
 fn auto_download_reads_wifi_limits_and_refuses_a_save() {
     use protocol::{AutoDownload, AutoDownloadPreset, ErrorCode};
-    let world = World::signed_in();
+    let mut world = World::signed_in();
     world.connected();
 
     let Response::AutoDownload { settings } = world.ask(Request::GetAutoDownload { account: account() }) else {
@@ -3648,12 +3648,30 @@ fn auto_download_reads_wifi_limits_and_refuses_a_save() {
     assert!(saved.fetch_full_photos && saved.private_chats);
     assert_eq!(saved.wifi.photo_size_max, 2_048);
     assert!(
-        world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings high photo=2048 video=8192 file=4096")),
-        "expected the wifi preset on the wire, got: {:#?}",
+        world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings high photo=2048 video=8192 file=4096 preload=1 bitrate=64")),
+        "expected the wifi preset to keep the preload flag, got: {:#?}",
         world.calls()
     );
     assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings low ")));
     assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings medium ")));
+
+    let saves = world.called("account.saveAutoDownloadSettings");
+    world.steer("autodownload-unread");
+    match world.ask(Request::SetAutoDownload { account: account(), settings: AutoDownload::default() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("CONNECTION_NOT_INITED"), "{detail}");
+        }
+        other => panic!("expected an unread preset to refuse the save, got {other:?}"),
+    }
+    assert_eq!(world.called("account.saveAutoDownloadSettings"), saves, "an unread preset is not overwritten: {:#?}", world.calls());
+
+    world.restart();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.steer("photo");
+    world.until("the saved private-chat gate to fetch the photo without opening settings", || {
+        (world.called("GetFile photo 6014 y") > 0).then_some(())
+    });
 
     world.steer("autodownload-refuse");
     let refused = world.ask(Request::SetAutoDownload {

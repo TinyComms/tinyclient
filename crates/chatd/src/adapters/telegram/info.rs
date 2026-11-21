@@ -900,33 +900,33 @@ fn preset_from(settings: &tl::enums::AutoDownloadSettings) -> protocol::AutoDown
     }
 }
 
-fn preset_to(preset: &protocol::AutoDownloadPreset) -> tl::enums::AutoDownloadSettings {
-    tl::enums::AutoDownloadSettings::Settings(tl::types::AutoDownloadSettings {
-        disabled: preset.disabled,
-        video_preload_large: false,
-        audio_preload_next: false,
-        phonecalls_less_data: false,
-        stories_preload: false,
-        photo_size_max: preset.photo_size_max.clamp(0, i64::from(i32::MAX)) as i32,
-        video_size_max: preset.video_size_max.max(0),
-        file_size_max: preset.file_size_max.max(0),
-        video_upload_maxbitrate: 0,
-        small_queue_active_operations_max: 0,
-        large_queue_active_operations_max: 0,
-    })
+/// Writes the four fields this app edits onto the preset Telegram already has.
+/// Preload, call, story, bitrate and queue fields stay as they were read.
+fn preset_to(current: &tl::types::AutoDownloadSettings, preset: &protocol::AutoDownloadPreset) -> tl::enums::AutoDownloadSettings {
+    let mut settings = current.clone();
+    settings.disabled = preset.disabled;
+    settings.photo_size_max = preset.photo_size_max.clamp(0, i64::from(i32::MAX)) as i32;
+    settings.video_size_max = preset.video_size_max.max(0);
+    settings.file_size_max = preset.file_size_max.max(0);
+    tl::enums::AutoDownloadSettings::Settings(settings)
+}
+
+fn wifi_caps(preset: &protocol::AutoDownloadPreset) -> (u64, u64, u64) {
+    let cap = |bytes: i64| if preset.disabled { 0 } else { bytes.max(0) as u64 };
+    (cap(preset.photo_size_max), cap(preset.video_size_max), cap(preset.file_size_max))
 }
 
 /// This desktop uses the Wi-Fi preset. Chat-kind gates stay local and default off.
 fn rules_of(settings: &protocol::AutoDownload) -> super::peers::DownloadRules {
-    let cap = |bytes: i64| if settings.wifi.disabled { 0 } else { bytes.max(0) as u64 };
+    let (photo_max, video_max, file_max) = wifi_caps(&settings.wifi);
     super::peers::DownloadRules {
         fetch_full_photos: settings.fetch_full_photos,
         private_chats: settings.private_chats,
         groups: settings.groups,
         channels: settings.channels,
-        photo_max: cap(settings.wifi.photo_size_max),
-        video_max: cap(settings.wifi.video_size_max),
-        file_max: cap(settings.wifi.file_size_max),
+        photo_max,
+        video_max,
+        file_max,
     }
 }
 
@@ -942,6 +942,25 @@ fn local_gates(account: &Account) -> (bool, bool, bool, bool) {
 
 fn remember_download(account: &Account, settings: &protocol::AutoDownload) {
     account.dir().download = rules_of(settings);
+}
+
+/// The stored chat-kind gates, plus the Wi-Fi caps when Telegram answers.
+/// A miss leaves the caps off and still applies the gates. Sign-on calls this before any
+/// message is mapped, so a restart does not wait for the Accounts page.
+pub(super) fn load_remembered_download(account: &Account) {
+    let (fetch_full_photos, private_chats, groups, channels) = local_gates(account);
+    let mut rules = super::peers::DownloadRules {
+        fetch_full_photos,
+        private_chats,
+        groups,
+        channels,
+        ..super::peers::DownloadRules::default()
+    };
+    if let Ok(tl::enums::account::AutoDownloadSettings::Settings(got)) = account.ask(&tl::functions::account::GetAutoDownloadSettings {}) {
+        let (photo_max, video_max, file_max) = wifi_caps(&preset_from(&got.high));
+        (rules.photo_max, rules.video_max, rules.file_max) = (photo_max, video_max, file_max);
+    }
+    account.dir().download = rules;
 }
 
 /// Reads `account.getAutoDownloadSettings` and the local chat-kind gates.
@@ -962,14 +981,18 @@ pub(super) fn get_auto_download(account: &Account) -> Result<protocol::AutoDownl
 }
 
 /// Writes each preset with `account.saveAutoDownloadSettings` and stores the local gates.
+/// The cloud preset is read first. Only `disabled` and the three size caps change.
+/// When that read fails, nothing is written over the preset.
 pub(super) fn set_auto_download(account: &Account, settings: &protocol::AutoDownload) -> Result<protocol::AutoDownload, Fault> {
-    let save = |low: bool, high: bool, preset: &protocol::AutoDownloadPreset| -> Result<(), Fault> {
-        let _: bool = account.ask(&tl::functions::account::SaveAutoDownloadSettings { low, high, settings: preset_to(preset) })?;
+    let tl::enums::account::AutoDownloadSettings::Settings(got) = account.ask(&tl::functions::account::GetAutoDownloadSettings {})?;
+    let save = |low: bool, high: bool, current: &tl::enums::AutoDownloadSettings, preset: &protocol::AutoDownloadPreset| -> Result<(), Fault> {
+        let tl::enums::AutoDownloadSettings::Settings(current) = current;
+        let _: bool = account.ask(&tl::functions::account::SaveAutoDownloadSettings { low, high, settings: preset_to(current, preset) })?;
         Ok(())
     };
-    save(true, false, &settings.roaming)?;
-    save(false, false, &settings.mobile)?;
-    save(false, true, &settings.wifi)?;
+    save(true, false, &got.low, &settings.roaming)?;
+    save(false, false, &got.medium, &settings.mobile)?;
+    save(false, true, &got.high, &settings.wifi)?;
     use protocol::settings::{TELEGRAM_DOWNLOAD_CHANNELS, TELEGRAM_DOWNLOAD_GROUPS, TELEGRAM_DOWNLOAD_PHOTOS, TELEGRAM_DOWNLOAD_PRIVATE};
     account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_PHOTOS, settings.fetch_full_photos);
     account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_PRIVATE, settings.private_chats);

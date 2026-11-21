@@ -421,6 +421,9 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
         let tl::enums::PeerNotifySettings::Settings(settings) = account.ask(&tl::functions::account::GetNotifySettings { peer })?;
         account.live().muted[index] = settings.mute_until.is_some_and(filing::mute_holds);
     }
+    // Before the dialog list maps its newest messages. The stored gates apply without
+    // the Accounts page, and the Wi-Fi caps come with them when Telegram answers.
+    super::info::load_remembered_download(account);
     dialogs(account)?;
     // An earlier build kept every chat in one invented Space. The rows read just now have left
     // it; what is left (chats past the newest 500) goes with it, and comes back on scroll.

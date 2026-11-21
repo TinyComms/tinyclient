@@ -1984,22 +1984,34 @@ impl Render for Pane {
     /// The latest reply keyboard while `key` is the open conversation.
     /// A selective one stays hidden unless it mentions the reader or answers one of theirs,
     /// and an older keyboard is not used in its place.
+    /// An empty keyboard is a hide: it clears what is showing. A message with no reply
+    /// markup is skipped, so the keyboard before it stays. A selective hide that is not
+    /// for the reader is skipped the same way.
     pub(super) fn reply_keyboard(&self, key: &Key) -> Option<(String, protocol::ReplyKeyboard)> {
         let open = self.open.as_ref()?;
         if &open.key != key {
             return None;
         }
-        let message = self.window.messages.iter().rev().find(|message| message.keyboard.is_some())?;
-        let board = message.keyboard.clone()?;
-        if board.selective {
+        for message in self.window.messages.iter().rev() {
+            let Some(board) = message.keyboard.as_ref() else {
+                continue;
+            };
             let answers_me = message.reply_to.as_ref().is_some_and(|reply| {
                 self.window.messages.iter().any(|held| held.id == reply.id && held.outgoing)
             });
-            if !message.mentions_me && !answers_me {
+            let for_me = message.mentions_me || answers_me;
+            if board.rows.is_empty() {
+                if board.selective && !for_me {
+                    continue;
+                }
                 return None;
             }
+            if board.selective && !for_me {
+                return None;
+            }
+            return Some((message.id.clone(), board.clone()));
         }
-        Some((message.id.clone(), board))
+        None
     }
 
     /// Start belongs on an empty bot chat. A thread, or a window that still has older history, has none.
