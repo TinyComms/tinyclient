@@ -304,7 +304,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn activate_home(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(super) fn activate_home(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.sidebar_state.home_items.get(ix).cloned() else {
             return;
         };
@@ -332,8 +332,9 @@ impl Shell {
                 if !account.is_empty() && !conversation.is_empty() {
                     return self.select(Key { network: Network::Teams, account, id: conversation }, &title, cx);
                 }
-                if join.starts_with("https://") || join.starts_with("http://") {
-                    cx.open_url(&join);
+                if join.starts_with("https://") {
+                    let pane = self.pane(cx);
+                    pane.update(cx, |pane, cx| pane.open_external_link(&join, window, cx));
                 }
                 return;
             }
@@ -433,7 +434,9 @@ impl Shell {
         };
         let focused = self.sidebar_state.listed() && self.sidebar_state.cursor == Some(ix) && (self.sidebar_state.focus.is_focused(window) || self.focus.is_focused(window));
         let network = self.sidebar_state.home.network;
-        let click = |row: Stateful<Div>, cx: &mut Context<Self>| self.tap(row, crate::gui::phone::token(&["home-item", &ix.to_string()]), None, move |this, cx| this.activate_home(ix, cx), cx);
+        let click = |row: Stateful<Div>, cx: &mut Context<Self>| {
+            self.tap(row, crate::gui::phone::token(&["home-item", &ix.to_string()]), None, move |this, window, cx| this.activate_home(ix, window, cx), cx)
+        };
         match item {
             Item::Header { label, first } => section_header(label, first).into_any_element(),
             Item::Chat(c) => {
@@ -523,10 +526,13 @@ impl Shell {
                 let line = crate::gui::time::meeting_display(&event, now());
                 let title = event.title.clone();
                 let join = event.join_url.clone();
-                let join_btn = (join.starts_with("https://") || join.starts_with("http://")).then(|| {
+                let join_btn = join.starts_with("https://").then(|| {
                     button(("home-meet-join", ix), ButtonKind::Secondary, "Join")
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(move |_, _, cx| cx.open_url(&join))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let pane = this.pane(cx);
+                            pane.update(cx, |pane, cx| pane.open_external_link(&join, window, cx));
+                        }))
                 });
                 let content = div()
                     .gap(px(8.))
@@ -714,7 +720,7 @@ impl Shell {
                 if crate::gui::phone::active() {
                     let token = crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]);
                     let menu = Some(picked.clone());
-                    return self.tap(row, token, menu, move |this, cx| this.pick_row(&picked, cx), cx);
+                    return self.tap(row, token, menu, move |this, _, cx| this.pick_row(&picked, cx), cx);
                 }
                 row.on_mouse_down(
                     MouseButton::Left,

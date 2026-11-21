@@ -726,12 +726,12 @@ fn response_of(item: &Value) -> MeetingResponse {
 fn join_of(teams_host: &str, urls: &[String], conversation: &str) -> String {
     let preferred = urls.iter().find(|url| {
         let lower = url.to_ascii_lowercase();
-        valid_http_url(url).is_some() && (lower.contains("meetup-join") || lower.contains("teams.microsoft"))
+        valid_https_url(url).is_some() && (lower.contains("meetup-join") || lower.contains("teams.microsoft"))
     });
-    if let Some(url) = preferred.and_then(|url| valid_http_url(url)) {
+    if let Some(url) = preferred.and_then(|url| valid_https_url(url)) {
         return url;
     }
-    if let Some(url) = urls.iter().find_map(|url| valid_http_url(url)) {
+    if let Some(url) = urls.iter().find_map(|url| valid_https_url(url)) {
         return url;
     }
     if conversation.starts_with("19:meeting_") {
@@ -820,9 +820,9 @@ fn local_parts(unix: i64) -> Option<(i32, i32)> {
     }
 }
 
-fn valid_http_url(url: &str) -> Option<String> {
+fn valid_https_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
-    (trimmed.starts_with("https://") || trimmed.starts_with("http://")).then(|| trimmed.to_owned())
+    trimmed.starts_with("https://").then(|| trimmed.to_owned())
 }
 
 fn classify_tab(app_id: &str, app_name: &str, display_name: &str) -> (&'static str, String) {
@@ -884,13 +884,13 @@ fn parse_tabs(teams_host: &str, thread: &str, channel_link: &str, raw_tabs: &[Va
         let content_url = config["contentUrl"]
             .as_str()
             .or_else(|| item["contentUrl"].as_str())
-            .and_then(valid_http_url)
+            .and_then(valid_https_url)
             .unwrap_or_default();
         let mut web_url = item["webUrl"]
             .as_str()
             .or_else(|| config["websiteUrl"].as_str())
             .or_else(|| item["websiteUrl"].as_str())
-            .and_then(valid_http_url)
+            .and_then(valid_https_url)
             .unwrap_or_default();
         if web_url.is_empty() {
             if !content_url.is_empty() && kind == "website" {
@@ -905,7 +905,7 @@ fn parse_tabs(teams_host: &str, thread: &str, channel_link: &str, raw_tabs: &[Va
                     escaped(entity),
                     escaped(&ctx),
                 );
-            } else if let Some(fallback) = valid_http_url(channel_link) {
+            } else if let Some(fallback) = valid_https_url(channel_link) {
                 web_url = fallback;
             }
         }
@@ -947,13 +947,21 @@ mod tests {
                 "teamsAppId": "com.microsoft.teamspace.tab.web",
                 "configuration": {"websiteUrl": "https://docs.example.com"}
             }),
+            json!({
+                "id": "t4",
+                "displayName": "Intranet",
+                "teamsAppId": "com.microsoft.teamspace.tab.web",
+                "configuration": {"websiteUrl": "http://intranet.example/page"}
+            }),
         ];
         let tabs = parse_tabs("https://gov.teams.microsoft.us", "19:chan@thread.tacv2", "https://gov.teams.microsoft.us/l/channel/x", &raw);
-        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs.len(), 4);
         assert_eq!((tabs[0].kind.as_str(), tabs[0].name.as_str()), ("files", "Files"));
         assert_eq!((tabs[1].kind.as_str(), tabs[1].app.as_str()), ("planner", "Planner"));
         assert!(tabs[1].web_url.starts_with("https://gov.teams.microsoft.us/l/entity/"), "javascript URL must be rejected and replaced with cloud handoff: {}", tabs[1].web_url);
         assert_eq!((tabs[2].kind.as_str(), tabs[2].web_url.as_str()), ("website", "https://docs.example.com"));
+        assert!(tabs[3].web_url.starts_with("https://"), "{}", tabs[3].web_url);
+        assert!(tabs.iter().all(|tab| !tab.web_url.starts_with("http://") && !tab.content_url.starts_with("http://")));
     }
 
     #[test]
@@ -1039,6 +1047,19 @@ mod tests {
         assert!(event.join_url.contains("meetup-join"));
         assert_eq!(event.conversation, "19:meeting_xyz@thread.v2");
         assert!(meeting_from_calendar_item(host, &json!({"subject": "No time"})).is_none());
+
+        let http_join = json!({
+            "id": "evt-http",
+            "subject": "Clearance",
+            "start": "2026-11-21T20:00:00Z",
+            "end": "2026-11-21T20:30:00Z",
+            "joinUrl": "http://teams.microsoft.com/l/meetup-join/19%3Ameeting_http%40thread.v2/0",
+            "threadId": "19:meeting_http@thread.v2"
+        });
+        let event = meeting_from_calendar_item(host, &http_join).unwrap();
+        assert_eq!(event.join_url, links::meeting_share_on(host, "19:meeting_http@thread.v2"));
+        assert!(event.join_url.starts_with("https://"), "{}", event.join_url);
+        assert!(!event.join_url.starts_with("http://"));
     }
 
     #[test]

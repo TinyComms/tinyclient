@@ -1371,6 +1371,15 @@ impl Chat {
         if with.files.is_empty() {
             return Ok(());
         }
+        // A voice send is one clip. A document sent that way is refused before the upload, and
+        // before the voice-note size exception below.
+        if with.voice.is_some() && with.files.len() == 1 {
+            let named = file_name(&with.files[0]);
+            let mime = crate::blobs::upload::mime_of(&named);
+            if !(mime.starts_with("audio/") || mime.starts_with("video/")) {
+                return refuse(format!("{named} is not an audio or video clip."));
+            }
+        }
         let voice_only = with.voice.is_some() && with.files.len() == 1 && can.voice_notes;
         let max_file_bytes = self
             .hub

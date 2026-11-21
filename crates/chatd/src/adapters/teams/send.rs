@@ -20,6 +20,22 @@ use std::sync::Arc;
 
 /// One request of an upload session: a multiple of 320 KiB, as OneDrive requires.
 const CHUNK: u64 = 10 * 320 * 1024;
+
+fn clip_name(file: &protocol::OutgoingFile) -> String {
+    if !file.name.is_empty() {
+        return file.name.clone();
+    }
+    std::path::Path::new(&file.path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| file.path.clone())
+}
+
+fn is_clip(mime: &str) -> bool {
+    mime.starts_with("audio/") || mime.starts_with("video/")
+}
+
 /// Where Teams keeps the files sent in chats.
 const FOLDER: &str = "Microsoft Teams Chat Files";
 
@@ -48,6 +64,11 @@ impl Teams {
             with.clone(),
         );
         if with.voice.is_some() && with.files.len() == 1 {
+            let named = clip_name(&with.files[0]);
+            if !is_clip(upload::mime_of(&named)) {
+                self.ctx.sent(conversation, client_id, Err(format!("{named} is not an audio or video clip.")));
+                return;
+            }
             upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
                 teams.send_voice(&conversation_id, &client, reply.as_deref(), &outgoing, up)
             });
@@ -194,6 +215,9 @@ impl Teams {
         };
         if bytes == 0 {
             return Err(format!("{name} is empty."));
+        }
+        if !is_clip(mime) {
+            return Err(format!("{name} is not an audio or video clip."));
         }
         let (skype_token, place) = self.skype().map_err(super::reason)?;
         let Some(ams) = place.ams.as_deref() else {

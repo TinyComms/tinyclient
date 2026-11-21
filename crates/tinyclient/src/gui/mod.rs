@@ -299,9 +299,9 @@ impl Shell {
                     this.move_cursor(false, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ListOpen, _, cx| {
+            .on_action(cx.listener(|this, _: &ListOpen, window, cx| {
                 if !this.first_run_key("enter", cx) {
-                    this.open_cursor(cx);
+                    this.open_cursor(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ListFold, _, cx| this.fold_cursor(false, cx)))

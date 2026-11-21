@@ -399,17 +399,17 @@ impl Fake {
         let scope = asked.get("scope").cloned().unwrap_or_default();
         let audience = match scope.as_str() {
             scope if scope.starts_with("https://api.spaces.skype.com/.default ")
-                || scope.starts_with("https://api.fl.spaces.skype.us/.default ")
-                || scope.starts_with("https://api.dod.spaces.skype.us/.default ")
-                || scope.starts_with("https://api.spaces.skype.cn/.default ") => "spaces",
+                || scope.starts_with("https://gov.teams.microsoft.us/.default ")
+                || scope.starts_with("https://dod.teams.microsoft.us/.default ")
+                || scope.starts_with("https://teams.microsoftonline.cn/.default ") => "spaces",
             scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ")
                 || scope.starts_with("https://chatsvcagg.gov.teams.microsoft.us/.default ")
                 || scope.starts_with("https://chatsvcagg.dod.teams.microsoft.us/.default ")
-                || scope.starts_with("https://chatsvcagg.teams.microsoft.cn/.default ") => "csa",
+                || scope.starts_with("https://chatsvcagg.teams.microsoftonline.cn/.default ") => "csa",
             scope if scope.starts_with("https://presence.teams.microsoft.com/.default ")
                 || scope.starts_with("https://presence.gov.teams.microsoft.us/.default ")
                 || scope.starts_with("https://presence.dod.teams.microsoft.us/.default ")
-                || scope.starts_with("https://presence.teams.microsoft.cn/.default ") => "presence",
+                || scope.starts_with("https://presence.teams.microsoftonline.cn/.default ") => "presence",
             scope if scope.starts_with("https://graph.microsoft.com/.default ")
                 || scope.starts_with("https://graph.microsoft.us/.default ")
                 || scope.starts_with("https://dod-graph.microsoft.us/.default ")
@@ -2498,9 +2498,12 @@ fn gcc_high_session_mints_sovereign_audiences_and_uses_sovereign_origin() {
         .iter()
         .filter_map(|c| form(&c.body).remove("scope"))
         .collect();
-    assert!(scopes.iter().any(|s| s.starts_with("https://api.fl.spaces.skype.us/.default")));
+    assert!(scopes.iter().any(|s| s.starts_with("https://gov.teams.microsoft.us/.default")));
     assert!(scopes.iter().any(|s| s.starts_with("https://chatsvcagg.gov.teams.microsoft.us/.default")));
-    assert!(!scopes.iter().any(|s| s.contains(".com")), "GCC High session must never mint worldwide audiences: {scopes:?}");
+    assert!(
+        !scopes.iter().any(|s| s.contains(".com") || s.contains("skype") || s.contains("teams.microsoft.cn")),
+        "GCC High session must never mint worldwide or Skype audiences: {scopes:?}"
+    );
 
     let list_call = world.fake.calls("GET", "/api/csa/api/v1/teams/users/me").pop().unwrap();
     assert_eq!(list_call.headers.get("origin").map(String::as_str), Some("https://gov.teams.microsoft.us"));
@@ -2615,6 +2618,41 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
     assert_eq!(posted.json()["messagetype"].as_str(), Some("RichText/Media_AudioMsg"));
     assert!(posted.json()["content"].as_str().unwrap_or("").contains("type=\"Audio.1\""));
     assert_eq!(posted.json()["properties"]["amsreferences"][0].as_str(), Some("0-weu-d1-sentvoice"));
+
+    // A voice send of a document is refused before AMS, and is not posted as an audio clip.
+    let ams_posts = world.fake.calls("POST", "/ams/v1/objects").len();
+    for (client_id, name) in [("1760000999000674", "notes.txt"), ("1760000999000675", "brief.pdf")] {
+        let refused = world.ask(Request::Send {
+            conversation: ana.clone(),
+            client_id: client_id.to_owned(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                files: vec![protocol::OutgoingFile {
+                    path: clip_path.to_string_lossy().into_owned(),
+                    name: name.to_owned(),
+                    spoiler: false,
+                    as_file: false,
+                    original: false,
+                    view_once: false,
+                    media: None,
+                }],
+                voice: Some(protocol::VoiceNote { duration: 4_600, waveform: vec![10, 20, 30] }),
+                ..protocol::Outgoing::default()
+            },
+        });
+        assert!(
+            matches!(&refused, Response::Error { detail, .. } if detail == &format!("{name} is not an audio or video clip.")),
+            "{name}: {refused:?}"
+        );
+        let posted = world
+            .fake
+            .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+            .into_iter()
+            .any(|call| call.json()["clientmessageid"] == client_id);
+        assert!(!posted, "{name} was posted");
+    }
+    assert_eq!(world.fake.calls("POST", "/ams/v1/objects").len(), ams_posts);
 
     // 4. Ordinary file sends remain refused when general uploads are disabled.
     let plain_file = Request::Send {

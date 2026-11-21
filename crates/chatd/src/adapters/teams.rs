@@ -1308,7 +1308,7 @@ mod tests {
         let ep = TeamsCloud::GccHigh.endpoints();
         assert_eq!(ep.login, "https://login.microsoftonline.us");
         assert_eq!(ep.teams, "https://gov.teams.microsoft.us");
-        assert_eq!(ep.spaces, "https://api.fl.spaces.skype.us");
+        assert_eq!(ep.spaces, "https://gov.teams.microsoft.us");
         assert_eq!(ep.aggregator, "https://chatsvcagg.gov.teams.microsoft.us");
         assert_eq!(ep.presence, "https://presence.gov.teams.microsoft.us");
         assert_eq!(ep.graph, "https://graph.microsoft.us");
@@ -1345,9 +1345,13 @@ mod tests {
         assert!(!teams.ours("https://graph.microsoft.com/v1.0/me"));
         assert!(!teams.ours("https://dod.teams.microsoft.us/api/authsvc/v1.0/authz"));
         assert!(!teams.ours("https://teams.microsoft.cn/api/authsvc/v1.0/authz"));
+        assert!(!teams.ours("https://teams.microsoftonline.cn/api/authsvc/v1.0/authz"));
+        assert!(!teams.ours("https://api.fl.spaces.skype.us/"));
+        assert!(!teams.ours("https://usgov-api.asm.skype.us/v1/objects/1"));
 
         // Media store and SharePoint links stay strictly inside GCC High.
-        assert!(teams.pictures("https://usgov-api.asm.skype.us/v1/objects/1/views/imgo"));
+        assert!(teams.pictures("https://usgov.asyncgw.gov.teams.microsoft.us/v1/objects/1/views/imgo"));
+        assert!(!teams.pictures("https://usgov-api.asm.skype.us/v1/objects/1/views/imgo"));
         assert!(!teams.pictures("https://eu-api.asm.skype.com/v1/objects/1/views/imgo"));
         assert!(teams.shared_download("https://agency.sharepoint.us/:x:/s/Ops/Abc").is_some_and(|u| u.starts_with("https://graph.microsoft.us/v1.0/shares/u!")));
         assert!(teams.shared_download("https://contoso.sharepoint.com/:x:/s/Ops/Abc").is_none());

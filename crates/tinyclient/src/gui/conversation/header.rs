@@ -203,7 +203,7 @@ impl Shell {
                     .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
                     .children(self.disappearing_chip(open, cx))
-                    .children(self.meeting_chip(open))
+                    .children(self.meeting_chip(open, cx))
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
@@ -273,8 +273,8 @@ impl Shell {
         )
     }
 
-    /// Today's meeting for this chat: the time, and Join when the link is http(s).
-    fn meeting_chip(&self, open: &Conversation) -> Option<gpui::Stateful<Div>> {
+    /// Today's meeting for this chat: the time, and Join when the link is https.
+    fn meeting_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         if open.key.network != Network::Teams {
             return None;
         }
@@ -283,7 +283,7 @@ impl Shell {
         })?;
         let mut label = crate::gui::time::meeting_display(event, crate::view::now());
         let join = event.join_url.clone();
-        let can_join = join.starts_with("https://") || join.starts_with("http://");
+        let can_join = join.starts_with("https://");
         if can_join {
             label.push_str(" · Join");
         }
@@ -305,7 +305,10 @@ impl Shell {
                     chip.cursor_pointer()
                         .hover(|style| style.text_color(theme::text()))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(move |_, _, cx| cx.open_url(&join))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let pane = this.pane(cx);
+                            pane.update(cx, |pane, cx| pane.open_external_link(&join, window, cx));
+                        }))
                 })
                 .child(glyph("icons/calendar.svg", 12., theme::text_soft()))
                 .child(label),

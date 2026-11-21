@@ -197,6 +197,13 @@ fn head_picture(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>)
     }
 }
 
+fn open_https_link(pane: &InfoPane, url: &str, window: &mut Window, cx: &mut Context<InfoPane>) {
+    pane.shell_do(cx, |shell, cx| {
+        let conv = shell.pane(cx);
+        conv.update(cx, |conv, cx| conv.open_external_link(url, window, cx));
+    });
+}
+
 /// A conversation's Details.
 pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &mut Context<InfoPane>) -> Div {
     let network = row.key.network;
@@ -520,12 +527,14 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
     }
     if let Some(meeting) = info.and_then(|info| info.meeting.clone()) {
         let line = crate::gui::time::meeting_display(&meeting, crate::view::now());
-        let can_join = meeting.join_url.starts_with("https://") || meeting.join_url.starts_with("http://");
+        let can_join = meeting.join_url.starts_with("https://");
         let join = meeting.join_url.clone();
         let show_rsvp = meeting.response != MeetingResponse::Organizer && !meeting.id.is_empty();
         let mut actions = div().flex().flex_wrap().gap(px(6.));
         if can_join {
-            actions = actions.child(button("details-meeting-join", ButtonKind::Secondary, "Join").on_click(move |_, _, cx| cx.open_url(&join)));
+            actions = actions.child(button("details-meeting-join", ButtonKind::Secondary, "Join").on_click(cx.listener(move |pane, _, window, cx| {
+                open_https_link(pane, &join, window, cx);
+            })));
         }
         if show_rsvp {
             let account = row.key.account();
@@ -564,7 +573,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         for (ix, tab) in tabs.iter().enumerate() {
             let open_url = [&tab.web_url, &tab.content_url, &fallback_link]
                 .into_iter()
-                .find(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .find(|u| u.starts_with("https://"))
                 .cloned();
             let icon = match tab.kind.as_str() {
                 "files" => "icons/folder-plus.svg",
@@ -593,7 +602,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()))
                     .child(glyph("icons/external-link.svg", 13., theme::text_faint()))
-                    .on_click(move |_, _, cx| cx.open_url(&url));
+                    .on_click(cx.listener(move |pane, _, window, cx| open_https_link(pane, &url, window, cx)));
             }
             rows = rows.child(row);
         }

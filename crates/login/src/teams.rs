@@ -83,7 +83,7 @@ impl Cloud {
             Cloud::Worldwide => "https://teams.microsoft.com",
             Cloud::GccHigh => "https://gov.teams.microsoft.us",
             Cloud::Dod => "https://dod.teams.microsoft.us",
-            Cloud::China => "https://teams.microsoft.cn",
+            Cloud::China => "https://teams.microsoftonline.cn",
         }
     }
 
@@ -98,9 +98,9 @@ impl Cloud {
     pub fn scope(self) -> &'static str {
         match self {
             Cloud::Worldwide => "https://api.spaces.skype.com/.default openid profile offline_access",
-            Cloud::GccHigh => "https://api.fl.spaces.skype.us/.default openid profile offline_access",
-            Cloud::Dod => "https://api.dod.spaces.skype.us/.default openid profile offline_access",
-            Cloud::China => "https://api.spaces.skype.cn/.default openid profile offline_access",
+            Cloud::GccHigh => "https://gov.teams.microsoft.us/.default openid profile offline_access",
+            Cloud::Dod => "https://dod.teams.microsoft.us/.default openid profile offline_access",
+            Cloud::China => "https://teams.microsoftonline.cn/.default openid profile offline_access",
         }
     }
 
@@ -797,12 +797,13 @@ mod tests {
         let gcc_url = authorize_url_for(Cloud::GccHigh, "CHALLENGE", "STATE");
         assert!(gcc_url.starts_with("https://login.microsoftonline.us/organizations/oauth2/v2.0/authorize?"));
         assert!(gcc_url.contains("https%3A%2F%2Flogin.microsoftonline.us%2Fcommon%2Foauth2%2Fnativeclient"));
-        assert!(gcc_url.contains("https%3A%2F%2Fapi.fl.spaces.skype.us%2F.default"));
-        assert!(!gcc_url.contains("microsoftonline.com") && !gcc_url.contains("skype.com"));
+        assert!(gcc_url.contains("https%3A%2F%2Fgov.teams.microsoft.us%2F.default"));
+        assert!(!gcc_url.contains("microsoftonline.com") && !gcc_url.contains("skype"));
 
         let cn_url = authorize_url_for(Cloud::China, "CHALLENGE", "STATE");
         assert!(cn_url.starts_with("https://login.chinacloudapi.cn/organizations/oauth2/v2.0/authorize?"));
-        assert!(cn_url.contains("https%3A%2F%2Fapi.spaces.skype.cn%2F.default"));
+        assert!(cn_url.contains("https%3A%2F%2Fteams.microsoftonline.cn%2F.default"));
+        assert!(!cn_url.contains("teams.microsoft.cn") && !cn_url.contains("skype"));
 
         // Redirects match only their own cloud.
         let gcc_redirect = "https://login.microsoftonline.us/common/oauth2/nativeclient?code=gov-code&state=STATE";

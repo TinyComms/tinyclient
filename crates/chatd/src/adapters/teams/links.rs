@@ -224,10 +224,9 @@ pub(crate) fn prove_share_links() -> Result<(), String> {
 fn after_scheme(url: &str) -> Option<&str> {
     let heads = [
         "https://teams.microsoft.com/l/",
-        "http://teams.microsoft.com/l/",
         "https://gov.teams.microsoft.us/l/",
         "https://dod.teams.microsoft.us/l/",
-        "https://teams.microsoft.cn/l/",
+        "https://teams.microsoftonline.cn/l/",
         "msteams://l/",
         "msteams:/l/",
     ];

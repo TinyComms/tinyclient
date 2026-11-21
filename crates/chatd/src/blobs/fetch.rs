@@ -690,7 +690,8 @@ mod tests {
 
         // GCC High allows GCC High session & SharePoint hosts and blocks Worldwide hosts.
         assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://gov.teams.microsoft.us/api/mt/pic"), Some(Trust::Session));
-        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://usgov-api.asm.skype.us/v1/objects/1/views/imgo"), Some(Trust::Session));
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://usgov.asyncgw.gov.teams.microsoft.us/v1/objects/1/views/imgo"), Some(Trust::Session));
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://usgov-api.asm.skype.us/v1/objects/1/views/imgo"), None);
         assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://agency.sharepoint.us/file"), Some(Trust::Open));
         assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://teams.microsoft.com/api/mt/pic"), None);
         assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://contoso.sharepoint.com/file"), None);
@@ -699,6 +700,7 @@ mod tests {
         assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://teams.microsoft.com/api/mt/pic"), Some(Trust::Session));
         assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://gov.teams.microsoft.us/api/mt/pic"), None);
         assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://teams.microsoft.cn/api/mt/pic"), None);
+        assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://teams.microsoftonline.cn/api/mt/pic"), None);
 
         crate::adapters::teams::cloud::unregister(&gcc);
         crate::adapters::teams::cloud::unregister(&ww);

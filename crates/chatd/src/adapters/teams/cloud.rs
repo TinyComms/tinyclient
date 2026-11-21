@@ -106,21 +106,17 @@ pub const WORLDWIDE: CloudEndpoints = CloudEndpoints {
 pub const GCC_HIGH: CloudEndpoints = CloudEndpoints {
     login: "https://login.microsoftonline.us",
     teams: "https://gov.teams.microsoft.us",
-    spaces: "https://api.fl.spaces.skype.us",
+    // The published GCC High front door is also the token audience. Microsoft does not publish
+    // a GCC High Skype spaces host.
+    spaces: "https://gov.teams.microsoft.us",
     aggregator: "https://chatsvcagg.gov.teams.microsoft.us",
     presence: "https://presence.gov.teams.microsoft.us",
     graph: "https://graph.microsoft.us",
     trouter: "https://go.trouter.gov.teams.microsoft.us",
-    ours: &[
-        "gov.teams.microsoft.us",
-        "fl.spaces.skype.us",
-        "asm.skype.us",
-        "graph.microsoft.us",
-    ],
-    media_hosts: &["asm.skype.us", "asyncgw.gov.teams.microsoft.us"],
+    ours: &["gov.teams.microsoft.us", "graph.microsoft.us"],
+    media_hosts: &["asyncgw.gov.teams.microsoft.us"],
     fetch_open: &["sharepoint.us"],
     fetch_session: &[
-        "asm.skype.us",
         "asyncgw.gov.teams.microsoft.us",
         "gov.teams.microsoft.us",
         "graph.microsoft.us",
@@ -129,7 +125,6 @@ pub const GCC_HIGH: CloudEndpoints = CloudEndpoints {
     upload_hosts: &[
         "graph.microsoft.us",
         "sharepoint.us",
-        "asm.skype.us",
         "asyncgw.gov.teams.microsoft.us",
         "gov.teams.microsoft.us",
     ],
@@ -138,21 +133,17 @@ pub const GCC_HIGH: CloudEndpoints = CloudEndpoints {
 pub const DOD: CloudEndpoints = CloudEndpoints {
     login: "https://login.microsoftonline.us",
     teams: "https://dod.teams.microsoft.us",
-    spaces: "https://api.dod.spaces.skype.us",
+    // The published DoD front door is also the token audience. Microsoft does not publish a
+    // DoD Skype spaces host.
+    spaces: "https://dod.teams.microsoft.us",
     aggregator: "https://chatsvcagg.dod.teams.microsoft.us",
     presence: "https://presence.dod.teams.microsoft.us",
     graph: "https://dod-graph.microsoft.us",
     trouter: "https://go.trouter.dod.teams.microsoft.us",
-    ours: &[
-        "dod.teams.microsoft.us",
-        "dod.spaces.skype.us",
-        "asm.skype.us",
-        "dod-graph.microsoft.us",
-    ],
-    media_hosts: &["asm.skype.us", "asyncgw.dod.teams.microsoft.us"],
+    ours: &["dod.teams.microsoft.us", "dod-graph.microsoft.us"],
+    media_hosts: &["asyncgw.dod.teams.microsoft.us"],
     fetch_open: &["sharepoint-mil.us"],
     fetch_session: &[
-        "asm.skype.us",
         "asyncgw.dod.teams.microsoft.us",
         "dod.teams.microsoft.us",
         "dod-graph.microsoft.us",
@@ -161,7 +152,6 @@ pub const DOD: CloudEndpoints = CloudEndpoints {
     upload_hosts: &[
         "dod-graph.microsoft.us",
         "sharepoint-mil.us",
-        "asm.skype.us",
         "asyncgw.dod.teams.microsoft.us",
         "dod.teams.microsoft.us",
     ],
@@ -169,32 +159,28 @@ pub const DOD: CloudEndpoints = CloudEndpoints {
 
 pub const CHINA: CloudEndpoints = CloudEndpoints {
     login: "https://login.chinacloudapi.cn",
-    teams: "https://teams.microsoft.cn",
-    spaces: "https://api.spaces.skype.cn",
-    aggregator: "https://chatsvcagg.teams.microsoft.cn",
-    presence: "https://presence.teams.microsoft.cn",
+    teams: "https://teams.microsoftonline.cn",
+    // The published 21Vianet front door is also the token audience. Microsoft publishes
+    // teams.microsoftonline.cn, not teams.microsoft.cn or a China Skype host.
+    spaces: "https://teams.microsoftonline.cn",
+    aggregator: "https://chatsvcagg.teams.microsoftonline.cn",
+    presence: "https://presence.teams.microsoftonline.cn",
     graph: "https://microsoftgraph.chinacloudapi.cn",
-    trouter: "https://go.trouter.teams.microsoft.cn",
-    ours: &[
-        "teams.microsoft.cn",
-        "skype.cn",
-        "microsoftgraph.chinacloudapi.cn",
-    ],
-    media_hosts: &["asm.skype.cn", "asyncgw.teams.microsoft.cn"],
+    trouter: "https://go.trouter.teams.microsoftonline.cn",
+    ours: &["teams.microsoftonline.cn", "microsoftgraph.chinacloudapi.cn"],
+    media_hosts: &["asyncgw.teams.microsoftonline.cn"],
     fetch_open: &["sharepoint.cn"],
     fetch_session: &[
-        "asm.skype.cn",
-        "asyncgw.teams.microsoft.cn",
-        "teams.microsoft.cn",
+        "asyncgw.teams.microsoftonline.cn",
+        "teams.microsoftonline.cn",
         "microsoftgraph.chinacloudapi.cn",
     ],
     sharepoint: &["sharepoint.cn"],
     upload_hosts: &[
         "microsoftgraph.chinacloudapi.cn",
         "sharepoint.cn",
-        "asm.skype.cn",
-        "asyncgw.teams.microsoft.cn",
-        "teams.microsoft.cn",
+        "asyncgw.teams.microsoftonline.cn",
+        "teams.microsoftonline.cn",
     ],
 };
 
@@ -269,6 +255,7 @@ mod tests {
         let gcc = TeamsCloud::GccHigh.endpoints();
         assert_eq!(gcc.login, "https://login.microsoftonline.us");
         assert_eq!(gcc.teams, "https://gov.teams.microsoft.us");
+        assert_eq!(gcc.spaces, "https://gov.teams.microsoft.us");
         assert_eq!(gcc.graph, "https://graph.microsoft.us");
         assert_eq!(gcc.trouter, "https://go.trouter.gov.teams.microsoft.us");
 
@@ -283,18 +270,29 @@ mod tests {
         assert!(!is_ours(gcc, "https://graph.microsoft.com/v1.0/me"));
         assert!(!is_ours(gcc, "https://dod.teams.microsoft.us/api/authsvc/v1.0/authz"));
         assert!(!is_ours(gcc, "https://teams.microsoft.cn/api/authsvc/v1.0/authz"));
+        assert!(!is_ours(gcc, "https://teams.microsoftonline.cn/api/authsvc/v1.0/authz"));
+        assert!(!is_ours(gcc, "https://api.fl.spaces.skype.us/"));
+        assert!(!is_ours(gcc, "https://usgov-api.asm.skype.us/v1/objects/1"));
 
         // DoD accepts only DoD endpoints and refuses worldwide and GCC High.
         let dod = TeamsCloud::Dod.endpoints();
+        assert_eq!(dod.spaces, "https://dod.teams.microsoft.us");
         assert!(is_ours(dod, "https://dod.teams.microsoft.us/api/authsvc/v1.0/authz"));
         assert!(is_ours(dod, "https://dod-graph.microsoft.us/v1.0/me"));
         assert!(!is_ours(dod, "https://gov.teams.microsoft.us/api/authsvc/v1.0/authz"));
         assert!(!is_ours(dod, "https://teams.microsoft.com/api/authsvc/v1.0/authz"));
+        assert!(!is_ours(dod, "https://api.dod.spaces.skype.us/"));
+        assert!(!is_ours(dod, "https://usgov-api.asm.skype.us/v1/objects/1"));
 
-        // China accepts only 21Vianet endpoints and refuses worldwide and US Gov.
+        // China accepts only published 21Vianet endpoints and refuses worldwide, US Gov, and teams.microsoft.cn.
         let cn = TeamsCloud::China.endpoints();
-        assert!(is_ours(cn, "https://teams.microsoft.cn/api/authsvc/v1.0/authz"));
+        assert_eq!(cn.teams, "https://teams.microsoftonline.cn");
+        assert_eq!(cn.spaces, "https://teams.microsoftonline.cn");
+        assert_eq!(cn.aggregator, "https://chatsvcagg.teams.microsoftonline.cn");
+        assert!(is_ours(cn, "https://teams.microsoftonline.cn/api/authsvc/v1.0/authz"));
+        assert!(is_ours(cn, "https://chatsvcagg.teams.microsoftonline.cn/v1/users/ME"));
         assert!(is_ours(cn, "https://microsoftgraph.chinacloudapi.cn/v1.0/me"));
+        assert!(!is_ours(cn, "https://teams.microsoft.cn/api/authsvc/v1.0/authz"));
         assert!(!is_ours(cn, "https://teams.microsoft.com/api/authsvc/v1.0/authz"));
         assert!(!is_ours(cn, "https://gov.teams.microsoft.us/api/authsvc/v1.0/authz"));
 
@@ -304,6 +302,7 @@ mod tests {
         assert!(!is_ours(ww, "https://gov.teams.microsoft.us/api/authsvc/v1.0/authz"));
         assert!(!is_ours(ww, "https://dod.teams.microsoft.us/api/authsvc/v1.0/authz"));
         assert!(!is_ours(ww, "https://teams.microsoft.cn/api/authsvc/v1.0/authz"));
+        assert!(!is_ours(ww, "https://teams.microsoftonline.cn/api/authsvc/v1.0/authz"));
     }
 
     #[test]
