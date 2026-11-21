@@ -1040,8 +1040,14 @@ impl Demo {
             | Command::TransferSpace { reply, .. }
             | Command::DeleteEvent { reply, .. }
             | Command::RevokeInvite { reply, .. }
-            | Command::SetInvitesPaused { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::SetInvitesPaused { reply, .. }
+            | Command::EditRole { reply, .. }
+            | Command::MoveRoles { reply, .. }
+            | Command::DeleteRole { reply, .. }
+            | Command::SetMemberRoles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Roles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateRole { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }

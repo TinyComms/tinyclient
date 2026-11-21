@@ -338,13 +338,7 @@ struct Tree {
 
 impl Discord {
     fn guild_info(&self, guild: &Guild, member: Option<&Member>, me: &str, position: i32, quiet: Quiet) -> GuildInfo {
-        let roles = guild.roles.iter().map(|role| {
-            let info = RoleInfo {
-                name: role.name.clone(),
-                permissions: role.permissions,
-            };
-            (number(&role.id), info)
-        });
+        let roles = guild.roles.iter().map(|role| (number(&role.id), RoleInfo::remember(role)));
         let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
         let categories = categories.map(|category| (category.id.clone(), (category.position, category.name.clone().unwrap_or_default())));
         GuildInfo {
@@ -635,10 +629,7 @@ impl Discord {
             };
             match (role, deleted) {
                 (Some(role), _) => {
-                    let fresh = RoleInfo {
-                        name: role.name.clone(),
-                        permissions: role.permissions,
-                    };
+                    let fresh = RoleInfo::remember(&role);
                     let before = info.roles.insert(number(&role.id), fresh);
                     // Everyone holds the server's own role; any other counts only if we do.
                     let ours = role.id == guild || info.my_roles.contains(&number(&role.id));

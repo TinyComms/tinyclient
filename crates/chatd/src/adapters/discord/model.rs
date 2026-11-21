@@ -454,6 +454,111 @@ pub struct Role {
     pub name: String,
     #[serde(default, deserialize_with = "lenient_u64")]
     pub permissions: u64,
+    /// `0xRRGGBB`. Missing and null are no colour.
+    #[serde(default, deserialize_with = "color_u32")]
+    pub color: u32,
+    #[serde(default)]
+    pub hoist: bool,
+    #[serde(default)]
+    pub position: i32,
+    #[serde(default)]
+    pub mentionable: bool,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub unicode_emoji: Option<String>,
+}
+
+fn color_u32<'de, D: Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Number(u64),
+        Text(String),
+    }
+    let value = match Option::<Either>::deserialize(de)? {
+        Some(Either::Number(number)) => number,
+        Some(Either::Text(text)) => text.parse().unwrap_or(0),
+        None => 0,
+    };
+    Ok((value & 0x00FF_FFFF) as u32)
+}
+
+/// A role-icon hash Discord would store. A URL, a slash, or anything outside the hash alphabet is dropped.
+pub fn role_icon_hash(raw: Option<&str>) -> Option<String> {
+    let hash = raw?.trim();
+    if hash.is_empty()
+        || hash.contains("://")
+        || hash.contains('/')
+        || hash.contains('\\')
+        || hash.contains('?')
+        || hash.contains('#')
+        || hash.contains('@')
+        || hash.contains('%')
+        || hash.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let body = hash.strip_prefix("a_").unwrap_or(hash);
+    if body.is_empty() || body.len() > 64 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hash.to_owned())
+}
+
+/// A unicode emoji for a role. A URL, a slash, or a sentence is dropped.
+pub fn role_emoji(raw: Option<&str>) -> Option<String> {
+    let emoji = raw?.trim();
+    if emoji.is_empty()
+        || emoji.contains("://")
+        || emoji.contains('/')
+        || emoji.contains('\\')
+        || emoji.chars().any(|c| c.is_whitespace() || c.is_control())
+        || emoji.chars().count() > 32
+    {
+        return None;
+    }
+    Some(emoji.to_owned())
+}
+
+/// `https` anywhere, or `http` only for a loopback host (the test CDN). Userinfo and junk are refused.
+pub fn cdn_base_ok(base: &str) -> bool {
+    if base.is_empty() || base.contains('@') || base.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    if let Some(rest) = base.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or("");
+        return !host.is_empty();
+    }
+    if let Some(rest) = base.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = if let Some(inner) = authority.strip_prefix('[') {
+            inner.split(']').next().unwrap_or("")
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        return matches!(host, "127.0.0.1" | "localhost" | "::1");
+    }
+    false
+}
+
+/// The picture URL for a role icon. Built only from a numeric role id, a hash, and the configured CDN.
+pub fn role_icon_url(role_id: &str, hash: &str) -> Option<String> {
+    let hash = role_icon_hash(Some(hash))?;
+    if role_id.is_empty()
+        || role_id.len() > 20
+        || !role_id.bytes().all(|byte| byte.is_ascii_digit())
+        || number(role_id) == 0
+    {
+        return None;
+    }
+    let base = cdn().trim_end_matches('/');
+    if !cdn_base_ok(base) {
+        return None;
+    }
+    Some(format!("{base}/role-icons/{role_id}/{hash}.png"))
 }
 
 /// What newer sessions wrap a guild's own fields in.
@@ -1403,5 +1508,44 @@ mod tests {
         assert_eq!(guild.afk_channel_id(), Some("4201"));
         assert_eq!(guild.afk_timeout(), Some(900));
         assert_eq!(guild.default_message_notifications(), Some(1));
+    }
+
+    #[test]
+    fn role_fields_default_and_icon_urls_stay_on_the_cdn() {
+        let role: Role = serde_json::from_str(
+            r#"{"id":"4701","name":"Newbie","permissions":"2048","color":16711680,"hoist":true,"position":1,"mentionable":true,"managed":false,"icon":"a1b2c3d4","unicode_emoji":null}"#,
+        )
+        .unwrap();
+        assert_eq!((role.color, role.position, role.permissions), (16_711_680, 1, 2048));
+        assert!(role.hoist && role.mentionable && !role.managed);
+        assert_eq!(role.icon.as_deref(), Some("a1b2c3d4"));
+        assert!(role.unicode_emoji.is_none());
+        let bare: Role = serde_json::from_str(r#"{"id":"1","name":"x","permissions":0,"color":null,"icon":null}"#).unwrap();
+        assert_eq!(bare.color, 0);
+        assert!(!bare.hoist && !bare.mentionable && !bare.managed);
+        assert_eq!(bare.position, 0);
+        assert!(bare.icon.is_none() && bare.unicode_emoji.is_none());
+
+        let url = role_icon_url("4701", "a1b2c3d4").unwrap();
+        assert_eq!(url, format!("{}/role-icons/4701/a1b2c3d4.png", cdn().trim_end_matches('/')));
+        assert!(url.starts_with("https://") || url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost") || url.starts_with("http://[::1]"));
+        assert!(!url.contains('@'));
+        assert!(url.contains("/role-icons/4701/a1b2c3d4.png"));
+        assert!(role_icon_url("4701", "a1b2/../../evil").is_none());
+        assert!(role_icon_url("4701", "https://evil.example/x").is_none());
+        assert!(role_icon_url("4701", "a1b2c3d4?x=1").is_none());
+        assert!(role_icon_url("nope", "a1b2c3d4").is_none());
+        assert!(role_icon_hash(Some("a_ab12")).as_deref() == Some("a_ab12"));
+        assert!(role_icon_hash(Some("not a hash")).is_none());
+        assert!(role_emoji(Some("🌿")).as_deref() == Some("🌿"));
+        assert!(role_emoji(Some("https://evil.example")).is_none());
+        assert!(cdn_base_ok("https://cdn.discordapp.com"));
+        assert!(cdn_base_ok("http://127.0.0.1:9/media"));
+        assert!(cdn_base_ok("http://localhost:9/media"));
+        assert!(cdn_base_ok("http://[::1]:9/media"));
+        assert!(!cdn_base_ok("http://evil.example/media"));
+        assert!(!cdn_base_ok("https://user:pass@cdn.discordapp.com"));
+        assert!(!cdn_base_ok("http://127.0.0.1:9/media user"));
+        assert!(cdn_base_ok(cdn().trim_end_matches('/')));
     }
 }

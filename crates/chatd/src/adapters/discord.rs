@@ -188,6 +188,30 @@ struct Pickable {
 struct RoleInfo {
     name: String,
     permissions: u64,
+    color: u32,
+    hoist: bool,
+    position: i32,
+    mentionable: bool,
+    managed: bool,
+    /// Discord's icon hash, never a URL.
+    icon: Option<String>,
+    unicode_emoji: Option<String>,
+}
+
+impl RoleInfo {
+    fn remember(role: &model::Role) -> Self {
+        Self {
+            name: role.name.clone(),
+            permissions: role.permissions,
+            color: role.color & 0x00FF_FFFF,
+            hoist: role.hoist,
+            position: role.position,
+            mentionable: role.mentionable,
+            managed: role.managed,
+            icon: model::role_icon_hash(role.icon.as_deref()),
+            unicode_emoji: model::role_emoji(role.unicode_emoji.as_deref()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1922,6 +1946,14 @@ impl Discord {
             Command::RevokeInvite { space_id, code, reply } => answer(reply, self.revoke_invite(&space_id, &code)),
             Command::SetInvitesPaused { space_id, paused, reply } => {
                 answer(reply, self.set_invites_paused(&space_id, paused))
+            }
+            Command::Roles { space_id, reply } => answer(reply, self.roles(&space_id)),
+            Command::CreateRole { space_id, edit, reply } => answer(reply, self.create_role(&space_id, &edit)),
+            Command::EditRole { space_id, role_id, edit, reply } => answer(reply, self.edit_role(&space_id, &role_id, &edit)),
+            Command::MoveRoles { space_id, roles, reply } => answer(reply, self.move_roles(&space_id, &roles)),
+            Command::DeleteRole { space_id, role_id, reply } => answer(reply, self.delete_role(&space_id, &role_id)),
+            Command::SetMemberRoles { space_id, person_id, roles, reply } => {
+                answer(reply, self.set_member_roles(&space_id, &person_id, &roles))
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),

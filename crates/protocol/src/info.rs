@@ -5,7 +5,7 @@
 //! Every field here is optional on the wire and every list has a cap, as in the rest of the
 //! contract.
 
-use crate::{is_false, is_zero, Conversation, Key, MediaFile, Network, Space};
+use crate::{is_false, is_zero, is_zero64, Conversation, Key, MediaFile, Network, Space};
 use serde::{Deserialize, Serialize};
 
 /// Most folders an account lists. Telegram allows 30 with Premium; Discord's server folders are
@@ -19,6 +19,36 @@ pub const FOLDER_MEMBERS: usize = 200;
 pub const ROWS_WATCHED: usize = 100;
 /// Most roles, or contact lines, a profile carries.
 pub const PROFILE_ROLES: usize = 12;
+/// Discord permission bits the Roles page labels. Values are Discord's; keep this table when
+/// Discord adds a bit the page should name. Bits absent here still round-trip as a number.
+pub const DISCORD_PERMISSIONS: &[(u64, &str)] = &[
+    (1 << 0, "Create invite"),
+    (1 << 1, "Kick members"),
+    (1 << 2, "Ban members"),
+    (1 << 3, "Administrator"),
+    (1 << 4, "Manage channels"),
+    (1 << 5, "Manage server"),
+    (1 << 6, "Add reactions"),
+    (1 << 10, "View channels"),
+    (1 << 11, "Send messages"),
+    (1 << 13, "Manage messages"),
+    (1 << 14, "Embed links"),
+    (1 << 15, "Attach files"),
+    (1 << 16, "Read message history"),
+    (1 << 17, "Mention @everyone"),
+    (1 << 20, "Connect"),
+    (1 << 21, "Speak"),
+    (1 << 24, "Move members"),
+    (1 << 26, "Change nickname"),
+    (1 << 27, "Manage nicknames"),
+    (1 << 28, "Manage roles"),
+    (1 << 29, "Manage webhooks"),
+    (1 << 31, "Use application commands"),
+    (1 << 33, "Manage events"),
+    (1 << 34, "Manage threads"),
+    (1 << 40, "Timeout members"),
+    (1 << 51, "Pin messages"),
+];
 pub const PROFILE_CONTACTS: usize = 6;
 /// Most files one `Send` carries. A network that takes fewer says so in `Capabilities`.
 pub const ATTACHMENTS_LIMIT: usize = 10;
@@ -437,6 +467,68 @@ pub struct SpaceInvite {
     /// True for the server's read-only vanity URL row.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vanity: bool,
+}
+
+/// One role in a Space (`Request::Roles`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRole {
+    pub id: String,
+    pub name: String,
+    /// `0xRRGGBB`. Zero means the role has no colour.
+    #[serde(default)]
+    pub color: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hoist: bool,
+    /// Discord's order. Zero is the everyone role, so it is kept on the wire.
+    #[serde(default)]
+    pub position: i32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentionable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed: bool,
+    /// A validated picture URL on Discord's CDN, or a unicode emoji. Empty when the role has neither.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub permissions: u64,
+    /// The signed-in user may edit this role (below their highest role, and not managed).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub editable: bool,
+    /// The signed-in user may give or take this role. The everyone role is never assignable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub assignable: bool,
+}
+
+/// Fields to create or edit a role (`Request::CreateRole` / `EditRole`).
+/// `icon`: `None` unchanged, `Some("")` clear, `Some(path)` a picture on this computer.
+/// `unicode_emoji`: `None` unchanged, `Some("")` clear.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hoist: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentionable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unicode_emoji: Option<String>,
+    /// Required when this edit newly grants Administrator.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confirm_admin: bool,
+}
+
+/// One role's new place in the list (`Request::MoveRoles`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMove {
+    pub id: String,
+    #[serde(default)]
+    pub position: i32,
 }
 
 /// Lifecycle status of a Space's scheduled event (Discord `guild_scheduled_events`).
@@ -1572,5 +1664,68 @@ mod tests {
         };
         let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn role_requests_round_trip_and_omit_defaults() {
+        use crate::Response;
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4777");
+        let person = Key::new(&account, "2006");
+        let edit = RoleEdit {
+            name: Some("Helper".into()),
+            color: Some(0xFF_00_00),
+            hoist: Some(true),
+            mentionable: Some(false),
+            permissions: Some(1 << 28),
+            confirm_admin: true,
+            ..RoleEdit::default()
+        };
+        let role = SpaceRole {
+            id: "4701".into(),
+            name: "Newbie".into(),
+            color: 0xFF_00_00,
+            hoist: true,
+            position: 1,
+            mentionable: true,
+            managed: false,
+            icon: "https://cdn.discordapp.com/role-icons/4701/a1b2c3d4.png".into(),
+            permissions: 0,
+            editable: true,
+            assignable: true,
+        };
+        let reqs = [
+            Request::Roles { space: space.clone() },
+            Request::CreateRole { space: space.clone(), edit: edit.clone() },
+            Request::EditRole { space: space.clone(), role_id: "4701".into(), edit: edit.clone() },
+            Request::MoveRoles {
+                space: space.clone(),
+                roles: vec![RoleMove { id: "4701".into(), position: 2 }],
+            },
+            Request::DeleteRole { space: space.clone(), role_id: "4701".into() },
+            Request::SetMemberRoles { space: space.clone(), person, roles: vec!["4701".into()] },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let bare = Request::CreateRole { space: space.clone(), edit: RoleEdit::default() };
+        let mut value = serde_json::to_value(&bare).unwrap();
+        value.as_object_mut().unwrap().remove("edit");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(back, bare);
+        let omitted: SpaceRole = serde_json::from_value(serde_json::json!({"id": "1", "name": "Helper"})).unwrap();
+        assert_eq!(omitted.color, 0);
+        assert!(!omitted.hoist && !omitted.mentionable && !omitted.managed);
+        assert_eq!(omitted.position, 0);
+        assert!(omitted.icon.is_empty());
+        assert_eq!(omitted.permissions, 0);
+        assert!(!omitted.editable && !omitted.assignable);
+        let resp = Response::Roles { space, roles: vec![role.clone()] };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+        let one = Response::Role { role };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&one).unwrap()).unwrap();
+        assert_eq!(back, one);
     }
 }

@@ -5579,3 +5579,263 @@ fn space_invites_list_vanity_revoke_pause_and_permission_guards() {
             .any(|v| v == "INVITES_DISABLED")
     );
 }
+
+/// Create, edit, and assign Discord roles. Missing Manage Roles, hierarchy, managed roles, and
+/// an unconfirmed Administrator grant are refused before any mutating HTTP.
+#[test]
+fn roles_create_edit_assign_and_permission_guards() {
+    fn refusal(answer: Response, needle: &str) {
+        match answer {
+            Response::Error { detail, .. } => assert!(detail.contains(needle), "got: {detail}"),
+            other => panic!("expected a refusal containing {needle}, got {other:?}"),
+        }
+    }
+
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // 4777: we hold Mod (Manage Roles and Administrator) at position 5. Owner is someone else,
+    // so Administrator does not bypass the hierarchy. 4000 still has neither right.
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4777",
+        "properties": {"id": "4777", "name": "Role Guild", "owner_id": "9999", "icon": null},
+        "roles": [
+            {"id": "4777", "name": "@everyone", "permissions": "0", "position": 0},
+            {"id": "4701", "name": "Newbie", "permissions": "0", "color": 16711680, "hoist": true, "mentionable": true, "position": 1, "icon": "a1b2c3d4"},
+            {"id": "4704", "name": "Bot", "permissions": "0", "position": 2, "managed": true},
+            {"id": "4705", "name": "Fun", "permissions": "0", "position": 3, "unicode_emoji": "🌿"},
+            {"id": "4702", "name": "Mod", "permissions": "268435464", "position": 5},
+            {"id": "4703", "name": "Admin", "permissions": "8", "position": 10}
+        ],
+        "channels": [{"id": "4771", "type": 0, "name": "general", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": ["4702"]}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let space = world.key("4777");
+    let rename = protocol::RoleEdit { name: Some("Nope".into()), ..Default::default() };
+
+    // 1. Guild 4000 has no Manage Roles. Each refusal stays on this machine.
+    refusal(world.ask(Request::Roles { space: world.key("4000") }), "to view roles");
+    refusal(
+        world.ask(Request::CreateRole {
+            space: world.key("4000"),
+            edit: protocol::RoleEdit { name: Some("Nope".into()), ..Default::default() },
+        }),
+        "to create a role",
+    );
+    refusal(
+        world.ask(Request::EditRole { space: world.key("4000"), role_id: "4010".into(), edit: rename.clone() }),
+        "to edit roles",
+    );
+    refusal(
+        world.ask(Request::SetMemberRoles {
+            space: world.key("4000"),
+            person: world.key("2006"),
+            roles: vec!["4010".into()],
+        }),
+        "to change a member's roles",
+    );
+    assert!(world.discord.requests_to("GET", "/guilds/4000/roles").is_empty());
+    assert!(world.discord.requests_to("POST", "/guilds/4000/roles").is_empty());
+    assert!(world.discord.requests_to("PATCH", "/guilds/4000/roles").is_empty());
+    assert!(world.discord.requests_to("PUT", "/guilds/4000/members").is_empty());
+    assert!(world.discord.requests_to("DELETE", "/guilds/4000/members").is_empty());
+
+    // 2. The list is the gateway cache. Colour, hoist, and the icon stay on the configured CDN.
+    match world.ask(Request::Roles { space: space.clone() }) {
+        Response::Roles { roles, .. } => {
+            let ids: Vec<&str> = roles.iter().map(|role| role.id.as_str()).collect();
+            assert_eq!(ids, ["4703", "4702", "4705", "4704", "4701", "4777"]);
+            let newbie = roles.iter().find(|role| role.id == "4701").unwrap();
+            assert_eq!(newbie.color, 16_711_680);
+            assert!(newbie.hoist && newbie.mentionable && newbie.editable && newbie.assignable);
+            assert!(!newbie.managed);
+            assert!(newbie.icon.contains("/role-icons/4701/a1b2c3d4.png"), "{}", newbie.icon);
+            assert!(newbie.icon.starts_with("http://") || newbie.icon.starts_with("https://"), "{}", newbie.icon);
+            assert!(!newbie.icon.contains('@'), "{}", newbie.icon);
+            let fun = roles.iter().find(|role| role.id == "4705").unwrap();
+            assert_eq!(fun.icon, "🌿");
+            assert!(fun.assignable && fun.editable);
+            let everyone = roles.iter().find(|role| role.id == "4777").unwrap();
+            assert!(everyone.editable && !everyone.assignable);
+            let admin = roles.iter().find(|role| role.id == "4703").unwrap();
+            assert!(!admin.editable && !admin.assignable);
+            let bot = roles.iter().find(|role| role.id == "4704").unwrap();
+            assert!(bot.managed && !bot.editable && !bot.assignable);
+            let mods = roles.iter().find(|role| role.id == "4702").unwrap();
+            assert!(!mods.editable && !mods.assignable);
+        }
+        other => panic!("expected Response::Roles, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4777/roles").is_empty());
+    assert!(world.discord.requests_to("POST", "/guilds/4777/roles").is_empty());
+    assert!(world.discord.requests_to("PATCH", "/guilds/4777/roles").is_empty());
+
+    // 3. A role above us, a managed role, and our own highest role are not edited.
+    refusal(world.ask(Request::EditRole { space: space.clone(), role_id: "4703".into(), edit: rename.clone() }), "at or above your highest role");
+    refusal(world.ask(Request::EditRole { space: space.clone(), role_id: "4704".into(), edit: rename.clone() }), "Managed roles cannot be edited");
+    refusal(world.ask(Request::EditRole { space: space.clone(), role_id: "4702".into(), edit: rename }), "at or above your highest role");
+    assert!(world.discord.requests_to("PATCH", "/guilds/4777/roles").is_empty());
+
+    // 4. Administrator is a second confirmation, even when we already hold the bit.
+    refusal(
+        world.ask(Request::CreateRole {
+            space: space.clone(),
+            edit: protocol::RoleEdit {
+                name: Some("Boss".into()),
+                permissions: Some(8),
+                confirm_admin: false,
+                ..Default::default()
+            },
+        }),
+        "Confirm before granting the Administrator permission",
+    );
+    assert!(world.discord.requests_to("POST", "/guilds/4777/roles").is_empty());
+
+    // 5. An edit that names nothing is the role we already have, and Discord is not asked.
+    match world.ask(Request::EditRole { space: space.clone(), role_id: "4701".into(), edit: protocol::RoleEdit::default() }) {
+        Response::Role { role } => {
+            assert_eq!(role.id, "4701");
+            assert_eq!(role.name, "Newbie");
+            assert_eq!(role.color, 16_711_680);
+            assert!(role.hoist && role.mentionable && role.assignable);
+        }
+        other => panic!("expected the cached role, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PATCH", "/guilds/4777/roles").is_empty());
+
+    // 6. Creating a role posts once. Permissions travel as a decimal string.
+    world.discord.script(
+        "/guilds/4777/roles",
+        200,
+        json!({"id": "4706", "name": "Helpers", "permissions": "0", "color": 255, "position": 2}),
+    );
+    match world.ask(Request::CreateRole {
+        space: space.clone(),
+        edit: protocol::RoleEdit {
+            name: Some("Helpers".into()),
+            color: Some(255),
+            permissions: Some(0),
+            ..Default::default()
+        },
+    }) {
+        Response::Role { role } => {
+            assert_eq!((role.id.as_str(), role.name.as_str(), role.color), ("4706", "Helpers", 255));
+            assert!(role.assignable && role.editable);
+        }
+        other => panic!("expected Response::Role, got {other:?}"),
+    }
+
+    // 7. Editing Newbie patches that role and keeps its icon on the CDN.
+    world.discord.script(
+        "/guilds/4777/roles/4701",
+        200,
+        json!({
+            "id": "4701",
+            "name": "Newcomers",
+            "permissions": "0",
+            "color": 255,
+            "hoist": true,
+            "mentionable": true,
+            "position": 1,
+            "icon": "a1b2c3d4"
+        }),
+    );
+    match world.ask(Request::EditRole {
+        space: space.clone(),
+        role_id: "4701".into(),
+        edit: protocol::RoleEdit {
+            name: Some("Newcomers".into()),
+            color: Some(255),
+            hoist: Some(true),
+            ..Default::default()
+        },
+    }) {
+        Response::Role { role } => {
+            assert_eq!(role.name, "Newcomers");
+            assert!(role.hoist);
+            assert_eq!(role.color, 255);
+            assert!(role.icon.contains("/role-icons/4701/a1b2c3d4.png"), "{}", role.icon);
+            assert!(!role.icon.contains('@'), "{}", role.icon);
+        }
+        other => panic!("expected the edited role, got {other:?}"),
+    }
+    let patches = world.discord.requests_to("PATCH", "/guilds/4777/roles");
+    assert!(patches.iter().all(|seen| seen.path == "/guilds/4777/roles/4701"), "{patches:?}");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["name"], "Newcomers");
+    assert_eq!(patches[0].body["color"], json!(255));
+    assert_eq!(patches[0].body["hoist"], json!(true));
+
+    // 8. The same Administrator grant, confirmed, is the second post.
+    world.discord.script(
+        "/guilds/4777/roles",
+        200,
+        json!({"id": "4707", "name": "Boss", "permissions": "8", "color": 0, "position": 4}),
+    );
+    match world.ask(Request::CreateRole {
+        space: space.clone(),
+        edit: protocol::RoleEdit {
+            name: Some("Boss".into()),
+            permissions: Some(8),
+            confirm_admin: true,
+            ..Default::default()
+        },
+    }) {
+        Response::Role { role } => {
+            assert_eq!(role.id, "4707");
+            assert_eq!(role.permissions, 8);
+            assert!(role.assignable);
+        }
+        other => panic!("expected the confirmed role, got {other:?}"),
+    }
+    let posts = world.discord.requests_to("POST", "/guilds/4777/roles");
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0].path, "/guilds/4777/roles");
+    assert_eq!(posts[0].body["name"], "Helpers");
+    assert_eq!(posts[0].body["color"], json!(255));
+    assert_eq!(posts[0].body["permissions"], json!("0"));
+    assert_eq!(posts[1].body["name"], "Boss");
+    assert_eq!(posts[1].body["permissions"], json!("8"));
+
+    // 9. An unknown role and @everyone never ask Discord who the member is.
+    let member = world.key("2006");
+    refusal(
+        world.ask(Request::SetMemberRoles { space: space.clone(), person: member.clone(), roles: vec!["4999".into()] }),
+        "not on this server",
+    );
+    refusal(
+        world.ask(Request::SetMemberRoles { space: space.clone(), person: member.clone(), roles: vec!["4777".into()] }),
+        "assigned to every member",
+    );
+    assert!(world.discord.requests_to("GET", "/guilds/4777/members/2006").is_empty());
+
+    // 10. Taking away a managed role reads the member, then stops before any write.
+    world.discord.script("/guilds/4777/members/2006", 200, json!({"user": {"id": "2006"}, "roles": ["4704"]}));
+    refusal(
+        world.ask(Request::SetMemberRoles { space: space.clone(), person: member.clone(), roles: vec!["4701".into()] }),
+        "so it stays",
+    );
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4777/members/2006").len(), 1);
+    assert!(world.discord.requests_to("PUT", "/guilds/4777/members/2006/roles").is_empty());
+    assert!(world.discord.requests_to("DELETE", "/guilds/4777/members/2006/roles").is_empty());
+
+    // 11. Keeping the managed role and adding Newbie is one PUT.
+    world.discord.script("/guilds/4777/members/2006", 200, json!({"user": {"id": "2006"}, "roles": ["4704"]}));
+    world.discord.script("/guilds/4777/members/2006/roles/4701", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetMemberRoles {
+            space,
+            person: member,
+            roles: vec!["4704".into(), "4701".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4777/members/2006").len(), 2);
+    let puts = world.discord.requests_to("PUT", "/guilds/4777/members/2006/roles");
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].path, "/guilds/4777/members/2006/roles/4701");
+    assert!(world.discord.requests_to("DELETE", "/guilds/4777/members/2006/roles").is_empty());
+}

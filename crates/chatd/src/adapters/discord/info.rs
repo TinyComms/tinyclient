@@ -153,6 +153,37 @@ mod invite_tests {
     }
 }
 
+#[cfg(test)]
+mod role_tests {
+    use super::model::{ADMINISTRATOR, MANAGE_ROLES};
+    use super::{may_grant, role_rights};
+
+    #[test]
+    fn role_rights_follow_hierarchy_and_skip_managed_and_everyone() {
+        let (editable, assignable) = role_rights(true, 5, 4777, 4701, 100, false);
+        assert!(editable && assignable, "the owner edits and assigns a role above everyone else");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4701, 1, false);
+        assert!(editable && assignable, "a role below our highest is editable and assignable");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4702, 5, false);
+        assert!(!editable && !assignable, "our own highest role is not below us");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4703, 10, false);
+        assert!(!editable && !assignable, "a role above us is out of reach");
+        let (editable, assignable) = role_rights(true, i32::MAX, 4777, 4704, 2, true);
+        assert!(!editable && !assignable, "a managed role stays put even for the owner");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4777, 0, false);
+        assert!(editable && !assignable, "everyone can be edited when it sits below us, never assigned");
+    }
+
+    #[test]
+    fn may_grant_only_adds_bits_the_actor_holds() {
+        assert!(!may_grant(MANAGE_ROLES, 0, ADMINISTRATOR), "Manage Roles alone cannot add Administrator");
+        assert!(may_grant(MANAGE_ROLES | ADMINISTRATOR, 0, ADMINISTRATOR));
+        assert!(may_grant(u64::MAX, 0, ADMINISTRATOR));
+        assert!(may_grant(MANAGE_ROLES, ADMINISTRATOR, 0), "taking away a bit we lack is allowed");
+        assert!(may_grant(MANAGE_ROLES, ADMINISTRATOR, ADMINISTRATOR | MANAGE_ROLES));
+    }
+}
+
 #[derive(Deserialize)]
 struct GuildCounts {
     #[serde(default)]
@@ -233,6 +264,171 @@ pub(super) fn shared_items(message: &Message, kind: SharedKind) -> Vec<SharedIte
     }
 }
 
+/// A Discord snowflake: digits only, at most 20, and not zero. The returned text is the number,
+/// so a path never keeps whatever punctuation arrived with it.
+fn snowflake(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 20 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let n = raw.parse::<u64>().ok()?;
+    (n != 0).then_some(n)
+}
+
+fn discord_id(raw: &str, why: &str) -> Result<(u64, String), Refusal> {
+    let n = snowflake(raw).ok_or_else(|| refused(why))?;
+    Ok((n, n.to_string()))
+}
+
+fn role_name(name: &str) -> Result<String, Refusal> {
+    let name = name.trim();
+    let count = name.chars().count();
+    if count == 0 {
+        return Err(refused("Enter a role name."));
+    }
+    if count > 100 {
+        return Err(refused("Role name must be between 1 and 100 characters."));
+    }
+    Ok(name.to_owned())
+}
+
+/// `(editable, assignable)`. Managed roles are neither. The owner bypasses the position check;
+/// Administrator does not. `@everyone` is never assignable.
+fn role_rights(owner: bool, highest: i32, guild_id: u64, role_id: u64, position: i32, managed: bool) -> (bool, bool) {
+    if managed {
+        return (false, false);
+    }
+    let editable = owner || position < highest;
+    let assignable = editable && role_id != guild_id;
+    (editable, assignable)
+}
+
+/// Newly set bits must be ones the actor already holds. `u64::MAX` is the owner or Administrator.
+/// Clearing a bit the actor lacks is allowed.
+fn may_grant(actor: u64, before: u64, after: u64) -> bool {
+    if actor == u64::MAX {
+        return true;
+    }
+    let added = after & !before;
+    added & !actor == 0
+}
+
+fn confirm_admin(before: u64, after: u64, confirmed: bool) -> Result<(), Refusal> {
+    let bit = model::ADMINISTRATOR;
+    if after & bit != 0 && before & bit == 0 && !confirmed {
+        return Err(refused("Confirm before granting the Administrator permission."));
+    }
+    Ok(())
+}
+
+fn highest_of(owner: bool, info: &super::GuildInfo) -> i32 {
+    if owner {
+        return i32::MAX;
+    }
+    info.my_roles.iter().filter_map(|id| info.roles.get(id).map(|role| role.position)).max().unwrap_or(0)
+}
+
+fn space_role(guild_num: u64, role_id: u64, role: &super::RoleInfo, owner: bool, highest: i32) -> protocol::SpaceRole {
+    let (editable, assignable) = role_rights(owner, highest, guild_num, role_id, role.position, role.managed);
+    let icon = match (&role.icon, &role.unicode_emoji) {
+        (Some(hash), _) => model::role_icon_url(&role_id.to_string(), hash).unwrap_or_default(),
+        (None, Some(emoji)) => emoji.clone(),
+        (None, None) => String::new(),
+    };
+    protocol::SpaceRole {
+        id: role_id.to_string(),
+        name: role.name.clone(),
+        color: role.color,
+        hoist: role.hoist,
+        position: role.position,
+        mentionable: role.mentionable,
+        managed: role.managed,
+        icon,
+        permissions: role.permissions,
+        editable,
+        assignable,
+    }
+}
+
+/// Picture and emoji are mutually exclusive on the wire. A clear of one leaves the other alone.
+fn role_body(edit: &protocol::RoleEdit, include_name: bool) -> Result<serde_json::Map<String, serde_json::Value>, Refusal> {
+    let picture_path = edit.icon.as_deref().map(str::trim);
+    if picture_path.is_some_and(|path| path.contains("://")) {
+        return Err(refused("Choose a picture on this computer."));
+    }
+    let emoji_value: Option<Option<&str>> = match edit.unicode_emoji.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(text) => {
+            if model::role_emoji(Some(text)).is_none() {
+                return Err(refused("That emoji cannot be used on a role."));
+            }
+            Some(Some(text))
+        }
+    };
+    let picture_is_file = picture_path.is_some_and(|path| !path.is_empty());
+    if picture_is_file && matches!(emoji_value, Some(Some(_))) {
+        return Err(refused("A role can have a picture or an emoji, not both."));
+    }
+    let picture_value: Option<Option<String>> = match picture_path {
+        None => None,
+        Some("") => Some(None),
+        Some(path) => Some(Some(super::read_image_data_uri(path, super::DISCORD_IMAGE_MAX)?)),
+    };
+    let mut body = serde_json::Map::new();
+    if include_name {
+        if let Some(name) = edit.name.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+            body.insert("name".into(), json!(name));
+        }
+    }
+    if let Some(color) = edit.color {
+        if color > 0x00FF_FFFF {
+            return Err(refused("Role color must be between #000000 and #FFFFFF."));
+        }
+        body.insert("color".into(), json!(color));
+    }
+    if let Some(hoist) = edit.hoist {
+        body.insert("hoist".into(), json!(hoist));
+    }
+    if let Some(mentionable) = edit.mentionable {
+        body.insert("mentionable".into(), json!(mentionable));
+    }
+    if let Some(permissions) = edit.permissions {
+        body.insert("permissions".into(), json!(permissions.to_string()));
+    }
+    match (&picture_value, &emoji_value) {
+        (Some(Some(uri)), _) => {
+            body.insert("icon".into(), json!(uri));
+            body.insert("unicode_emoji".into(), serde_json::Value::Null);
+        }
+        (_, Some(Some(text))) => {
+            body.insert("unicode_emoji".into(), json!(text));
+            body.insert("icon".into(), serde_json::Value::Null);
+        }
+        (Some(None), Some(None)) => {
+            body.insert("icon".into(), serde_json::Value::Null);
+            body.insert("unicode_emoji".into(), serde_json::Value::Null);
+        }
+        (Some(None), None) => {
+            body.insert("icon".into(), serde_json::Value::Null);
+        }
+        (None, Some(None)) => {
+            body.insert("unicode_emoji".into(), serde_json::Value::Null);
+        }
+        _ => {}
+    }
+    Ok(body)
+}
+
+#[derive(Clone, Copy)]
+struct RoleGate {
+    owner: bool,
+    highest: i32,
+    manage: bool,
+    actor: u64,
+    guild_num: u64,
+}
+
 impl Discord {
     /// A card's profile, off the command thread: it waits its turn (one per [`PROFILE_EVERY`])
     /// there, so sends and everything else behind it go on. A profile still waiting when a
@@ -310,8 +506,9 @@ impl Discord {
             about.nickname = member.nick.clone().unwrap_or_default();
             // Role names in the server's own order of ids, the everyone role left out; colours
             // are never sent on.
-            let named = member.roles.iter().filter(|role| role.as_str() != space);
-            let names = named.filter_map(|role| guild.and_then(|guild| guild.roles.get(&number(role))).map(|role| role.name.clone()));
+            let held: Vec<&String> = member.roles.iter().filter(|role| role.as_str() != space).collect();
+            about.role_ids = held.iter().take(100).map(|role| (*role).clone()).collect();
+            let names = held.iter().filter_map(|role| guild.and_then(|guild| guild.roles.get(&number(role))).map(|role| role.name.clone()));
             about.roles = names.take(protocol::PROFILE_ROLES).collect();
             about.joined = member.joined_at.as_deref().and_then(model::iso_seconds);
         }
@@ -1151,6 +1348,306 @@ impl Discord {
             }
         }
         self.ctx.space_info_stale(guild);
+        Ok(())
+    }
+
+    fn role_gate(&self, guild: &str) -> Result<RoleGate, Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(guild) else {
+            return Err(refused("This server is gone."));
+        };
+        let owner = info.owner;
+        Ok(RoleGate {
+            owner,
+            highest: highest_of(owner, info),
+            manage: info.space_rights(guild).manage_roles,
+            actor: info.base_permissions(guild),
+            guild_num: number(guild),
+        })
+    }
+
+    fn role_view(&self, guild: &str, role_id: u64) -> Result<protocol::SpaceRole, Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+        let role = info.roles.get(&role_id).ok_or_else(|| refused("Discord did not return the role."))?;
+        let owner = info.owner;
+        let highest = highest_of(owner, info);
+        Ok(space_role(number(guild), role_id, role, owner, highest))
+    }
+
+    fn apply_role(&self, guild: &str, raw: &str) -> Result<protocol::SpaceRole, Refusal> {
+        let role: model::Role = serde_json::from_str(raw).map_err(|_| refused("Discord did not return the role."))?;
+        let (id, _) = discord_id(&role.id, "Discord did not return the role.")?;
+        let _ = self.role_changed(guild, Some(role), None);
+        self.role_view(guild, id)
+    }
+
+    /// Roles already known from READY and later gateway events. Nothing is asked of Discord.
+    pub(super) fn roles(&self, guild: &str) -> Result<Vec<protocol::SpaceRole>, Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(&guild) else {
+            return Err(refused("This server is gone."));
+        };
+        if !info.space_rights(&guild).manage_roles {
+            return Err(refused("You need the Manage Roles permission to view roles."));
+        }
+        let owner = info.owner;
+        let highest = highest_of(owner, info);
+        let guild_num = number(&guild);
+        let mut roles: Vec<protocol::SpaceRole> = info.roles.iter().map(|(id, role)| space_role(guild_num, *id, role, owner, highest)).collect();
+        drop(state);
+        roles.sort_by(|a, b| b.position.cmp(&a.position).then_with(|| a.id.cmp(&b.id)));
+        Ok(roles)
+    }
+
+    /// `POST /guilds/{id}/roles`. One click, so a 429 is not retried.
+    pub(super) fn create_role(&self, guild: &str, edit: &protocol::RoleEdit) -> Result<protocol::SpaceRole, Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to create a role."));
+        }
+        role_name(edit.name.as_deref().unwrap_or(""))?;
+        let after = edit.permissions.unwrap_or(0);
+        if !may_grant(gate.actor, 0, after) {
+            return Err(refused("You can only grant permissions you have."));
+        }
+        confirm_admin(0, after, edit.confirm_admin)?;
+        let body = role_body(edit, true)?;
+        let raw = self
+            .rest
+            .call_once_with("POST", &format!("/guilds/{guild}/roles"), Some(serde_json::Value::Object(body)), &[])
+            .map_err(refusal)?;
+        self.apply_role(&guild, &raw)
+    }
+
+    /// `PATCH /guilds/{id}/roles/{role}`. Hierarchy, managed, and Administrator are refused first.
+    pub(super) fn edit_role(&self, guild: &str, role_id: &str, edit: &protocol::RoleEdit) -> Result<protocol::SpaceRole, Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let (role_num, role_id) = discord_id(role_id, "That role is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to edit roles."));
+        }
+        let held = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            let role = info.roles.get(&role_num).ok_or_else(|| refused("That role is not on this server."))?;
+            (role.name.clone(), role.permissions, role.managed, role.position)
+        };
+        let (name, before, managed, position) = held;
+        if managed {
+            return Err(refused("Managed roles cannot be edited."));
+        }
+        let (editable, _) = role_rights(gate.owner, gate.highest, gate.guild_num, role_num, position, false);
+        if !editable {
+            return Err(refused("That role is at or above your highest role, so you cannot edit it."));
+        }
+        let everyone = role_num == gate.guild_num;
+        if let Some(asked) = edit.name.as_deref() {
+            let asked = role_name(asked)?;
+            if everyone && asked != name {
+                return Err(refused("The everyone role cannot be renamed."));
+            }
+        }
+        let after = edit.permissions.unwrap_or(before);
+        if !may_grant(gate.actor, before, after) {
+            return Err(refused("You can only grant permissions you have."));
+        }
+        confirm_admin(before, after, edit.confirm_admin)?;
+        let body = role_body(edit, !everyone)?;
+        if body.is_empty() {
+            return self.role_view(&guild, role_num);
+        }
+        let raw = self
+            .rest
+            .call_once_with("PATCH", &format!("/guilds/{guild}/roles/{role_id}"), Some(serde_json::Value::Object(body)), &[])
+            .map_err(refusal)?;
+        self.apply_role(&guild, &raw)
+    }
+
+    /// `PATCH /guilds/{id}/roles` with the new order. An empty list changes nothing.
+    pub(super) fn move_roles(&self, guild: &str, roles: &[protocol::RoleMove]) -> Result<(), Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to edit roles."));
+        }
+        if roles.is_empty() {
+            return Ok(());
+        }
+        let mut planned = Vec::with_capacity(roles.len());
+        for role in roles {
+            let (id, id_text) = discord_id(&role.id, "That role is not a Discord id.")?;
+            planned.push((id, id_text, role.position));
+        }
+        let payload = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            let mut payload = Vec::with_capacity(planned.len());
+            for (id, id_text, position) in &planned {
+                if *id == gate.guild_num {
+                    return Err(refused("The everyone role cannot be moved."));
+                }
+                let Some(role) = info.roles.get(id) else {
+                    return Err(refused("That role is not on this server."));
+                };
+                if role.managed {
+                    return Err(refused("Managed roles cannot be moved."));
+                }
+                let (editable, _) = role_rights(gate.owner, gate.highest, gate.guild_num, *id, role.position, false);
+                if !editable {
+                    return Err(refused("That role is at or above your highest role, so you cannot move it."));
+                }
+                if *position <= 0 {
+                    return Err(refused("A role cannot move to the everyone position."));
+                }
+                if !gate.owner && *position >= gate.highest {
+                    return Err(refused("That position is at or above your highest role."));
+                }
+                payload.push(json!({"id": id_text, "position": position}));
+            }
+            payload
+        };
+        let raw = self
+            .rest
+            .call_once_with("PATCH", &format!("/guilds/{guild}/roles"), Some(json!(payload)), &[])
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<Vec<model::Role>>(&raw) {
+            for role in updated {
+                let _ = self.role_changed(&guild, Some(role), None);
+            }
+            return Ok(());
+        }
+        let mut state = crate::hub::lock(&self.state);
+        if let Some(info) = state.guilds.get_mut(&guild) {
+            for (id, _, position) in &planned {
+                if let Some(role) = info.roles.get_mut(id) {
+                    role.position = *position;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `DELETE /guilds/{id}/roles/{role}`.
+    pub(super) fn delete_role(&self, guild: &str, role_id: &str) -> Result<(), Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let (role_num, role_id) = discord_id(role_id, "That role is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to edit roles."));
+        }
+        if role_num == gate.guild_num {
+            return Err(refused("The everyone role cannot be deleted."));
+        }
+        let (managed, position) = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            let role = info.roles.get(&role_num).ok_or_else(|| refused("That role is not on this server."))?;
+            (role.managed, role.position)
+        };
+        if managed {
+            return Err(refused("Managed roles cannot be deleted."));
+        }
+        let (editable, _) = role_rights(gate.owner, gate.highest, gate.guild_num, role_num, position, false);
+        if !editable {
+            return Err(refused("That role is at or above your highest role, so you cannot delete it."));
+        }
+        self.rest.call_once_with("DELETE", &format!("/guilds/{guild}/roles/{role_id}"), None, &[]).map_err(refusal)?;
+        let _ = self.role_changed(&guild, None, Some(&role_id));
+        Ok(())
+    }
+
+    /// `PUT` and `DELETE /guilds/{id}/members/{user}/roles/{role}` for the difference from the
+    /// member Discord returns. Refusals happen before any of those writes.
+    pub(super) fn set_member_roles(&self, guild: &str, person: &str, desired: &[String]) -> Result<(), Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let (_, person) = discord_id(person, "That member is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to change a member's roles."));
+        }
+        let mut wanted = Vec::new();
+        for raw in desired {
+            let (id, _) = discord_id(raw, "That role is not a Discord id.")?;
+            if id == gate.guild_num {
+                return Err(refused("The everyone role is assigned to every member."));
+            }
+            if !wanted.contains(&id) {
+                wanted.push(id);
+            }
+        }
+        let flags: Vec<(u64, bool)> = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            info.roles
+                .iter()
+                .map(|(id, role)| {
+                    let (_, assignable) = role_rights(gate.owner, gate.highest, gate.guild_num, *id, role.position, role.managed);
+                    (*id, assignable)
+                })
+                .collect()
+        };
+        for id in &wanted {
+            if !flags.iter().any(|(known, _)| known == id) {
+                return Err(refused("That role is not on this server."));
+            }
+        }
+        let raw = self
+            .rest
+            .call_once_with("GET", &format!("/guilds/{guild}/members/{person}"), None, &[])
+            .map_err(refusal)?;
+        let member: model::Member = serde_json::from_str(&raw).map_err(refused)?;
+        let mut current = Vec::new();
+        for id in &member.roles {
+            match snowflake(id) {
+                Some(n) if n == gate.guild_num => {}
+                Some(n) => {
+                    if !current.contains(&n) {
+                        current.push(n);
+                    }
+                }
+                None => return Err(refused("That role is above yours or managed, so it stays.")),
+            }
+        }
+        let assignable = |id: &u64| flags.iter().find(|(known, _)| known == id).map(|(_, ok)| *ok).unwrap_or(false);
+        for id in &current {
+            if !wanted.contains(id) && !assignable(id) {
+                return Err(refused("That role is above yours or managed, so it stays."));
+            }
+        }
+        for id in &wanted {
+            if !current.contains(id) && !assignable(id) {
+                return Err(refused("That role cannot be assigned."));
+            }
+        }
+        let mut final_ids: Vec<String> = current.iter().map(u64::to_string).collect();
+        for id in &current {
+            if wanted.contains(id) {
+                continue;
+            }
+            let id_s = id.to_string();
+            self.rest
+                .call_once_with("DELETE", &format!("/guilds/{guild}/members/{person}/roles/{id_s}"), None, &[])
+                .map_err(refusal)?;
+            final_ids.retain(|kept| kept != &id_s);
+        }
+        for id in &wanted {
+            if current.contains(id) {
+                continue;
+            }
+            let id_s = id.to_string();
+            self.rest
+                .call_once_with("PUT", &format!("/guilds/{guild}/members/{person}/roles/{id_s}"), None, &[])
+                .map_err(refusal)?;
+            final_ids.push(id_s);
+        }
+        if person == self.me() {
+            let member = model::Member { user_id: Some(self.me()), roles: final_ids, ..model::Member::default() };
+            let _ = self.member_changed(&guild, &member);
+        }
         Ok(())
     }
 

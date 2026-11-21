@@ -17,7 +17,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
     KeyDownEvent, Pixels, Point, WeakEntity, Window,
 };
-use protocol::{Conversation, Key, Link, Notify, Person, Profile, RelateAction, Request, Response};
+use protocol::{Conversation, Key, Link, Network, Notify, Person, Profile, RelateAction, Request, Response, SpaceRole};
 
 const CARD_WIDTH: f32 = 300.;
 const CONFIRM_WIDTH: f32 = 360.;
@@ -145,6 +145,11 @@ pub struct Floating {
     /// One-line input for setting a friend's private nickname (`Float::FriendNickname`).
     nick_input: Option<Entity<TextInput>>,
     nick_error: Option<String>,
+    /// Roles of the Discord server this card was opened from, when we may assign them.
+    space_roles: Vec<SpaceRole>,
+    roles_loaded: bool,
+    roles_error: Option<String>,
+    manage_roles: bool,
 }
 
 impl Floating {
@@ -162,6 +167,10 @@ impl Floating {
             direct: None,
             nick_input: None,
             nick_error: None,
+            space_roles: Vec::new(),
+            roles_loaded: false,
+            roles_error: None,
+            manage_roles: false,
         }
     }
 
@@ -200,13 +209,22 @@ impl Floating {
         }
         self.place = None;
         self.direct = None;
+        self.space_roles.clear();
+        self.roles_loaded = false;
+        self.roles_error = None;
+        self.manage_roles = false;
         let (asked, shell, this) = (self.profile_asked, self.shell.clone(), cx.weak_entity());
         cx.spawn(async move |_, cx| {
             let held = shell.read_with(cx, |shell, _| {
                 let open = shell.held_rows().next().cloned();
-                (super::info::space_of(open.as_ref(), &person), existing_direct(shell.held_rows(), &person).cloned())
+                let place = super::info::space_of(open.as_ref(), &person);
+                let direct = existing_direct(shell.held_rows(), &person).cloned();
+                let manage = place.as_ref().is_some_and(|(key, _)| {
+                    shell.spaces.iter().any(|space| space.key == *key && space.key.network == Network::Discord && space.rights.manage_roles)
+                });
+                (place, direct, manage)
             });
-            let Ok((place, direct)) = held else {
+            let Ok((place, direct, manage)) = held else {
                 return;
             };
             let space = place.as_ref().map(|(key, _)| key.clone());
@@ -217,9 +235,30 @@ impl Floating {
                 }
                 this.place = place;
                 this.direct = direct;
+                this.manage_roles = manage;
                 cx.notify();
                 if !card {
                     return;
+                }
+                if manage {
+                    if let Some(space_key) = space.clone() {
+                        let weak_roles = weak.clone();
+                        super::ask_later(cx, Request::Roles { space: space_key }, move |answer, cx| {
+                            let _ = weak_roles.update(cx, |this, cx| {
+                                if this.profile_asked != asked {
+                                    return;
+                                }
+                                this.roles_loaded = true;
+                                match answer {
+                                    Ok(Response::Roles { roles, .. }) => this.space_roles = roles,
+                                    Ok(Response::Error { detail, .. }) => this.roles_error = Some(detail),
+                                    Err(err) => this.roles_error = Some(err.to_string()),
+                                    _ => {}
+                                }
+                                cx.notify();
+                            });
+                        });
+                    }
                 }
                 super::ask_later(cx, Request::Profile { person, space }, move |answer, cx| {
                     let Ok(Response::Profile { profile }) = answer else {
@@ -340,7 +379,7 @@ impl Floating {
         let mut any = false;
         if let Some(profile) = profile.filter(|_| seen.online) {
             match facts::card_body(person, profile, place) {
-                Some(CardBody::Role(role)) => {
+                Some(CardBody::Role(role)) if !self.manage_roles => {
                     any = true;
                     let spaces = self.spaces(cx);
                     let icon = self.place.as_ref().map(|(key, name)| {
@@ -350,11 +389,16 @@ impl Floating {
                     });
                     body = body.child(draw::role(&role, icon, Some(3)));
                 }
+                Some(CardBody::Role(_)) => {}
                 Some(CardBody::About(bio)) => {
                     any = true;
                     body = body.child(div().type_ui().line_clamp(2).child(bio));
                 }
                 None => {}
+            }
+            if self.manage_roles {
+                any = true;
+                body = body.child(self.member_roles(person, profile, cx));
             }
             if let Some(common) = facts::in_common(network, profile) {
                 any = true;
@@ -376,6 +420,9 @@ impl Floating {
                         .child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(common.words)),
                 );
             }
+        } else if self.manage_roles && seen.online {
+            any = true;
+            body = body.child(div().type_small().text_color(theme::text_soft()).child("Loading roles…"));
         }
         let max = f32::from(window.viewport_size().height) - 16.;
         let (key, space, given) = (person.key.clone(), self.place.as_ref().map(|(key, _)| key.clone()), profile.cloned());
@@ -415,6 +462,109 @@ impl Floating {
             .when(any, |card| card.child(div().id("card-body").min_h_0().flex_shrink(1.).overflow_y_scroll().pt(px(12.)).child(body)))
             .child(div().h(px(12.)))
             .child(foot)
+    }
+
+    /// Checkboxes for roles we may give or take. A picture URL is never fetched or linked:
+    /// a colour swatch and a unicode emoji are the only marks drawn beside the name.
+    fn member_roles(&self, person: &Person, profile: &Profile, cx: &mut Context<Self>) -> Div {
+        if !self.roles_loaded && self.roles_error.is_none() {
+            return div().type_small().text_color(theme::text_soft()).child("Loading roles…");
+        }
+        let space_id = self.place.as_ref().map(|(key, _)| key.id.as_str()).unwrap_or("");
+        let mut col = div().flex().flex_col().gap(px(4.)).child(div().type_small().text_color(theme::text_soft()).child("Roles"));
+        for (ix, role) in self.space_roles.iter().enumerate() {
+            if role.id == space_id {
+                continue;
+            }
+            let held = profile.role_ids.iter().any(|id| id == &role.id);
+            if !role.assignable && !held {
+                continue;
+            }
+            let on = held;
+            let mut row = div()
+                .id(("card-role", ix))
+                .h(px(28.))
+                .px(px(6.))
+                .rounded(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(6.));
+            if role.assignable {
+                let who = person.key.clone();
+                let role_id = role.id.clone();
+                row = row.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_member_role(who, role_id, cx);
+                }));
+            } else {
+                row = row.opacity(0.55).cursor_default();
+            }
+            row = row
+                .child(crate::gui::components::glyph(
+                    if on { "icons/square-check.svg" } else { "icons/square.svg" },
+                    14.,
+                    if on { theme::accent() } else { theme::text_soft() },
+                ))
+                .when(role.color != 0, |row| row.child(div().w(px(10.)).h(px(10.)).rounded(px(4.)).bg(gpui::rgb(role.color))))
+                .when(!role.icon.is_empty() && !role.icon.contains("://"), |row| {
+                    row.child(div().type_small().child(role.icon.clone()))
+                })
+                .child(div().min_w_0().truncate().type_small().text_color(theme::text()).child(role.name.clone()));
+            col = col.child(row);
+        }
+        if let Some(error) = &self.roles_error {
+            col = col.child(div().type_small().text_color(theme::danger()).child(error.clone()));
+        }
+        col
+    }
+
+    /// The full desired set, including roles we cannot change, so the server does not treat them as removed.
+    fn toggle_member_role(&mut self, person: Key, role_id: String, cx: &mut Context<Self>) {
+        if !self.roles_loaded {
+            self.roles_error = Some("Loading roles…".to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(held) = self.profile.as_ref().filter(|profile| profile.person.key == person).map(|profile| profile.role_ids.clone()) else {
+            self.roles_error = Some("Loading roles…".to_owned());
+            cx.notify();
+            return;
+        };
+        let Some(space) = self.place.as_ref().map(|(key, _)| key.clone()) else {
+            return;
+        };
+        let mut ids = held;
+        if ids.iter().any(|id| id == &role_id) {
+            ids.retain(|id| id != &role_id);
+        } else {
+            ids.push(role_id);
+        }
+        self.roles_error = None;
+        let asked = self.profile_asked;
+        let weak = cx.weak_entity();
+        super::ask_later(cx, Request::SetMemberRoles { space, person: person.clone(), roles: ids.clone() }, move |answer, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                if this.profile_asked != asked {
+                    return;
+                }
+                match answer {
+                    Ok(Response::Ok) => {
+                        let names: Vec<String> = ids
+                            .iter()
+                            .filter_map(|id| this.space_roles.iter().find(|role| role.id == *id).map(|role| role.name.clone()))
+                            .take(protocol::PROFILE_ROLES)
+                            .collect();
+                        if let Some(profile) = this.profile.as_mut().filter(|profile| profile.person.key == person) {
+                            profile.role_ids = ids;
+                            profile.roles = names;
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.roles_error = Some(detail),
+                    Err(err) => this.roles_error = Some(err.to_string()),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
     }
 
     fn spaces(&self, cx: &mut Context<Self>) -> Vec<protocol::Space> {

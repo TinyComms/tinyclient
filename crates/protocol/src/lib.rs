@@ -890,6 +890,9 @@ pub struct Profile {
     /// Their roles in that Space, names only (colours are left out), at most [`PROFILE_ROLES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// Role ids in that Space, so a card can give or take them. Not capped at [`PROFILE_ROLES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_ids: Vec<String>,
     /// Email and phone, each copied on click; phone numbers masked until clicked. At most
     /// [`PROFILE_CONTACTS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -938,6 +941,7 @@ impl Profile {
             title: String::new(),
             department: String::new(),
             roles: Vec::new(),
+            role_ids: Vec::new(),
             contacts: Vec::new(),
             mutual_total: 0,
             joined: None,
@@ -1844,6 +1848,41 @@ pub enum Request {
     SetInvitesPaused {
         space: Key,
         paused: bool,
+    },
+    /// List a Space's roles (Discord roles already known from the gateway).
+    Roles {
+        space: Key,
+    },
+    /// Create a role (Discord `POST /guilds/{id}/roles`).
+    CreateRole {
+        space: Key,
+        #[serde(default)]
+        edit: RoleEdit,
+    },
+    /// Edit a role (Discord `PATCH /guilds/{id}/roles/{role}`).
+    EditRole {
+        space: Key,
+        role_id: String,
+        #[serde(default)]
+        edit: RoleEdit,
+    },
+    /// Reorder roles (Discord `PATCH /guilds/{id}/roles`).
+    MoveRoles {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<RoleMove>,
+    },
+    /// Delete a role (Discord `DELETE /guilds/{id}/roles/{role}`).
+    DeleteRole {
+        space: Key,
+        role_id: String,
+    },
+    /// Give or take a member's roles (Discord `PUT` / `DELETE /guilds/{id}/members/{user}/roles/{role}`).
+    SetMemberRoles {
+        space: Key,
+        person: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
     },
     Watch(Watching),
 
@@ -3067,6 +3106,15 @@ pub enum Response {
         invites: Vec<SpaceInvite>,
         #[serde(default, skip_serializing_if = "is_false")]
         paused: bool,
+    },
+    /// Answers `Roles`: the Space's roles, highest first.
+    Roles {
+        space: Key,
+        roles: Vec<SpaceRole>,
+    },
+    /// Answers `CreateRole` / `EditRole`.
+    Role {
+        role: SpaceRole,
     },
     Pinned {
         conversation: Key,

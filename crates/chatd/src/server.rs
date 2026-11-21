@@ -1880,6 +1880,82 @@ impl Chat {
         }
     }
 
+    fn roles(&self, space: Key) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::Roles { space_id, reply }) {
+            Ok(roles) => Response::Roles { space, roles },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn create_role(&self, space: Key, edit: protocol::RoleEdit) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::CreateRole { space_id, edit, reply }) {
+            Ok(role) => Response::Role { role },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn edit_role(&self, space: Key, role_id: String, edit: protocol::RoleEdit) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::EditRole { space_id, role_id, edit, reply }) {
+            Ok(role) => Response::Role { role },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn move_roles(&self, space: Key, roles: Vec<protocol::RoleMove>) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::MoveRoles { space_id, roles, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn delete_role(&self, space: Key, role_id: String) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::DeleteRole { space_id, role_id, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_member_roles(&self, space: Key, person: Key, roles: Vec<String>) -> Response {
+        if person.account() != space.account() {
+            return error(ErrorCode::Refused, "That member is on another account.");
+        }
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        let person_id = person.id.clone();
+        match self.ask(&account, |reply| Command::SetMemberRoles { space_id, person_id, roles, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -3475,6 +3551,12 @@ impl Chat {
             Request::SpaceInvites { space } => self.space_invites(space),
             Request::RevokeInvite { space, code } => self.revoke_invite(space, code),
             Request::SetInvitesPaused { space, paused } => self.set_invites_paused(space, paused),
+            Request::Roles { space } => self.roles(space),
+            Request::CreateRole { space, edit } => self.create_role(space, edit),
+            Request::EditRole { space, role_id, edit } => self.edit_role(space, role_id, edit),
+            Request::MoveRoles { space, roles } => self.move_roles(space, roles),
+            Request::DeleteRole { space, role_id } => self.delete_role(space, role_id),
+            Request::SetMemberRoles { space, person, roles } => self.set_member_roles(space, person, roles),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
@@ -4308,6 +4390,9 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     about.roles.retain(|role| !role.is_empty());
     about.roles.truncate(protocol::PROFILE_ROLES);
     about.roles.iter_mut().for_each(|role| clip(role, 100));
+    about.role_ids.retain(|role| !role.is_empty());
+    about.role_ids.truncate(100);
+    about.role_ids.iter_mut().for_each(|role| clip(role, 32));
     about.contacts.truncate(protocol::PROFILE_CONTACTS);
     for contact in &mut about.contacts {
         clip(&mut contact.value, 200);
@@ -4329,6 +4414,7 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.title = about.title;
     profile.department = about.department;
     profile.roles = about.roles;
+    profile.role_ids = about.role_ids;
     profile.contacts = about.contacts;
     profile.mutual_total = about.mutual_total;
     profile.joined = about.joined;

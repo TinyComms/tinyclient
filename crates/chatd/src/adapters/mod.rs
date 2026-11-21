@@ -168,6 +168,8 @@ pub struct About {
     pub department: String,
     /// Role names in that Space, colours left out.
     pub roles: Vec<String>,
+    /// Role ids in that Space. The card uses these to give or take roles; names stay in `roles`.
+    pub role_ids: Vec<String>,
     /// Email and phone; chatd masks phone numbers.
     pub contacts: Vec<Contact>,
     /// Mutual Spaces in all, when more than `mutual_spaces` lists.
@@ -618,6 +620,43 @@ pub enum Command {
         paused: bool,
         reply: Reply<()>,
     },
+    /// A Space's roles, from what the adapter already knows.
+    Roles {
+        space_id: String,
+        reply: Reply<Vec<protocol::SpaceRole>>,
+    },
+    /// Create a role.
+    CreateRole {
+        space_id: String,
+        edit: protocol::RoleEdit,
+        reply: Reply<protocol::SpaceRole>,
+    },
+    /// Edit a role.
+    EditRole {
+        space_id: String,
+        role_id: String,
+        edit: protocol::RoleEdit,
+        reply: Reply<protocol::SpaceRole>,
+    },
+    /// Reorder roles.
+    MoveRoles {
+        space_id: String,
+        roles: Vec<protocol::RoleMove>,
+        reply: Reply<()>,
+    },
+    /// Delete a role.
+    DeleteRole {
+        space_id: String,
+        role_id: String,
+        reply: Reply<()>,
+    },
+    /// Give or take a member's roles.
+    SetMemberRoles {
+        space_id: String,
+        person_id: String,
+        roles: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -938,8 +977,14 @@ impl Command {
             | Command::TransferSpace { reply, .. }
             | Command::DeleteEvent { reply, .. }
             | Command::RevokeInvite { reply, .. }
-            | Command::SetInvitesPaused { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::SetInvitesPaused { reply, .. }
+            | Command::EditRole { reply, .. }
+            | Command::MoveRoles { reply, .. }
+            | Command::DeleteRole { reply, .. }
+            | Command::SetMemberRoles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Roles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateRole { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
