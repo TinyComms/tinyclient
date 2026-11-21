@@ -168,6 +168,17 @@ pub struct State {
     pub join_server: Option<JoinServerModal>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
+    /// Discord "Browse channels" modal with follow/unfollow checkboxes.
+    pub browse_channels: Option<BrowseChannelsModal>,
+}
+
+pub struct BrowseChannelsModal {
+    pub space: Key,
+    pub space_name: String,
+    pub filter: Entity<crate::gui::input::TextInput>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub channels: Vec<protocol::BrowsedChannel>,
 }
 
 pub struct JoinServerModal {
@@ -300,6 +311,7 @@ impl State {
             create_channel: None,
             join_server: None,
             leave_space: None,
+            browse_channels: None,
         }
     }
 
@@ -1007,6 +1019,10 @@ impl Shell {
                         state.muted_shown.insert(space);
                     }
                     (tree::Reveal::OptedOut, Some(space)) => {
+                        if space.network == Network::Discord {
+                            self.open_browse_channels(space, cx);
+                            return;
+                        }
                         state.opted_shown.insert(space);
                     }
                     (tree::Reveal::Threads(channel), _) => {
@@ -2121,7 +2137,329 @@ impl Shell {
         }
     }
 
-    /// Open the "Create channel…" modal for a Space (optionally inside a section/group).
+    pub(super) fn open_browse_channels(&mut self, space: Key, cx: &mut Context<Self>) {
+        let space_name = self
+            .spaces
+            .iter()
+            .find(|s| s.key == space)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Server".to_owned());
+        let filter = cx.new(|cx| crate::gui::input::TextInput::new("Filter channels…", cx));
+        let initial: Vec<protocol::BrowsedChannel> = self
+            .trees
+            .get(&space)
+            .map(|tree| {
+                tree.conversations
+                    .iter()
+                    .filter(|c| c.kind != ConversationKind::Thread)
+                    .map(|c| protocol::BrowsedChannel {
+                        key: c.key.clone(),
+                        name: c.title.clone(),
+                        topic: c.topic.clone(),
+                        members: 0,
+                        joined: !c.opted_out,
+                        private: c.private,
+                        archived: false,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.sidebar_state.browse_channels = Some(BrowseChannelsModal {
+            space: space.clone(),
+            space_name,
+            filter,
+            loading: true,
+            error: None,
+            channels: initial,
+        });
+        cx.notify();
+        let req = Request::BrowseChannels {
+            space: space.clone(),
+            query: String::new(),
+            cursor: None,
+            limit: 200,
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(modal) = this.sidebar_state.browse_channels.as_mut().filter(|m| m.space == space) else {
+                    return;
+                };
+                modal.loading = false;
+                match answer {
+                    Ok(Response::BrowsedChannels { channels, .. }) => {
+                        modal.channels = channels;
+                        modal.error = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => modal.error = Some(detail),
+                    Ok(_) => modal.error = Some("Could not load channels.".to_owned()),
+                    Err(err) => modal.error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn toggle_follow_channel(&mut self, conversation: Key, on: bool, cx: &mut Context<Self>) {
+        if let Some(modal) = self.sidebar_state.browse_channels.as_mut() {
+            if let Some(ch) = modal.channels.iter_mut().find(|c| c.key == conversation) {
+                ch.joined = on;
+            }
+        }
+        cx.notify();
+        let revert_key = conversation.clone();
+        let req = Request::FollowChannel { conversation, on };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(modal) = this.sidebar_state.browse_channels.as_mut() {
+                        if let Some(ch) = modal.channels.iter_mut().find(|c| c.key == revert_key) {
+                            ch.joined = !on;
+                        }
+                    }
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                    cx.notify();
+                }
+                _ => {
+                    if let Some(modal) = this.sidebar_state.browse_channels.as_mut() {
+                        if let Some(ch) = modal.channels.iter_mut().find(|c| c.key == revert_key) {
+                            ch.joined = !on;
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn set_space_view(
+        &mut self,
+        space: Key,
+        show_all: Option<bool>,
+        hide_muted: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let req = Request::SetSpaceView { space, show_all, hide_muted };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                } else if let Err(err) = answer {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), err.to_string(), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn browse_channels_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.browse_channels.as_ref()?;
+        let space_row = self.spaces.iter().find(|s| s.key == modal.space);
+        let opt_in_on = space_row.is_some_and(|s| s.opt_in_channels);
+        let hide_muted = space_row.is_some_and(|s| s.hide_muted);
+        let needle = modal.filter.read(cx).text().trim().to_lowercase();
+        let tree = self.trees.get(&modal.space);
+
+        // Group viewable channels by their category in tree order.
+        let mut group_order: Vec<(Option<String>, String)> = vec![(None, "Channels".to_owned())];
+        if let Some(tree) = tree {
+            let mut groups: Vec<&protocol::Group> = tree.groups.iter().collect();
+            groups.sort_by_key(|g| g.position);
+            for g in groups {
+                group_order.push((Some(g.id.clone()), g.name.clone()));
+            }
+        }
+        let group_of = |key: &Key| -> Option<String> {
+            tree.and_then(|t| t.conversations.iter().find(|c| &c.key == key).and_then(|c| c.group.clone()))
+        };
+
+        let mut list = div()
+            .id("browse-channels-list")
+            .flex_1()
+            .min_h(px(120.))
+            .max_h(px(340.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(4.));
+
+        let mut any_shown = false;
+        for (cat_id, cat_name) in &group_order {
+            let matching: Vec<&protocol::BrowsedChannel> = modal
+                .channels
+                .iter()
+                .filter(|ch| {
+                    let in_cat = group_of(&ch.key) == *cat_id
+                        || (cat_id.is_none()
+                            && group_of(&ch.key)
+                                .as_ref()
+                                .is_none_or(|gid| !group_order.iter().any(|(id, _)| id.as_deref() == Some(gid.as_str()))));
+                    let matches_query = needle.is_empty()
+                        || ch.name.to_lowercase().contains(&needle)
+                        || ch.topic.to_lowercase().contains(&needle);
+                    in_cat && matches_query
+                })
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+            any_shown = true;
+            if group_order.len() > 1 {
+                list = list.child(
+                    div()
+                        .pt(px(6.))
+                        .pb(px(2.))
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .child(cat_name.clone()),
+                );
+            }
+            for (ix, ch) in matching.into_iter().enumerate() {
+                let key = ch.key.clone();
+                let following = ch.joined;
+                let row_key = SharedString::from(format!("browse-ch-{}-{ix}", ch.key.id));
+                list = list.child(
+                    div()
+                        .id(row_key)
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(theme::R_CONTROL))
+                        .hover(|s| s.bg(theme::hover()))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(glyph(
+                            if ch.private { "icons/lock.svg" } else { "icons/hash.svg" },
+                            14.,
+                            theme::text_soft(),
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(ch.name.clone()))
+                                .when(!ch.topic.is_empty(), |col| {
+                                    col.child(div().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(ch.topic.clone()))
+                                }),
+                        )
+                        .child(
+                            button(
+                                SharedString::from(format!("browse-toggle-{}", ch.key.id)),
+                                if following { ButtonKind::Secondary } else { ButtonKind::Primary },
+                                if following { "Following" } else { "Follow" },
+                            )
+                            .h(px(26.))
+                            .px(px(10.))
+                            .type_small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_follow_channel(key.clone(), !following, cx);
+                            })),
+                        ),
+                );
+            }
+        }
+        if !any_shown {
+            let msg = if modal.loading { "Loading channels…" } else { "No matching channels." };
+            list = list.child(div().py(px(20.)).type_small().text_color(theme::text_faint()).child(msg));
+        }
+
+        let space_all = modal.space.clone();
+        let space_muted = modal.space.clone();
+        let card = div()
+            .id("browse-channels-card")
+            .w(px(480.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_title().text_color(theme::text()).child(format!("Browse channels · {}", modal.space_name)))
+                    .child(icon_button("browse-channels-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.browse_channels = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        button(
+                            "browse-show-all",
+                            if !opt_in_on { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            if !opt_in_on { "Showing all channels" } else { "Show all channels" },
+                        )
+                        .h(px(26.))
+                        .px(px(10.))
+                        .type_small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_space_view(space_all.clone(), Some(opt_in_on), None, cx);
+                        })),
+                    )
+                    .child(
+                        button(
+                            "browse-hide-muted",
+                            if hide_muted { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            if hide_muted { "Muted hidden" } else { "Hide muted channels" },
+                        )
+                        .h(px(26.))
+                        .px(px(10.))
+                        .type_small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_space_view(space_muted.clone(), None, Some(!hide_muted), cx);
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.filter.clone()),
+            )
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(list);
+
+        Some(
+            div()
+                .id("browse-channels-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.browse_channels = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    /// Open the "Leave server" confirmation modal for a Space.
     pub(super) fn open_leave_space(&mut self, space: Key, name: String, cx: &mut Context<Self>) {
         self.sidebar_state.leave_space = Some((space, name));
         cx.notify();

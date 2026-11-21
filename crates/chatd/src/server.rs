@@ -3205,6 +3205,20 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::FollowChannel { conversation, on } => {
+                self.act(&conversation, |conversation_id, reply| Command::FollowChannel { conversation_id, on, reply })
+            }
+            Request::SetSpaceView { space, show_all, hide_muted } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SetSpaceView { space_id, show_all, hide_muted, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::SetDisappearing { conversation, seconds } => {
                 let res = self.act(&conversation, |conversation_id, reply| Command::SetDisappearing { conversation_id, seconds, reply });
                 if res == Response::Ok {

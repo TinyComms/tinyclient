@@ -876,7 +876,38 @@ impl Shell {
                         .into_any_element(),
                 );
                 if space.network == Network::Discord {
-                    let space_muted = self.spaces.iter().any(|s| &s.key == space && s.muted);
+                    let space_row = self.spaces.iter().find(|s| &s.key == space);
+                    let space_muted = space_row.is_some_and(|s| s.muted);
+                    let opt_in_on = space_row.is_some_and(|s| s.opt_in_channels);
+                    let hide_muted = space_row.is_some_and(|s| s.hide_muted);
+                    let browse_space = space.clone();
+                    let view_all_space = space.clone();
+                    let hide_muted_space = space.clone();
+                    items.push(menu_separator().into_any_element());
+                    items.push(
+                        menu_item("space-browse-channels", Some("icons/list.svg"), "Browse channels…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_browse_channels(browse_space.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                    items.push(
+                        menu_item_check("space-show-all", !opt_in_on, "Show all channels", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.set_space_view(view_all_space.clone(), Some(opt_in_on), None, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                    items.push(
+                        menu_item_check("space-hide-muted", hide_muted, "Hide muted channels", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.set_space_view(hide_muted_space.clone(), None, Some(!hide_muted), cx);
+                            }))
+                            .into_any_element(),
+                    );
                     items.push(menu_separator().into_any_element());
                     if space_muted {
                         let unmute_space = space.clone();
@@ -1686,6 +1717,7 @@ impl Render for Shell {
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
+            .children(self.browse_channels_modal(cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))

@@ -262,6 +262,9 @@ pub struct Space {
     /// The user has permission to create channels in this Space (`Request::CreateChannel`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_channels: bool,
+    /// Opt-in channel filter is active ("Show all channels" is off, Discord `OPT_IN_CHANNELS_ON`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opt_in_channels: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1420,6 +1423,21 @@ pub enum Request {
     FollowThread {
         conversation: Key,
         on: bool,
+    },
+    /// Follow (`on: true`) or unfollow (`on: false`) a channel or category in a Space's
+    /// channel list (Discord Browse Channels opt-in flag bit 12).
+    FollowChannel {
+        conversation: Key,
+        on: bool,
+    },
+    /// Toggle a Space's channel-list view filters (Discord "Show all channels" and
+    /// "Hide muted channels"). Unset fields are left unchanged.
+    SetSpaceView {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show_all: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hide_muted: Option<bool>,
     },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.

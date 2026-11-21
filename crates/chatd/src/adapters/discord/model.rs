@@ -660,6 +660,15 @@ pub const OPT_IN_CHANNELS_ON: u32 = 1 << 14;
 /// Channel override flags: this channel (or category) is opted in.
 pub const OPT_IN_ENABLED: u32 = 1 << 12;
 
+/// Server onboarding configuration (`GET /guilds/{id}/onboarding`).
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct Onboarding {
+    #[serde(default, deserialize_with = "nullable")]
+    pub default_channel_ids: Vec<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub enabled: bool,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct GuildSettings {
     /// Null for the entry that holds direct messages.

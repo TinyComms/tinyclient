@@ -5143,3 +5143,95 @@ fn set_space_notify_mutes_server_with_duration_levels_and_category() {
         other => panic!("expected Refused for unknown guild, got {other:?}"),
     }
 }
+
+#[test]
+fn follow_channel_space_view_and_onboarding_defaults() {
+    let world = polished();
+    let guild = world.key("4000");
+
+    // 1. Space 4000 starts with OPT_IN_CHANNELS_ON (opt_in_channels = true) and hide_muted = true.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let found = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            assert!(found.opt_in_channels, "opt-in filter should be on from READY");
+            assert!(found.hide_muted, "hide_muted should be on from READY");
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+
+    // 2. BrowseChannels fetches GET /guilds/4000/onboarding once and marks default_channel_ids as followed (!opted_out).
+    world.discord.script(
+        "/guilds/4000/onboarding",
+        200,
+        json!({"guild_id": "4000", "enabled": true, "default_channel_ids": ["4102"]}),
+    );
+    match world.ask(Request::BrowseChannels {
+        space: guild.clone(),
+        query: String::new(),
+        cursor: None,
+        limit: 100,
+    }) {
+        Response::BrowsedChannels { channels, .. } => {
+            let ch_4101 = channels.iter().find(|c| c.key.id == "4101").expect("4101");
+            let ch_4102 = channels.iter().find(|c| c.key.id == "4102").expect("4102");
+            let ch_4201 = channels.iter().find(|c| c.key.id == "4201").expect("4201");
+            assert!(ch_4101.joined, "opted-in channel 4101 should be joined");
+            assert!(ch_4102.joined, "onboarding default channel 4102 should be joined");
+            assert!(!ch_4201.joined, "non-default non-opted-in channel 4201 stays opted out");
+        }
+        other => panic!("expected BrowsedChannels, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4000/onboarding").len(), 1);
+
+    // 3. FollowChannel opts channel 4201 in (bit 12 = 4096) and unfollowing clears bit 12.
+    assert_eq!(
+        world.ask(Request::FollowChannel { conversation: world.key("4201"), on: true }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["channel_overrides"]["4201"]["flags"], 1u32 << 12);
+
+    assert_eq!(
+        world.ask(Request::FollowChannel { conversation: world.key("4201"), on: false }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 2);
+    assert_eq!(patches[1].body["channel_overrides"]["4201"]["flags"], 0);
+
+    // 4. SetSpaceView toggles Show All Channels (clears bit 14) and Hide Muted Channels.
+    assert_eq!(
+        world.ask(Request::SetSpaceView {
+            space: guild.clone(),
+            show_all: Some(false),
+            hide_muted: Some(true),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[2].body["flags"], 1u32 << 14);
+    assert_eq!(patches[2].body["hide_muted_channels"], true);
+
+    assert_eq!(
+        world.ask(Request::SetSpaceView {
+            space: guild.clone(),
+            show_all: Some(true),
+            hide_muted: Some(false),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 4);
+    assert_eq!(patches[3].body["flags"], 0);
+    assert_eq!(patches[3].body["hide_muted_channels"], false);
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let found = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            assert!(!found.opt_in_channels, "Show all channels clears opt_in_channels");
+            assert!(!found.hide_muted, "hide_muted should now be false");
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+}

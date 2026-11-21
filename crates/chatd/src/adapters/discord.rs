@@ -166,6 +166,10 @@ struct Quiet {
     opt_in: bool,
     /// Channels and categories opted in.
     opted_in: HashSet<String>,
+    /// Raw guild settings `flags`, kept so toggling one bit preserves all others.
+    raw_flags: u32,
+    /// Raw per-channel override `flags`, kept so toggling one bit preserves all others.
+    channel_flags: HashMap<String, u32>,
     /// The server's notification level (0 all, 1 mentions, 2 nothing), and the channels and
     /// categories that set their own.
     level: u8,
@@ -212,6 +216,10 @@ struct GuildInfo {
     premium_tier: u8,
     /// Unix seconds until our own server timeout ends, if timed out.
     timeout_until: Option<i64>,
+    /// Channels always shown by the server's onboarding (`GET /guilds/{id}/onboarding`).
+    onboarding_defaults: HashSet<String>,
+    /// Whether `GET /guilds/{id}/onboarding` has already been fetched in this session.
+    onboarding_fetched: bool,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
 }
@@ -1862,6 +1870,15 @@ impl Discord {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::SetSpaceNotify { space_id, notify, until, category, reply } => {
                 answer(reply, self.set_space_notify(&space_id, notify, until, category.as_deref()))
+            }
+            Command::FollowChannel { conversation_id, on, reply } => {
+                answer(reply, self.follow_channel(&conversation_id, on))
+            }
+            Command::SetSpaceView { space_id, show_all, hide_muted, reply } => {
+                answer(reply, self.set_space_view(&space_id, show_all, hide_muted))
+            }
+            Command::BrowseChannels { space_id, query, cursor: _, limit, reply } => {
+                answer(reply, self.browse_channels(&space_id, &query, limit))
             }
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),

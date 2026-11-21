@@ -107,6 +107,12 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
         hide_muted: settings.hide_muted_channels,
         opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
         opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
+        raw_flags: settings.flags,
+        channel_flags: overrides
+            .iter()
+            .filter(|channel| channel.flags != 0)
+            .map(|channel| (channel.channel_id.clone(), channel.flags))
+            .collect(),
         level: settings.message_notifications,
         levels: levels.map(|channel| (channel.channel_id.clone(), channel.message_notifications)).collect(),
     }
@@ -124,12 +130,13 @@ impl Quiet {
         self.muted_until.is_some_and(|until| until > now)
     }
 
-    /// Not opted in to, where the user turned "Show all channels" off: neither the channel nor
-    /// its category is opted in. Unverified against a real account: the flag bits are the
-    /// community's, and the channels a server's onboarding always shows are not known here, so
-    /// such a server may show fewer channels than Discord does until they are opted in.
-    pub(super) fn opted_out(&self, channel: &str, parent: Option<&str>) -> bool {
-        self.opt_in && !self.opted_in.contains(channel) && !parent.is_some_and(|parent| self.opted_in.contains(parent))
+    /// Not opted in to, where the user turned "Show all channels" off: neither an onboarding
+    /// default channel nor opted in (directly or via its category).
+    pub(super) fn opted_out(&self, channel: &str, parent: Option<&str>, defaults: &HashSet<String>) -> bool {
+        self.opt_in
+            && !defaults.contains(channel)
+            && !self.opted_in.contains(channel)
+            && !parent.is_some_and(|parent| self.opted_in.contains(parent))
     }
 
     /// The network's notification setting for one conversation, mute first.
@@ -234,12 +241,12 @@ impl GuildInfo {
         allowed
     }
 
-    fn can_view(&self, guild: &str, me: &str, channel: &Channel) -> bool {
+    pub(super) fn can_view(&self, guild: &str, me: &str, channel: &Channel) -> bool {
         self.permissions(guild, me, channel) & VIEW_CHANNEL != 0
     }
 
     /// True for a channel someone with no role cannot see: it is drawn with a lock.
-    fn private(&self, guild: &str, channel: &Channel) -> bool {
+    pub(super) fn private(&self, guild: &str, channel: &Channel) -> bool {
         let everyone = number(guild);
         let mut allowed = self.roles.get(&everyone).map_or(0, |role| role.permissions);
         let overwrites = &channel.permission_overwrites;
@@ -284,7 +291,7 @@ impl GuildInfo {
             read_only_reason,
             rights,
             private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
-            opted_out: self.quiet.opted_out(&channel.id, parent),
+            opted_out: self.quiet.opted_out(&channel.id, parent, &self.onboarding_defaults),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
             ..ConversationRow::new(&channel.id, kind, name)
         })
@@ -334,6 +341,8 @@ impl Discord {
             nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
             premium_tier: guild.premium_tier().unwrap_or(0),
             timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
+            onboarding_defaults: HashSet::new(),
+            onboarding_fetched: false,
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
                     id: emoji.id.clone()?,
@@ -566,9 +575,16 @@ impl Discord {
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
-        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted));
-        if let Some((muted, hide)) = flags {
+        let flags = self
+            .state
+            .lock()
+            .unwrap()
+            .guilds
+            .get(guild_id)
+            .map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted, info.quiet.opt_in));
+        if let Some((muted, hide, opt_in)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
+            self.ctx.set_space_opt_in(guild_id, opt_in)?;
         }
         Ok(())
     }
@@ -635,7 +651,9 @@ impl Discord {
         let mut flags = Vec::new();
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
-            flags.extend(state.guilds.iter().map(|(id, info)| (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted)));
+            flags.extend(state.guilds.iter().map(|(id, info)| {
+                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.quiet.opt_in)
+            }));
             let listed = state.guilds.iter().map(|(id, info)| {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
                 let row = SpaceRow {
@@ -651,9 +669,10 @@ impl Discord {
         };
         self.ctx.media(&files)?;
         self.ctx.spaces(&rows)?;
-        // A server's own mute and "hide muted channels", once its Space exists to hold them.
-        for (id, muted, hide) in flags {
+        // A server's own mute, "hide muted channels" and opt-in filter, once its Space exists.
+        for (id, muted, hide, opt_in) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
+            self.ctx.set_space_opt_in(&id, opt_in)?;
         }
         Ok(())
     }

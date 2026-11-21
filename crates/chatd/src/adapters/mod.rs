@@ -617,6 +617,19 @@ pub enum Command {
         on: bool,
         reply: Reply<()>,
     },
+    /// Follow (`on: true`) or unfollow (`on: false`) a channel or category (Discord opt-in bit 12).
+    FollowChannel {
+        conversation_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
+    /// Toggle Space channel-list view settings (Discord Show All Channels / Hide Muted Channels).
+    SetSpaceView {
+        space_id: String,
+        show_all: Option<bool>,
+        hide_muted: Option<bool>,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -866,7 +879,9 @@ impl Command {
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
-            | Command::FollowThread { reply, .. } => {
+            | Command::FollowThread { reply, .. }
+            | Command::FollowChannel { reply, .. }
+            | Command::SetSpaceView { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1054,6 +1069,15 @@ impl Context {
     pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
         let space = self.key(space_id);
         if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sets whether the Space's opt-in channel filter ("Show all channels" off) is active.
+    pub fn set_space_opt_in(&self, space_id: &str, opt_in: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_opt_in(&space, opt_in)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())
