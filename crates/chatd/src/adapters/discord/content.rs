@@ -1,12 +1,13 @@
 //! Discord's messages into the one message model: markdown to text and spans, attachments,
 //! embeds, stickers, reactions, replies, system lines.
 
-use super::model::{self, seconds, Attachment as Attached, Embed, EmbedImage, Posted};
+use super::model::{self, seconds, Attachment as Attached, Component, Embed, EmbedImage, Posted, UnfurledMedia};
 use crate::adapters::Context;
 use base64::Engine;
 use protocol::{
-    AccountKey, Attachment, Card, Forwarded, Key, MediaFile, MediaKind, MentionKind, Message,
-    MessageKind, Preview, Reaction, ReplyTo, Sender, Span, Style, ThreadSummary,
+    AccountKey, Attachment, Card, ControlKind, ControlOption, ControlStyle, Forwarded, Key, MediaFile, MediaKind,
+    MentionKind, Message, MessageControl, MessageKind, Preview, Reaction, ReplyTo, Sender, Span, Style, ThreadSummary,
+    MESSAGE_CONTROLS_LIMIT,
 };
 
 /// Names for what a message only gives ids for.
@@ -811,6 +812,20 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed);
     attachments.extend(moving_pictures);
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
+    let app_id = posted.application_id.as_deref().unwrap_or(&author.id);
+    let (controls, _dropped_components) = match carried.components.as_deref() {
+        Some(comps) if !comps.is_empty() => extract_components(
+            comps,
+            &posted.id,
+            app_id,
+            posted.flags,
+            &link,
+            place.names,
+            &mut rich,
+            &mut attachments,
+        ),
+        _ => (Vec::new(), false),
+    };
     let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && forwarded.is_some());
     let forwarded_from = origin.map(|origin| {
         let channel = origin.channel_id.as_deref().unwrap_or("");
@@ -836,14 +851,16 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         && attachments.is_empty()
         && previews.is_empty()
         && card.is_none()
+        && controls.is_empty()
     {
         // Buttons, menus, or something newer than this build: never a blank row.
-        rich.text = if posted.components.is_empty() {
+        let has_components = posted.components.as_deref().is_some_and(|c| !c.is_empty());
+        rich.text = if !has_components {
             "A message tinyclient cannot show.".to_owned()
         } else {
             "Interactive message".to_owned()
         };
-        message_kind = MessageKind::Unsupported { link };
+        message_kind = MessageKind::Unsupported { link: link.clone() };
     }
 
     let reply_to = match (&posted.message_reference, &posted.referenced_message) {
@@ -942,8 +959,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
-        permalink: String::new(),
-        controls: Vec::new(),
+        permalink: link,
+        controls,
     };
     (message, rich.files)
 }
@@ -1022,6 +1039,45 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     if let Some(reacted) = &update.reactions {
         stored.reactions = reactions(&mut rich, reacted);
     }
+    if let Some(components) = &update.components {
+        let app_id = update
+            .application_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&stored.sender.id);
+        let link = if stored.permalink.is_empty() {
+            jump_link(place.guild, &update.channel_id, &stored.id)
+        } else {
+            stored.permalink.clone()
+        };
+        let mut comp_rich = Rich::default();
+        let mut comp_attachments = Vec::new();
+        let (controls, _) = extract_components(
+            components,
+            &stored.id,
+            app_id,
+            update.flags,
+            &link,
+            place.names,
+            &mut comp_rich,
+            &mut comp_attachments,
+        );
+        stored.controls = controls;
+        if !comp_rich.text.is_empty() && update.content.as_deref().unwrap_or("").is_empty() {
+            stored.text = comp_rich.text;
+            stored.spans = comp_rich.spans;
+            if matches!(stored.kind, MessageKind::Unsupported { .. }) {
+                stored.kind = MessageKind::Normal;
+            }
+        } else if !stored.controls.is_empty() && matches!(stored.kind, MessageKind::Unsupported { .. }) {
+            stored.kind = MessageKind::Normal;
+        }
+        rich.files.merge(comp_rich.files);
+        if !comp_attachments.is_empty() {
+            stored.attachments.retain(|kept| !kept.file.id.starts_with("comp:"));
+            stored.attachments.extend(comp_attachments);
+        }
+    }
     if let Some(pinned) = update.pinned {
         stored.pinned = pinned;
     }
@@ -1044,6 +1100,397 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
         stored.call = Some(note);
     }
     rich.files
+}
+
+/// Returns `true` only for safe external HTTP(S) URLs.
+fn is_safe_http_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// Formats a component's emoji as a short display string (Unicode glyph or `:name:`).
+fn component_emoji(emoji: Option<&model::Emoji>) -> String {
+    let Some(emoji) = emoji else {
+        return String::new();
+    };
+    match (&emoji.id, &emoji.name) {
+        (None, Some(name)) => name.clone(),
+        (Some(_), Some(name)) => format!(":{name}:"),
+        _ => String::new(),
+    }
+}
+
+/// Converts a Discord v2 unfurled media item into an attachment when it has a safe HTTP(S) URL.
+fn component_media_attachment(
+    rich: &mut Rich,
+    message_id: &str,
+    index: usize,
+    media: &UnfurledMedia,
+    as_file: bool,
+    spoiler: bool,
+    caption: Option<&str>,
+) -> Option<Attachment> {
+    let fetch_url = media
+        .proxy_url
+        .as_deref()
+        .filter(|u| is_safe_http_url(u))
+        .or_else(|| is_safe_http_url(&media.url).then_some(media.url.as_str()))?;
+    let mime = media.content_type.clone().unwrap_or_else(|| {
+        if as_file {
+            "application/octet-stream".to_owned()
+        } else {
+            "image/png".to_owned()
+        }
+    });
+    let kind = if as_file {
+        MediaKind::File
+    } else if mime.starts_with("video/") {
+        MediaKind::Video
+    } else if mime == "image/gif" {
+        MediaKind::Gif
+    } else {
+        MediaKind::Image
+    };
+    let name = caption
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            fetch_url
+                .split('?')
+                .next()
+                .and_then(|s| s.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("media-{index}"));
+    let file = MediaFile {
+        width: media.width,
+        height: media.height,
+        ..MediaFile::new(format!("comp:{message_id}:{index}"), kind)
+    };
+    rich.files.push((file.clone(), fetch_url.to_owned()));
+    Some(Attachment {
+        name,
+        file,
+        thumb: None,
+        preview: None,
+        mime,
+        duration: 0,
+        spoiler,
+        sticker: false,
+        waveform: Vec::new(),
+        round: false,
+        view_once: false,
+    })
+}
+
+/// Parses Discord message components (both v1 interactive action rows and v2 layout/display
+/// components) into `MessageControl`s, v2 text/attachments, and whether any component was dropped.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn extract_components(
+    components: &[Component],
+    message_id: &str,
+    app_id: &str,
+    flags: u64,
+    link: &str,
+    names: &dyn Names,
+    rich: &mut Rich,
+    attachments: &mut Vec<Attachment>,
+) -> (Vec<MessageControl>, bool) {
+    let block_id = format!("discord:{app_id}:{flags}");
+    let mut controls: Vec<MessageControl> = Vec::new();
+    let mut dropped = false;
+    let mut row_idx: u8 = 0;
+    let mut media_idx: usize = 0;
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        comp: &Component,
+        row: u8,
+        row_idx: &mut u8,
+        media_idx: &mut usize,
+        message_id: &str,
+        block_id: &str,
+        names: &dyn Names,
+        rich: &mut Rich,
+        attachments: &mut Vec<Attachment>,
+        controls: &mut Vec<MessageControl>,
+        dropped: &mut bool,
+    ) {
+        if controls.len() >= MESSAGE_CONTROLS_LIMIT {
+            *dropped = true;
+            return;
+        }
+        match comp.kind {
+            // Type 1: Action Row
+            1 => {
+                let this_row = *row_idx;
+                *row_idx = row_idx.saturating_add(1);
+                for child in &comp.components {
+                    visit(child, this_row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+            }
+            // Type 2: Button
+            2 => {
+                let style_num = comp.style.unwrap_or(2);
+                let label = comp.label.as_deref().unwrap_or("").trim().to_owned();
+                let emoji = component_emoji(comp.emoji.as_ref());
+                if style_num == 5 {
+                    // Link button: validate URL strictly (http/https only).
+                    if let Some(url) = comp.url.as_deref().filter(|u| is_safe_http_url(u)) {
+                        controls.push(MessageControl {
+                            block_id: block_id.to_owned(),
+                            action_id: format!("link_{}", controls.len()),
+                            element_type: "discord_button".to_owned(),
+                            label: if label.is_empty() && emoji.is_empty() { "Open link".to_owned() } else { label },
+                            value: String::new(),
+                            confirm: None,
+                            kind: ControlKind::Button { url: url.to_owned(), style: ControlStyle::Default },
+                            disabled: comp.disabled,
+                            emoji,
+                            row,
+                            min_values: 0,
+                            max_values: 0,
+                        });
+                    } else {
+                        *dropped = true;
+                    }
+                } else if style_num == 6 {
+                    // Premium / SKU purchase button: not supported.
+                    *dropped = true;
+                } else if let Some(custom_id) = comp.custom_id.as_deref().filter(|id| !id.is_empty()) {
+                    let style = match style_num {
+                        1 => ControlStyle::Primary,
+                        3 => ControlStyle::Success,
+                        4 => ControlStyle::Danger,
+                        _ => ControlStyle::Default,
+                    };
+                    controls.push(MessageControl {
+                        block_id: block_id.to_owned(),
+                        action_id: custom_id.to_owned(),
+                        element_type: "discord_button".to_owned(),
+                        label: if label.is_empty() && emoji.is_empty() { "Action".to_owned() } else { label },
+                        value: String::new(),
+                        confirm: None,
+                        kind: ControlKind::Button { url: String::new(), style },
+                        disabled: comp.disabled,
+                        emoji,
+                        row,
+                        min_values: 0,
+                        max_values: 0,
+                    });
+                } else {
+                    *dropped = true;
+                }
+            }
+            // Type 3: String Select
+            3 => {
+                if let Some(custom_id) = comp.custom_id.as_deref().filter(|id| !id.is_empty()) {
+                    let placeholder = comp
+                        .placeholder
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("Make a selection")
+                        .trim()
+                        .to_owned();
+                    let mut selected = None;
+                    let options: Vec<ControlOption> = comp
+                        .options
+                        .iter()
+                        .map(|opt| {
+                            if opt.default && selected.is_none() {
+                                selected = Some(opt.value.clone());
+                            }
+                            let prefix = component_emoji(opt.emoji.as_ref());
+                            let label = if prefix.is_empty() {
+                                opt.label.clone()
+                            } else {
+                                format!("{prefix} {}", opt.label)
+                            };
+                            ControlOption {
+                                label,
+                                value: opt.value.clone(),
+                                description: opt.description.clone().unwrap_or_default(),
+                            }
+                        })
+                        .collect();
+                    controls.push(MessageControl {
+                        block_id: block_id.to_owned(),
+                        action_id: custom_id.to_owned(),
+                        element_type: "discord_string_select".to_owned(),
+                        label: String::new(),
+                        value: selected.clone().unwrap_or_default(),
+                        confirm: None,
+                        kind: ControlKind::Select {
+                            placeholder,
+                            options,
+                            selected,
+                            external: false,
+                        },
+                        disabled: comp.disabled,
+                        emoji: String::new(),
+                        row,
+                        min_values: comp.min_values.unwrap_or(1),
+                        max_values: comp.max_values.unwrap_or(1),
+                    });
+                } else {
+                    *dropped = true;
+                }
+            }
+            // Types 5..=8: User, Role, Mentionable, Channel Selects (entity pickers)
+            5 | 6 | 7 | 8 => {
+                let (element_type, fallback_placeholder) = match comp.kind {
+                    5 => ("discord_user_select", "Select a user"),
+                    6 => ("discord_role_select", "Select a role"),
+                    7 => ("discord_mentionable_select", "Select a user or role"),
+                    _ => ("discord_channel_select", "Select a channel"),
+                };
+                if let Some(custom_id) = comp.custom_id.as_deref().filter(|id| !id.is_empty()) {
+                    let placeholder = comp
+                        .placeholder
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(fallback_placeholder)
+                        .trim()
+                        .to_owned();
+                    controls.push(MessageControl {
+                        block_id: block_id.to_owned(),
+                        action_id: custom_id.to_owned(),
+                        element_type: element_type.to_owned(),
+                        label: String::new(),
+                        value: String::new(),
+                        confirm: None,
+                        kind: ControlKind::Select {
+                            placeholder,
+                            options: Vec::new(),
+                            selected: None,
+                            external: true,
+                        },
+                        disabled: comp.disabled,
+                        emoji: String::new(),
+                        row,
+                        min_values: comp.min_values.unwrap_or(1),
+                        max_values: comp.max_values.unwrap_or(1),
+                    });
+                } else {
+                    // No custom id, so the menu cannot be sent. The shell offers Open in Discord.
+                    *dropped = true;
+                }
+            }
+            // Type 9: Section (v2) — child text displays + optional accessory (button or thumbnail)
+            9 => {
+                for child in &comp.components {
+                    visit(child, row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+                if let Some(accessory) = comp.accessory.as_deref() {
+                    let this_row = *row_idx;
+                    if accessory.kind == 2 {
+                        *row_idx = row_idx.saturating_add(1);
+                    }
+                    visit(accessory, this_row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+            }
+            // Type 10: Text Display (v2)
+            10 => {
+                if let Some(text) = comp.content.as_deref().filter(|s| !s.is_empty()) {
+                    if !rich.text.is_empty() && !rich.text.ends_with('\n') {
+                        rich.text.push('\n');
+                    }
+                    markdown(rich, text, names);
+                }
+            }
+            // Type 11: Thumbnail (v2)
+            11 => {
+                if let Some(media) = comp.media.as_ref() {
+                    let idx = *media_idx;
+                    *media_idx += 1;
+                    if let Some(att) = component_media_attachment(rich, message_id, idx, media, false, false, None) {
+                        attachments.push(att);
+                    }
+                }
+            }
+            // Type 12: Media Gallery (v2)
+            12 => {
+                for item in &comp.items {
+                    if let Some(media) = item.media.as_ref() {
+                        let idx = *media_idx;
+                        *media_idx += 1;
+                        if let Some(att) = component_media_attachment(
+                            rich,
+                            message_id,
+                            idx,
+                            media,
+                            false,
+                            item.spoiler,
+                            item.description.as_deref(),
+                        ) {
+                            attachments.push(att);
+                        }
+                    }
+                }
+            }
+            // Type 13: File (v2)
+            13 => {
+                if let Some(media) = comp.file.as_ref() {
+                    let idx = *media_idx;
+                    *media_idx += 1;
+                    if let Some(att) = component_media_attachment(rich, message_id, idx, media, true, false, None) {
+                        attachments.push(att);
+                    }
+                }
+            }
+            // Type 14: Separator (v2)
+            14 => {
+                if !rich.text.is_empty() && !rich.text.ends_with("\n\n") {
+                    rich.text.push('\n');
+                }
+            }
+            // Type 17: Container (v2)
+            17 => {
+                for child in &comp.components {
+                    visit(child, row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+            }
+            _ => {
+                *dropped = true;
+            }
+        }
+    }
+
+    for comp in components {
+        visit(
+            comp,
+            row_idx,
+            &mut row_idx,
+            &mut media_idx,
+            message_id,
+            &block_id,
+            names,
+            rich,
+            attachments,
+            &mut controls,
+            &mut dropped,
+        );
+    }
+
+    // Always offer "Open in Discord" when any component could not be rendered locally.
+    if dropped && is_safe_http_url(link) && controls.len() < MESSAGE_CONTROLS_LIMIT {
+        controls.push(MessageControl {
+            block_id,
+            action_id: "open_in_discord".to_owned(),
+            element_type: "discord_open_link".to_owned(),
+            label: "Open in Discord".to_owned(),
+            value: String::new(),
+            confirm: None,
+            kind: ControlKind::Button { url: link.to_owned(), style: ControlStyle::Default },
+            disabled: false,
+            emoji: String::new(),
+            row: row_idx,
+            min_values: 0,
+            max_values: 0,
+        });
+    }
+
+    (controls, dropped)
 }
 
 #[cfg(test)]
@@ -1236,5 +1683,119 @@ mod tests {
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
         assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
+    }
+
+    #[test]
+    fn components_v1_and_v2_extract_controls_text_and_open_in_discord_fallback() {
+        struct Empty;
+        impl Names for Empty {
+            fn user(&self, _: &str) -> Option<String> { None }
+            fn role(&self, _: &str) -> Option<String> { None }
+            fn channel(&self, _: &str) -> Option<String> { None }
+            fn space(&self, _: &str) -> Option<String> { None }
+        }
+        let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+        let place = Place { account: &account, me: "me", guild: Some("4000"), names: &Empty, author: None };
+
+        // 1. V1 action rows: primary/success/danger/link buttons (invalid link rejected) + string select.
+        let posted: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000100",
+            "channel_id": "4101",
+            "application_id": "9001",
+            "author": {"id": "9001", "username": "DeployBot", "bot": true},
+            "content": "Choose a target:",
+            "flags": 0,
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {"type": 2, "style": 3, "label": "Approve", "custom_id": "approve_1", "emoji": {"name": "✅"}},
+                        {"type": 2, "style": 4, "label": "Reject", "custom_id": "reject_1", "disabled": true},
+                        {"type": 2, "style": 5, "label": "Docs", "url": "https://example.com/docs"},
+                        {"type": 2, "style": 5, "label": "BadLink", "url": "javascript:alert(1)"}
+                    ]
+                },
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 3,
+                            "custom_id": "env_pick",
+                            "placeholder": "Pick env",
+                            "min_values": 1,
+                            "max_values": 2,
+                            "options": [
+                                {"label": "Staging", "value": "staging", "description": "Pre-prod", "default": true},
+                                {"label": "Prod", "value": "prod"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let (mut m, _) = message(&posted, &place);
+        assert_eq!(m.kind, MessageKind::Normal);
+        // 3 valid buttons + 1 string select + 1 "Open in Discord" fallback (because BadLink was dropped).
+        assert_eq!(m.controls.len(), 5);
+        assert_eq!(m.controls[0].action_id, "approve_1");
+        assert_eq!(m.controls[0].emoji, "✅");
+        assert_eq!(m.controls[0].row, 0);
+        assert_eq!(m.controls[0].block_id, "discord:9001:0");
+        assert_eq!(m.controls[0].kind, ControlKind::Button { url: String::new(), style: ControlStyle::Success });
+        assert!(m.controls[1].disabled);
+        assert_eq!(m.controls[2].kind, ControlKind::Button { url: "https://example.com/docs".into(), style: ControlStyle::Default });
+        assert_eq!(m.controls[3].row, 1);
+        assert_eq!((m.controls[3].min_values, m.controls[3].max_values), (1, 2));
+        assert!(matches!(&m.controls[3].kind, ControlKind::Select { selected: Some(s), options, .. } if s == "staging" && options[0].description == "Pre-prod"));
+        assert_eq!(m.controls[4].label, "Open in Discord");
+        assert!(matches!(&m.controls[4].kind, ControlKind::Button { url, .. } if url == "https://discord.com/channels/4000/4101/1300000000000000100"));
+
+        // 2. Partial MESSAGE_UPDATE replaces controls (e.g. disabling button after press).
+        let upd: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000100",
+            "channel_id": "4101",
+            "components": [
+                {"type": 1, "components": [{"type": 2, "style": 3, "label": "Approved", "custom_id": "approve_1", "disabled": true}]}
+            ]
+        }))
+        .unwrap();
+        patch(&mut m, &upd, &place);
+        assert_eq!(m.controls.len(), 1);
+        assert_eq!(m.controls[0].label, "Approved");
+        assert!(m.controls[0].disabled);
+
+        // 3. Components V2: Container + Section + Text Display + Button accessory + Media Gallery.
+        let v2: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000101",
+            "channel_id": "4101",
+            "author": {"id": "9001", "username": "Bot", "bot": true},
+            "content": "",
+            "flags": 32768,
+            "components": [
+                {
+                    "type": 17,
+                    "components": [
+                        {
+                            "type": 9,
+                            "components": [{"type": 10, "content": "**Release v2** is ready"}],
+                            "accessory": {"type": 2, "style": 1, "label": "Ship", "custom_id": "ship_v2"}
+                        },
+                        {
+                            "type": 12,
+                            "items": [{"media": {"url": "https://cdn.discordapp.com/a.png", "width": 640, "height": 480, "content_type": "image/png"}}]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let (m2, files2) = message(&v2, &place);
+        assert_eq!(m2.kind, MessageKind::Normal);
+        assert_eq!(m2.text, "Release v2 is ready");
+        assert_eq!(m2.controls.len(), 1);
+        assert_eq!(m2.controls[0].label, "Ship");
+        assert_eq!(m2.attachments.len(), 1);
+        assert!(files2.files.iter().any(|(_, url)| url == "https://cdn.discordapp.com/a.png"));
     }
 }

@@ -225,6 +225,9 @@ impl Discord {
             "STREAM_DELETE" => self.stream_deleted(data)?,
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
+            "INTERACTION_CREATE" | "INTERACTION_SUCCESS" => self.interaction_settled(from_str(data)?),
+            "INTERACTION_FAILURE" => self.interaction_failed(from_str(data)?),
+            "INTERACTION_MODAL_CREATE" => self.interaction_modal_create(from_str(data)?),
             _ => {}
         }
         Ok(())

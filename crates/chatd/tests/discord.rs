@@ -412,6 +412,39 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["read-states", "ack-bulk"]) => (200, json!({})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
+        ("POST", ["interactions"]) => {
+            let nonce = seen.body["nonce"].as_str().unwrap_or("").to_owned();
+            let custom_id = seen.body["data"]["custom_id"].as_str().unwrap_or("");
+            if custom_id == "open_feedback_modal" {
+                shared.push(
+                    "INTERACTION_MODAL_CREATE",
+                    json!({
+                        "id": "modal_99",
+                        "custom_id": "feedback_submit",
+                        "title": "Feedback Form",
+                        "channel_id": seen.body["channel_id"],
+                        "nonce": nonce,
+                        "application": {"id": seen.body["application_id"]},
+                        "components": [{
+                            "type": 1,
+                            "components": [{
+                                "type": 4,
+                                "custom_id": "reason",
+                                "label": "Reason",
+                                "style": 2,
+                                "placeholder": "Describe it",
+                                "required": true
+                            }]
+                        }]
+                    }),
+                );
+            } else if custom_id == "fail_me" {
+                shared.push("INTERACTION_FAILURE", json!({"nonce": nonce, "reason_code": 1}));
+            } else {
+                shared.push("INTERACTION_SUCCESS", json!({"nonce": nonce}));
+            }
+            (204, Value::Null)
+        }
         ("POST", ["channels", _, "call", "stop-ringing"]) => (204, Value::Null),
         ("POST", ["users", "@me", "channels"]) => {
             let zoe = json!({"id": "2050", "username": "zoe", "global_name": "Zoe Lin", "discriminator": "0", "avatar": null});
@@ -5044,4 +5077,188 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         }
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
+}
+
+#[test]
+fn discord_buttons_selects_and_modals_round_trip() {
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let channel = world.key("4101");
+
+    // Push a bot message containing buttons + a string select menu.
+    world.discord.push(
+        "MESSAGE_CREATE",
+        json!({
+            "id": "1300000000000000901",
+            "channel_id": "4101",
+            "guild_id": "4000",
+            "type": 0,
+            "application_id": "990011",
+            "author": {"id": "990011", "username": "DeployBot", "global_name": "DeployBot", "discriminator": "0", "avatar": null, "bot": true},
+            "content": "Ready to deploy?",
+            "timestamp": "2026-10-13T08:15:00.000000+00:00",
+            "mentions": [], "mention_roles": [], "mention_everyone": false,
+            "attachments": [], "embeds": [], "pinned": false, "flags": 0,
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {"type": 2, "style": 3, "label": "Approve", "custom_id": "approve_btn"},
+                        {"type": 2, "style": 1, "label": "Feedback", "custom_id": "open_feedback_modal"},
+                        {"type": 2, "style": 4, "label": "Broken", "custom_id": "fail_me"}
+                    ]
+                },
+                {
+                    "type": 1,
+                    "components": [{
+                        "type": 3,
+                        "custom_id": "env_select",
+                        "placeholder": "Pick target",
+                        "options": [
+                            {"label": "Staging", "value": "staging"},
+                            {"label": "Production", "value": "prod"}
+                        ]
+                    }]
+                }
+            ]
+        }),
+    );
+
+    let msg = wait("bot message with controls", || {
+        let Response::Messages { messages, .. } = world.ask(Request::Messages {
+            conversation: channel.clone(),
+            page: Page::Newest,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        messages.into_iter().find(|m| m.id == "1300000000000000901")
+    });
+    assert_eq!(msg.kind, protocol::MessageKind::Normal);
+    assert_eq!(msg.controls.len(), 4);
+    assert_eq!(msg.controls[0].action_id, "approve_btn");
+    assert_eq!(msg.controls[3].action_id, "env_select");
+
+    // 1. Click a button -> POST /interactions type 3, component_type 2.
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: channel.clone(),
+            message_id: msg.id.clone(),
+            block_id: msg.controls[0].block_id.clone(),
+            action_id: "approve_btn".into(),
+            element_type: "discord_button".into(),
+            value: String::new(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let posts = world.discord.requests_to("POST", "/interactions");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["type"], json!(3));
+    assert_eq!(posts[0].body["guild_id"], json!("4000"));
+    assert_eq!(posts[0].body["channel_id"], json!("4101"));
+    assert_eq!(posts[0].body["message_id"], json!("1300000000000000901"));
+    assert_eq!(posts[0].body["application_id"], json!("990011"));
+    assert!(!posts[0].body["session_id"].as_str().unwrap_or("").is_empty());
+    assert!(!posts[0].body["nonce"].as_str().unwrap_or("").is_empty());
+    assert_eq!(posts[0].body["data"], json!({"component_type": 2, "custom_id": "approve_btn"}));
+
+    // 2. Pick from string select -> POST /interactions type 3, component_type 3 with values.
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: channel.clone(),
+            message_id: msg.id.clone(),
+            block_id: msg.controls[3].block_id.clone(),
+            action_id: "env_select".into(),
+            element_type: "discord_string_select".into(),
+            value: "staging".into(),
+            values: vec!["staging".into()],
+        }),
+        Response::Ok
+    );
+    let posts = world.discord.requests_to("POST", "/interactions");
+    assert_eq!(posts.len(), 2);
+    assert_eq!(
+        posts[1].body["data"],
+        json!({"component_type": 3, "custom_id": "env_select", "values": ["staging"]})
+    );
+
+    // 3. Button that triggers INTERACTION_MODAL_CREATE -> Change::InteractionModal -> ModalSubmit type 5.
+    let seq = match world.ask(Request::Status) {
+        Response::Status { seq, .. } => seq,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: channel.clone(),
+            message_id: msg.id.clone(),
+            block_id: msg.controls[1].block_id.clone(),
+            action_id: "open_feedback_modal".into(),
+            element_type: "discord_button".into(),
+            value: String::new(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let modal = wait("interaction modal change", || {
+        let Response::Changed { changes, .. } = world.ask(Request::Wait { since: seq, timeout_ms: 200 }) else {
+            return None;
+        };
+        changes.into_iter().find_map(|c| match c {
+            protocol::Change::InteractionModal { conversation, modal } if conversation == channel => Some(modal),
+            _ => None,
+        })
+    });
+    assert_eq!(modal.title, "Feedback Form");
+    assert_eq!(modal.fields.len(), 1);
+    assert_eq!(modal.fields[0].custom_id, "reason");
+    assert!(modal.fields[0].multiline);
+
+    assert_eq!(
+        world.ask(Request::ModalSubmit {
+            conversation: channel.clone(),
+            modal_id: modal.id,
+            application_id: modal.application_id,
+            custom_id: modal.custom_id,
+            values: vec![("reason".into(), "All checks passed".into())],
+        }),
+        Response::Ok
+    );
+    let posts = world.discord.requests_to("POST", "/interactions");
+    assert_eq!(posts.len(), 4);
+    assert_eq!(posts[3].body["type"], json!(5));
+    assert_eq!(posts[3].body["data"]["custom_id"], json!("feedback_submit"));
+    assert_eq!(
+        posts[3].body["data"]["components"],
+        json!([{"type": 1, "components": [{"type": 4, "custom_id": "reason", "value": "All checks passed"}]}])
+    );
+
+    // 4. Button that triggers INTERACTION_FAILURE -> Change::InteractionFailed.
+    let seq2 = match world.ask(Request::Status) {
+        Response::Status { seq, .. } => seq,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: channel.clone(),
+            message_id: msg.id,
+            block_id: msg.controls[2].block_id.clone(),
+            action_id: "fail_me".into(),
+            element_type: "discord_button".into(),
+            value: String::new(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let failed_reason = wait("interaction failure change", || {
+        let Response::Changed { changes, .. } = world.ask(Request::Wait { since: seq2, timeout_ms: 200 }) else {
+            return None;
+        };
+        changes.into_iter().find_map(|c| match c {
+            protocol::Change::InteractionFailed { conversation, action_id, reason, .. }
+                if conversation == channel && action_id == "fail_me" => Some(reason),
+            _ => None,
+        })
+    });
+    assert!(failed_reason.contains("did not respond"));
 }

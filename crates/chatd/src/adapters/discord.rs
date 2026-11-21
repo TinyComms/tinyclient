@@ -19,6 +19,7 @@ pub(super) fn prove_code_colors() -> Result<(), String> {
 /// Its socket waits are shared with the Tiny server's live socket.
 pub(super) mod gateway;
 mod info;
+mod interactions;
 mod members;
 mod model;
 mod picker;
@@ -362,6 +363,8 @@ struct State {
     /// Per channel, the read acknowledgement last sent and the newest one held back since
     /// (`mark_read`): one per channel per [`ACK_EVERY`].
     acks: HashMap<String, Ack>,
+    /// In-flight interaction nonces waiting on gateway settlement or modal popups.
+    pending_interactions: HashMap<String, interactions::PendingInteraction>,
 }
 
 /// One channel's read acknowledgements.
@@ -1913,6 +1916,38 @@ impl Discord {
             Command::CallAddPeople { conversation_id, people, reply } => {
                 answer(reply, self.call_add_people(&conversation_id, people))
             }
+            Command::MessageAction {
+                conversation_id,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                reply,
+            } => answer(
+                reply,
+                self.message_action(
+                    &conversation_id,
+                    &message_id,
+                    &block_id,
+                    &action_id,
+                    &element_type,
+                    &value,
+                    values,
+                ),
+            ),
+            Command::ModalSubmit {
+                conversation_id,
+                modal_id,
+                application_id,
+                custom_id,
+                values,
+                reply,
+            } => answer(
+                reply,
+                self.modal_submit(&conversation_id, &modal_id, &application_id, &custom_id, values),
+            ),
             // The user asked to sign out, so the token should stop working, not just be
             // forgotten: the answer goes once Discord has ended the session, or refused to.
             Command::SignOut(done) => {

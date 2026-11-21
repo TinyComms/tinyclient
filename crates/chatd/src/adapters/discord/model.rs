@@ -965,6 +965,99 @@ pub struct Snapshot {
     pub message: Box<Posted>,
 }
 
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct SelectOption {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<Emoji>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub default: bool,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct UnfurledMedia {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub width: u32,
+    #[serde(default, deserialize_with = "nullable")]
+    pub height: u32,
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct MediaGalleryItem {
+    #[serde(default)]
+    pub media: Option<UnfurledMedia>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub spoiler: bool,
+}
+
+/// One Discord message or modal component (v1 action rows/buttons/selects/text inputs and v2 layout/display).
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct Component {
+    #[serde(rename = "type", default)]
+    pub kind: u8,
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub custom_id: Option<String>,
+    #[serde(default)]
+    pub style: Option<u8>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<Emoji>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub disabled: bool,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub min_values: Option<u8>,
+    #[serde(default)]
+    pub max_values: Option<u8>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub options: Vec<SelectOption>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub components: Vec<Component>,
+    /// Type 10 Text Display markdown content.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Type 9 Section accessory (button or thumbnail).
+    #[serde(default)]
+    pub accessory: Option<Box<Component>>,
+    /// Type 12 Media Gallery items.
+    #[serde(default, deserialize_with = "nullable")]
+    pub items: Vec<MediaGalleryItem>,
+    /// Type 11 Thumbnail media.
+    #[serde(default)]
+    pub media: Option<UnfurledMedia>,
+    /// Type 13 File media.
+    #[serde(default)]
+    pub file: Option<UnfurledMedia>,
+    /// Type 4 Text Input pre-filled value and bounds.
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub min_length: Option<u16>,
+    #[serde(default)]
+    pub max_length: Option<u16>,
+    #[serde(default)]
+    pub required: Option<bool>,
+}
+
 /// A message, whole or (in `MESSAGE_UPDATE`) only the fields that changed.
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct Posted {
@@ -980,6 +1073,8 @@ pub struct Posted {
     pub member: Option<Member>,
     #[serde(default)]
     pub webhook_id: Option<String>,
+    #[serde(default)]
+    pub application_id: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -1000,6 +1095,8 @@ pub struct Posted {
     pub pinned: Option<bool>,
     #[serde(rename = "type", default)]
     pub kind: Option<u8>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u64,
     #[serde(default)]
     pub message_reference: Option<Reference>,
     #[serde(default)]
@@ -1010,8 +1107,8 @@ pub struct Posted {
     pub sticker_items: Vec<Sticker>,
     #[serde(default)]
     pub poll: Option<Poll>,
-    #[serde(default, deserialize_with = "nullable")]
-    pub components: Vec<IgnoredAny>,
+    #[serde(default)]
+    pub components: Option<Vec<Component>>,
     #[serde(default, deserialize_with = "nullable")]
     pub message_snapshots: Vec<Snapshot>,
     /// A string from our own client, a number from some others.
