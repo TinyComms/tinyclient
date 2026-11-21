@@ -44,7 +44,7 @@ mod wire;
 use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
-use crate::store::{ConversationRow, Filing, PersonRow};
+use crate::store::{ConversationRow, Filing, FolderRow, PersonRow};
 use protocol::{Attachment, Contact, ContactKind, ConversationKind, Delivery, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -552,6 +552,10 @@ struct Live {
     dont_notify_mentions: HashSet<String>,
     /// Account setting: keep muted chats archived when new messages arrive.
     keep_muted_archived: bool,
+    /// Chat folders synced from the phone's storage service.
+    folders: Vec<wire::ChatFolder>,
+    /// Conversations known to this adapter, for re-evaluating folder membership.
+    known_conversations: HashSet<String>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -661,14 +665,37 @@ impl Live {
         self.muted_until.get(conversation).is_some_and(|&until| until > now_ms())
     }
 
-    fn filing_for(&self, conversation: &str) -> Filing {
+    fn filing_for(&self, conversation: &str, unread: bool) -> Filing {
+        let is_group = conversation.starts_with("g.");
+        let muted = self.is_muted(conversation);
+        let folders = self
+            .folders
+            .iter()
+            .filter(|folder| folder_holds(folder, conversation, is_group, muted, unread))
+            .map(|folder| folder.id.clone())
+            .collect();
         Filing {
-            folders: Vec::new(),
+            folders,
             archived: self.archived.contains(conversation),
             pin: self.pinned.iter().position(|id| id == conversation).map(|at| at as i32),
             hidden: false,
             followed: false,
         }
+    }
+
+    fn folder_rows(&self) -> Vec<FolderRow> {
+        self.folders
+            .iter()
+            .enumerate()
+            .map(|(at, folder)| FolderRow {
+                id: folder.id.clone(),
+                name: folder.name.clone(),
+                position: at as i32,
+                color: None,
+                spaces: Vec::new(),
+                pinned: Vec::new(),
+            })
+            .collect()
     }
 
     /// Records a person's reaction, answering the one it replaced. Both memory and the file on
@@ -908,11 +935,42 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     ended
 }
 
+/// Evaluates a Signal chat folder's filter rules against one conversation.
+fn folder_holds(folder: &wire::ChatFolder, conversation: &str, is_group: bool, muted: bool, unread: bool) -> bool {
+    if folder.excluded.iter().any(|p| p.conversation() == conversation) {
+        return false;
+    }
+    if folder.show_only_unread && !unread {
+        return false;
+    }
+    if !folder.show_muted && muted {
+        return false;
+    }
+    if folder.included.iter().any(|p| p.conversation() == conversation) {
+        return true;
+    }
+    if !is_group && folder.include_all_individual {
+        return true;
+    }
+    if is_group && folder.include_all_groups {
+        return true;
+    }
+    false
+}
+
+/// Recomputes and writes a conversation's filing (folders, archive, pin) based on its current unread & mute state.
+fn sync_filing(account: &Account, conversation: &str) {
+    let unread = account.ctx.known(conversation).ok().flatten().is_some_and(|row| row.unread > 0);
+    let filing = account.live().filing_for(conversation, unread);
+    let _ = account.ctx.filing(conversation, &filing);
+}
+
 /// The row of a conversation, recorded the first time it is seen.
 fn ensure_row(account: &Account, peer: &Peer, title: &str) {
     // The phone need not include ourselves in its contact list.
     let title = if matches!(peer, Peer::Direct(aci) if aci == &account.me) { "Note to Self" } else { title };
     let id = peer.conversation();
+    account.live().known_conversations.insert(id.clone());
     match account.ctx.known(&id) {
         Ok(Some(known)) if title.is_empty() || known.title == title => {}
         // A picture fetched earlier stays the row's.
@@ -1021,6 +1079,7 @@ fn apply(account: &Account, event: Event) {
                 {
                     let mut live = account.live();
                     live.groups.insert(conv.clone(), group.member_ids.clone());
+                    live.known_conversations.insert(conv.clone());
                     if group.timer_secs > 0 {
                         live.note_timer(&conv, group.timer_secs, 0);
                     }
@@ -1030,6 +1089,9 @@ fn apply(account: &Account, event: Event) {
                 row.read_only = !group.member;
                 row.avatar = ctx.avatar_of(&row.id);
                 let _ = ctx.conversation(&row);
+                if !account.live().folders.is_empty() {
+                    sync_filing(account, &conv);
+                }
             }
         }
         Event::GroupChanged { peer, changes, title, description, left, rejoined, .. } => {
@@ -1089,25 +1151,24 @@ fn apply(account: &Account, event: Event) {
                 return;
             }
             let mut message = message(account, &text, outgoing);
+            let mut needs_filing = false;
             if !outgoing {
-                let (suppress_mention, unarchive_filing) = {
+                let (suppress_mention, unarchived) = {
                     let mut live = account.live();
                     let muted = live.is_muted(&conversation);
                     let suppress = muted && live.dont_notify_mentions.contains(&conversation);
-                    let unarchive = if live.archived.contains(&conversation) && !(live.keep_muted_archived && muted) {
+                    let unarchived = if live.archived.contains(&conversation) && !(live.keep_muted_archived && muted) {
                         live.archived.remove(&conversation);
-                        Some(live.filing_for(&conversation))
+                        true
                     } else {
-                        None
+                        false
                     };
-                    (suppress, unarchive)
+                    (suppress, unarchived)
                 };
                 if suppress_mention {
                     message.mentions_me = false;
                 }
-                if let Some(filing) = unarchive_filing {
-                    let _ = ctx.filing(&conversation, &filing);
-                }
+                needs_filing = unarchived || !account.live().folders.is_empty();
             }
             if text.expire_timer > 0 || text.expire_timer_version > 0 {
                 account.live().note_timer(&conversation, text.expire_timer, text.expire_timer_version);
@@ -1126,6 +1187,9 @@ fn apply(account: &Account, event: Event) {
                 account.live().unread(&conversation, &text.author, text.sent);
             }
             let _ = ctx.message(&conversation, &message);
+            if needs_filing {
+                sync_filing(account, &conversation);
+            }
         }
         Event::Edited { peer, author, target, at, text, spans } => {
             // A late edit is ignored by every other client. Keeping it here would show words
@@ -1302,13 +1366,29 @@ fn apply(account: &Account, event: Event) {
             }
             for (conv, muted) in mutes {
                 let _ = ctx.muted(&conv, muted);
-            }
-            for conv in to_file {
-                let filing = account.live().filing_for(&conv);
-                let _ = ctx.filing(&conv, &filing);
+                if !account.live().folders.is_empty() {
+                    to_file.insert(conv);
+                }
             }
             for conv in mark_unreads {
                 let _ = ctx.mark_unread(&conv);
+                if !account.live().folders.is_empty() {
+                    to_file.insert(conv);
+                }
+            }
+            for conv in to_file {
+                sync_filing(account, &conv);
+            }
+        }
+        Event::Folders(folders) => {
+            let (rows, known): (Vec<FolderRow>, Vec<String>) = {
+                let mut live = account.live();
+                live.folders = folders;
+                (live.folder_rows(), live.known_conversations.iter().cloned().collect())
+            };
+            let _ = ctx.folders(&rows);
+            for conv in known {
+                sync_filing(account, &conv);
             }
         }
         Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
@@ -1355,6 +1435,9 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
         let left = account.live().unread.get(&conversation).map_or(0, VecDeque::len) as u32;
         let updated = account.ctx.known(&conversation).ok().flatten().map_or(0, |row| row.updated);
         let _ = account.ctx.counts(&conversation, left, 0, Some(&wire::message_id(upto, &author)), updated);
+        if !account.live().folders.is_empty() {
+            sync_filing(account, &conversation);
+        }
     }
 }
 
@@ -1563,12 +1646,20 @@ fn capabilities() -> protocol::Capabilities {
 fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
-        Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
+        Command::MarkRead { conversation_id, message_id } => {
+            mark_read(account, &conversation_id, &message_id);
+            if !account.live().folders.is_empty() {
+                sync_filing(account, &conversation_id);
+            }
+        }
         Command::MarkUnread { conversation_id, .. } => {
             if let Ok(to) = peer(&conversation_id) {
                 let _ = account.wire.set_marked_unread(&to, true);
             }
             let _ = ctx.mark_unread(&conversation_id);
+            if !account.live().folders.is_empty() {
+                sync_filing(account, &conversation_id);
+            }
         }
         Command::SetMute { conversation_id, notify, until, reply } => {
             let outcome = (|| -> Result<(), Refusal> {
@@ -1593,6 +1684,9 @@ fn serve(account: &Arc<Account>, command: Command) {
                     }
                 }
                 let _ = ctx.muted(&conversation_id, muted);
+                if !account.live().folders.is_empty() {
+                    sync_filing(account, &conversation_id);
+                }
                 Ok(())
             })();
             let _ = reply.send(outcome);
@@ -1625,12 +1719,10 @@ fn serve(account: &Arc<Account>, command: Command) {
                     }
                     affected_pins = live.pinned.clone();
                 }
-                let filing = account.live().filing_for(&conversation_id);
-                let _ = ctx.filing(&conversation_id, &filing);
+                sync_filing(account, &conversation_id);
                 for id in affected_pins {
                     if id != conversation_id {
-                        let f = account.live().filing_for(&id);
-                        let _ = ctx.filing(&id, &f);
+                        sync_filing(account, &id);
                     }
                 }
                 Ok(())

@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -444,6 +444,54 @@ fn steer(line: &str) -> Vec<Event> {
         "keep-muted-archived" => {
             let on = next() == "on";
             vec![Event::ChatStates { chats: Vec::new(), pinned: None, keep_muted_archived: Some(on) }]
+        }
+        "folders" => {
+            // Format: folders id:Name:opts... ; id2:Name2:opts...
+            // Where opts are comma-separated key=val: include=grace+club,exclude=alan,all_dm=1,all_group=1,only_unread=1,show_muted=0
+            let spec = line.strip_prefix("folders ").unwrap_or("");
+            let parse_peer = |tok: &str| -> Option<Peer> {
+                if tok == "club" {
+                    Some(club())
+                } else {
+                    who(tok).map(|(id, _)| direct(id))
+                }
+            };
+            let mut list = Vec::new();
+            for (pos, entry) in spec.split(';').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+                let mut parts = entry.splitn(3, ':');
+                let id = parts.next().unwrap_or("").trim().to_owned();
+                let name = parts.next().unwrap_or("").trim().to_owned();
+                let opts = parts.next().unwrap_or("");
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let mut folder = ChatFolder {
+                    id,
+                    name,
+                    position: pos as u32,
+                    show_only_unread: false,
+                    show_muted: true,
+                    include_all_individual: false,
+                    include_all_groups: false,
+                    included: Vec::new(),
+                    excluded: Vec::new(),
+                };
+                for kv in opts.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        match k {
+                            "include" => folder.included = v.split('+').filter_map(parse_peer).collect(),
+                            "exclude" => folder.excluded = v.split('+').filter_map(parse_peer).collect(),
+                            "all_dm" => folder.include_all_individual = v == "1" || v == "true",
+                            "all_group" => folder.include_all_groups = v == "1" || v == "true",
+                            "only_unread" => folder.show_only_unread = v == "1" || v == "true",
+                            "show_muted" => folder.show_muted = v == "1" || v == "true",
+                            _ => {}
+                        }
+                    }
+                }
+                list.push(folder);
+            }
+            vec![Event::Folders(list)]
         }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],

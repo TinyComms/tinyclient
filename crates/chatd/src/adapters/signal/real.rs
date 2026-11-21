@@ -7,7 +7,7 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -27,7 +27,7 @@ use presage::model::messages::Received;
 use presage::proto::{
     account_record, addressable_message,
     body_range::{AssociatedValue, Style as RangeStyle},
-    call_message, conversation_identifier, data_message, receipt_message, storage_record, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
+    call_message, chat_folder_record, conversation_identifier, data_message, receipt_message, recipient, storage_record, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
     ConversationIdentifier, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage,
 };
 use presage::store::{ContentsStore, StateStore};
@@ -556,6 +556,7 @@ impl Session {
         let mut chats = Vec::new();
         let mut pinned: Option<Vec<Peer>> = None;
         let mut keep_muted_archived: Option<bool> = None;
+        let mut folders = Vec::new();
         for record in records {
             match record.record {
                 Some(storage_record::Record::Contact(contact)) => {
@@ -614,11 +615,54 @@ impl Session {
                     }
                     pinned = Some(pins);
                 }
+                Some(storage_record::Record::ChatFolder(folder)) => {
+                    if folder.deleted_at_timestamp_ms != 0
+                        || folder.folder_type == chat_folder_record::FolderType::All as i32
+                        || folder.name.trim().is_empty()
+                    {
+                        continue;
+                    }
+                    let id = if folder.identifier.is_empty() {
+                        format!("f-{}", folder.position)
+                    } else {
+                        hex(&folder.identifier)
+                    };
+                    let map_recipient = |r: presage::proto::Recipient| -> Option<Peer> {
+                        match r.identifier {
+                            Some(recipient::Identifier::Contact(contact)) => {
+                                if super::wire::is_aci(&contact.service_id) {
+                                    Some(Peer::Direct(contact.service_id))
+                                } else {
+                                    aci_bytes(&contact.service_id_binary).map(Peer::Direct)
+                                }
+                            }
+                            Some(recipient::Identifier::GroupMasterKey(raw)) => {
+                                <[u8; 32]>::try_from(raw.as_slice()).ok().map(|k| Peer::Group(group_id(&k)))
+                            }
+                            _ => None,
+                        }
+                    };
+                    folders.push(ChatFolder {
+                        id,
+                        name: folder.name,
+                        position: folder.position,
+                        show_only_unread: folder.show_only_unread,
+                        show_muted: folder.show_muted_chats,
+                        include_all_individual: folder.include_all_individual_chats,
+                        include_all_groups: folder.include_all_group_chats,
+                        included: folder.included_recipients.into_iter().filter_map(map_recipient).collect(),
+                        excluded: folder.excluded_recipients.into_iter().filter_map(map_recipient).collect(),
+                    });
+                }
                 _ => {}
             }
         }
         if !chats.is_empty() || pinned.is_some() || keep_muted_archived.is_some() {
             self.tell(Event::ChatStates { chats, pinned, keep_muted_archived });
+        }
+        if !folders.is_empty() {
+            folders.sort_by_key(|f| f.position);
+            self.tell(Event::Folders(folders));
         }
     }
 

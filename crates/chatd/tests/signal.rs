@@ -1478,3 +1478,74 @@ fn mute_archive_pin_and_mark_unread_sync_and_serve_commands() {
     world.until("Alan marked unread", || (world.conversation(ALAN)?.unread > 0).then_some(()));
     world.heard(&format!("mark-unread {ALAN} true"));
 }
+
+#[test]
+fn chat_folders_from_phone_filter_chats_and_react_to_mute_and_unread() {
+    let world = World::linked();
+    world.connected();
+
+    world.steer(&format!("incoming grace {} Dinner?", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer(&format!("incoming alan {} Cards?", T0 + 2_000));
+    world.arrived(ALAN, &id(T0 + 2_000, ALAN));
+
+    // Sync two folders from the phone: Family (Grace + Club) and Unread (all non-muted unread, excluding Alan).
+    world.steer("folders fam:Family:include=grace+club ; unr:Unread:all_dm=1,all_group=1,only_unread=1,show_muted=0,exclude=alan");
+
+    let folders = world.until("Signal folders", || match world.ask(Request::Folders { network: Network::Signal }) {
+        Response::Folders { folders } if folders.len() == 2 => Some(folders),
+        _ => None,
+    });
+    assert_eq!(folders[0].name, "Family");
+    assert_eq!(folders[1].name, "Unread");
+
+    // Family contains Grace and Bridge club, not Alan.
+    let fam_rows = world.until("Family folder rows", || {
+        let Response::Conversations { conversations, .. } = world.ask(Request::Home {
+            network: Network::Signal,
+            account: Some(account()),
+            folder: Some("fam".into()),
+            shelf: protocol::Shelf::Main,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return None;
+        };
+        (conversations.len() == 2).then_some(conversations)
+    });
+    let fam_ids: Vec<&str> = fam_rows.iter().map(|c| c.key.id.as_str()).collect();
+    assert!(fam_ids.contains(&GRACE) && fam_ids.contains(&CLUB) && !fam_ids.contains(&ALAN));
+
+    // Unread contains Grace (unread, unmuted), not Alan (excluded), not Club (0 unread).
+    let unread_ids = || -> Vec<String> {
+        let Response::Conversations { conversations, .. } = world.ask(Request::Home {
+            network: Network::Signal,
+            account: Some(account()),
+            folder: Some("unr".into()),
+            shelf: protocol::Shelf::Main,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return Vec::new();
+        };
+        conversations.into_iter().map(|c| c.key.id).collect()
+    };
+    world.until("Grace in Unread folder", || (unread_ids() == vec![GRACE.to_owned()]).then_some(()));
+
+    // Muting Grace removes her from Unread (show_muted=0).
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(GRACE), notify: protocol::Notify::Nothing, until: None }),
+        Response::Ok
+    );
+    world.until("Grace leaves Unread when muted", || unread_ids().is_empty().then_some(()));
+
+    // Unmuting brings her back; marking her read removes her again.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(GRACE), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    world.until("Grace returns to Unread when unmuted", || (unread_ids() == vec![GRACE.to_owned()]).then_some(()));
+
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 1_000, GRACE) }), Response::Ok);
+    world.until("Grace leaves Unread when read", || unread_ids().is_empty().then_some(()));
+}

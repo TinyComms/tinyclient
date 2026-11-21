@@ -104,6 +104,20 @@ pub struct ChatState {
     pub whitelisted: bool,
 }
 
+/// One Signal chat folder from the storage service (`ChatFolderRecord`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatFolder {
+    pub id: String,
+    pub name: String,
+    pub position: u32,
+    pub show_only_unread: bool,
+    pub show_muted: bool,
+    pub include_all_individual: bool,
+    pub include_all_groups: bool,
+    pub included: Vec<Peer>,
+    pub excluded: Vec<Peer>,
+}
+
 /// The earlier message a message answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Quote {
@@ -250,6 +264,8 @@ pub enum Event {
         /// Account setting: keep muted chats archived when new messages arrive.
         keep_muted_archived: Option<bool>,
     },
+    /// Chat folders synced from the phone's storage service.
+    Folders(Vec<ChatFolder>),
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
