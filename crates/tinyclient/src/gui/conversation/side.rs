@@ -46,6 +46,8 @@ pub struct Side {
     installed: Option<RightKind>,
     /// The pins of a conversation, once asked for.
     pins: Option<Pins>,
+    /// Active / archived threads of a channel (`Layer::Threads`).
+    channel_threads: Option<ChannelThreadsPane>,
     /// The switches were read from what the window remembers.
     restored: bool,
     /// The window is too narrow for the pane beside the conversation: the layout says so each
@@ -284,11 +286,21 @@ struct Pins {
     messages: Option<Result<Vec<Rc<Message>>, String>>,
 }
 
+struct ChannelThreadsPane {
+    conversation: Key,
+    archived: bool,
+    query: String,
+    threads: Option<Result<Vec<protocol::ChannelThread>, String>>,
+    cursor: Option<String>,
+    more: bool,
+    loading: bool,
+}
+
 fn kind_of(layer: &Layer) -> RightKind {
     match layer {
         Layer::Profile(_) | Layer::Details(_) | Layer::Space(_) => RightKind::Info,
         Layer::Members(_) => RightKind::Members,
-        Layer::Thread { .. } | Layer::Pinned(_) => RightKind::Thread,
+        Layer::Thread { .. } | Layer::Pinned(_) | Layer::Threads(_) => RightKind::Thread,
         Layer::Search => RightKind::Search,
     }
 }
@@ -410,6 +422,17 @@ impl Shell {
         }
         if let Some(Layer::Pinned(conversation)) = &top {
             self.ask_pins(conversation, cx);
+        }
+        if let Some(Layer::Threads(conversation)) = &top {
+            let needs_load = self
+                .conversation_state
+                .side
+                .channel_threads
+                .as_ref()
+                .is_none_or(|pane| pane.conversation != *conversation);
+            if needs_load {
+                self.ask_channel_threads(conversation.clone(), false, String::new(), None, cx);
+            }
         }
         match top {
             Some(layer) => {
@@ -1065,6 +1088,142 @@ impl Shell {
         self.install(cx);
     }
 
+    /// Opens or closes the channel's Active / Archived Threads browser pane.
+    pub(super) fn toggle_channel_threads(&mut self, cx: &mut Context<Self>) {
+        let Some(conversation) = self.open_key().cloned() else {
+            return;
+        };
+        let showing = matches!(self.conversation_state.side.stack.top(), Some(Layer::Threads(k)) if k == &conversation);
+        if showing {
+            if !self.pane_pop(cx) {
+                self.conversation_state.side.stack = Stack::default();
+                self.install(cx);
+            }
+            return;
+        }
+        let side = &mut self.conversation_state.side;
+        side.stack = pane::open(&side.stack, Layer::Threads(conversation.clone()));
+        self.install(cx);
+    }
+
+    /// Loads active or archived threads for one channel from chatd.
+    pub(super) fn ask_channel_threads(
+        &mut self,
+        conversation: Key,
+        archived: bool,
+        query: String,
+        cursor: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let append = cursor.is_some();
+        let existing = if append {
+            self.conversation_state
+                .side
+                .channel_threads
+                .as_ref()
+                .filter(|p| p.conversation == conversation && p.archived == archived && p.query == query)
+                .and_then(|p| p.threads.as_ref().and_then(|r| r.as_ref().ok()).cloned())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.conversation_state.side.channel_threads = Some(ChannelThreadsPane {
+            conversation: conversation.clone(),
+            archived,
+            query: query.clone(),
+            threads: if append { Some(Ok(existing.clone())) } else { None },
+            cursor: cursor.clone(),
+            more: false,
+            loading: true,
+        });
+        cx.notify();
+        let request = Request::ChannelThreads {
+            conversation: conversation.clone(),
+            archived,
+            query: query.clone(),
+            cursor,
+        };
+        self.off_thread(
+            cx,
+            move || ask(&request),
+            move |this, answer, cx| {
+                let Some(pane) = this
+                    .conversation_state
+                    .side
+                    .channel_threads
+                    .as_mut()
+                    .filter(|p| p.conversation == conversation && p.archived == archived && p.query == query)
+                else {
+                    return;
+                };
+                pane.loading = false;
+                match answer {
+                    Ok(Response::ChannelThreads { mut threads, cursor, more, .. }) => {
+                        if append {
+                            let mut merged = existing;
+                            for item in threads.drain(..) {
+                                if !merged.iter().any(|e| e.conversation.key == item.conversation.key) {
+                                    merged.push(item);
+                                }
+                            }
+                            pane.threads = Some(Ok(merged));
+                        } else {
+                            pane.threads = Some(Ok(threads));
+                        }
+                        pane.cursor = cursor;
+                        pane.more = more;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        pane.threads = Some(Err(detail));
+                        pane.more = false;
+                    }
+                    Ok(_) => {
+                        pane.threads = Some(Err("Threads could not be loaded.".to_owned()));
+                        pane.more = false;
+                    }
+                    Err(err) => {
+                        pane.threads = Some(Err(crate::client::trouble_words("threads", &err)));
+                        pane.more = false;
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Joins (`on: true`) or leaves (`on: false`) a Discord thread.
+    pub(super) fn toggle_follow_thread(&mut self, thread: Key, on: bool, cx: &mut Context<Self>) {
+        let request = Request::FollowThread { conversation: thread.clone(), on };
+        self.off_thread(
+            cx,
+            move || ask(&request),
+            move |this, answer, cx| {
+                match answer {
+                    Ok(Response::Ok) => {
+                        if let Some(pane) = this.conversation_state.side.channel_threads.as_mut() {
+                            if let Some(Ok(list)) = pane.threads.as_mut() {
+                                if let Some(item) = list.iter_mut().find(|t| t.conversation.key == thread) {
+                                    item.conversation.followed = on;
+                                }
+                            }
+                        }
+                        this.refresh_row(thread, cx);
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                    }
+                    Ok(_) => {
+                        this.toast(Some(("icons/circle-alert.svg", theme::danger())), "Could not update thread membership.".to_owned(), cx);
+                    }
+                    Err(err) => {
+                        this.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words("thread", &err), cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
     /// The two switches go to the window's prefs, which keep them across a restart. Members
     /// or Details beside channels is this session's; the prefs say only on or off.
     fn remember_switches(&mut self, cx: &mut Context<Self>) {
@@ -1314,6 +1473,7 @@ fn draw_side(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> Any
         Layer::Members(_) => shell.pane_members(window, cx),
         Layer::Thread { conversation, .. } => draw_thread(shell, conversation, cx),
         Layer::Pinned(conversation) => draw_pins(shell, conversation, cx),
+        Layer::Threads(conversation) => draw_channel_threads(shell, conversation, cx),
         Layer::Search => draw_search(shell, window, cx),
     };
     // A phone's page has one way back, its strip's chevron, which pops the pushed layer first:
@@ -1764,6 +1924,176 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
             .on_click(cx.listener(move |shell, _, _, cx| shell.jump_to_pin(&id, cx)))
     });
     crate::gui::components::scroll::scroll_page("pins-scroll-frame", div().id("pins").size_full().overflow_y_scroll().py(px(4.)).children(rows)).into_any_element()
+}
+
+/// Active and archived threads of one Discord channel. Clicking a thread opens it without joining;
+/// Join / Leave updates thread membership explicitly.
+fn draw_channel_threads(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyElement {
+    let pane = shell
+        .conversation_state
+        .side
+        .channel_threads
+        .as_ref()
+        .filter(|p| p.conversation == *conversation);
+    let archived = pane.is_some_and(|p| p.archived);
+    let conv_active = conversation.clone();
+    let conv_archived = conversation.clone();
+    let tab = |id: &'static str, label: &'static str, selected: bool, target_archived: bool, conv: Key| {
+        div()
+            .id(id)
+            .px(px(10.))
+            .py(px(4.))
+            .rounded(px(theme::R_CONTROL))
+            .type_small()
+            .cursor_pointer()
+            .when(selected, |el| el.bg(theme::selected()).text_color(theme::text()).font_weight(theme::MEDIUM))
+            .when(!selected, |el| el.text_color(theme::text_soft()).hover(|s| s.bg(theme::hover())))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.ask_channel_threads(conv.clone(), target_archived, String::new(), None, cx);
+            }))
+            .child(label)
+    };
+    let tabs = div()
+        .flex_none()
+        .px(px(theme::PANE_PAD))
+        .py(px(8.))
+        .border_b_1()
+        .border_color(theme::hairline())
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .child(tab("threads-tab-active", "Active", !archived, false, conv_active))
+        .child(tab("threads-tab-archived", "Archived", archived, true, conv_archived));
+
+    let body: AnyElement = match pane.and_then(|p| p.threads.as_ref()) {
+        None => div()
+            .p(px(theme::PANE_PAD))
+            .type_ui()
+            .text_color(theme::text_faint())
+            .child("Loading threads…")
+            .into_any_element(),
+        Some(Err(why)) => empty_state("icons/messages-square.svg", "Threads aren't available", why).into_any_element(),
+        Some(Ok(list)) if list.is_empty() => {
+            let empty_msg = if archived { "No archived threads in this channel." } else { "No active threads in this channel." };
+            empty_state("icons/messages-square.svg", "No threads", empty_msg).into_any_element()
+        }
+        Some(Ok(list)) => {
+            let clock = now();
+            let rows = list.iter().map(|item| {
+                let open_key = item.conversation.key.clone();
+                let open_title = item.conversation.title.clone();
+                let follow_key = item.conversation.key.clone();
+                let joined = item.conversation.followed;
+                let replies_label = if item.replies == 1 {
+                    "1 reply".to_owned()
+                } else {
+                    format!("{} replies", item.replies)
+                };
+                let meta = if item.last_activity > 0 {
+                    format!("{replies_label} · {}", time::stamp(clock, item.last_activity))
+                } else {
+                    replies_label
+                };
+                div()
+                    .id(gpui::ElementId::Name(format!("chan-thread-{}", item.conversation.key.id).into()))
+                    .px(px(theme::PANE_PAD))
+                    .py(px(8.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        shell.open_now(open_key.clone(), &open_title, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .children((item.conversation.private || item.locked).then(|| glyph("icons/lock.svg", 12., theme::text_faint())))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .type_ui()
+                                    .font_weight(theme::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child(item.conversation.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(gpui::ElementId::Name(format!("chan-thread-join-{}", item.conversation.key.id).into()))
+                                    .flex_none()
+                                    .px(px(7.))
+                                    .py(px(2.))
+                                    .rounded(px(theme::R_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .type_micro()
+                                    .text_color(if joined { theme::text_soft() } else { theme::accent_text() })
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::pressed()))
+                                    .on_click(cx.listener(move |shell, _, _, cx| {
+                                        cx.stop_propagation();
+                                        shell.toggle_follow_thread(follow_key.clone(), !joined, cx);
+                                    }))
+                                    .child(if joined { "Leave" } else { "Join" }),
+                            ),
+                    )
+                    .child(div().type_micro().text_color(theme::text_faint()).child(meta))
+            });
+            let load_more = pane.filter(|p| p.more && !p.loading).and_then(|p| {
+                let cursor = p.cursor.clone()?;
+                let conv = p.conversation.clone();
+                let query = p.query.clone();
+                Some(
+                    div()
+                        .px(px(theme::PANE_PAD))
+                        .py(px(8.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("chan-threads-more")
+                                .px(px(12.))
+                                .py(px(4.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(theme::raised())
+                                .type_small()
+                                .text_color(theme::accent_text())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::hover()))
+                                .on_click(cx.listener(move |shell, _, _, cx| {
+                                    shell.ask_channel_threads(conv.clone(), archived, query.clone(), Some(cursor.clone()), cx);
+                                }))
+                                .child("Load more"),
+                        ),
+                )
+            });
+            crate::gui::components::scroll::scroll_page(
+                "channel-threads-scroll",
+                div()
+                    .id("channel-threads-list")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .py(px(4.))
+                    .children(rows)
+                    .children(load_more),
+            )
+            .into_any_element()
+        }
+    };
+
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(theme::canvas())
+        .child(tabs)
+        .child(div().flex_1().min_h_0().child(body))
+        .into_any_element()
 }
 
 /// Where the message was said, as the spec's result line has it: the Space it sits in and the

@@ -438,13 +438,21 @@ impl Discord {
             let timed_out = info.timed_out(clock);
             let mut thread_rights = *parent_rights;
             thread_rights.add_members = timed_out.is_none() && (thread_rights.send_in_threads || thread_rights.manage_threads);
+            let locked = thread.thread_metadata.as_ref().is_some_and(|m| m.locked);
+            let (read_only, read_only_reason) = if let Some(until) = timed_out {
+                (true, timeout_reason(until, clock))
+            } else if locked && !thread_rights.manage_threads {
+                (true, "This thread is locked.".to_owned())
+            } else {
+                (false, String::new())
+            };
             let row = ConversationRow {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
                 root: Some(thread.id.clone()),
                 private: thread.kind == model::PRIVATE_THREAD,
-                read_only: timed_out.is_some(),
-                read_only_reason: timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default(),
+                read_only,
+                read_only_reason,
                 rights: thread_rights,
                 slowmode_seconds: if slowmode_exempt(*parent_perms, true) { 0 } else { thread.rate_limit_per_user },
                 // A server's threads in READY are the ones we were added to.
@@ -856,6 +864,7 @@ impl Discord {
             edit: true,
             delete: true,
             threads: true,
+            follow_threads: true,
             direct_threads: false,
             pins: true,
             forward: true,
@@ -1326,23 +1335,32 @@ impl Discord {
             .map_or(parent.rights.delete_others, |perms| slowmode_exempt(perms, true));
         let mut thread_rights = parent.rights;
         thread_rights.add_members = thread_rights.send_in_threads || thread_rights.manage_threads;
+        let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
+        let locked = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.locked);
+        let followed = joined || thread.member.is_some() || known.as_ref().is_some_and(|k| k.followed);
+        let (read_only, read_only_reason) = if locked && !thread_rights.manage_threads {
+            (true, "This thread is locked.".to_owned())
+        } else {
+            (parent.read_only && !thread_rights.send_in_threads, parent.read_only_reason.clone())
+        };
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
             private: thread.kind == model::PRIVATE_THREAD,
+            read_only,
+            read_only_reason,
             rights: thread_rights,
             slowmode_seconds: if exempt { 0 } else { thread.rate_limit_per_user },
-            // Joined, or our membership came with it: followed. Otherwise left as it was.
-            filing: (joined || thread.member.is_some()).then(|| Filing {
-                followed: true,
+            filing: Some(Filing {
+                archived,
+                followed,
                 ..Filing::default()
             }),
             ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
         };
         // An archived thread leaves the tree, and a forum's posts were never in it
         // (`polish/01` §3): both stay recorded, read by their parent.
-        let in_tree = !thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived)
-            && parent.kind != ConversationKind::Forum;
+        let in_tree = !archived && followed && parent.kind != ConversationKind::Forum;
         if let Some(guild) = &parent.space {
             self.ctx.set_note(&format!("guild:{}", thread.id), guild);
         }

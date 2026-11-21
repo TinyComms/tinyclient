@@ -299,10 +299,16 @@ pub struct Overwrite {
     pub deny: u64,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct ThreadMetadata {
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub auto_archive_duration: u32,
+    #[serde(default)]
+    pub archive_timestamp: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]

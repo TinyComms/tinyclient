@@ -2770,6 +2770,34 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::ChannelThreads { conversation, archived, query, cursor } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
+                }
+                match self.ask(&conversation.account(), |reply| Command::ChannelThreads {
+                    conversation_id: conversation.id.clone(),
+                    archived,
+                    query,
+                    cursor,
+                    reply,
+                }) {
+                    Ok(mut page) => {
+                        for item in &mut page.threads {
+                            item.conversation = self.row(item.conversation.clone());
+                        }
+                        Response::ChannelThreads {
+                            conversation,
+                            threads: page.threads,
+                            cursor: page.cursor,
+                            more: page.more,
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),

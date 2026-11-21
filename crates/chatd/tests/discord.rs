@@ -451,6 +451,83 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             )
         }
         ("PUT", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
+        ("DELETE", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
+        ("GET", ["channels", channel, "threads", "search"]) => {
+            let mut threads = vec![
+                json!({
+                    "id": "4510",
+                    "type": 11,
+                    "name": "Active API refactor",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "2001",
+                    "message_count": 7,
+                    "last_message_id": "1300000000000000800",
+                    "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": 1440},
+                }),
+                json!({
+                    "id": "4511",
+                    "type": 11,
+                    "name": "Active docs cleanup",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 2,
+                    "last_message_id": "1300000000000000790",
+                    "member": {"id": "4511", "user_id": "1000"},
+                    "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": 1440},
+                }),
+            ];
+            if let Some(q) = seen.path.split("name=").nth(1).map(|s| s.split('&').next().unwrap_or("")) {
+                let needle = q.to_lowercase();
+                threads.retain(|t| t["name"].as_str().unwrap_or("").to_lowercase().contains(&needle));
+            }
+            (200, json!({"threads": threads, "has_more": false, "total_results": threads.len()}))
+        }
+        ("GET", ["channels", channel, "threads", "archived", "public"]) => (
+            200,
+            json!({
+                "threads": [{
+                    "id": "4520",
+                    "type": 11,
+                    "name": "Old 0.9 release notes",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "2001",
+                    "message_count": 19,
+                    "last_message_id": "1300000000000000500",
+                    "thread_metadata": {
+                        "archived": true,
+                        "locked": false,
+                        "auto_archive_duration": 1440,
+                        "archive_timestamp": "2026-10-01T12:00:00.000000+00:00"
+                    },
+                }],
+                "has_more": false,
+            }),
+        ),
+        ("GET", ["channels", channel, "users", "@me", "threads", "archived", "private"]) => (
+            200,
+            json!({
+                "threads": [{
+                    "id": "4521",
+                    "type": 12,
+                    "name": "Old private triage",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 5,
+                    "last_message_id": "1300000000000000510",
+                    "thread_metadata": {
+                        "archived": true,
+                        "locked": true,
+                        "auto_archive_duration": 4320,
+                        "archive_timestamp": "2026-10-02T12:00:00.000000+00:00"
+                    },
+                }],
+                "has_more": false,
+            }),
+        ),
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["read-states", "ack-bulk"]) => (200, json!({})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
@@ -5467,4 +5544,83 @@ fn standalone_public_private_and_announcement_threads_with_first_message_and_inv
         world.discord.requests_to("PUT", &format!("/channels/{}/thread-members/2002", priv_thread.key.id)).len(),
         1
     );
+}
+
+#[test]
+fn browse_active_and_archived_channel_threads_and_join_leave_with_events() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("channel 4101 loaded", || (world.conversation("4101").key.id == "4101").then_some(()));
+
+    // 1. Active threads via GET /channels/4101/threads/search.
+    let active = world.ask(Request::ChannelThreads {
+        conversation: world.key("4101"),
+        archived: false,
+        query: String::new(),
+        cursor: None,
+    });
+    let Response::ChannelThreads { threads, more, .. } = active else { panic!("{active:?}") };
+    assert!(!more);
+    assert_eq!(threads.len(), 2);
+    assert_eq!(threads[0].conversation.key.id, "4510");
+    assert_eq!(threads[0].replies, 7);
+    assert!(!threads[0].conversation.followed, "unjoined thread is recorded without joining");
+    assert_eq!(threads[1].conversation.key.id, "4511");
+    assert!(threads[1].conversation.followed);
+    // Searching active threads passes &name= to Discord.
+    let filtered = world.ask(Request::ChannelThreads {
+        conversation: world.key("4101"),
+        archived: false,
+        query: "docs".into(),
+        cursor: None,
+    });
+    let Response::ChannelThreads { threads: found, .. } = filtered else { panic!("{filtered:?}") };
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].conversation.key.id, "4511");
+
+    // 2. Archived threads fetch both public archived and private archived routes.
+    let archived = world.ask(Request::ChannelThreads {
+        conversation: world.key("4101"),
+        archived: true,
+        query: String::new(),
+        cursor: None,
+    });
+    let Response::ChannelThreads { threads: old, .. } = archived else { panic!("{archived:?}") };
+    assert_eq!(old.len(), 2);
+    let pub_old = old.iter().find(|t| t.conversation.key.id == "4520").expect("public archived");
+    let priv_old = old.iter().find(|t| t.conversation.key.id == "4521").expect("private archived");
+    assert!(pub_old.conversation.archived && !pub_old.locked);
+    assert!(priv_old.conversation.archived && priv_old.conversation.private && priv_old.locked);
+    assert!(priv_old.conversation.read_only, "locked thread is read-only without MANAGE_THREADS");
+    assert_eq!(world.discord.requests_to("GET", "/channels/4101/threads/archived/public").len(), 1);
+    assert_eq!(world.discord.requests_to("GET", "/channels/4101/users/@me/threads/archived/private").len(), 1);
+
+    // 3. Join and leave thread 4510 via FollowThread -> PUT/DELETE /channels/4510/thread-members/@me.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: world.key("4510"), on: true }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PUT", "/channels/4510/thread-members/@me").len(), 1);
+    assert!(world.conversation("4510").followed);
+    assert_eq!(world.conversation("4510").space.as_deref(), Some("4000"));
+
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: world.key("4510"), on: false }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/4510/thread-members/@me").len(), 1);
+    assert!(!world.conversation("4510").followed);
+    assert_eq!(world.conversation("4510").space, None, "leaving removes thread from sidebar tree");
+
+    // 4. Gateway THREAD_MEMBER_UPDATE and THREAD_MEMBERS_UPDATE keep followed in sync.
+    world.discord.push("THREAD_MEMBER_UPDATE", json!({ "id": "4510", "user_id": "1000" }));
+    wait("joined via THREAD_MEMBER_UPDATE", || world.conversation("4510").followed.then_some(()));
+    world.discord.push("THREAD_MEMBERS_UPDATE", json!({
+        "id": "4510",
+        "guild_id": "4000",
+        "member_count": 1,
+        "added_members": [],
+        "removed_member_ids": ["1000"]
+    }));
+    wait("left via THREAD_MEMBERS_UPDATE", || (!world.conversation("4510").followed).then_some(()));
 }

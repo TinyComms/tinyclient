@@ -1425,10 +1425,21 @@ pub enum Request {
         limit: u32,
     },
     /// Follow (`on: true`) or unfollow (`on: false`) a thread for reply notifications
-    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`).
+    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`, Discord thread-members/@me).
     FollowThread {
         conversation: Key,
         on: bool,
+    },
+    /// Active or archived threads of one channel (Discord). Opening any returned thread works
+    /// without joining it first.
+    ChannelThreads {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        archived: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
     },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.
@@ -2750,6 +2761,21 @@ impl Change {
     }
 }
 
+/// One thread listed by `Request::ChannelThreads`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelThread {
+    pub conversation: Conversation,
+    /// Number of replies in the thread, when the network reports it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replies: u32,
+    /// Unix seconds of the most recent message or archive event.
+    #[serde(default)]
+    pub last_activity: i64,
+    /// Whether the thread is locked by a moderator.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
@@ -2803,6 +2829,15 @@ pub enum Response {
         /// For `Inbox`: what each filter would hold. Zero for `Find`.
         #[serde(default)]
         counts: InboxCounts,
+    },
+    /// Active or archived threads of one channel (`Request::ChannelThreads`).
+    ChannelThreads {
+        conversation: Key,
+        threads: Vec<ChannelThread>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
     Conversation {
         conversation: Conversation,

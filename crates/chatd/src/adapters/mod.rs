@@ -615,11 +615,19 @@ pub enum Command {
         post_at: i64,
         reply: Reply<protocol::ScheduledMessage>,
     },
-    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`).
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`, Discord thread-members/@me).
     FollowThread {
         conversation_id: String,
         on: bool,
         reply: Reply<()>,
+    },
+    /// Lists active or archived threads of one channel (Discord).
+    ChannelThreads {
+        conversation_id: String,
+        archived: bool,
+        query: String,
+        cursor: Option<String>,
+        reply: Reply<ChannelThreadsPage>,
     },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
@@ -831,6 +839,14 @@ pub enum Command {
     Stop,
 }
 
+/// One page of a channel's active or archived threads (`Command::ChannelThreads`).
+#[derive(Debug, Clone, Default)]
+pub struct ChannelThreadsPage {
+    pub threads: Vec<protocol::ChannelThread>,
+    pub cursor: Option<String>,
+    pub more: bool,
+}
+
 impl Command {
     /// Answers a command this adapter does not serve, so nothing waits for it.
     pub fn unsupported(self, ctx: &Context) {
@@ -869,7 +885,8 @@ impl Command {
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
-            | Command::FollowThread { reply, .. } => {
+            | Command::FollowThread { reply, .. }
+            | Command::ChannelThreads { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
