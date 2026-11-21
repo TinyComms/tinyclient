@@ -216,30 +216,87 @@ impl Teams {
         self.report(handled.map_err(Failure::from));
     }
 
-    /// `ConversationUpdate`: the read marker moved on another device (forward or rolled back).
+    /// `ConversationUpdate`: the read marker or conversation properties (hidden, pinned) changed
+    /// on another device.
     fn read_elsewhere(&self, conversation: &Value) -> Result<(), Fault> {
-        let horizon = conversation["properties"]["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
-        let (Some(id), Some(read)) = (conversation["id"].as_str(), horizon.filter(|read| super::millis(read) > 0)) else {
+        let Some(id) = conversation["id"].as_str() else {
             return Ok(());
         };
         let Some(row) = self.ctx.known(id)? else {
             return Ok(());
         };
-        let read_ms = super::millis(read);
-        let prev_ms = row.last_read.as_deref().map(super::millis).unwrap_or(0);
+        let props = &conversation["properties"];
+        let parse_flag = |val: &Value| -> Option<bool> {
+            match val {
+                Value::Bool(b) => Some(*b),
+                Value::String(s) if s.eq_ignore_ascii_case("true") => Some(true),
+                Value::String(s) if s.eq_ignore_ascii_case("false") => Some(false),
+                _ => None,
+            }
+        };
+        let hidden_upd = parse_flag(&props["hidden"]);
+        let pinned_upd = parse_flag(&props["pinned"]);
+        if hidden_upd.is_some() || pinned_upd.is_some() {
+            let pin = match pinned_upd {
+                Some(true) => {
+                    let mut state = self.state();
+                    if let Some(pos) = state.pinned_chats.iter().position(|p| p == id) {
+                        Some(pos as i32)
+                    } else {
+                        state.pinned_chats.push(id.to_owned());
+                        Some((state.pinned_chats.len() - 1) as i32)
+                    }
+                }
+                Some(false) => {
+                    self.state().pinned_chats.retain(|p| p != id);
+                    None
+                }
+                None => row.pin,
+            };
+            let filing = crate::store::Filing {
+                hidden: hidden_upd.unwrap_or(row.hidden),
+                pin,
+                ..crate::store::Filing::default()
+            };
+            self.ctx.filing(id, &filing)?;
+        }
+        if let Some(level) = super::info::parse_notify(props, super::tree::is_channel(id)) {
+            self.state().notify.insert(id.to_owned(), level);
+            self.ctx.set_note(&format!("notify:{id}"), super::info::notify_word(level));
+            self.ctx.muted(id, level == protocol::Notify::Nothing)?;
+        }
+        let mut parts = props["consumptionhorizon"].as_str().into_iter().flat_map(|h| h.split(';'));
+        let horizon = parts.next();
+        let client_ts = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        let Some(read) = horizon.filter(|read| *read == "0" || super::millis(read) > 0) else {
+            return Ok(());
+        };
+        if client_ts > 0 {
+            let mut state = self.state();
+            if state.horizon_ms.get(id).is_some_and(|&prev_ts| client_ts < prev_ts) {
+                return Ok(());
+            }
+            state.horizon_ms.insert(id.to_owned(), client_ts);
+        }
         let newest = match super::id_of(&conversation["lastMessage"]) {
             newest if !newest.is_empty() => Some(newest),
             _ => self.ctx.newest(id)?,
         };
-        let behind = newest.as_deref().is_some_and(|newest| super::millis(newest) > read_ms);
-        let rolled_back = read_ms < prev_ms;
-        if rolled_back || behind {
-            self.ctx.manual_ack(id, read, None)?;
-            if (behind || (rolled_back && newest.is_none()))
-                && self.ctx.known(id)?.is_some_and(|after| after.unread == 0)
+        let moved_back = row
+            .last_read
+            .as_deref()
+            .is_some_and(|prev| super::millis(read) < super::millis(prev));
+        let has_unread = newest.as_deref().is_some_and(|newest| super::millis(newest) > super::millis(read));
+        if moved_back || (has_unread && row.unread == 0) {
+            let marker = if read == "0" { "" } else { read };
+            self.ctx.manual_ack(id, marker, None)?;
+            if (has_unread || (moved_back && newest.is_none()))
+                && self.ctx.known(id)?.is_some_and(|updated| updated.unread == 0)
             {
                 self.ctx.mark_unread(id)?;
             }
+        } else if has_unread {
+            self.ctx.counts(id, row.unread, row.mentions, Some(read), 0)?;
         } else {
             self.ctx.counts(id, 0, 0, Some(read), 0)?;
         }

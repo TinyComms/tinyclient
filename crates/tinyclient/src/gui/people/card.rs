@@ -8,13 +8,14 @@ use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
 use crate::gui::components::{
     button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_separator, modal_body,
-    modal_buttons, network_icon, scrim, Avatar, ButtonKind, Shape as Plate,
+    modal_buttons, network_icon, scrim, search_field, Avatar, ButtonKind, Shape as Plate,
 };
+use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, FocusHandle, KeyDownEvent, Pixels,
-    Point, WeakEntity, Window,
+    anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
+    KeyDownEvent, Pixels, Point, WeakEntity, Window,
 };
 use protocol::{Conversation, Key, Link, Notify, Person, Profile, RelateAction, Request, Response};
 
@@ -32,6 +33,8 @@ pub enum Float {
     Conversation { conversation: Conversation, link: Option<String>, alt: bool },
     /// Asked once before a friend is removed or someone is blocked.
     Confirm(Key, RelateAction),
+    /// One-line modal to set or clear a friend's private nickname.
+    FriendNickname(Key),
     /// Asked once before leaving a group.
     Leave(Conversation),
     /// Asked once before clearing history or deleting a chat on the network.
@@ -49,7 +52,11 @@ pub enum Float {
 impl Float {
     fn person(&self) -> Option<&Key> {
         match self {
-            Float::Card(person) | Float::Menu(person) | Float::Person { person, .. } | Float::Confirm(person, _) => Some(person),
+            Float::Card(person)
+            | Float::Menu(person)
+            | Float::Person { person, .. }
+            | Float::Confirm(person, _)
+            | Float::FriendNickname(person) => Some(person),
             Float::Conversation { .. } | Float::Leave(_) | Float::ClearHistory { .. } | Float::Report { .. } => None,
         }
     }
@@ -135,6 +142,9 @@ pub struct Floating {
     /// Read from the shell once the card is up: the Space it was opened from, and their DM.
     place: Option<(Key, String)>,
     direct: Option<Conversation>,
+    /// One-line input for setting a friend's private nickname (`Float::FriendNickname`).
+    nick_input: Option<Entity<TextInput>>,
+    nick_error: Option<String>,
 }
 
 impl Floating {
@@ -150,6 +160,8 @@ impl Floating {
             profile_asked: 0,
             place: None,
             direct: None,
+            nick_input: None,
+            nick_error: None,
         }
     }
 
@@ -266,6 +278,7 @@ impl Floating {
             online: self.online(person),
             close_direct: super::scene_can_close_direct(&self.scene, person),
             can_block: self.scene.blocks_accounts.contains(&person.account()),
+            can_friend_nickname: self.scene.accounts.iter().any(|own| own.key == person.account() && own.can.friend_nickname),
         }
     }
 
@@ -534,6 +547,32 @@ impl Floating {
                         }
                     });
                 })))
+            }
+            Item::FriendNickname => {
+                let key = person.map(|person| person.key.clone());
+                let current = person.map(|person| person.name.clone()).unwrap_or_default();
+                div().child(menu_item("menu-friend-nickname", Some("icons/pencil.svg"), "Set nickname…", None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(key) = key.clone() {
+                            let initial = current.clone();
+                            let input = cx.new(|cx| {
+                                let mut input = TextInput::new("Friend nickname", cx);
+                                input.set_text(&initial, cx);
+                                input
+                            });
+                            let person_key = key.clone();
+                            cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
+                                if matches!(event, InputEvent::Submit) {
+                                    this.save_friend_nickname(person_key.clone(), false, cx);
+                                }
+                            })
+                            .detach();
+                            this.nick_input = Some(input);
+                            this.nick_error = None;
+                            this.turn_to(Float::FriendNickname(key), cx);
+                        }
+                    }),
+                ))
             }
             Item::RemoveFriend => {
                 let key = person.map(|person| person.key.clone());
@@ -859,6 +898,97 @@ impl Floating {
             .child(scrim().id("report-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
             .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
     }
+
+    fn save_friend_nickname(&mut self, person: Key, clear: bool, cx: &mut Context<Self>) {
+        if only_draws() {
+            self.close(cx);
+            return;
+        }
+        let nickname = if clear {
+            None
+        } else {
+            self.nick_input
+                .as_ref()
+                .map(|input| input.read(cx).text().trim().to_owned())
+                .filter(|s| !s.is_empty())
+        };
+        let req = Request::SetFriendNickname { person, nickname };
+        self.nick_error = None;
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => this.close(cx),
+                Ok(Response::Error { detail, .. }) => {
+                    this.nick_error = Some(detail);
+                    cx.notify();
+                }
+                Ok(_) => {
+                    this.nick_error = Some("Could not save nickname.".to_owned());
+                    cx.notify();
+                }
+                Err(err) => {
+                    this.nick_error = Some(err.to_string());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_friend_nickname(&self, person: &Person, window: &Window, cx: &mut Context<Self>) -> Div {
+        let size = window.viewport_size();
+        let key = person.key.clone();
+        let key_clear = key.clone();
+        let focused = self.nick_input.as_ref().is_some_and(|i| i.focus_handle(cx).is_focused(window));
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let panel = div()
+            .w(px(wide))
+            .p(px(20.))
+            .rounded(px(theme::R_MODAL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            .flex()
+            .flex_col()
+            .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Friend nickname"))
+            .child(
+                div()
+                    .mt(px(4.))
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(format!("Only you see this nickname for {} (@{}).", person.name, person.handle)),
+            )
+            .children(self.nick_input.clone().map(|input| {
+                div()
+                    .mt(px(12.))
+                    .child(search_field(focused).w_full().line_height(px(18.)).child(input))
+            }))
+            .children(
+                self.nick_error
+                    .as_ref()
+                    .map(|err| div().mt(px(6.)).type_small().text_color(theme::danger()).child(err.clone())),
+            )
+            .child(
+                modal_buttons()
+                    .child(button("nick-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+                    .child(button("nick-clear", ButtonKind::Secondary, "Clear").on_click(cx.listener(move |this, _, _, cx| {
+                        this.save_friend_nickname(key_clear.clone(), true, cx);
+                    })))
+                    .child(button("nick-save", ButtonKind::Primary, "Save").on_click(cx.listener(move |this, _, _, cx| {
+                        this.save_friend_nickname(key.clone(), false, cx);
+                    }))),
+            );
+        div()
+            .w(size.width)
+            .h(size.height)
+            .relative()
+            .child(scrim().id("nick-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+    }
 }
 
 impl Render for Floating {
@@ -881,6 +1011,7 @@ impl Render for Floating {
                 let act = super::info::act_of(action);
                 (self.confirm(act, &person.name, person.key.network, window, cx, move |shell, cx| shell.relate(&target, action, cx)), true)
             }
+            (Float::FriendNickname(_), Some(person)) => (self.confirm_friend_nickname(person, window, cx), true),
             (Float::Leave(row), _) => {
                 let target = row.clone();
                 (self.confirm(Act::Leave, &row.title, row.key.network, window, cx, move |shell, cx| shell.leave(&target, cx)), true)

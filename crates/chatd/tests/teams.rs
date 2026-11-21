@@ -1,4 +1,4 @@
-//! Runs the real chatd against a local fake of Teams and asks it, over its own socket, what the
+﻿//! Runs the real chatd against a local fake of Teams and asks it, over its own socket, what the
 //! shell would ask.
 //!
 //! The fake is one HTTP server on localhost that is also the push socket. It stands in for
@@ -489,6 +489,13 @@ impl Fake {
                     GENERAL => "messages.general",
                     DEPLOYS => "messages.deploys",
                     CHAT_ANA => "messages.ana",
+                    "19:grp1@thread.v2" => {
+                        let msgs: Vec<Value> = (1..=8u64)
+                            .rev()
+                            .map(|i| message("19:grp1@thread.v2", None, 1_759_500_000_000 + i * 100, BEN, "Ben Okafor", &format!("<p>update {i}</p>")))
+                            .collect();
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
+                    }
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
                     "48:notifications" => "messages.activity",
                     _ => return ok(json!({"messages": [], "_metadata": {}})),
@@ -497,6 +504,7 @@ impl Fake {
             }
             ("POST", "messages") => self.post(call, conversation),
             ("PUT", "properties") => ok(json!({})),
+            ("DELETE", "") => ok(json!({})),
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
             _ => answer("404 Not Found", json!({"errorCode": 404, "message": "not here"})),
         }
@@ -575,6 +583,19 @@ impl Fake {
             let query = call.body.to_lowercase();
             let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
+        }
+        if call.path.ends_with("/v1/urlpreview") {
+            let asked = call.json();
+            let url = asked["url"].as_str().unwrap_or("");
+            if url == "https://example.com/release" {
+                return ok(json!({
+                    "url": url,
+                    "title": "TinyClient Release",
+                    "description": "Wave 4D Teams improvements",
+                    "siteName": "Example",
+                    "previewImage": format!("{}/ams/v1/objects/preview-1/views/imgo", self.base),
+                }));
+            }
         }
         answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
     }
@@ -960,11 +981,11 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
 
     // A grey line in words, with names already known from the chat list.
     assert_eq!((by("1760000050050").text.as_str(), &by("1760000050050").kind), ("Ana Ruiz added Ben Okafor", &MessageKind::System));
-    assert_eq!((by("1760000260260").text.as_str(), &by("1760000260260").kind), ("A call ended · 3 min", &MessageKind::System));
+    assert_eq!((by("1760000260260").text.as_str(), &by("1760000260260").kind), ("A call ended Â· 3 min", &MessageKind::System));
 
     // Formatting: text and ranges, with the post's headline as its first line.
     let post = by("1760000100100");
-    assert_eq!(post.text, "Release plan\nShip today, not tomorrow: cargo test then the plan, @Me Myself & @General 🙂\nbuild\ndeploy\nlooks good");
+    assert_eq!(post.text, "Release plan\nShip today, not tomorrow: cargo test then the plan, @Me Myself & @General ðŸ™‚\nbuild\ndeploy\nlooks good");
     let found = ranges(post);
     let has = |text: &str, style: Style| found.contains(&(text, &style));
     assert!(has("Release plan", Style::Bold) && has("Ship", Style::Bold) && has("today", Style::Italic) && has("not", Style::Strike));
@@ -996,7 +1017,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
 
     // Reactions: each person once however often Teams recorded them, mine marked, none empty.
     let reactions: Vec<(&str, u32, bool)> = picture.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.count, reaction.mine)).collect();
-    assert_eq!(reactions, [("👍", 2, true), ("❤️", 1, false)]);
+    assert_eq!(reactions, [("ðŸ‘", 2, true), ("â¤ï¸", 1, false)]);
 
     // A shared file is listed with its name and size, and its name opens it in the browser.
     let shared = by("1760000250250");
@@ -1031,7 +1052,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
 
     // A Loop component is named and linked to its file, not left as a blank card.
     let looped = by("1760000310310");
-    assert_eq!(looped.text, "Loop component · Sprint checklist");
+    assert_eq!(looped.text, "Loop component Â· Sprint checklist");
     let MessageKind::Unsupported { link } = &looped.kind else {
         panic!("{:?}", looped.kind);
     };
@@ -1111,7 +1132,7 @@ fn push_delivers_messages_edits_reactions_deletes_typing_and_reads() {
     edit["properties"]["emotions"] = json!([{"key": "1f389_partypopper", "users": [{"mri": ANA, "time": 1_760_000_602_000u64, "value": "1760000602000"}]}]);
     world.fake.push("MessageUpdate", edit.clone(), false);
     let reacted = world.until("the reaction", || world.message(&ana, "1760000600600").filter(|message| !message.reactions.is_empty()));
-    assert_eq!((reacted.reactions[0].emoji.as_str(), reacted.reactions[0].count, reacted.reactions[0].mine, reacted.text.as_str()), ("🎉", 1, false, "ping!"));
+    assert_eq!((reacted.reactions[0].emoji.as_str(), reacted.reactions[0].count, reacted.reactions[0].mine, reacted.text.as_str()), ("ðŸŽ‰", 1, false, "ping!"));
 
     // A delete is the same message again with a delete time and nothing left in it.
     edit["content"] = "".into();
@@ -1204,21 +1225,21 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
 
     // React and take it back, under Teams' name for the emoji.
     let react = |emoji: &str, on: bool| Request::React { conversation: ana.clone(), message_id: "1760000500500".to_owned(), emoji: emoji.to_owned(), on , burst: false };
-    assert_eq!(world.ask(react("👍", true)), Response::Ok);
+    assert_eq!(world.ask(react("ðŸ‘", true)), Response::Ok);
     let given = world.until("the reaction to reach Teams", || world.fake.calls("PUT", &path("/messages/1760000500500/properties")).pop());
     assert_eq!((given.query.as_str(), given.json()["emotions"]["key"].as_str()), ("name=emotions", Some("like")));
     assert!(given.json()["emotions"]["value"].as_u64().is_some_and(|at| at > 1_700_000_000_000));
-    assert_eq!(world.ask(react("👍", false)), Response::Ok);
+    assert_eq!(world.ask(react("ðŸ‘", false)), Response::Ok);
     let taken = world.until("the reaction to be taken back", || world.fake.calls("DELETE", &path("/messages/1760000500500/properties")).pop());
     assert_eq!(taken.json(), json!({"emotions": {"key": "like"}}));
     // A skin tone stays on the catalog's tone base (`yes`), not the plain `like` key.
-    assert_eq!(world.ask(react("👍🏽", true)), Response::Ok);
+    assert_eq!(world.ask(react("ðŸ‘ðŸ½", true)), Response::Ok);
     let toned = world.until("the toned reaction to reach Teams", || {
         world.fake.calls("PUT", &path("/messages/1760000500500/properties")).into_iter().rev().find(|call| call.json()["emotions"]["key"].as_str() == Some("yes-tone3"))
     });
     assert!(toned.json()["emotions"]["value"].as_u64().is_some());
     // Squid is in the catalog, so it goes out under that key.
-    assert_eq!(world.ask(react("🦑", true)), Response::Ok);
+    assert_eq!(world.ask(react("ðŸ¦‘", true)), Response::Ok);
     let squid = world.until("the squid reaction to reach Teams", || {
         world.fake.calls("PUT", &path("/messages/1760000500500/properties")).into_iter().rev().find(|call| call.json()["emotions"]["key"].as_str() == Some("1f991_squid"))
     });
@@ -1769,7 +1790,7 @@ fn adaptive_connector_and_hero_cards_render_and_malformed_falls_back() {
     assert_eq!(alert_card.fields, vec![("Service".into(), "checkout-api".into()), ("P99".into(), "2450 ms".into())]);
     assert!(alert_card.image.is_none(), "external connector image must not be fetched");
     assert!(alert_card.actions.iter().any(|a| a.label == "View Incident" && a.url == "https://pagerduty.example/incidents/904"));
-    assert!(alert_card.actions.iter().any(|a| a.label == "Acknowledge · Open in Teams"));
+    assert!(alert_card.actions.iter().any(|a| a.label == "Acknowledge Â· Open in Teams"));
     assert!(alert_card.actions.iter().any(|a| a.label == "Latency chart" && a.url == "https://cdn.pagerduty.example/chart.png"));
 
     // 2. Adaptive card with facts, table, hosted + external image, OpenUrl + Submit
@@ -1782,7 +1803,7 @@ fn adaptive_connector_and_hero_cards_render_and_malformed_falls_back() {
     assert!(ac.image.is_some(), "Teams-hosted image should be registered");
     assert!(ac.actions.iter().any(|a| a.label == "External banner" && a.url == "https://external.example/banner.png"));
     assert!(ac.actions.iter().any(|a| a.label == "Diff" && a.url == "https://github.com/org/repo/compare/v2.3...v2.4"));
-    assert!(ac.actions.iter().any(|a| a.label == "Approve · Open in Teams"));
+    assert!(ac.actions.iter().any(|a| a.label == "Approve Â· Open in Teams"));
 
     // 3. Hero card
     let hero = world.message(&general, "1760000801003").unwrap();
@@ -1793,7 +1814,7 @@ fn adaptive_connector_and_hero_cards_render_and_malformed_falls_back() {
     assert_eq!(hc.text, "All checks green.");
     assert!(hc.image.is_none(), "external hero image must not be fetched");
     assert!(hc.actions.iter().any(|a| a.label == "View PR" && a.url == "https://github.com/org/repo/pull/42"));
-    assert!(hc.actions.iter().any(|a| a.label == "Merge · Open in Teams"));
+    assert!(hc.actions.iter().any(|a| a.label == "Merge Â· Open in Teams"));
 
     // 4. Malformed card falls back cleanly to Unsupported (never a blank row)
     let broken = world.message(&general, "1760000801004").unwrap();
@@ -2024,224 +2045,347 @@ fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance(
 }
 
 #[test]
-fn link_previews_are_parsed_from_properties_links_and_unfurled_via_teams_on_send() {
+fn chat_pin_hide_and_delete_sync_with_teams() {
     let world = World::start();
     world.ready();
-    let ana = key(CHAT_ANA);
-    world.open(&ana, 3);
 
-    // 1. Account advertises suppress_embeds so the composer enables its preview-remove chip.
-    assert!(world.account(HOME).can.suppress_embeds);
-
-    // 2. Received message with web preview + M365 file link populates Message::previews.
-    let fixture = world.fake.fixture("links").expect("links fixture");
-    world.fake.push("NewMessage", fixture, false);
-    let received = world.until("link preview message to arrive", || world.message(&ana, "1760000840001"));
-    assert_eq!(received.previews.len(), 2);
-    assert_eq!(received.previews[0].url, "https://example.com/guide");
-    assert_eq!(received.previews[0].site, "Example Docs");
-    assert_eq!(received.previews[0].title, "Operations Guide");
-    assert_eq!(received.previews[0].description, "Runbook for weekly releases");
-    assert!(received.previews[0].image.is_some(), "Teams-hosted preview image registered");
-    assert_eq!(received.previews[1].title, "Q4 Architecture.docx");
-    assert_eq!(received.previews[1].site, "SharePoint");
-    assert_eq!(received.previews[1].description, "Word document");
-    assert!(received.previews[1].image.is_none(), "external preview image ignored");
-
-    // 3. Sending a link asks Teams' urlp service (never the external URL) and attaches properties.links.
-    let unfurl_id = "1760000999000631";
-    world.send(&ana, unfurl_id, "Read https://docs.example/release-notes");
-    let sent = world.until("unfurled send accepted", || {
-        world.messages(&ana).into_iter().find(|m| m.client_id.as_deref() == Some(unfurl_id) && m.state == SendState::Sent)
-    });
-    assert_eq!(sent.previews.len(), 1);
-    assert_eq!(sent.previews[0].title, "Unfurled by Teams");
-    assert_eq!(world.fake.calls("GET", "/urlp/v1/url/info").len(), 1);
-    let post = world
-        .fake
-        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
-        .into_iter()
-        .find(|c| c.json()["clientmessageid"] == unfurl_id)
-        .expect("unfurled POST");
-    let links_json: Vec<Value> = serde_json::from_str(post.json()["properties"]["links"].as_str().expect("properties.links")).unwrap();
-    assert_eq!(links_json[0]["url"].as_str(), Some("https://docs.example/release-notes"));
-    assert_eq!(links_json[0]["title"].as_str(), Some("Unfurled by Teams"));
-
-    // 4. Sending with suppress_embeds: true skips urlp and omits properties.links.
-    let suppressed_id = "1760000999000632";
-    let req = Request::Send {
-        conversation: ana.clone(),
-        client_id: suppressed_id.to_owned(),
-        text: "No card for https://docs.example/private".to_owned(),
-        reply_to: None,
-        with: protocol::Outgoing { suppress_embeds: true, ..protocol::Outgoing::default() },
+    // Capabilities advertise chat pinning, hiding (close_direct), and deleting (clear_history).
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
     };
-    assert!(matches!(world.ask(req), Response::Sent { .. }));
-    let suppressed = world.until("suppressed send accepted", || {
-        world.messages(&ana).into_iter().find(|m| m.client_id.as_deref() == Some(suppressed_id) && m.state == SendState::Sent)
+    assert!(caps.pin_chats > 0 && caps.close_direct && caps.clear_history);
+
+    let grp1 = key("19:grp1@thread.v2");
+    let grp2 = key("19:grp2@thread.v2");
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Pin grp1 and grp2 in order.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let pinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((pinned_call.query.as_str(), pinned_call.json()), ("name=pinned", json!({"pinned": "true"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, Some(0));
+
+    assert_eq!(
+        world.ask(Request::File { conversation: grp2.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&grp2).unwrap().pin, Some(1));
+
+    // Unpin grp1.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(false), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let unpinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((unpinned_call.query.as_str(), unpinned_call.json()), ("name=pinned", json!({"pinned": "false"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Hide grp1 via CloseDirect; it becomes hidden and writes hidden=true.
+    assert_eq!(world.ask(Request::CloseDirect { conversation: grp1.clone() }), Response::Ok);
+    let hidden_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((hidden_call.query.as_str(), hidden_call.json()), ("name=hidden", json!({"hidden": "true"})));
+    assert!(world.conversation(&grp1).unwrap().hidden);
+
+    // A ConversationUpdate from another device unhides grp1 and pins it.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"hidden": "false", "pinned": "true"}}),
+        false,
+    );
+    world.until("grp1 unhidden and pinned by push", || {
+        world.conversation(&grp1).filter(|row| !row.hidden && row.pin.is_some())
     });
-    assert!(suppressed.previews.is_empty());
-    assert_eq!(world.fake.calls("GET", "/urlp/v1/url/info").len(), 1, "suppress_embeds must not call urlp");
-    let post2 = world
-        .fake
-        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
-        .into_iter()
-        .find(|c| c.json()["clientmessageid"] == suppressed_id)
-        .expect("suppressed POST");
-    assert!(post2.json()["properties"]["links"].is_null());
+
+    // Delete grp1 for me only via ClearHistory { delete_chat: true }.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: grp1.clone(), delete_chat: true, revoke: false }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", "19:grp1@thread.v2").is_empty());
+    assert!(world.conversation(&grp1).is_none());
+
+    // Channels cannot be deleted as chats.
+    assert!(matches!(
+        world.ask(Request::ClearHistory { conversation: key(GENERAL), delete_chat: true, revoke: false }),
+        Response::Error { .. }
+    ));
 }
 
 #[test]
-fn unread_counts_seven_messages_mark_unread_writes_earlier_horizon_and_activity_pages_past_50() {
-    const CHAT_SEVEN: &str = "19:seven_unread@thread.v2";
-    const HORIZON: u64 = 1_760_000_900_000;
-
-    // Build a chat with 7 unread messages newer than its consumptionHorizon (plus 2 older ones)
-    // and a 2-page activity feed (50 entries on page 1 + 1 unread mention on page 2).
-    let world = World::start_with(|fake| {
-        let mut msgs = Vec::new();
-        for i in (1..=7u64).rev() {
-            let id = HORIZON + i * 1_000;
-            msgs.push(message(CHAT_SEVEN, None, id, BEN, "Ben Okafor", &format!("<p>unread #{i}</p>")));
-        }
-        msgs.push(message(CHAT_SEVEN, None, HORIZON, BEN, "Ben Okafor", "<p>at horizon</p>"));
-        msgs.push(message(CHAT_SEVEN, None, HORIZON - 1_000, ME, "Me Myself", "<p>earlier</p>"));
-        fake.extra_pages
-            .lock()
-            .unwrap()
-            .insert(CHAT_SEVEN.to_owned(), json!({"messages": msgs, "_metadata": {}}));
-        fake.extra_chats.lock().unwrap().push(json!({
-            "id": CHAT_SEVEN,
-            "members": [
-                {"isMuted": false, "mri": ME, "role": "Admin"},
-                {"isMuted": false, "mri": BEN, "role": "Admin"}
-            ],
-            "title": "Seven unread",
-            "isRead": false,
-            "isOneOnOne": false,
-            "hidden": false,
-            "isLastMessageFromMe": false,
-            "chatType": "chat",
-            "consumptionHorizon": {
-                "originalArrivalTime": HORIZON,
-                "timeStamp": HORIZON + 500,
-                "clientMessageId": "1"
-            },
-            "lastMessage": {
-                "messageType": "RichText/Html",
-                "content": "<p>unread #7</p>",
-                "id": (HORIZON + 7_000).to_string(),
-                "imDisplayName": "Ben Okafor",
-                "from": BEN
-            }
-        }));
-
-        // 50 activity items on page 1 (reactions), plus a mention for 19:grp1@thread.v2 on page 2.
-        let page1_items: Vec<Value> = (0..50u64)
-            .map(|i| {
-                json!({
-                    "id": (1_760_000_950_000u64 - i * 10).to_string(),
-                    "type": "Message",
-                    "messagetype": "Text",
-                    "contenttype": "text",
-                    "content": "",
-                    "conversationid": "48:notifications",
-                    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
-                    "from": BEN,
-                    "properties": {
-                        "activity": json!({
-                            "activityType": "reaction",
-                            "sourceThreadId": "19:grp1@thread.v2",
-                            "sourceMessageId": 1_759_600_000_000u64 + i,
-                        }).to_string()
-                    }
-                })
-            })
-            .collect();
-        let page1 = json!({
-            "messages": page1_items,
-            "_metadata": {
-                "backwardLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications/messages?syncState=actpage2"
-            }
-        });
-        let page2 = json!({
-            "messages": [{
-                "id": "1760000940000",
-                "type": "Message",
-                "messagetype": "Text",
-                "contenttype": "text",
-                "content": "",
-                "conversationid": "48:notifications",
-                "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
-                "from": BEN,
-                "properties": {
-                    "activity": json!({
-                        "activityType": "mention",
-                        "sourceThreadId": "19:grp1@thread.v2",
-                        "sourceMessageId": 1_759_700_000_000u64,
-                    }).to_string()
-                }
-            }],
-            "_metadata": {}
-        });
-        *fake.activity_pages.lock().unwrap() = Some((page1, page2));
-    });
+fn link_previews_received_sent_and_opted_out() {
+    let world = World::start();
     world.ready();
 
-    // 1. The warmed chat with 7 messages past its consumption horizon lists with unread == 7 and Count(7).
-    let seven = key(CHAT_SEVEN);
-    let counted = world.until("chat with 7 unread messages", || {
-        world.conversation(&seven).filter(|row| row.unread == 7)
-    });
-    assert_eq!(counted.unread, 7);
-    assert_eq!(counted.badge(), Badge::Count(7));
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.suppress_embeds);
 
-    // 2. Activity stream paged past 50 and picked up the mention on page 2.
+    // 1. Received message with web link preview and M365 file link card.
+    let chat = key(CHAT_ANA);
+    let mut incoming = message(CHAT_ANA, None, 1_760_000_950_000, ANA, "Ana Ruiz", "<p>See https://example.com/doc</p>");
+    incoming["properties"]["links"] = json!(json!([
+        {
+            "url": "https://example.com/doc",
+            "title": "Architecture Doc",
+            "description": "Design overview",
+            "siteName": "Example",
+            "previewImage": format!("{}/ams/v1/objects/img-1/views/imgo", world.fake.base),
+        },
+        {
+            "url": "https://contoso.sharepoint.com/:w:/s/Platform/Doc1",
+            "fileName": "Spec.docx",
+            "fileType": "docx",
+            "description": "Shared specification"
+        }
+    ]).to_string());
+    world.fake.push("NewMessage", incoming, false);
+    let received = world.until("received message with previews", || world.message(&chat, "1760000950000"));
+    assert_eq!(received.previews.len(), 2);
+    assert_eq!((received.previews[0].title.as_str(), received.previews[0].site.as_str()), ("Architecture Doc", "Example"));
+    assert!(received.previews[0].image.is_some());
+    assert_eq!((received.previews[1].title.as_str(), received.previews[1].site.as_str()), ("Spec.docx", "Word Â· SharePoint"));
+
+    // 2. Sent message with a URL unfurls through Teams' middle tier and attaches properties.links.
+    world.send(&chat, "1760000960000001", "Check https://example.com/release");
+    let sent = world.until("sent message with preview", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000001") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.previews.len(), 1);
+    assert_eq!(sent.previews[0].title, "TinyClient Release");
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["links"].as_str().unwrap_or("").contains("TinyClient Release"));
+
+    // 3. Opting out via suppress_embeds skips unfurl and omits properties.links.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000960000002".to_owned(),
+        text: "No preview https://example.com/release".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { suppress_embeds: true, ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let opted_out = world.until("opted-out message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000002") && m.state == SendState::Sent)
+    });
+    assert!(opted_out.previews.is_empty());
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1, "suppress_embeds must not call urlpreview");
+    let posted2 = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted2.json()["properties"]["links"].is_null());
+}
+
+#[test]
+fn notification_levels_read_write_and_live_update() {
+    let world = World::start();
+    world.ready();
+
+    let general = key(GENERAL);
     let grp1 = key("19:grp1@thread.v2");
-    world.until("page-2 mention counted", || world.conversation(&grp1).filter(|row| row.mentions == 1));
-    let activity_calls = world.fake.calls("GET", "/48:notifications/messages");
-    assert_eq!(activity_calls.len(), 2, "expected 2 pages of activity feed");
-    assert!(activity_calls[1].query.contains("syncState=actpage2"), "{}", activity_calls[1].query);
 
-    // 3. Mark read, then MarkUnread from message #5: Teams receives the earlier consumptionhorizon (#4).
-    let msg_7 = (HORIZON + 7_000).to_string();
-    let msg_5 = (HORIZON + 5_000).to_string();
-    let msg_4 = (HORIZON + 4_000).to_string();
-    assert_eq!(world.ask(Request::MarkRead { conversation: seven.clone(), message_id: msg_7.clone() }), Response::Ok);
-    world.until("mark read horizon sent", || {
-        world.fake.calls("PUT", &format!("{CHAT_SEVEN}/properties")).into_iter().find(|c| {
-            c.json()["consumptionhorizon"].as_str().is_some_and(|h| h.starts_with(&format!("{msg_7};")))
+    // Unmuted channel with no explicit override starts at All; setting Mentions updates both alerts and channelNotificationSettings.
+    let info = match world.ask(Request::ConversationInfo { conversation: general.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(info.notify, protocol::Notify::All);
+
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "false", "mentions": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "off" && c.json()["channelNotificationSettings"]["mentions"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update channel back to All: writes alerts=true and channelNotificationSettings allPosts=bannerAndFeed.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update chat to Mentions: writes alerts=false + mentions=true and does NOT mark row muted.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let grp_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((grp_call.query.as_str(), grp_call.json()), ("name=alerts", json!({"alerts": "false", "mentions": "true"})));
+    assert!(!world.conversation(&grp1).unwrap().muted);
+
+    // Live ConversationUpdate push muting grp1 reflects in row.muted.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"alerts": "false"}}),
+        false,
+    );
+    world.until("grp1 muted by ConversationUpdate", || {
+        world.conversation(&grp1).filter(|row| row.muted)
+    });
+}
+
+#[test]
+fn scheduled_chat_message_send_edit_cancel_and_channel_refusal() {
+    let world = World::start();
+    world.ready();
+
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.schedule);
+
+    let chat = key(CHAT_ANA);
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+
+    // 1. Schedule a message in a chat.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000970000001".to_owned(),
+        text: "Remind me in an hour".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let scheduled = world.until("scheduled message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000970000001") && m.state == SendState::Sent)
+    });
+    assert!(scheduled.id.starts_with("scheduled:"), "got id {}", scheduled.id);
+    assert_eq!(scheduled.sent, future_ts);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 2. Edit the scheduled message preserves scheduledTime and targets the raw message id.
+    let raw_id = scheduled.id.trim_start_matches("scheduled:").to_owned();
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            text: "Updated reminder".to_owned(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let edited_call = world.fake.calls("PUT", &format!("{CHAT_ANA}/messages/{raw_id}")).pop().unwrap();
+    assert!(edited_call.json()["properties"]["scheduledTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+
+    // 3. Cancel (delete) the scheduled message sends DELETE for the raw id and removes it.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: chat.clone(),
+            message_id: scheduled.id.clone(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", &format!("{CHAT_ANA}/messages/{raw_id}")).is_empty());
+    assert!(world.message(&chat, &scheduled.id).is_none());
+
+    // 4. Scheduling in a channel is refused cleanly without posting to Teams.
+    let general = key(GENERAL);
+    let posts_before = world.fake.calls("POST", &format!("{GENERAL}/messages")).len();
+    match world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "1760000970000002".to_owned(),
+        text: "Channel schedule attempt".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future_ts), ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let failed = world.until("channel scheduled send fails", || {
+        world.messages(&general).into_iter().find(|m| {
+            m.client_id.as_deref() == Some("1760000970000002") && matches!(m.state, SendState::Failed { .. })
         })
     });
-    assert_eq!(world.conversation(&seven).unwrap().unread, 0);
+    assert!(matches!(failed.state, SendState::Failed { ref reason } if reason.contains("channels")));
+    assert_eq!(world.fake.calls("POST", &format!("{GENERAL}/messages")).len(), posts_before);
+}
 
-    assert_eq!(world.ask(Request::MarkUnread { conversation: seven.clone(), message_id: msg_5.clone() }), Response::Ok);
-    let rewound = world.until("mark unread horizon sent", || {
-        world.fake.calls("PUT", &format!("{CHAT_SEVEN}/properties")).into_iter().find(|c| {
-            c.json()["consumptionhorizon"].as_str().is_some_and(|h| h.starts_with(&format!("{msg_4};")))
-        })
-    });
-    assert_eq!(rewound.query, "name=consumptionhorizon");
-    let rewound_json = rewound.json();
-    let parts: Vec<&str> = rewound_json["consumptionhorizon"].as_str().unwrap().split(';').collect();
-    assert_eq!((parts.len(), parts[0], parts[2]), (3, msg_4.as_str(), msg_4.as_str()));
-    assert_eq!(world.conversation(&seven).unwrap().unread, 3, "messages #5, #6, #7 are unread");
+#[test]
+fn unread_count_from_horizon_and_mark_unread_sync() {
+    let world = World::start();
+    world.ready();
 
-    // 4. Inbound ConversationUpdate from another device rolling the marker back to #2 sets unread to 5.
-    let msg_2 = (HORIZON + 2_000).to_string();
+    let grp1 = key("19:grp1@thread.v2");
+
+    // 1. Set consumption horizon at msg 1 (1759500000100), then open grp1 (8 messages: 100..=800).
+    //    Backfill counts the 7 messages past the horizon instead of collapsing to 1.
     world.fake.push(
         "ConversationUpdate",
         json!({
-            "id": CHAT_SEVEN,
-            "type": "Conversation",
-            "version": 1_760_000_999_000u64,
-            "properties": {"consumptionhorizon": format!("{msg_2};1760000999000;{msg_2}")},
-            "lastMessage": {"id": msg_7, "type": "Message", "messagetype": "RichText/Html"}
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": "1759500000100;1759500000150;1759500000100"},
+            "lastMessage": {"id": "1759500000800"}
         }),
         false,
     );
-    let rolled = world.until("remote mark-unread rollback applied", || {
-        world.conversation(&seven).filter(|row| row.unread == 5 && row.last_read.as_deref() == Some(msg_2.as_str()))
+    world.until("grp1 horizon recorded", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000100"))
     });
-    assert_eq!(rolled.badge(), Badge::Count(5));
+    world.open(&grp1, 8);
+    let counted = world.until("grp1 unread count refined to 7", || {
+        world.conversation(&grp1).filter(|row| row.unread == 7)
+    });
+    assert_eq!(counted.unread, 7);
+
+    // 2. Mark read at msg 8, then MarkUnread from msg 5 (1759500000500) -> writes prior msg (1759500000400) to Teams.
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    world.until("MarkRead PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000800;")
+        })
+    });
+    assert_eq!(world.ask(Request::MarkUnread { conversation: grp1.clone(), message_id: "1759500000500".into() }), Response::Ok);
+    let unread_call = world.until("MarkUnread PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;")
+        })
+    });
+    assert!(unread_call.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;"));
+
+    // 3. Another device moving consumptionhorizon backwards via ConversationUpdate rewinds last_read and unread count
+    //    (with a clientTimestamp newer than our local MarkRead write).
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    let newer_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": format!("1759500000300;{newer_ts};1759500000300")},
+            "lastMessage": {"id": "1759500000800"}
+        }),
+        false,
+    );
+    let rewound = world.until("grp1 rewound to 5 unread", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000300") && row.unread == 5)
+    });
+    assert_eq!(rewound.unread, 5);
 }

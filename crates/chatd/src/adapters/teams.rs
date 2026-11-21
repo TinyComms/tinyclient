@@ -313,6 +313,9 @@ struct State {
     me: String,
     /// Set by any call that finds the session over, so the push thread ends it.
     expired: Option<String>,
+    /// Latest `clientTimestamp` (ms) written or applied per conversation for `consumptionhorizon`,
+    /// so stale out-of-order `ConversationUpdate` echoes cannot rewind a newer local read.
+    horizon_ms: HashMap<String, i64>,
     people: HashMap<String, Known>,
     /// What was already written this run and need not be again: pictures registered, and
     /// the names of reactions learned.
@@ -334,6 +337,12 @@ struct State {
     /// Raw `properties.files` JSON remembered for messages with shared files so forwarding
     /// references them without re-uploading.
     file_props: HashMap<(String, String), Vec<Value>>,
+    /// Chat ids pinned in Teams, in Teams' own order.
+    pinned_chats: Vec<String>,
+    /// Per-conversation notification level as reported by Teams.
+    notify: HashMap<String, protocol::Notify>,
+    /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
+    scheduled: HashMap<String, i64>,
 }
 
 /// What a call presents.
@@ -570,6 +579,25 @@ fn seconds(iso: &str) -> i64 {
     let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
     days * 86_400 + hour * 3600 + minute * 60 + second
+}
+
+/// ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.000Z`) from Unix seconds.
+pub(super) fn iso_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400) + 719_468;
+    let secs = unix_secs.rem_euclid(86_400);
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.000Z")
 }
 
 /// 16 bytes nobody can guess, as a version 4 UUID.
@@ -900,9 +928,13 @@ impl Teams {
             delete: true,
             threads: true,
             pins: false,
+            pin_chats: 15,
+            close_direct: true,
+            clear_history: true,
+            suppress_embeds: true,
+            schedule: true,
             forward: true,
             reactions: true,
-            suppress_embeds: true,
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
             importance: true,
@@ -981,6 +1013,15 @@ impl Teams {
             }
             Command::Leave { conversation_id, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
+            }
+            Command::File { conversation_id, pinned, archived: _, folder_add: _, folder_remove: _, reply } => {
+                let _ = reply.send(self.file_chat(&conversation_id, pinned).map_err(refuse));
+            }
+            Command::CloseDirect { conversation_id, reply } => {
+                let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));
+            }
+            Command::ClearHistory { conversation_id, delete_chat, revoke: _, reply } => {
+                let _ = reply.send(self.delete_chat(&conversation_id, delete_chat).map_err(refuse));
             }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
@@ -1063,35 +1104,31 @@ impl Teams {
             return Ok(());
         }
         // Teams keeps one marker for a channel, its reply chains included.
-        let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread_of(conversation)));
-        let horizon = json!({"consumptionhorizon": format!("{message};{};{message}", now_ms())});
+        let thread = thread_of(conversation);
+        let ts = now_ms();
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread));
+        let horizon = json!({"consumptionhorizon": format!("{message};{ts};{message}")});
         self.chat("PUT", &path, Body::Json(&horizon), true)?;
+        self.state().horizon_ms.insert(thread.to_owned(), ts);
         if let Some((channel, root)) = chain_of(conversation) {
             self.clear_chain_unread(channel, root)?;
         }
         Ok(())
     }
 
-    /// Moves the read marker back on Teams by writing `consumptionhorizon` to the message before
-    /// the chosen unread message (or just before the oldest stored message when empty).
+    /// Moves Teams' consumption horizon back to `message` (the last message that still counts
+    /// as read, or `"0"` when marking from the very start) so "Mark as unread" syncs across devices.
     fn mark_unread(&self, conversation: &str, message: &str) -> Result<(), Fault> {
-        let horizon_id = if millis(message) >= 1_000_000_000_000 {
-            message.to_owned()
-        } else {
-            let earliest = self
-                .ctx
-                .stored_ids(conversation, "", "9999999999999999", 1)?
-                .into_iter()
-                .next()
-                .or_else(|| self.ctx.newest(conversation).ok().flatten());
-            match earliest.as_deref().map(millis).filter(|ms| *ms > 1) {
-                Some(ms) => (ms - 1).to_string(),
-                None => "1".to_owned(),
-            }
-        };
-        let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread_of(conversation)));
-        let horizon = json!({"consumptionhorizon": format!("{horizon_id};{};{horizon_id}", now_ms())});
+        let marker = if millis(message) >= 1_000_000_000_000 { message } else { "0" };
+        let thread = thread_of(conversation);
+        let ts = now_ms();
+        let path = format!(
+            "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
+            escaped(thread)
+        );
+        let horizon = json!({"consumptionhorizon": format!("{marker};{ts};{marker}")});
         self.chat("PUT", &path, Body::Json(&horizon), true)?;
+        self.state().horizon_ms.insert(thread.to_owned(), ts);
         Ok(())
     }
 }

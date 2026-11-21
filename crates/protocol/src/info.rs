@@ -581,6 +581,9 @@ pub struct Capabilities {
     /// This account supports message reactions.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reactions: bool,
+    /// This account supports fetching who reacted to a message (`Request::Reactors`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reactors: bool,
     /// How inline mentions are formatted on the wire for this account.
     #[serde(default, skip_serializing_if = "MentionFormat::is_plain")]
     pub mention_format: MentionFormat,
@@ -633,6 +636,12 @@ pub struct Capabilities {
     /// This account supports blocking and unblocking people (`Request::Relate` with Block/Unblock).
     #[serde(default, skip_serializing_if = "is_false")]
     pub blocks: bool,
+    /// This account supports sending a friend request by typing a username (`Request::AddFriend`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_friend_by_username: bool,
+    /// This account supports setting a private nickname on a friend (`Request::SetFriendNickname`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub friend_nickname: bool,
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,
@@ -651,6 +660,31 @@ pub struct Capabilities {
     /// This account supports setting a status with an emoji and a clear-after expiration (`SetPresence` with `status_emoji` and `clear_at`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub rich_status: bool,
+    /// This account supports previewing and joining a Space from an invite link (`InvitePreview`, `InviteJoin`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub join_space_by_invite: bool,
+    /// This account supports leaving a Space (`Request::LeaveSpace`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub leave_space: bool,
+}
+
+/// Preview of a Space invite (`Request::InvitePreview`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitePreview {
+    pub code: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
