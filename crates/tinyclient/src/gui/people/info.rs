@@ -450,6 +450,7 @@ impl InfoPane {
             in_their_dm: self.scene.peer.as_ref() == Some(&person.key),
             direct: self.row.as_ref().map(|row| (row.call, self.notify_of(row, None) == Notify::Nothing)),
             online: self.online(person.key.network),
+            close_direct: super::scene_can_close_direct(&self.scene, &person.key),
         }
     }
 
@@ -1034,6 +1035,24 @@ impl Shell {
     /// Closes a DM as the network's own ×: it leaves the list until a new message.
     pub(in crate::gui) fn close_direct(&mut self, conversation: Key, cx: &mut Context<Self>) {
         self.conversation_act(Request::CloseDirect { conversation }, "Can't close this conversation".to_owned(), cx);
+    }
+
+    /// Asks once before permanently clearing a chat's history or deleting the chat on the network.
+    pub(in crate::gui) fn confirm_clear_history(&mut self, conversation: Conversation, delete_chat: bool, cx: &mut Context<Self>) {
+        self.open_float(Float::ClearHistory { conversation, delete_chat, revoke: false }, gpui::Point::default(), cx);
+    }
+
+    pub(in crate::gui) fn clear_history(&mut self, conversation: &Conversation, delete_chat: bool, revoke: bool, cx: &mut Context<Self>) {
+        let failed = if delete_chat {
+            format!("Can't delete {}", conversation.title)
+        } else {
+            format!("Can't clear {}", conversation.title)
+        };
+        self.conversation_act(
+            Request::ClearHistory { conversation: conversation.key.clone(), delete_chat, revoke },
+            failed,
+            cx,
+        );
     }
 
     fn conversation_act(&mut self, request: Request, failed: String, cx: &mut Context<Self>) {

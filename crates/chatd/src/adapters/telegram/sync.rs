@@ -334,6 +334,8 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         voice_notes: true,
         direct_calls: false,
         revisions: false,
+        close_direct: false,
+        clear_history: true,
     }
 }
 

@@ -141,6 +141,7 @@ impl Staged {
             spoiler: self.spoiler,
             as_file: self.as_file,
             original: self.converted.is_some() && self.original,
+            media: None,
         })
     }
 

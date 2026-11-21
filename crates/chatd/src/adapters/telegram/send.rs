@@ -348,16 +348,27 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
 /// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
 /// `voice` and is sent as a voice note, as Telegram's apps send one.
 fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {
-    let (name, bytes, mime, spoiler, as_file) = {
+    let (name, bytes, mime, spoiler, as_file, path, staged_media, thumb_path) = {
         let source = &up.files()[at];
-        (source.name.clone(), source.bytes, source.mime, source.spoiler, source.as_file)
+        (
+            source.name.clone(),
+            source.bytes,
+            source.mime,
+            source.spoiler,
+            source.as_file,
+            source.path.clone(),
+            source.media.clone(),
+            source.thumb.clone(),
+        )
     };
     let photo = !as_file && PHOTOS.contains(&mime) && bytes <= BIG;
+    let is_video = !as_file && voice.is_none() && mime.starts_with("video/");
+    let is_audio = !as_file && voice.is_none() && mime.starts_with("audio/");
     let activity = if voice.is_some() {
         protocol::Compose::UploadingAudio
     } else if photo {
         protocol::Compose::UploadingPhoto
-    } else if !as_file && mime.starts_with("video/") {
+    } else if is_video {
         protocol::Compose::UploadingVideo
     } else {
         protocol::Compose::UploadingFile
@@ -393,6 +404,10 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
         // The checksum is optional; Telegram checks the parts itself.
         false => tl::types::InputFile { id: file_id, parts, name: name.clone(), md5_checksum: String::new() }.into(),
     };
+    let thumb = match thumb_path.as_deref() {
+        Some(thumb_file) if is_video => upload_thumb(account, client_id, at, thumb_file)?,
+        _ => None,
+    };
     // A voice note is one Ogg Opus file and its own attribute: no file name, which Telegram's
     // own voice notes carry none of (their rows read "Voice message"). The loudness bars go
     // from the contract's byte a bar to Telegram's five bits a bar.
@@ -405,7 +420,61 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
             waveform: Some(packed(&voice.waveform)),
         }
         .into()],
-        None => vec![tl::types::DocumentAttributeFilename { file_name: name }.into()],
+        None => {
+            let mut attrs: Vec<tl::enums::DocumentAttribute> = vec![tl::types::DocumentAttributeFilename { file_name: name }.into()];
+            if is_video {
+                let probed = probe_mp4(&path);
+                let duration = staged_media
+                    .as_ref()
+                    .and_then(|m| m.duration_ms)
+                    .map(|ms| f64::from(ms) / 1000.0)
+                    .or_else(|| probed.as_ref().map(|p| p.duration))
+                    .unwrap_or(0.0);
+                let w = staged_media
+                    .as_ref()
+                    .and_then(|m| m.width)
+                    .or_else(|| probed.as_ref().map(|p| p.width))
+                    .unwrap_or(0) as i32;
+                let h = staged_media
+                    .as_ref()
+                    .and_then(|m| m.height)
+                    .or_else(|| probed.as_ref().map(|p| p.height))
+                    .unwrap_or(0) as i32;
+                let supports_streaming = probed.as_ref().is_some_and(|p| p.moov_first);
+                attrs.push(
+                    tl::types::DocumentAttributeVideo {
+                        round_message: false,
+                        supports_streaming,
+                        nosound: false,
+                        duration,
+                        w,
+                        h,
+                        preload_prefix_size: None,
+                        video_start_ts: None,
+                        video_codec: None,
+                    }
+                    .into(),
+                );
+            } else if is_audio {
+                let probed = probe_audio_tags(&path);
+                let duration = staged_media.as_ref().and_then(|m| m.duration_ms).map(|ms| (ms / 1000) as i32).unwrap_or(0);
+                let title = staged_media.as_ref().and_then(|m| m.title.clone()).or(probed.title);
+                let performer = staged_media.as_ref().and_then(|m| m.performer.clone()).or(probed.performer);
+                if duration > 0 || title.is_some() || performer.is_some() {
+                    attrs.push(
+                        tl::types::DocumentAttributeAudio {
+                            voice: false,
+                            duration,
+                            title,
+                            performer,
+                            waveform: None,
+                        }
+                        .into(),
+                    );
+                }
+            }
+            attrs
+        }
     };
     let media: tl::enums::InputMedia = match photo {
         true => tl::types::InputMediaUploadedPhoto { spoiler, live_photo: false, file: input, stickers: None, ttl_seconds: None, video: None }.into(),
@@ -414,7 +483,7 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
             force_file: as_file,
             spoiler: spoiler && !as_file,
             file: input,
-            thumb: None,
+            thumb,
             mime_type: mime.to_owned(),
             attributes,
             stickers: None,
@@ -424,7 +493,221 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
         }
         .into(),
     };
-    Ok(Uploaded { media, visual: photo || (!as_file && mime.starts_with("video/")) })
+    Ok(Uploaded { media, visual: photo || is_video })
+}
+
+fn upload_thumb(account: &Account, client_id: &str, at: usize, path: &std::path::Path) -> Result<Option<tl::enums::InputFile>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) if !bytes.is_empty() && bytes.len() <= 2 * 1024 * 1024 => bytes,
+        _ => return Ok(None),
+    };
+    let file_id = random_id(&format!("{client_id}/{at}/thumb"));
+    let chunks: Vec<&[u8]> = bytes.chunks(PART).collect();
+    let parts = chunks.len() as i32;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let saved = account.ask(&tl::functions::upload::SaveFilePart {
+            file_id,
+            file_part: index as i32,
+            bytes: chunk.to_vec(),
+        });
+        match saved {
+            Ok(true) => {}
+            Ok(false) => return Err("Thumbnail could not be sent: Telegram did not keep a part of it.".to_owned()),
+            Err(fault) => return Err(format!("Thumbnail could not be sent: {}", fault.words())),
+        }
+    }
+    Ok(Some(tl::types::InputFile { id: file_id, parts, name: "thumb.jpg".to_owned(), md5_checksum: String::new() }.into()))
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Mp4Info {
+    width: u32,
+    height: u32,
+    duration: f64,
+    moov_first: bool,
+}
+
+/// Inspects an ISO BMFF (`.mp4` / `.mov` / `.m4v`) file for `moov` vs `mdat` ordering,
+/// duration (`mvhd`), and display dimensions (`trak` -> `tkhd`).
+fn probe_mp4(path: &std::path::Path) -> Option<Mp4Info> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut pos = 0u64;
+    let mut seen_mdat = false;
+    let mut info = Mp4Info::default();
+    let mut found_moov = false;
+    while pos + 8 <= len {
+        file.seek(SeekFrom::Start(pos)).ok()?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header).ok()?;
+        let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let kind = &header[4..8];
+        let (box_size, header_len) = match size32 {
+            0 => (len.saturating_sub(pos), 8u64),
+            1 => {
+                if pos + 16 > len {
+                    break;
+                }
+                let mut ext = [0u8; 8];
+                file.read_exact(&mut ext).ok()?;
+                (u64::from_be_bytes(ext), 16u64)
+            }
+            n => (u64::from(n), 8u64),
+        };
+        if box_size < header_len || pos + box_size > len {
+            break;
+        }
+        if kind == b"mdat" {
+            seen_mdat = true;
+        } else if kind == b"moov" {
+            found_moov = true;
+            info.moov_first = !seen_mdat;
+            let payload_len = (box_size - header_len).min(8 * 1024 * 1024) as usize;
+            let mut moov = vec![0u8; payload_len];
+            if file.read_exact(&mut moov).is_ok() {
+                parse_moov(&moov, &mut info);
+            }
+            break;
+        }
+        pos += box_size;
+    }
+    found_moov.then_some(info)
+}
+
+fn parse_moov(buf: &[u8], info: &mut Mp4Info) {
+    let mut at = 0usize;
+    while at + 8 <= buf.len() {
+        let size = u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize;
+        let kind = &buf[at + 4..at + 8];
+        let box_end = if size == 0 { buf.len() } else { at.saturating_add(size) };
+        if size > 0 && size < 8 || box_end > buf.len() {
+            break;
+        }
+        let body = &buf[at + 8..box_end];
+        if kind == b"mvhd" && body.len() >= 20 {
+            let version = body[0];
+            if version == 0 && body.len() >= 20 {
+                let timescale = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+                let duration = u32::from_be_bytes([body[16], body[17], body[18], body[19]]);
+                if timescale > 0 {
+                    info.duration = f64::from(duration) / f64::from(timescale);
+                }
+            } else if version == 1 && body.len() >= 32 {
+                let timescale = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
+                let duration = u64::from_be_bytes([body[24], body[25], body[26], body[27], body[28], body[29], body[30], body[31]]);
+                if timescale > 0 {
+                    info.duration = duration as f64 / f64::from(timescale);
+                }
+            }
+        } else if kind == b"trak" && (info.width == 0 || info.height == 0) {
+            parse_trak(body, info);
+        }
+        at = box_end;
+    }
+}
+
+fn parse_trak(buf: &[u8], info: &mut Mp4Info) {
+    let mut at = 0usize;
+    while at + 8 <= buf.len() {
+        let size = u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize;
+        let kind = &buf[at + 4..at + 8];
+        let box_end = if size == 0 { buf.len() } else { at.saturating_add(size) };
+        if size > 0 && size < 8 || box_end > buf.len() {
+            break;
+        }
+        if kind == b"tkhd" {
+            let body = &buf[at + 8..box_end];
+            if let Some(&version) = body.first() {
+                let dims_at = if version == 1 { 88 } else { 76 };
+                if body.len() >= dims_at + 8 {
+                    let w = u32::from_be_bytes([body[dims_at], body[dims_at + 1], body[dims_at + 2], body[dims_at + 3]]) >> 16;
+                    let h = u32::from_be_bytes([body[dims_at + 4], body[dims_at + 5], body[dims_at + 6], body[dims_at + 7]]) >> 16;
+                    if w > 0 && h > 0 {
+                        info.width = w;
+                        info.height = h;
+                        return;
+                    }
+                }
+            }
+        }
+        at = box_end;
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AudioTags {
+    title: Option<String>,
+    performer: Option<String>,
+}
+
+/// Reads ID3v2 (`TIT2`/`TPE1`) or trailing ID3v1 tags for music track title and performer.
+fn probe_audio_tags(path: &std::path::Path) -> AudioTags {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut tags = AudioTags::default();
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return tags;
+    };
+    let mut head = [0u8; 10];
+    if file.read_exact(&mut head).is_ok() && &head[0..3] == b"ID3" && matches!(head[3], 3 | 4) {
+        let size = ((usize::from(head[6] & 0x7f)) << 21)
+            | ((usize::from(head[7] & 0x7f)) << 14)
+            | ((usize::from(head[8] & 0x7f)) << 7)
+            | usize::from(head[9] & 0x7f);
+        let mut buf = vec![0u8; size.min(256 * 1024)];
+        if file.read_exact(&mut buf).is_ok() {
+            let mut at = 0usize;
+            while at + 10 <= buf.len() {
+                let frame_id = &buf[at..at + 4];
+                if frame_id[0] == 0 {
+                    break;
+                }
+                let frame_len = if head[3] == 4 {
+                    ((usize::from(buf[at + 4] & 0x7f)) << 21)
+                        | ((usize::from(buf[at + 5] & 0x7f)) << 14)
+                        | ((usize::from(buf[at + 6] & 0x7f)) << 7)
+                        | usize::from(buf[at + 7] & 0x7f)
+                } else {
+                    u32::from_be_bytes([buf[at + 4], buf[at + 5], buf[at + 6], buf[at + 7]]) as usize
+                };
+                at += 10;
+                if frame_len == 0 || at + frame_len > buf.len() {
+                    break;
+                }
+                let data = &buf[at..at + frame_len];
+                if matches!(frame_id, b"TIT2" | b"TPE1") && !data.is_empty() {
+                    let text = match data[0] {
+                        0 | 3 => String::from_utf8_lossy(&data[1..]).trim_matches('\0').trim().to_owned(),
+                        _ => String::new(),
+                    };
+                    if !text.is_empty() {
+                        if frame_id == b"TIT2" {
+                            tags.title = Some(text);
+                        } else {
+                            tags.performer = Some(text);
+                        }
+                    }
+                }
+                at += frame_len;
+            }
+        }
+    }
+    if tags.title.is_none() && tags.performer.is_none() {
+        if let Ok(meta) = file.metadata() {
+            if meta.len() >= 128 && file.seek(SeekFrom::End(-128)).is_ok() {
+                let mut tail = [0u8; 128];
+                if file.read_exact(&mut tail).is_ok() && &tail[0..3] == b"TAG" {
+                    let clean = |slice: &[u8]| {
+                        let s = String::from_utf8_lossy(slice).trim_matches('\0').trim().to_owned();
+                        (!s.is_empty()).then_some(s)
+                    };
+                    tags.title = clean(&tail[3..33]);
+                    tags.performer = clean(&tail[33..63]);
+                }
+            }
+        }
+    }
+    tags
 }
 
 /// A voice message's loudness, one byte a bar, as Telegram packs it: five-bit values end to

@@ -673,6 +673,14 @@ impl Demo {
                 let closed = demo.ctx.filing(&conversation_id, &Filing { hidden: true, ..Filing::default() });
                 let _ = reply.send(closed.map_err(|err| Refusal::Refused(err.to_string())));
             }
+            Command::ClearHistory { conversation_id, delete_chat, reply, .. } => {
+                let done = if delete_chat {
+                    demo.ctx.conversation_gone(&conversation_id)
+                } else {
+                    demo.ctx.clear_messages(&conversation_id)
+                };
+                let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
+            }
             Command::Pinned { conversation_id, reply } => drop(reply.send(Ok(demo.pinned(&conversation_id)))),
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));

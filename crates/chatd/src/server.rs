@@ -2517,6 +2517,9 @@ impl Chat {
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }
+            Request::ClearHistory { conversation, delete_chat, revoke } => {
+                self.act(&conversation, |conversation_id, reply| Command::ClearHistory { conversation_id, delete_chat, revoke, reply })
+            }
             Request::Pinned { conversation } => self.pinned(conversation),
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
@@ -3064,6 +3067,7 @@ fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
             spoiler: attachment.spoiler,
             as_file: false,
             original: false,
+            media: None,
         })
     })
     .collect()
@@ -3381,6 +3385,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },

@@ -34,7 +34,7 @@ DAVE seals the picture as well as the voice. The transport encryption is the sam
 | --- | --- |
 | Slack | Huddles open in Slack. |
 | Teams | Calls and meetings open in Teams. |
-| Telegram | Calls open in Telegram. |
+| Telegram | Opens the chat in Telegram so you can start a call there. |
 | Android Messages | Opens in Messages. |
 | Signal | No call control. An incoming call rings as one notification with "Answer on your phone"; a call nobody answered here leaves a missed-call line in the conversation. |
 | Discord stage | Opens in Discord. |

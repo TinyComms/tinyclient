@@ -1456,6 +1456,20 @@ impl Store {
         tx.commit()
     }
 
+    /// Drops the stored messages of a conversation while keeping its row in the list.
+    pub fn clear_messages(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let tx = self.db.transaction()?;
+        let key = params![word(&conversation.network), conversation.account, conversation.id];
+        tx.execute("DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3", key)?;
+        let changed = tx.execute(
+            "UPDATE conversation SET unread = 0, mentions = 0, preview = '', preview_from = '', preview_mine = 0, preview_id = ''
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            key,
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     pub fn conversation(&self, conversation: &Key) -> rusqlite::Result<Option<Conversation>> {
         self.db
             .query_row(

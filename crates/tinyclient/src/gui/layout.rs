@@ -16,7 +16,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
     SharedString, Window, WindowControlArea,
 };
-use protocol::{CallState, Conversation, ConversationKind, Key, Link, Network, Presence};
+use protocol::{CallState, Conversation, Key, Link, Network, Presence};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -903,13 +903,38 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
-                if conversation.kind == ConversationKind::Direct {
+                let can = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.accounts.iter().find(|a| a.key == conversation.key.account()).map(|a| a.can))
+                    .unwrap_or_default();
+                if super::people::can_close_direct(conversation, &can) {
                     let closed = conversation.key.clone();
                     items.push(
                         menu_item("close-dm", Some("icons/x.svg"), "Close conversation", None)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
                                 this.close_direct(closed.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if super::people::can_clear_history(conversation, &can) {
+                    let cleared = conversation.as_ref().clone();
+                    items.push(
+                        menu_item("clear-history", Some("icons/trash-2.svg"), "Clear history…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.confirm_clear_history(cleared.clone(), false, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                    let deleted = conversation.as_ref().clone();
+                    items.push(
+                        menu_item("delete-chat", Some("icons/trash-2.svg"), "Delete chat…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.confirm_clear_history(deleted.clone(), true, cx);
                             }))
                             .into_any_element(),
                     );
@@ -1069,14 +1094,25 @@ impl Shell {
                 Box::new(move |this, cx| this.call_handoff(handoff_key.clone(), cx)),
             ));
         }
-        // Closing a DM is offered only on networks whose adapter serves `CloseDirect`; leaving, where `can_leave` says.
-        let close = row.kind == protocol::ConversationKind::Direct && matches!(network, Network::Discord | Network::Messages | Network::Slack);
-        if close || leave {
+        let can = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| a.key == key.account()).map(|a| a.can))
+            .unwrap_or_default();
+        let close = super::people::can_close_direct(&row, &can);
+        let clear = super::people::can_clear_history(&row, &can);
+        if close || clear || leave {
             items.push(menu_separator().into_any_element());
         }
         if close {
             let closed = key.clone();
             items.push(act("row-close", "icons/x.svg", "Close conversation".into(), Box::new(move |this, cx| this.close_direct(closed.clone(), cx))));
+        }
+        if clear {
+            let cleared = row.clone();
+            items.push(act("row-clear", "icons/trash-2.svg", "Clear history…".into(), Box::new(move |this, cx| this.confirm_clear_history(cleared.clone(), false, cx))));
+            let deleted = row.clone();
+            items.push(act("row-delete-chat", "icons/trash-2.svg", "Delete chat…".into(), Box::new(move |this, cx| this.confirm_clear_history(deleted.clone(), true, cx))));
         }
         if leave {
             let left = row.clone();

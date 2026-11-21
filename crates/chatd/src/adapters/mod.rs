@@ -363,6 +363,7 @@ pub enum Command {
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
     CloseDirect { conversation_id: String, reply: Reply<()> },
+    ClearHistory { conversation_id: String, delete_chat: bool, revoke: bool, reply: Reply<()> },
     /// The messages pinned in a conversation, newest first, at most 50.
     Pinned { conversation_id: String, reply: Reply<Vec<Message>> },
     /// What was shared in a conversation, from the network's own search, because the user
@@ -466,6 +467,7 @@ impl Command {
             Command::SetMute { reply, .. }
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
+            | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
@@ -1012,6 +1014,17 @@ impl Context {
     /// before history has loaded acks this id.
     pub fn note_newest(&self, conversation_id: &str, message_id: &str) -> Stores {
         self.hub.store().note_newest(&self.key(conversation_id), message_id)?;
+        Ok(())
+    }
+
+    /// Drops the cached messages of a conversation while keeping its row.
+    pub fn clear_messages(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().clear_messages(&conversation)? {
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
         Ok(())
     }
 

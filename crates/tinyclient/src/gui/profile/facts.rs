@@ -34,6 +34,8 @@ pub struct Seen {
     pub direct: Option<(CallSupport, bool)>,
     /// Their network is connected. Off: what shows is the cache.
     pub online: bool,
+    /// The account supports closing a direct conversation (`Request::CloseDirect`).
+    pub close_direct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,7 @@ pub struct Actions {
 pub fn handoff_words(network: Network) -> String {
     match network {
         Network::Slack => "Huddle in Slack".to_owned(),
+        Network::Telegram => "Open chat in Telegram".to_owned(),
         other => format!("Call in {}", other.label()),
     }
 }
@@ -69,6 +72,7 @@ pub fn call_label(call: &Call, network: Network, beside_message: bool) -> String
         (Call::Native, _) => "Call".to_owned(),
         (Call::Handoff(words), false) => words.clone(),
         (Call::Handoff(_), true) if network == Network::Slack => "Huddle".to_owned(),
+        (Call::Handoff(_), true) if network == Network::Telegram => "Telegram".to_owned(),
         (Call::Handoff(_), true) => "Call".to_owned(),
     }
 }
@@ -598,7 +602,7 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if !pane && !person.link.is_empty() {
         items.push(Item::OpenIn);
     }
-    if seen.in_their_dm && seen.direct.is_some() && can_close_direct(person.key.network) {
+    if seen.in_their_dm && seen.direct.is_some() && seen.close_direct {
         items.push(Item::CloseDirect);
     }
     let (remove, block) = offers(person);
@@ -612,9 +616,14 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     tidy(items)
 }
 
-/// Whether this network's adapter serves `Request::CloseDirect`.
-pub fn can_close_direct(network: Network) -> bool {
-    matches!(network, Network::Discord | Network::Messages | Network::Slack)
+/// A direct conversation whose account serves `CloseDirect` (Discord, Messages).
+pub fn can_close_direct(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    conversation.kind == ConversationKind::Direct && can.close_direct
+}
+
+/// A conversation whose account serves `ClearHistory` (Telegram) and is not read-only.
+pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.clear_history && !conversation.read_only
 }
 
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
@@ -887,7 +896,7 @@ mod tests {
         }
     }
 
-    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true };
+    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true, close_direct: true };
 
     #[test]
     fn friendship_buttons_follow_discord_relationship_state() {
@@ -937,7 +946,7 @@ mod tests {
 
     #[test]
     fn calls_are_native_handed_off_or_absent_by_network_and_never_for_apps() {
-        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true };
+        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false };
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(actions(&tess, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Huddle in Slack".into())));
         let omar = person(Network::Teams, Relation::Contact);
@@ -947,10 +956,10 @@ mod tests {
         let unseen = Seen { online: true, ..Seen::default() };
         assert_eq!(actions(&tess, &unseen, Surface::Pane).call, None);
         assert_eq!(actions(&person(Network::Discord, Relation::None), &unseen, Surface::Pane).call, Some(Call::Native));
-        // A Telegram person's call is a hand-off, DM held or not; their service account has none.
+        // A Telegram person's hand-off opens the chat in Telegram, DM held or not; their service account has none.
         let nadia = person(Network::Telegram, Relation::Contact);
-        assert_eq!(actions(&nadia, &unseen, Surface::Card).call, Some(Call::Handoff("Call in Telegram".into())));
-        assert_eq!(actions(&nadia, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Call in Telegram".into())));
+        assert_eq!(actions(&nadia, &unseen, Surface::Card).call, Some(Call::Handoff("Open chat in Telegram".into())));
+        assert_eq!(actions(&nadia, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Open chat in Telegram".into())));
         let mut service = nadia.clone();
         service.mark = Some(Mark::Verified);
         assert_eq!(actions(&service, &unseen, Surface::Card).call, None);
@@ -1044,7 +1053,7 @@ mod tests {
     #[test]
     fn menus_follow_the_designs_order_and_destructive_items_come_last() {
         let juno = person(Network::Discord, Relation::Friend);
-        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true };
+        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
             vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::Block]
@@ -1052,6 +1061,9 @@ mod tests {
         // In their DM: no Mute (the switch has it), Close DM instead, Copy ID only with ⌥. The
         // pane's foot opens them in the app, so its menu does not.
         assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::Block]);
+        let nadia = person(Network::Telegram, Relation::Contact);
+        let telegram_dm = Seen { in_their_dm: true, direct: Some((CallSupport::Handoff, false)), online: true, ..Seen::default() };
+        assert!(!person_menu(&nadia, &telegram_dm, false, true).contains(&Item::CloseDirect), "Telegram does not serve CloseDirect");
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(person_menu(&tess, &Seen::default(), false, false), vec![Item::CopyHandle, Item::CopyLink, Item::OpenIn]);
         assert_eq!(person_menu(&tess, &Seen::default(), false, true), vec![Item::CopyHandle, Item::CopyLink]);
@@ -1065,14 +1077,16 @@ mod tests {
         assert!(!can_leave(&row(Network::Discord, ConversationKind::Channel)));
         assert!(can_leave(&row(Network::Teams, ConversationKind::Group)));
         assert!(!can_leave(&row(Network::Teams, ConversationKind::Channel)));
-        // Slack serves CloseDirect on DMs and Leave (via conversations.close) on group DMs;
-        // networks that do not serve CloseDirect omit it from the person menu.
-        assert!(person_menu(&tess, &DM, false, true).contains(&Item::CloseDirect));
         assert!(conversation_menu(&row(Network::Slack, ConversationKind::Group), Some("l"), false).contains(&Item::Leave));
-        for unsupported in [Network::Signal, Network::Telegram, Network::Teams, Network::Tiny] {
-            let other = person(unsupported, Relation::Contact);
-            assert!(!person_menu(&other, &DM, false, true).contains(&Item::CloseDirect), "{unsupported:?} should not offer CloseDirect");
-        }
+        let dm_with_close = Seen { close_direct: true, ..DM };
+        assert!(person_menu(&tess, &dm_with_close, false, true).contains(&Item::CloseDirect));
+        assert!(!person_menu(&tess, &DM, false, true).contains(&Item::CloseDirect));
+        let tg_caps = protocol::Capabilities { close_direct: false, clear_history: true, ..Default::default() };
+        let dc_caps = protocol::Capabilities { close_direct: true, clear_history: false, ..Default::default() };
+        assert!(!can_close_direct(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
+        assert!(can_close_direct(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
+        assert!(can_clear_history(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
+        assert!(!can_clear_history(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
     }
 
     #[test]
@@ -1183,8 +1197,10 @@ mod tests {
     #[test]
     fn a_hand_off_beside_message_is_one_word() {
         let handoff = Call::Handoff(handoff_words(Network::Telegram));
-        assert_eq!(call_label(&handoff, Network::Telegram, false), "Call in Telegram");
-        assert_eq!(call_label(&handoff, Network::Telegram, true), "Call");
+        assert_eq!(call_label(&handoff, Network::Telegram, false), "Open chat in Telegram");
+        assert_eq!(call_label(&handoff, Network::Telegram, true), "Telegram");
+        assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Teams)), Network::Teams, false), "Call in Teams");
+        assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Teams)), Network::Teams, true), "Call");
         assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Slack)), Network::Slack, true), "Huddle");
         assert_eq!(call_label(&Call::Native, Network::Discord, false), "Call");
     }

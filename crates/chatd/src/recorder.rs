@@ -41,13 +41,25 @@ struct Active {
 /// What mediad's word makes of `shown`. False when the word is stale: a recording replaced or
 /// forgotten before its mediad answered is not told its facts.
 fn heard(shown: &mut Recording, active: &Active, event: &RecEvent) -> bool {
-    if *shown != active.recording {
+    if shown.conversation != active.recording.conversation
+        || shown.since != active.recording.since
+        || !matches!(shown.state, RecordState::Active)
+    {
         return false;
     }
     *shown = match event {
+        RecEvent::Started { device, notice } => Recording {
+            conversation: active.recording.conversation.clone(),
+            since: active.recording.since,
+            device: (!device.is_empty()).then(|| device.clone()),
+            notice: notice.clone(),
+            state: RecordState::Active,
+        },
         RecEvent::Done { duration, waveform } => Recording {
             conversation: active.recording.conversation.clone(),
             since: active.recording.since,
+            device: shown.device.clone(),
+            notice: shown.notice.clone(),
             state: RecordState::Recorded {
                 path: active.path.display().to_string(),
                 duration: *duration,
@@ -57,6 +69,8 @@ fn heard(shown: &mut Recording, active: &Active, event: &RecEvent) -> bool {
         RecEvent::Failed { detail } => Recording {
             conversation: active.recording.conversation.clone(),
             since: active.recording.since,
+            device: shown.device.clone(),
+            notice: shown.notice.clone(),
             state: RecordState::Failed { detail: detail.clone() },
         },
     };
@@ -84,30 +98,29 @@ impl Recorder {
     /// The shell's request. Every answer is `Ok`: what happened is a `Change::Recording`.
     pub fn request(&self, hub: &Arc<Hub>, request: RecordRequest) {
         match request {
-            RecordRequest::Start { conversation } => self.start(hub, conversation),
+            RecordRequest::Start { conversation, input } => self.start(hub, conversation, input),
             RecordRequest::Stop => self.stop(hub),
             RecordRequest::Forget => self.forget(hub),
         }
     }
 
     /// Starts a mediad. Whatever was recording ends first: its facts never arrive any more.
-    fn start(&self, hub: &Arc<Hub>, conversation: Key) {
+    fn start(&self, hub: &Arc<Hub>, conversation: Key, input: Option<String>) {
         let since = now_ms();
         let path = crate::blobs::upload::outbox().join(format!("voice-{since}.opus"));
         self.replace(hub, None);
-        let recording = Recording { conversation, since, state: RecordState::Active };
+        let recording = Recording { conversation, since, device: None, notice: None, state: RecordState::Active };
         let _ = std::fs::create_dir_all(path.parent().expect("the outbox has a parent"));
-        self.spawn_recording(hub, &recording, &path);
+        self.spawn_recording(hub, &recording, &path, input.as_deref());
         self.tell(hub);
     }
 
-    /// Runs `mediad --rec` for the recording's file, and reads its one event off its stdout.
-    fn spawn_recording(&self, hub: &Arc<Hub>, recording: &Recording, path: &Path) {
+    /// Runs `mediad --rec` for the recording's file, and reads its events off its stdout.
+    fn spawn_recording(&self, hub: &Arc<Hub>, recording: &Recording, path: &Path, input: Option<&str>) {
         let error = match mediad_path() {
             Err(err) => Some(err),
             Ok(mediad) => {
-                let mut command = Command::new(mediad);
-                command.arg("--rec").arg(path);
+                let mut command = recorder_command(&mediad, path, input);
                 protocol::launch::no_console(&mut command);
                 match protocol::media_host::spawn(&mut command) {
                     Ok(spawned) => {
@@ -124,6 +137,8 @@ impl Recorder {
             *lock(&self.shown) = Some(Recording {
                 conversation: recording.conversation.clone(),
                 since: recording.since,
+                device: None,
+                notice: None,
                 state: RecordState::Failed { detail: NO_RECORDER.to_owned() },
             });
         }
@@ -197,7 +212,9 @@ impl Recorder {
             let active = lock(&self.active);
             match (active.as_ref(), shown.as_mut()) {
                 (Some(active), Some(shown)) if active.recording == *recording => {
-                    active.said.store(true, Ordering::Relaxed);
+                    if !matches!(event, RecEvent::Started { .. }) {
+                        active.said.store(true, Ordering::Relaxed);
+                    }
                     heard(shown, active, &event)
                 }
                 _ => {
@@ -210,6 +227,15 @@ impl Recorder {
             self.tell(hub);
         }
     }
+}
+
+fn recorder_command(mediad: &Path, path: &Path, input: Option<&str>) -> Command {
+    let mut command = Command::new(mediad);
+    command.arg("--rec").arg(path);
+    if let Some(input) = input.filter(|s| !s.is_empty()) {
+        command.arg("--input").arg(input);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -265,7 +291,7 @@ mod tests {
     }
 
     fn recording(since: u64) -> Recording {
-        Recording { conversation: Key { network: Network::Telegram, account: "10".into(), id: "7002".into() }, since, state: RecordState::Active }
+        Recording { conversation: Key { network: Network::Telegram, account: "10".into(), id: "7002".into() }, since, device: None, notice: None, state: RecordState::Active }
     }
 
     fn active(recording: Recording, path: &str) -> Active {
@@ -342,5 +368,32 @@ mod tests {
         } else {
             unreachable!("the recording was done");
         }
+    }
+
+    #[test]
+    fn recorder_command_passes_chosen_input_and_started_updates_device_and_notice() {
+        let cmd = recorder_command(Path::new("mediad"), Path::new("voice.opus"), Some("Blue Yeti\tusb-mic"));
+        let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args, ["--rec", "voice.opus", "--input", "Blue Yeti\tusb-mic"]);
+
+        let auto = recorder_command(Path::new("mediad"), Path::new("voice.opus"), None);
+        let auto_args: Vec<&str> = auto.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(auto_args, ["--rec", "voice.opus"]);
+
+        let mut shown = recording(1000);
+        let running = active(shown.clone(), "media/telegram/10/voice-1000.opus");
+        assert!(heard(
+            &mut shown,
+            &running,
+            &RecEvent::Started {
+                device: "Built-in Mic".into(),
+                notice: Some("Blue Yeti isn't connected. Using Built-in Mic until it's back.".into()),
+            }
+        ));
+        assert_eq!(shown.device.as_deref(), Some("Built-in Mic"));
+        assert!(shown.notice.as_deref().unwrap().contains("Blue Yeti"));
+        assert_eq!(shown.state, RecordState::Active);
+        assert!(heard(&mut shown, &running, &RecEvent::Done { duration: 2000, waveform: vec![12] }));
+        assert!(matches!(shown.state, RecordState::Recorded { duration: 2000, .. }));
     }
 }

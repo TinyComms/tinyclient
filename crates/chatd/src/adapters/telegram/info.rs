@@ -285,6 +285,57 @@ pub(super) fn leave(account: &Account, conversation: &str) -> Result<(), Fault> 
     Ok(())
 }
 
+/// Clears a chat's history (`delete_chat == false`) or deletes the chat (`delete_chat == true`).
+/// `revoke` also removes the other side's copy where Telegram allows it. Loops while Telegram
+/// returns a non-zero `offset`.
+pub(super) fn clear_history(account: &Account, conversation: &str, delete_chat: bool, revoke: bool) -> Result<(), Fault> {
+    let Some((who, None)) = Who::parse(conversation) else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    match who {
+        Who::User(_) | Who::Group(_) => {
+            let peer = account.input(who)?;
+            let mut pages = 0u32;
+            loop {
+                let tl::enums::messages::AffectedHistory::History(affected) = account.ask(
+                    &tl::functions::messages::DeleteHistory {
+                        just_clear: !delete_chat,
+                        revoke,
+                        peer: peer.clone(),
+                        max_id: 0,
+                        min_date: None,
+                        max_date: None,
+                    },
+                )?;
+                pages += 1;
+                if affected.offset == 0 || pages >= 64 {
+                    break;
+                }
+            }
+            if delete_chat {
+                super::live::left(account, who);
+            } else {
+                let _ = account.ctx.clear_messages(conversation);
+            }
+        }
+        Who::Channel(_) => {
+            let channel = account.input_channel(who)?;
+            let answer = account.ask(&tl::functions::channels::DeleteHistory {
+                for_everyone: revoke,
+                channel,
+                max_id: 0,
+            })?;
+            super::live::answered(account, &answer);
+            if delete_chat {
+                super::live::left(account, who);
+            } else {
+                let _ = account.ctx.clear_messages(conversation);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn search(account: &Account, conversation: &str, query: &str, filter: tl::enums::MessagesFilter, offset_id: i32, limit: i32) -> Result<(Vec<Message>, Option<u32>), Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     let request = tl::functions::messages::Search {

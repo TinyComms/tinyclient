@@ -755,6 +755,8 @@ impl Discord {
             voice_notes: false,
             direct_calls: false,
             revisions: false,
+            close_direct: true,
+            clear_history: false,
         });
         self.state.lock().unwrap().premium = premium;
     }

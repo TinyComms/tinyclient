@@ -2426,7 +2426,7 @@ fn pickers_and_sending_with_files_options_and_picks() {
         std::fs::write(&path, vec![7u8; bytes]).unwrap();
         path.to_string_lossy().into_owned()
     };
-    let one = |path: String, spoiler: bool, as_file: bool| protocol::OutgoingFile { path, name: String::new(), spoiler, as_file, original: false };
+    let one = |path: String, spoiler: bool, as_file: bool| protocol::OutgoingFile { path, name: String::new(), spoiler, as_file, original: false, media: None };
     let photo = file("ridge.jpg", 700 * 1024);
     let sent = send("8105", "the ridge", protocol::Outgoing { files: vec![one(photo.clone(), true, false)], ..Default::default() });
     assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
@@ -2518,7 +2518,7 @@ fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("voice-1234.opus");
     std::fs::write(&path, vec![7u8; 2048]).unwrap();
-    let one = protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false };
+    let one = protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, media: None };
     // Bars at the widest and shut: both are exact through Telegram's five bits a bar.
     let voice = protocol::VoiceNote { duration: 7_500, waveform: vec![255, 0, 255, 0, 255, 0, 255, 0] };
     let sent = send("8201", "", protocol::Outgoing { files: vec![one], voice: Some(voice), ..Default::default() });
@@ -3144,4 +3144,154 @@ fn a_link_card_fetches_its_picture_and_not_the_full_photo() {
     assert_eq!(std::fs::metadata(&landed).unwrap().len(), FILE_BYTES);
     assert_eq!(world.called("GetFile photo 8801 m"), 2, "{:#?}", world.calls());
     assert_eq!(world.called("GetFile photo 8801 y"), 0, "{:#?}", world.calls());
+}
+
+#[test]
+fn delete_chat_and_clear_history_loop_over_offset_and_update_store() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("u7002 history", || world.message("u7002", "12"));
+
+    // Clear history on a DM with revoke=true: loops over non-zero offset, clears stored messages,
+    // and keeps the conversation row.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: key("u7002"), delete_chat: false, revoke: true }),
+        Response::Ok
+    );
+    assert_eq!(world.called("DeleteHistory u7002 just_clear=true revoke=true max_id=0"), 2, "{:#?}", world.calls());
+    assert!(world.conversation("u7002").is_some(), "clear history keeps the chat row");
+    assert!(world.messages("u7002").is_empty(), "clear history removes stored messages");
+
+    // Delete chat on a DM: removes the row and its stored messages.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: key("u7002"), delete_chat: true, revoke: false }),
+        Response::Ok
+    );
+    assert_eq!(world.called("DeleteHistory u7002 just_clear=false revoke=false max_id=0"), 1, "{:#?}", world.calls());
+    assert!(world.conversation("u7002").is_none(), "delete chat removes the row");
+
+    // Clear history on a supergroup/channel uses channels.deleteHistory.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: key("c9001"), delete_chat: false, revoke: false }),
+        Response::Ok
+    );
+    assert_eq!(world.called("ChannelDeleteHistory c9001 for_everyone=false max_id=0"), 1, "{:#?}", world.calls());
+}
+
+fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + payload.len());
+    out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Builds a minimal valid ISO BMFF (.mp4) with `mvhd` (duration_ms) and `trak`/`tkhd` (width x height).
+/// When `moov_first` is true, `moov` precedes `mdat` (fast-start / streamable).
+fn sample_mp4(width: u32, height: u32, duration_ms: u32, moov_first: bool) -> Vec<u8> {
+    let ftyp = mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isommp41");
+    // mvhd version 0: 4 bytes flags/ver, 4 creation, 4 mod, 4 timescale (1000), 4 duration, rest padding (100 bytes total).
+    let mut mvhd_payload = vec![0u8; 100];
+    mvhd_payload[12..16].copy_from_slice(&1000u32.to_be_bytes());
+    mvhd_payload[16..20].copy_from_slice(&duration_ms.to_be_bytes());
+    let mvhd = mp4_box(b"mvhd", &mvhd_payload);
+    // tkhd version 0: 84 bytes payload; width at 76..80 (16.16 fixed), height at 80..84 (16.16 fixed).
+    let mut tkhd_payload = vec![0u8; 84];
+    tkhd_payload[76..80].copy_from_slice(&(width << 16).to_be_bytes());
+    tkhd_payload[80..84].copy_from_slice(&(height << 16).to_be_bytes());
+    let tkhd = mp4_box(b"tkhd", &tkhd_payload);
+    let trak = mp4_box(b"trak", &tkhd);
+    let mut moov_body = Vec::new();
+    moov_body.extend_from_slice(&mvhd);
+    moov_body.extend_from_slice(&trak);
+    let moov = mp4_box(b"moov", &moov_body);
+    let mdat = mp4_box(b"mdat", &[0u8; 32]);
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    if moov_first {
+        file.extend_from_slice(&moov);
+        file.extend_from_slice(&mdat);
+    } else {
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&moov);
+    }
+    file
+}
+
+#[test]
+fn sent_video_carries_dimensions_duration_streaming_flag_and_thumb() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-video-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let fast_path = dir.join("clip.mp4");
+    std::fs::write(&fast_path, sample_mp4(1280, 720, 12_500, true)).unwrap();
+    let thumb_path = dir.join("poster.jpg");
+    std::fs::write(&thumb_path, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+    let slow_path = dir.join("late-moov.mp4");
+    std::fs::write(&slow_path, sample_mp4(640, 360, 4_000, false)).unwrap();
+    let song_path = dir.join("track.mp3");
+    let mut mp3 = vec![0u8; 16];
+    let mut id3v1 = vec![0u8; 128];
+    id3v1[0..3].copy_from_slice(b"TAG");
+    id3v1[3..14].copy_from_slice(b"Night Drive");
+    id3v1[33..42].copy_from_slice(b"Synthwave");
+    mp3.extend_from_slice(&id3v1);
+    std::fs::write(&song_path, mp3).unwrap();
+
+    let send = |client_id: &str, file: protocol::OutgoingFile| {
+        assert!(matches!(
+            world.ask(Request::Send {
+                conversation: key("u7002"),
+                client_id: client_id.into(),
+                text: String::new(),
+                reply_to: None,
+                with: protocol::Outgoing { files: vec![file], ..Default::default() },
+            }),
+            Response::Sent { .. }
+        ));
+        world.until("sent", || {
+            world.messages("u7002").into_iter().find(|m| m.client_id.as_deref() == Some(client_id) && m.state != SendState::Pending)
+        })
+    };
+
+    let sent = send("8901", protocol::OutgoingFile {
+        path: fast_path.to_string_lossy().into_owned(),
+        media: Some(protocol::OutgoingMedia {
+            thumb: Some(thumb_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMedia u7002 video:1280x720:12.5:stream=true:thumb=true")),
+        "expected fast-start video attribute + thumb on wire, got: {:#?}",
+        world.calls()
+    );
+
+    let sent_slow = send("8902", protocol::OutgoingFile {
+        path: slow_path.to_string_lossy().into_owned(),
+        ..Default::default()
+    });
+    assert_eq!(sent_slow.state, SendState::Sent, "{:?}", world.calls());
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMedia u7002 video:640x360:4.0:stream=false:thumb=false")),
+        "expected non-fast-start video to have supports_streaming=false, got: {:#?}",
+        world.calls()
+    );
+
+    let sent_song = send("8903", protocol::OutgoingFile {
+        path: song_path.to_string_lossy().into_owned(),
+        ..Default::default()
+    });
+    assert_eq!(sent_song.state, SendState::Sent, "{:?}", world.calls());
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMedia u7002 audio:Night Drive:Synthwave")),
+        "expected audio tags on wire, got: {:#?}",
+        world.calls()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
