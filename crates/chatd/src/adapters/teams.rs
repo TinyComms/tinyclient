@@ -95,6 +95,7 @@
 //! then hands out must be under it), `TINYCLIENT_TEAMS_TROUTER` replaces
 //! `https://go.trouter.teams.microsoft.com`. The session comes from `TINYCLIENT_SESSION_TEAMS`.
 
+mod card;
 mod emoji;
 mod html;
 

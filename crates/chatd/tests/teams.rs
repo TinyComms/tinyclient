@@ -970,13 +970,12 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     assert_eq!(std::fs::read(path).unwrap(), SHEET);
     assert_eq!(world.fake.calls("GET", &content).len(), 1);
 
-    // A card is named and linked into the official app, never blank.
-    let card = by("1760000300300");
-    assert_eq!(card.text, "Card: Build 512 passed");
-    let MessageKind::Unsupported { link } = &card.kind else {
-        panic!("{:?}", card.kind);
-    };
-    assert_eq!(link, &format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000300300?tenantId={HOME}"));
+    // An adaptive card renders into Message::card and stays a normal message (reactable, quotable).
+    let card_msg = by("1760000300300");
+    assert_eq!(card_msg.kind, MessageKind::Normal);
+    let card = card_msg.card.as_deref().expect("adaptive card parsed into Message::card");
+    assert_eq!(card.title, "Build 512 passed");
+    assert_eq!(card.actions, vec![protocol::CardAction { label: "Open".into(), url: "https://ci.example/512".into() }]);
 
     // A Loop component is named and linked to its file, not left as a blank card.
     let looped = by("1760000310310");
@@ -1685,4 +1684,66 @@ fn reply_to_my_channel_post_marks_chain_and_channel_unread_while_untouched_post_
         world.message(&deploys, &mine.id).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.unread == 0))
     });
     assert_eq!(read_post.thread.unwrap().unread, 0);
+}
+
+#[test]
+fn adaptive_connector_and_hero_cards_render_and_malformed_falls_back() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+    let fixtures = world.fake.fixture("cards").expect("cards fixture");
+
+    for name in ["connector_alert", "adaptive_facts_buttons", "hero_card", "malformed_card"] {
+        world.fake.push("NewMessage", fixtures[name].clone(), false);
+    }
+    world.until("all four card messages to arrive", || {
+        let msgs = world.messages(&general);
+        ["1760000801001", "1760000801002", "1760000801003", "1760000801004"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+
+    // 1. Office 365 connector alert
+    let alert = world.message(&general, "1760000801001").unwrap();
+    assert_eq!(alert.kind, MessageKind::Normal);
+    let alert_card = alert.card.as_deref().expect("connector card");
+    assert_eq!(alert_card.title, "High latency on checkout");
+    assert_eq!(alert_card.author, "PagerDuty");
+    assert_eq!(alert_card.color, Some(0xD93025));
+    assert_eq!(alert_card.fields, vec![("Service".into(), "checkout-api".into()), ("P99".into(), "2450 ms".into())]);
+    assert!(alert_card.image.is_none(), "external connector image must not be fetched");
+    assert!(alert_card.actions.iter().any(|a| a.label == "View Incident" && a.url == "https://pagerduty.example/incidents/904"));
+    assert!(alert_card.actions.iter().any(|a| a.label == "Acknowledge · Open in Teams"));
+    assert!(alert_card.actions.iter().any(|a| a.label == "Latency chart" && a.url == "https://cdn.pagerduty.example/chart.png"));
+
+    // 2. Adaptive card with facts, table, hosted + external image, OpenUrl + Submit
+    let adaptive = world.message(&general, "1760000801002").unwrap();
+    assert_eq!(adaptive.kind, MessageKind::Normal);
+    let ac = adaptive.card.as_deref().expect("adaptive card");
+    assert_eq!(ac.title, "Release v2.4.0 approval needed");
+    assert_eq!(ac.fields, vec![("Environment".into(), "Production".into()), ("Commit".into(), "a7fa2e22".into())]);
+    assert!(ac.text.contains("Check | Result") && ac.text.contains("Tests | Pass"), "{}", ac.text);
+    assert!(ac.image.is_some(), "Teams-hosted image should be registered");
+    assert!(ac.actions.iter().any(|a| a.label == "External banner" && a.url == "https://external.example/banner.png"));
+    assert!(ac.actions.iter().any(|a| a.label == "Diff" && a.url == "https://github.com/org/repo/compare/v2.3...v2.4"));
+    assert!(ac.actions.iter().any(|a| a.label == "Approve · Open in Teams"));
+
+    // 3. Hero card
+    let hero = world.message(&general, "1760000801003").unwrap();
+    assert_eq!(hero.kind, MessageKind::Normal);
+    let hc = hero.card.as_deref().expect("hero card");
+    assert_eq!(hc.title, "PR #42: Fix timeouts");
+    assert_eq!(hc.author, "tinyclient / main");
+    assert_eq!(hc.text, "All checks green.");
+    assert!(hc.image.is_none(), "external hero image must not be fetched");
+    assert!(hc.actions.iter().any(|a| a.label == "View PR" && a.url == "https://github.com/org/repo/pull/42"));
+    assert!(hc.actions.iter().any(|a| a.label == "Merge · Open in Teams"));
+
+    // 4. Malformed card falls back cleanly to Unsupported (never a blank row)
+    let broken = world.message(&general, "1760000801004").unwrap();
+    assert!(broken.card.is_none());
+    assert_eq!(broken.text, "Card");
+    assert!(matches!(broken.kind, MessageKind::Unsupported { ref link } if link.contains("1760000801004")));
 }

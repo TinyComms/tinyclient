@@ -2280,6 +2280,31 @@ impl Pane {
                     .into_any_element()
             }
         });
+        let actions_el = (!card.actions.is_empty()).then(|| {
+            let buttons = card.actions.iter().enumerate().map(|(a_ix, action)| {
+                let url = action.url.clone();
+                div()
+                    .id(SharedString::from(format!("card-action-{}-{ix}-{a_ix}", message.id)))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(theme::R_CONTROL))
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .bg(theme::canvas())
+                    .type_small()
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()).underline())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    })
+                    .child(action.label.clone())
+            });
+            div().mt(px(4.)).flex().flex_wrap().gap(px(6.)).children(buttons)
+        });
         let words = div()
             .flex_1()
             .min_w_0()
@@ -2292,6 +2317,7 @@ impl Pane {
             .children(title_el)
             .children((!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone())))
             .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
+            .children(actions_el)
             .children(footer_el);
         let framed = div()
             // The column's width on a phone, so its wrapped words measure against it (`card`).

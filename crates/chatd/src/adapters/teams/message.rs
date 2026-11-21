@@ -561,12 +561,25 @@ impl Teams {
             let link = if component.url.is_empty() { self.message_link(conversation, &id, raw) } else { component.url };
             message.kind = MessageKind::Unsupported { link };
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
-            let title = cards.iter().find_map(|card| card_title(card, 6));
-            if message.text.is_empty() {
-                message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
+            let link = self.message_link(conversation, &id, raw);
+            let mut rendered = super::card::parse_cards(&cards, content, &id, &link, |url| self.pictures(url));
+            if !rendered.cards.is_empty() {
+                if !rendered.media.is_empty() {
+                    if let Err(err) = self.ctx.media(&rendered.media) {
+                        tracing::warn!("chatd: Teams: {err}");
+                    }
+                }
+                message.card = Some(Box::new(rendered.cards.remove(0)));
+                message.cards = rendered.cards;
+                // Keep the message normal (reactable, quotable) when the card rendered.
+            } else {
+                let title = cards.iter().find_map(|card| card_title(card, 6));
+                if message.text.is_empty() {
+                    message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
+                }
+                message.kind = MessageKind::Unsupported { link };
             }
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
-        } else if message.text.is_empty() && message.attachments.is_empty() {
+        } else if message.text.is_empty() && message.attachments.is_empty() && message.card.is_none() {
             message.text = "Unsupported message".to_owned();
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }

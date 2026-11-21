@@ -860,6 +860,7 @@ fn preview_of(message: &Message) -> String {
         }
         return match &message.card {
             Some(card) if !card.title.is_empty() => card.title.chars().take(120).collect(),
+            Some(card) if !card.text.is_empty() => card.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(120).collect(),
             _ => String::new(),
         };
     };
