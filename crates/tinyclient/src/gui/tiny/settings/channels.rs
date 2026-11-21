@@ -420,7 +420,7 @@ fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
         }
     }
     if community.rooms.is_empty() {
-        tree = tree.child(div().px(px(8.)).py(px(8.)).type_small().text_color(theme::text_faint()).child("No channels yet."));
+        tree = tree.child(div().px(px(8.)).py(px(8.)).type_small().text_color(theme::text_faint()).child("No voice channels yet."));
     }
     tree
 }

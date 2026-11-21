@@ -23,7 +23,7 @@ pub(in crate::gui) const GROUPS: [(&str, &[(u64, &str, &str)]); 5] = [
     (
         "General",
         &[
-            (TINY_VIEW_CHANNEL, "View channels", "See the voice channels and who is sitting in them."),
+            (TINY_VIEW_CHANNEL, "View channels", "See channels, read their messages, and see who is in a call."),
             (TINY_MANAGE_CHANNELS, "Manage channels", "Create, rename, reorder and delete channels and categories."),
             (TINY_VIEW_AUDIT_LOG, "View audit log", "Read who changed what on the server, and why."),
         ],
@@ -35,14 +35,14 @@ pub(in crate::gui) const GROUPS: [(&str, &[(u64, &str, &str)]); 5] = [
             (TINY_MANAGE_INVITES, "Manage invites", "See and revoke everyone's invites."),
             (TINY_KICK_MEMBERS, "Kick members", "Remove people from the server. They can come back with a new invite."),
             (TINY_BAN_MEMBERS, "Ban members", "Remove people and keep them out, for a while or for good."),
-            (TINY_TIMEOUT_MEMBERS, "Time out members", "Keep someone out of calls for a while."),
+            (TINY_TIMEOUT_MEMBERS, "Time out members", "Stop someone talking and posting for a while."),
         ],
     ),
     (
         "Voice",
         &[
             (TINY_CONNECT, "Connect", "Join voice channels."),
-            (TINY_SPEAK, "Speak", "Be heard in a call. Without it they can only listen."),
+            (TINY_SPEAK, "Speak", "Be heard in a call, and post and react in text channels. Without it they can only listen and read."),
             (TINY_VOICE_ACTIVITY, "Use voice activity", "Talk without holding a key. Without it, push to talk only."),
             (TINY_VIDEO, "Video", "Turn their camera on in a call."),
             (TINY_SHARE_SCREEN, "Share screen", "Show their screen in a call."),
