@@ -446,6 +446,9 @@ pub struct Conversation {
     /// Unread messages that mention me.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub mentions: u32,
+    /// Unread reactions to my messages (Telegram `unread_reactions_count`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread_reactions: u32,
     /// Muted on the network. Drawn dimmed, never a dot, still a quiet mention count.
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
@@ -607,6 +610,7 @@ impl Conversation {
             peer: None,
             unread: 0,
             mentions: 0,
+            unread_reactions: 0,
             muted: false,
             starred: false,
             preview: String::new(),
@@ -2655,6 +2659,75 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// Press an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
+    /// Answers `Response::ButtonAnswer`.
+    PressButton {
+        conversation: Key,
+        message_id: String,
+        /// Hex-encoded callback payload from `InlineButtonKind::Callback::data`.
+        data: String,
+    },
+    /// Read account-wide notification defaults and per-chat exceptions (Telegram).
+    /// Answers `Response::NotifyDefaults`.
+    GetNotifyDefaults {
+        account: AccountKey,
+    },
+    /// Update one account-wide notification default scope (Telegram `account.updateNotifySettings`).
+    /// Answers `Response::NotifyDefaults`.
+    SetNotifyDefault {
+        account: AccountKey,
+        scope: NotifyDefaultScope,
+        muted: bool,
+    },
+    /// Reset all account-wide notification defaults and exceptions (Telegram `account.resetNotifySettings`).
+    /// Answers `Response::NotifyDefaults`.
+    ResetNotifyDefaults {
+        account: AccountKey,
+    },
+    /// List Saved Messages sub-dialogs (by source peer) and reaction tags (Telegram).
+    /// Answers `Response::SavedDialogs`.
+    SavedDialogs {
+        account: AccountKey,
+    },
+    /// Fetch Saved Messages filtered by source peer (`saved_peer_id`) and/or reaction tag (Telegram).
+    /// Answers `Response::SavedHistory`.
+    SavedHistory {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// List active signed-in devices/sessions for an account (Telegram `account.getAuthorizations`).
+    /// Answers `Response::ActiveSessions`.
+    ActiveSessions {
+        account: AccountKey,
+    },
+    /// Terminate another active session (Telegram `account.resetAuthorization`). Never ends the current session.
+    /// Answers `Response::Ok`.
+    EndSession {
+        account: AccountKey,
+        session_id: String,
+    },
+    /// Fetch unread mention or reaction message IDs in a conversation (Telegram `messages.getUnreadMentions` / `getUnreadReactions`).
+    /// Answers `Response::UnreadItems`.
+    UnreadItems {
+        conversation: Key,
+        kind: UnreadItemKind,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Mark unread mentions or reactions read in a conversation (`readMessageContents`, `readMentions`, `readReactions`).
+    /// When `message_ids` is empty, marks all unread items of `kind` read in the conversation.
+    /// Answers `Response::Ok`.
+    MarkUnreadItemsRead {
+        conversation: Key,
+        kind: UnreadItemKind,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3171,6 +3244,32 @@ pub enum Response {
     /// Members who have read a given message (`Request::ReadBy`).
     ReadBy {
         readers: Vec<ReadBy>,
+    },
+    /// Answer to pressing an inline bot callback button (`Request::PressButton`).
+    ButtonAnswer {
+        answer: ButtonAnswer,
+    },
+    /// Account-wide notification defaults and per-chat exceptions.
+    NotifyDefaults {
+        defaults: NotifyDefaults,
+    },
+    /// Saved Messages sub-dialogs and reaction tags (`Request::SavedDialogs`).
+    SavedDialogs {
+        dialogs: Vec<SavedDialog>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<SavedTag>,
+    },
+    /// Saved Messages filtered by source peer or reaction tag (`Request::SavedHistory`).
+    SavedHistory {
+        messages: Vec<Message>,
+    },
+    /// Active signed-in devices/sessions (`Request::ActiveSessions`).
+    ActiveSessions {
+        sessions: Vec<ActiveSession>,
+    },
+    /// Unread mention or reaction message IDs in a conversation (`Request::UnreadItems`).
+    UnreadItems {
+        message_ids: Vec<String>,
     },
 }
 

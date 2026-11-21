@@ -3979,6 +3979,84 @@ impl Chat {
                 values,
                 reply,
             }),
+            Request::PressButton { conversation, message_id, data } => {
+                let account = conversation.account();
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::PressButton {
+                    conversation_id,
+                    message_id,
+                    data,
+                    reply,
+                }) {
+                    Ok(answer) => Response::ButtonAnswer { answer },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GetNotifyDefaults { account } => {
+                match self.ask(&account, |reply| Command::GetNotifyDefaults { reply }) {
+                    Ok(defaults) => Response::NotifyDefaults { defaults },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetNotifyDefault { account, scope, muted } => {
+                match self.ask(&account, |reply| Command::SetNotifyDefault { scope, muted, reply }) {
+                    Ok(defaults) => Response::NotifyDefaults { defaults },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ResetNotifyDefaults { account } => {
+                match self.ask(&account, |reply| Command::ResetNotifyDefaults { reply }) {
+                    Ok(defaults) => Response::NotifyDefaults { defaults },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SavedDialogs { account } => {
+                match self.ask(&account, |reply| Command::SavedDialogs { reply }) {
+                    Ok((dialogs, tags)) => Response::SavedDialogs { dialogs, tags },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SavedHistory { account, peer_id, tag, limit } => {
+                let limit = limit.clamp(1, protocol::PAGE_LIMIT);
+                match self.ask(&account, |reply| Command::SavedHistory { peer_id, tag, limit, reply }) {
+                    Ok(messages) => Response::SavedHistory { messages },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ActiveSessions { account } => {
+                match self.ask(&account, |reply| Command::ActiveSessions { reply }) {
+                    Ok(sessions) => Response::ActiveSessions { sessions },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EndSession { account, session_id } => {
+                match self.ask(&account, |reply| Command::EndSession { session_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UnreadItems { conversation, kind, limit } => {
+                let account = conversation.account();
+                let conversation_id = conversation.id;
+                let limit = limit.clamp(1, protocol::PAGE_LIMIT);
+                match self.ask(&account, |reply| Command::UnreadItems {
+                    conversation_id,
+                    kind,
+                    limit,
+                    reply,
+                }) {
+                    Ok(message_ids) => Response::UnreadItems { message_ids },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::MarkUnreadItemsRead { conversation, kind, message_ids } => {
+                self.act(&conversation, |conversation_id, reply| Command::MarkUnreadItemsRead {
+                    conversation_id,
+                    kind,
+                    message_ids,
+                    reply,
+                })
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

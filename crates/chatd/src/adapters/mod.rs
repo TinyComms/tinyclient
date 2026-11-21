@@ -38,6 +38,12 @@ pub fn prove_discord_mark_unread() -> Result<(), String> {
     discord::prove_mark_unread()
 }
 
+/// `TINYCLIENT_PROVE=discord-forward-report`. A forward is a type-1 reference, and a report
+/// uses one captured message-menu path.
+pub fn prove_discord_forward_report() -> Result<(), String> {
+    discord::prove_forward_report()
+}
+
 /// `TINYCLIENT_PROVE=discord-voice-move`. A move to another voice channel in the same server is followed.
 pub fn prove_discord_voice_move() -> Result<(), String> {
     discord::prove_voice_move()
@@ -666,6 +672,61 @@ pub enum Command {
         values: Vec<String>,
         reply: Reply<()>,
     },
+    /// Presses an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
+    PressButton {
+        conversation_id: String,
+        message_id: String,
+        data: String,
+        reply: Reply<protocol::ButtonAnswer>,
+    },
+    /// Reads account-wide notification defaults and per-chat exceptions.
+    GetNotifyDefaults {
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Updates an account-wide notification default for private chats, groups, or channels.
+    SetNotifyDefault {
+        scope: protocol::NotifyDefaultScope,
+        muted: bool,
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Resets all account-wide notification defaults and exceptions.
+    ResetNotifyDefaults {
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Lists Saved Messages grouped by source peer plus reaction tags (Telegram).
+    SavedDialogs {
+        reply: Reply<(Vec<protocol::SavedDialog>, Vec<protocol::SavedTag>)>,
+    },
+    /// Fetches Saved Messages filtered by source peer and/or reaction tag (Telegram).
+    SavedHistory {
+        peer_id: Option<String>,
+        tag: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<protocol::Message>>,
+    },
+    /// Lists active signed-in devices/sessions for this account.
+    ActiveSessions {
+        reply: Reply<Vec<protocol::ActiveSession>>,
+    },
+    /// Terminates another active session by id.
+    EndSession {
+        session_id: String,
+        reply: Reply<()>,
+    },
+    /// Fetches unread mention or reaction message IDs in a conversation.
+    UnreadItems {
+        conversation_id: String,
+        kind: protocol::UnreadItemKind,
+        limit: u32,
+        reply: Reply<Vec<String>>,
+    },
+    /// Marks unread mentions or reactions read in a conversation.
+    MarkUnreadItemsRead {
+        conversation_id: String,
+        kind: protocol::UnreadItemKind,
+        message_ids: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -893,6 +954,16 @@ impl Command {
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNotifyDefaults { reply }
+            | Command::SetNotifyDefault { reply, .. }
+            | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1152,6 +1223,23 @@ impl Context {
     ) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_counts(&conversation, unread, mentions, last_read, updated)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
+    pub fn unread_reactions(&self, conversation_id: &str, count: u32) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_unread_reactions(&conversation, count)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    pub fn mentions_count(&self, conversation_id: &str, count: u32) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_mentions_count(&conversation, count)? {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
         }

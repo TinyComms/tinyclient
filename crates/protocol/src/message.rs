@@ -703,6 +703,55 @@ pub struct MessageControl {
     pub kind: ControlKind,
 }
 
+/// Maximum inline button rows kept on a single message.
+pub const MESSAGE_BUTTON_ROWS_LIMIT: usize = 32;
+/// Maximum buttons kept in a single inline button row.
+pub const MESSAGE_BUTTONS_PER_ROW_LIMIT: usize = 12;
+
+/// What pressing an inline bot button does (Telegram `replyInlineMarkup`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InlineButtonKind {
+    /// Fires a bot callback (`messages.getBotCallbackAnswer`); `data` is hex-encoded payload bytes.
+    Callback {
+        data: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        requires_password: bool,
+    },
+    /// Opens an external link or web view.
+    Url { url: String },
+    /// Copies text to the clipboard (`keyboardButtonCopy`).
+    Copy { text: String },
+    /// Switches to an inline bot query (`keyboardButtonSwitchInline`).
+    SwitchInline {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        same_peer: bool,
+    },
+    /// A button kind that must be handled in the official app.
+    Unsupported,
+}
+
+/// One inline keyboard button under a bot message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineButton {
+    pub label: String,
+    #[serde(flatten)]
+    pub kind: InlineButtonKind,
+}
+
+/// Feedback returned by a bot when an inline callback button is pressed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ButtonAnswer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alert: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 /// One message. Which conversation it is in comes from the answer that carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -846,6 +895,9 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Inline keyboard button rows under a bot message (Telegram `replyInlineMarkup`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<Vec<InlineButton>>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -955,6 +1007,7 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            buttons: Vec::new(),
         }
     }
 
@@ -1086,6 +1139,20 @@ impl Message {
                 }
             }
         }
+        self.buttons.truncate(MESSAGE_BUTTON_ROWS_LIMIT);
+        for row in &mut self.buttons {
+            row.truncate(MESSAGE_BUTTONS_PER_ROW_LIMIT);
+            for btn in row {
+                clip(&mut btn.label, 128);
+                match &mut btn.kind {
+                    InlineButtonKind::Callback { data, .. } => clip(data, 2_000),
+                    InlineButtonKind::Url { url } => clip(url, 2_000),
+                    InlineButtonKind::Copy { text } => clip(text, 2_000),
+                    InlineButtonKind::SwitchInline { query, .. } => clip(query, 2_000),
+                    InlineButtonKind::Unsupported => {}
+                }
+            }
+        }
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
@@ -1105,6 +1172,7 @@ impl Message {
         self.card = None;
         self.cards.clear();
         self.controls.clear();
+        self.buttons.clear();
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();
@@ -1350,5 +1418,27 @@ mod tests {
         let story_wire = serde_json::to_string(&story_reply).unwrap();
         assert!(story_wire.contains(r#""story":true"#));
         assert!(serde_json::from_str::<ReplyTo>(&story_wire).unwrap().story);
+    }
+
+    #[test]
+    fn inline_buttons_round_trip_and_stay_bounded() {
+        let mut msg = Message::plain("m4", "Bot", "Pick one", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("buttons"));
+        msg.buttons = vec![vec![
+            InlineButton {
+                label: "Approve".into(),
+                kind: InlineButtonKind::Callback { data: "617070".into(), requires_password: false },
+            },
+            InlineButton {
+                label: "Docs".into(),
+                kind: InlineButtonKind::Url { url: "https://example.com".into() },
+            },
+        ]];
+        msg.bound();
+        let wire = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.buttons, msg.buttons);
+        msg.tombstone();
+        assert!(msg.buttons.is_empty());
     }
 }
