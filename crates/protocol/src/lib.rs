@@ -1763,6 +1763,22 @@ pub enum Request {
         account: AccountKey,
         guild_id: String,
     },
+    /// A server's rules and onboarding, for the member who is looking at it.
+    SpaceGate {
+        space: Key,
+    },
+    /// Accept that server's rules. `answers` follow the form fields, in order.
+    AcceptRules {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<String>,
+    },
+    /// Finish that server's onboarding. `options` are snowflake ids from its questions.
+    SubmitOnboarding {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+    },
     /// Read a Space's webhooks, followed channels, and installed bots/integrations.
     SpaceIntegrations {
         space: Key,
@@ -3043,6 +3059,12 @@ pub enum Response {
         guilds: Vec<DiscoveredGuild>,
         #[serde(default, skip_serializing_if = "is_zero")]
         total: u32,
+    },
+    /// Answers `SpaceGate` and `AcceptRules`.
+    SpaceGate {
+        space: Key,
+        #[serde(default)]
+        gate: SpaceGate,
     },
     Pinned {
         conversation: Key,

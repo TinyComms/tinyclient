@@ -86,6 +86,13 @@ impl Shell {
             .tooltip(tip("Search in conversation", Some("⌘F")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
+        let setup = (open.key.network == Network::Discord && open.space.is_some()).then(|| {
+            let space = Key { id: open.space.clone().unwrap_or_default(), ..open.key.clone() };
+            icon_button("server-setup", "icons/list.svg", false)
+                .tooltip(tip("Server setup", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.open_server_gate(space.clone(), cx)))
+        });
         let live_hint = self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx));
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
@@ -208,7 +215,7 @@ impl Shell {
             )
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).child(search).children(members).children(details))
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the

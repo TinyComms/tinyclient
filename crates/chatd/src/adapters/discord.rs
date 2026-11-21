@@ -214,6 +214,24 @@ struct GuildInfo {
     premium_tier: u8,
     /// Unix seconds until our own server timeout ends, if timed out.
     timeout_until: Option<i64>,
+    /// Rules not accepted yet. Not a permission.
+    pending: bool,
+    /// Membership flag BYPASSES_VERIFICATION. It skips the verification lock only.
+    bypass_verification: bool,
+    /// Guild verification level when Discord sent one.
+    verification: Option<u8>,
+    /// The server has onboarding questions. That alone does not lock the composer.
+    onboarding: bool,
+    /// COMPLETED_ONBOARDING. Not a permission grant.
+    onboarding_done: bool,
+    /// A moderator still has to approve the join.
+    manual: bool,
+    /// MEMBER_VERIFICATION_GATE_ENABLED. The rules form is fetched when this or `pending` is set.
+    rules: bool,
+    /// Our verified email, copied off the session so a row can be built without locking state.
+    verified: Option<bool>,
+    /// Whether we have a phone, copied the same way. The number is never stored.
+    phone: Option<bool>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
 }
@@ -314,6 +332,10 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
 #[derive(Default)]
 struct State {
     me: String,
+    /// Verified email from READY's own user. Missing is unknown.
+    verified: Option<bool>,
+    /// Whether READY's own user has a phone. The number is never stored.
+    phone: Option<bool>,
     session: Option<Resumable>,
     guilds: HashMap<String, GuildInfo>,
     /// Friends, pending requests and direct partners by id: the name shown for them.
@@ -1457,6 +1479,170 @@ impl Discord {
         }
     }
 
+    /// The rules form and onboarding questions for one server. Phone and email, when we know
+    /// they are missing, point at Discord's own app. Nothing in the JSON is opened or fetched.
+    fn space_gate(&self, guild_id: &str) -> Result<protocol::SpaceGate, Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server.".to_owned()));
+        }
+        let (mut gate, rules, onboarding) = self.gate_snapshot(guild_id)?;
+        if rules {
+            if let Ok(form) = self.get_json(&format!("/guilds/{guild_id}/member-verification")) {
+                fill_form(&mut gate, &form);
+            }
+        }
+        if onboarding {
+            if let Ok(board) = self.get_json(&format!("/guilds/{guild_id}/onboarding")) {
+                fill_prompts(&mut gate, &board);
+            }
+        }
+        Ok(gate)
+    }
+
+    /// Accepts the rules. The form is read again and sent back whole, with this member's answers
+    /// filled in. A required check Discord has to do itself is not submitted.
+    fn accept_rules(&self, guild_id: &str, answers: &[String]) -> Result<protocol::SpaceGate, Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server.".to_owned()));
+        }
+        let form = self.get_json(&format!("/guilds/{guild_id}/member-verification"))?;
+        let fields = form.get("form_fields").and_then(Value::as_array).cloned().unwrap_or_default();
+        if fields.is_empty() {
+            return Err(Refusal::Refused("This server has no rules to accept.".to_owned()));
+        }
+        let mut filled = Vec::with_capacity(fields.len());
+        for (index, mut field) in fields.into_iter().enumerate() {
+            if !field.is_object() {
+                filled.push(field);
+                continue;
+            }
+            let kind = field.get("field_type").and_then(Value::as_str).unwrap_or("").to_owned();
+            let required = field.get("required").and_then(Value::as_bool).unwrap_or(false);
+            let answer = answers.get(index).map(String::as_str).unwrap_or("");
+            match kind.as_str() {
+                "TERMS" => {
+                    let yes = matches!(answer.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
+                    if required && !yes {
+                        return Err(Refusal::Refused("Accept the rules to continue.".to_owned()));
+                    }
+                    field["response"] = json!(yes);
+                }
+                "MULTIPLE_CHOICE" => {
+                    if answer.is_empty() {
+                        if required {
+                            return Err(Refusal::Refused("Pick one of the choices.".to_owned()));
+                        }
+                    } else {
+                        let choice: u64 = answer.parse().map_err(|_| Refusal::Refused("Pick one of the choices.".to_owned()))?;
+                        field["response"] = json!(choice);
+                    }
+                }
+                "TEXT_INPUT" | "PARAGRAPH" => {
+                    let text: String = answer.chars().take(1000).collect();
+                    if required && text.trim().is_empty() {
+                        return Err(Refusal::Refused("Fill in every required answer.".to_owned()));
+                    }
+                    if !text.is_empty() {
+                        field["response"] = json!(text);
+                    }
+                }
+                "VERIFICATION" if required => {
+                    return Err(Refusal::Refused("That check can only be done in Discord.".to_owned()));
+                }
+                _ if required => {
+                    return Err(Refusal::Refused("This server asks for something that can only be finished in Discord.".to_owned()));
+                }
+                _ => {}
+            }
+            filled.push(field);
+        }
+        let version = form.get("version").cloned().unwrap_or(Value::Null);
+        let body = json!({"form_fields": filled, "version": version});
+        let text = self
+            .rest
+            .call_once_with("PUT", &format!("/guilds/{guild_id}/requests/@me"), Some(body), &[])
+            .map_err(refusal)?;
+        let parsed = parse_body(&text);
+        if accept_cleared(&parsed) {
+            {
+                let mut state = crate::hub::lock(&self.state);
+                if let Some(info) = state.guilds.get_mut(guild_id) {
+                    info.pending = false;
+                }
+            }
+            let _ = self.replant(guild_id);
+        }
+        let (mut gate, _, _) = self.gate_snapshot(guild_id)?;
+        fill_form(&mut gate, &form);
+        Ok(gate)
+    }
+
+    /// Sends onboarding answers. Option ids that were not in the questions are dropped.
+    /// Discord assigns any roles itself; this does not.
+    fn submit_onboarding(&self, guild_id: &str, options: &[String]) -> Result<(), Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server.".to_owned()));
+        }
+        let onboarding = crate::hub::lock(&self.state).guilds.get(guild_id).is_some_and(|info| info.onboarding);
+        if !onboarding {
+            return Err(Refusal::Refused("This server has no setup questions.".to_owned()));
+        }
+        let board = self.get_json(&format!("/guilds/{guild_id}/onboarding"))?;
+        let allowed = prompt_option_ids(&board);
+        let mut picked = Vec::new();
+        for id in options {
+            if discovery_snowflake(id) && allowed.contains(id) && !picked.iter().any(|kept: &String| kept == id) {
+                picked.push(id.to_owned());
+            }
+            if picked.len() == 750 {
+                break;
+            }
+        }
+        if !options.is_empty() && picked.is_empty() {
+            return Err(Refusal::Refused("Those answers are not part of this server's questions.".to_owned()));
+        }
+        let (prompts_seen, responses_seen) = if options.is_empty() {
+            (serde_json::Map::new(), serde_json::Map::new())
+        } else {
+            seen_maps(&board, &picked)
+        };
+        let body = json!({
+            "onboarding_responses": picked,
+            "onboarding_prompts_seen": prompts_seen,
+            "onboarding_responses_seen": responses_seen,
+        });
+        self.rest
+            .call_once_with("POST", &format!("/guilds/{guild_id}/onboarding-responses"), Some(body), &[])
+            .map_err(refusal)?;
+        Ok(())
+    }
+
+    fn gate_snapshot(&self, guild_id: &str) -> Result<(protocol::SpaceGate, bool, bool), Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let me = state.me.clone();
+        let Some(info) = state.guilds.get(guild_id) else {
+            return Err(Refusal::Refused("You are not in that server.".to_owned()));
+        };
+        let reason = info.gate_reason(crate::hub::now(), &me);
+        let mut gate = protocol::SpaceGate {
+            pending: info.pending,
+            verification: info.verification.unwrap_or(0),
+            manual: info.manual,
+            onboarding: info.onboarding,
+            reason: reason.clone(),
+            ..protocol::SpaceGate::default()
+        };
+        if reason.contains("verified phone") || reason.contains("verified email") {
+            gate.external = "https://discord.com/app".to_owned();
+        }
+        Ok((gate, info.pending || info.rules, info.onboarding))
+    }
+
+    fn get_json(&self, path: &str) -> Result<Value, Refusal> {
+        let text = self.call("GET", path, None).map_err(refusal)?;
+        Ok(parse_body(&text))
+    }
+
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
     /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
     /// does this.
@@ -1946,6 +2132,9 @@ impl Discord {
                 answer(reply, self.discover(&query, category, offset, limit))
             }
             Command::JoinDiscovered { guild_id, reply } => answer(reply, self.join_discovered(&guild_id)),
+            Command::SpaceGate { space_id, reply } => answer(reply, self.space_gate(&space_id)),
+            Command::AcceptRules { space_id, answers, reply } => answer(reply, self.accept_rules(&space_id, &answers)),
+            Command::SubmitOnboarding { space_id, options, reply } => answer(reply, self.submit_onboarding(&space_id, &options)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
@@ -2118,6 +2307,140 @@ fn add_friend_refusal(err: Refused) -> Refusal {
     }
 }
 
+fn parse_body(text: &str) -> Value {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Value::Null;
+    }
+    serde_json::from_str(trimmed).unwrap_or(Value::Null)
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn text_at(value: &Value, key: &str, max: usize) -> String {
+    value.get(key).and_then(Value::as_str).map(|text| clip_chars(text, max)).unwrap_or_default()
+}
+
+fn string_list(value: Option<&Value>, max_items: usize, max_chars: usize) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().filter_map(Value::as_str).take(max_items).map(|text| clip_chars(text, max_chars)).collect()
+        })
+        .unwrap_or_default()
+}
+
+fn choice_list(value: Option<&Value>) -> Vec<String> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .take(12)
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item.get("label").and_then(Value::as_str))
+                .or_else(|| item.get("value").and_then(Value::as_str))
+                .map(|text| clip_chars(text, 200))
+        })
+        .collect()
+}
+
+/// Copies the form's words. It does not request anything those words mention.
+fn fill_form(gate: &mut protocol::SpaceGate, form: &Value) {
+    if let Some(description) = form.get("description").and_then(Value::as_str) {
+        gate.description = clip_chars(description, 2000);
+    }
+    let Some(fields) = form.get("form_fields").and_then(Value::as_array) else {
+        return;
+    };
+    gate.fields.clear();
+    for field in fields.iter().take(5) {
+        gate.fields.push(protocol::GateField {
+            label: text_at(field, "label", 200),
+            kind: text_at(field, "field_type", 40),
+            values: string_list(field.get("values"), 8, 2000),
+            required: field.get("required").and_then(Value::as_bool).unwrap_or(false),
+            choices: choice_list(field.get("choices")),
+        });
+    }
+}
+
+fn fill_prompts(gate: &mut protocol::SpaceGate, board: &Value) {
+    let Some(prompts) = board.get("prompts").and_then(Value::as_array) else {
+        return;
+    };
+    gate.prompts.clear();
+    for prompt in prompts.iter().take(12) {
+        let mut options = Vec::new();
+        if let Some(list) = prompt.get("options").and_then(Value::as_array) {
+            for option in list.iter().take(25) {
+                let Some(id) = option.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) else {
+                    continue;
+                };
+                let label = option.get("title").or_else(|| option.get("label")).and_then(Value::as_str).unwrap_or("");
+                options.push(protocol::GateOption { id: id.to_owned(), label: clip_chars(label, 200) });
+            }
+        }
+        let label = prompt.get("title").or_else(|| prompt.get("label")).and_then(Value::as_str).unwrap_or("");
+        gate.prompts.push(protocol::GatePrompt { label: clip_chars(label, 200), options });
+    }
+}
+
+fn prompt_option_ids(board: &Value) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Some(prompts) = board.get("prompts").and_then(Value::as_array) else {
+        return ids;
+    };
+    for prompt in prompts {
+        let Some(list) = prompt.get("options").and_then(Value::as_array) else {
+            continue;
+        };
+        for option in list {
+            if let Some(id) = option.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) {
+                ids.insert(id.to_owned());
+            }
+        }
+    }
+    ids
+}
+
+fn seen_maps(board: &Value, picked: &[String]) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
+    let mut prompts_seen = serde_json::Map::new();
+    let mut responses_seen = serde_json::Map::new();
+    let Some(prompts) = board.get("prompts").and_then(Value::as_array) else {
+        return (prompts_seen, responses_seen);
+    };
+    for prompt in prompts {
+        if let Some(id) = prompt.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) {
+            prompts_seen.insert(id.to_owned(), Value::Bool(true));
+        }
+        let Some(list) = prompt.get("options").and_then(Value::as_array) else {
+            continue;
+        };
+        for option in list {
+            let Some(id) = option.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if picked.iter().any(|picked| picked == id) {
+                responses_seen.insert(id.to_owned(), Value::Bool(true));
+            }
+        }
+    }
+    (prompts_seen, responses_seen)
+}
+
+/// Pending is cleared only when Discord says the join is through.
+fn accept_cleared(body: &Value) -> bool {
+    let approved = |value: &Value| {
+        value.get("pending") == Some(&Value::Bool(false))
+            || value.get("application_status").and_then(Value::as_str) == Some("APPROVED")
+    };
+    approved(body) || body.get("member").is_some_and(approved) || body.get("guild_member").is_some_and(approved)
+}
+
 /// Digits only. A URL is not a server id.
 fn discovery_snowflake(id: &str) -> bool {
     (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
@@ -2206,6 +2529,22 @@ fn answer<T>(reply: Reply<T>, outcome: Result<T, Refusal>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phone_number_is_not_kept_and_a_missing_one_is_unknown() {
+        let missing: User = serde_json::from_str(r#"{"id":"1","username":"a"}"#).unwrap();
+        assert_eq!(missing.phone, None);
+        assert_eq!(missing.verified, None);
+        let empty: User = serde_json::from_str(r#"{"id":"1","username":"a","phone":null,"verified":null}"#).unwrap();
+        assert_eq!(empty.phone, Some(false));
+        assert_eq!(empty.verified, None);
+        let blank: User = serde_json::from_str(r#"{"id":"1","username":"a","phone":"","verified":false}"#).unwrap();
+        assert_eq!(blank.phone, Some(false));
+        assert_eq!(blank.verified, Some(false));
+        let set: User = serde_json::from_str(r#"{"id":"1","username":"a","phone":"+15555550100","verified":true}"#).unwrap();
+        assert_eq!(set.phone, Some(true));
+        assert!(!format!("{set:?}").contains("555"));
+    }
 
     #[test]
     fn the_account_is_named_by_the_user_id_in_the_token() {

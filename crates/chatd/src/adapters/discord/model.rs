@@ -112,6 +112,23 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(de: D) -> 
     Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
 }
 
+/// A phone number is a secret. Missing stays unknown (`None`, and this is not called).
+/// Null or an empty string is "no phone". Anything else is "a phone is set", and the digits are dropped.
+fn phone_known<'de, D: Deserializer<'de>>(de: D) -> Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Phone {
+        Text(String),
+        Other(IgnoredAny),
+    }
+    let known = match Option::<Phone>::deserialize(de)? {
+        None => false,
+        Some(Phone::Text(text)) => !text.trim().is_empty(),
+        Some(Phone::Other(_)) => true,
+    };
+    Ok(Some(known))
+}
+
 #[derive(Deserialize, Default, Clone, Debug)]
 pub struct User {
     pub id: String,
@@ -131,6 +148,12 @@ pub struct User {
     /// Our own plan, on READY's user: 0 none, 1 Nitro Classic, 2 Nitro, 3 Nitro Basic.
     #[serde(default, deserialize_with = "nullable")]
     pub premium_type: u8,
+    /// Verified email, when Discord says. Missing and null are unknown, not a failure.
+    #[serde(default)]
+    pub verified: Option<bool>,
+    /// Whether a phone is on the account. The number is never stored.
+    #[serde(default, deserialize_with = "phone_known")]
+    pub phone: Option<bool>,
     /// Present on the users of a message's `mentions`.
     #[serde(default)]
     pub member: Option<Box<Member>>,
@@ -261,6 +284,12 @@ pub struct Member {
     pub presence: Option<PresenceUpdate>,
     #[serde(default)]
     pub communication_disabled_until: Option<String>,
+    /// Rules not accepted yet. Not a permission.
+    #[serde(default, deserialize_with = "nullable")]
+    pub pending: bool,
+    /// Membership flags. Not a permission grant.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub flags: u64,
 }
 
 impl Member {
@@ -454,6 +483,10 @@ pub struct GuildProperties {
     pub owner_id: Option<String>,
     #[serde(default)]
     pub premium_tier: Option<u8>,
+    #[serde(default)]
+    pub verification_level: Option<u8>,
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -469,6 +502,10 @@ pub struct Guild {
     pub owner_id: Option<String>,
     #[serde(default)]
     pub premium_tier: Option<u8>,
+    #[serde(default)]
+    pub verification_level: Option<u8>,
+    #[serde(default)]
+    pub features: Vec<String>,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -565,6 +602,23 @@ impl Guild {
     pub fn premium_tier(&self) -> Option<u8> {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.premium_tier);
         wrapped.or(self.premium_tier)
+    }
+
+    /// Missing on a partial guild update, so a caller does not treat that as level 0.
+    pub fn verification_level(&self) -> Option<u8> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.verification_level);
+        wrapped.or(self.verification_level)
+    }
+
+    /// The feature list when this payload carries one. An omitted list is not an empty one.
+    pub fn listed_features(&self) -> Option<&[String]> {
+        if let Some(features) = self.properties.as_ref().and_then(|properties| properties.features.as_deref()) {
+            return Some(features);
+        }
+        if !self.features.is_empty() {
+            return Some(self.features.as_slice());
+        }
+        None
     }
 }
 

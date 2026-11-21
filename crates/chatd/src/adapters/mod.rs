@@ -550,6 +550,23 @@ pub enum Command {
         guild_id: String,
         reply: Reply<(Option<String>, Option<String>)>,
     },
+    /// A server's rules form and onboarding questions.
+    SpaceGate {
+        space_id: String,
+        reply: Reply<protocol::SpaceGate>,
+    },
+    /// Accept that server's rules. Answers follow the form fields, in order.
+    AcceptRules {
+        space_id: String,
+        answers: Vec<String>,
+        reply: Reply<protocol::SpaceGate>,
+    },
+    /// Finish that server's onboarding with option ids from its questions.
+    SubmitOnboarding {
+        space_id: String,
+        options: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -925,6 +942,9 @@ impl Command {
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Discover { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::JoinDiscovered { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceGate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AcceptRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SubmitOnboarding { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }

@@ -204,10 +204,58 @@ pub(super) fn timeout_reason(until: i64, now: i64) -> String {
     format!("You are timed out in this server for {phrase}.")
 }
 
+/// Membership flags. Neither one grants a permission bit.
+const BYPASSES_VERIFICATION: u64 = 1 << 2;
+const COMPLETED_ONBOARDING: u64 = 1 << 1;
+
 impl GuildInfo {
     /// Unix seconds when our server timeout ends, if still active.
     pub(super) fn timed_out(&self, now: i64) -> Option<i64> {
         self.timeout_until.filter(|until| *until > now)
+    }
+
+    /// Why this member cannot talk yet. Empty when the only block is a missing send permission.
+    /// Timeout wins. A verification we cannot prove does not lock. Onboarding alone does not lock.
+    pub(super) fn lock_reason(&self, now: i64, me: &str) -> (bool, String) {
+        if let Some(until) = self.timed_out(now) {
+            let reason = timeout_reason(until, now);
+            if !reason.is_empty() {
+                return (true, reason);
+            }
+        }
+        let reason = self.gate_reason(now, me);
+        if reason.is_empty() {
+            (false, String::new())
+        } else {
+            (true, reason)
+        }
+    }
+
+    pub(super) fn gate_reason(&self, now: i64, me: &str) -> String {
+        if self.pending {
+            return "Accept the rules to talk here".to_owned();
+        }
+        if self.bypass_verification {
+            return String::new();
+        }
+        let level = self.verification.unwrap_or(0);
+        if level >= 4 && self.phone == Some(false) {
+            return "This server needs a verified phone".to_owned();
+        }
+        if level >= 1 && self.verified == Some(false) {
+            return "This server needs a verified email".to_owned();
+        }
+        if level >= 2 {
+            let born_ms = (number(me) >> 22) + 1_420_070_400_000;
+            let now_ms = (now.max(0) as u64).saturating_mul(1000);
+            if now_ms.saturating_sub(born_ms) < 5 * 60 * 1000 {
+                return "This server needs an account older than 5 minutes".to_owned();
+            }
+        }
+        if level >= 3 && self.joined > 0 && now.saturating_sub(self.joined) < 10 * 60 {
+            return "This server needs you to be a member for 10 minutes".to_owned();
+        }
+        String::new()
     }
 
     /// Guild-level permissions for our account (owner or ADMINISTRATOR grants all bits).
@@ -271,8 +319,8 @@ impl GuildInfo {
         let timed_out = self.timed_out(clock);
         let perms = self.permissions(guild, me, channel);
         let can_connect = perms & CONNECT != 0;
-        let read_only_reason = timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default();
-        let read_only = timed_out.is_some() || (written && perms & SEND_MESSAGES == 0);
+        let (locked, read_only_reason) = self.lock_reason(clock, me);
+        let read_only = locked || (written && perms & SEND_MESSAGES == 0);
         let rights = protocol::ConversationRights {
             pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
             delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
@@ -331,6 +379,12 @@ impl Discord {
         });
         let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
         let categories = categories.map(|category| (category.id.clone(), (category.position, category.name.clone().unwrap_or_default())));
+        let features = guild.listed_features().unwrap_or(&[]);
+        let member_flags = member.map(|member| member.flags).unwrap_or(0);
+        let (verified, phone) = {
+            let state = self.state.lock().unwrap();
+            (state.verified, state.phone)
+        };
         GuildInfo {
             name: guild.name().to_owned(),
             icon: guild.icon().map(str::to_owned),
@@ -345,6 +399,15 @@ impl Discord {
             nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
             premium_tier: guild.premium_tier().unwrap_or(0),
             timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
+            pending: member.is_some_and(|member| member.pending),
+            bypass_verification: member_flags & BYPASSES_VERIFICATION != 0,
+            verification: guild.verification_level(),
+            onboarding: features.iter().any(|feature| feature == "GUILD_ONBOARDING"),
+            onboarding_done: member_flags & COMPLETED_ONBOARDING != 0,
+            manual: features.iter().any(|feature| feature == "MEMBER_VERIFICATION_MANUAL_APPROVAL"),
+            rules: features.iter().any(|feature| feature == "MEMBER_VERIFICATION_GATE_ENABLED"),
+            verified,
+            phone,
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
                     id: emoji.id.clone()?,
@@ -428,14 +491,13 @@ impl Discord {
                 continue;
             }
             let name = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
-            let clock = now();
-            let timed_out = info.timed_out(clock);
+            let (locked, reason) = info.lock_reason(now(), me);
             let row = ConversationRow {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
                 root: Some(thread.id.clone()),
-                read_only: timed_out.is_some(),
-                read_only_reason: timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default(),
+                read_only: locked,
+                read_only_reason: reason,
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
                     followed: true,
@@ -547,7 +609,7 @@ impl Discord {
     /// Works out a server's visible channels again from what is kept of them, after a role's
     /// permissions or our own roles changed. Unread state and threads stay as they are: the
     /// store keeps both through a tree replacement.
-    fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
+    pub(super) fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
         let kept: Vec<Kept> = match self.ctx.note(&format!("kept:{guild_id}")).map(|kept| serde_json::from_str(&kept)) {
             Some(Ok(kept)) => kept,
             _ => return Ok(()),
@@ -622,7 +684,10 @@ impl Discord {
         let mut roles: Vec<u64> = member.roles.iter().map(|role| number(role)).collect();
         roles.sort_unstable();
         let timeout_until = member.communication_disabled_until.as_deref().and_then(model::iso_seconds);
-        let (moved, timeout_changed) = {
+        let pending = member.pending;
+        let bypass = member.flags & BYPASSES_VERIFICATION != 0;
+        let onboarding_done = member.flags & COMPLETED_ONBOARDING != 0;
+        let (moved, timeout_changed, gate_changed) = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(guild) else {
                 return Ok(());
@@ -630,9 +695,13 @@ impl Discord {
             let mut before = std::mem::replace(&mut info.my_roles, roles.clone());
             before.sort_unstable();
             let prev_timeout = std::mem::replace(&mut info.timeout_until, timeout_until);
-            (before != roles, prev_timeout != timeout_until)
+            let gate_changed = info.pending != pending || info.bypass_verification != bypass || info.onboarding_done != onboarding_done;
+            info.pending = pending;
+            info.bypass_verification = bypass;
+            info.onboarding_done = onboarding_done;
+            (before != roles, prev_timeout != timeout_until, gate_changed)
         };
-        if moved || timeout_changed {
+        if moved || timeout_changed || gate_changed {
             self.replant(guild)?;
         }
         if moved {
@@ -925,6 +994,8 @@ impl Discord {
                 url,
             });
             state.me = me.clone();
+            state.verified = ready.user.verified;
+            state.phone = ready.user.phone;
             state.users = names;
             state.users.insert(me.clone(), ready.user.name().to_owned());
             state.rows = kept;
@@ -1173,7 +1244,26 @@ impl Discord {
                 _ => false,
             }
         };
-        if tier_changed {
+        let verification_changed = {
+            let mut state = self.state.lock().unwrap();
+            let Some(info) = state.guilds.get_mut(&guild.id) else {
+                return Ok(());
+            };
+            let mut changed = false;
+            if let Some(level) = guild.verification_level() {
+                if info.verification != Some(level) {
+                    info.verification = Some(level);
+                    changed = true;
+                }
+            }
+            if let Some(features) = guild.listed_features() {
+                info.onboarding = features.iter().any(|feature| feature == "GUILD_ONBOARDING");
+                info.manual = features.iter().any(|feature| feature == "MEMBER_VERIFICATION_MANUAL_APPROVAL");
+                info.rules = features.iter().any(|feature| feature == "MEMBER_VERIFICATION_GATE_ENABLED");
+            }
+            changed
+        };
+        if tier_changed || verification_changed {
             self.replant(&guild.id)?;
         }
         Ok(self.spaces()?)

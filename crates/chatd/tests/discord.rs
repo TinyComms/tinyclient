@@ -4287,6 +4287,142 @@ fn server_timeout_marks_rows_read_only_and_lifts_when_cleared() {
 }
 
 #[test]
+fn rules_and_onboarding_lock_until_discord_says_so_and_do_not_grant_a_channel() {
+    let world = polished();
+    assert!(!world.conversation("4101").read_only);
+    let hidden = |world: &World| world.tree("4000").1.iter().any(|row| row.key.id == "4103");
+    assert!(!hidden(&world), "staff stays hidden without that role");
+
+    world.discord.push("GUILD_UPDATE", json!({
+        "id": "4000",
+        "properties": {
+            "features": ["COMMUNITY", "GUILD_ONBOARDING", "MEMBER_VERIFICATION_GATE_ENABLED", "MEMBER_VERIFICATION_MANUAL_APPROVAL"],
+            "verification_level": 4
+        }
+    }));
+    world.discord.push("GUILD_MEMBER_UPDATE", json!({
+        "guild_id": "4000",
+        "user": {"id": "1000", "username": "justin"},
+        "roles": ["4010"],
+        "pending": true,
+        "flags": 0
+    }));
+    wait("pending rules to lock the channel", || {
+        let row = world.conversation("4101");
+        (row.read_only && row.read_only_reason == "Accept the rules to talk here").then_some(())
+    });
+    assert!(!hidden(&world), "pending does not grant the staff channel");
+
+    let form = json!({
+        "version": "2024-01-01",
+        "description": "Read this first. https://evil.example/join",
+        "form_fields": [
+            {
+                "field_type": "TERMS",
+                "label": "Rules",
+                "required": true,
+                "values": ["Be kind.", "https://evil.example/phish"]
+            },
+            {"field_type": "TEXT_INPUT", "label": "Name", "required": false}
+        ]
+    });
+    let board = json!({
+        "prompts": [{
+            "id": "6100",
+            "title": "What brings you here?",
+            "options": [
+                {"id": "6101", "title": "Art", "role_ids": ["4011"], "channel_ids": ["4103"]},
+                {"id": "https://evil.example/opt", "title": "Do not keep"}
+            ]
+        }]
+    });
+    world.discord.script("/guilds/4000/member-verification", 200, form.clone());
+    world.discord.script("/guilds/4000/onboarding", 200, board.clone());
+    world.discord.script("/guilds/4000/member-verification", 200, form);
+    world.discord.script("/guilds/4000/requests/@me", 200, json!({"application_status": "PENDING"}));
+    world.discord.script("/guilds/4000/onboarding", 200, board);
+    world.discord.script("/guilds/4000/onboarding-responses", 204, Value::Null);
+
+    let gate = match world.ask(Request::SpaceGate { space: world.key("4000") }) {
+        Response::SpaceGate { gate, .. } => gate,
+        other => panic!("{other:?}"),
+    };
+    assert!(gate.pending && gate.manual && gate.onboarding, "{gate:?}");
+    assert!(gate.description.contains("https://evil.example/join"));
+    assert_eq!(gate.fields.len(), 2);
+    assert_eq!(gate.fields[0].kind, "TERMS");
+    assert!(gate.fields[0].values.iter().any(|value| value.contains("https://evil.example/phish")));
+    assert_eq!(gate.prompts.len(), 1);
+    assert_eq!(gate.prompts[0].options.len(), 1);
+    assert_eq!(gate.prompts[0].options[0].id, "6101");
+    assert!(gate.external.is_empty(), "rules text is not a link");
+    let asked = world.discord.asked();
+    assert!(asked.iter().all(|line| !line.contains("evil.example")), "{asked:?}");
+
+    match world.ask(Request::AcceptRules { space: world.key("4000"), answers: vec!["true".into(), "Ada".into()] }) {
+        Response::SpaceGate { gate, .. } => assert!(gate.pending, "a pending review stays pending"),
+        other => panic!("{other:?}"),
+    }
+    let puts = world.discord.requests_to("PUT", "/guilds/4000/requests/@me");
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].body["version"], "2024-01-01");
+    let fields = puts[0].body["form_fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0]["field_type"], "TERMS");
+    assert_eq!(fields[0]["response"], true);
+    assert_eq!(fields[1]["response"], "Ada");
+    assert!(fields[0]["values"].to_string().contains("evil.example"));
+    assert!(world.conversation("4101").read_only, "pending review does not unlock");
+    assert!(!hidden(&world));
+
+    assert_eq!(
+        world.ask(Request::SubmitOnboarding {
+            space: world.key("4000"),
+            options: vec!["6101".into(), "https://evil.example/opt".into(), "9999".into()],
+        }),
+        Response::Ok
+    );
+    let posts = world.discord.requests_to("POST", "/guilds/4000/onboarding-responses");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["onboarding_responses"], json!(["6101"]));
+    assert_eq!(posts[0].body["onboarding_prompts_seen"]["6100"], true);
+    assert_eq!(posts[0].body["onboarding_responses_seen"]["6101"], true);
+    assert!(!hidden(&world), "onboarding does not grant the role's channel");
+
+    world.discord.push("GUILD_MEMBER_UPDATE", json!({
+        "guild_id": "4000",
+        "user": {"id": "1000", "username": "justin"},
+        "roles": ["4010"],
+        "pending": false,
+        "flags": 2
+    }));
+    wait("discord clearing pending to unlock", || (!world.conversation("4101").read_only).then_some(()));
+    assert!(world.conversation("4101").read_only_reason.is_empty());
+    assert!(!hidden(&world), "finishing onboarding does not grant a channel");
+
+    let puts_before = world.discord.requests_to("PUT", "/guilds/4000/requests/").len();
+    match world.ask(Request::AcceptRules { space: world.key("https://evil.example/join"), answers: vec!["true".into()] }) {
+        Response::Error { .. } => {}
+        other => panic!("a URL is not a server, got {other:?}"),
+    }
+    match world.ask(Request::SubmitOnboarding { space: world.key("4000/../1"), options: vec!["6101".into()] }) {
+        Response::Error { .. } => {}
+        other => panic!("a path is not a server, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("PUT", "/guilds/4000/requests/").len(), puts_before);
+
+    world.discord.script("/guilds/4000/member-verification", 200, json!({
+        "version": "2024-01-01",
+        "form_fields": [{"field_type": "TERMS", "label": "Rules", "required": true, "values": ["Be kind."]}]
+    }));
+    world.discord.script("/guilds/4000/requests/@me", 403, json!({"message": "Missing Access", "code": 50001}));
+    match world.ask(Request::AcceptRules { space: world.key("4000"), answers: vec!["true".into()] }) {
+        Response::Error { .. } => {}
+        other => panic!("a refused submit stays an error, got {other:?}"),
+    }
+}
+
+#[test]
 fn voice_channel_respects_connect_permission_and_user_limit() {
     let mut ready: Value = serde_json::from_str(READY).unwrap();
     ready["guilds"][0]["roles"][0]["permissions"] = json!("36769344");

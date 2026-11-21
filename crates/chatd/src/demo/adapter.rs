@@ -1039,6 +1039,9 @@ impl Demo {
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Discover { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::JoinDiscovered { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceGate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AcceptRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SubmitOnboarding { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceIntegrations { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateWebhook { reply, .. } | Command::EditWebhook { reply, .. } => {

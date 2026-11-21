@@ -1627,6 +1627,7 @@ impl Render for Shell {
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
+            .children(self.server_gate_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.discord_admin_modal(window, cx))
             .children(self.tiny_layer(window, cx))

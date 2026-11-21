@@ -2713,7 +2713,16 @@ impl Composer {
                 format!("{name} signed you out. Your messages are still here."),
                 Some("Sign in again"),
             ),
-            Locked::ReadOnly(sentence) => ("icons/lock.svg", sentence, None),
+            Locked::ReadOnly(sentence) => {
+                let action = if sentence == "Accept the rules to talk here" {
+                    Some("Accept the rules")
+                } else if sentence.contains("verified phone") || sentence.contains("verified email") {
+                    Some("Open Discord")
+                } else {
+                    None
+                };
+                ("icons/lock.svg", sentence, action)
+            }
             Locked::MessageRequest | Locked::Blocked(_) | Locked::NotJoined => unreachable!(),
         };
         let expired = action == Some("Sign in again");
@@ -2733,8 +2742,18 @@ impl Composer {
             .child(glyph(icon, 16., if expired { theme::danger() } else { theme::text_faint() }))
             .child(div().flex_1().min_w_0().truncate().child(words))
             .children(action.map(|label| {
-                button("composer-sign-in", ButtonKind::Primary, label)
-                    .on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))
+                button("composer-sign-in", ButtonKind::Primary, label).on_click(cx.listener(move |this, _, window, cx| {
+                    if label == "Accept the rules" {
+                        let space = this.target.as_ref().and_then(|target| target.space_key());
+                        if let Some(space) = space {
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_server_gate(space, cx));
+                        }
+                    } else if label == "Open Discord" {
+                        let _ = this.shell.update(cx, |shell, cx| shell.open_external_link("https://discord.com/app", window, cx));
+                    } else {
+                        this.sign_in(cx);
+                    }
+                }))
             }))
     }
 

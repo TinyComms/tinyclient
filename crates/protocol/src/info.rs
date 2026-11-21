@@ -699,6 +699,64 @@ pub struct DiscoveredGuild {
     pub online: u32,
 }
 
+/// One question on a server's rules form (`Request::SpaceGate`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateField {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// Discord's `field_type`: TERMS, TEXT_INPUT, PARAGRAPH, MULTIPLE_CHOICE, VERIFICATION.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+}
+
+/// One answer a server's onboarding offers. The id is a snowflake, never a URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateOption {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+/// One onboarding question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatePrompt {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<GateOption>,
+}
+
+/// What a server asks before a member can talk (`Request::SpaceGate`).
+/// `external` is only ever `https://discord.com/app`, and only when phone or email
+/// verification has to be finished in Discord. Rules text is not a link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SpaceGate {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub verification: u8,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub onboarding: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<GateField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<GatePrompt>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external: String,
+}
+
 /// Preview of a Space invite (`Request::InvitePreview`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvitePreview {
@@ -1534,5 +1592,38 @@ mod tests {
         let guild = DiscoveredGuild { id: "5000".into(), name: "Lichen".into(), description: String::new(), icon: String::new(), members: 12, online: 3 };
         let resp = Response::Discovered { guilds: vec![guild], total: 1 };
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+    }
+
+    #[test]
+    fn space_gate_requests_round_trip_and_default_the_new_fields() {
+        use crate::Response;
+        let space = Key { network: Network::Discord, account: "1".into(), id: "4000".into() };
+        let bare = Request::SpaceGate { space: space.clone() };
+        let wire = serde_json::to_string(&bare).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), bare);
+        let accept = Request::AcceptRules { space: space.clone(), answers: vec!["true".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&accept).unwrap()).unwrap(), accept);
+        let empty = format!(r#"{{"op":"accept_rules","space":{}}}"#, serde_json::to_string(&space).unwrap());
+        assert!(matches!(serde_json::from_str::<Request>(&empty).unwrap(), Request::AcceptRules { answers, .. } if answers.is_empty()));
+        let submit = Request::SubmitOnboarding { space: space.clone(), options: vec!["6101".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&submit).unwrap()).unwrap(), submit);
+        let gate = SpaceGate {
+            pending: true,
+            description: "Be kind".into(),
+            reason: "Accept the rules to talk here".into(),
+            external: "https://discord.com/app".into(),
+            fields: vec![GateField { label: "Rules".into(), kind: "TERMS".into(), values: vec!["Be kind".into()], required: true, choices: Vec::new() }],
+            ..SpaceGate::default()
+        };
+        let resp = Response::SpaceGate { space, gate };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+        let omitted = r#"{"op":"space_gate","space":{"network":"discord","account":"1","id":"4000"},"gate":{}}"#;
+        let back: Response = serde_json::from_str(omitted).unwrap();
+        match back {
+            Response::SpaceGate { gate, .. } => {
+                assert!(!gate.pending && gate.fields.is_empty() && gate.external.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

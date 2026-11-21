@@ -1736,6 +1736,57 @@ impl Chat {
         }
     }
 
+    fn space_gate(&self, space: Key) -> Response {
+        if space.network != Network::Discord || !discovery_snowflake(&space.id) {
+            return error(ErrorCode::Refused, "That is not a server.");
+        }
+        if let Err(refused) = self.online(&space.account()) {
+            return *refused;
+        }
+        match self.ask(&space.account(), |reply| Command::SpaceGate { space_id: space.id.clone(), reply }) {
+            Ok(mut gate) => {
+                scrub_gate(&mut gate);
+                Response::SpaceGate { space, gate }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn accept_rules(&self, space: Key, mut answers: Vec<String>) -> Response {
+        if space.network != Network::Discord || !discovery_snowflake(&space.id) {
+            return error(ErrorCode::Refused, "That is not a server.");
+        }
+        if let Err(refused) = self.online(&space.account()) {
+            return *refused;
+        }
+        answers.truncate(8);
+        for answer in &mut answers {
+            clip(answer, 1000);
+        }
+        match self.ask(&space.account(), |reply| Command::AcceptRules { space_id: space.id.clone(), answers, reply }) {
+            Ok(mut gate) => {
+                scrub_gate(&mut gate);
+                Response::SpaceGate { space, gate }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn submit_onboarding(&self, space: Key, mut options: Vec<String>) -> Response {
+        if space.network != Network::Discord || !discovery_snowflake(&space.id) {
+            return error(ErrorCode::Refused, "That is not a server.");
+        }
+        if let Err(refused) = self.online(&space.account()) {
+            return *refused;
+        }
+        options.truncate(750);
+        options.retain(|id| discovery_snowflake(id));
+        match self.ask(&space.account(), |reply| Command::SubmitOnboarding { space_id: space.id.clone(), options, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -3493,6 +3544,9 @@ impl Chat {
             Request::InviteJoin { account, code } => self.invite_join(account, code),
             Request::Discover { account, query, category, offset, limit } => self.discover(account, query, category, offset, limit),
             Request::JoinDiscovered { account, guild_id } => self.join_discovered(account, guild_id),
+            Request::SpaceGate { space } => self.space_gate(space),
+            Request::AcceptRules { space, answers } => self.accept_rules(space, answers),
+            Request::SubmitOnboarding { space, options } => self.submit_onboarding(space, options),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
@@ -4144,6 +4198,42 @@ impl Chat {
 }
 
 /// A Discord snowflake: digits only, short enough to be an id and not a URL.
+/// Phone and email leave Discord only through this address, which we write ourselves.
+const DISCORD_APP: &str = "https://discord.com/app";
+
+fn scrub_gate(gate: &mut protocol::SpaceGate) {
+    if gate.external != DISCORD_APP {
+        gate.external.clear();
+    }
+    clip(&mut gate.description, 2_000);
+    clip(&mut gate.reason, 300);
+    gate.fields.truncate(5);
+    for field in &mut gate.fields {
+        clip(&mut field.label, 200);
+        clip(&mut field.kind, 40);
+        field.values.truncate(8);
+        for value in &mut field.values {
+            clip(value, 2_000);
+        }
+        field.choices.truncate(12);
+        for choice in &mut field.choices {
+            clip(choice, 200);
+        }
+    }
+    gate.prompts.truncate(12);
+    for prompt in &mut gate.prompts {
+        clip(&mut prompt.label, 200);
+        prompt.options.truncate(25);
+        for option in &mut prompt.options {
+            if !discovery_snowflake(&option.id) {
+                option.id.clear();
+            }
+            clip(&mut option.label, 200);
+        }
+        prompt.options.retain(|option| !option.id.is_empty());
+    }
+}
+
 fn discovery_snowflake(id: &str) -> bool {
     (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
 }

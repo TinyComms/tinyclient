@@ -166,10 +166,26 @@ pub struct State {
     pub switcher: Option<switcher::Switcher>,
     pub create_channel: Option<CreateChannelModal>,
     pub join_server: Option<JoinServerModal>,
+    /// A server's rules and onboarding, opened from the composer or the conversation header.
+    pub server_gate: Option<ServerGate>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
     /// The search field on Discord's Discover list.
     discover_input: Option<Entity<crate::gui::input::TextInput>>,
+}
+
+const DISCORD_APP: &str = "https://discord.com/app";
+
+pub struct ServerGate {
+    pub space: Key,
+    pub loaded: bool,
+    pub gate: Option<protocol::SpaceGate>,
+    pub agreed: Vec<bool>,
+    pub choice: Vec<Option<u32>>,
+    pub texts: Vec<Option<Entity<crate::gui::input::TextInput>>>,
+    pub picked: Vec<String>,
+    pub error: Option<String>,
+    pub busy: bool,
 }
 
 pub struct JoinServerModal {
@@ -301,6 +317,7 @@ impl State {
             switcher: None,
             create_channel: None,
             join_server: None,
+            server_gate: None,
             leave_space: None,
             discover_input: None,
         }
@@ -2403,6 +2420,367 @@ impl Shell {
                 .justify_center()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.sidebar_state.join_server = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(super) fn open_server_gate(&mut self, space: Key, cx: &mut Context<Self>) {
+        if space.network != Network::Discord {
+            return;
+        }
+        self.sidebar_state.server_gate = Some(ServerGate {
+            space: space.clone(),
+            loaded: false,
+            gate: None,
+            agreed: Vec::new(),
+            choice: Vec::new(),
+            texts: Vec::new(),
+            picked: Vec::new(),
+            error: None,
+            busy: true,
+        });
+        cx.notify();
+        self.off_thread(cx, move || ask(&Request::SpaceGate { space }), |this, answer, cx| {
+            this.install_gate_answer(answer, cx);
+        });
+    }
+
+    fn install_gate_answer(&mut self, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+        {
+            let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+                return;
+            };
+            modal.busy = false;
+            modal.loaded = true;
+        }
+        match answer {
+            Ok(Response::SpaceGate { gate, .. }) => self.install_gate(gate, cx),
+            Ok(Response::Error { detail, .. }) => {
+                if let Some(modal) = self.sidebar_state.server_gate.as_mut() {
+                    modal.error = Some(detail);
+                }
+            }
+            Ok(_) => {
+                if let Some(modal) = self.sidebar_state.server_gate.as_mut() {
+                    modal.error = Some("Could not load this server's setup.".to_owned());
+                }
+            }
+            Err(err) => {
+                if let Some(modal) = self.sidebar_state.server_gate.as_mut() {
+                    modal.error = Some(err.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn install_gate(&mut self, mut gate: protocol::SpaceGate, cx: &mut Context<Self>) {
+        if gate.prompts.is_empty() {
+            if let Some(old) = self.sidebar_state.server_gate.as_ref().and_then(|modal| modal.gate.as_ref()) {
+                gate.prompts = old.prompts.clone();
+            }
+        }
+        let same = self.sidebar_state.server_gate.as_ref().is_some_and(|modal| {
+            modal.gate.as_ref().is_some_and(|old| {
+                old.fields.len() == gate.fields.len() && old.fields.iter().zip(&gate.fields).all(|(left, right)| left.kind == right.kind)
+            })
+        });
+        let texts = if same {
+            None
+        } else {
+            Some(
+                gate.fields
+                    .iter()
+                    .map(|field| {
+                        matches!(field.kind.as_str(), "TEXT_INPUT" | "PARAGRAPH").then(|| {
+                            let hint = if field.kind == "PARAGRAPH" { "Write a paragraph" } else { "Write an answer" };
+                            cx.new(|cx| crate::gui::input::TextInput::new(hint, cx))
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+            return;
+        };
+        if let Some(texts) = texts {
+            modal.agreed = vec![false; gate.fields.len()];
+            modal.choice = vec![None; gate.fields.len()];
+            modal.texts = texts;
+        }
+        modal.gate = Some(gate);
+        modal.loaded = true;
+        modal.busy = false;
+        modal.error = None;
+    }
+
+    fn accept_server_rules(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let Some(gate) = modal.gate.as_ref() else {
+            return;
+        };
+        if gate.fields.is_empty() {
+            return;
+        }
+        let answers = gate
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| match field.kind.as_str() {
+                "TERMS" => {
+                    if modal.agreed.get(index).copied().unwrap_or(false) {
+                        "true".to_owned()
+                    } else {
+                        "false".to_owned()
+                    }
+                }
+                "MULTIPLE_CHOICE" => modal.choice.get(index).and_then(|choice| *choice).map(|choice| choice.to_string()).unwrap_or_default(),
+                "TEXT_INPUT" | "PARAGRAPH" => modal
+                    .texts
+                    .get(index)
+                    .and_then(|input| input.as_ref())
+                    .map(|input| input.read(cx).text())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        let space = modal.space.clone();
+        modal.busy = true;
+        modal.error = None;
+        cx.notify();
+        self.off_thread(cx, move || ask(&Request::AcceptRules { space, answers }), |this, answer, cx| {
+            match answer {
+                Ok(Response::SpaceGate { gate, .. }) => {
+                    let pending = gate.pending;
+                    this.install_gate(gate, cx);
+                    if !pending {
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Rules accepted", cx);
+                    }
+                }
+                other => this.install_gate_answer(other, cx),
+            }
+            cx.notify();
+        });
+    }
+
+    fn submit_server_onboarding(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let space = modal.space.clone();
+        let options = modal.picked.clone();
+        modal.busy = true;
+        modal.error = None;
+        cx.notify();
+        self.off_thread(cx, move || ask(&Request::SubmitOnboarding { space, options }), |this, answer, cx| {
+            let finished = matches!(answer, Ok(Response::Ok));
+            if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                modal.busy = false;
+                match answer {
+                    Ok(Response::Ok) => modal.error = None,
+                    Ok(Response::Error { detail, .. }) => modal.error = Some(detail),
+                    Ok(_) => modal.error = Some("Could not finish setup.".to_owned()),
+                    Err(err) => modal.error = Some(err.to_string()),
+                }
+            }
+            if finished {
+                this.toast(Some(("icons/check.svg", theme::text_soft())), "Setup finished", cx);
+            }
+            cx.notify();
+        });
+    }
+
+    pub(in crate::gui) fn server_gate_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.server_gate.as_ref()?;
+        let gate = modal.gate.clone();
+        let busy = modal.busy;
+        let loaded = modal.loaded;
+        let error = modal.error.clone();
+        let agreed = modal.agreed.clone();
+        let choice = modal.choice.clone();
+        let texts = modal.texts.clone();
+        let picked = modal.picked.clone();
+        let body = match &gate {
+            None if !loaded => div().type_ui().text_color(theme::text_soft()).child("Loading server setup…"),
+            None => div().type_ui().text_color(theme::text_soft()).child("Nothing to finish on this server."),
+            Some(gate) if gate.fields.is_empty() && gate.prompts.is_empty() && gate.description.is_empty() && gate.reason.is_empty() => {
+                div().type_ui().text_color(theme::text_soft()).child("Nothing to finish on this server.")
+            }
+            Some(gate) => {
+                let mut column = div().flex().flex_col().gap(px(8.));
+                if !gate.reason.is_empty() {
+                    column = column.child(div().type_ui().text_color(theme::text()).child(gate.reason.clone()));
+                }
+                if !gate.description.is_empty() {
+                    column = column.child(div().type_small().text_color(theme::text_soft()).child(gate.description.clone()));
+                }
+                if gate.manual {
+                    column = column.child(div().type_small().text_color(theme::text_soft()).child("A moderator still has to approve you."));
+                }
+                for (index, field) in gate.fields.iter().take(5).enumerate() {
+                    let mut row = div().flex().flex_col().gap(px(4.));
+                    if !field.label.is_empty() {
+                        row = row.child(div().type_ui().text_color(theme::text()).child(field.label.clone()));
+                    }
+                    if !field.values.is_empty() {
+                        row = row.child(div().type_small().text_color(theme::text_soft()).child(field.values.join("\n")));
+                    }
+                    match field.kind.as_str() {
+                        "TERMS" => {
+                            let on = agreed.get(index).copied().unwrap_or(false);
+                            row = row.child(
+                                button(SharedString::from(format!("gate-terms-{index}")), ButtonKind::Secondary, if on { "Agreed" } else { "Agree" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                                            if let Some(flag) = modal.agreed.get_mut(index) {
+                                                *flag = !*flag;
+                                            }
+                                        }
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        "MULTIPLE_CHOICE" => {
+                            let chosen = choice.get(index).copied().flatten();
+                            for (choice_index, label) in field.choices.iter().enumerate() {
+                                let on = chosen == Some(choice_index as u32);
+                                let words = if on { format!("Selected: {label}") } else { label.clone() };
+                                row = row.child(
+                                    button(SharedString::from(format!("gate-choice-{index}-{choice_index}")), ButtonKind::Secondary, words).on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                                                if let Some(slot) = modal.choice.get_mut(index) {
+                                                    *slot = Some(choice_index as u32);
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                                );
+                            }
+                        }
+                        "TEXT_INPUT" | "PARAGRAPH" => {
+                            if let Some(input) = texts.get(index).and_then(|input| input.clone()) {
+                                row = row.child(
+                                    div()
+                                        .px(px(8.))
+                                        .py(px(6.))
+                                        .rounded(px(theme::R_CONTROL))
+                                        .bg(theme::canvas())
+                                        .border_1()
+                                        .border_color(theme::border())
+                                        .child(input),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    column = column.child(row);
+                }
+                for prompt in &gate.prompts {
+                    let mut block = div().flex().flex_col().gap(px(4.));
+                    if !prompt.label.is_empty() {
+                        block = block.child(div().type_ui().text_color(theme::text()).child(prompt.label.clone()));
+                    }
+                    for option in &prompt.options {
+                        let on = picked.iter().any(|id| id == &option.id);
+                        let id = option.id.clone();
+                        let words = if on { format!("Selected: {}", option.label) } else { option.label.clone() };
+                        block = block.child(
+                            button(SharedString::from(format!("gate-option-{}", option.id)), ButtonKind::Secondary, words).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                                        if let Some(place) = modal.picked.iter().position(|kept| kept == &id) {
+                                            modal.picked.remove(place);
+                                        } else {
+                                            modal.picked.push(id.clone());
+                                        }
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                        );
+                    }
+                    column = column.child(block);
+                }
+                column
+            }
+        };
+        let has_fields = gate.as_ref().is_some_and(|gate| !gate.fields.is_empty());
+        let has_prompts = gate.as_ref().is_some_and(|gate| !gate.prompts.is_empty());
+        let external = gate.as_ref().is_some_and(|gate| gate.external == DISCORD_APP);
+        let card = div()
+            .id("server-gate-card")
+            .w(px(420.))
+            .max_w_full()
+            .max_h(px(560.))
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .overflow_y_scroll()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Server setup"))
+            .child(body)
+            .children(error.map(|err| div().type_small().text_color(theme::danger()).child(err)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .flex_wrap()
+                    .child(button("server-gate-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.server_gate = None;
+                        cx.notify();
+                    })))
+                    .when(external, |row| {
+                        row.child(button("server-gate-discord", ButtonKind::Secondary, "Open Discord").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.open_external_link(DISCORD_APP, window, cx);
+                            },
+                        )))
+                    })
+                    .when(has_fields, |row| {
+                        row.child(
+                            button("server-gate-accept", ButtonKind::Primary, if busy { "Sending…" } else { "Accept the rules" }).when(!busy, |button| {
+                                button.on_click(cx.listener(|this, _, _, cx| this.accept_server_rules(cx)))
+                            }),
+                        )
+                    })
+                    .when(has_prompts, |row| {
+                        row.child(
+                            button("server-gate-finish", ButtonKind::Primary, if busy { "Sending…" } else { "Finish setup" }).when(!busy, |button| {
+                                button.on_click(cx.listener(|this, _, _, cx| this.submit_server_onboarding(cx)))
+                            }),
+                        )
+                    }),
+            );
+        Some(
+            div()
+                .id("server-gate-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.server_gate = None;
                     cx.notify();
                 }))
                 .child(card),
