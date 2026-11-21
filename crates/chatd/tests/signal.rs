@@ -1201,7 +1201,7 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
         text: String::new(),
         reply_to: None,
         with: Outgoing {
-            poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false }),
+            poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false, ..PollDraft::default() }),
             files: vec![OutgoingFile { path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false, media: None }],
             ..Outgoing::default()
         },
@@ -1238,7 +1238,7 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
         text: String::new(),
         reply_to: None,
         with: Outgoing {
-            poll: Some(PollDraft { question: "Next week?".into(), options: vec!["Yes".into(), "No".into()], multiple: false }),
+            poll: Some(PollDraft { question: "Next week?".into(), options: vec!["Yes".into(), "No".into()], multiple: false, ..PollDraft::default() }),
             ..Outgoing::default()
         },
     };

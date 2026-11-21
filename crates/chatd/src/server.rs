@@ -1193,7 +1193,7 @@ impl Chat {
         }
         message.waiting = false;
         if with.poll.is_some() {
-            if account.network != Network::Signal {
+            if self.hub.capabilities(&account).polls.is_none() {
                 return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
             }
             if !with.files.is_empty() {
@@ -1657,20 +1657,15 @@ impl Chat {
         }
     }
 
-    /// A vote, a retraction, or ending a poll. Not an edit: the poll may be someone else's, and
-    /// the message's text stays "Poll: …". Signal only; the adapter reads the sentinel.
+    /// A vote, a retraction, or ending a poll. Dispatched to the account's adapter via `Command::Vote`.
     fn poll(&self, conversation: Key, message_id: String, votes: Option<Vec<u32>>) -> Response {
         let account = conversation.account();
-        if account.network != Network::Signal {
-            return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
-        }
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        let votes = votes.map(|votes| votes.into_iter().take(10).collect::<Vec<_>>());
-        let text = adapters::signal::poll_command(votes.as_deref());
+        let votes = votes.map(|votes| votes.into_iter().take(protocol::POLL_OPTIONS).collect::<Vec<_>>());
         let conversation_id = conversation.id;
-        match self.ask(&account, |reply| Command::Edit { conversation_id, message_id, text, spans: Vec::new(), reply }) {
+        match self.ask(&account, |reply| Command::Vote { conversation_id, message_id, votes, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }

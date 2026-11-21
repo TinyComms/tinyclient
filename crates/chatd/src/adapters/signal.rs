@@ -1430,6 +1430,12 @@ fn capabilities() -> protocol::Capabilities {
         edit_window: (SEND_WINDOW_MS / 1_000) as u32,
         max_file_bytes: files.max_file_bytes,
         max_files: files.max_files,
+        polls: Some(protocol::PollCapabilities {
+            max_options: protocol::POLL_OPTIONS as u8,
+            max_duration_secs: 0,
+            multiple: true,
+            anonymous: false,
+        }),
         ..protocol::Capabilities::default()
     }
 }
@@ -1468,6 +1474,13 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
+        }
+        Command::Vote { conversation_id, message_id, votes, reply } => {
+            let act = match votes {
+                Some(indexes) => PollAct::Vote(indexes),
+                None => PollAct::End,
+            };
+            let _ = reply.send(poll_act(account, &conversation_id, &message_id, act).map_err(refused));
         }
         Command::Typing { conversation_id, activity: _ } => typing(account, &conversation_id),
         Command::StartDirect { person_id, reply } => {

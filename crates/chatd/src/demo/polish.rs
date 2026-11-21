@@ -139,6 +139,12 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
 
     // What each account may send, as its session would say.
     let mb = 1 << 20;
+    let demo_polls = Some(protocol::PollCapabilities {
+        max_options: protocol::POLL_OPTIONS as u8,
+        max_duration_secs: 7 * 86_400,
+        multiple: true,
+        anonymous: false,
+    });
     s.capabilities.push((discord::account(), Capabilities {
         max_file_bytes: 10 * mb,
         max_files: 10,
@@ -149,6 +155,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         silent: true,
         suppress_embeds: true,
         reply_ping: true,
+        polls: demo_polls.clone(),
         ..Capabilities::default()
     }));
     for account in [slack::harbor(), slack::fernhill()] {
@@ -174,9 +181,21 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         suppress_embeds: true,
         edit_window: 48 * 3_600,
         voice_notes: true,
+        polls: Some(protocol::PollCapabilities {
+            max_options: protocol::POLL_OPTIONS as u8,
+            max_duration_secs: 0,
+            multiple: true,
+            anonymous: true,
+        }),
         ..Capabilities::default()
     }));
     s.capabilities.push((teams::account(), Capabilities { max_file_bytes: 250 * mb, max_files: 10, ..Capabilities::default() }));
+    s.capabilities.push((super::signal::account(), Capabilities {
+        max_file_bytes: 100 * mb,
+        max_files: 10,
+        polls: demo_polls,
+        ..Capabilities::default()
+    }));
     Ok(())
 }
 

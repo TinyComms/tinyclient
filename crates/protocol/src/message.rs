@@ -399,6 +399,15 @@ pub struct Poll {
     pub multiple: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub closed: bool,
+    /// Unix seconds when the poll closes. `None` if it has no scheduled end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closes_at: Option<i64>,
+    /// Votes are anonymous; individual voters are not shown.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
+    /// Total votes/voters when the network reports it separately from the sum of choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mine: Vec<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -413,9 +422,80 @@ impl Poll {
             choices: options.into_iter().map(|text| PollChoice { text: text.into(), count: 0, voters: Vec::new() }).collect(),
             multiple,
             closed: false,
+            closes_at: None,
+            anonymous: false,
+            total: None,
             mine: Vec::new(),
             ballots: Vec::new(),
         }
+    }
+
+    /// Total votes cast across all choices (or the network-supplied `total` when present).
+    pub fn total_votes(&self) -> u32 {
+        self.total.unwrap_or_else(|| self.choices.iter().map(|c| c.count).sum())
+    }
+
+    /// Compute the next `mine` selection when the user clicks `choice`.
+    /// Single-choice polls toggle off if already sole selection, otherwise switch to `[choice]`.
+    /// Multi-choice polls toggle `choice` in/out while keeping sorted order.
+    pub fn next_votes(&self, choice: u32) -> Vec<u32> {
+        if choice as usize >= self.choices.len() {
+            return self.mine.clone();
+        }
+        if self.multiple {
+            let mut next = self.mine.clone();
+            if let Some(pos) = next.iter().position(|&c| c == choice) {
+                next.remove(pos);
+            } else {
+                next.push(choice);
+                next.sort_unstable();
+                next.dedup();
+            }
+            next
+        } else if self.mine == [choice] {
+            Vec::new()
+        } else {
+            vec![choice]
+        }
+    }
+
+    /// Apply a person's vote replacement and recompute choice counts, voter lists, and `mine`.
+    pub fn apply_vote(&mut self, person: &str, mut choices: Vec<u32>, me: &str) {
+        let len = self.choices.len() as u32;
+        choices.retain(|&idx| idx < len);
+        choices.sort_unstable();
+        choices.dedup();
+        if !self.multiple {
+            choices.truncate(1);
+        }
+        if let Some(existing) = self.ballots.iter_mut().find(|b| b.person == person) {
+            existing.choices = choices;
+            existing.serial = existing.serial.saturating_add(1);
+        } else {
+            self.ballots.push(PollBallot { person: person.to_owned(), choices, serial: 1 });
+        }
+        self.ballots.retain(|b| !b.choices.is_empty());
+        for choice in &mut self.choices {
+            choice.count = 0;
+            choice.voters.clear();
+        }
+        for ballot in &self.ballots {
+            for &idx in &ballot.choices {
+                if let Some(choice) = self.choices.get_mut(idx as usize) {
+                    choice.count = choice.count.saturating_add(1);
+                    if !self.anonymous && choice.voters.len() < POLL_VOTERS {
+                        choice.voters.push(ballot.person.clone());
+                    }
+                }
+            }
+        }
+        self.mine = self
+            .ballots
+            .iter()
+            .find(|b| b.person == me)
+            .map(|b| b.choices.clone())
+            .unwrap_or_default();
+        self.total = None;
     }
 }
 
@@ -750,5 +830,44 @@ mod tests {
         message.bound();
         assert_eq!(message.reactions[0].who.len(), REACTION_REACTORS);
         assert_eq!(message.reactions[0].who[1].len(), 200, "a long id is clipped");
+    }
+
+    #[test]
+    fn poll_votes_and_round_trip() {
+        let mut poll = Poll::open("Lunch?", ["Thai", "Pizza", "Tacos"], false);
+        poll.closes_at = Some(1_800_000_000);
+        assert_eq!(poll.total_votes(), 0);
+        assert_eq!(poll.next_votes(1), vec![1]);
+
+        poll.apply_vote("me", vec![1], "me");
+        assert_eq!(poll.mine, vec![1]);
+        assert_eq!(poll.choices[1].count, 1);
+        assert_eq!(poll.total_votes(), 1);
+        // Clicking the same single-choice option retracts it.
+        assert_eq!(poll.next_votes(1), Vec::<u32>::new());
+        // Clicking another option switches to it.
+        assert_eq!(poll.next_votes(2), vec![2]);
+
+        poll.apply_vote("other", vec![0], "me");
+        poll.apply_vote("me", vec![2], "me");
+        assert_eq!(poll.choices[0].count, 1);
+        assert_eq!(poll.choices[1].count, 0);
+        assert_eq!(poll.choices[2].count, 1);
+        assert_eq!(poll.total_votes(), 2);
+
+        // Multi-choice toggles independently.
+        let mut multi = Poll::open("Days?", ["Mon", "Tue", "Wed"], true);
+        multi.apply_vote("me", vec![0, 2], "me");
+        assert_eq!(multi.next_votes(1), vec![0, 1, 2]);
+        assert_eq!(multi.next_votes(0), vec![2]);
+
+        let json = serde_json::to_string(&poll).unwrap();
+        assert_eq!(serde_json::from_str::<Poll>(&json).unwrap(), poll);
+        // Older wire payload without closes_at/anonymous/total still deserializes.
+        let older = r#"{"question":"Q?","choices":[{"text":"A","count":1}]}"#;
+        let parsed: Poll = serde_json::from_str(older).unwrap();
+        assert_eq!(parsed.closes_at, None);
+        assert!(!parsed.anonymous);
+        assert_eq!(parsed.total_votes(), 1);
     }
 }

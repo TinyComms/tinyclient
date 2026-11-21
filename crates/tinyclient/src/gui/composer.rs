@@ -410,6 +410,14 @@ struct Reply {
     snippet: String,
 }
 
+struct PollComposer {
+    question: Entity<TextInput>,
+    options: Vec<Entity<TextInput>>,
+    multiple: bool,
+    allow_multiple: bool,
+    max_options: usize,
+}
+
 struct Editing {
     id: String,
     /// The message as it was put in the field: saving this unchanged is a cancel.
@@ -558,6 +566,8 @@ pub struct Composer {
     /// A Tiny file client id whose verdict may arrive before the send ack. Cleared once that
     /// ack opens the hold (the id is in flight from then) or the send does not hold.
     pending_file: Option<(Key, String)>,
+    /// Inline poll creation form when the user clicks "Create poll".
+    poll_composer: Option<PollComposer>,
 }
 
 impl Composer {
@@ -648,6 +658,7 @@ impl Composer {
             note: None,
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
+            poll_composer: None,
         }
     }
 
@@ -1576,6 +1587,210 @@ impl Composer {
     }
 
     /// ⌘U: the system's file panel, several at once.
+    fn toggle_poll_composer(&mut self, cx: &mut Context<Self>) {
+        if self.poll_composer.is_some() {
+            self.poll_composer = None;
+            cx.notify();
+            return;
+        }
+        let Some(caps) = self.target.as_ref().and_then(|t| t.can.polls) else {
+            return;
+        };
+        let max_options = usize::from(caps.max_options).clamp(2, protocol::POLL_OPTIONS);
+        let question = cx.new(|cx| TextInput::new("Ask a question…", cx));
+        let options = vec![
+            cx.new(|cx| TextInput::new("Option 1", cx)),
+            cx.new(|cx| TextInput::new("Option 2", cx)),
+        ];
+        self.poll_composer = Some(PollComposer {
+            question,
+            options,
+            multiple: false,
+            allow_multiple: caps.multiple,
+            max_options,
+        });
+        cx.notify();
+    }
+
+    fn submit_poll(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let Some(form) = self.poll_composer.as_ref() else { return };
+        let question = form.question.read(cx).text().trim().to_owned();
+        let options: Vec<String> = form
+            .options
+            .iter()
+            .map(|opt| opt.read(cx).text().trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if question.is_empty() || options.len() < 2 {
+            return;
+        }
+        let draft = protocol::PollDraft {
+            question: question.clone(),
+            options,
+            multiple: form.multiple && form.allow_multiple,
+            ..protocol::PollDraft::default()
+        };
+        self.poll_composer = None;
+        cx.notify();
+        if !live() {
+            return;
+        }
+        let client_id = client_id();
+        let request = Request::Send {
+            conversation: target.key,
+            client_id,
+            text: format!("Poll: {question}"),
+            reply_to: None,
+            with: protocol::Outgoing { poll: Some(draft), ..protocol::Outgoing::default() },
+        };
+        cx.spawn(async move |composer, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = composer.update(cx, |this, cx| {
+                    this.shell_later(cx, move |shell, cx| shell.toast(None, detail, cx));
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn poll_composer_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let form = self.poll_composer.as_ref()?;
+        let can_add = form.options.len() < form.max_options;
+        let can_remove = form.options.len() > 2;
+        let ready = !form.question.read(cx).text().trim().is_empty()
+            && form.options.iter().filter(|o| !o.read(cx).text().trim().is_empty()).count() >= 2;
+        let mut opt_rows = div().flex().flex_col().gap(px(4.));
+        for (idx, opt) in form.options.iter().enumerate() {
+            let row = div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::canvas())
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .type_ui()
+                        .child(opt.clone()),
+                )
+                .when(can_remove, |el| {
+                    el.child(
+                        div()
+                            .id(("poll-opt-rm", idx))
+                            .size(px(22.))
+                            .rounded(px(theme::R_CONTROL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(form) = this.poll_composer.as_mut() {
+                                    if form.options.len() > 2 && idx < form.options.len() {
+                                        form.options.remove(idx);
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .child(glyph("icons/x.svg", 12., theme::text_faint())),
+                    )
+                });
+            opt_rows = opt_rows.child(row);
+        }
+
+        let mut footer = div().mt(px(6.)).flex().items_center().justify_between().gap(px(8.));
+        let mut left = div().flex().items_center().gap(px(8.));
+        if can_add {
+            left = left.child(
+                div()
+                    .id("poll-add-opt")
+                    .type_small()
+                    .text_color(theme::accent())
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(form) = this.poll_composer.as_mut() {
+                            if form.options.len() < form.max_options {
+                                let label = format!("Option {}", form.options.len() + 1);
+                                form.options.push(cx.new(|cx| TextInput::new(label, cx)));
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .child("+ Add option"),
+            );
+        }
+        if form.allow_multiple {
+            let mult = form.multiple;
+            left = left.child(
+                div()
+                    .id("poll-toggle-multi")
+                    .type_small()
+                    .text_color(if mult { theme::accent() } else { theme::text_faint() })
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(form) = this.poll_composer.as_mut() {
+                            form.multiple = !form.multiple;
+                            cx.notify();
+                        }
+                    }))
+                    .child(if mult { "☑ Multiple choices" } else { "☐ Multiple choices" }),
+            );
+        }
+        footer = footer.child(left).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    button("poll-cancel", ButtonKind::Ghost, "Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.poll_composer = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    button("poll-submit", if ready { ButtonKind::Primary } else { ButtonKind::Ghost }, "Create poll")
+                        .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_poll(cx)))),
+                ),
+        );
+
+        Some(
+            div()
+                .mb(px(6.))
+                .p(px(10.))
+                .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Create a poll"))
+                .child(
+                    div()
+                        .px(px(8.))
+                        .py(px(5.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::canvas())
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .type_ui()
+                        .child(form.question.clone()),
+                )
+                .child(opt_rows)
+                .child(footer),
+        )
+    }
+
     fn attach_files(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone().filter(|target| target.locked().is_none())
         else {
@@ -2587,6 +2802,11 @@ impl Composer {
                 .tooltip(tip("Attach files", Some("⌘U")))
                 .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
         });
+        let poll_btn = controls.poll.then(|| {
+            self.card_button("create-poll", Some("icons/list.svg"), self.poll_composer.is_some(), None)
+                .tooltip(tip("Create poll", None))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_poll_composer(cx)))
+        });
         let gif = controls.gif.then(|| {
             let tiny = self.target.as_ref().is_some_and(|target| target.key.network == Network::Tiny);
             let slot = if tiny { None } else { Some(Trigger::Gif) };
@@ -2691,6 +2911,7 @@ impl Composer {
                 .flex()
                 .items_end()
                 .children(attach.map(|attach| attach.mr(px(4.))))
+                .children(poll_btn.map(|btn| btn.mr(px(4.))))
                 .child(field)
                 .children(gif.map(|gif| gif.mr(px(2.))))
                 .children(mic.map(|mic| mic.mr(px(2.))))
@@ -3314,6 +3535,7 @@ impl Render for Composer {
         let anchors = self.anchors.clone();
         // The row sits over the card's text, not its edge.
         dock.child(div().pl(px(13.)).child(self.typing.clone()))
+            .children(self.poll_composer_panel(cx))
             .child(div().relative().child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))
             .children(self.picker_layer(window, cx))

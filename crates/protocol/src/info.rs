@@ -351,6 +351,30 @@ pub struct Capabilities {
     /// (`Request::ClearHistory`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub clear_history: bool,
+    /// This account supports creating and voting in polls, with its limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polls: Option<PollCapabilities>,
+}
+
+/// What a network allows when creating a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PollCapabilities {
+    /// Maximum number of options (e.g. 10).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub max_options: u8,
+    /// Longest duration in seconds. 0 means no duration setting / network default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_duration_secs: u32,
+    /// Whether multi-select polls are supported.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiple: bool,
+    /// Whether anonymous polls are supported.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Capabilities {
@@ -434,12 +458,18 @@ pub struct VoiceNote {
 
 /// A poll the user is starting. Signal: a question of 1 to 100 characters and 2 to 10 choices,
 /// each at most 100 characters. `multiple` lets a person pick more than one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollDraft {
     pub question: String,
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub multiple: bool,
+    /// Optional duration in seconds before the poll closes automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u32>,
+    /// Whether votes are anonymous.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
 }
 
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text

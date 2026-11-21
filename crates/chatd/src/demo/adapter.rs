@@ -125,6 +125,23 @@ impl Demo {
     /// Files "upload" from their paths in quarters, read from disk in parts as a real upload
     /// streams them, telling the progress as they go. A cancel stops them before the next part.
     fn send_with(demo: &Arc<Demo>, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, with: Outgoing) {
+        if let Some(draft) = with.poll {
+            let question = draft.question.trim().to_owned();
+            let options: Vec<String> = draft.options.into_iter().map(|o| o.trim().to_owned()).filter(|o| !o.is_empty()).collect();
+            if question.is_empty() || options.len() < 2 {
+                demo.ctx.sent(&conversation_id, &client_id, Err("A poll needs a question and at least two options.".to_owned()));
+                return;
+            }
+            let mut poll = protocol::Poll::open(question.clone(), options, draft.multiple);
+            poll.anonymous = draft.anonymous;
+            if let Some(secs) = draft.duration_secs.filter(|&s| s > 0) {
+                poll.closes_at = Some(now() + i64::from(secs));
+            }
+            let mut message = demo.accepted(&conversation_id, format!("Poll: {question}"), reply_to, Vec::new());
+            message.poll = Some(Box::new(poll));
+            demo.ctx.sent(&conversation_id, &client_id, Ok(message));
+            return;
+        }
         let demo = demo.clone();
         let spawned = std::thread::Builder::new().name("demo-upload".into()).stack_size(256 * 1024).spawn(move || {
             use std::io::Read;
@@ -636,6 +653,29 @@ impl Demo {
             Command::Delete { conversation_id, message_id, reply } => {
                 let deleted = demo.ctx.deleted(&conversation_id, &message_id);
                 let _ = reply.send(deleted.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            Command::Vote { conversation_id, message_id, votes, reply } => {
+                let outcome = (|| -> Result<(), Refusal> {
+                    let stored = demo.ctx.stored_message(&conversation_id, &message_id).ok().flatten();
+                    let mut message = stored.ok_or_else(|| Refusal::Refused("That message is gone.".to_owned()))?;
+                    let poll = message.poll.as_deref_mut().ok_or_else(|| Refusal::Refused("That is not a poll.".to_owned()))?;
+                    match votes {
+                        None => {
+                            if !message.outgoing {
+                                return Err(Refusal::Refused("Only the person who started this poll can end it.".to_owned()));
+                            }
+                            poll.closed = true;
+                        }
+                        Some(choices) => {
+                            if poll.closed {
+                                return Err(Refusal::Refused("This poll has ended.".to_owned()));
+                            }
+                            poll.apply_vote(&demo.me.id, choices, &demo.me.id);
+                        }
+                    }
+                    demo.ctx.message(&conversation_id, &message).map_err(|err| Refusal::Refused(err.to_string()))
+                })();
+                let _ = reply.send(outcome);
             }
             Command::Relate { person_id, action, reply } => {
                 let relation = match action {

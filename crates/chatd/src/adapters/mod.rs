@@ -309,6 +309,14 @@ pub enum Command {
         message_id: String,
         reply: Reply<()>,
     },
+    /// Vote on a poll, retract a vote (`Some(vec![])`), or end a poll (`None`). Report the
+    /// updated message through [`Context::message`] before answering.
+    Vote {
+        conversation_id: String,
+        message_id: String,
+        votes: Option<Vec<u32>>,
+        reply: Reply<()>,
+    },
     /// The user's draft is changing. Pace it: at most one typing signal per 8 s per
     /// conversation. `activity` is what they are doing; an adapter that only has typing ignores it.
     Typing { conversation_id: String, activity: Compose },
@@ -490,6 +498,7 @@ impl Command {
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
+            | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
             | Command::SetPresence { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }

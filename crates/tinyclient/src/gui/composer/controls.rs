@@ -22,6 +22,8 @@ pub struct Controls {
     pub voice: bool,
     /// Right-click on Send can hand the network a time (`Outgoing::schedule`).
     pub schedule: bool,
+    /// The "Create poll" button beside Attach (`Capabilities::polls`).
+    pub poll: bool,
 }
 
 /// `editing`: edit mode is text only on every network.
@@ -50,6 +52,7 @@ pub fn controls(network: Network, can: &Capabilities, editing: bool) -> Controls
         custom_emoji: can.custom_emoji != EmojiScope::None,
         voice: super::rec::available(can) && !editing,
         schedule: can.schedule && !editing,
+        poll: can.polls.is_some() && !editing,
     }
 }
 
@@ -122,5 +125,16 @@ mod tests {
         let edit = controls(Network::Slack, &slack, true);
         assert!(!edit.schedule && !edit.silent, "edit mode is text only");
         assert!(!controls(Network::Discord, &discord(), false).schedule);
+    }
+
+    #[test]
+    fn poll_button_follows_capability_and_hides_when_editing() {
+        let with_polls = Capabilities {
+            polls: Some(protocol::PollCapabilities { max_options: 10, max_duration_secs: 86_400, multiple: true, anonymous: false }),
+            ..Capabilities::default()
+        };
+        assert!(controls(Network::Discord, &with_polls, false).poll);
+        assert!(!controls(Network::Discord, &with_polls, true).poll);
+        assert!(!controls(Network::Slack, &Capabilities::default(), false).poll);
     }
 }
