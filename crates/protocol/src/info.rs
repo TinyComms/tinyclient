@@ -737,6 +737,9 @@ pub struct Capabilities {
     /// This account can fetch recent mentions from before tinyclient was open (`Request::Mentions`, Discord).
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_history: bool,
+    /// This account supports reordering Spaces and creating/renaming/colouring Space folders (`MoveSpace`, `SetFolder`, Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_space_folders: bool,
 }
 
 /// One recent mention fetched from the network (`Request::Mentions`).

@@ -3812,6 +3812,28 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::MoveSpace { space, before, folder, into_space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::MoveSpace { space_id, before, folder, into_space, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetFolder { folder, name, color } => {
+                let account = folder.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let folder_id = folder.id;
+                match self.ask(&account, |reply| Command::SetFolder { folder_id, name, color, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::BookmarkAdd { conversation, title, link, emoji } => {
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {

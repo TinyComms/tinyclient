@@ -1001,6 +1001,10 @@ impl Demo {
             // Nothing is behind these: what is stored is all there is.
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Mentions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MoveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetFolder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

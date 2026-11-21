@@ -861,6 +861,7 @@ impl Discord {
             profile_banner: premium > 0,
             profile_server: premium > 0,
             mentions_history: true,
+            manage_space_folders: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -992,6 +993,26 @@ impl Discord {
             self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         }
         self.spaces()?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.guild_folders_settings = ready
+                .user_settings_proto
+                .as_deref()
+                .and_then(proto::guild_folders_settings)
+                .unwrap_or_default();
+            state.folders = match &folders {
+                Some(list) => list.clone(),
+                None => order
+                    .iter()
+                    .map(|id| proto::GuildFolder {
+                        id: None,
+                        name: String::new(),
+                        color: None,
+                        guild_ids: vec![id.clone()],
+                    })
+                    .collect(),
+            };
+        }
         if let Some(folders) = &folders {
             self.record_folders(folders)?;
         }

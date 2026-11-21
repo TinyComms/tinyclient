@@ -2573,6 +2573,29 @@ pub enum Request {
         account: AccountKey,
         message_id: String,
     },
+    /// Reorder a Space, move it into or out of a folder, or drop it onto another Space to make a folder.
+    MoveSpace {
+        space: Key,
+        /// Insert before this Space. Absent: the end of the target list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        /// Move into this folder. Absent: the Space sits on its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        /// Drop onto this Space to make a folder of the two. Not combined with `folder`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        into_space: Option<String>,
+    },
+    /// Rename or recolour a Space folder (e.g. Discord server folder).
+    SetFolder {
+        folder: Key,
+        /// New name. Absent leaves it. Empty clears it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// New colour (`0xRRGGBB`). Absent leaves it. `Some(None)` clears it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Option<u32>>,
+    },
     /// Add a link bookmark to a channel (Slack `bookmarks.add`).
     BookmarkAdd {
         conversation: Key,

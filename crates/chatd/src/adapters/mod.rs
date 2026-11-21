@@ -491,6 +491,21 @@ pub enum Command {
         message_id: String,
         reply: Reply<()>,
     },
+    /// Reorder a Space, move it into/out of a folder, or create a folder with another Space.
+    MoveSpace {
+        space_id: String,
+        before: Option<String>,
+        folder: Option<String>,
+        into_space: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Rename or recolour a Space folder.
+    SetFolder {
+        folder_id: String,
+        name: Option<String>,
+        color: Option<Option<u32>>,
+        reply: Reply<()>,
+    },
     /// Add a bookmark to a channel.
     BookmarkAdd {
         conversation_id: String,
@@ -904,6 +919,8 @@ impl Command {
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Mentions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MoveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetFolder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

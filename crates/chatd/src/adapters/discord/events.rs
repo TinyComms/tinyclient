@@ -501,7 +501,11 @@ impl Discord {
         if update.partial {
             return Ok(());
         }
+        if let Some(raw_block) = proto::guild_folders_settings(&update.settings.proto) {
+            self.state.lock().unwrap().guild_folders_settings = raw_block;
+        }
         if let Some(folders) = proto::guild_folders(&update.settings.proto) {
+            self.state.lock().unwrap().folders = folders.clone();
             self.record_folders(&folders)?;
         }
         let Some(order) = proto::guild_order(&update.settings.proto) else {

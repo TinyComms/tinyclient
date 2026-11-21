@@ -1,5 +1,5 @@
-//! The two things read from Discord's protobuf settings: the order of the server list, and our
-//! own status. The status is also the one thing written.
+//! What is read from Discord's protobuf settings, and what is written back: the server list
+//! and its folders, and our own status.
 //!
 //! Sessions that identify as the current web client get their settings as base64 protobuf
 //! (`user_settings_proto`) instead of JSON. The field numbers are from the community's
@@ -82,9 +82,8 @@ fn bytes_of(message: &[u8], wanted: u64) -> Option<&[u8]> {
     })
 }
 
-/// A length-delimited field: its tag, its length, its bytes.
-fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
-    let mut varint = |mut value: u64| loop {
+fn write_varint(into: &mut Vec<u8>, mut value: u64) {
+    loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
@@ -92,9 +91,18 @@ fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
             break;
         }
         into.push(byte | 0x80);
-    };
-    varint(number << 3 | 2);
-    varint(bytes.len() as u64);
+    }
+}
+
+fn write_varint_field(into: &mut Vec<u8>, number: u64, value: u64) {
+    write_varint(into, number << 3);
+    write_varint(into, value);
+}
+
+/// A length-delimited field: its tag, its length, its bytes.
+fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
+    write_varint(into, number << 3 | 2);
+    write_varint(into, bytes.len() as u64);
     into.extend_from_slice(bytes);
 }
 
@@ -207,6 +215,195 @@ pub fn guild_folders(settings: &str) -> Option<Vec<GuildFolder>> {
     (!found.is_empty()).then_some(found)
 }
 
+/// Our guild folders settings block (field 14) as Discord sent it. `None` when absent.
+pub fn guild_folders_settings(settings: &str) -> Option<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
+    bytes_of(&bytes, 14).map(<[u8]>::to_vec)
+}
+
+/// Replaces `folders` (field 1) and `guild_positions` (field 2) inside field 14 (`GuildFolders`),
+/// copying every unknown field of `raw` byte-for-byte untouched.
+pub fn with_guild_folders(raw: &[u8], folders: &[GuildFolder]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + folders.len() * 32);
+    for (number, _, raw_field) in fields(raw) {
+        if number != 1 && number != 2 {
+            out.extend_from_slice(raw_field);
+        }
+    }
+    let mut positions = Vec::new();
+    for folder in folders {
+        let mut packed = Vec::with_capacity(folder.guild_ids.len() * 8);
+        for id in &folder.guild_ids {
+            if let Ok(num) = id.parse::<u64>() {
+                packed.extend_from_slice(&num.to_le_bytes());
+                positions.extend_from_slice(&num.to_le_bytes());
+            }
+        }
+        if packed.is_empty() {
+            continue;
+        }
+        let mut entry = Vec::with_capacity(packed.len() + folder.name.len() + 24);
+        write(&mut entry, 1, &packed);
+        if let Some(id) = folder.id {
+            let mut wrapped = Vec::new();
+            write_varint_field(&mut wrapped, 1, id as u64);
+            write(&mut entry, 2, &wrapped);
+        }
+        if !folder.name.is_empty() {
+            let mut wrapped = Vec::new();
+            write(&mut wrapped, 1, folder.name.as_bytes());
+            write(&mut entry, 3, &wrapped);
+        }
+        if let Some(color) = folder.color {
+            let mut wrapped = Vec::new();
+            write_varint_field(&mut wrapped, 1, u64::from(color & 0xff_ffff));
+            write(&mut entry, 4, &wrapped);
+        }
+        write(&mut out, 1, &entry);
+    }
+    if !positions.is_empty() {
+        write(&mut out, 2, &positions);
+    }
+    out
+}
+
+/// Settings proto holding only the `guild_folders` field (14), for `PATCH /users/@me/settings-proto/1`.
+pub fn settings_with_folders(folders_block: &[u8]) -> String {
+    let mut whole = Vec::with_capacity(folders_block.len() + 4);
+    write(&mut whole, 14, folders_block);
+    base64::engine::general_purpose::STANDARD.encode(whole)
+}
+
+/// Reorders `space`, moves it into or out of a folder, or drops it onto `into_space` to make a
+/// folder. `before` is a server to insert ahead of (absent: the end of that list). `folder` is
+/// an existing folder id; absent means the server sits on its own. `into_space` is not combined
+/// with `folder`. A folder left with one server becomes a loose server, which is how Discord
+/// drops an emptied folder. `new_id` is the id of a folder this creates.
+pub(super) fn move_guild(
+    folders: &[GuildFolder],
+    space: &str,
+    before: Option<&str>,
+    folder: Option<&str>,
+    into_space: Option<&str>,
+    new_id: i64,
+) -> Result<Vec<GuildFolder>, &'static str> {
+    if space.is_empty() {
+        return Err("That server is not on this account.");
+    }
+    if into_space == Some(space) {
+        return Err("A server cannot be dropped onto itself.");
+    }
+    if folder.is_some() && into_space.is_some() {
+        return Err("Move a server into a folder or onto another server, not both.");
+    }
+    if into_space.is_none() && folder.is_none() && before == Some(space) {
+        return Ok(folders.to_vec());
+    }
+
+    let mut entries = folders.to_vec();
+    if let Some(target) = into_space {
+        if target.is_empty() {
+            return Err("That server is not on this account.");
+        }
+        let anchor = entries.iter().position(|entry| entry.guild_ids.iter().any(|id| id == target));
+        let removed_before = remove_guilds(&mut entries, &[space, target], anchor);
+        let insert_at = anchor.map(|index| index - removed_before).unwrap_or(0).min(entries.len());
+        let guild_ids = if before == Some(target) {
+            vec![space.to_owned(), target.to_owned()]
+        } else {
+            vec![target.to_owned(), space.to_owned()]
+        };
+        entries.insert(insert_at, GuildFolder { id: Some(new_id), name: String::new(), color: None, guild_ids });
+        dissolve_thin_folders(&mut entries);
+        return Ok(entries);
+    }
+
+    remove_guilds(&mut entries, &[space], None);
+    if let Some(folder_id) = folder {
+        let id = folder_id.parse::<i64>().map_err(|_| "That folder is not on this account.")?;
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == Some(id)) else {
+            return Err("That folder is not on this account.");
+        };
+        let at = before.and_then(|id| entry.guild_ids.iter().position(|guild| guild == id)).unwrap_or(entry.guild_ids.len());
+        entry.guild_ids.insert(at, space.to_owned());
+    } else {
+        let before = before.filter(|id| !id.is_empty());
+        let insert_at = match before {
+            Some(id) => entries.iter().position(|entry| entry.guild_ids.iter().any(|guild| guild == id)).unwrap_or(entries.len()),
+            None => entries.len(),
+        };
+        entries.insert(insert_at, GuildFolder { id: None, name: String::new(), color: None, guild_ids: vec![space.to_owned()] });
+    }
+    dissolve_thin_folders(&mut entries);
+    Ok(entries)
+}
+
+/// Renames or recolors one folder. `name` absent leaves the name; empty clears it. `color`
+/// absent leaves the color; `Some(None)` clears it.
+pub(super) fn edit_guild_folder(
+    folders: &mut [GuildFolder],
+    folder_id: i64,
+    name: Option<&str>,
+    color: Option<Option<u32>>,
+) -> Result<(), &'static str> {
+    let Some(entry) = folders.iter_mut().find(|entry| entry.id == Some(folder_id)) else {
+        return Err("That folder is not on this account.");
+    };
+    if let Some(name) = name {
+        entry.name = name.trim().chars().take(100).collect();
+    }
+    if let Some(color) = color {
+        entry.color = color.map(|color| color & 0xff_ffff);
+    }
+    Ok(())
+}
+
+/// Drops `gone` out of every entry. Returns how many entries before `anchor` disappeared, so a
+/// new folder can be inserted where the target used to be.
+fn remove_guilds(entries: &mut Vec<GuildFolder>, gone: &[&str], anchor: Option<usize>) -> usize {
+    let mut removed_before = 0;
+    let mut kept = Vec::with_capacity(entries.len());
+    for (index, mut entry) in entries.drain(..).enumerate() {
+        entry.guild_ids.retain(|id| !gone.iter().any(|drop| id == *drop));
+        if entry.guild_ids.is_empty() {
+            if anchor.is_some_and(|anchor| index < anchor) {
+                removed_before += 1;
+            }
+        } else {
+            kept.push(entry);
+        }
+    }
+    *entries = kept;
+    removed_before
+}
+
+/// Discord only keeps a folder that holds two servers. One left becomes a server on its own.
+fn dissolve_thin_folders(entries: &mut [GuildFolder]) {
+    for entry in entries.iter_mut() {
+        if entry.id.is_some() && entry.guild_ids.len() < 2 {
+            entry.id = None;
+            entry.name.clear();
+            entry.color = None;
+        }
+    }
+}
+
+/// Replaces only field 14 in a whole `PreloadedUserSettings` protobuf blob, preserving every
+/// other top-level field (and every unknown subfield inside field 14) byte-for-byte.
+#[cfg(test)]
+pub fn replace_guild_folders_in_whole(whole: &[u8], folders: &[GuildFolder]) -> Vec<u8> {
+    let existing = bytes_of(whole, 14).unwrap_or(&[]);
+    let updated = with_guild_folders(existing, folders);
+    let mut out = Vec::with_capacity(whole.len() + updated.len());
+    for (number, _, raw) in fields(whole) {
+        if number != 14 {
+            out.extend_from_slice(raw);
+        }
+    }
+    write(&mut out, 14, &updated);
+    out
+}
+
 /// The server ids in the user's own order, folders flattened. `None` when the settings do not
 /// say (or are not what this expects).
 pub fn guild_order(settings: &str) -> Option<Vec<String>> {
@@ -300,5 +497,117 @@ mod tests {
         let cleared = with_status(&idle, "online", Some(""));
         assert_eq!((own_status(&cleared).1.as_str(), bytes_of(&cleared, 2)), ("", None));
         assert_eq!(status_settings("AAAA"), None);
+    }
+
+    #[test]
+    fn guild_folders_round_trip_preserves_unknown_fields_and_other_settings_byte_for_byte() {
+        // Build a PreloadedUserSettings blob containing:
+        // - field 11 (status = "dnd")
+        // - field 99 (unknown top-level varint = 42)
+        // - field 14 (guild_folders with an unknown subfield 7 = 1 and initial folder)
+        let mut whole = Vec::new();
+        let status = with_status(&[], "dnd", Some("busy"));
+        write(&mut whole, 11, &status);
+        write_varint_field(&mut whole, 99, 42);
+        let mut initial_f14 = Vec::new();
+        write_varint_field(&mut initial_f14, 7, 1);
+        let initial_f14 = with_guild_folders(
+            &initial_f14,
+            &[GuildFolder { id: None, name: String::new(), color: None, guild_ids: vec!["4000".into()] }],
+        );
+        write(&mut whole, 14, &initial_f14);
+
+        let updated_folders = vec![
+            GuildFolder {
+                id: Some(77),
+                name: "Favorites".into(),
+                color: Some(0x5865F2),
+                guild_ids: vec!["5000".into(), "4000".into()],
+            },
+            GuildFolder {
+                id: None,
+                name: String::new(),
+                color: None,
+                guild_ids: vec!["6000".into()],
+            },
+        ];
+
+        // 1. Patch-only encoding round-trips folders, order, and keeps unknown field 7 inside field 14.
+        let patch_block = with_guild_folders(&initial_f14, &updated_folders);
+        let patch_b64 = settings_with_folders(&patch_block);
+        assert_eq!(guild_folders(&patch_b64).unwrap(), updated_folders);
+        assert_eq!(guild_order(&patch_b64).unwrap(), ["5000", "4000", "6000"]);
+        let round_block = guild_folders_settings(&patch_b64).unwrap();
+        assert!(fields(&round_block).iter().any(|(n, f, _)| *n == 7 && matches!(f, Field::Varint(1))));
+
+        // 2. Whole-settings replacement leaves field 11 (status) and unknown field 99 byte-for-byte identical.
+        let replaced = replace_guild_folders_in_whole(&whole, &updated_folders);
+        assert_eq!(bytes_of(&replaced, 11), bytes_of(&whole, 11));
+        assert!(fields(&replaced).iter().any(|(n, f, _)| *n == 99 && matches!(f, Field::Varint(42))));
+        let replaced_b64 = base64::engine::general_purpose::STANDARD.encode(&replaced);
+        assert_eq!(guild_folders(&replaced_b64).unwrap(), updated_folders);
+    }
+
+    fn loose(id: &str) -> GuildFolder {
+        GuildFolder { id: None, name: String::new(), color: None, guild_ids: vec![id.into()] }
+    }
+
+    fn named(id: i64, name: &str, guilds: &[&str]) -> GuildFolder {
+        GuildFolder {
+            id: Some(id),
+            name: name.into(),
+            color: None,
+            guild_ids: guilds.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_server_moves_before_another_into_a_folder_and_out_and_a_drop_makes_a_folder() {
+        let list = vec![loose("30"), loose("10"), loose("20")];
+        let before = move_guild(&list, "30", Some("20"), None, None, 1).unwrap();
+        assert_eq!(before, vec![loose("10"), loose("30"), loose("20")]);
+        let end = move_guild(&list, "30", None, None, None, 1).unwrap();
+        assert_eq!(end, vec![loose("10"), loose("20"), loose("30")]);
+        assert_eq!(move_guild(&list, "30", Some("30"), None, None, 1).unwrap(), list);
+
+        let made = move_guild(&list, "30", None, None, Some("10"), 77).unwrap();
+        assert_eq!(made, vec![named(77, "", &["10", "30"]), loose("20")]);
+        let flipped = move_guild(&list, "30", Some("10"), None, Some("10"), 77).unwrap();
+        assert_eq!(flipped[0].guild_ids, ["30", "10"]);
+
+        let joined = move_guild(&made, "20", Some("30"), Some("77"), None, 1).unwrap();
+        assert_eq!(joined, vec![named(77, "", &["10", "20", "30"])]);
+        let pair = vec![named(77, "Games", &["10", "20"]), loose("30")];
+        let left = move_guild(&pair, "10", Some("30"), None, None, 1).unwrap();
+        assert_eq!(left, vec![loose("20"), loose("10"), loose("30")], "one server left is not a folder");
+
+        assert_eq!(move_guild(&list, "30", None, None, Some("30"), 1), Err("A server cannot be dropped onto itself."));
+        assert_eq!(
+            move_guild(&list, "30", None, Some("77"), Some("10"), 1),
+            Err("Move a server into a folder or onto another server, not both.")
+        );
+        assert_eq!(move_guild(&made, "20", None, Some("nope"), None, 1), Err("That folder is not on this account."));
+    }
+
+    #[test]
+    fn a_folder_can_be_renamed_and_recoloured_and_the_moved_list_keeps_unknown_bytes() {
+        let mut folders = vec![named(77, "Games", &["30", "10"])];
+        edit_guild_folder(&mut folders, 77, Some("  Favourites  "), Some(Some(0x15865F2))).unwrap();
+        assert_eq!(folders[0].name, "Favourites");
+        assert_eq!(folders[0].color, Some(0x5865F2));
+        edit_guild_folder(&mut folders, 77, Some(""), Some(None)).unwrap();
+        assert_eq!(folders[0].name, "");
+        assert_eq!(folders[0].color, None);
+        assert_eq!(edit_guild_folder(&mut folders, 3, Some("x"), None), Err("That folder is not on this account."));
+
+        let mut raw = Vec::new();
+        write_varint_field(&mut raw, 7, 1);
+        let start = vec![loose("30"), loose("10"), loose("20")];
+        let raw = with_guild_folders(&raw, &start);
+        let moved = move_guild(&start, "30", None, None, Some("10"), 77).unwrap();
+        let encoded = settings_with_folders(&with_guild_folders(&raw, &moved));
+        assert_eq!(guild_folders(&encoded).unwrap(), moved);
+        let block = guild_folders_settings(&encoded).unwrap();
+        assert!(fields(&block).iter().any(|(n, f, _)| *n == 7 && matches!(f, Field::Varint(1))));
     }
 }

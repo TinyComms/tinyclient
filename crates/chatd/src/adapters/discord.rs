@@ -342,6 +342,10 @@ struct State {
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
     status_settings: Vec<u8>,
+    /// Our guild folders protobuf block (field 14) and parsed folder list, kept so reordering
+    /// or folder edits preserve unknown fields byte-for-byte.
+    guild_folders_settings: Vec<u8>,
+    folders: Vec<proto::GuildFolder>,
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
     covered: HashMap<String, Vec<(u64, u64)>>,
@@ -1411,6 +1415,80 @@ impl Discord {
         Ok(())
     }
 
+    /// Reorders a server, moves it into or out of a folder, or drops it onto another server to
+    /// make a folder. Discord stores that list in the settings protobuf (`settings-proto/1`).
+    ///
+    /// Unverified against a real account: the field numbers are the community's (`proto.rs`),
+    /// and the folder block is sent back with every unknown field inside it kept.
+    fn move_space(&self, space_id: &str, before: Option<&str>, folder: Option<&str>, into_space: Option<&str>) -> Result<(), Refusal> {
+        self.known_guild(space_id)?;
+        if let Some(other) = into_space {
+            self.known_guild(other)?;
+        }
+        let (current, new_id) = {
+            let state = crate::hub::lock(&self.state);
+            (state.folders.clone(), fresh_folder_id(&state.folders))
+        };
+        let next = proto::move_guild(&current, space_id, before, folder, into_space, new_id).map_err(|err| Refusal::Refused(err.to_owned()))?;
+        self.save_folders(&current, next)
+    }
+
+    /// Renames or recolors a server folder. `name` absent leaves the name; `color` absent
+    /// leaves the color, and `Some(None)` clears it.
+    fn set_folder(&self, folder_id: &str, name: Option<String>, color: Option<Option<u32>>) -> Result<(), Refusal> {
+        let id = folder_id
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| Refusal::Refused("That folder is not on this account.".to_owned()))?;
+        let current = crate::hub::lock(&self.state).folders.clone();
+        let mut next = current.clone();
+        proto::edit_guild_folder(&mut next, id, name.as_deref(), color).map_err(|err| Refusal::Refused(err.to_owned()))?;
+        self.save_folders(&current, next)
+    }
+
+    fn known_guild(&self, id: &str) -> Result<(), Refusal> {
+        let numeric = !id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_digit());
+        let known = numeric && crate::hub::lock(&self.state).guilds.contains_key(id);
+        if known { Ok(()) } else { Err(Refusal::Refused("That server is not on this account.".to_owned())) }
+    }
+
+    /// Writes the folder list when it changed, then records it. A list Discord already has is
+    /// not sent again, so a retry after the store write failed does not move the server twice.
+    fn save_folders(&self, current: &[proto::GuildFolder], next: Vec<proto::GuildFolder>) -> Result<(), Refusal> {
+        let block = if next != current {
+            let raw = crate::hub::lock(&self.state).guild_folders_settings.clone();
+            let block = proto::with_guild_folders(&raw, &next);
+            let body = json!({"settings": proto::settings_with_folders(&block)});
+            self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+            Some(block)
+        } else {
+            None
+        };
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(block) = block {
+                state.guild_folders_settings = block;
+            }
+            let placed: HashSet<String> = next.iter().flat_map(|folder| folder.guild_ids.iter().cloned()).collect();
+            let mut unplaced: Vec<String> = state.guilds.keys().filter(|id| !placed.contains(*id)).cloned().collect();
+            unplaced.sort_by(|left, right| {
+                let pos = |id: &String| state.guilds.get(id).map(|info| info.position).unwrap_or(0);
+                pos(left).cmp(&pos(right)).then(left.cmp(right))
+            });
+            let mut position = 0i32;
+            let ordered = unplaced.into_iter().chain(next.iter().flat_map(|folder| folder.guild_ids.iter().cloned()));
+            for id in ordered {
+                if let Some(info) = state.guilds.get_mut(&id) {
+                    info.position = position;
+                    position = position.saturating_add(1);
+                }
+            }
+            state.folders = next.clone();
+        }
+        self.record_folders(&next).map_err(|err| Refusal::Refused(err.to_string()))?;
+        self.spaces().map_err(|err| Refusal::Refused(err.to_string()))
+    }
+
     /// Acknowledges reading up to `message`. At most one per channel per [`ACK_EVERY`]: a read
     /// inside that time is held, and the newest held one is sent when the time is up, once.
     fn mark_read(&self, channel: &str, message: &str) {
@@ -1887,6 +1965,12 @@ impl Discord {
                 answer(reply, self.mentions(before.as_deref(), everyone, roles, space_id.as_deref(), limit))
             }
             Command::DismissMention { message_id, reply } => answer(reply, self.dismiss_mention(&message_id)),
+            Command::MoveSpace { space_id, before, folder, into_space, reply } => {
+                answer(reply, self.move_space(&space_id, before.as_deref(), folder.as_deref(), into_space.as_deref()))
+            }
+            Command::SetFolder { folder_id, name, color, reply } => {
+                answer(reply, self.set_folder(&folder_id, name, color))
+            }
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { kind, space_id, query, cursor, reply } => {
                 answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))
@@ -1936,6 +2020,20 @@ impl Discord {
             command => command.unsupported(&self.ctx),
         }
     }
+}
+
+/// A new folder id, a snowflake from now, distinct from the folders already stored.
+fn fresh_folder_id(folders: &[proto::GuildFolder]) -> i64 {
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(0);
+    let snowflake = millis.saturating_sub(1_420_070_400_000).saturating_shl(22);
+    let mut id = i64::try_from(snowflake).unwrap_or(1).max(1);
+    for _ in 0..64 {
+        if !folders.iter().any(|folder| folder.id == Some(id)) {
+            return id;
+        }
+        id = id.saturating_add(1);
+    }
+    id
 }
 
 /// Discord's thread name: one line, at most 100 characters. Empty becomes "Thread".
