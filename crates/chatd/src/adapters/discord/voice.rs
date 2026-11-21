@@ -271,6 +271,7 @@ impl Voice {
     pub(super) fn reset(&mut self) {
         self.states.clear();
         self.told.clear();
+        self.ringing_out.clear();
     }
 
     /// True for a channel whose occupants chatd is to know: one of the server on screen, the
@@ -1036,6 +1037,9 @@ impl Discord {
             call.stopped_by_us = false;
             call.answered = false;
         }
+        // Tell chatd/shell the call moved BEFORE OP 4 so VOICE_STATE_UPDATE / VOICE_SERVER_UPDATE
+        // arriving while the HTTP ring request is in flight are not dropped by `Calls::join`.
+        self.ctx.tiny_moved(conversation_id, &new_id);
         self.tell(4, voice_state(None, Some(&new_id), muted, deafened, video));
 
         // Step 3: ring everyone in the new group DM. If ringing fails, undo Step 2 and return
@@ -1053,12 +1057,11 @@ impl Discord {
                     call.ring = false;
                 }
             }
+            self.ctx.tiny_moved(&new_id, conversation_id);
             self.tell(4, voice_state(None, Some(conversation_id), muted, deafened, video));
             return Err(super::Refusal::Refused(ring_refused(&refused)));
         }
 
-        // Tell the shell the call moved to the new group DM.
-        self.ctx.tiny_moved(conversation_id, &new_id);
         self.roster();
         self.occupancy(BTreeSet::from([conversation_id.to_owned(), new_id.clone()]));
         Ok(new_id)

@@ -425,7 +425,7 @@ impl MemberList {
                     s.read(cx)
                         .held_rows()
                         .find(|r| &r.key == key)
-                        .map(|r| (crate::gui::profile::facts::can_remove_members(r), r.key.clone()))
+                        .map(|r| (super::info::profile::facts::can_remove_members(r), r.key.clone()))
                 })
             })
             .unwrap_or_else(|| (false, person.key.clone()));
@@ -537,7 +537,7 @@ impl Render for MemberList {
             self.shell.upgrade().and_then(|s| {
                 s.read(cx)
                     .held_rows()
-                    .find(|r| &r.key == key && crate::gui::profile::facts::can_add_members(r))
+                    .find(|r| &r.key == key && super::info::profile::facts::can_add_members(r))
                     .map(|r| r.key.clone())
             })
         });
