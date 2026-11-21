@@ -357,6 +357,30 @@ impl Fake {
             },
             _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
             _ if path.starts_with("/upload/") => self.upload(call),
+            _ if path == "/ams/v1/objects" && call.method == "POST" => {
+                if header("authorization") != format!("skype_token {skype}") {
+                    return unauthorized();
+                }
+                answer("201 Created", json!({"id": "0-weu-d1-sentvoice"}))
+            }
+            _ if path.starts_with("/ams/v1/objects/") && path.ends_with("/content/audio") && call.method == "PUT" => {
+                if header("authorization") != format!("skype_token {skype}") {
+                    return unauthorized();
+                }
+                answer("201 Created", json!({}))
+            }
+            _ if path.starts_with("/ams/v1/objects/") && path.ends_with("/views/audio") => Reply {
+                status: "200 OK",
+                headers: Vec::new(),
+                kind: "audio/ogg",
+                body: b"OggSfake-voice-bytes".to_vec(),
+            },
+            _ if path.starts_with("/ams/v1/objects/") && path.ends_with("/views/video") => Reply {
+                status: "200 OK",
+                headers: Vec::new(),
+                kind: "video/mp4",
+                body: b"\x00\x00\x00\x18ftypmp42video".to_vec(),
+            },
             _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") => Reply {
                 status: "200 OK",
                 headers: Vec::new(),
@@ -497,6 +521,9 @@ impl Fake {
         let (thread, root) = conversation.split_once(";messageid=").map_or((conversation, None), |(thread, root)| (thread, Some(root.to_owned())));
         let root = root.or_else(|| thread.contains("@thread.tacv2").then(|| arrived.to_string()));
         let mut echo = message(thread, root.as_deref(), arrived, ME, sent["imdisplayname"].as_str().unwrap_or(""), sent["content"].as_str().unwrap_or(""));
+        if let Some(mt) = sent["messagetype"].as_str().filter(|s| !s.is_empty()) {
+            echo["messagetype"] = json!(mt);
+        }
         echo["clientmessageid"] = sent["clientmessageid"].clone();
         if sent["properties"].is_object() {
             echo["properties"] = sent["properties"].clone();
@@ -2384,6 +2411,133 @@ fn gcc_high_session_mints_sovereign_audiences_and_uses_sovereign_origin() {
         panic!("no info");
     };
     assert!(info.link.starts_with("https://gov.teams.microsoft.us/l/channel/"), "{}", info.link);
+}
+
+#[test]
+fn voice_messages_and_video_clips_can_be_played_and_recorded() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Teams advertises voice notes while keeping general OneDrive uploads disabled.
+    let status = world.account(HOME);
+    assert!(status.can.voice_notes, "Teams must advertise voice_notes");
+    assert_eq!(status.can.max_file_bytes, 0, "general file uploads remain disabled");
+
+    // 2. Receive voice message, video clip, and unhosted fallback fixtures.
+    let fixtures = world.fake.fixture("clips").expect("clips fixture");
+    for kind in ["voice", "video", "unhosted_voice"] {
+        world.fake.push("NewMessage", fixtures[kind].clone(), false);
+    }
+    world.until("all three clip fixtures", || {
+        let msgs = world.messages(&ana);
+        ["1760000840001", "1760000840002", "1760000840003"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+
+    let voice = world.message(&ana, "1760000840001").unwrap();
+    assert_eq!(voice.attachments.len(), 1);
+    assert_eq!(voice.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(voice.attachments[0].duration, 12);
+    assert_eq!(voice.attachments[0].waveform, vec![5, 18, 29, 12]);
+    let voice_id = voice.attachments[0].file.id.clone();
+    let fetched_voice = world.until("voice message audio to be fetched", || {
+        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![voice_id.clone()] }) {
+            Response::Media { files } => files.into_iter().find(|f| f.id == voice_id && f.path.is_some()),
+            _ => None,
+        }
+    });
+    assert_eq!(std::fs::read(fetched_voice.path.as_deref().unwrap()).unwrap(), b"OggSfake-voice-bytes");
+
+    let video = world.message(&ana, "1760000840002").unwrap();
+    assert_eq!(video.attachments.len(), 1);
+    assert_eq!(video.attachments[0].file.kind, MediaKind::Video);
+    assert_eq!(video.attachments[0].duration, 25);
+    assert_eq!(video.attachments[0].file.width, 640);
+    assert_eq!(video.attachments[0].file.height, 360);
+    let thumb = video.attachments[0].thumb.as_ref().expect("video clip thumbnail");
+    assert_eq!(thumb.kind, MediaKind::Image);
+    let video_id = video.attachments[0].file.id.clone();
+    let fetched_video = world.until("video clip to be fetched", || {
+        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![video_id.clone()] }) {
+            Response::Media { files } => files.into_iter().find(|f| f.id == video_id && f.path.is_some()),
+            _ => None,
+        }
+    });
+    assert_eq!(std::fs::read(fetched_video.path.as_deref().unwrap()).unwrap(), b"\x00\x00\x00\x18ftypmp42video");
+
+    let unhosted = world.message(&ana, "1760000840003").unwrap();
+    assert!(unhosted.attachments.is_empty());
+    assert_eq!(unhosted.text, "Voice message", "unhosted clip must not say Card");
+
+    // 3. Send a recorded voice note: accepted even though max_file_bytes == 0.
+    let clip_path = std::env::temp_dir().join(format!("tiny-teams-voice-{}.opus", std::process::id()));
+    std::fs::write(&clip_path, b"OggSrecorded-voice-note").unwrap();
+    let send_voice = Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000672".to_owned(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: clip_path.to_string_lossy().into_owned(),
+                name: "voice-note.opus".to_owned(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            voice: Some(protocol::VoiceNote { duration: 4_600, waveform: vec![10, 20, 30] }),
+            ..protocol::Outgoing::default()
+        },
+    };
+    assert!(matches!(world.ask(send_voice), Response::Sent { .. }));
+    let sent_voice = world.until("sent voice note", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000672") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent_voice.attachments.len(), 1);
+    assert_eq!(sent_voice.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent_voice.attachments[0].duration, 5);
+    assert!(!world.fake.calls("POST", "/ams/v1/objects").is_empty());
+    assert!(!world.fake.calls("PUT", "/ams/v1/objects/0-weu-d1-sentvoice/content/audio").is_empty());
+    let posted = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000672")
+        .expect("voice message POST");
+    assert_eq!(posted.json()["messagetype"].as_str(), Some("RichText/Media_AudioMsg"));
+    assert!(posted.json()["content"].as_str().unwrap_or("").contains("type=\"Audio.1\""));
+    assert_eq!(posted.json()["properties"]["amsreferences"][0].as_str(), Some("0-weu-d1-sentvoice"));
+
+    // 4. Ordinary file sends remain refused when general uploads are disabled.
+    let plain_file = Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000673".to_owned(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: clip_path.to_string_lossy().into_owned(),
+                name: "notes.txt".to_owned(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            ..protocol::Outgoing::default()
+        },
+    };
+    assert!(matches!(world.ask(plain_file), Response::Error { .. }));
+    let _ = std::fs::remove_file(&clip_path);
 }
 
 

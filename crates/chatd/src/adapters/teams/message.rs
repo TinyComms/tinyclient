@@ -788,6 +788,133 @@ impl Teams {
         for gif in parsed.gifs {
             message.attachments.push(giphy_gif(&gif, &mut media));
         }
+        let is_voice_msg = matches!(kind, "RichText/Media_AudioMsg" | "RichText/Media_VoiceClip");
+        let is_video_msg = matches!(kind, "RichText/Media_Video" | "RichText/Media_VideoClip");
+        let mut saw_voice_clip = is_voice_msg;
+        let mut saw_video_clip = is_video_msg;
+        let prop_duration = [&props["voiceMessageDuration"], &props["durationInSeconds"], &props["duration"]]
+            .into_iter()
+            .find_map(|v| match v {
+                Value::Number(n) => n.as_f64().filter(|f| *f > 0.0).map(|f| f.round() as u32),
+                Value::String(s) => Some(html::parse_duration_secs(s, false)).filter(|d| *d > 0),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let prop_waveform: Vec<u8> = match &props["waveform"] {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n.min(255) as u8))
+                .take(protocol::WAVEFORM_LIMIT)
+                .collect(),
+            Value::String(raw) if !raw.trim().is_empty() => {
+                let trimmed = raw.trim();
+                if trimmed.starts_with('[') {
+                    serde_json::from_str::<Vec<u64>>(trimmed)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|n| n.min(255) as u8)
+                        .take(protocol::WAVEFORM_LIMIT)
+                        .collect()
+                } else {
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(protocol::WAVEFORM_LIMIT)
+                        .collect()
+                }
+            }
+            _ => Vec::new(),
+        };
+        for (idx, clip) in parsed.clips.into_iter().enumerate() {
+            match clip.kind {
+                html::ClipKind::Audio => saw_voice_clip = true,
+                html::ClipKind::Video => saw_video_clip = true,
+            }
+            if clip.uri.is_empty() || !self.pictures(&clip.uri) {
+                continue;
+            }
+            let base = clip.uri.trim_end_matches('/');
+            let object = base
+                .split("/objects/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!clip.doc_id.is_empty()).then_some(clip.doc_id.as_str()))
+                .unwrap_or(&id);
+            match clip.kind {
+                html::ClipKind::Audio => {
+                    let fetch_url = if base.contains("/views/") {
+                        base.to_owned()
+                    } else {
+                        format!("{base}/views/audio")
+                    };
+                    let named = if clip.name.trim().is_empty() { "Voice message" } else { clip.name.trim() };
+                    let ext = named.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+                    let mime = match ext.as_str() {
+                        "ogg" | "oga" | "opus" => "audio/ogg",
+                        "mp3" => "audio/mpeg",
+                        "wav" => "audio/wav",
+                        "webm" => "audio/webm",
+                        _ => "audio/mp4",
+                    };
+                    let file = MediaFile {
+                        bytes: clip.bytes,
+                        ..MediaFile::new(format!("voice:{}:{idx}", escaped(object)), MediaKind::Audio)
+                    };
+                    media.push((file.clone(), fetch_url));
+                    message.attachments.push(Attachment {
+                        mime: mime.to_owned(),
+                        duration: if clip.duration > 0 { clip.duration } else { prop_duration },
+                        waveform: prop_waveform.clone(),
+                        ..Attachment::new(named, file)
+                    });
+                }
+                html::ClipKind::Video => {
+                    let fetch_url = if base.contains("/views/") {
+                        base.to_owned()
+                    } else {
+                        format!("{base}/views/video")
+                    };
+                    let named = if clip.name.trim().is_empty() { "Video clip" } else { clip.name.trim() };
+                    let ext = named.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+                    let mime = match ext.as_str() {
+                        "webm" => "video/webm",
+                        "mov" => "video/quicktime",
+                        _ => "video/mp4",
+                    };
+                    let file = MediaFile {
+                        width: clip.width,
+                        height: clip.height,
+                        bytes: clip.bytes,
+                        ..MediaFile::new(format!("video:{}:{idx}", escaped(object)), MediaKind::Video)
+                    };
+                    media.push((file.clone(), fetch_url));
+                    let thumb_url = if !clip.thumb.is_empty() && self.pictures(&clip.thumb) {
+                        Some(clip.thumb.clone())
+                    } else if base.contains("/objects/") {
+                        let root = base.split("/views/").next().unwrap_or(base);
+                        Some(format!("{root}/views/video_imgt1"))
+                    } else {
+                        None
+                    };
+                    let thumb = thumb_url.map(|u| {
+                        let t = MediaFile {
+                            width: clip.width,
+                            height: clip.height,
+                            ..MediaFile::new(format!("video:{}:{idx}:thumb", escaped(object)), MediaKind::Image)
+                        };
+                        media.push((t.clone(), u));
+                        t
+                    });
+                    message.attachments.push(Attachment {
+                        thumb,
+                        mime: mime.to_owned(),
+                        duration: if clip.duration > 0 { clip.duration } else { prop_duration },
+                        ..Attachment::new(named, file)
+                    });
+                }
+            }
+        }
         let shared_files = listed(&props["files"]);
         if !shared_files.is_empty() {
             let mut state = self.state();
@@ -972,7 +1099,13 @@ impl Teams {
                 message.kind = MessageKind::Unsupported { link };
             }
         } else if message.text.is_empty() && message.attachments.is_empty() && message.card.is_none() && message.previews.is_empty() {
-            message.text = "Unsupported message".to_owned();
+            message.text = if saw_voice_clip {
+                "Voice message".to_owned()
+            } else if saw_video_clip {
+                "Video clip".to_owned()
+            } else {
+                "Unsupported message".to_owned()
+            };
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
@@ -1577,6 +1710,79 @@ impl Teams {
         message.spans = spans;
         message.importance = with.importance;
         message.previews = sent_previews;
+        message.sender.avatar = self.picture(&me, &name);
+        message.sender.id = me;
+        if let Some((channel, root)) = chain_of(&target) {
+            if target != conversation {
+                self.chain_known(channel, root)?;
+                self.ctx.history(&target, std::slice::from_ref(&message))?;
+            }
+            self.bump(channel, root, &[&message], false)?;
+        }
+        message.reply_to = quote;
+        Ok(message)
+    }
+
+    /// Posts a message with caller-built raw content and an explicit Teams `messagetype`
+    /// (e.g. `RichText/Media_AudioMsg` for voice notes, or `RichText/Html` for GIF/sticker embeds).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn post_raw_message(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        message_type: &str,
+        content: &str,
+        reply_to: Option<&str>,
+        with: &protocol::Outgoing,
+        mut properties: Option<Value>,
+        attachments: Vec<Attachment>,
+    ) -> Result<Message, Fault> {
+        let mut target = conversation.to_owned();
+        let quote = match reply_to {
+            Some(original) => self.quoted(conversation, original)?,
+            None => None,
+        };
+        let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
+        let mut wire_content = content.to_owned();
+        if let Some(level) = importance_wire(with.importance) {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("importance".to_owned(), Value::String(level.to_owned()));
+            }
+        }
+        match (reply_to, &quote) {
+            (Some(original), _) if channel => target = chain_id(conversation, original),
+            (_, Some(quote)) if message_type == "RichText/Html" => wire_content = format!("{}{wire_content}", quote_markup(quote)),
+            _ => {}
+        }
+        let path = format!("/v1/users/ME/conversations/{}/messages", escaped(&target));
+        let mut body = json!({
+            "clientmessageid": client_id,
+            "content": wire_content,
+            "messagetype": message_type,
+            "contenttype": "text",
+            "imdisplayname": self.own_name(),
+        });
+        if let Some(properties) = properties {
+            body["properties"] = properties;
+        }
+        let answer = self.chat("POST", &path, Body::Json(&body), false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } if channel && reply_to.is_none() => Fault::Refused {
+                status: 403,
+                message: "Only channel moderators can start new posts here.".to_owned(),
+            },
+            other => other,
+        })?;
+        let id = id_of(&answer.body["OriginalArrivalTime"]);
+        if millis(&id) == 0 {
+            return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
+        }
+        let me = self.me();
+        let name = self.own_name();
+        let sent = millis(&id) / 1000;
+        let mut message = Message::plain(id, name.clone(), String::new(), sent, true);
+        message.importance = with.importance;
+        message.attachments = attachments;
         message.sender.avatar = self.picture(&me, &name);
         message.sender.id = me;
         if let Some((channel, root)) = chain_of(&target) {

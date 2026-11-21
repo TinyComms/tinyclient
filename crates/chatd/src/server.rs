@@ -1371,6 +1371,7 @@ impl Chat {
         if with.files.is_empty() {
             return Ok(());
         }
+        let voice_only = with.voice.is_some() && with.files.len() == 1 && can.voice_notes;
         let max_file_bytes = self
             .hub
             .store()
@@ -1378,6 +1379,11 @@ impl Chat {
             .ok()
             .flatten()
             .map_or(can.max_file_bytes, |row| can.max_file_bytes.max(row.max_file_bytes));
+        let max_file_bytes = if voice_only && max_file_bytes == 0 {
+            25 * 1024 * 1024
+        } else {
+            max_file_bytes
+        };
         if max_file_bytes == 0 {
             return refuse(format!("Files can't be sent to {name} from tinyclient yet."));
         }

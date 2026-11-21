@@ -41,6 +41,12 @@ impl Teams {
             reply_to.map(str::to_owned),
             with.clone(),
         );
+        if with.voice.is_some() && with.files.len() == 1 {
+            upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
+                teams.send_voice(&conversation_id, &client, reply.as_deref(), &outgoing, up)
+            });
+            return;
+        }
         upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
             teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &outgoing, up)
         });
@@ -91,6 +97,87 @@ impl Teams {
         Ok(message)
     }
 
+    /// Uploads a recorded voice message to Teams' AMS media store and posts a
+    /// `RichText/Media_AudioMsg` referencing it.
+    fn send_voice(&self, conversation: &str, client_id: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
+        let (name, bytes, mime) = {
+            let file = &up.files()[0];
+            (file.name.clone(), file.bytes, file.mime)
+        };
+        if bytes == 0 {
+            return Err(format!("{name} is empty."));
+        }
+        let (skype_token, place) = self.skype().map_err(super::reason)?;
+        let Some(ams) = place.ams.as_deref() else {
+            return Err("Teams did not advertise a media store for voice messages.".to_owned());
+        };
+        let thread = super::thread_of(conversation);
+        let failed = |fault: Fault| format!("{name} could not be sent: {}", super::reason(fault));
+        let create_url = format!("{ams}/v1/objects");
+        let create_body = json!({
+            "type": "pish/audio",
+            "permissions": { thread: ["read"] },
+            "filename": name,
+        });
+        let created = self
+            .call("POST", &create_url, Auth::Ams, Body::Json(&create_body), false)
+            .map_err(failed)?;
+        let Some(object_id) = created.body["id"].as_str().filter(|s| !s.is_empty()).map(str::to_owned) else {
+            return Err(format!("{name} could not be sent: Teams did not name the uploaded voice message."));
+        };
+        up.check()?;
+        let upload_url = format!("{ams}/v1/objects/{}/content/audio", escaped(&object_id));
+        let target = Target::put(upload_url)
+            .header("Authorization", &format!("skype_token {skype_token}"))
+            .header("Content-Type", mime);
+        up.send(0, &target)?;
+        up.check()?;
+        let voice = with.voice.as_ref();
+        let duration_secs = voice.map_or(0, |v| (u64::from(v.duration) + 500) / 1000) as u32;
+        let waveform = voice.map_or_else(Vec::new, |v| v.waveform.clone());
+        let object_uri = format!("{ams}/v1/objects/{}", escaped(&object_id));
+        let content = format!(
+            "<URIObject uri=\"{uri}\" type=\"Audio.1\" doc_id=\"{doc}\">\
+             <Title></Title><Description></Description>\
+             <OriginalName v=\"{orig}\"/><FileSize v=\"{bytes}\"/><Duration v=\"{dur}\"/>\
+             </URIObject>",
+            uri = xml_attr(&object_uri),
+            doc = xml_attr(&object_id),
+            orig = xml_attr(&name),
+            bytes = bytes,
+            dur = format_hms(duration_secs),
+        );
+        let mut props = json!({ "amsreferences": [object_id] });
+        if !waveform.is_empty() {
+            props["waveform"] = json!(waveform);
+        }
+        let file = MediaFile {
+            bytes,
+            ..MediaFile::new(format!("voice:sent:{}", escaped(&object_id)), MediaKind::Audio)
+        };
+        let fetch_url = format!("{object_uri}/views/audio");
+        if let Err(err) = self.ctx.media(&[(file.clone(), fetch_url)]) {
+            tracing::warn!("chatd: Teams: {err}");
+        }
+        let attachment = Attachment {
+            mime: mime.to_owned(),
+            duration: duration_secs,
+            waveform,
+            ..Attachment::new(name, file)
+        };
+        self.post_raw_message(
+            conversation,
+            client_id,
+            "RichText/Media_AudioMsg",
+            &content,
+            reply_to,
+            with,
+            Some(props),
+            vec![attachment],
+        )
+        .map_err(super::reason)
+    }
+
     /// One file to OneDrive, in an upload session, and the entry the message names it by.
     fn one_file(&self, up: &mut Upload, at: usize) -> Result<(Value, Attachment), String> {
         let (name, bytes) = (up.files()[at].name.clone(), up.files()[at].bytes);
@@ -139,9 +226,31 @@ impl Teams {
     }
 }
 
+fn xml_attr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn format_hms(secs: u32) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h}:{m:02}:{s:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{iso_utc, seconds};
+    use super::{format_hms, xml_attr};
 
     #[test]
     fn iso_utc_round_trips_with_seconds() {
@@ -149,5 +258,12 @@ mod tests {
         let formatted = iso_utc(ts);
         assert_eq!(formatted, "2027-01-15T08:00:00.000Z");
         assert_eq!(seconds(&formatted), ts);
+    }
+
+    #[test]
+    fn voice_uri_helpers_escape_and_format_duration() {
+        assert_eq!(xml_attr("a&b\"<c>"), "a&amp;b&quot;&lt;c&gt;");
+        assert_eq!(format_hms(14), "0:00:14");
+        assert_eq!(format_hms(3665), "1:01:05");
     }
 }

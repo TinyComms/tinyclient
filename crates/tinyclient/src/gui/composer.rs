@@ -3054,10 +3054,16 @@ impl Composer {
         let Some(recording) = on else { return };
         let RecordState::Recorded { path, .. } = &recording.state else { return };
         self.note = Some(recording.clone());
-        let target = self.target.clone().expect("the conversation matched");
+        let mut target = self.target.clone().expect("the conversation matched");
         let known = self.tray.iter().any(|chip| chip.path.to_string_lossy() == *path)
             || self.drafts.get(&target.key).is_some_and(|draft| draft.files.iter().any(|chip| chip.path.to_string_lossy() == *path));
         if !known {
+            // Voice-note-only accounts (e.g. Teams AMS audio) keep general file uploads disabled
+            // (`max_file_bytes == 0`), so lift the staging cap for the recorded note only.
+            if target.can.voice_notes && target.can.max_file_bytes == 0 {
+                target.can.max_file_bytes = 25 * 1024 * 1024;
+                target.can.max_files = target.can.max_files.max(1);
+            }
             self.stage_files_for(target, vec![PathBuf::from(path)], false, cx);
         }
     }

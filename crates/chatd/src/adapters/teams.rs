@@ -289,6 +289,7 @@ struct Place {
     middle: String,
     presence: String,
     urlp: Option<String>,
+    ams: Option<String>,
 }
 
 struct Token {
@@ -349,6 +350,8 @@ struct State {
 enum Auth {
     /// The chat service's own header.
     Skype,
+    /// AMS media store header (`Authorization: skype_token ...`).
+    Ams,
     Bearer(Audience),
     /// A bearer token and the skype token beside it, as the middle tier takes them.
     Both(Audience),
@@ -733,7 +736,7 @@ impl Teams {
     fn forget(&self, auth: Auth) {
         let mut state = self.state();
         match auth {
-            Auth::Skype | Auth::Push => state.skype = None,
+            Auth::Skype | Auth::Ams | Auth::Push => state.skype = None,
             Auth::Bearer(scope) => drop(state.access.remove(&scope)),
             Auth::Both(scope) => {
                 state.access.remove(&scope);
@@ -796,6 +799,7 @@ impl Teams {
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| self.cloud.endpoints().presence.to_owned()),
                 urlp: named("urlp"),
+                ams: named("ams").or_else(|| named("amsV2")),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -824,6 +828,7 @@ impl Teams {
     fn headers(&self, auth: Auth) -> Result<Vec<(&'static str, String)>, Fault> {
         Ok(match auth {
             Auth::Skype => vec![("Authentication", format!("skypetoken={}", self.skype()?.0))],
+            Auth::Ams => vec![("Authorization", format!("skype_token {}", self.skype()?.0))],
             Auth::Push => vec![("X-Skypetoken", self.skype()?.0)],
             Auth::Bearer(scope) => vec![("Authorization", format!("Bearer {}", self.token(scope)?))],
             Auth::Both(scope) => {
@@ -950,6 +955,7 @@ impl Teams {
             clear_history: true,
             suppress_embeds: true,
             schedule: true,
+            voice_notes: true,
             forward: true,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
