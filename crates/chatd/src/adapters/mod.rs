@@ -421,6 +421,50 @@ pub enum Command {
         path: String,
         reply: Reply<()>,
     },
+    /// Kick, ban, unban, or restrict a member of a group or channel.
+    ModerateMember {
+        conversation_id: String,
+        person: String,
+        action: protocol::MemberModeration,
+        reply: Reply<()>,
+    },
+    /// Promote or demote an admin with specific rights and optional custom title.
+    SetAdmin {
+        conversation_id: String,
+        person: String,
+        rights: protocol::AdminRights,
+        reply: Reply<()>,
+    },
+    /// Transfer group/channel ownership using the account's 2FA password.
+    TransferOwnership {
+        conversation_id: String,
+        person: String,
+        password: String,
+        reply: Reply<()>,
+    },
+    /// Update group/channel default send permissions, slow mode, and feature toggles.
+    UpdateChatSettings {
+        conversation_id: String,
+        settings: protocol::ChatSettings,
+        reply: Reply<()>,
+    },
+    /// Read recent admin log events for a supergroup or channel.
+    AdminLog {
+        conversation_id: String,
+        limit: u32,
+        reply: Reply<Vec<protocol::AdminLogEntry>>,
+    },
+    /// List selectable send-as peers for a conversation and the current default peer id.
+    SendAsOptions {
+        conversation_id: String,
+        reply: Reply<(Vec<protocol::SendAs>, Option<String>)>,
+    },
+    /// Save the default send-as peer for a conversation.
+    SetDefaultSendAs {
+        conversation_id: String,
+        peer: String,
+        reply: Reply<()>,
+    },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
     /// Tiny call setup can create encrypted text history without enrolling a text device.
@@ -832,7 +876,14 @@ impl Command {
             Command::MembersAdd { reply, .. }
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }
-            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::ConversationPicture { reply, .. }
+            | Command::ModerateMember { reply, .. }
+            | Command::SetAdmin { reply, .. }
+            | Command::TransferOwnership { reply, .. }
+            | Command::UpdateChatSettings { reply, .. }
+            | Command::SetDefaultSendAs { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AdminLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendAsOptions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }
             | Command::StartGroup { reply, .. }

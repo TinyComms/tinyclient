@@ -58,6 +58,7 @@ mod files;
 mod filing;
 mod info;
 mod live;
+mod manage;
 mod members;
 mod peers;
 mod premium;
@@ -292,6 +293,8 @@ pub(super) struct Options {
     pub schedule: Option<i32>,
     /// Explicit consent to pay up to this many Stars for a paid message.
     pub allow_paid_stars: Option<i64>,
+    /// Optional peer to post as (channel or anonymous admin, from `channels.getSendAs`).
+    pub send_as: Option<Who>,
 }
 
 /// One connection's worth of an account: what every thread of the adapter shares.
@@ -812,6 +815,42 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Members { conversation_id, offset, limit, reply } => {
             let _ = reply.send(members::list(account, &conversation_id, offset, limit).map_err(refused));
         }
+        Command::MembersAdd { conversation_id, people, reply } => {
+            let _ = reply.send(manage::members_add(account, &conversation_id, &people).map_err(refused));
+        }
+        Command::MembersRemove { conversation_id, person, reply } => {
+            let _ = reply.send(manage::members_remove(account, &conversation_id, &person).map_err(refused));
+        }
+        Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+            let _ = reply.send(
+                manage::update_conversation(account, &conversation_id, title.as_deref(), topic.as_deref(), description.as_deref())
+                    .map_err(refused),
+            );
+        }
+        Command::ConversationPicture { conversation_id, path, reply } => {
+            let _ = reply.send(manage::update_picture(account, &conversation_id, &path).map_err(refused));
+        }
+        Command::ModerateMember { conversation_id, person, action, reply } => {
+            let _ = reply.send(manage::moderate_member(account, &conversation_id, &person, &action).map_err(refused));
+        }
+        Command::SetAdmin { conversation_id, person, rights, reply } => {
+            let _ = reply.send(manage::set_admin(account, &conversation_id, &person, &rights).map_err(refused));
+        }
+        Command::TransferOwnership { conversation_id, person, password, reply } => {
+            let _ = reply.send(manage::transfer_ownership(account, &conversation_id, &person, &password).map_err(refused));
+        }
+        Command::UpdateChatSettings { conversation_id, settings, reply } => {
+            let _ = reply.send(manage::update_settings(account, &conversation_id, &settings).map_err(refused));
+        }
+        Command::AdminLog { conversation_id, limit, reply } => {
+            let _ = reply.send(manage::admin_log(account, &conversation_id, limit).map_err(refused));
+        }
+        Command::SendAsOptions { conversation_id, reply } => {
+            let _ = reply.send(manage::send_as_options(account, &conversation_id).map_err(refused));
+        }
+        Command::SetDefaultSendAs { conversation_id, peer, reply } => {
+            let _ = reply.send(manage::set_default_send_as(account, &conversation_id, &peer).map_err(refused));
+        }
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Telegram once a message does.
             let started = match Who::parse(&person_id) {
@@ -1096,7 +1135,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         entities,
         schedule_date: opts.schedule,
         schedule_repeat_period: None,
-        send_as: None,
+        send_as: opts.send_as.and_then(|who| account.input(who).ok()),
         quick_reply_shortcut: None,
         effect: None,
         allow_paid_stars: opts.allow_paid_stars,

@@ -387,11 +387,24 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
             );
             let active = !chat.left && !chat.deactivated;
+            let can_info = chat.creator || admin.is_some_and(|r| r.change_info);
+            let can_ban = chat.creator || admin.is_some_and(|r| r.ban_users);
             let rights = protocol::ConversationRights {
                 pin: active && (chat.creator || admin.is_some_and(|r| r.pin_messages) || !pin_banned),
                 delete_others: active && (chat.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (chat.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
-                ..protocol::ConversationRights::default()
+                add_members: active && (chat.creator || admin.is_some_and(|r| r.invite_users)),
+                remove_members: active && can_ban,
+                rename: active && can_info,
+                edit_topic: active && can_info,
+                edit_picture: active && can_info,
+                ban_members: active && can_ban,
+                // Basic groups have no channel admin log, `channels.editAdmin`, or slow mode.
+                promote_admins: false,
+                manage_settings: false,
+                view_admin_log: false,
+                transfer_owner: active && chat.creator,
+                anonymous: active && admin.is_some_and(|r| r.anonymous),
             };
             let known = Known {
                 name: chat.title.clone(),
@@ -434,6 +447,8 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
             );
             let active = !channel.left;
+            let can_info = channel.creator || admin.is_some_and(|r| r.change_info);
+            let can_ban = channel.creator || admin.is_some_and(|r| r.ban_users);
             let rights = protocol::ConversationRights {
                 pin: active
                     && if channel.broadcast {
@@ -443,7 +458,17 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                     },
                 delete_others: active && (channel.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (channel.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
-                ..protocol::ConversationRights::default()
+                add_members: active && (channel.creator || admin.is_some_and(|r| r.invite_users)),
+                remove_members: active && can_ban,
+                rename: active && can_info,
+                edit_topic: active && can_info,
+                edit_picture: active && can_info,
+                ban_members: active && can_ban,
+                promote_admins: active && (channel.creator || admin.is_some_and(|r| r.add_admins)),
+                manage_settings: active && can_info,
+                view_admin_log: active && (channel.creator || admin.is_some()),
+                transfer_owner: active && channel.creator,
+                anonymous: active && admin.is_some_and(|r| r.anonymous),
             };
             let known = Known {
                 hash: channel.access_hash.filter(|_| !channel.min),

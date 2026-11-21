@@ -407,6 +407,25 @@ pub struct ConversationRights {
     /// May change this conversation's picture (`Request::ConversationPicture`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit_picture: bool,
+    /// May ban, unban, or restrict members (`Request::ModerateMember`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ban_members: bool,
+    /// May promote or demote admins and set admin custom titles (`Request::SetAdmin`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub promote_admins: bool,
+    /// May edit group/channel settings: default permissions, slow mode, join requests, forum,
+    /// pre-history visibility, signatures, protected content (`Request::UpdateChatSettings`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_settings: bool,
+    /// May read the recent-actions admin log (`Request::AdminLog`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_admin_log: bool,
+    /// Owner/creator: may transfer ownership with a 2FA password (`Request::TransferOwnership`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transfer_owner: bool,
+    /// Admin posts anonymously as the group/channel (`anonymous` admin right).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
 }
 
 impl ConversationRights {
@@ -418,6 +437,12 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
+    const BAN_MEMBERS: i64 = 1 << 8;
+    const PROMOTE_ADMINS: i64 = 1 << 9;
+    const MANAGE_SETTINGS: i64 = 1 << 10;
+    const VIEW_ADMIN_LOG: i64 = 1 << 11;
+    const TRANSFER_OWNER: i64 = 1 << 12;
+    const ANONYMOUS: i64 = 1 << 13;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -453,6 +478,24 @@ impl ConversationRights {
         if self.edit_picture {
             bits |= Self::EDIT_PICTURE;
         }
+        if self.ban_members {
+            bits |= Self::BAN_MEMBERS;
+        }
+        if self.promote_admins {
+            bits |= Self::PROMOTE_ADMINS;
+        }
+        if self.manage_settings {
+            bits |= Self::MANAGE_SETTINGS;
+        }
+        if self.view_admin_log {
+            bits |= Self::VIEW_ADMIN_LOG;
+        }
+        if self.transfer_owner {
+            bits |= Self::TRANSFER_OWNER;
+        }
+        if self.anonymous {
+            bits |= Self::ANONYMOUS;
+        }
         bits
     }
 
@@ -466,8 +509,104 @@ impl ConversationRights {
             rename: (bits & Self::RENAME) != 0,
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+            ban_members: (bits & Self::BAN_MEMBERS) != 0,
+            promote_admins: (bits & Self::PROMOTE_ADMINS) != 0,
+            manage_settings: (bits & Self::MANAGE_SETTINGS) != 0,
+            view_admin_log: (bits & Self::VIEW_ADMIN_LOG) != 0,
+            transfer_owner: (bits & Self::TRANSFER_OWNER) != 0,
+            anonymous: (bits & Self::ANONYMOUS) != 0,
         }
     }
+}
+
+/// Moderation action against one member of a group or channel (`Request::ModerateMember`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MemberModeration {
+    /// Remove from the group/channel without permanently banning.
+    Kick,
+    /// Ban from the group/channel (`until`: Unix seconds, `None` = permanent).
+    Ban {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
+    /// Lift an existing ban or restriction.
+    Unban,
+    /// Restrict specific send permissions (`until`: Unix seconds, `None` = permanent).
+    Restrict {
+        rules: SendRules,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
+}
+
+/// Admin permissions and custom title assigned via `Request::SetAdmin`. All booleans false demotes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRights {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub change_info: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub post_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ban_users: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invite_users: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pin_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_admins: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_call: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_topics: bool,
+    /// Custom admin title / rank (e.g. "Moderator"). Empty leaves unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rank: String,
+}
+
+/// Partial update to group or channel settings (`Request::UpdateChatSettings`). Unset fields stay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSettings {
+    /// Group-wide default member send permissions (`messages.editChatDefaultBannedRights`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_send_rules: Option<SendRules>,
+    /// Slow-mode interval in seconds (`0` disables slow mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_seconds: Option<u32>,
+    /// Require admin approval for join requests (`channels.toggleJoinRequest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_request: Option<bool>,
+    /// Enable or disable forum topics (`channels.toggleForum`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forum: Option<bool>,
+    /// Hide prior chat history for new members (`channels.togglePreHistoryHidden`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_history_hidden: Option<bool>,
+    /// Sign channel posts with the posting admin's name (`channels.toggleSignatures`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<bool>,
+    /// Protected content: forbid forwarding and saving media (`messages.toggleNoForwards`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_forwards: Option<bool>,
+}
+
+/// One read-only entry in a channel/supergroup's recent-actions log (`Request::AdminLog`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminLogEntry {
+    pub id: String,
+    /// Unix seconds when the action occurred.
+    pub date: i64,
+    /// Display name of the admin or user who performed the action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    /// Plain-text summary of what changed.
+    pub summary: String,
 }
 
 /// What an account may send and do on messages, as the session says (the plan, the workspace's

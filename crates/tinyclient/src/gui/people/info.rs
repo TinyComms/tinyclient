@@ -61,6 +61,38 @@ pub(in crate::gui) enum ManageKind {
     AddMembers,
 }
 
+/// Pending destructive moderation / management confirmation in Details.
+#[derive(Clone)]
+pub(in crate::gui) enum PendingMod {
+    Ban {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+    },
+    Promote {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+        rank: Entity<crate::gui::input::TextInput>,
+    },
+    TransferOwner {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+        password: Entity<crate::gui::input::TextInput>,
+    },
+}
+
+impl PendingMod {
+    pub fn conversation(&self) -> &Key {
+        match self {
+            PendingMod::Ban { conversation, .. }
+            | PendingMod::Promote { conversation, .. }
+            | PendingMod::TransferOwner { conversation, .. } => conversation,
+        }
+    }
+}
+
 pub struct InfoPane {
     shell: WeakEntity<Shell>,
     hub: Hub,
@@ -86,6 +118,11 @@ pub struct InfoPane {
     manage: Option<(Key, ManageKind, Entity<crate::gui::input::TextInput>)>,
     /// Pending confirmation to remove a member: (conversation, person_id, person_name).
     pending_remove: Option<(Key, String, String)>,
+    /// Pending confirmation for ban, admin promotion, or ownership transfer.
+    pending_mod: Option<PendingMod>,
+    /// Read-only recent admin actions fetched on demand (`Request::AdminLog`).
+    admin_log: Option<(Key, Vec<protocol::AdminLogEntry>)>,
+    admin_log_loading: bool,
     /// The content width, from the pane's.
     width: f32,
     /// The shell's Spaces, for In common and Details' icons.
@@ -138,6 +175,9 @@ impl InfoPane {
             notify_set: None,
             manage: None,
             pending_remove: None,
+            pending_mod: None,
+            admin_log: None,
+            admin_log_loading: false,
             width: 268.,
             spaces: Vec::new(),
         }
@@ -1159,6 +1199,168 @@ impl InfoPane {
         };
         super::ask_later(cx, Request::MembersRemove { conversation, person }, |_, _| {});
         cx.notify();
+    }
+
+    pub(in crate::gui) fn pending_mod(&self) -> Option<&PendingMod> {
+        self.pending_mod.as_ref()
+    }
+
+    pub(in crate::gui) fn admin_log_for(&self, key: &Key) -> Option<&[protocol::AdminLogEntry]> {
+        self.admin_log.as_ref().filter(|(k, _)| k == key).map(|(_, entries)| entries.as_slice())
+    }
+
+    pub(in crate::gui) fn admin_log_loading(&self) -> bool {
+        self.admin_log_loading
+    }
+
+    pub(in crate::gui) fn ask_ban_member(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        self.pending_mod = Some(PendingMod::Ban { conversation, person_id, person_name });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn ask_promote_admin(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        let rank = cx.new(|cx| crate::gui::input::TextInput::new("Custom title (optional)", cx));
+        self.pending_mod = Some(PendingMod::Promote { conversation, person_id, person_name, rank });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn ask_transfer_owner(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        let password = cx.new(|cx| crate::gui::input::TextInput::secret("Two-step verification password", cx));
+        self.pending_mod = Some(PendingMod::TransferOwner { conversation, person_id, person_name, password });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_mod(&mut self, cx: &mut Context<Self>) {
+        self.pending_mod = None;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn confirm_mod(&mut self, cx: &mut Context<Self>) {
+        if let Some(PendingMod::TransferOwner { password, .. }) = self.pending_mod.as_ref() {
+            if password.read(cx).text().is_empty() {
+                cx.notify();
+                return;
+            }
+        }
+        let Some(action) = self.pending_mod.take() else {
+            return;
+        };
+        let request = match action {
+            PendingMod::Ban { conversation, person_id, .. } => Request::ModerateMember {
+                conversation,
+                person: person_id,
+                action: protocol::MemberModeration::Ban { until: None },
+            },
+            PendingMod::Promote { conversation, person_id, rank, .. } => {
+                let rank = rank.read(cx).text().trim().to_owned();
+                Request::SetAdmin {
+                    conversation,
+                    person: person_id,
+                    rights: protocol::AdminRights {
+                        change_info: true,
+                        delete_messages: true,
+                        ban_users: true,
+                        invite_users: true,
+                        pin_messages: true,
+                        rank,
+                        ..protocol::AdminRights::default()
+                    },
+                }
+            }
+            PendingMod::TransferOwner { conversation, person_id, password, .. } => {
+                let password = password.read(cx).text().to_owned();
+                Request::TransferOwnership { conversation, person: person_id, password }
+            }
+        };
+        let shell = self.shell.clone();
+        super::ask_later(cx, request, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn pick_picture(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if only_draws() {
+            return;
+        }
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose photo".into()),
+        });
+        let shell = self.shell.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = asked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            let _ = cx.update(|cx| {
+                super::ask_later(cx, Request::ConversationPicture { conversation, path }, move |answer, cx| {
+                    if let Ok(Response::Error { detail, .. }) = answer {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                        });
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn update_chat_settings(&mut self, conversation: Key, settings: protocol::ChatSettings, cx: &mut Context<Self>) {
+        if only_draws() {
+            return;
+        }
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::UpdateChatSettings { conversation, settings }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn load_admin_log(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if self.admin_log.as_ref().is_some_and(|(k, _)| k == &conversation) {
+            self.admin_log = None;
+            cx.notify();
+            return;
+        }
+        self.admin_log_loading = true;
+        cx.notify();
+        if only_draws() {
+            self.admin_log_loading = false;
+            return;
+        }
+        let this = cx.weak_entity();
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::AdminLog { conversation: conversation.clone(), limit: 50 }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.admin_log_loading = false;
+                match answer {
+                    Ok(Response::AdminLog { conversation, entries }) => {
+                        this.admin_log = Some((conversation, entries));
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                        });
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
     }
 }
 

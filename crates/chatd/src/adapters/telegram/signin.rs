@@ -72,6 +72,35 @@ fn waiting() -> SignInStep {
     SignInStep::Qr { link: String::new(), expires: 0, problem: None }
 }
 
+/// Computes a Telegram 2FA SRP proof (`InputCheckPasswordSRP`) for `password` by fetching
+/// fresh parameters from `account.getPassword`. Used by ownership transfer (`messages.editChatCreator`).
+pub(super) fn srp_proof(wire: &dyn Wire, password: &str) -> Result<tl::enums::InputCheckPasswordSrp, Fault> {
+    let tl::enums::account::Password::Password(asked) = wire::call(wire, &tl::functions::account::GetPassword {})?;
+    let (Some(tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(algo)), Some(g_b), Some(srp_id)) =
+        (&asked.current_algo, asked.srp_b.clone(), asked.srp_id)
+    else {
+        return Err(Fault::Rpc { code: 400, name: "PASSWORD_REQUIRED".to_owned(), value: None });
+    };
+    if !(2..=7).contains(&algo.g) || !check_p_and_g(&algo.p, &algo.g) {
+        return Err(Fault::Net("Telegram sent untrusted SRP parameters for the password check.".to_owned()));
+    }
+    let (salt1, salt2, p, g, secure_random, pw) = (
+        algo.salt1.clone(),
+        algo.salt2.clone(),
+        algo.p.clone(),
+        algo.g,
+        asked.secure_random.clone(),
+        password.as_bytes().to_vec(),
+    );
+    let srp = std::thread::Builder::new()
+        .name("srp-transfer".into())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || calculate_2fa(&salt1, &salt2, &p, &g, g_b, secure_random, &pw))
+        .map_err(|err| Fault::Net(err.to_string()))?;
+    let (m1, g_a) = srp.join().map_err(|_| Fault::Net("SRP calculation failed.".to_owned()))?;
+    Ok(tl::types::InputCheckPasswordSrp { srp_id, a: g_a.to_vec(), m1: m1.to_vec() }.into())
+}
+
 /// Begins a sign-in, or with `input` answers the step on show. Answers the step to draw.
 /// `Err` when this build cannot sign in to Telegram at all, and why.
 pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<SignInStep, String> {

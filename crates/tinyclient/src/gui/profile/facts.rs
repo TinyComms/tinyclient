@@ -721,6 +721,66 @@ pub fn can_edit_picture(conversation: &Conversation) -> bool {
     conversation.kind != ConversationKind::Direct && conversation.rights.edit_picture
 }
 
+/// Whether this account may ban, unban, or restrict members of this group or channel.
+pub fn can_ban_members(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.ban_members
+}
+
+/// Whether this account may promote or demote admins in this group or channel.
+pub fn can_promote_admins(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.promote_admins
+}
+
+/// Whether this account may change group/channel settings (slow mode, defaults, toggles).
+pub fn can_manage_settings(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.manage_settings
+}
+
+/// Whether this account may view the recent-actions admin log.
+pub fn can_view_admin_log(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.view_admin_log
+}
+
+/// Whether this account is the owner and may transfer ownership.
+pub fn can_transfer_ownership(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.transfer_owner
+}
+
+/// Whether the Details pane should show the "Manage" section at all. Non-admins always get `false`.
+pub fn can_manage_conversation(conversation: &Conversation) -> bool {
+    can_rename(conversation)
+        || can_edit_topic(conversation)
+        || can_edit_picture(conversation)
+        || can_add_members(conversation)
+        || can_manage_settings(conversation)
+        || can_view_admin_log(conversation)
+        || can_transfer_ownership(conversation)
+}
+
+/// Moderation actions offered in a member's menu for this conversation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberModActions {
+    pub remove: bool,
+    pub ban: bool,
+    pub promote: bool,
+    pub transfer: bool,
+}
+
+impl MemberModActions {
+    pub fn any(self) -> bool {
+        self.remove || self.ban || self.promote || self.transfer
+    }
+}
+
+pub fn member_mod_actions(conversation: &Conversation) -> MemberModActions {
+    MemberModActions {
+        remove: can_remove_members(conversation),
+        ban: can_ban_members(conversation),
+        promote: can_promote_admins(conversation),
+        transfer: can_transfer_ownership(conversation),
+    }
+}
+
 /// Confirmation sentence for removing a member; names the person explicitly.
 pub fn remove_member_confirm_text(person_name: &str, group_title: &str) -> String {
     format!("Remove {person_name} from {group_title}? Others in the conversation may see this.")
@@ -1243,6 +1303,42 @@ mod tests {
         dm_with_rights.rights = grp.rights;
         assert!(!can_add_members(&dm_with_rights) && !can_rename(&dm_with_rights), "direct chats are not managed as groups");
         assert!(remove_member_confirm_text("Mina", "Design").contains("Mina"));
+
+        // Non-admin in a Telegram group or channel sees no Manage section and no member mod actions.
+        let non_admin = row(Network::Telegram, ConversationKind::Channel);
+        assert!(!can_manage_conversation(&non_admin), "non-admin must see no Manage section");
+        assert!(!can_ban_members(&non_admin));
+        assert!(!can_promote_admins(&non_admin));
+        assert!(!can_manage_settings(&non_admin));
+        assert!(!can_view_admin_log(&non_admin));
+        assert!(!can_transfer_ownership(&non_admin));
+        assert!(!member_mod_actions(&non_admin).any());
+
+        // An admin with change_info + ban_users sees only those actions, not ownership transfer.
+        let mut admin = row(Network::Telegram, ConversationKind::Channel);
+        admin.rights = protocol::ConversationRights {
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+            remove_members: true,
+            ban_members: true,
+            manage_settings: true,
+            view_admin_log: true,
+            ..Default::default()
+        };
+        assert!(can_manage_conversation(&admin));
+        assert!(can_ban_members(&admin) && can_manage_settings(&admin) && can_view_admin_log(&admin));
+        assert!(!can_promote_admins(&admin) && !can_transfer_ownership(&admin));
+        let acts = member_mod_actions(&admin);
+        assert!(acts.remove && acts.ban && !acts.promote && !acts.transfer);
+
+        // The creator sees ownership transfer as well.
+        let mut owner = admin;
+        owner.rights.promote_admins = true;
+        owner.rights.transfer_owner = true;
+        assert!(can_transfer_ownership(&owner));
+        let owner_acts = member_mod_actions(&owner);
+        assert!(owner_acts.remove && owner_acts.ban && owner_acts.promote && owner_acts.transfer);
     }
 
     #[test]

@@ -89,6 +89,15 @@ impl Fault {
                 "PEER_ID_INVALID" | "CHANNEL_INVALID" | "CHANNEL_PRIVATE" | "USER_ID_INVALID" => {
                     "Telegram no longer lets this account reach that chat.".to_owned()
                 }
+                "CHAT_ADMIN_REQUIRED" | "RIGHT_FORBIDDEN" => "You don't have admin permission to do that here.".to_owned(),
+                "USER_CREATOR" => "You can't modify the group or channel creator.".to_owned(),
+                "ADMINS_TOO_MUCH" => "This group or channel already has the maximum number of admins.".to_owned(),
+                "PASSWORD_HASH_INVALID" => "That two-step verification password is incorrect.".to_owned(),
+                "PASSWORD_REQUIRED" => "Two-step verification must be enabled on your Telegram account to transfer ownership.".to_owned(),
+                "FRESH_CHANGE_ADMINS_FORBIDDEN" => "Telegram requires a newer session to transfer ownership. Try again later.".to_owned(),
+                "CHAT_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
+                "SEND_AS_PEER_INVALID" => "You can't send messages as that peer here.".to_owned(),
+                "CHANNEL_ONLY" => "That setting is only available in a channel or supergroup.".to_owned(),
                 "PARTICIPANTS_HIDDEN" => "This group hides its member list.".to_owned(),
                 "USER_PRIVACY_RESTRICTED" => "This person's privacy settings don't allow calls.".to_owned(),
                 "CALL_PROTOCOL_COMPAT_LAYER_INVALID" => "This call protocol version isn't supported.".to_owned(),

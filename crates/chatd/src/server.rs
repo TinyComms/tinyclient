@@ -3156,6 +3156,107 @@ impl Chat {
                 }
                 res
             }
+            Request::ModerateMember { conversation, person, action } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No person named to moderate.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::ModerateMember {
+                    conversation_id,
+                    person,
+                    action,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::SetAdmin { conversation, person, rights } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No person named to update.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::SetAdmin {
+                    conversation_id,
+                    person,
+                    rights,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::TransferOwnership { conversation, person, password } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No new owner named.");
+                }
+                if password.is_empty() {
+                    return error(ErrorCode::Refused, "Your two-step verification password is required to transfer ownership.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::TransferOwnership {
+                    conversation_id,
+                    person,
+                    password,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::UpdateChatSettings { conversation, settings } => {
+                let res = self.act(&conversation, |conversation_id, reply| Command::UpdateChatSettings {
+                    conversation_id,
+                    settings,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                    self.hub.send_rules.forget(&conversation);
+                }
+                res
+            }
+            Request::AdminLog { conversation, limit } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 50 } else { limit.min(100) };
+                match self.ask(&account, |reply| Command::AdminLog {
+                    conversation_id: conversation.id.clone(),
+                    limit,
+                    reply,
+                }) {
+                    Ok(entries) => Response::AdminLog { conversation, entries },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SendAsOptions { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SendAsOptions {
+                    conversation_id: conversation.id.clone(),
+                    reply,
+                }) {
+                    Ok((peers, default)) => Response::SendAsOptions { conversation, peers, default },
+                    Err(refused) if matches!(&*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                        Response::SendAsOptions { conversation, peers: Vec::new(), default: None }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDefaultSendAs { conversation, peer } => {
+                if peer.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Choose who to send as.");
+                }
+                self.act(&conversation, |conversation_id, reply| Command::SetDefaultSendAs {
+                    conversation_id,
+                    peer,
+                    reply,
+                })
+            }
             request @ (Request::StartDirect { .. } | Request::StartDirectCall { .. }) => {
                 let (person, call) = match request {
                     Request::StartDirect { person } => (person, false),
