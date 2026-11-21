@@ -163,6 +163,8 @@ pub struct Prefs {
     pub frame: Option<(f32, f32, f32, f32)>,
     /// The call pop-out window's remembered frame in screen points: x, y, width, height (`#267`).
     pub call_popout_frame: Option<(f32, f32, f32, f32)>,
+    /// Conversation windows left open, and where each sat (`#756`).
+    pub conversation_windows: Vec<(Key, (f32, f32, f32, f32))>,
     /// The conversation that was open, and its title for the strip until its row is read.
     pub open: Option<(Key, String)>,
     pub mode: Mode,
@@ -197,6 +199,7 @@ impl Default for Prefs {
             pins: Vec::new(),
             frame: None,
             call_popout_frame: None,
+            conversation_windows: Vec::new(),
             open: None,
             mode: Mode::Inbox,
             telegram_folder: None,
@@ -267,6 +270,15 @@ pub fn parse(text: &str) -> Prefs {
                 let numbers: Vec<f32> = fields.filter_map(|n| n.parse().ok()).filter(|n: &f32| n.is_finite()).collect();
                 if let [x, y, w, h] = numbers[..] {
                     prefs.call_popout_frame = Some((x, y, w.max(240.), h.max(135.)));
+                }
+            }
+            "conversation_window" => {
+                let mut fields = fields;
+                let Some(key) = key(fields.by_ref()) else { continue };
+                let numbers: Vec<f32> = fields.filter_map(|n| n.parse().ok()).filter(|n: &f32| n.is_finite()).collect();
+                if let [x, y, w, h] = numbers[..] {
+                    let (min_w, min_h) = layout::WINDOW_MIN;
+                    prefs.conversation_windows.push((key, (x, y, w.max(min_w), h.max(min_h))));
                 }
             }
             "open" => {
@@ -350,6 +362,9 @@ pub fn write(prefs: &Prefs) -> String {
     }
     if let Some((x, y, w, h)) = prefs.call_popout_frame {
         text.push_str(&format!("call_popout_frame\t{x}\t{y}\t{w}\t{h}\n"));
+    }
+    for (window, (x, y, w, h)) in &prefs.conversation_windows {
+        text.push_str(&format!("conversation_window\t{}\t{x}\t{y}\t{w}\t{h}\n", key(window)));
     }
     if let Some((open, title)) = &prefs.open {
         text.push_str(&format!("open\t{}\t{}\n", key(open), clean(title)));
@@ -450,6 +465,7 @@ mod tests {
             pins: vec![key(Network::Slack, "T1"), key(Network::Discord, "9")],
             frame: Some((120., 80., 1300., 800.)),
             call_popout_frame: Some((1400., 760., 368., 207.)),
+            conversation_windows: vec![(key(Network::Telegram, "dm"), (40., 40., 720., 640.))],
             open: Some((key(Network::Discord, "c1"), "#general\twith a tab".into())),
             mode: Mode::Space(key(Network::Discord, "9")),
             telegram_folder: Some("2".into()),
@@ -495,6 +511,8 @@ mod tests {
         assert_eq!(odd.pins, vec![key(Network::Slack, "T1")]);
         // A frame below the minimum grows to it; the text step stops at +3.
         assert_eq!(odd.frame, Some((1., 2., layout::WINDOW_MIN.0, layout::WINDOW_MIN.1)));
+        let tiny = parse("conversation_window\ttelegram\tT1\tdm\t10\t10\t10\t10\n");
+        assert_eq!(tiny.conversation_windows, vec![(key(Network::Telegram, "dm"), (10., 10., layout::WINDOW_MIN.0, layout::WINDOW_MIN.1))]);
         assert_eq!((odd.text_step, odd.mode, odd.autoplay), (3, Mode::Inbox, Autoplay::Always));
         assert_eq!(parse(""), Prefs::default());
     }

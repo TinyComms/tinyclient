@@ -303,7 +303,7 @@ fn pane_open(open: &protocol::Conversation) -> pane::Open {
 /// The key a thread is read and posted under: its own id, on its conversation's account.
 /// Slack's is `{channel}:{root}` and Teams' is `{channel};messageid={root}`, even before the
 /// first reply. Discord's does not exist until the thread channel is created.
-fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Option<Key> {
+pub(super) fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Option<Key> {
     let caps = Capabilities {
         threads: matches!(conversation.network, Network::Slack | Network::Teams | Network::Discord | Network::Tiny),
         direct_threads: conversation.network == Network::Slack,

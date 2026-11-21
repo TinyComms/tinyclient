@@ -421,14 +421,26 @@ impl Shell {
                     ),
             );
         let (picked, menu_row) = (c.clone(), c.clone());
-        list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
-            .map(|row| self.tap(row, crate::gui::phone::token(&[id, picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
-            .on_mouse_down(
-                MouseButton::Right,
+        let row = list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content);
+        let row = if crate::gui::phone::active() {
+            let token = crate::gui::phone::token(&[id, picked.key.network.label(), &picked.key.account, &picked.key.id]);
+            self.tap(row, token, Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx)
+        } else {
+            let open = picked.clone();
+            row.on_mouse_down(
+                MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    this.open_menu(Menu::Row(menu_row.clone(), event.position), cx);
+                    if crate::gui::conversation::modifier_click(event.click_count, event.modifiers) {
+                        this.pop_out_conversation(open.key.clone(), cx);
+                        return;
+                    }
+                    this.pick_row(&open, cx);
                 }),
             )
+        };
+        row.on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+            this.open_menu(Menu::Row(menu_row.clone(), event.position), cx);
+        }))
     }
 
     /// A one-line action row (28): Friends, Message requests, Archive, Show n more, folds.

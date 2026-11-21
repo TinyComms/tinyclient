@@ -346,6 +346,8 @@ impl Shell {
         shell.tiny_state.set_members_open(prefs.tiny_members);
         shell.call_state.popout_frame = prefs.call_popout_frame;
         app::prefs::set_me(prefs.me.clone());
+        // Before the first snapshot, so a conversation window is not forgotten on the first write.
+        shell.conversation_state.windows.set_pending(prefs.conversation_windows);
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));
         if crate::update::announce().is_some() {
             shell.layout_state.update_alert = true;
@@ -799,6 +801,7 @@ impl Shell {
             tree.conversations = conversations.into_iter().map(Rc::new).collect();
             tree.loaded = true;
             this.rebuild_rows(cx);
+            this.restore_conversation_windows(cx);
         });
     }
 
@@ -859,6 +862,7 @@ impl Shell {
             if spaced && before.as_ref() != Some(&after) {
                 this.load_spaces_soon(cx);
             }
+            this.refresh_conversation_window(&key, cx);
         });
     }
 
@@ -912,6 +916,7 @@ impl Shell {
         if let Some((conversation, peer)) = catch_up {
             self.catch_up_if_blocked(conversation, peer, cx);
         }
+        self.sync_popout_composers(cx);
     }
 
     /// Opening a DM with someone we blocked clears the badge even when their history will not

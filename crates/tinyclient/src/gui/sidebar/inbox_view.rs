@@ -65,6 +65,7 @@ impl Shell {
         if applied && inbox::attention_moved(&before, self.sidebar_state.inbox.all()) {
             self.load_spaces_soon(cx);
         }
+        self.restore_conversation_windows(cx);
     }
 
     /// The order waiting behind the pill goes in.

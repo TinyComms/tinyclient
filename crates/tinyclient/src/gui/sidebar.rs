@@ -1623,6 +1623,10 @@ impl Shell {
                     MouseButton::Left,
                     // A voice row joins on a double-click; a single click only opens its chat.
                     cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if crate::gui::conversation::modifier_click(event.click_count, event.modifiers) {
+                            this.pop_out_conversation(picked.key.clone(), cx);
+                            return;
+                        }
                         if join && event.click_count == 2 {
                             this.call_start(picked.key.clone(), cx);
                         } else {

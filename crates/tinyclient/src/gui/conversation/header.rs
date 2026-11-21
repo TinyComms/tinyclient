@@ -125,6 +125,11 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
         });
+        let pop_key = open.key.clone();
+        let windowed = icon_button("pop-out-conversation", "icons/picture-in-picture-2.svg", false)
+            .tooltip(tip("Open in New Window", None))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| this.pop_out_conversation(pop_key.clone(), cx)));
         // The title keeps 96, or its whole width when shorter, so a short name is not padded
         // away from what follows. The line after it truncates first, then the title.
         let title_tip = if direct { "Open profile".to_owned() } else { open.title.clone() };
@@ -208,7 +213,7 @@ impl Shell {
             )
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details).child(windowed))
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the

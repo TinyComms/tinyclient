@@ -19,6 +19,7 @@ mod rich;
 mod rows;
 #[cfg(feature = "gui-shot")]
 mod shot;
+mod popout;
 mod side;
 mod text;
 mod tokens;
@@ -29,6 +30,7 @@ mod wiki;
 use protocol::highlight;
 
 pub(in crate::gui) use player::glyph as player_glyph;
+pub(in crate::gui) use popout::modifier_click;
 
 
 use super::components::empty_state;
@@ -64,6 +66,8 @@ pub struct State {
     listening: OnceCell<Subscription>,
     following: OnceCell<Subscription>,
     side: side::Side,
+    /// Conversations the user opened in their own windows.
+    pub(in crate::gui) windows: popout::Windows,
 }
 
 /// How often the network is told how far the user has read, at most.
@@ -1957,11 +1961,18 @@ impl Shell {
         thread.into_iter().chain(main).any(|pane| pane.update(cx, |pane, cx| pane.phone_back(cx)))
     }
 
+    /// The main pane, its thread, and any conversation window. Not the phone's back stack.
+    fn message_panes(&self) -> Vec<Entity<Pane>> {
+        let state = &self.conversation_state;
+        let mut panes: Vec<_> = state.pane.get().cloned().into_iter().chain(state.thread.borrow().clone()).collect();
+        panes.extend(state.windows.panes());
+        panes
+    }
+
     /// Draws the panes again: a player in them moved on. Only marks them, so it is safe from
     /// inside a pane's own handler, where the pane cannot be updated.
     pub(super) fn conversation_redraw(&mut self, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        let panes: Vec<gpui::EntityId> = state.pane.get().into_iter().chain(state.thread.borrow().as_ref()).map(Entity::entity_id).collect();
+        let panes: Vec<gpui::EntityId> = self.message_panes().iter().map(Entity::entity_id).collect();
         let app: &mut gpui::App = cx;
         for pane in panes {
             app.notify(pane);
@@ -1971,8 +1982,7 @@ impl Shell {
 
     /// Offered every change chatd reports, after `Shell` has applied its own part.
     pub(super) fn conversation_changed(&mut self, change: &Change, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        for pane in state.pane.get().into_iter().chain(state.thread.borrow().as_ref()) {
+        for pane in self.message_panes() {
             pane.update(cx, |pane, cx| pane.changed(change, cx));
         }
     }
@@ -1980,8 +1990,7 @@ impl Shell {
     /// chatd no longer knows what changed: everything held is read again.
     #[allow(dead_code)]
     pub(super) fn conversation_reset(&mut self, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        for pane in state.pane.get().into_iter().chain(state.thread.borrow().as_ref()) {
+        for pane in self.message_panes() {
             pane.update(cx, |pane, cx| pane.refresh(cx));
         }
     }
