@@ -2780,6 +2780,7 @@ pub enum Request {
         /// Maximum unread conversations to include (server-clamped; 0 uses default 15).
         #[serde(default)]
         limit: u32,
+    },
     /// Who has read a given message in a chat (`Capabilities::read_by`).
     ReadBy {
         conversation: Key,
