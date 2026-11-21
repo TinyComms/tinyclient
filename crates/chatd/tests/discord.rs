@@ -264,7 +264,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (200, profile)
         }
         ("PATCH", ["users", "@me", "guilds", guild, "settings"]) => {
-            // The server's settings whole, with the override asked for, as Discord answers.
+            // The server's settings whole, with the override or top-level options asked for, as Discord answers.
             let overrides = seen.body["channel_overrides"].as_object().cloned().unwrap_or_default();
             let overrides: Vec<Value> = overrides
                 .into_iter()
@@ -274,8 +274,26 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 })
                 .collect();
             let guild_id = if *guild == "@me" { Value::Null } else { json!(guild) };
-            (200, json!({"guild_id": guild_id, "muted": false, "suppress_everyone": false, "suppress_roles": false, "message_notifications": 0, "flags": 0, "channel_overrides": overrides}))
+            (200, json!({
+                "guild_id": guild_id,
+                "muted": seen.body.get("muted").and_then(Value::as_bool).unwrap_or(false),
+                "suppress_everyone": seen.body.get("suppress_everyone").and_then(Value::as_bool).unwrap_or(false),
+                "suppress_roles": seen.body.get("suppress_roles").and_then(Value::as_bool).unwrap_or(false),
+                "notify_highlights": seen.body.get("notify_highlights").and_then(Value::as_u64).unwrap_or(0),
+                "mute_scheduled_events": seen.body.get("mute_scheduled_events").and_then(Value::as_bool).unwrap_or(false),
+                "mobile_push": seen.body.get("mobile_push").and_then(Value::as_bool).unwrap_or(true),
+                "message_notifications": seen.body.get("message_notifications").and_then(Value::as_u64).unwrap_or(0),
+                "flags": 0,
+                "channel_overrides": overrides,
+            }))
         }
+        ("PATCH", ["channels", _channel, "thread-members", "@me", "settings"]) => (
+            200,
+            json!({
+                "flags": seen.body.get("flags").and_then(Value::as_u64).unwrap_or(0),
+                "muted": seen.body.get("muted").and_then(Value::as_bool).unwrap_or(false),
+            }),
+        ),
         ("DELETE", ["channels", channel]) => (200, json!({"id": channel, "type": 1})),
         ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
         ("GET", ["channels", channel, "messages", "pins"]) => {
@@ -5128,4 +5146,116 @@ fn voice_message_sends_with_flag_waveform_audio_ogg_and_respects_permission() {
     let posted_owned = world.discord.requests_to("POST", "/channels/5001/messages");
     assert_eq!(posted_owned.len(), 1);
     assert_eq!(posted_owned[0].body["flags"], json!(8192));
+}
+
+#[test]
+fn space_notification_switches_thread_settings_and_channel_overrides() {
+    let world = World::start();
+
+    // 1. SpaceInfo for guild 4000 exposes suppress_everyone (true in READY), suppress_roles (false),
+    //    highlights (true), events (true), mobile_push (true), and channel override 4105 (muted).
+    let info = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("expected SpaceInfo, got {other:?}"),
+    };
+    assert!(info.suppress_everyone);
+    assert!(!info.suppress_roles);
+    assert!(info.highlights);
+    assert!(info.events);
+    assert!(info.mobile_push);
+    assert!(info.channel_overrides.iter().any(|o| o.channel_id == "4105" && o.notify == protocol::Notify::Nothing));
+
+    // 2. Updating all switches sends PATCH /users/@me/guilds/4000/settings with top-level fields.
+    assert_eq!(
+        world.ask(Request::SetSpaceOptions {
+            space: world.key("4000"),
+            notify: Some(protocol::Notify::Mentions),
+            suppress_everyone: Some(false),
+            suppress_roles: Some(true),
+            highlights: Some(false),
+            events: Some(false),
+            mobile_push: Some(false),
+            reset_channel: Some("4105".into()),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["message_notifications"], json!(1));
+    assert_eq!(patches[0].body["suppress_everyone"], json!(false));
+    assert_eq!(patches[0].body["suppress_roles"], json!(true));
+    assert_eq!(patches[0].body["notify_highlights"], json!(1));
+    assert_eq!(patches[0].body["mute_scheduled_events"], json!(true));
+    assert_eq!(patches[0].body["mobile_push"], json!(false));
+    assert_eq!(patches[0].body["channel_overrides"]["4105"]["message_notifications"], json!(3));
+    assert_eq!(patches[0].body["channel_overrides"]["4105"]["muted"], json!(false));
+
+    // Re-reading SpaceInfo reflects the updated switches and cleared override.
+    let updated = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("expected SpaceInfo, got {other:?}"),
+    };
+    assert!(!updated.suppress_everyone);
+    assert!(updated.suppress_roles);
+    assert!(!updated.highlights);
+    assert!(!updated.events);
+    assert!(!updated.mobile_push);
+    assert!(updated.channel_overrides.is_empty());
+
+    // 3. Fixture test: with suppress_everyone turned OFF above, an @everyone message in 4101
+    //    raises mentions_me; turning suppress_everyone back ON stops @everyone from raising mentions_me.
+    let before_mentions = world.conversation("4101").mentions;
+    let m1 = world.incoming("4101", Some("4000"), "@everyone hello", json!({"mention_everyone": true}));
+    wait("first @everyone message to land", || world.messages("4101").into_iter().find(|m| m.id == m1));
+    let landed1 = world.messages("4101").into_iter().find(|m| m.id == m1).unwrap();
+    assert!(landed1.mentions_me, "@everyone should mention when suppress_everyone is false");
+    assert_eq!(world.conversation("4101").mentions, before_mentions + 1);
+
+    assert_eq!(
+        world.ask(Request::SetSpaceOptions {
+            space: world.key("4000"),
+            notify: None,
+            suppress_everyone: Some(true),
+            suppress_roles: None,
+            highlights: None,
+            events: None,
+            mobile_push: None,
+            reset_channel: None,
+        }),
+        Response::Ok
+    );
+    let m2 = world.incoming("4101", Some("4000"), "@everyone quiet", json!({"mention_everyone": true}));
+    wait("second @everyone message to land", || world.messages("4101").into_iter().find(|m| m.id == m2));
+    let landed2 = world.messages("4101").into_iter().find(|m| m.id == m2).unwrap();
+    assert!(!landed2.mentions_me, "@everyone must NOT mention when suppress_everyone is true");
+    assert_eq!(world.conversation("4101").mentions, before_mentions + 1);
+
+    // 4. Thread notification settings: PATCH /channels/4500/thread-members/@me/settings and THREAD_MEMBER_UPDATE.
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: world.key("4500"),
+            notify: protocol::Notify::Mentions,
+            until: None,
+        }),
+        Response::Ok
+    );
+    let thread_patches = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
+    assert_eq!(thread_patches.len(), 1);
+    assert_eq!(thread_patches[0].body["muted"], json!(false));
+    // Bit 0 (HAS_INTERACTED = 1 from READY) preserved + bit 2 (ONLY_MENTIONS = 4) => 5.
+    assert_eq!(thread_patches[0].body["flags"], json!(5));
+    let tinfo = match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    };
+    assert_eq!(tinfo.notify, protocol::Notify::Mentions);
+
+    // Live THREAD_MEMBER_UPDATE from another device updates thread notification state.
+    world.discord.push("THREAD_MEMBER_UPDATE", json!({"id": "4500", "user_id": "1000", "flags": 9, "muted": true}));
+    wait("thread 4500 to become muted", || world.conversation("4500").muted.then_some(()));
+    let tinfo2 = match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    };
+    assert_eq!(tinfo2.notify, protocol::Notify::Nothing);
 }

@@ -849,6 +849,7 @@ pub fn notify_control(conversation: &Conversation) -> NotifyControl {
                 NotifyControl::LocalSwitch
             }
         }
+        Network::Discord if conversation.kind == ConversationKind::Thread => NotifyControl::Segmented,
         _ => {
             if channel && conversation.key.network != Network::Telegram {
                 NotifyControl::Segmented
@@ -1295,6 +1296,7 @@ mod tests {
         assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
         assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Channel)), NotifyControl::LocalSegmented);
         assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Direct)), NotifyControl::LocalSwitch);
+        assert_eq!(notify_control(&row(Network::Discord, ConversationKind::Thread)), NotifyControl::Segmented);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
         info.creator = "Dev Patel".into();

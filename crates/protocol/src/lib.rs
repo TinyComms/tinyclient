@@ -1546,6 +1546,26 @@ pub enum Request {
     SpaceInfo {
         space: Key,
     },
+    /// Updates a Space's notification level, switches, or resets a per-channel override
+    /// (Discord `PATCH /users/@me/guilds/{id}/settings`). Omitted fields are left unchanged.
+    SetSpaceOptions {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify: Option<Notify>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppress_everyone: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppress_roles: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        highlights: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        events: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mobile_push: Option<bool>,
+        /// Channel id whose per-channel override should be reset to the Space's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset_channel: Option<String>,
+    },
     /// The network's notification setting for a conversation. The row changes when the network
     /// says so. `until` is when a mute ends, as Unix seconds. Absent means muted until it is
     /// turned off, or not muted when `notify` asks for everything.

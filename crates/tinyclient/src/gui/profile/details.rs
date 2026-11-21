@@ -664,22 +664,223 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
         .child(div().pt(px(16.)).child(Avatar::new(key, &name, draw::AVATAR).shape(Plate::Place).image(icon.as_ref()).build()))
         .child(div().mt(px(12.)).min_w_0().truncate().type_title().child(name.clone()))
         .children(line.map(|line| line.type_ui().text_color(theme::text_soft())));
-    // CONTRACT: no request sets a Space's notifications, so the setting `SpaceInfo` gives is
-    // shown as it is, read-only, and changed in the network's app.
-    let notify = info.as_ref().filter(|_| key.network == Network::Discord).map(|info| info.notify);
-    let top = top.children(notify.map(|notify| {
-        let shown = |ix: usize, words: &'static str, at: Notify| segment(("space-notify", ix), words, notify == at).px(px(8.)).cursor_default();
-        div()
+    let top = if let Some(info) = info.as_ref().filter(|_| key.network == Network::Discord) {
+        let notify = info.notify;
+        let level_seg = |ix: usize, words: &'static str, at: Notify, cx: &mut Context<InfoPane>| {
+            let space_key = key.clone();
+            segment(("space-notify", ix), words, notify == at)
+                .px(px(8.))
+                .on_click(cx.listener(move |pane, _, _, cx| {
+                    let req = Request::SetSpaceOptions {
+                        space: space_key.clone(),
+                        notify: Some(at),
+                        suppress_everyone: None,
+                        suppress_roles: None,
+                        highlights: None,
+                        events: None,
+                        mobile_push: None,
+                        reset_channel: None,
+                    };
+                    pane.set_space_options(req, move |s| s.notify = at, cx);
+                }))
+        };
+        let mut notify_box = div()
             .id("space-notify-row")
             .mt(px(12.))
-            .tooltip(tip(format!("Change this in {}", key.network.label()), None))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
             .child(draw::notifications_row(
                 segmented()
-                    .child(shown(0, "All", Notify::All))
-                    .child(shown(1, "Mentions", Notify::Mentions))
-                    .child(shown(2, "Nothing", Notify::Nothing)),
-            ))
-    }));
+                    .child(level_seg(0, "All", Notify::All, cx))
+                    .child(level_seg(1, "Mentions", Notify::Mentions, cx))
+                    .child(level_seg(2, "Nothing", Notify::Nothing, cx)),
+            ));
+        let toggle_row = |id: &'static str, label: &'static str, caption: Option<&'static str>, click: gpui::Stateful<Div>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().type_small().text_color(theme::text()).child(label))
+                        .children(caption.map(|c| div().type_micro().text_color(theme::text_faint()).child(c))),
+                )
+                .child(click)
+        };
+        let sk_ev = key.clone();
+        let cur_everyone = info.suppress_everyone;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-everyone-row",
+            "Suppress @everyone and @here",
+            None,
+            draw::switch("space-opt-everyone", cur_everyone).on_click(cx.listener(move |pane, _, _, cx| {
+                let next = !cur_everyone;
+                let req = Request::SetSpaceOptions {
+                    space: sk_ev.clone(),
+                    notify: None,
+                    suppress_everyone: Some(next),
+                    suppress_roles: None,
+                    highlights: None,
+                    events: None,
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.suppress_everyone = next, cx);
+            })),
+        ));
+        let sk_roles = key.clone();
+        let cur_roles = info.suppress_roles;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-roles-row",
+            "Suppress all role @mentions",
+            None,
+            draw::switch("space-opt-roles", cur_roles).on_click(cx.listener(move |pane, _, _, cx| {
+                let next = !cur_roles;
+                let req = Request::SetSpaceOptions {
+                    space: sk_roles.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: Some(next),
+                    highlights: None,
+                    events: None,
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.suppress_roles = next, cx);
+            })),
+        ));
+        let sk_hl = key.clone();
+        let cur_suppress_hl = !info.highlights;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-highlights-row",
+            "Suppress highlights",
+            None,
+            draw::switch("space-opt-highlights", cur_suppress_hl).on_click(cx.listener(move |pane, _, _, cx| {
+                let next_highlights = cur_suppress_hl;
+                let req = Request::SetSpaceOptions {
+                    space: sk_hl.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: None,
+                    highlights: Some(next_highlights),
+                    events: None,
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.highlights = next_highlights, cx);
+            })),
+        ));
+        let sk_events = key.clone();
+        let cur_mute_events = !info.events;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-events-row",
+            "Mute new events",
+            None,
+            draw::switch("space-opt-events", cur_mute_events).on_click(cx.listener(move |pane, _, _, cx| {
+                let next_events = cur_mute_events;
+                let req = Request::SetSpaceOptions {
+                    space: sk_events.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: None,
+                    highlights: None,
+                    events: Some(next_events),
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.events = next_events, cx);
+            })),
+        ));
+        let sk_push = key.clone();
+        let cur_push = info.mobile_push;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-push-row",
+            "Mobile push notifications",
+            Some("Only affects Discord's own phone app."),
+            draw::switch("space-opt-push", cur_push).on_click(cx.listener(move |pane, _, _, cx| {
+                let next = !cur_push;
+                let req = Request::SetSpaceOptions {
+                    space: sk_push.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: None,
+                    highlights: None,
+                    events: None,
+                    mobile_push: Some(next),
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.mobile_push = next, cx);
+            })),
+        ));
+        if !info.channel_overrides.is_empty() {
+            let mut list = div()
+                .mt(px(4.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().type_micro().font_weight(theme::MEDIUM).text_color(theme::text_faint()).child("CHANNEL OVERRIDES"));
+            for (ix, over) in info.channel_overrides.iter().enumerate() {
+                let level_word = match over.notify {
+                    Notify::All => "All",
+                    Notify::Mentions => "Mentions",
+                    Notify::Nothing => "Nothing",
+                };
+                let sk_reset = key.clone();
+                let ch_id = over.channel_id.clone();
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .type_small()
+                                .text_color(theme::text_soft())
+                                .child(format!("#{} · {level_word}", over.name)),
+                        )
+                        .child(
+                            button(("space-override-reset", ix), ButtonKind::Ghost, "Reset")
+                                .h(px(22.))
+                                .px(px(6.))
+                                .type_micro()
+                                .on_click(cx.listener(move |pane, _, _, cx| {
+                                    let ch = ch_id.clone();
+                                    let req = Request::SetSpaceOptions {
+                                        space: sk_reset.clone(),
+                                        notify: None,
+                                        suppress_everyone: None,
+                                        suppress_roles: None,
+                                        highlights: None,
+                                        events: None,
+                                        mobile_push: None,
+                                        reset_channel: Some(ch.clone()),
+                                    };
+                                    pane.set_space_options(
+                                        req,
+                                        move |s| s.channel_overrides.retain(|o| o.channel_id != ch),
+                                        cx,
+                                    );
+                                })),
+                        ),
+                );
+            }
+            notify_box = notify_box.child(list);
+        }
+        top.child(notify_box)
+    } else {
+        top
+    };
     let mut body = div().flex().flex_col().pb(px(theme::PANE_PAD)).child(top);
     let mut sections = div().px(px(theme::PANE_PAD)).flex().flex_col();
     let mut any = false;

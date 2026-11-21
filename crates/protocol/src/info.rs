@@ -316,6 +316,16 @@ pub struct Bookmark {
     pub kind: BookmarkKind,
 }
 
+/// One channel inside a Space that overrides the Space's notification level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceChannelOverride {
+    pub channel_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default)]
+    pub notify: Notify,
+}
+
 /// A Space's info: opened from its name, never from a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceInfo {
@@ -333,6 +343,24 @@ pub struct SpaceInfo {
     pub roles: Vec<String>,
     #[serde(default)]
     pub notify: Notify,
+    /// Suppress `@everyone` and `@here` mentions in this Space.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppress_everyone: bool,
+    /// Suppress all role `@mentions` in this Space.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppress_roles: bool,
+    /// Highlights notifications enabled (Discord `notify_highlights != 1`).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub highlights: bool,
+    /// New scheduled event notifications enabled (`!mute_scheduled_events`).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub events: bool,
+    /// Discord mobile app push notifications (affects Discord's own phone app only).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub mobile_push: bool,
+    /// Channels whose notification setting overrides the Space's default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_overrides: Vec<SpaceChannelOverride>,
 }
 
 /// Which of a custom emoji set this account may send.

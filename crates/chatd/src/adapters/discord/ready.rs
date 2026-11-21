@@ -103,6 +103,9 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
         muted_until: settings.muted.then(|| until(settings.mute_config.as_ref())),
         suppress_everyone: settings.suppress_everyone,
         suppress_roles: settings.suppress_roles,
+        notify_highlights: settings.notify_highlights,
+        mute_scheduled_events: settings.mute_scheduled_events,
+        mobile_push: settings.mobile_push,
         channels: muted.map(|channel| (channel.channel_id.clone(), until(channel.mute_config.as_ref()))).collect(),
         hide_muted: settings.hide_muted_channels,
         opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
@@ -907,6 +910,7 @@ impl Discord {
             state.presence.clear();
             state.doing.clear();
             state.guilds.clear();
+            state.thread_members.clear();
             state.quiet_directs = settings.remove(&None).unwrap_or_default();
             // Whatever happened between the sessions was not heard: nothing fetched before
             // is known to be whole any more.
@@ -964,7 +968,15 @@ impl Discord {
             self.plant(guild, &mut info, &me, &read)?;
             icons.extend(info.icon.as_deref().map(|hash| model::guild_icon(&guild.id, hash)));
             self.voice_states(Some(&guild.id), &guild.voice_states);
-            self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
+            {
+                let mut state = self.state.lock().unwrap();
+                for thread in &guild.threads {
+                    if let Some(member) = &thread.member {
+                        state.thread_members.insert(thread.id.clone(), member.clone());
+                    }
+                }
+                state.guilds.insert(guild.id.clone(), info);
+            }
         }
         self.spaces()?;
         if let Some(folders) = &folders {
@@ -1122,7 +1134,15 @@ impl Discord {
         // stage is known from the rows the tree just planted.
         self.plant(&guild, &mut info, &me, &HashMap::new())?;
         self.voice_states(Some(&guild.id), &guild.voice_states);
-        self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
+        {
+            let mut state = self.state.lock().unwrap();
+            for thread in &guild.threads {
+                if let Some(member) = &thread.member {
+                    state.thread_members.insert(thread.id.clone(), member.clone());
+                }
+            }
+            state.guilds.insert(guild.id.clone(), info);
+        }
         Ok(self.spaces()?)
     }
 
@@ -1322,6 +1342,9 @@ impl Discord {
             if listed != before {
                 self.ctx.set_note(&note, &listed);
             }
+        }
+        if let Some(member) = &thread.member {
+            self.state.lock().unwrap().thread_members.insert(thread.id.clone(), member.clone());
         }
         self.ctx.conversation(&row)?;
         self.note_thread_update(&thread)?;

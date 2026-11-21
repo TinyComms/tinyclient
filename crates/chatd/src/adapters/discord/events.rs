@@ -98,6 +98,17 @@ struct ThreadList {
 }
 
 #[derive(Deserialize)]
+struct ThreadMemberUpdate {
+    id: String,
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    flags: u32,
+    #[serde(default)]
+    muted: bool,
+}
+
+#[derive(Deserialize)]
 struct SettingsProto {
     #[serde(default)]
     proto: String,
@@ -154,6 +165,7 @@ impl Discord {
             "CHANNEL_RECIPIENT_REMOVE" => self.recipient(from_str(data)?, false)?,
             "CHANNEL_DELETE" | "THREAD_DELETE" => self.channel_deleted(from_str(data)?)?,
             "THREAD_CREATE" | "THREAD_UPDATE" => self.thread_changed(from_str(data)?, false)?,
+            "THREAD_MEMBER_UPDATE" => self.thread_member_updated(from_str(data)?)?,
             "THREAD_LIST_SYNC" => {
                 let list: ThreadList = from_str(data)?;
                 for thread in list.threads {
@@ -227,6 +239,19 @@ impl Discord {
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Our own thread-member notification settings changed on another device.
+    fn thread_member_updated(&self, update: ThreadMemberUpdate) -> Result<(), Failure> {
+        if !update.user_id.is_empty() && update.user_id != self.me() {
+            return Ok(());
+        }
+        let member = model::ThreadMember { flags: update.flags, muted: update.muted };
+        let muted = member.notify() == Some(protocol::Notify::Nothing);
+        self.state.lock().unwrap().thread_members.insert(update.id.clone(), member);
+        self.ctx.muted(&update.id, muted)?;
+        self.ctx.info_stale(&update.id);
         Ok(())
     }
 

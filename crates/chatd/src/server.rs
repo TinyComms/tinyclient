@@ -1990,6 +1990,12 @@ impl Chat {
             nickname: about.nickname,
             roles: about.roles,
             notify: about.notify,
+            suppress_everyone: about.suppress_everyone,
+            suppress_roles: about.suppress_roles,
+            highlights: about.highlights,
+            events: about.events,
+            mobile_push: about.mobile_push,
+            channel_overrides: about.channel_overrides,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
@@ -1997,6 +2003,42 @@ impl Chat {
         info.roles.iter_mut().for_each(|role| clip(role, 100));
         self.hub.space_infos.keep(space, info.clone());
         Response::SpaceInfo { info: Box::new(info) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_space_options(
+        &self,
+        space: Key,
+        notify: Option<protocol::Notify>,
+        suppress_everyone: Option<bool>,
+        suppress_roles: Option<bool>,
+        highlights: Option<bool>,
+        events: Option<bool>,
+        mobile_push: Option<bool>,
+        reset_channel: Option<String>,
+    ) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SetSpaceOptions {
+            space_id,
+            notify,
+            suppress_everyone,
+            suppress_roles,
+            highlights,
+            events,
+            mobile_push,
+            reset_channel,
+            reply,
+        }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
     }
 
     /// Something the user did to a conversation on the network: mute, leave, close. The answer
@@ -3188,6 +3230,16 @@ impl Chat {
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),
+            Request::SetSpaceOptions {
+                space,
+                notify,
+                suppress_everyone,
+                suppress_roles,
+                highlights,
+                events,
+                mobile_push,
+                reset_channel,
+            } => self.set_space_options(space, notify, suppress_everyone, suppress_roles, highlights, events, mobile_push, reset_channel),
             Request::SetMute { conversation, notify, until } => {
                 self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, until, reply })
             }

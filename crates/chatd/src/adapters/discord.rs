@@ -154,11 +154,14 @@ struct Session {
 
 /// A server's settings as the user made them in Discord. Times are unix seconds; `i64::MAX` is
 /// "until I turn it back on".
-#[derive(Default)]
 struct Quiet {
     muted_until: Option<i64>,
     suppress_everyone: bool,
     suppress_roles: bool,
+    /// Discord `notify_highlights`: 0 default, 1 disabled (suppressed), 2 enabled.
+    notify_highlights: u8,
+    mute_scheduled_events: bool,
+    mobile_push: bool,
     channels: HashMap<String, i64>,
     /// "Hide muted channels", as the user set it for the server.
     hide_muted: bool,
@@ -170,6 +173,25 @@ struct Quiet {
     /// categories that set their own.
     level: u8,
     levels: HashMap<String, u8>,
+}
+
+impl Default for Quiet {
+    fn default() -> Quiet {
+        Quiet {
+            muted_until: None,
+            suppress_everyone: false,
+            suppress_roles: false,
+            notify_highlights: 0,
+            mute_scheduled_events: false,
+            mobile_push: true,
+            channels: HashMap::new(),
+            hide_muted: false,
+            opt_in: false,
+            opted_in: HashSet::new(),
+            level: 0,
+            levels: HashMap::new(),
+        }
+    }
 }
 
 /// One of a server's custom emoji or stickers, kept for the picker: about 40 bytes each.
@@ -362,6 +384,8 @@ struct State {
     /// Per channel, the read acknowledgement last sent and the newest one held back since
     /// (`mark_read`): one per channel per [`ACK_EVERY`].
     acks: HashMap<String, Ack>,
+    /// Per thread, our own thread-member notification flags and muted flag.
+    thread_members: HashMap<String, model::ThreadMember>,
 }
 
 /// One channel's read acknowledgements.
@@ -1857,6 +1881,29 @@ impl Discord {
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
+            Command::SetSpaceOptions {
+                space_id,
+                notify,
+                suppress_everyone,
+                suppress_roles,
+                highlights,
+                events,
+                mobile_push,
+                reset_channel,
+                reply,
+            } => answer(
+                reply,
+                self.set_space_options(
+                    &space_id,
+                    notify,
+                    suppress_everyone,
+                    suppress_roles,
+                    highlights,
+                    events,
+                    mobile_push,
+                    reset_channel.as_deref(),
+                ),
+            ),
             Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),

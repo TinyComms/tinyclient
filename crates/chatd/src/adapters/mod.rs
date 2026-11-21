@@ -201,7 +201,7 @@ pub struct ConversationAbout {
 }
 
 /// What a Space's info says, as the network tells it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SpaceAbout {
     pub description: String,
     pub members: Option<u32>,
@@ -209,6 +209,31 @@ pub struct SpaceAbout {
     pub nickname: String,
     pub roles: Vec<String>,
     pub notify: Notify,
+    pub suppress_everyone: bool,
+    pub suppress_roles: bool,
+    pub highlights: bool,
+    pub events: bool,
+    pub mobile_push: bool,
+    pub channel_overrides: Vec<protocol::SpaceChannelOverride>,
+}
+
+impl Default for SpaceAbout {
+    fn default() -> SpaceAbout {
+        SpaceAbout {
+            description: String::new(),
+            members: None,
+            online: None,
+            nickname: String::new(),
+            roles: Vec::new(),
+            notify: Notify::default(),
+            suppress_everyone: false,
+            suppress_roles: false,
+            highlights: true,
+            events: true,
+            mobile_push: true,
+            channel_overrides: Vec::new(),
+        }
+    }
 }
 
 /// A page of what was shared, from the network's own search.
@@ -524,6 +549,18 @@ pub enum Command {
     },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
+    /// Updates a Space's notification level, switches, or resets one channel override.
+    SetSpaceOptions {
+        space_id: String,
+        notify: Option<Notify>,
+        suppress_everyone: Option<bool>,
+        suppress_roles: Option<bool>,
+        highlights: Option<bool>,
+        events: Option<bool>,
+        mobile_push: Option<bool>,
+        reset_channel: Option<String>,
+        reply: Reply<()>,
+    },
     /// Preview a Space invite link or code.
     InvitePreview {
         code: String,
@@ -844,6 +881,7 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceOptions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
