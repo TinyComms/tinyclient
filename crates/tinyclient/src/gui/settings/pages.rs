@@ -16,7 +16,7 @@ use gpui::{canvas, div, img, prelude::*, px, AnyElement, ClipboardItem, Context,
 use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
-    ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
+    AUTO_WATCH_SHARE, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
     PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
     VOICE_VOLUME,
 };
@@ -415,6 +415,7 @@ impl SettingsWindow {
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V22"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
                 self.group(&["V4"], Some("Joining"), window, cx),
+                self.group(&["V23"], Some("Screen sharing"), window, cx),
             ],
             Section::Voice => {
                 let values = prefs::values();
@@ -906,6 +907,10 @@ impl SettingsWindow {
             "V4" => {
                 let on = values.on(JOIN_MUTED);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
+            }
+            "V23" => {
+                let on = values.on(AUTO_WATCH_SHARE);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, AUTO_WATCH_SHARE, on, false, cx), cx)
             }
             "D1" => self.usage(cx),
             "D2" => {

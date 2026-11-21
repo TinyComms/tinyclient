@@ -651,6 +651,95 @@ impl Shell {
             )
     }
 
+    /// Someone in this call started sharing their screen: a 32 px strip on top of the card
+    /// naming who is sharing, with one-click Watch and a dismiss button.
+    fn call_share_strip(
+        &self,
+        call: &Call,
+        subject: &Subject,
+        first_strip: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if call.state != CallState::Joined {
+            return None;
+        }
+        let sharer_id = self.call_state.share_prompt.as_deref()?;
+        if super::watching(call, sharer_id) {
+            return None;
+        }
+        let sharer = call.participants.iter().find(|p| p.id == sharer_id && !p.ringing && p.sharing)?;
+        let watch_call = call.clone();
+        let watch_id = sharer.id.clone();
+        let watch_title = subject.title.clone();
+        Some(
+            div()
+                .min_h(px(32.))
+                .flex_none()
+                .when(first_strip, |strip| strip.mt(px(-9.)).rounded_t(px(11.)))
+                .mx(px(-9.))
+                .pl(px(10.))
+                .pr(px(8.))
+                .py(px(5.))
+                .bg(theme::accent_soft())
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .text_color(theme::text())
+                .child(glyph("icons/monitor-up.svg", 13., theme::accent()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("{} is sharing their screen", sharer.name)),
+                )
+                .child(
+                    div()
+                        .id("call-share-strip-watch")
+                        .flex_none()
+                        .h(px(22.))
+                        .px(px(8.))
+                        .rounded(px(6.))
+                        .bg(theme::accent())
+                        .hover(|s| s.bg(theme::accent_hover()))
+                        .text_color(theme::on_accent())
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_watch_stream(&watch_call, watch_id.clone(), &watch_title, cx);
+                        }))
+                        .child("Watch"),
+                )
+                .child(
+                    div()
+                        .id("call-share-strip-dismiss")
+                        .flex_none()
+                        .size(px(20.))
+                        .rounded(px(5.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(tip("Dismiss", None))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_dismiss_share_prompt(cx);
+                        }))
+                        .child(glyph("icons/x.svg", 12., theme::text_soft())),
+                ),
+        )
+    }
+
     /// The counter's text, told what it counts. Nothing ticks unless this is on screen.
     fn call_counter(&self, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.call_dock_clock(call, cx)
@@ -786,6 +875,8 @@ impl Shell {
                 cx.stop_propagation();
                 this.call_leave(cx);
             }));
+        let waiting = self.call_waiting_strip();
+        let share_strip = self.call_share_strip(call, subject, waiting.is_none(), cx);
         // The name takes the card's width. Signal, lock, people and Leave sit on the row above it,
         // and wrap under it when the column is the narrowest sidebar.
         card()
@@ -795,7 +886,8 @@ impl Shell {
             .focus_visible(|style| style.shadow(theme::focus_ring()))
             .tooltip(tip("Open the call", Some("⌘⇧J")))
             .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
-            .children(self.call_waiting_strip().map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .children(waiting.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .children(share_strip)
             .child(
                 div()
                     .flex()
@@ -1244,6 +1336,8 @@ impl Shell {
                     })),
             );
 
+        let waiting = self.call_waiting_strip();
+        let share_strip = self.call_share_strip(call, subject, waiting.is_none(), cx);
         let card_key = call.conversation.clone();
         let card_title = subject.title.clone();
         card()
@@ -1251,10 +1345,8 @@ impl Shell {
             .cursor_pointer()
             .tooltip(tip("Open the call", Some("⌘⇧J")))
             .on_click(cx.listener(move |this, _, _, cx| this.call_go(card_key.clone(), &card_title, cx)))
-            .children(
-                self.call_waiting_strip()
-                    .map(|(ring, from)| self.call_strip(&ring, &from, cx)),
-            )
+            .children(waiting.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .children(share_strip)
             .child(self.call_title(call, subject, words, cx))
             .child(controls)
             .children(self.call_popover(call, subject, Place::Dock, cx))

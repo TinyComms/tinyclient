@@ -57,6 +57,8 @@ pub const SYSTEM_DEFAULT: &str = "@system";
 pub const JOIN_MUTED: &str = "join_muted";
 /// V19: "You're muted" shows when the microphone hears speech while I am muted in a call.
 pub const MUTED_TALK: &str = "muted_talk";
+/// V23: automatically open a newly started screen share when the user is looking at the call.
+pub const AUTO_WATCH_SHARE: &str = "auto_watch_share";
 /// Only join Tiny calls that are end-to-end encrypted. A call whose server turns encryption off
 /// always stops sending and playing (mediad `Blocked`); off, the person may choose to carry on
 /// unencrypted, on, they may not, and a server that cannot encrypt is not joined. Off by default:
@@ -272,7 +274,7 @@ fn kind(key: &str) -> Option<Kind> {
         NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
         JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN => Kind::Switch(false),
-        MUTED_TALK => Kind::Switch(true),
+        MUTED_TALK | AUTO_WATCH_SHARE => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
         VOICE_VOLUME => Kind::Percent(100),
@@ -1242,5 +1244,13 @@ mod tests {
         assert!(telegram_relay_only(false, true));
         assert!(telegram_relay_only(true, true));
         assert!(!telegram_relay_only(true, false));
+    }
+
+    #[test]
+    fn auto_watch_share_defaults_on_and_is_global() {
+        assert!(Values::default().on(AUTO_WATCH_SHARE));
+        assert!(valid(GLOBAL, AUTO_WATCH_SHARE, "on"));
+        assert!(valid(GLOBAL, AUTO_WATCH_SHARE, "off"));
+        assert!(!valid(&account_scope(&account(Network::Tiny)), AUTO_WATCH_SHARE, "off"));
     }
 }

@@ -255,7 +255,7 @@ impl Controls {
         let tuning = self.tuning();
         let wanted = match cue {
             Cue::Test => true,
-            Cue::Joined | Cue::Left => tuning.joins && !self.deafened.load(Ordering::Relaxed),
+            Cue::Joined | Cue::Left | Cue::ShareStarted => tuning.joins && !self.deafened.load(Ordering::Relaxed),
             // Our own room changed: as a join, but heard while deafened, since it is ours.
             Cue::Moved => tuning.joins,
             Cue::Muted | Cue::Unmuted | Cue::Deafened | Cue::Undeafened => tuning.mine,

@@ -320,6 +320,12 @@ pub struct State {
     pub(in crate::gui) full: Option<bool>,
     /// True once the user has turned their camera on at least once in this session.
     pub(in crate::gui) camera_used: bool,
+    /// The active remote sharer we last saw in this call, so dismissing the notice strip holds
+    /// until they stop sharing and someone starts again.
+    pub(super) sharer: Option<String>,
+    /// The sharer currently offered on the dock's notice strip (cleared on Watch, dismiss, stop,
+    /// or call end).
+    pub(super) share_prompt: Option<String>,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -406,6 +412,49 @@ fn auto_watch_step(
         return Some(None);
     }
     None
+}
+
+/// Diffs remote screen sharing in a joined call.
+/// Returns `Some(user_id)` once when a remote participant starts sharing (or another sharer
+/// replaces the previous one). Dismissing the notice clears `prompt` while `prev_sharer` holds
+/// until nobody is sharing.
+fn share_notice_step(
+    call: &Call,
+    prev_sharer: &mut Option<String>,
+    prompt: &mut Option<String>,
+) -> Option<String> {
+    if call.state != CallState::Joined {
+        *prev_sharer = None;
+        *prompt = None;
+        return None;
+    }
+    let current = call
+        .participants
+        .iter()
+        .find(|p| !p.ringing && p.sharing)
+        .map(|p| p.id.clone());
+    match current {
+        None => {
+            *prev_sharer = None;
+            *prompt = None;
+            None
+        }
+        Some(id) => {
+            if prev_sharer.as_deref() == Some(id.as_str()) {
+                None
+            } else {
+                *prev_sharer = Some(id.clone());
+                *prompt = Some(id.clone());
+                Some(id)
+            }
+        }
+    }
+}
+
+/// Whether a newly started screen share should open automatically on the stage:
+/// the setting is on, the user is already looking at the call, and nothing is focused yet.
+fn should_auto_watch_share(auto_watch_pref: bool, looking_at_call: bool, already_focused: bool) -> bool {
+    auto_watch_pref && looking_at_call && !already_focused
 }
 
 /// Someone's volume and mute among what chatd keeps, else 100 % and heard.
@@ -801,6 +850,8 @@ impl Shell {
                 state.view = None;
                 state.focus = None;
                 state.full = None;
+                state.sharer = None;
+                state.share_prompt = None;
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -831,6 +882,7 @@ impl Shell {
                 }
                 self.call_watch_muted_talk(call, cx);
                 self.call_cue_join(call, cx);
+                self.call_share_notice(call, cx);
                 self.call_auto_watch(call, cx);
                 self.call_discord_speaker(call, cx);
                 if let Some((asked_id, _)) = &self.call_state.watch_asked {
@@ -1369,7 +1421,7 @@ impl Shell {
             let row_group: SharedString = format!("call-person-row-{}", who.id).into();
             let watch_btn = who.sharing.then(|| {
                 let watch_id = who.id.clone();
-                let watch_call = call.conversation.clone();
+                let watch_call = call.clone();
                 let watch_title = subject.title.clone();
                 div()
                     .id(SharedString::from(format!("call-person-watch-{}", who.id)))
@@ -1387,9 +1439,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.call_menu_close(cx);
-                        this.call_watch(watch_id.clone(), cx);
-                        this.call_state.focus = Some(stage::Focus::Stream(watch_id.clone()));
-                        this.call_go(watch_call.clone(), &watch_title, cx);
+                        this.call_watch_stream(&watch_call, watch_id.clone(), &watch_title, cx);
                     }))
                     .child(glyph("icons/monitor-up.svg", 13., theme::accent()))
             });
@@ -1559,6 +1609,7 @@ impl Shell {
     /// Ask mediad to watch `user_id`'s stream and schedule 3 s / 10 s redraws so the tile never
     /// stays on "Connecting…" silently.
     pub(in crate::gui) fn call_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        self.call_state.share_prompt = None;
         self.call_state.watch_asked = Some((user_id.clone(), Instant::now()));
         self.call_state.watch_timer = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(3)).await;
@@ -1567,6 +1618,70 @@ impl Shell {
             let _ = this.update(cx, |_, cx| cx.notify());
         }));
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
+    }
+
+    /// Watch `user_id`'s screen, focus their stream on the stage, dismiss any share notice, and
+    /// open the call view or room stage.
+    pub(in crate::gui) fn call_watch_stream(
+        &mut self,
+        call: &Call,
+        user_id: String,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.call_state.share_prompt = None;
+        self.call_state.focus = Some(stage::Focus::Stream(user_id.clone()));
+        if !watching(call, &user_id) {
+            self.call_watch(user_id, cx);
+        }
+        self.call_go(call.conversation.clone(), title, cx);
+    }
+
+    /// Dismiss the dock's screen-share notice strip until the sharer stops and someone shares again.
+    pub(super) fn call_dismiss_share_prompt(&mut self, cx: &mut Context<Self>) {
+        self.call_state.share_prompt = None;
+        cx.notify();
+    }
+
+    /// True when the user is currently looking at `call`'s main-pane call view or Tiny room stage.
+    fn call_looking_at(&self, call: &Call) -> bool {
+        if self.call_state.view.as_ref() == Some(&call.conversation) {
+            return true;
+        }
+        call.conversation.network == Network::Tiny
+            && self.tiny_open()
+            && self.tiny_account() == Some(&call.conversation.account())
+            && self.tiny_state.channel.as_deref() == Some(call.conversation.id.as_str())
+    }
+
+    /// Notices when a remote participant starts sharing their screen: plays a soft cue, offers
+    /// Watch on the dock card, and optionally auto-watches when the user is already looking at the
+    /// call.
+    fn call_share_notice(&mut self, call: &Call, cx: &mut Context<Self>) {
+        let started = share_notice_step(call, &mut self.call_state.sharer, &mut self.call_state.share_prompt);
+        if self.call_state.share_prompt.as_deref().is_some_and(|id| watching(call, id)) {
+            self.call_state.share_prompt = None;
+        }
+        let Some(id) = started else {
+            return;
+        };
+        if !cfg!(feature = "gui-shot") {
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = ask(&Request::Media(protocol::MediaRequest::Cue {
+                        cue: protocol::Cue::ShareStarted,
+                    }));
+                })
+                .detach();
+        }
+        let auto_watch = super::app::prefs::values().on(protocol::settings::AUTO_WATCH_SHARE);
+        if should_auto_watch_share(auto_watch, self.call_looking_at(call), self.call_state.focus.is_some()) {
+            self.call_state.share_prompt = None;
+            self.call_state.focus = Some(stage::Focus::Stream(id.clone()));
+            if !watching(call, &id) {
+                self.call_watch(id, cx);
+            }
+        }
     }
 
     /// Reset the decoder and ask for a fresh keyframe for `user_id`.
@@ -2739,5 +2854,54 @@ mod tests {
         assert_eq!(call_row_key_action("f10", false, false), None);
         assert_eq!(call_row_key_action("f10", true, true), None);
         assert_eq!(call_row_key_action("space", false, false), None);
+    }
+
+    #[test]
+    fn share_notice_prompts_once_respects_dismiss_and_resets_when_sharing_stops() {
+        let mut call = bare_call(key("lounge"), CallState::Joined, false, false);
+        call.participants = vec![
+            protocol::Participant { id: "u1".into(), name: "Ada".into(), sharing: false, ..Default::default() },
+            protocol::Participant { id: "u2".into(), name: "Bea".into(), sharing: false, ..Default::default() },
+        ];
+        let (mut prev, mut prompt) = (None, None);
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prompt, None);
+
+        // Ada starts sharing -> prompts once.
+        call.participants[0].sharing = true;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), Some("u1".into()));
+        assert_eq!(prompt.as_deref(), Some("u1"));
+
+        // Repeated Call snapshots while Ada keeps sharing do not re-trigger.
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prompt.as_deref(), Some("u1"));
+
+        // Dismissing clears the prompt, and prev holds so it does not immediately reappear.
+        prompt = None;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prompt, None);
+
+        // Ada stops sharing -> clears prev so the next share starts fresh.
+        call.participants[0].sharing = false;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prev, None);
+
+        // Bea starts sharing -> prompts again.
+        call.participants[1].sharing = true;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), Some("u2".into()));
+        assert_eq!(prompt.as_deref(), Some("u2"));
+
+        // Leaving / reconnecting clears both.
+        call.state = CallState::Reconnecting;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!((prev, prompt), (None, None));
+    }
+
+    #[test]
+    fn auto_watch_share_requires_pref_active_view_and_no_existing_focus() {
+        assert!(should_auto_watch_share(true, true, false));
+        assert!(!should_auto_watch_share(false, true, false));
+        assert!(!should_auto_watch_share(true, false, false));
+        assert!(!should_auto_watch_share(true, true, true));
     }
 }

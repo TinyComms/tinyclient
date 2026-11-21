@@ -909,6 +909,8 @@ pub enum Cue {
     Moved,
     /// We were put out of the call: kicked, banned, timed out, or the room went (S9).
     Disconnected,
+    /// Someone started sharing their screen in this call (S7, with joins and leaves).
+    ShareStarted,
     /// "Play test sound": the join cue, whatever the switches say.
     Test,
 }
