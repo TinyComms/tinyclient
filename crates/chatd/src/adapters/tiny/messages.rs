@@ -7,7 +7,7 @@
 use super::e2ee::{self, Read};
 use super::live::{Ask, Live};
 use super::Saved;
-use crate::adapters::{CatalogPage, Command, Context, Download, Refusal};
+use crate::adapters::{About, CatalogPage, Command, Context, ConversationAbout, Download, Refusal};
 use crate::blobs::upload::{self, Target};
 use crate::store::{ConversationRow, PersonRow, PreviewLine, SpaceRow};
 use ::e2ee as e2ee_core;
@@ -447,6 +447,12 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
                     "That file is on another server.".to_owned(),
                 )));
             }
+        }
+        Command::Profile { person_id, reply } | Command::ProfileIn { person_id, reply, .. } => {
+            profile(saved, &person_id, reply);
+        }
+        Command::ConversationInfo { conversation_id, reply } => {
+            conversation_info(ctx, saved, &conversation_id, reply);
         }
         other => other.unsupported(ctx),
     }
@@ -2189,6 +2195,49 @@ fn member_names(saved: &Saved) -> HashMap<String, String> {
     super::members_of(saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default()
 }
 
+fn roles_of(saved: &Saved) -> Vec<protocol::TinyRole> {
+    optional_list::<protocol::TinyRole>(saved, "/v1/roles", "roles").unwrap_or_default()
+}
+
+fn conversation_info(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    reply: crate::adapters::Reply<ConversationAbout>,
+) {
+    let mut about = ConversationAbout::default();
+    if let Ok(Some(row)) = ctx.known(conversation_id) {
+        about.description = row.topic;
+        if row.kind == ConversationKind::Channel {
+            about.members = super::members_of(saved).ok().map(|members| members.len() as u32);
+        }
+    }
+    let _ = reply.send(Ok(about));
+}
+
+fn profile(saved: &Saved, person_id: &str, reply: crate::adapters::Reply<About>) {
+    let mut about = About::default();
+    if super::safe_id(person_id) {
+        if let Ok(members) = super::members_of(saved) {
+            if let Some(member) = members.into_iter().find(|member| member.user_id == person_id) {
+                about.joined = rfc3339(&member.created_at);
+                about.last_seen = member.last_seen_at.as_deref().and_then(rfc3339);
+                let roles = roles_of(saved);
+                let mut named: Vec<&protocol::TinyRole> = roles
+                    .iter()
+                    .filter(|role| !role.default && member.roles.contains(&role.id))
+                    .collect();
+                named.sort_by_key(|role| std::cmp::Reverse(role.position));
+                about.roles = named.into_iter().map(|role| role.name.clone()).collect();
+                if about.roles.is_empty() && (member.owner || member.role.eq_ignore_ascii_case("owner")) {
+                    about.roles.push("Owner".to_owned());
+                }
+            }
+        }
+    }
+    let _ = reply.send(Ok(about));
+}
+
 fn name_of(names: &HashMap<String, String>, saved: &Saved, author: &str) -> String {
     if author == saved.user_id && !saved.display_name.is_empty() {
         return saved.display_name.clone();
@@ -3504,6 +3553,41 @@ mod tests {
             .unwrap();
         assert!(rows.iter().any(|row| row.key.id == "direct-1"));
         assert_eq!(direct.call, CallSupport::None);
+    }
+
+    #[test]
+    fn conversation_info_and_profile_answer_without_refusal_or_email() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/members ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"[{{"user_id":"{PEER}","display_name":"Bea","email":"bea@secret.test","role":"member","roles":["r-mod"],"created_at":"{WHEN}"}}]"#
+                    ),
+                ));
+            }
+            if request.starts_with("GET /v1/roles ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    r#"[{"id":"r-mod","name":"Mods","position":2,"permissions":1,"hoist":true,"default":false}]"#,
+                ));
+            }
+            None
+        });
+        let live = Live::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &live, Command::ConversationInfo { conversation_id: "channel-1".into(), reply: tx });
+        let info = rx.recv().unwrap().expect("ConversationInfo must answer Ok");
+        assert_eq!(info.members, Some(1));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &live, Command::Profile { person_id: PEER.into(), reply: tx });
+        let about = rx.recv().unwrap().expect("Profile must answer Ok");
+        assert_eq!(about.roles, vec!["Mods".to_owned()]);
+        assert_eq!(about.joined, rfc3339(WHEN));
+        assert!(about.contacts.is_empty() && about.fields.is_empty(), "never expose email");
     }
 
     #[test]

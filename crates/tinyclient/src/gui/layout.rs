@@ -903,7 +903,8 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
-                if conversation.kind == ConversationKind::Direct {
+                // CONTRACT: closing a DM has a request on Discord only.
+                if conversation.kind == ConversationKind::Direct && conversation.key.network == Network::Discord {
                     let closed = conversation.key.clone();
                     items.push(
                         menu_item("close-dm", Some("icons/x.svg"), "Close conversation", None)
