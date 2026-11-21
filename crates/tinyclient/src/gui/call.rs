@@ -293,6 +293,57 @@ pub struct State {
     /// The volume slider's track bounds, as last drawn, and whose volume is being dragged.
     pub(in crate::gui) slider: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub(in crate::gui) sliding: Option<(AccountKey, String)>,
+    /// `(conversation, peer_id)` that `call_auto_watch` already asked to watch, so we ask once
+    /// per start and respect a manual "Stop watching" until the peer stops and starts again.
+    pub(in crate::gui) auto_watch: Option<(Key, String)>,
+}
+
+/// A decode of this person was asked for, or their picture is on screen.
+pub(in crate::gui) fn watching(call: &Call, user_id: &str) -> bool {
+    call.video.iter().any(|stream| {
+        stream.direction == protocol::Direction::Decode
+            && stream.content == protocol::Content::Share
+            && stream.source == user_id
+    }) || call
+        .picture
+        .as_ref()
+        .is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+}
+
+/// Pure auto-watch decision for a 1:1 Tiny direct call.
+/// Returns `Some(Some(peer_id))` to start watching, `Some(None)` to stop watching, or `None` for no-op.
+fn auto_watch_step(
+    call: &Call,
+    is_room: bool,
+    prev: &mut Option<(Key, String)>,
+) -> Option<Option<String>> {
+    if call.state != CallState::Joined
+        || call.conversation.network != Network::Tiny
+        || is_room
+        || call.participants.len() != 1
+    {
+        if prev.as_ref().is_some_and(|(k, _)| k == &call.conversation) {
+            *prev = None;
+            return Some(None);
+        }
+        return None;
+    }
+    let peer = &call.participants[0];
+    if peer.sharing || peer.camera {
+        let target = (call.conversation.clone(), peer.id.clone());
+        if prev.as_ref() == Some(&target) {
+            return None;
+        }
+        *prev = Some(target);
+        if !watching(call, &peer.id) {
+            return Some(Some(peer.id.clone()));
+        }
+        return None;
+    }
+    if prev.take().is_some() {
+        return Some(None);
+    }
+    None
 }
 
 /// Someone's volume and mute among what chatd keeps, else 100 % and heard.
@@ -622,6 +673,7 @@ impl Shell {
                 state.muted_talk_task = None;
                 state.metering = None;
                 state.cued = None;
+                state.auto_watch = None;
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -652,6 +704,7 @@ impl Shell {
                 }
                 self.call_watch_muted_talk(call, cx);
                 self.call_cue_join(call, cx);
+                self.call_auto_watch(call, cx);
                 if !in_call(call) {
                     // Ringing, connecting or failed: not a call that can end.
                     self.call_state.was = None;
@@ -1071,6 +1124,262 @@ impl Shell {
                     .flex_col()
                     .children(rows),
             )
+    }
+
+    /// In a 1:1 Tiny direct call, automatically watch the peer's screen share or camera as soon
+    /// as they start sending, and stop decoding when they stop.
+    fn call_auto_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
+        let is_room = self.tiny_room(&call.conversation).is_some();
+        if let Some(source) = auto_watch_step(call, is_room, &mut self.call_state.auto_watch) {
+            self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source }), cx);
+        }
+    }
+
+    /// The received video frame on screen, when it belongs to `user_id`.
+    pub(in crate::gui) fn call_frame(
+        &self,
+        call: Option<&Call>,
+        user_id: &str,
+    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        call?.picture
+            .as_ref()
+            .filter(|picture| !picture.path.is_empty() && picture.user_id == user_id)?;
+        self.call_state.feed.shown().cloned()
+    }
+
+    /// My own camera, or with `share` my own screen, as it is sent, while it is on.
+    pub(in crate::gui) fn call_self_frame(
+        &self,
+        call: Option<&Call>,
+        share: bool,
+    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        let (picture, feed) = if share {
+            (call?.share_view.as_ref(), &self.call_state.screen_feed)
+        } else {
+            (call?.self_view.as_ref(), &self.call_state.self_feed)
+        };
+        picture.filter(|picture| !picture.path.is_empty())?;
+        feed.shown().cloned()
+    }
+
+    /// Video picture area shown above the messages when the open conversation is a non-room call
+    /// carrying a peer picture or local self-view.
+    pub(in crate::gui) fn call_conversation_picture(
+        &self,
+        snapshot: &Snapshot,
+        open: &protocol::Conversation,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let call = self.call_shown(snapshot).filter(|call| {
+            call.state == CallState::Joined
+                && call.conversation == open.key
+                && self.tiny_room(&call.conversation).is_none()
+        })?;
+        self.call_picture_box(&call, false, cx)
+    }
+
+    /// Compact picture tile shown above the dock card when a non-room call has live video while
+    /// another conversation is open.
+    pub(super) fn call_dock_picture(
+        &self,
+        snapshot: &Snapshot,
+        call: &Call,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if call.state != CallState::Joined || self.tiny_room(&call.conversation).is_some() {
+            return None;
+        }
+        if snapshot.open.as_ref().is_some_and(|open| open.key == call.conversation) {
+            return None;
+        }
+        self.call_picture_box(call, true, cx)
+    }
+
+    fn call_picture_box(&self, call: &Call, compact: bool, cx: &mut Context<Self>) -> Option<Div> {
+        let peer_picture = call.picture.as_ref().filter(|p| !p.path.is_empty());
+        let peer_sender = call.participants.iter().find(|p| p.sharing || p.camera);
+        let peer_id = peer_picture
+            .map(|p| p.user_id.as_str())
+            .or_else(|| peer_sender.map(|p| p.id.as_str()));
+        let peer_name = peer_id
+            .and_then(|id| call.participants.iter().find(|p| p.id == id))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Peer".to_owned());
+        let peer_is_share = peer_picture
+            .map(|p| p.kind == protocol::PictureKind::Share)
+            .or_else(|| peer_sender.map(|p| p.sharing))
+            .unwrap_or(false);
+        let peer_frame = peer_id.and_then(|id| self.call_frame(Some(call), id));
+        let my_share = self.call_self_frame(Some(call), true);
+        let my_camera = self.call_self_frame(Some(call), false);
+        let self_frame = my_share.clone().or_else(|| my_camera.clone());
+        let self_is_share = my_share.is_some();
+
+        let has_peer = peer_frame.is_some() || peer_sender.is_some();
+        if !has_peer && self_frame.is_none() {
+            return None;
+        }
+        let main_is_peer = has_peer;
+        let height = if compact { 126. } else { 260. };
+
+        let main_body = if main_is_peer {
+            if let Some(frame) = peer_frame {
+                gpui::img(frame).size_full().object_fit(gpui::ObjectFit::Contain).into_any_element()
+            } else {
+                let id = peer_id.unwrap_or_default().to_owned();
+                let is_watching = watching(call, &id);
+                let label = if is_watching { "Connecting…" } else if peer_is_share { "Watch stream" } else { "Watch camera" };
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.))
+                    .child(div().type_small().text_color(theme::text_soft()).child(format!(
+                        "{peer_name} is {}",
+                        if peer_is_share { "sharing their screen" } else { "on camera" }
+                    )))
+                    .child(
+                        div()
+                            .id("call-picture-watch")
+                            .h(px(28.))
+                            .px(px(12.))
+                            .rounded_full()
+                            .bg(if is_watching { theme::overlay() } else { theme::accent() })
+                            .text_color(if is_watching { theme::text_soft() } else { theme::on_accent() })
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_micro()
+                            .font_weight(theme::SEMIBOLD)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(id.clone()) }), cx);
+                            }))
+                            .child(label),
+                    )
+                    .into_any_element()
+            }
+        } else {
+            gpui::img(self_frame.clone().unwrap())
+                .size_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element()
+        };
+
+        let caption = if main_is_peer {
+            format!("{peer_name}'s {}", if peer_is_share { "screen" } else { "camera" })
+        } else if self_is_share {
+            "Your screen".to_owned()
+        } else {
+            "Your camera".to_owned()
+        };
+        let badge = (main_is_peer && peer_is_share).then(|| {
+            div()
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .bg(theme::danger())
+                .text_color(theme::on_accent())
+                .text_size(px(10.))
+                .font_weight(FontWeight::BOLD)
+                .child("LIVE")
+        });
+        let action_btn = if main_is_peer && peer_id.is_some_and(|id| watching(call, id)) {
+            Some(
+                div()
+                    .id("call-picture-stop-watch")
+                    .h(px(24.))
+                    .px(px(8.))
+                    .rounded(px(6.))
+                    .bg(theme::overlay())
+                    .text_color(theme::text())
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+                    }))
+                    .child("Stop watching"),
+            )
+        } else if !main_is_peer {
+            Some(
+                div()
+                    .id("call-picture-stop-self")
+                    .h(px(24.))
+                    .px(px(8.))
+                    .rounded(px(6.))
+                    .bg(theme::danger())
+                    .text_color(theme::on_accent())
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if self_is_share {
+                            this.tiny_stop_share(cx);
+                        } else {
+                            this.call_ask(Request::Media(protocol::MediaRequest::Camera { on: false }), cx);
+                        }
+                    }))
+                    .child("Stop"),
+            )
+        } else {
+            None
+        };
+        let pip = (main_is_peer && !compact).then(|| self_frame).flatten().map(|frame| {
+            div()
+                .absolute()
+                .bottom(px(8.))
+                .right(px(8.))
+                .w(px(112.))
+                .h(px(64.))
+                .rounded(px(8.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme::border())
+                .bg(gpui::rgb(0x0b0b0d))
+                .child(gpui::img(frame).size_full().object_fit(gpui::ObjectFit::Contain))
+        });
+
+        let box_div = div()
+            .relative()
+            .w_full()
+            .h(px(height))
+            .flex_none()
+            .rounded(px(if compact { theme::R_CARD } else { 10. }))
+            .bg(gpui::rgb(0x0b0b0d))
+            .border_1()
+            .border_color(theme::hairline())
+            .overflow_hidden()
+            .child(main_body)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .bg(theme::overlay())
+                    .children(badge)
+                    .child(div().type_micro().text_color(theme::text()).child(caption)),
+            )
+            .children(action_btn.map(|btn| div().absolute().top(px(8.)).right(px(8.)).child(btn)))
+            .children(pip);
+
+        if compact {
+            Some(div().w_full().pb(px(6.)).child(box_div))
+        } else {
+            Some(div().w_full().flex_none().px(px(16.)).pt(px(10.)).pb(px(4.)).child(box_div))
+        }
     }
 
     /// A join was asked for here: a new room that follows is not a moderator's move.
@@ -1747,5 +2056,30 @@ mod tests {
         assert_eq!(state.gain(&tiny_b, "u1"), (60, true));
         assert_eq!(state.gain(&discord, "u1"), (180, false));
         assert_eq!(state.gain(&tiny_a, "other"), (100, false));
+    }
+
+    #[test]
+    fn auto_watch_starts_once_for_direct_peer_ignores_rooms_and_respects_manual_stop() {
+        let mut call: Call = serde_json::from_value(serde_json::json!({
+            "conversation": { "network": "tiny", "account": "srv", "id": "dm-1" },
+            "state": "joined",
+            "participants": [{ "id": "peer-1", "name": "Bea", "sharing": true, "camera": false }],
+            "muted": false, "deafened": false, "joined": 1, "engine_linked": true, "video": []
+        })).unwrap();
+        let mut prev = None;
+        // Room call never auto-watches.
+        assert_eq!(auto_watch_step(&call, true, &mut prev), None);
+        assert_eq!(prev, None);
+        // Direct call auto-watches once.
+        assert_eq!(auto_watch_step(&call, false, &mut prev), Some(Some("peer-1".into())));
+        // Subsequent Call changes (including after a manual Stop watching) do not re-ask.
+        assert_eq!(auto_watch_step(&call, false, &mut prev), None);
+        // When peer stops sharing, decoder stops and prev clears.
+        call.participants[0].sharing = false;
+        assert_eq!(auto_watch_step(&call, false, &mut prev), Some(None));
+        assert_eq!(prev, None);
+        // When peer turns on camera, auto-watch triggers again.
+        call.participants[0].camera = true;
+        assert_eq!(auto_watch_step(&call, false, &mut prev), Some(Some("peer-1".into())));
     }
 }

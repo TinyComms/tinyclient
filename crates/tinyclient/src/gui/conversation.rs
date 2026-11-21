@@ -1767,6 +1767,7 @@ impl Shell {
         } else {
             self.strip(open, link, window, cx)
         })
+        .children((!phone).then(|| self.call_conversation_picture(snapshot, open, cx)).flatten())
         .child(div().flex_1().min_h_0().child(pane))
         .child(match open.special {
             Special::Service => self.no_composer(open, cx),

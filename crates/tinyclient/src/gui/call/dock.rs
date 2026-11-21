@@ -410,6 +410,9 @@ impl Shell {
             }
             None => self.call_ended(ended?, cx),
         };
+        let dock_picture = self
+            .call_shown(snapshot)
+            .and_then(|call| self.call_dock_picture(snapshot, &call, cx));
         Some(
             div()
                 .w_full()
@@ -420,6 +423,7 @@ impl Shell {
                 .pb(px(8.))
                 .border_t_1()
                 .border_color(theme::hairline())
+                .children(dock_picture)
                 .child(card),
         )
     }

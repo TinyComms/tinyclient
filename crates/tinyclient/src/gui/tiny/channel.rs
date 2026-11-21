@@ -157,8 +157,7 @@ fn sending(call: &Call, content: Content) -> bool {
 
 /// A decode of this person was asked for, or their picture is on screen.
 pub(super) fn watching(call: &Call, user_id: &str) -> bool {
-    call.video.iter().any(|stream| stream.direction == Direction::Decode && stream.content == Content::Share && stream.source == user_id)
-        || call.picture.as_ref().is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+    crate::gui::call::watching(call, user_id)
 }
 
 /// What my call sends, when it is up.
@@ -453,15 +452,12 @@ impl Shell {
 
     /// The frame on screen, when it is this person's.
     fn tiny_frame(&self, call: Option<&Call>, user_id: &str) -> Option<Arc<RenderImage>> {
-        call?.picture.as_ref().filter(|picture| !picture.path.is_empty() && picture.user_id == user_id)?;
-        self.call_state.feed.shown().cloned()
+        self.call_frame(call, user_id)
     }
 
     /// My own camera, or with `share` my own screen, as it is sent, while it is on.
     fn tiny_self_frame(&self, call: Option<&Call>, share: bool) -> Option<Arc<RenderImage>> {
-        let (picture, feed) = if share { (call?.share_view.as_ref(), &self.call_state.screen_feed) } else { (call?.self_view.as_ref(), &self.call_state.self_feed) };
-        picture.filter(|picture| !picture.path.is_empty())?;
-        feed.shown().cloned()
+        self.call_self_frame(call, share)
     }
 
     /// What a stream shows: its picture; mine, the same small live view of it that I send, with
