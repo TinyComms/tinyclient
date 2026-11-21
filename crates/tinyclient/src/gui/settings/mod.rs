@@ -156,6 +156,7 @@ pub(super) enum Confirm {
     /// A shorter retention, with what it would delete when chatd said.
     Retention { days: u32, prunable: Option<(u64, u64)> },
     Clear,
+    ExportAll,
     Reset,
     TinyEverywhere(Box<AccountStatus>),
 }

@@ -1076,6 +1076,18 @@ pub struct MessageReminder {
     pub due: i64,
 }
 
+/// What cached data `Request::Export` writes to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ExportScope {
+    /// One conversation.
+    Conversation { conversation: Key },
+    /// Every cached conversation of one account.
+    Account { account: AccountKey },
+    /// Every cached conversation on this device, organized per account.
+    All,
+}
+
 /// Most targets a single `Request::Forward` may name (official apps cap around 5).
 pub const FORWARD_LIMIT: usize = 5;
 
@@ -1653,6 +1665,18 @@ pub enum Request {
     Storage,
     /// Deletes every cached message and file. Sessions, drafts and settings stay.
     Clear,
+    /// Exports cached messages (and optionally on-disk media) to an unencrypted folder at
+    /// `destination`. Never fetches history from any network and never exports member lists.
+    Export {
+        scope: ExportScope,
+        destination: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        #[serde(default)]
+        include_files: bool,
+    },
     /// How much a retention of `days` would delete now.
     Prunable {
         days: u32,
@@ -2257,6 +2281,17 @@ pub enum Response {
         message_id: Option<String>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         title: String,
+    },
+    /// Answers `Export`: where the unencrypted export was written and what cached range it covered.
+    Exported {
+        path: String,
+        conversations: u32,
+        messages: u64,
+        files: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        earliest: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest: Option<i64>,
     },
     /// Answers `Forward`: one outcome per target conversation.
     Forwarded {

@@ -1856,7 +1856,17 @@ impl SettingsWindow {
                     .items_center()
                     .child(div().flex_1().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(crate::host::on_here(&total_words)))
                     .when(!phone::active(), |line| {
-                        line.child(button("D1", ButtonKind::Ghost, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| cx.open_with_system(&protocol::support_dir()))))
+                        line.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(button("D1-export", ButtonKind::Secondary, "Export all…").on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm = Some(Confirm::ExportAll);
+                                    cx.notify();
+                                })))
+                                .child(button("D1", ButtonKind::Ghost, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| cx.open_with_system(&protocol::support_dir())))),
+                        )
                     }),
             )
             .child(
@@ -1915,6 +1925,35 @@ impl SettingsWindow {
                 button("retention-confirm", ButtonKind::Danger, "Delete").on_click(cx.listener(move |this, _, _, cx| {
                     this.confirm = None;
                     this.set("P4", GLOBAL.into(), KEEP_DAYS, Some(days.to_string()), cx);
+                })),
+                cx,
+            ),
+            Confirm::ExportAll => modal_panel(
+                "Export everything cached on this device?",
+                vec![
+                    "Saves each account's cached conversations as messages.json, index.html, and on-disk media files. Only messages already cached on this device are included; member lists are omitted.".to_owned(),
+                    "Warning: the export is written as unencrypted files on disk, including messages that were end-to-end encrypted in transit.".to_owned(),
+                ],
+                button("export-all-confirm", ButtonKind::Primary, "Export unencrypted").on_click(cx.listener(|this, _, _, cx| {
+                    this.confirm = None;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let dest = protocol::support_dir().join("exports").join(format!("all-{now}"));
+                    let dest_str = dest.to_string_lossy().into_owned();
+                    let req = Request::Export {
+                        scope: protocol::ExportScope::All,
+                        destination: dest_str,
+                        since: None,
+                        until: None,
+                        include_files: true,
+                    };
+                    this.off_thread(cx, move || crate::client::ask(&req), move |_this, answer, cx| {
+                        if let Ok(Response::Exported { path, .. }) = answer {
+                            cx.open_with_system(std::path::Path::new(&path));
+                        }
+                    });
+                    cx.notify();
                 })),
                 cx,
             ),

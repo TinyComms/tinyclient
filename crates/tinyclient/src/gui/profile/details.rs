@@ -258,6 +258,39 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         body = body.child(draw::rule().mt(px(16.))).child(pane.shared_of(network, window, cx).mt(px(8.)));
     }
     let created = info.map(facts::created_line).unwrap_or_default();
+    let export_key = row.key.clone();
+    let export_row = div()
+        .mt(px(4.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            button_with_icon("details-export", ButtonKind::Secondary, "icons/folder-plus.svg", "Export cached messages…")
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let dest = protocol::support_dir().join("exports").join(format!("conv-{now}"));
+                    let req = Request::Export {
+                        scope: protocol::ExportScope::Conversation { conversation: export_key.clone() },
+                        destination: dest.to_string_lossy().into_owned(),
+                        since: None,
+                        until: None,
+                        include_files: true,
+                    };
+                    crate::gui::people::ask_later(cx, req, |answer, cx| {
+                        if let Ok(protocol::Response::Exported { path, .. }) = answer {
+                            cx.open_with_system(std::path::Path::new(&path));
+                        }
+                    });
+                })),
+        )
+        .child(
+            div()
+                .type_micro()
+                .text_color(theme::text_faint())
+                .child("Writes unencrypted JSON, HTML, and cached files (including messages that were end-to-end encrypted in transit). Only cached messages are included; member lists are omitted."),
+        );
     body.child(
         div()
             .px(px(theme::PANE_PAD))
@@ -266,7 +299,8 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
             .flex_col()
             .gap(px(8.))
             .children(draw::foot_line(created))
-            .children(link.filter(|_| facts::foot_opens(network)).map(|url| draw::open_in("details-open", network).on_click(move |_, _, cx| cx.open_url(&url)))),
+            .children(link.filter(|_| facts::foot_opens(network)).map(|url| draw::open_in("details-open", network).on_click(move |_, _, cx| cx.open_url(&url))))
+            .child(export_row),
     )
 }
 

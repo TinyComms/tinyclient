@@ -1816,6 +1816,35 @@ impl Chat {
         }
     }
 
+    fn export_cache(
+        &self,
+        scope: protocol::ExportScope,
+        destination: String,
+        since: Option<i64>,
+        until: Option<i64>,
+        include_files: bool,
+    ) -> Response {
+        let dest = destination.trim();
+        if dest.is_empty() {
+            return error(ErrorCode::Refused, "Choose a destination folder for the export.");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let store = self.hub.store();
+        match crate::export::run(&store, &scope, std::path::Path::new(dest), since, until, include_files, now) {
+            Ok(summary) => Response::Exported {
+                path: summary.path.to_string_lossy().into_owned(),
+                conversations: summary.conversations,
+                messages: summary.messages,
+                files: summary.files,
+                earliest: summary.earliest,
+                latest: summary.latest,
+            },
+            Err(why) => error(ErrorCode::Refused, why),
+        }
+    }
+
     fn forward(&self, from: Key, message_ids: Vec<String>, to: Vec<Key>, note: String) -> Response {
         if message_ids.is_empty() || to.is_empty() {
             return error(ErrorCode::Refused, "Choose at least one message and one conversation.");
@@ -2981,6 +3010,9 @@ impl Chat {
             Request::Shutdown => self.shutdown(),
             Request::Storage => self.storage(),
             Request::Clear => self.clear(),
+            Request::Export { scope, destination, since, until, include_files } => {
+                self.export_cache(scope, destination, since, until, include_files)
+            }
             Request::Prunable { days } => match self.hub.store().prunable(now(), days) {
                 Ok((messages, bytes)) => Response::Prunable { messages, bytes },
                 Err(err) => internal(err),

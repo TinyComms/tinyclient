@@ -1520,6 +1520,91 @@ impl Store {
             .optional()
     }
 
+    /// Lists cached conversations matching `scope` for local export. Never touches any network
+    /// and never includes member lists.
+    pub fn export_conversations(&self, scope: &protocol::ExportScope) -> rusqlite::Result<Vec<Conversation>> {
+        match scope {
+            protocol::ExportScope::Conversation { conversation } => {
+                Ok(self.conversation(conversation)?.into_iter().collect())
+            }
+            protocol::ExportScope::Account { account } => {
+                let mut stmt = self.db.prepare(&format!(
+                    "{CONVERSATION} WHERE c.network = ?1 AND c.account = ?2 ORDER BY c.updated DESC, c.id"
+                ))?;
+                let rows = stmt.query_map(params![word(&account.network), account.account], conversation_from)?;
+                rows.collect()
+            }
+            protocol::ExportScope::All => {
+                let mut stmt = self.db.prepare(&format!(
+                    "{CONVERSATION} ORDER BY c.network, c.account, c.updated DESC, c.id"
+                ))?;
+                let rows = stmt.query_map([], conversation_from)?;
+                rows.collect()
+            }
+        }
+    }
+
+    /// Reads all cached, non-expired messages of `conversation` in chronological order,
+    /// filtered by optional `since` / `until` unix seconds. Never pages any network.
+    pub fn export_messages(
+        &self,
+        conversation: &Key,
+        since: Option<i64>,
+        until: Option<i64>,
+        now: i64,
+    ) -> rusqlite::Result<Vec<Message>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3
+                AND (expires IS NULL OR expires > ?4)
+              {OLDEST_FIRST}"
+        ))?;
+        let mut rows: Vec<Message> = stmt
+            .query_map(
+                params![word(&conversation.network), conversation.account, conversation.id, now],
+                message_from,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.retain(|m| {
+            if let Some(s) = since {
+                if m.sent < s {
+                    return false;
+                }
+            }
+            if let Some(u) = until {
+                if m.sent > u {
+                    return false;
+                }
+            }
+            if m.expires_at.is_some_and(|at| at <= now) {
+                return false;
+            }
+            true
+        });
+        let account = conversation.account();
+        for msg in &mut rows {
+            for att in &mut msg.attachments {
+                if att.file.path.is_none() {
+                    att.file.path = self.cached_media_path(&account, &att.file.id)?;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// On-disk path of a cached media file, if present.
+    pub fn cached_media_path(&self, account: &AccountKey, id: &str) -> rusqlite::Result<Option<String>> {
+        let path: Option<String> = self
+            .db
+            .query_row(
+                "SELECT path FROM media WHERE network = ?1 AND account = ?2 AND id = ?3 AND path != ''",
+                params![word(&account.network), account.account, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
     /// Resolves a parsed network message/channel link against cached conversations across
     /// signed-in accounts. Never creates or joins a conversation.
     pub fn resolve_link(&self, link: &protocol::link::NetworkLink) -> rusqlite::Result<Option<Conversation>> {
