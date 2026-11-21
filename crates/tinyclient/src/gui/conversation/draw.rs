@@ -1897,7 +1897,12 @@ impl Pane {
                 let attachment = &message.attachments[*only];
                 let (wide, tall) = natural(attachment);
                 let single = media::single(wide, tall, width);
-                out.push(self.tile(message, *only, single.width, single.height, single.fit, None, window, cx));
+                let tile = self.tile(message, *only, single.width, single.height, single.fit, None, window, cx);
+                if let Some(panel) = self.transcript_box(message, *only, None, cx) {
+                    out.push(div().flex().flex_col().child(tile).child(panel).into_any_element());
+                } else {
+                    out.push(tile);
+                }
             }
             many => {
                 let (tiles, height) = media::grid(many.len(), width);

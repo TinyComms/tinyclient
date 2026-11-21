@@ -423,6 +423,12 @@ pub struct Pane {
     scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// A file the user pressed play on before it was on disk: file, message, attachment, from.
     play_after: Option<(String, String, usize, Option<u32>)>,
+    /// Clip attachment file ids whose full transcript panel is expanded.
+    transcript_open: HashSet<String>,
+    /// Lazily parsed WebVTT lines keyed by VTT `MediaFile::id`.
+    transcripts: HashMap<String, Vec<protocol::TranscriptLine>>,
+    /// Video clip attachment file ids with inline captions toggled on.
+    captions_on: HashSet<String>,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -513,6 +519,9 @@ impl Pane {
             scrub: None,
             scrub_bounds: Rc::default(),
             play_after: None,
+            transcript_open: HashSet::new(),
+            transcripts: HashMap::new(),
+            captions_on: HashSet::new(),
             width: 0.,
             opening: false,
             seen: Rc::default(),
@@ -537,6 +546,60 @@ impl Pane {
             self.revealed_contacts.insert(key);
         }
         cx.notify();
+    }
+
+    pub(super) fn load_transcript_file(&mut self, vtt_id: &str, path: &str) {
+        const MAX_VTT_BYTES: u64 = 512 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_VTT_BYTES {
+                return;
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            self.transcripts.insert(vtt_id.to_owned(), protocol::parse_webvtt(&raw));
+        }
+    }
+
+    fn ensure_transcript_loaded(&mut self, vtt: Option<MediaFile>, cx: &mut Context<Self>) {
+        let Some(vtt) = vtt else {
+            return;
+        };
+        if self.transcripts.contains_key(&vtt.id) {
+            return;
+        }
+        if let Some(path) = vtt.path.clone().or_else(|| self.known.get(&vtt.id).cloned()) {
+            self.load_transcript_file(&vtt.id, &path);
+        } else {
+            self.fetch(vec![vtt.id.clone()], None, vtt.failed.is_some(), cx);
+        }
+    }
+
+    pub(super) fn toggle_transcript(&mut self, clip_id: String, vtt: Option<MediaFile>, cx: &mut Context<Self>) {
+        if !self.transcript_open.remove(&clip_id) {
+            self.transcript_open.insert(clip_id);
+            self.ensure_transcript_loaded(vtt, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_captions(&mut self, clip_id: String, vtt: Option<MediaFile>, cx: &mut Context<Self>) {
+        if !self.captions_on.remove(&clip_id) {
+            self.captions_on.insert(clip_id);
+            self.ensure_transcript_loaded(vtt, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn transcript_lines<'a>(&'a self, transcript: &'a protocol::Transcript) -> &'a [protocol::TranscriptLine] {
+        if !transcript.lines.is_empty() {
+            return &transcript.lines;
+        }
+        if let Some(vtt) = &transcript.file {
+            if let Some(lines) = self.transcripts.get(&vtt.id) {
+                return lines;
+            }
+        }
+        &[]
     }
 
     pub(super) fn vote_poll(&mut self, message_id: String, votes: Option<Vec<u32>>, cx: &mut Context<Self>) {
@@ -698,6 +761,9 @@ impl Pane {
         self.shown.clear();
         self.expanded.clear();
         self.revealed_blocked.clear();
+        self.transcript_open.clear();
+        self.transcripts.clear();
+        self.captions_on.clear();
         self.code_colors.clear();
         self.multi_select.clear();
         self.code_coloring.clear();
@@ -1145,6 +1211,9 @@ impl Pane {
                 self.replaced.push(path.clone());
             }
             self.known.insert(file.id.clone(), path.clone());
+            if file.id.ends_with(":vtt") {
+                self.load_transcript_file(&file.id, path);
+            }
             if let Some((then, name)) = self.then.remove(&file.id) {
                 draw::open_file(path, &name, then, cx);
             }

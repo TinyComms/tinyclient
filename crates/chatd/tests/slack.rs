@@ -299,10 +299,20 @@ impl Fake {
             assert_eq!(space, team(&call.token), "the edge cache is asked under the workspace's own id");
             return self.edge(&call.token, method, &asked);
         }
-        // A file: an upload, a thumbnail, a picture.
+        // A file: an upload, a thumbnail, a picture, or a clip WebVTT track.
         call.method = format!("file:{path}");
         call.token = header("authorization").trim_start_matches("Bearer ").to_owned();
         self.calls.lock().unwrap().push(call);
+        if path.ends_with(".vtt") {
+            let vtt = "WEBVTT\n\n00:00:00.500 --> 00:00:03.200\n<v Ana>Quick deploy update for everyone.</v>\n\n00:00:03.500 --> 00:00:07.000\nCanary is green and traffic is at 50%.\n";
+            return Reply {
+                status: "200 OK",
+                retry_after: None,
+                kind: "text/vtt",
+                cookie: None,
+                body: vtt.as_bytes().to_vec(),
+            };
+        }
         Reply {
             status: "200 OK",
             retry_after: None,
@@ -5899,4 +5909,107 @@ fn slack_records_and_sends_audio_and_video_clips() {
     assert_eq!(video_sent.attachments[0].duration, 45);
     let vid_url = world.fake.calls(ALPHA, "files.getUploadURLExternal").pop().unwrap();
     assert_eq!(vid_url.params.get("subtype").map(String::as_str), Some("slack_video"));
+}
+
+#[test]
+fn slack_clip_transcript_vtt_and_transcoded_video() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    world.open(&general);
+
+    let ts = "1760000950.000950";
+    let event = json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "",
+        "ts": ts,
+        "event_ts": ts,
+        "files": [
+            {
+                "id": "F0CLIP1",
+                "name": "standup.ogg",
+                "title": "Standup update",
+                "mimetype": "audio/ogg",
+                "subtype": "slack_audio",
+                "size": 42_000,
+                "duration_ms": 7_500,
+                "audio_wave_samples": [10, 50, 90, 40],
+                "url_private": format!("{}/files-pri/T01ALPHA-F0CLIP1/standup.ogg", world.fake.base),
+                "vtt": format!("{}/files-pri/T01ALPHA-F0CLIP1/transcript.vtt", world.fake.base),
+                "transcription": {
+                    "status": "complete",
+                    "preview": { "content": "Quick deploy update for everyone." }
+                }
+            },
+            {
+                "id": "F0VID1",
+                "name": "walkthrough.mov",
+                "title": "Walkthrough",
+                "mimetype": "video/quicktime",
+                "subtype": "slack_video",
+                "size": 25_000_000,
+                "duration_ms": 30_000,
+                "url_private": format!("{}/files-pri/T01ALPHA-F0VID1/original.mov", world.fake.base),
+                "mp4": format!("{}/files-pri/T01ALPHA-F0VID1/transcoded.mp4", world.fake.base),
+                "thumb_video": format!("{}/files-tmb/T01ALPHA-F0VID1/thumb.jpg", world.fake.base),
+                "vtt": format!("{}/files-pri/T01ALPHA-F0VID1/captions.vtt", world.fake.base),
+                "transcription": {
+                    "status": "complete",
+                    "preview": "Demo preview"
+                }
+            }
+        ]
+    });
+    world.fake.push(ALPHA, event);
+
+    let msg = world.until("clip message stored", || world.message(&general, ts));
+    assert_eq!(msg.attachments.len(), 2);
+
+    // 1. Audio clip carries transcript preview/status and lazy VTT MediaFile, never eagerly fetched.
+    let audio = &msg.attachments[0];
+    assert_eq!(audio.file.kind, MediaKind::Audio);
+    assert_eq!(audio.duration, 7);
+    let tr = audio.transcript.as_ref().expect("audio clip transcript");
+    assert_eq!(tr.status, "complete");
+    assert_eq!(tr.preview, "Quick deploy update for everyone.");
+    assert!(tr.lines.is_empty(), "full lines must be fetched lazily, not stored eagerly");
+    let vtt_file = tr.file.as_ref().expect("vtt MediaFile registered");
+    assert_eq!(vtt_file.id, "F0CLIP1:vtt");
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0CLIP1/transcript.vtt").is_none(),
+        "VTT must not be fetched until the user opens the transcript"
+    );
+
+    // 2. On-demand Request::Fetch downloads the VTT with session headers and parses into timed cues.
+    let landed = world.fetched(&general, &vtt_file.id, None);
+    let path = landed.path.as_deref().expect("vtt landed on disk");
+    let vtt_call = world
+        .fake
+        .file("/files-pri/T01ALPHA-F0CLIP1/transcript.vtt")
+        .expect("vtt fetched on demand");
+    assert_eq!(vtt_call.token, ALPHA);
+    assert!(vtt_call.cookie.contains(COOKIE));
+    let raw = std::fs::read_to_string(path).unwrap();
+    let lines = protocol::parse_webvtt(&raw);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].start_ms, 500);
+    assert_eq!(lines[0].text, "Ana: Quick deploy update for everyone.");
+    assert_eq!(lines[1].start_ms, 3_500);
+    assert_eq!(protocol::active_caption(&lines, 4_000).map(|l| l.text.as_str()), Some("Canary is green and traffic is at 50%."));
+
+    // 3. Video clip prefers the smaller transcoded `mp4` copy over the raw `url_private` upload.
+    let video = &msg.attachments[1];
+    assert_eq!(video.file.kind, MediaKind::Video);
+    assert_eq!(video.transcript.as_ref().unwrap().preview, "Demo preview");
+    let _landed_vid = world.fetched(&general, &video.file.id, None);
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0VID1/transcoded.mp4").is_some(),
+        "must prefer transcoded mp4 copy over original mov"
+    );
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0VID1/original.mov").is_none(),
+        "must not fetch original mov when transcoded mp4 exists"
+    );
 }

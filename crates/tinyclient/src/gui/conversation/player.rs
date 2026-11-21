@@ -117,7 +117,7 @@ pub(in crate::gui) fn glyph(playing: bool, size: f32, color: impl IntoColor<Hsla
 }
 
 impl Pane {
-    fn playback_of(&self, file: &str, cx: &Context<Self>) -> (Option<Playback>, u16) {
+    pub(super) fn playback_of(&self, file: &str, cx: &Context<Self>) -> (Option<Playback>, u16) {
         let account = self.key().map(protocol::Key::account);
         self.shell.upgrade().map_or((None, 100), |shell| {
             let state = &shell.read(cx).playing_state;
@@ -355,7 +355,183 @@ impl Pane {
                 .child(div().flex().items_center().gap(px(8.)).child(track).child(time));
             row.h(px(56.)).child(button).child(lines).child(speed)
         };
+        let active_ms = shown.active().then_some(shown.at);
+        if let Some(panel) = self.transcript_box(message, index, active_ms, cx) {
+            return div().flex().flex_col().child(row).child(panel).into_any_element();
+        }
         row.into_any_element()
+    }
+
+    /// Preview line, "Show transcript" toggle, and expandable timed transcript panel for a clip.
+    /// Clicking any timed line seeks the player to that timestamp (`press_play` with `Some(start_ms)`).
+    pub(super) fn transcript_box(
+        &self,
+        message: &Rc<Message>,
+        index: usize,
+        active_ms: Option<u32>,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let attachment = message.attachments.get(index)?;
+        let transcript = attachment.transcript.as_ref()?;
+        if transcript.is_empty() {
+            return None;
+        }
+        let clip_id = attachment.file.id.clone();
+        let expanded = self.transcript_open.contains(&clip_id);
+        let lines = self.transcript_lines(transcript);
+        let active_start = active_ms
+            .and_then(|ms| protocol::active_caption(lines, ms))
+            .map(|line| line.start_ms);
+        let can_expand = transcript.file.is_some() || !lines.is_empty() || !transcript.preview.is_empty();
+        let (toggle_id, toggle_vtt) = (clip_id.clone(), transcript.file.clone());
+
+        let mut panel = div()
+            .w(px(360.))
+            .max_w_full()
+            .mt(px(4.))
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(theme::R_CARD))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::hairline())
+            .flex()
+            .flex_col()
+            .gap(px(4.));
+
+        if !expanded {
+            if !transcript.preview.is_empty() {
+                panel = panel.child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .line_clamp(2)
+                        .child(transcript.preview.clone()),
+                );
+            } else if transcript.status == "processing" {
+                panel = panel.child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_faint())
+                        .child("Transcribing clip…"),
+                );
+            }
+            if can_expand {
+                panel = panel.child(
+                    div()
+                        .id(SharedString::from(format!("tr-toggle-{clip_id}")))
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(theme::accent_text())
+                        .hover(|s| s.underline())
+                        .child("Show transcript")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_transcript(toggle_id.clone(), toggle_vtt.clone(), cx);
+                        })),
+                );
+            }
+            return Some(panel);
+        }
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .type_micro()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::text_faint())
+                    .child("Transcript"),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("tr-hide-{clip_id}")))
+                    .cursor_pointer()
+                    .type_micro()
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent_text())
+                    .hover(|s| s.underline())
+                    .child("Hide transcript")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_transcript(toggle_id.clone(), toggle_vtt.clone(), cx);
+                    })),
+            );
+        panel = panel.child(header);
+
+        if !lines.is_empty() {
+            let mut list = div()
+                .id(SharedString::from(format!("tr-scroll-{clip_id}")))
+                .max_h(px(200.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(2.));
+            for (line_ix, line) in lines.iter().take(200).enumerate() {
+                let is_active = active_start == Some(line.start_ms);
+                let seek_msg = message.clone();
+                let seek_ms = line.start_ms;
+                let row_el = div()
+                    .id(SharedString::from(format!("tr-line-{clip_id}-{line_ix}")))
+                    .px(px(4.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .when(is_active, |row| row.bg(theme::accent_soft()))
+                    .hover(|s| s.bg(theme::hover()))
+                    .cursor_pointer()
+                    .flex()
+                    .items_start()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(34.))
+                            .type_micro()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(if is_active { theme::accent_text() } else { theme::text_faint() })
+                            .child(playing::clock(line.start_ms)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .type_small()
+                            .text_color(if is_active { theme::text() } else { theme::text_soft() })
+                            .child(line.text.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.press_play(&seek_msg, index, Some(seek_ms), cx);
+                    }));
+                list = list.child(row_el);
+            }
+            panel = panel.child(list);
+        } else if transcript.file.as_ref().and_then(|f| f.failed.as_ref()).is_some() {
+            panel = panel.child(
+                div()
+                    .type_small()
+                    .text_color(theme::danger())
+                    .child("Couldn't load transcript."),
+            );
+        } else if transcript.file.is_some() {
+            panel = panel.child(
+                div()
+                    .type_small()
+                    .text_color(theme::text_faint())
+                    .child("Loading transcript…"),
+            );
+        } else if !transcript.preview.is_empty() {
+            panel = panel.child(
+                div()
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(transcript.preview.clone()),
+            );
+        }
+        Some(panel)
     }
 }
 
