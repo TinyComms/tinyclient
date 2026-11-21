@@ -23,7 +23,8 @@ pub fn wire_with_spans(
     emoticons: bool,
 ) -> (String, Vec<protocol::Span>) {
     let wired = wire_text(field, tokens, can, emoticons);
-    if !can.mention_spans || tokens.is_empty() {
+    let structured = can.mention_spans || (can.mention_format == protocol::MentionFormat::Plain && can.custom_emoji != protocol::EmojiScope::None);
+    if !structured || tokens.is_empty() {
         return (wired, Vec::new());
     }
     let lead = field.len() - field.trim_start().len();
@@ -41,7 +42,7 @@ pub fn wire_with_spans(
             shifted.push(Token { range: start..end, ..token.clone() });
         }
     }
-    let spans = mention::spans(&wired, &shifted, can.mention_spans);
+    let spans = mention::spans(&wired, &shifted, structured);
     (wired, spans)
 }
 

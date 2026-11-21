@@ -224,6 +224,7 @@ impl Device {
             attachments: Vec::new(),
             sent_at: None,
             on: false,
+            ..Envelope::default()
         };
         let Ok(client_id) = super::attachment_id() else {
             return false;

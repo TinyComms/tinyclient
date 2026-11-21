@@ -1579,12 +1579,15 @@ pub enum Request {
         target: ReportTarget,
     },
     /// Our own presence on one account, and the status text beside it: `None` leaves the text
-    /// as it is, empty clears it.
+    /// as it is, empty clears it. `clear_at`, when given, is a Unix timestamp (seconds) when
+    /// the status text expires.
     SetPresence {
         account: AccountKey,
         presence: Presence,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clear_at: Option<i64>,
     },
     /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
     /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is
@@ -1959,6 +1962,44 @@ pub enum Request {
     TinySignOutEverywhere {
         account: AccountKey,
     },
+    /// Permanently deletes this account on the Tiny server (`DELETE /v1/me` with confirmation),
+    /// then wipes this install's local session, keys, and cache for that server. Answers `Status`.
+    TinyDeleteAccount {
+        account: AccountKey,
+    },
+    /// Files an abuse report on a Tiny server (`POST /v1/reports`). Answers `TinyReported`.
+    TinyReport {
+        account: AccountKey,
+        kind: String,
+        target_id: String,
+        category: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+    },
+    /// Lists a Tiny server's custom emoji and stickers (`GET /v1/emoji`). Answers `TinyEmojiList`.
+    TinyEmojiList {
+        account: AccountKey,
+    },
+    /// Uploads a new custom emoji or sticker (`POST /v1/emoji`). Answers `Ok`.
+    TinyEmojiCreate {
+        account: AccountKey,
+        name: String,
+        kind: String,
+        path: String,
+    },
+    /// Renames a custom emoji or sticker (`PATCH /v1/emoji/{id}`). Answers `Ok`.
+    TinyEmojiRename {
+        account: AccountKey,
+        emoji_id: String,
+        name: String,
+    },
+    /// Deletes a custom emoji or sticker (`DELETE /v1/emoji/{id}`). Answers `Ok`.
+    TinyEmojiDelete {
+        account: AccountKey,
+        emoji_id: String,
+    },
     /// Makes a room, for an owner or an admin. Its call is empty until someone joins.
     TinyRoomCreate {
         account: AccountKey,
@@ -2180,6 +2221,25 @@ pub enum Request {
         account: AccountKey,
         #[serde(default)]
         filter: TinyAuditFilter,
+    },
+    /// One page of the server's abuse reports (`GET /v1/reports`). Answers `TinyReports`.
+    TinyReportsList {
+        account: AccountKey,
+        #[serde(default)]
+        filter: TinyReportFilter,
+    },
+    /// One abuse report with reporter note, unverified evidence, and moderator notes (`GET /v1/reports/{id}`).
+    /// Kept in memory only; never cached or logged. Answers `TinyReport`.
+    TinyReportRead {
+        account: AccountKey,
+        report_id: String,
+    },
+    /// Update an abuse report (`PATCH /v1/reports/{id}`): status, moderator note, linked audit id,
+    /// or legal hold (`preserve`, owners only). Answers `TinyReport`.
+    TinyReportWork {
+        account: AccountKey,
+        report_id: String,
+        update: TinyReportUpdate,
     },
     /// What the owner is asked about the community's privacy (`GET /v1/setup`). Answers
     /// `TinySetup`; refused in words unless the server has `first_run_setup` and this account is
@@ -2665,6 +2725,14 @@ pub enum Response {
     TinyAudit {
         audit: Vec<TinyAudit>,
     },
+    /// One page of a Tiny server's abuse reports, newest first.
+    TinyReports {
+        reports: Vec<TinyReportSummary>,
+    },
+    /// One full abuse report (note, evidence, moderator notes). Kept in memory only.
+    TinyReport {
+        report: Box<TinyReportDetail>,
+    },
     /// What `TinySetupRead` asked.
     TinySetup {
         setup: TinySetup,
@@ -2697,6 +2765,15 @@ pub enum Response {
     TinyBotCreated {
         bot: TinyBot,
         token: String,
+    },
+    /// An abuse report was accepted (`POST /v1/reports`). `duplicate` is true on `200` when the
+    /// same reporter already has an open or reviewing report on this target.
+    TinyReported {
+        duplicate: bool,
+    },
+    /// A Tiny server's community custom emoji and stickers (`GET /v1/emoji`).
+    TinyEmojiList {
+        items: Vec<TinyEmoji>,
     },
     /// What `E2eeAsk::Status` asked.
     TinyE2ee {

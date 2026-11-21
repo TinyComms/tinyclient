@@ -46,6 +46,10 @@ pub(in crate::gui) struct Draft {
     pub conversation: Option<protocol::Key>,
     /// Only one backup form is open at a time: save (`true`) or import (`false`).
     pub backup_mode: Option<bool>,
+    /// Local edits to the community E2EE policy before publishing.
+    pub policy_draft: Option<protocol::CommunityPolicy>,
+    /// Two-step confirmation for "Replace root" (warns every member).
+    pub confirm_replace_root: bool,
     scope: std::rc::Rc<()>,
     status_read: Option<std::rc::Rc<()>>,
     status_again: bool,
@@ -438,7 +442,7 @@ fn security_details(open: bool, cx: &mut Context<Shell>) -> Div {
 
 pub(in crate::gui::tiny) fn encryption(
     shell: &Shell,
-    _facts: &Facts,
+    facts: &Facts,
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) -> AnyElement {
@@ -902,8 +906,183 @@ pub(in crate::gui::tiny) fn encryption(
         );
     }
     page.when(draft.details, |page| page.child(kit::security_section("icons/key.svg", "Recovery key").child(recovery)))
+        .when_some(status.community.as_ref(), |page, community| {
+            let can_manage = facts.community.allowed("community.server.edit");
+            page.child(community_card(draft, community, can_manage, cx))
+        })
         .child(super::backup::backup(shell, draft.loading, window, cx))
         .into_any_element()
+}
+
+fn community_card(
+    draft: &Draft,
+    community: &protocol::CommunityRootStatus,
+    can_manage: bool,
+    cx: &mut Context<Shell>,
+) -> Div {
+    let heading = if community.set {
+        format!("Root key set · version {}", community.version)
+    } else {
+        "No root key set".to_owned()
+    };
+    let mut body = card()
+        .p(px(12.))
+        .gap(px(10.))
+        .child(kit::security_words(heading).type_ui().font_weight(theme::MEDIUM).text_color(theme::text()));
+
+    if community.root_changed {
+        let detail = format!(
+            "The community encryption root key was replaced. Previous key: {}. New key: {}.",
+            community.previous_fingerprint, community.fingerprint
+        );
+        body = body
+            .child(kit::note("icons/triangle-alert.svg", theme::danger(), detail))
+            .child(div().flex().child(
+                button("tiny-e2ee-accept-root", ButtonKind::Secondary, "Acknowledge new root")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tiny_e2ee_do(E2eeAsk::AcceptCommunityRoot, "Pinned the new community root key.", cx);
+                    })),
+            ));
+    }
+
+    if community.set && !community.signature_valid {
+        body = body.child(kit::note(
+            "icons/triangle-alert.svg",
+            theme::warning(),
+            "The community policy signature could not be verified.",
+        ));
+    }
+
+    if community.set && !community.fingerprint.is_empty() {
+        body = body.child(
+            kit::security_words(format!("Root fingerprint: {}", community.fingerprint))
+                .type_small()
+                .font_family(theme::MONO)
+                .text_color(theme::text_soft()),
+        );
+    }
+
+    let policy = draft.policy_draft.clone().unwrap_or_else(|| community.policy.clone());
+    if can_manage {
+        let p_invite = policy.clone();
+        let p_e2ee = policy.clone();
+        body = body
+            .child(
+                div()
+                    .id("tiny-e2ee-policy-invite")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(overlay) = this.tiny_state.settings.as_mut() {
+                            let mut next = p_invite.clone();
+                            next.require_invite_signing = !next.require_invite_signing;
+                            overlay.encryption.policy_draft = Some(next);
+                            cx.notify();
+                        }
+                    }))
+                    .child(kit::check_box("tiny-e2ee-policy-invite-box", Some(policy.require_invite_signing), true))
+                    .child(kit::security_words("Require invite signing for new devices").type_small().text_color(theme::text())),
+            )
+            .child(
+                div()
+                    .id("tiny-e2ee-policy-new")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(overlay) = this.tiny_state.settings.as_mut() {
+                            let mut next = p_e2ee.clone();
+                            next.require_e2ee_new = !next.require_e2ee_new;
+                            overlay.encryption.policy_draft = Some(next);
+                            cx.notify();
+                        }
+                    }))
+                    .child(kit::check_box("tiny-e2ee-policy-new-box", Some(policy.require_e2ee_new), true))
+                    .child(kit::security_words("Require encryption for new conversations").type_small().text_color(theme::text())),
+            );
+
+        let publish_label = if community.set { "Update policy" } else { "Publish root & policy" };
+        let publish_policy = policy.clone();
+        let mut actions = div().flex().flex_wrap().items_center().gap(px(8.)).child(
+            button("tiny-e2ee-publish-policy", ButtonKind::Primary, publish_label)
+                .when(draft.loading, |b| b.opacity(0.5))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(overlay) = this.tiny_state.settings.as_mut() {
+                        overlay.encryption.confirm_replace_root = false;
+                        overlay.encryption.policy_draft = None;
+                    }
+                    this.tiny_e2ee_do(
+                        E2eeAsk::PublishCommunityPolicy { policy: publish_policy.clone(), replace: false },
+                        "Community encryption policy published.",
+                        cx,
+                    );
+                })),
+        );
+
+        if community.set && !draft.confirm_replace_root {
+            actions = actions.child(
+                button("tiny-e2ee-replace-ask", ButtonKind::Secondary, "Replace root")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(overlay) = this.tiny_state.settings.as_mut() {
+                            overlay.encryption.confirm_replace_root = true;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+        body = body.child(actions);
+
+        if community.set && draft.confirm_replace_root {
+            let replace_policy = policy;
+            body = body
+                .child(kit::note(
+                    "icons/triangle-alert.svg",
+                    theme::warning(),
+                    "Replacing the community root key will warn every member on this server that the root changed.",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            button("tiny-e2ee-replace-confirm", ButtonKind::Danger, "Confirm replace root")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(overlay) = this.tiny_state.settings.as_mut() {
+                                        overlay.encryption.confirm_replace_root = false;
+                                        overlay.encryption.policy_draft = None;
+                                    }
+                                    this.tiny_e2ee_do(
+                                        E2eeAsk::PublishCommunityPolicy { policy: replace_policy.clone(), replace: true },
+                                        "Community root key replaced.",
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            button("tiny-e2ee-replace-cancel", ButtonKind::Ghost, "Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(overlay) = this.tiny_state.settings.as_mut() {
+                                        overlay.encryption.confirm_replace_root = false;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                );
+        }
+    } else if community.set {
+        let summary = format!(
+            "Invite signing: {} · Require encryption on new chats: {}",
+            if community.policy.require_invite_signing { "required" } else { "optional" },
+            if community.policy.require_e2ee_new { "yes" } else { "no" },
+        );
+        body = body.child(kit::security_words(summary).type_small().text_color(theme::text_soft()));
+    }
+
+    kit::security_section("icons/shield.svg", "Community encryption").child(body)
 }
 
 #[cfg(test)]

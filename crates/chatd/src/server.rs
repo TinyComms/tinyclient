@@ -1644,7 +1644,7 @@ impl Chat {
     }
 
     /// Our own presence, shown at once and put back if the network refuses it.
-    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>) -> Response {
+    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>, clear_at: Option<i64>) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
@@ -1660,7 +1660,7 @@ impl Chat {
             self.hub.set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
             self.hub.changed(Change::Status);
         }
-        match self.ask(&account, |reply| Command::SetPresence { presence, status, reply }) {
+        match self.ask(&account, |reply| Command::SetPresence { presence, status, clear_at, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => {
                 if let (Some(me), Some((presence, status))) = (me, before) {
@@ -1695,7 +1695,7 @@ impl Chat {
                 return *refused;
             }
             let status = adapters::signal::profile_status(name.as_deref(), about.as_deref(), emoji.as_deref());
-            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), reply }) {
+            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), clear_at: None, reply }) {
                 Ok(()) => {
                     self.forget_own_profile(&account, None);
                     Response::Ok
@@ -2267,6 +2267,35 @@ impl Chat {
                 }
             }
         }
+        let left = stored.and_then(|session| adapters::without(account.network, &session, &account.account));
+        match left {
+            Some(session) => {
+                if let Err(why) = session::save(account.network, &session) {
+                    if session::enabled() {
+                        return error(ErrorCode::Internal, why);
+                    }
+                }
+            }
+            None => session::forget(account.network),
+        }
+        self.forget(&account);
+        self.hub.set_link(&account, Link::SignedOut, "");
+        self.hub.changed(Change::Status);
+        self.status()
+    }
+
+    /// Wipes local session, history, and adapter state after `DELETE /v1/me` succeeded on the
+    /// server, without calling `DELETE /v1/session` or keeping history.
+    fn forget_deleted_tiny(&self, account: AccountKey) -> Response {
+        let _ = lock(&self.adapters).remove(&account);
+        let stored = match session::read(account.network) {
+            session::Stored::Found(session) => Some(session),
+            session::Stored::Absent => None,
+            session::Stored::Unreadable(why) => {
+                return error(ErrorCode::Internal, format!("The session could not be read from {}: {why}", session::STORE));
+            }
+        };
+        adapters::tiny::erase_history(&account.account);
         let left = stored.and_then(|session| adapters::without(account.network, &session, &account.account));
         match left {
             Some(session) => {
@@ -2982,7 +3011,7 @@ impl Chat {
             Request::Relate { person, action } => self.relate(person, action),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
-            Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),
+            Request::SetPresence { account, presence, status, clear_at } => self.set_presence(account, presence, status, clear_at),
             Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
                 self.set_profile(account, name, about, pronouns, emoji, username, photo)
             }
@@ -3156,6 +3185,17 @@ impl Chat {
                 Ok(()) => self.sign_out(account, false),
                 Err(answer) => answer,
             },
+            Request::TinyDeleteAccount { account } => match adapters::tiny::manage::delete_account(&account) {
+                Ok(()) => self.forget_deleted_tiny(account),
+                Err(answer) => answer,
+            },
+            Request::TinyReport { account, kind, target_id, category, note, evidence } => {
+                adapters::tiny::manage::report_create(account, kind, target_id, category, note, evidence)
+            }
+            Request::TinyEmojiList { account } => adapters::tiny::manage::emoji_list(account),
+            Request::TinyEmojiCreate { account, name, kind, path } => adapters::tiny::manage::emoji_create(account, name, kind, path),
+            Request::TinyEmojiRename { account, emoji_id, name } => adapters::tiny::manage::emoji_rename(account, emoji_id, name),
+            Request::TinyEmojiDelete { account, emoji_id } => adapters::tiny::manage::emoji_delete(account, emoji_id),
             Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
             Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
             Request::TinyAvatar { account, path } => adapters::tiny::manage::user_avatar(account, path),
@@ -3184,6 +3224,9 @@ impl Chat {
             Request::TinyChannelOverrideClear { account, channel_id, role_id } => adapters::tiny::manage::channel_override_clear(account, channel_id, role_id),
             Request::TinyInviteWith { account, options } => adapters::tiny::manage::invite_with(account, options),
             Request::TinyAudit { account, filter } => adapters::tiny::manage::audit(account, filter),
+            Request::TinyReportsList { account, filter } => adapters::tiny::manage::reports_list(account, filter),
+            Request::TinyReportRead { account, report_id } => adapters::tiny::manage::report_read(account, report_id),
+            Request::TinyReportWork { account, report_id, update } => adapters::tiny::manage::report_work(account, report_id, update),
             Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),
             Request::TinySetupApply { account, apply } => adapters::tiny::manage::setup_apply(account, apply),
             Request::TinyPasskeyLink { account } => adapters::tiny::manage::passkey_link(account),

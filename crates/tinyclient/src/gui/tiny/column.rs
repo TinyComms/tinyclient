@@ -6,7 +6,8 @@
 
 use super::model::{self, Line};
 use super::{Dragged, Float, Modal, Page};
-use crate::gui::components::{badge_for, badge_look, glyph, list_row, network_icon, tip, Avatar, Shape as AvatarShape};
+use crate::gui::components::{badge_for, badge_look, glyph, list_row, network_icon, row_badge, tip, Avatar, Shape as AvatarShape};
+use crate::gui::sidebar::Mode;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
@@ -14,34 +15,62 @@ use protocol::{Conversation, ConversationKind, Key, Network, TinyChannel, TinyLa
 use std::collections::HashSet;
 use std::rc::Rc;
 
-/// Text channels only. A direct message is a People chat, not a row in the server.
+/// How many direct conversations are shown in the server column before offering "Show all".
+const DIRECT_CAP: usize = 20;
+
+/// Text channels and direct (or group) conversations that belong in the server column.
 fn in_the_server(chats: &[Rc<Conversation>]) -> Vec<Rc<Conversation>> {
+    chats
+        .iter()
+        .filter(|chat| matches!(chat.kind, ConversationKind::Channel | ConversationKind::Direct | ConversationKind::Group))
+        .cloned()
+        .collect()
+}
+
+/// Text channels only, in the tree's order.
+fn channels_in_server(chats: &[Rc<Conversation>]) -> Vec<Rc<Conversation>> {
     chats.iter().filter(|chat| chat.kind == ConversationKind::Channel).cloned().collect()
 }
 
-/// A text channel row. Picking it opens the conversation pane; right-clicking opens its menu.
-/// With `draggable`, it is a drag source and a drop target for mixed channel/room layout.
+/// Direct and group conversations on this server, ordered newest-first by last activity and
+/// capped at [`DIRECT_CAP`]. The boolean is true when more exist than are shown.
+fn directs_in_server(chats: &[Rc<Conversation>]) -> (Vec<Rc<Conversation>>, bool) {
+    let mut rows: Vec<Rc<Conversation>> = chats
+        .iter()
+        .filter(|chat| matches!(chat.kind, ConversationKind::Direct | ConversationKind::Group))
+        .cloned()
+        .collect();
+    rows.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.title.cmp(&b.title)));
+    let has_more = rows.len() > DIRECT_CAP;
+    rows.truncate(DIRECT_CAP);
+    (rows, has_more)
+}
+
+/// A text channel row. Picking it opens the conversation pane in place; right-clicking opens its
+/// menu. With `draggable`, it is a drag source and a drop target for mixed channel/room layout.
 fn text_row(chat: &Conversation, open: Option<&Key>, draggable: bool, cx: &mut Context<Shell>) -> Stateful<Div> {
     let selected = open.is_some_and(|open| open == &chat.key);
-    let unread = chat.unread > 0;
+    let badge = badge_for(badge_look(chat));
+    let unread = chat.unread > 0 || badge.is_some();
     let icon = if chat.kind == ConversationKind::Direct { "icons/user.svg" } else { "icons/hash.svg" };
     let tone = if selected || unread { theme::text() } else { theme::text_soft() };
-    let title_el = div()
-        .flex_1()
-        .min_w_0()
-        .truncate()
-        .type_ui()
-        .when(unread, |el| el.font_weight(theme::MEDIUM))
-        .text_color(if selected || unread { theme::text() } else { theme::text_soft() })
-        .child(chat.title.clone());
     let content = div()
         .w_full()
         .flex()
         .items_center()
         .gap(px(8.))
         .child(glyph(icon, 16., tone))
-        .child(title_el)
-        .children(badge_for(badge_look(chat)));
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .type_ui()
+                .when(unread, |el| el.font_weight(theme::MEDIUM))
+                .text_color(tone)
+                .child(chat.title.clone()),
+        )
+        .children(badge);
     let key = chat.key.clone();
     let title = chat.title.clone();
     let menu_id = key.id.clone();
@@ -175,21 +204,29 @@ impl Shell {
             return line.type_small().text_color(theme::danger()).child(detail).into_any_element();
         };
         let chats = self.tiny_chats();
-        let unread_ids: HashSet<String> = chats
+        let text_channels = channels_in_server(&chats);
+        let unread_ids: HashSet<String> = text_channels
             .iter()
             .filter(|chat| chat.unread > 0)
             .map(|chat| chat.key.id.clone())
             .collect();
-        let lines = model::lines(page.community, &self.tiny_state.folded, page.mine, &unread_ids);
+        let lines = model::lines_with_expanded(
+            page.community,
+            &self.tiny_state.folded,
+            &self.tiny_state.expanded_rooms,
+            page.mine,
+            &unread_ids,
+        );
         let mut list = div().id("tiny-channels").size_full().overflow_y_scroll().pt(px(4.)).pb(px(12.)).flex().flex_col();
         let channel_drag = page.may.layout && page.community.has(TINY_FEATURE_CHANNEL_LAYOUT);
         // Fallback for servers whose `TinyCommunity.channels` is empty while the store still has
         // text channels.
         if page.community.channels.is_empty() {
-            for chat in &chats {
+            for chat in &text_channels {
                 list = list.child(text_row(chat, self.open.as_ref(), false, cx));
             }
         }
+        list = self.direct_section(list, &page, &chats, self.open.as_ref(), cx);
         if page.community.rooms.is_empty() && page.community.channels.is_empty() && chats.is_empty() {
             list = list.child(
                 div()
@@ -228,14 +265,30 @@ impl Shell {
                         None => continue,
                     }
                 }
+                Line::MoreSeats { room, hidden, expanded } => {
+                    let toggle_id = room.clone();
+                    let label = if *expanded { "Show fewer".to_owned() } else { format!("+{hidden} more") };
+                    let content = div()
+                        .pl(px(24.))
+                        .gap(px(8.))
+                        .child(div().type_small().text_color(theme::text_faint()).child(label));
+                    list_row(SharedString::from(format!("tiny-more-seats-{room}")), theme::row_height(theme::ROW_ONE), false, false, content)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.tiny_state.expanded_rooms.remove(&toggle_id) {
+                                this.tiny_state.expanded_rooms.insert(toggle_id.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }
             };
             list = list.child(row);
         }
         crate::gui::components::scroll::scroll_page("tiny-directory-scroll-frame", list).into_any_element()
     }
 
-    /// Text channels in this server's space, in the tree's order. Direct messages are kept in
-    /// the store for People and are not drawn here.
+    /// Text channels and direct messages in this server's space.
     pub(super) fn tiny_chats(&self) -> Vec<Rc<Conversation>> {
         let Some(account) = self.tiny_state.account.as_ref() else {
             return Vec::new();
@@ -244,6 +297,99 @@ impl Shell {
             return Vec::new();
         };
         in_the_server(&tree.conversations)
+    }
+
+    /// Direct and group conversations on this server, newest first, capped at [`DIRECT_CAP`].
+    /// The header is omitted when there are none.
+    fn direct_section(&self, mut list: Stateful<Div>, page: &Page, chats: &[Rc<Conversation>], open: Option<&Key>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (rows, has_more) = directs_in_server(chats);
+        if rows.is_empty() {
+            return list;
+        }
+        let header = div()
+            .px(px(theme::INSET + 2.))
+            .pt(px(10.))
+            .pb(px(2.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11. + theme::text_step() as f32))
+                    .line_height(px(14. + theme::text_step() as f32))
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::text_faint())
+                    .child("DIRECT MESSAGES"),
+            )
+            .child(
+                div()
+                    .id("tiny-direct-add")
+                    .size(px(18.))
+                    .rounded(px(theme::R_CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .tooltip(tip("New direct message", None))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.tiny_open_modal(Modal::NewDirect, window, cx);
+                    }))
+                    .child(glyph("icons/plus.svg", 14., theme::text_soft())),
+            );
+        list = list.child(header);
+        for chat in rows {
+            list = list.child(self.direct_row(page, &chat, open, cx));
+        }
+        if has_more {
+            let more = div()
+                .gap(px(8.))
+                .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph("icons/ellipsis.svg", 14., theme::text_faint())))
+                .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child("Show all"));
+            list = list.child(
+                list_row("tiny-direct-show-all", theme::row_height(theme::ROW_ONE), false, false, more)
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.go(Mode::People, cx))),
+            );
+        }
+        list
+    }
+
+    /// A direct conversation row in the server column: picture, presence dot, name, unread badge.
+    fn direct_row(&self, page: &Page, chat: &Conversation, open: Option<&Key>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let selected = open.is_some_and(|open| open == &chat.key);
+        let badge = row_badge(chat);
+        let unread = badge.is_some();
+        let tone = if selected || unread { theme::text() } else { theme::text_soft() };
+        let peer_id = chat.peer.as_deref();
+        let avatar_key = peer_id.map(|id| page.key(id)).unwrap_or_else(|| chat.key.clone());
+        let picture = peer_id
+            .and_then(|id| page.picture(id))
+            .or_else(|| chat.avatar.as_ref().and_then(|file| file.path.as_deref()).map(std::path::PathBuf::from));
+        let mut avatar = Avatar::new(&avatar_key, &chat.title, 20.).image_at(picture);
+        if let Some(presence) = peer_id.and_then(|id| page.online(id)) {
+            avatar = avatar.presence(presence, theme::sidebar());
+        }
+        let content = div()
+            .gap(px(8.))
+            .child(avatar.build())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .type_ui()
+                    .when(unread, |name| name.font_weight(theme::MEDIUM))
+                    .text_color(tone)
+                    .child(chat.title.clone()),
+            )
+            .children(badge);
+        let key = chat.key.clone();
+        let title = chat.title.clone();
+        list_row(SharedString::from(format!("tiny-direct-{}", key.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.select(key.clone(), &title, cx)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -494,13 +640,35 @@ mod tests {
     use protocol::Network;
 
     #[test]
-    fn direct_messages_are_not_rows_of_the_server() {
+    fn channels_and_directs_both_appear_in_their_own_sections() {
         let account = AccountKey { network: Network::Tiny, account: "host".into() };
         let channel = Rc::new(Conversation::new(Key::new(&account, "c"), ConversationKind::Channel, "general"));
         let direct = Rc::new(Conversation::new(Key::new(&account, "d"), ConversationKind::Direct, "Ada"));
         let voice = Rc::new(Conversation::new(Key::new(&account, "v"), ConversationKind::Voice, "Lobby"));
         let shown = in_the_server(&[channel, direct, voice]);
-        assert_eq!(shown.len(), 1);
-        assert_eq!(shown[0].title, "general");
+        assert_eq!(shown.len(), 2);
+        let channels = channels_in_server(&shown);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].title, "general");
+        let (directs, has_more) = directs_in_server(&shown);
+        assert_eq!(directs.len(), 1);
+        assert_eq!(directs[0].title, "Ada");
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn directs_are_ordered_newest_first_and_capped() {
+        let account = AccountKey { network: Network::Tiny, account: "host".into() };
+        let mut chats = Vec::new();
+        for i in 0..25 {
+            let mut dm = Conversation::new(Key::new(&account, format!("d-{i}")), ConversationKind::Direct, format!("User {i:02}"));
+            dm.updated = i as i64 * 100;
+            chats.push(Rc::new(dm));
+        }
+        let (directs, has_more) = directs_in_server(&chats);
+        assert!(has_more);
+        assert_eq!(directs.len(), DIRECT_CAP);
+        assert_eq!(directs[0].title, "User 24");
+        assert_eq!(directs[DIRECT_CAP - 1].title, "User 05");
     }
 }

@@ -113,6 +113,41 @@ pub(super) fn streams(room: &TinyRoom, me: &str, sending: Option<Sending>) -> Ve
     found
 }
 
+/// Above this many participants, the stage grid keeps active speakers, streams, and `me` up to
+/// this cap so tiles never shrink without bound, and moves silent listeners into a scrollable
+/// roster list underneath.
+pub(super) const STAGE_GRID_CAP: usize = 12;
+
+/// Partition `seats` into `(grid, roster)` for a call of any size.
+/// Small calls (`<= cap`) place everyone in `grid` with an empty `roster`.
+/// Large calls place speaking seats, anyone with an active stream, and `me` in `grid` (filling
+/// remaining slots up to `cap`), and place the remaining silent participants in `roster`.
+pub(super) fn partition_stage<'a>(
+    seats: &'a [TinySeat],
+    streams: &[Stream],
+    me: &str,
+    cap: usize,
+) -> (Vec<&'a TinySeat>, Vec<&'a TinySeat>) {
+    if seats.len() <= cap {
+        return (seats.iter().collect(), Vec::new());
+    }
+    let has_stream = |uid: &str| streams.iter().any(|s| s.user_id == uid);
+    let mut grid = Vec::new();
+    let mut rest = Vec::new();
+    for seat in seats {
+        if seat.speaking || seat.sharing || seat.camera || seat.user_id == me || has_stream(&seat.user_id) {
+            grid.push(seat);
+        } else {
+            rest.push(seat);
+        }
+    }
+    if grid.len() < cap {
+        let take = (cap - grid.len()).min(rest.len());
+        grid.extend(rest.drain(..take));
+    }
+    (grid, rest)
+}
+
 /// A click on a tile: that tile focused, or the grid again when it already was.
 pub(super) fn toggle(focus: Option<&Focus>, clicked: Focus) -> Option<Focus> {
     (focus != Some(&clicked)).then_some(clicked)
@@ -213,5 +248,25 @@ mod tests {
         assert_eq!(still(Some(&Focus::Stream("bev".into())), &room, &found), None, "bev shares nothing");
         assert_eq!(still(Some(&Focus::Person("bev".into())), &room, &found), Some(&Focus::Person("bev".into())));
         assert_eq!(still(Some(&Focus::Person("cal".into())), &room, &found), None, "cal is not in the call");
+    }
+
+    #[test]
+    fn large_call_partitions_speakers_and_streams_into_grid_and_rest_into_roster() {
+        let small: Vec<TinySeat> = (0..10).map(|i| seat(&format!("u{i}"), false, false)).collect();
+        let (grid, roster) = partition_stage(&small, &[], "u0", STAGE_GRID_CAP);
+        assert_eq!(grid.len(), 10);
+        assert!(roster.is_empty());
+
+        let mut large: Vec<TinySeat> = (0..40).map(|i| seat(&format!("u{i}"), false, false)).collect();
+        large[25].speaking = true;
+        large[33].camera = true;
+        let room = room(large.clone());
+        let streams = streams(&room, "u39", None);
+        let (grid, roster) = partition_stage(&large, &streams, "u39", STAGE_GRID_CAP);
+        assert_eq!(grid.len(), STAGE_GRID_CAP);
+        assert_eq!(roster.len(), 40 - STAGE_GRID_CAP);
+        assert!(grid.iter().any(|s| s.user_id == "u25"), "speaker stays in grid");
+        assert!(grid.iter().any(|s| s.user_id == "u33"), "camera holder stays in grid");
+        assert!(grid.iter().any(|s| s.user_id == "u39"), "me stays in grid");
     }
 }

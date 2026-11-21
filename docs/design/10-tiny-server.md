@@ -29,15 +29,23 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   its menu is open (the chevron becomes a close glyph). The menu, below it, 240 wide: Invite
   people · Server settings · — · Create channel · Create category · — · Copy server address ·
   — · Servers (a check per signed-in server, when there are several) · Join another server ·
-  Sign out of this server… (`danger`, asks first). Only what is allowed shows; Server settings
+  Sign out of this server… (`danger`, asks first) · Delete my account on this server… (`danger`,
+  asks for the server's name first). Only what is allowed shows; Server settings
   always shows, its pages read-only where they must be.
 - **Before the server answers,** the column is its own list as shapes: a section label, four text
   channel rows, then two categories with their rooms and a seat under the first, all at the
   heights and insets those rows will take, in static `hover` and `raised` blocks. They are not
   controls until they are rows, so nothing lights under the pointer.
 - **Text channels** come first, under a header "TEXT CHANNELS" (omitted when there are none).
-  A row is 28: hash glyph, name. A click opens that conversation in the ordinary pane. Direct
-  messages are not rows here. Message, in the person menu, opens one in People.
+  A row is 28: hash glyph, name, unread badge. A click opens that conversation in the ordinary
+  pane without leaving the server.
+- **Direct messages** sit under the text channels and above the voice categories, under a header
+  "DIRECT MESSAGES" with a `+` button that opens a member picker (the header is omitted when
+  there are none). One row per direct (or group) conversation on this server, newest first by
+  last activity, capped at 20 with a "Show all" row that opens People: avatar 20 with presence
+  dot, name, unread badge. Clicking a row, or choosing Message in a person menu, opens the
+  conversation in the ordinary pane without leaving the server. The same conversations stay in
+  People and the Inbox.
 - **Categories** fold, under the text channels. Header 34 (24 for the first): a 12 chevron and the name in capitals,
   11/600 `text_faint`, `text_soft` on hover; folded, the room count follows. A `+` on hover
   creates a channel in it. A server without categories has one header, "Voice channels", for its rooms.

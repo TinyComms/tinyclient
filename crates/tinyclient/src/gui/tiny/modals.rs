@@ -70,9 +70,66 @@ impl Shell {
         self.tiny_state.modal_error.clone().map(|detail| div().mt(px(12.)).whitespace_normal().type_small().text_color(theme::danger()).child(detail))
     }
 
+    fn new_direct_modal(&self, page: &Page, window: &Window, cx: &mut Context<Self>) -> Div {
+        let query = self.tiny_state.search_input.read(cx).text().trim().to_lowercase();
+        let mut members: Vec<&protocol::TinyMember> = page
+            .community
+            .members
+            .iter()
+            .filter(|m| m.user_id != page.me)
+            .filter(|m| {
+                if query.is_empty() {
+                    return true;
+                }
+                model::name_of(m).to_lowercase().contains(&query) || m.email.to_lowercase().contains(&query)
+            })
+            .collect();
+        members.sort_by(|a, b| model::name_of(a).to_lowercase().cmp(&model::name_of(b).to_lowercase()));
+        let mut list = div().id("tiny-new-direct-list").mt(px(12.)).max_h(px(260.)).overflow_y_scroll().flex().flex_col().gap(px(2.));
+        if members.is_empty() {
+            list = list.child(div().py(px(16.)).flex().justify_center().type_small().text_color(theme::text_faint()).child("No matching members"));
+        } else {
+            for member in members {
+                let name = model::name_of(member);
+                let id = member.user_id.clone();
+                let mut avatar = crate::gui::components::Avatar::new(&page.key(&member.user_id), &name, 24.).image_at(page.picture(&member.user_id));
+                if let Some(presence) = page.online(&member.user_id) {
+                    avatar = avatar.presence(presence, theme::overlay());
+                }
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("tiny-new-dm-{}", member.user_id)))
+                        .h(px(36.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.tiny_message(id.clone(), cx)))
+                        .child(avatar.build())
+                        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(name)),
+                );
+            }
+        }
+        modal("New direct message")
+            .child(words("Choose someone on this server to message."))
+            .child(div().mt(px(12.)).child(self.input_box(&self.tiny_state.search_input, window, cx)))
+            .child(list)
+            .child(
+                div()
+                    .mt(px(16.))
+                    .flex()
+                    .justify_end()
+                    .child(button("tiny-modal-cancel", ButtonKind::Secondary, "Close").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
+            )
+    }
+
     pub(super) fn tiny_modal(&self, page: &Page, modal_on_show: &Modal, window: &Window, cx: &mut Context<Self>) -> Div {
         match modal_on_show {
             Modal::Share => self.tiny_share_modal(cx),
+            Modal::NewDirect => self.new_direct_modal(page, window, cx),
             Modal::Invite => self.invite_modal(page, window, cx),
             Modal::Code { paste, origin, terms, role } => self.code_modal(page, paste, origin, terms, role, cx),
             Modal::Kick(user_id) => {
@@ -385,7 +442,130 @@ impl Shell {
                 .child(words(format!("Every session of yours on {} ends, on every computer, this one too. Sign in again with your provider when you want back in.", page.name)))
                 .children(self.modal_error())
                 .child(self.buttons("Sign out everywhere", ButtonKind::Danger, cx, |this, cx| this.tiny_sign_out_everywhere(cx))),
+            Modal::DeleteAccount => {
+                let last_owner = self.tiny_state.modal_error.as_deref() == Some("You're the only owner. Hand the server to someone first.");
+                let panel = modal(format!("Delete your account on {}?", page.name))
+                    .w(px(460.))
+                    .child(words(
+                        "Every message you wrote is emptied and its files are deleted; others see “Deleted user”. Your membership, sessions, sign-in identity, reactions, read marks, bots, and unused invites are deleted, and your encryption devices are revoked. A ban on you survives, and reports you filed lose your name. Backups and copies already stored on other devices are not reached. This can't be undone.",
+                    ))
+                    .when(last_owner, |panel| {
+                        panel.child(
+                            div().mt(px(12.)).child(
+                                button("tiny-delete-account-danger", ButtonKind::Secondary, "Open Danger zone").h(px(30.)).on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_modal(cx);
+                                    this.tiny_open_settings(super::settings::Page::Danger, None, window, cx);
+                                })),
+                            ),
+                        )
+                    });
+                self.tiny_typed_confirm(panel, page, "Delete my account", window, cx, |this, cx| this.tiny_delete_account(cx))
+            }
+            Modal::Report { kind, label, message_text, category, include_evidence, .. } => {
+                self.tiny_report_modal(kind, label, message_text.as_deref(), *category, *include_evidence, window, cx)
+            }
         }
+    }
+
+    /// Abuse report modal for a message, member, or channel on a Tiny server.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tiny_report_modal(
+        &self,
+        kind: &str,
+        target_label: &str,
+        message_text: Option<&str>,
+        category: &'static str,
+        include_evidence: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        const CATEGORIES: [(&str, &str); 8] = [
+            ("spam", "Spam"),
+            ("harassment", "Harassment"),
+            ("hate", "Hate speech"),
+            ("violence", "Violence"),
+            ("sexual", "Sexual content"),
+            ("illegal", "Illegal"),
+            ("impersonation", "Impersonation"),
+            ("other", "Other"),
+        ];
+        let title = match kind {
+            "message" => "Report message".to_owned(),
+            "channel" => format!("Report #{target_label}"),
+            _ => format!("Report {target_label}"),
+        };
+        let mut chips = div().flex().flex_wrap().gap(px(6.));
+        for (ix, (wire, name)) in CATEGORIES.into_iter().enumerate() {
+            let on = category == wire;
+            chips = chips.child(
+                div()
+                    .id(("tiny-report-cat", ix))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(14.))
+                    .border_1()
+                    .border_color(if on { theme::accent() } else { theme::border() })
+                    .bg(if on { theme::accent_soft() } else { theme::hover() })
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_small()
+                    .text_color(if on { theme::accent_text() } else { theme::text() })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(Modal::Report { category, .. }) = this.tiny_state.modal.as_mut() {
+                            *category = wire;
+                            cx.notify();
+                        }
+                    }))
+                    .child(name),
+            );
+        }
+        let mut panel = modal(title)
+            .w(px(460.))
+            .child(label("Category"))
+            .child(chips)
+            .child(label("Note (optional)"))
+            .child(self.input_box(&self.tiny_state.reason_input, window, cx));
+        if kind == "message" && message_text.is_some() {
+            panel = panel
+                .child(
+                    div()
+                        .id("tiny-report-evidence")
+                        .mt(px(14.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(Modal::Report { include_evidence, .. }) = this.tiny_state.modal.as_mut() {
+                                *include_evidence = !*include_evidence;
+                                cx.notify();
+                            }
+                        }))
+                        .child(super::settings::check_box("tiny-report-evidence-box", Some(include_evidence), true))
+                        .child(div().type_ui().text_color(theme::text()).child("Include this message's text")),
+                )
+                .child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(24.))
+                        .whitespace_normal()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child("Moderators will see the text you send. The server cannot check it is genuine."),
+                );
+        }
+        panel
+            .children(self.modal_error())
+            .child(self.buttons("Report", ButtonKind::Danger, cx, |this, cx| this.tiny_send_report(cx)))
+            .child(
+                div()
+                    .mt(px(10.))
+                    .whitespace_normal()
+                    .type_small()
+                    .text_color(theme::text_faint())
+                    .child("The moderators of this server will see that you reported this. The person you report is not told."),
+            )
     }
 
     /// A dangerous modal's end: the server's name to type, and the action quiet until it is.

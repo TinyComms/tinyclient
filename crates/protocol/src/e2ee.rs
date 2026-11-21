@@ -172,6 +172,49 @@ pub enum E2eeAsk {
     ImportBackup { path: String, passphrase: String },
     /// Starts an owner-approved encryption update for this conversation. Progress is in Status.
     Repair { conversation_id: String },
+    /// Publishes or updates the community's signed E2EE policy (`PUT /v1/e2ee/community`).
+    /// Generates a new P-256 root key on this device if none is held locally or if `replace` is true.
+    PublishCommunityPolicy { policy: CommunityPolicy, replace: bool },
+    /// Acknowledges a replaced community root key and updates this device's local pin.
+    AcceptCommunityRoot,
+}
+
+/// The signed community E2EE policy payload (schema v1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityPolicy {
+    #[serde(default)]
+    pub require_invite_signing: bool,
+    #[serde(default)]
+    pub require_e2ee_new: bool,
+}
+
+/// Community-wide encryption root key and policy state (`GET /v1/e2ee/community` + local pin).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityRootStatus {
+    /// True when the server has a community root key published (`version > 0`).
+    #[serde(default)]
+    pub set: bool,
+    #[serde(default)]
+    pub version: u64,
+    /// Short fingerprint of the current root public key (SHA-256 hex grouped).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub updated_at: String,
+    #[serde(default)]
+    pub policy: CommunityPolicy,
+    /// True when the server's `policy_signature` verified under `root_key`.
+    #[serde(default)]
+    pub signature_valid: bool,
+    /// True when a previously pinned root key was replaced by a different key on the server.
+    #[serde(default)]
+    pub root_changed: bool,
+    /// Fingerprint of the previously pinned root key when `root_changed` is true.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub previous_fingerprint: String,
+    /// True when this device holds the local root private key for signing policy updates.
+    #[serde(default)]
+    pub has_local_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,6 +399,9 @@ pub struct E2eeStatus {
     /// The person's devices that appeared since they last looked: "New device added".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added: Vec<E2eeDevice>,
+    /// Community-wide encryption root key and signed policy, when fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community: Option<CommunityRootStatus>,
 }
 
 #[cfg(test)]

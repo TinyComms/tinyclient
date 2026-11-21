@@ -1671,7 +1671,7 @@ impl Discord {
                 }
             }
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
-            Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetPresence { presence, status, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),

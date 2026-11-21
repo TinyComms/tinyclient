@@ -979,3 +979,191 @@ fn layout_sends_items_with_channel_layout_and_room_ids_without() {
         assert_eq!(bucket["room_ids"], json!([LOBBY]));
     });
 }
+
+#[test]
+fn delete_account_sends_confirm_and_handles_last_owner() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_ok = log.clone();
+    let base_ok = serve(move |request| {
+        log_ok.lock().unwrap().push(request.to_owned());
+        if request.starts_with("DELETE /v1/me ") {
+            http(204, "No Content", "")
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base_ok, "member", |account| {
+        assert_eq!(delete_account(&account), Ok(()));
+    });
+    let req = last(&log, "DELETE /v1/me ");
+    assert_eq!(json_body(&req)["confirm"], "delete my account");
+    assert!(sent(&log, "DELETE /v1/session ").is_empty(), "must not call session close route");
+
+    // 409 last_owner maps to the owner message and leaves the session readable.
+    let base_owner = serve(|request| {
+        if request.starts_with("DELETE /v1/me ") {
+            http(409, "Conflict", r#"{"error":"last_owner"}"#)
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base_owner, "owner", |account| {
+        assert_eq!(delete_account(&account), Err(said(DELETE_LAST_OWNER)));
+        assert!(open(&account).is_ok(), "session remains in place on 409");
+    });
+
+    // Other failure also leaves the session readable.
+    let base_err = serve(|_| http(500, "Internal Server Error", r#"{"error":"unavailable"}"#));
+    with_session(&base_err, "member", |account| {
+        assert!(delete_account(&account).is_err());
+        assert!(open(&account).is_ok(), "session remains in place on 500");
+    });
+}
+
+#[test]
+fn report_create_sends_payload_and_maps_all_answers() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        if first.starts_with("GET /v1/capabilities") {
+            http(200, "OK", r#"{"version":"0.6.0","features":["abuse_reports"]}"#)
+        } else if first.starts_with("GET /v1/me ") {
+            http(200, "OK", OWNER)
+        } else if first.starts_with("POST /v1/reports ") {
+            if body.contains("\"dup\"") {
+                http(200, "OK", r#"{"id":"r1","duplicate":true}"#)
+            } else if body.contains("\"rate\"") {
+                http(429, "Too Many Requests", r#"{"error":"slow_down"}"#)
+            } else if body.contains("\"gone\"") {
+                http(404, "Not Found", r#"{"error":"not_found"}"#)
+            } else {
+                http(201, "Created", r#"{"id":"r2","duplicate":false}"#)
+            }
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base, "member", |account| {
+        // Without evidence: field omitted.
+        assert_eq!(
+            report_create(account.clone(), "member".into(), BEA.into(), "harassment".into(), Some("  rude  ".into()), None),
+            Response::TinyReported { duplicate: false }
+        );
+        let body = json_body(&last(&log, "POST /v1/reports "));
+        assert_eq!(body["kind"], "member");
+        assert_eq!(body["target_id"], BEA);
+        assert_eq!(body["category"], "harassment");
+        assert_eq!(body["note"], "rude");
+        assert!(body.get("evidence").is_none());
+
+        // With evidence: included verbatim.
+        assert_eq!(
+            report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), None, Some("buy now".into())),
+            Response::TinyReported { duplicate: false }
+        );
+        let body = json_body(&last(&log, "POST /v1/reports "));
+        assert_eq!(body["kind"], "message");
+        assert_eq!(body["evidence"], "buy now");
+        assert!(body.get("note").is_none());
+
+        // Duplicate (200), rate limit (429), missing (404).
+        assert_eq!(report_create(account.clone(), "channel".into(), "dup".into(), "other".into(), None, None), Response::TinyReported { duplicate: true });
+        assert_eq!(report_create(account.clone(), "channel".into(), "rate".into(), "other".into(), None, None), said(REPORT_RATE_LIMIT));
+        assert_eq!(report_create(account.clone(), "channel".into(), "gone".into(), "other".into(), None, None), said(REPORT_NOT_FOUND));
+
+        // Client-side size and shape validation.
+        assert_eq!(report_create(account.clone(), "bad".into(), "m1".into(), "spam".into(), None, None), said(CHECK));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "bogus".into(), None, None), said(CHECK));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), Some("a".repeat(2001)), None), said(REPORT_NOTE_SIZE));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), None, Some("b".repeat(32_769))), said(REPORT_EVIDENCE_SIZE));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), Some("bad\x00char".into()), None), said(CHECK));
+    });
+}
+
+#[test]
+fn abuse_reports_list_read_work_and_refusals() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let logged = log.clone();
+    let base = serve(move |request| {
+        logged.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("GET /v1/capabilities ") {
+            http(200, "OK", r#"{"version":"0.6.0","features":["roles","abuse_reports"]}"#)
+        } else if first.starts_with("GET /v1/me ") {
+            http(200, "OK", OWNER)
+        } else if first.starts_with("GET /v1/reports?") {
+            http(
+                200,
+                "OK",
+                r#"[{"id":"r1","kind":"message","category":"spam","status":"open","preserve":false,"reported":{"user_id":"u2","display_name":"Bea"},"reporter":{"user_id":"u3","display_name":"Cy"},"message_id":"m1","channel_id":"c1","direct_id":null,"has_evidence":true,"evidence_unverified":true,"linked_audit_ids":[],"created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:00:00Z","resolved_at":null}]"#,
+            )
+        } else if first.starts_with("GET /v1/reports/r1 ") {
+            http(
+                200,
+                "OK",
+                r#"{"id":"r1","kind":"message","category":"spam","status":"open","preserve":false,"reported":{"user_id":"u2","display_name":"Bea"},"reporter":{"user_id":"u3","display_name":"Cy"},"message_id":"m1","channel_id":"c1","direct_id":null,"has_evidence":true,"evidence_unverified":true,"linked_audit_ids":[],"created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:00:00Z","resolved_at":null,"note":"Repeated spam","evidence":"buy now","preserved_by":null,"preserved_at":null,"notes":[]}"#,
+            )
+        } else if first.starts_with("PATCH /v1/reports/r1 ") {
+            http(
+                200,
+                "OK",
+                r#"{"id":"r1","kind":"message","category":"spam","status":"actioned","preserve":true,"reported":{"user_id":"u2","display_name":"Bea"},"reporter":{"user_id":"u3","display_name":"Cy"},"message_id":"m1","channel_id":"c1","direct_id":null,"has_evidence":true,"evidence_unverified":true,"linked_audit_ids":[42],"created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:05:00Z","resolved_at":"2026-11-20T00:05:00Z","note":"Repeated spam","evidence":"buy now","preserved_by":"u1","preserved_at":"2026-11-20T00:05:00Z","notes":[{"id":"n1","author":{"user_id":"u1","display_name":"Ada"},"body":"Banned user","created_at":"2026-11-20T00:05:00Z"}]}"#,
+            )
+        } else if first.starts_with("GET /v1/reports/self ") {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        } else if first.starts_with("GET /v1/reports/denied ") {
+            http(403, "Forbidden", r#"{"error":"forbidden"}"#)
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base, "owner", |account| {
+        let filter = TinyReportFilter { status: "open".into(), kind: "message".into(), before: None, limit: 25 };
+        match reports_list(account.clone(), filter) {
+            Response::TinyReports { reports } => {
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0].id, "r1");
+                assert!(reports[0].has_evidence);
+            }
+            other => panic!("unexpected list response: {other:?}"),
+        }
+        assert!(last(&log, "GET /v1/reports?").contains("limit=25&status=open&kind=message"));
+
+        match report_read(account.clone(), "r1".into()) {
+            Response::TinyReport { report } => {
+                assert_eq!(report.note.as_deref(), Some("Repeated spam"));
+                assert_eq!(report.evidence.as_deref(), Some("buy now"));
+            }
+            other => panic!("unexpected read response: {other:?}"),
+        }
+
+        let update = TinyReportUpdate {
+            status: Some("actioned".into()),
+            note: Some("Banned user".into()),
+            link_audit_id: Some(42),
+            preserve: Some(true),
+        };
+        match report_work(account.clone(), "r1".into(), update) {
+            Response::TinyReport { report } => {
+                assert_eq!(report.summary.status, "actioned");
+                assert!(report.summary.preserve);
+                assert_eq!(report.summary.linked_audit_ids, vec![42]);
+                assert_eq!(report.notes.len(), 1);
+            }
+            other => panic!("unexpected work response: {other:?}"),
+        }
+        let patch_body = json_body(&last(&log, "PATCH /v1/reports/r1"));
+        assert_eq!(patch_body["status"], "actioned");
+        assert_eq!(patch_body["note"], "Banned user");
+        assert_eq!(patch_body["link_audit_id"], 42);
+        assert_eq!(patch_body["preserve"], true);
+
+        // 404 (including a hidden self-report) gives a neutral message with no hint.
+        assert_eq!(report_read(account.clone(), "self".into()), said(REPORT_GONE));
+        // 403 gives a permission refusal.
+        assert_eq!(report_read(account, "denied".into()), said(REPORT_FORBIDDEN));
+    });
+}

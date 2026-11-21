@@ -97,6 +97,7 @@ impl Shell {
                 this.sign_in(Network::Tiny, cx);
             })))
             .child(self.plain(menu_item_danger("tiny-menu-sign-out", Some("icons/log-out.svg"), "Sign out of this server…"), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::SignOut { erase: false }, window, cx))))
+            .child(self.plain(menu_item_danger("tiny-menu-delete-account", Some("icons/trash-2.svg"), "Delete my account on this server…"), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::DeleteAccount, window, cx))))
     }
 
     pub(super) fn tiny_person_menu(&self, page: &Page, user_id: &str, cx: &mut Context<Self>) -> Div {
@@ -240,6 +241,15 @@ impl Shell {
                 items = items.child(self.plain(menu_item_danger("tiny-person-ban", Some("icons/ban.svg"), "Ban…"), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::Ban(id.clone()), window, cx))));
             }
         }
+        if !facts.me && page.community.has(protocol::TINY_FEATURE_ABUSE_REPORTS) {
+            let account = page.account.clone();
+            let id = user_id.to_owned();
+            let label = name.clone();
+            items = items.child(menu_separator()).child(
+                self.plain(menu_item_danger("tiny-person-report", Some("icons/triangle-alert.svg"), "Report…"), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_report(account.clone(), "member", id.clone(), label.clone(), None, window, cx))),
+            );
+        }
         let copy = user_id.to_owned();
         let copy_name = (name != "Someone").then(|| name.clone());
         items = items.child(menu_separator());
@@ -350,6 +360,15 @@ impl Shell {
             this.tiny_close_float(cx);
             this.tiny_copy(link.clone(), "Channel link copied", cx);
         })));
+        if page.community.has(protocol::TINY_FEATURE_ABUSE_REPORTS) {
+            let account = page.account.clone();
+            let id = room.id.clone();
+            let label = room.name.clone();
+            items = items.child(menu_separator()).child(
+                self.plain(menu_item_danger("tiny-channel-report", Some("icons/triangle-alert.svg"), "Report…"), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_report(account.clone(), "channel", id.clone(), label.clone(), None, window, cx))),
+            );
+        }
         if may.delete_room {
             let id = room.id.clone();
             items = items.child(menu_separator()).child(self.plain(menu_item_danger("tiny-channel-delete", Some("icons/trash-2.svg"), "Delete channel…"), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::DeleteRoom(id.clone()), window, cx))));

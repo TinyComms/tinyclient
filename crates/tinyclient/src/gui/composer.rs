@@ -980,11 +980,12 @@ impl Composer {
                 return;
             }
         };
+        let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
             silent: silent && controls.silent,
-            suppress_embeds: self.no_preview && controls.link_chip && !hosts.is_empty(),
+            suppress_embeds: tiny_previews_off || (self.no_preview && controls.link_chip && !hosts.is_empty()),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
@@ -1915,16 +1916,17 @@ impl Composer {
         .detach();
     }
 
-    /// Tiny has no GIF catalog. The button asks for a .gif and stages it like any other file.
+    /// When a network has no GIF catalog (`!can.gifs`), the button asks for a `.gif` file and stages it like any other attachment.
     fn attach_gif(&mut self, cx: &mut Context<Self>) {
-        if !self.controls().gif || self.target.as_ref().is_none_or(|target| target.key.network != Network::Tiny || target.locked().is_some()) {
+        let controls = self.controls();
+        if !controls.gif || controls.tabs.contains(&Tab::Gifs) || self.target.as_ref().is_none_or(|target| target.locked().is_some()) {
             return;
         }
         let Some(target) = self.target.clone() else {
             return;
         };
         let key = target.key.clone();
-        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Send a GIF".into()) });
+        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach a GIF file".into()) });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = asked.await {
                 let _ = this.update(cx, |this, cx| {
@@ -2394,7 +2396,42 @@ impl Composer {
         let rows = match (answer, target.space.as_deref()) {
             (Ok(Response::People { people, .. }), _) => {
                 self.hub.learn(&people);
-                complete::people(self.known(&target.key), people, &account, &trigger.query)
+                let mut rows = complete::people(self.known(&target.key), people, &account, &trigger.query);
+                if target.key.network == protocol::Network::Tiny {
+                    if let Some(shell) = self.shell.upgrade() {
+                        let shell = shell.read(cx);
+                        if let Some(community) = shell.tiny_state.community.as_ref().filter(|_| shell.tiny_state.account.as_ref() == Some(&account)) {
+                            let can_everyone = community.access.as_ref().is_some_and(|a| a.has(protocol::TINY_MENTION_EVERYONE));
+                            if can_everyone && mention::rank("everyone", "", &trigger.query).is_some() {
+                                rows.push(complete::Row {
+                                    kind: mention::Kind::Role,
+                                    key: Key::new(&account, "everyone"),
+                                    name: "everyone".to_owned(),
+                                    handle: String::new(),
+                                    second: "Notify everyone in this channel".to_owned(),
+                                    person: None,
+                                });
+                            }
+                            for role in &community.roles {
+                                if role.default || (!role.mentionable && !can_everyone) {
+                                    continue;
+                                }
+                                if mention::rank(&role.name, "", &trigger.query).is_some() {
+                                    rows.push(complete::Row {
+                                        kind: mention::Kind::Role,
+                                        key: Key::new(&account, &role.id),
+                                        name: role.name.clone(),
+                                        handle: String::new(),
+                                        second: "Role".to_owned(),
+                                        person: None,
+                                    });
+                                }
+                            }
+                            rows.truncate(complete::ROWS);
+                        }
+                    }
+                }
+                rows
             }
             (Ok(Response::Conversations { conversations, .. }), Some(space)) => complete::channels(conversations, &account, space, &trigger.query),
             _ => Vec::new(),
@@ -2939,13 +2976,13 @@ impl Composer {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_poll_composer(cx)))
         });
         let gif = controls.gif.then(|| {
-            let tiny = self.target.as_ref().is_some_and(|target| target.key.network == Network::Tiny);
-            let slot = if tiny { None } else { Some(Trigger::Gif) };
-            let button = self.card_button("gif", None, !tiny && open_tab == Some(Tab::Gifs), slot);
-            if tiny {
-                button.tooltip(tip("Send a GIF", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
-            } else {
+            let catalog = controls.tabs.contains(&Tab::Gifs);
+            let slot = if catalog { Some(Trigger::Gif) } else { None };
+            let button = self.card_button("gif", None, catalog && open_tab == Some(Tab::Gifs), slot);
+            if catalog {
                 button.tooltip(tip("GIFs", Some("⇧⌘G"))).on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Gifs, window, cx)))
+            } else {
+                button.tooltip(tip("Attach a GIF file", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
             }
         });
         let smile = controls.emoji.then(|| {
@@ -3097,7 +3134,8 @@ impl Composer {
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
         let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
-        let hosts = if self.controls().link_chip && unlocked { niceties::link_hosts(&text) } else { Vec::new() };
+        let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
+        let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
             let suppressed = self.no_preview;
             div()
@@ -3645,10 +3683,10 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &crate::gui::AttachFile, _, cx| this.attach_files(cx)))
             .on_action(cx.listener(|this, _: &PickEmoji, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
             .on_action(cx.listener(|this, _: &PickGifs, window, cx| {
-                if this.target.as_ref().is_some_and(|target| target.key.network == Network::Tiny) {
-                    this.attach_gif(cx);
-                } else {
+                if this.controls().tabs.contains(&Tab::Gifs) {
                     this.toggle_picker(Tab::Gifs, window, cx);
+                } else {
+                    this.attach_gif(cx);
                 }
             }))
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {

@@ -108,6 +108,19 @@ pub(super) enum Modal {
     SignOut {
         erase: bool,
     },
+    /// Permanently deleting this account on the server, the server's name typed first.
+    DeleteAccount,
+    /// Reporting a message, member, or channel on a Tiny server (`POST /v1/reports`).
+    Report {
+        account: AccountKey,
+        kind: String,
+        target_id: String,
+        label: String,
+        /// Decrypted text of the message, sent only when `include_evidence` is ticked.
+        message_text: Option<String>,
+        category: &'static str,
+        include_evidence: bool,
+    },
     /// Server Settings' confirmations.
     DeleteRole(String),
     KickMany(Vec<String>),
@@ -129,6 +142,8 @@ pub(super) enum Modal {
     RecoveryCodes(Vec<String>),
     /// One of this account's passkeys, to remove, by id, with its name for the words.
     RemovePasskey { id: String, label: String },
+    /// Pick a member of this server to open a direct message with.
+    NewDirect,
 }
 
 impl Modal {
@@ -188,11 +203,11 @@ pub(super) enum Dragged {
 /// What the server page holds. An invite's token stays until Done and is never logged.
 pub struct State {
     seen: bool,
-    account: Option<AccountKey>,
+    pub(crate) account: Option<AccountKey>,
     load_epoch: u64,
     action_epoch: u64,
     loading: bool,
-    community: Option<TinyCommunity>,
+    pub(crate) community: Option<TinyCommunity>,
     error: Option<String>,
     busy: bool,
     /// The action whose buttons stay quiet until a read started after it returns. Any such read
@@ -234,6 +249,8 @@ pub struct State {
     shared: Option<protocol::ScreenSource>,
     /// Categories folded, by key ([`model::LOOSE`] for the rooms in none).
     folded: HashSet<String>,
+    /// Voice rooms whose seat list is expanded past [`model::SIDEBAR_SEAT_CAP`].
+    expanded_rooms: HashSet<String>,
     members_open: bool,
 
     float: Option<Float>,
@@ -343,6 +360,7 @@ impl State {
             share_cursor: true,
             shared: None,
             folded: HashSet::new(),
+            expanded_rooms: HashSet::new(),
             members_open: true,
             float: None,
             sub: None,
@@ -895,6 +913,103 @@ impl Shell {
                 if failed && this.tiny_state.action_epoch == epoch {
                     this.fetch(account, None, cx);
                 }
+            },
+        );
+    }
+
+    /// Opens the Tiny abuse report modal for a message, member, or channel.
+    pub(in crate::gui) fn tiny_open_report(
+        &mut self,
+        account: AccountKey,
+        kind: &str,
+        target_id: String,
+        label: String,
+        message_text: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tiny_open_modal(
+            Modal::Report {
+                account,
+                kind: kind.to_owned(),
+                target_id,
+                label,
+                message_text,
+                category: "spam",
+                include_evidence: false,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Submits the open `Modal::Report`. Never logs the note or evidence.
+    pub(super) fn tiny_send_report(&mut self, cx: &mut Context<Self>) {
+        if self.tiny_state.busy {
+            return;
+        }
+        let Some(Modal::Report { account, kind, target_id, message_text, category, include_evidence, .. }) = self.tiny_state.modal.clone() else {
+            return;
+        };
+        let note_text = self.tiny_state.reason_input.read(cx).text().trim().to_owned();
+        let note = (!note_text.is_empty()).then_some(note_text);
+        let evidence = if include_evidence { message_text.filter(|t| !t.is_empty()) } else { None };
+        let request = Request::TinyReport {
+            account,
+            kind,
+            target_id,
+            category: category.to_owned(),
+            note,
+            evidence,
+        };
+        self.tiny_state.busy = true;
+        self.tiny_state.modal_error = None;
+        cx.notify();
+        self.off_thread(
+            cx,
+            move || ask(&request),
+            |this, answer, cx| {
+                this.tiny_state.busy = false;
+                match answer {
+                    Ok(Response::TinyReported { duplicate }) => {
+                        this.tiny_state.modal = None;
+                        let msg = if duplicate { "You already reported this" } else { "Reported" };
+                        this.toast(Some(("icons/check.svg", super::theme::positive())), msg.to_owned(), cx);
+                    }
+                    Ok(Response::Error { detail, .. }) => this.tiny_state.modal_error = Some(detail),
+                    Ok(_) => this.tiny_state.modal_error = Some(crate::client::OTHER_ANSWER.to_owned()),
+                    Err(err) => this.tiny_state.modal_error = Some(crate::client::trouble_words("tiny", &err)),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Permanently deletes this account on the server and wipes local session, keys, and cache.
+    pub(super) fn tiny_delete_account(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.with_account() else {
+            return;
+        };
+        if self.tiny_state.busy {
+            return;
+        }
+        self.tiny_state.busy = true;
+        self.tiny_state.modal_error = None;
+        cx.notify();
+        self.off_thread(
+            cx,
+            move || ask(&Request::TinyDeleteAccount { account }),
+            |this, answer, cx| {
+                this.tiny_state.busy = false;
+                match answer {
+                    Ok(Response::Error { detail, .. }) => this.tiny_state.modal_error = Some(detail),
+                    Ok(_) => {
+                        this.tiny_state.modal = None;
+                        this.tiny_state.settings = None;
+                    }
+                    Err(err) => this.tiny_state.modal_error = Some(crate::client::trouble_words("tiny", &err)),
+                }
+                cx.notify();
             },
         );
     }
@@ -1677,12 +1792,12 @@ impl Shell {
                 self.tiny_state.topic_input.update(cx, |input, cx| input.set_text(&topic_now, cx));
                 Some(self.tiny_state.name_input.clone())
             }
-            Modal::Transfer(_) | Modal::RevokeInvites { typed: true } => {
+            Modal::Transfer(_) | Modal::RevokeInvites { typed: true } | Modal::DeleteAccount => {
                 let confirm = self.tiny_state.settings_fields.confirm.clone();
                 confirm.update(cx, |input, cx| input.set_text("", cx));
                 Some(confirm)
             }
-            Modal::KickMany(_) => {
+            Modal::KickMany(_) | Modal::Report { .. } => {
                 self.tiny_state.reason_input.update(cx, |input, cx| input.set_text("", cx));
                 Some(self.tiny_state.reason_input.clone())
             }
@@ -1695,6 +1810,10 @@ impl Shell {
                 self.tiny_state.label_input.update(cx, |input, cx| input.set_text("", cx));
                 self.tiny_state.invite = InviteDraft::default();
                 None
+            }
+            Modal::NewDirect => {
+                self.tiny_state.search_input.update(cx, |input, cx| input.set_text("", cx));
+                Some(self.tiny_state.search_input.clone())
             }
             _ => None,
         };
@@ -1711,8 +1830,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Opens a direct message with someone on this server. The chat is a People conversation,
-    /// not a channel of the server.
+    /// Opens a direct message with someone on this server in place, without leaving the server.
     pub(super) fn tiny_message(&mut self, user_id: String, cx: &mut Context<Self>) {
         let Some(page) = self.tiny_page_facts() else {
             return;
@@ -1725,7 +1843,6 @@ impl Shell {
         drop(page);
         self.close_modal(cx);
         self.tiny_close_float(cx);
-        self.go(Mode::People, cx);
         self.open_person(&person, cx);
     }
 

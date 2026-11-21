@@ -428,6 +428,9 @@ pub struct Capabilities {
     /// The GIF button picks a `.gif` file through the attachment path when `max_file_bytes > 0` (Tiny).
     #[serde(default, skip_serializing_if = "is_false")]
     pub gif_file: bool,
+    /// This Tiny server supports setting presence state (online, idle, dnd, invisible) and status text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub presence_status: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stickers: bool,
     /// The network searches its own messages (`SearchNetwork`), which the search pane's Enter
@@ -463,6 +466,9 @@ pub struct Capabilities {
     /// This Tiny server takes archives. Ignored unless `file_scan` is set.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_archives: bool,
+    /// This Tiny server accepts abuse reports (`POST /v1/reports`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub abuse_reports: bool,
     /// This network keeps earlier wordings of an edited message (`Request::Revisions`).
     /// Off everywhere until that network's adapter says so. The shell does not ask otherwise,
     /// and chatd does not keep words a sender replaced on a network that has no history.

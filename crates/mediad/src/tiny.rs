@@ -2032,6 +2032,41 @@ mod tests {
     }
 
     #[test]
+    fn slot_change_resets_jitter_and_volume_follows_person() {
+        use crate::jitter::{Jitter, Pop};
+
+        // 1. Slot "s0" moves from "ada" to "bea": remap flags "s0" for reset.
+        let mut held = HashMap::new();
+        assert_eq!(remap(&mut held, &[slot("s0", "ada")]), (vec![], vec![]));
+        let (reset, freed) = remap(&mut held, &[slot("s0", "bea")]);
+        assert_eq!(reset, vec!["s0".to_owned()]);
+        assert!(freed.is_empty());
+        assert_eq!(held["s0"], "bea");
+
+        // 2. A fresh jitter buffer for the new speaker pops their first frames without delay
+        //    even if their sequence number jumps far away from the old speaker's.
+        let mut old_jitter = Jitter::default();
+        old_jitter.insert(frame_sequence(960 * 500), vec![1, 2, 3]);
+        old_jitter.insert(frame_sequence(960 * 501), vec![4, 5, 6]);
+        old_jitter.insert(frame_sequence(960 * 502), vec![7, 8, 9]);
+        assert_eq!(old_jitter.pop(), Pop::Packet(vec![1, 2, 3]));
+        let mut fresh_jitter = Jitter::default();
+        fresh_jitter.insert(frame_sequence(960 * 12), vec![9, 8, 7]);
+        fresh_jitter.insert(frame_sequence(960 * 13), vec![6, 5, 4]);
+        fresh_jitter.insert(frame_sequence(960 * 14), vec![3, 2, 1]);
+        assert_eq!(fresh_jitter.pop(), Pop::Packet(vec![9, 8, 7]));
+
+        // 3. Per-person volume and local mute follow the user_id, not the slot mid.
+        let mut ear = Ear::default();
+        ear.gains.insert("ada".into(), (100, true));
+        ear.gains.insert("bea".into(), (150, false));
+        assert_eq!(ear.factor("ada", false), 0.0);
+        assert!((ear.factor("bea", false) - 1.5).abs() < 0.001);
+        // After "bea" takes over "s0", looking up by held["s0"] yields bea's gain, not ada's.
+        assert!((ear.factor(&held["s0"], false) - 1.5).abs() < 0.001);
+    }
+
+    #[test]
     fn the_audio_level_is_in_dbov() {
         assert_eq!(dbov(&[0; 1920]), -127);
         assert_eq!(dbov(&[i16::MAX; 1920]), 0);

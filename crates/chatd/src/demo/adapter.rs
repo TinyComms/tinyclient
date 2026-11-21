@@ -717,7 +717,7 @@ impl Demo {
             Command::ReportReasons { reply, .. } => {
                 let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
             }
-            Command::SetPresence { presence, status, reply } => {
+            Command::SetPresence { presence, status, clear_at: _, reply } => {
                 let (_, old) = demo.hub.shown(&demo.key(&demo.me.id));
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));

@@ -35,7 +35,11 @@ pub(crate) fn refresh(ctx: &Context, saved: &Saved) {
 
 /// The same as [`refresh`], with names the caller already loaded (a fresh `ready` has them).
 pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, String>) {
-    ctx.capabilities(account_caps(saved));
+    let caps = account_caps(saved);
+    ctx.capabilities(caps);
+    if caps.custom_emoji != protocol::EmojiScope::None || caps.stickers {
+        sync_emoji(ctx, saved);
+    }
     let _ = ctx.spaces(&[SpaceRow {
         id: SPACE.to_owned(),
         name: join_host(&saved.base_url),
@@ -183,6 +187,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
                 channel.last_message.as_ref(),
                 false,
             )
+            .mentions(channel.mentions)
             .sealed(channel.e2ee),
         );
         rows.push(row);
@@ -237,6 +242,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
                 direct.last_message.as_ref(),
                 mine,
             )
+            .mentions(direct.mentions)
             .sealed(direct.e2ee),
         );
         rows.push(row);
@@ -414,6 +420,8 @@ pub(crate) fn on_live(
             }
         }
         "read.updated" => read_updated(ctx, saved, frame),
+        "thread.updated" => thread_updated(ctx, saved, frame),
+        "emoji.updated" => { let _ = sync_emoji(ctx, saved); }
         "server.updated" => ctx.capabilities(account_caps(saved)),
         // The group of an encrypted conversation changed, this device's key packages ran low, or
         // someone's devices changed. Off the socket's thread: it asks the server. A row that did
@@ -454,6 +462,8 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "reaction.updated"
             | "e2ee.reaction"
             | "read.updated"
+            | "thread.updated"
+            | "emoji.updated"
             | "e2ee.handshake"
             | "e2ee.keys_low"
             | "e2ee.device"
@@ -501,6 +511,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             }
         }
         Command::OpenSpace(_) | Command::OpenHome => refresh(ctx, saved),
+        Command::OpenThreads(_) => open_threads(ctx, saved),
         Command::MarkRead { conversation_id, message_id } => mark_read(saved, &conversation_id, &message_id),
         Command::Send { conversation_id, client_id, text, reply_to } => send(ctx, saved, conversation_id, client_id, text, reply_to),
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -515,9 +526,9 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             conversation_id,
             message_id,
             text,
-            spans: _,
+            spans,
             reply,
-        } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
+        } => edit(ctx, saved, &conversation_id, &message_id, &text, &spans, reply),
         Command::Delete {
             conversation_id,
             message_id,
@@ -554,6 +565,19 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
                 live.ask(Ask::Type { conversation_id });
             }
         }
+        Command::SetPresence { presence, status, clear_at, reply } => {
+            let known = super::manage::known(saved);
+            let supported = if known.checked {
+                known.capabilities.has(protocol::TINY_FEATURE_PRESENCE_STATUS)
+            } else {
+                super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_PRESENCE_STATUS)
+            };
+            if !supported {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            } else {
+                live.ask(Ask::SetPresence { presence, status, clear_at, reply });
+            }
+        }
         Command::StartDirect { person_id, reply } => start_direct(ctx, saved, &person_id, reply),
         Command::StartDirectCall { person_id, reply } => start_direct_intent(ctx, saved, &person_id, true, reply),
         Command::MembersRemove { person, reply, .. } => {
@@ -577,12 +601,41 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             };
             let _ = reply.send(answer);
         }
-        Command::Catalog { kind, reply, .. } => match kind {
-            CatalogKind::Emoji | CatalogKind::Gifs => {
-                let _ = reply.send(Ok(CatalogPage::default()));
+        Command::Catalog { kind, query, reply, .. } => match kind {
+            CatalogKind::Emoji | CatalogKind::Stickers => {
+                let want_kind = if kind == CatalogKind::Stickers { "sticker" } else { "emoji" };
+                let known = super::manage::known(saved);
+                let items_src = if known.emoji.is_empty()
+                    && (server_has_feature(saved, protocol::TINY_FEATURE_CUSTOM_EMOJI)
+                        || server_has_feature(saved, protocol::TINY_FEATURE_STICKERS))
+                {
+                    sync_emoji(ctx, saved)
+                } else {
+                    known.emoji
+                };
+                let q = query.trim().to_ascii_lowercase();
+                let items = items_src
+                    .into_iter()
+                    .filter(|item| item.kind == want_kind && (q.is_empty() || item.name.to_ascii_lowercase().contains(&q)))
+                    .map(|item| {
+                        let file_id = emoji_media_id(&item.id);
+                        let mut file = MediaFile::new(&file_id, if item.animated { MediaKind::Gif } else { MediaKind::Image });
+                        if !item.path.is_empty() {
+                            file.path = Some(item.path.clone());
+                        }
+                        protocol::CatalogItem {
+                            id: if kind == CatalogKind::Stickers { item.id.clone() } else { file_id },
+                            name: if kind == CatalogKind::Stickers { item.name } else { format!(":{}:", item.name) },
+                            file: Some(file),
+                            pack: join_host(&saved.base_url),
+                            animated: item.animated,
+                        }
+                    })
+                    .collect();
+                let _ = reply.send(Ok(CatalogPage { items, cursor: None }));
             }
-            _ => {
-                let _ = reply.send(Err(Refusal::Unsupported));
+            CatalogKind::Gifs => {
+                let _ = reply.send(Ok(CatalogPage::default()));
             }
         },
         Command::Download { id, url, reply } => {
@@ -617,6 +670,29 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         Command::ConversationInfo { conversation_id, reply } => {
             conversation_info(ctx, saved, &conversation_id, reply);
         }
+        Command::Report { target, reason, note, block: _, reply } => {
+            let (kind, target_id) = match &target {
+                protocol::ReportTarget::Message { message_id, .. } => ("message".to_owned(), message_id.clone()),
+                protocol::ReportTarget::Person(key) => ("member".to_owned(), key.id.clone()),
+                protocol::ReportTarget::Conversation(key) => ("channel".to_owned(), key.id.clone()),
+            };
+            let category = match reason {
+                protocol::ReportReason::Spam => "spam",
+                protocol::ReportReason::Harassment => "harassment",
+                protocol::ReportReason::Violence => "violence",
+                protocol::ReportReason::Illegal => "illegal",
+                protocol::ReportReason::Impersonation => "impersonation",
+                protocol::ReportReason::Other => "other",
+            }
+            .to_owned();
+            let note = (!note.trim().is_empty()).then_some(note);
+            let answer = match super::manage::report_create(ctx.account.clone(), kind, target_id, category, note, None) {
+                protocol::Response::TinyReported { .. } => Ok(()),
+                protocol::Response::Error { detail, .. } => Err(Refusal::Refused(detail)),
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
         other => other.unsupported(ctx),
     }
 }
@@ -626,6 +702,7 @@ struct Note {
     /// The conversation is end-to-end encrypted: its last line has no body for the server.
     sealed: bool,
     unread: u32,
+    mentions: u32,
     last_read: Option<String>,
     peer_read: Option<String>,
     last: Option<WireLast>,
@@ -640,11 +717,17 @@ impl Note {
             id: id.to_owned(),
             sealed: false,
             unread,
+            mentions: 0,
             last_read: kept(last_read),
             peer_read: kept(peer_read),
             last: last.cloned(),
             mine,
         }
+    }
+
+    fn mentions(mut self, mentions: u32) -> Note {
+        self.mentions = mentions;
+        self
     }
 
     fn sealed(mut self, sealed: bool) -> Note {
@@ -658,7 +741,7 @@ impl Note {
         let updated = if updated == 0 && self.peer_read.is_some() { 1 } else { updated };
         let direct = self.peer_read.is_some() || self.last_read.is_some();
         let updated = if updated == 0 && direct { 1 } else { updated };
-        let _ = ctx.counts(&self.id, self.unread, 0, self.last_read.as_deref(), updated);
+        let _ = ctx.counts(&self.id, self.unread, self.mentions, self.last_read.as_deref(), updated);
         if let Some(last) = &self.last {
             if super::safe_id(&last.id) {
                 if self.sealed {
@@ -711,11 +794,11 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
     }
     // The broadcast copies the actor's unread into the channel object. Ours stays until our
     // own list (`publish`) says otherwise, or a live message moves it.
-    let unread = match ctx.known(&channel.id) {
-        Ok(Some(existing)) => existing.unread,
-        _ => channel.unread,
+    let (unread, mentions) = match ctx.known(&channel.id) {
+        Ok(Some(existing)) => (existing.unread, existing.mentions),
+        _ => (channel.unread, channel.mentions),
     };
-    Note::from_last(&channel.id, unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee).apply(ctx, saved, names);
+    Note::from_last(&channel.id, unread, None, None, channel.last_message.as_ref(), false).mentions(mentions).sealed(channel.e2ee).apply(ctx, saved, names);
 }
 
 fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, frame: &Value) {
@@ -771,7 +854,7 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     // leave messages already heard intact; only the REST shape supplies a full snapshot.
     if !paired {
         let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
-        Note::from_last(&direct.id, direct.unread, direct.last_read.as_deref(), direct.peer_read.as_deref(), direct.last_message.as_ref(), mine).sealed(direct.e2ee).apply(ctx, saved, names);
+        Note::from_last(&direct.id, direct.unread, direct.last_read.as_deref(), direct.peer_read.as_deref(), direct.last_message.as_ref(), mine).mentions(direct.mentions).sealed(direct.e2ee).apply(ctx, saved, names);
     }
 }
 
@@ -786,13 +869,24 @@ fn deliver(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, conver
         refold(ctx, saved, names, conversation_id, &opened);
         return;
     }
-    let Some(message) = map_message(saved, names, wire, &opened, &mut media) else {
+    let Some(mut message) = map_message(saved, names, wire, &opened, &mut media) else {
         return;
     };
+    apply_thread_summary(ctx, conversation_id, wire, &mut message);
     if !media.is_empty() {
         let _ = ctx.media(&media);
     }
-    let _ = ctx.message(conversation_id, &message);
+    let sealed_thread = match opened.get(&wire.id) {
+        Some(Read::Opened(o) | Read::Legacy(o)) => o.thread_id.as_deref(),
+        _ => None,
+    };
+    let target_thread = wire.thread_id.as_deref().or(sealed_thread).filter(|id| super::safe_id(id));
+    if let Some(root_id) = target_thread {
+        let tid = thread_known(ctx, conversation_id, root_id);
+        let _ = ctx.message(&tid, &message);
+    } else {
+        let _ = ctx.message(conversation_id, &message);
+    }
 }
 
 /// An encrypted edit came: each target it folded into is shown again with its new text.
@@ -813,6 +907,9 @@ fn refold(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, convers
         message.saved_history = false;
         message.text = opened.text.clone();
         message.edited = true;
+        message.spans.clear();
+        message.mentions_me = false;
+        apply_mentions(&mut message, saved, &opened.mentions, true);
         relink(&mut message);
         let mut media = Vec::new();
         message.attachments = sealed_attachments(saved, opened, &mut media);
@@ -1160,6 +1257,7 @@ fn prove_rehydrate_attachment(text: &str, file_id: &str, name: &str) -> Result<(
                 sha256: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_owned(),
                 width: 640,
                 height: 480,
+                ..e2ee::OpenedFile::default()
             }],
             ..e2ee::Opened::default()
         },
@@ -1601,18 +1699,171 @@ fn load_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option
     }
 }
 
+fn split_thread_id(id: &str) -> Option<(&str, &str)> {
+    let (channel, root) = id.split_once(':')?;
+    if super::safe_id(channel) && super::safe_id(root) {
+        Some((channel, root))
+    } else {
+        None
+    }
+}
+
+fn thread_conv_id(channel_id: &str, root_id: &str) -> String {
+    format!("{channel_id}:{root_id}")
+}
+
+fn thread_known(ctx: &Context, channel_id: &str, root_id: &str) -> String {
+    let id = thread_conv_id(channel_id, root_id);
+    if ctx.known(&id).ok().flatten().is_none() {
+        let parent = ctx.known(channel_id).ok().flatten();
+        let title = parent
+            .as_ref()
+            .map(|p| p.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Thread".to_owned());
+        let mut row = ConversationRow::new(&id, ConversationKind::Thread, title);
+        row.space = Some(SPACE.to_owned());
+        row.parent = Some(channel_id.to_owned());
+        row.root = Some(root_id.to_owned());
+        if let Some(p) = parent {
+            row.encryption = p.encryption;
+        }
+        let _ = ctx.conversation(&row);
+    }
+    id
+}
+
+fn map_thread_summary(ctx: &Context, channel_id: &str, root_id: &str, wire: &WireThreadSummary) -> protocol::ThreadSummary {
+    let last = wire.last_reply_at.as_deref().and_then(rfc3339).unwrap_or(0);
+    let participants = wire
+        .participants
+        .iter()
+        .take(protocol::THREAD_FACES)
+        .filter(|id| !id.is_empty())
+        .map(|id| ctx.key(id))
+        .collect();
+    protocol::ThreadSummary {
+        id: thread_conv_id(channel_id, root_id),
+        replies: wire.replies,
+        last,
+        participants,
+        unread: wire.unread,
+    }
+}
+
+fn apply_thread_summary(ctx: &Context, channel_id: &str, wire: &WireMessage, message: &mut Message) {
+    if let Some(summary) = wire.thread.as_ref().filter(|s| s.replies > 0) {
+        message.thread = Some(map_thread_summary(ctx, channel_id, &wire.id, summary));
+    }
+}
+
+fn thread_updated(ctx: &Context, _saved: &Saved, frame: &Value) {
+    let channel_id = field(frame, "conversation_id");
+    let root_id = field(frame, "message_id");
+    if !super::safe_id(channel_id) || !super::safe_id(root_id) {
+        return;
+    }
+    let summary = frame
+        .get("thread")
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<WireThreadSummary>(v.clone()).ok())
+        .filter(|s| s.replies > 0)
+        .map(|s| map_thread_summary(ctx, channel_id, root_id, &s));
+    if let Ok(Some(mut root)) = ctx.stored_message(channel_id, root_id) {
+        root.thread = summary.clone();
+        let _ = ctx.message(channel_id, &root);
+    }
+    if let Some(summary) = summary {
+        let tid = thread_known(ctx, channel_id, root_id);
+        let _ = ctx.counts(&tid, summary.unread, 0, None, summary.last);
+    }
+}
+
+fn open_threads(ctx: &Context, saved: &Saved) {
+    if !server_has_feature(saved, protocol::TINY_FEATURE_THREADS) {
+        return;
+    }
+    let Ok((200, body)) = super::asked("GET", saved, "/v1/threads", None) else {
+        return;
+    };
+    let Ok(items) = serde_json::from_value::<Vec<WireFollowedThread>>(body) else {
+        return;
+    };
+    let names = member_names(saved);
+    for item in items {
+        if !super::safe_id(&item.channel_id) || !super::safe_id(&item.message_id) {
+            continue;
+        }
+        let tid = thread_known(ctx, &item.channel_id, &item.message_id);
+        let _ = ctx.filing(&tid, &crate::store::Filing { followed: true, ..crate::store::Filing::default() });
+        if let Some(wire) = item.message.as_ref() {
+            let mut media = Vec::new();
+            let opened = open_rows(ctx, saved, &item.channel_id, &[wire]);
+            if let Some(mut msg) = map_message(saved, &names, wire, &opened, &mut media) {
+                if let Some(summary) = item.thread.as_ref().filter(|s| s.replies > 0) {
+                    msg.thread = Some(map_thread_summary(ctx, &item.channel_id, &item.message_id, summary));
+                }
+                if !media.is_empty() {
+                    let _ = ctx.media(&media);
+                }
+                let _ = ctx.history(&tid, &[msg]);
+            }
+        }
+        if let Some(summary) = item.thread.as_ref() {
+            let last = summary.last_reply_at.as_deref().and_then(rfc3339).unwrap_or(0);
+            let _ = ctx.counts(&tid, summary.unread, 0, None, last);
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn follow_thread(saved: &Saved, root_id: &str, follow: bool) -> Result<(), String> {
+    if !super::safe_id(root_id) {
+        return Err(super::CHECK.to_owned());
+    }
+    let method = if follow { "PUT" } else { "DELETE" };
+    let path = format!("/v1/messages/{root_id}/thread/follow");
+    match super::asked(method, saved, &path, None) {
+        Ok((200 | 204, _)) => Ok(()),
+        Ok((status, body)) => Err(super::explain(status, &body, super::Missing::Plain).to_owned()),
+        Err(detail) => Err(detail.to_owned()),
+    }
+}
+
 fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option<&str>, limit: u32) -> Result<(), String> {
-    let path = match before {
-        Some(before) => format!("/v1/conversations/{conversation_id}/messages?before={before}&limit={limit}"),
-        None => format!("/v1/conversations/{conversation_id}/messages?limit={limit}"),
+    let thread = split_thread_id(conversation_id);
+    let (path, e2ee_conv) = if let Some((channel_id, root_id)) = thread {
+        thread_known(ctx, channel_id, root_id);
+        let p = match before {
+            Some(before) => format!("/v1/messages/{root_id}/thread?before={before}&limit={limit}"),
+            None => format!("/v1/messages/{root_id}/thread?limit={limit}"),
+        };
+        (p, channel_id)
+    } else {
+        let threads_q = if server_has_feature(saved, protocol::TINY_FEATURE_THREADS) { "&threads=1" } else { "" };
+        let p = match before {
+            Some(before) => format!("/v1/conversations/{conversation_id}/messages?before={before}&limit={limit}{threads_q}"),
+            None => format!("/v1/conversations/{conversation_id}/messages?limit={limit}{threads_q}"),
+        };
+        (p, conversation_id)
     };
     match super::asked("GET", saved, &path, None) {
         Ok((200, body)) => {
             let wires: Vec<WireMessage> = list_of(body, "messages").map_err(|()| super::UNREADABLE.to_owned())?;
             let names = member_names(saved);
             let mut media = Vec::new();
-            let opened = open_rows(ctx, saved, conversation_id, &wires.iter().collect::<Vec<_>>());
-            let messages: Vec<Message> = wires.iter().filter(|wire| wire.kind.as_deref() != Some("edit")).filter_map(|wire| map_message(saved, &names, wire, &opened, &mut media)).collect();
+            let opened = open_rows(ctx, saved, e2ee_conv, &wires.iter().collect::<Vec<_>>());
+            let messages: Vec<Message> = wires
+                .iter()
+                .filter(|wire| wire.kind.as_deref() != Some("edit"))
+                .filter_map(|wire| {
+                    let mut msg = map_message(saved, &names, wire, &opened, &mut media)?;
+                    if thread.is_none() {
+                        apply_thread_summary(ctx, conversation_id, wire, &mut msg);
+                    }
+                    Some(msg)
+                })
+                .collect();
             if !media.is_empty() {
                 let _ = ctx.media(&media);
             }
@@ -1623,21 +1874,21 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             // ones that changed while this device was away are asked for now, with anything a
             // page before this one still owed. The list is paged without the device mutex,
             // so the network holds up no other user of this device.
-            if sealed_here(ctx, saved, conversation_id) == Ok(true) {
+            if thread.is_none() && sealed_here(ctx, saved, e2ee_conv) == Ok(true) {
                 if let Some(device) = e2ee::started(saved) {
-                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, conversation_id);
+                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, e2ee_conv);
                     let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
-                    landed.extend(device.owed_reactions(conversation_id));
+                    landed.extend(device.owed_reactions(e2ee_conv));
                     let (mut applied, mut owed) = (Vec::new(), Vec::new());
                     for reaction in &landed {
                         let pair = (reaction.message.clone(), reaction.emoji.clone());
-                        if apply_reaction(ctx, conversation_id, reaction) {
+                        if apply_reaction(ctx, e2ee_conv, reaction) {
                             applied.push(pair);
                         } else {
                             owed.push(pair);
                         }
                     }
-                    device.settle_reactions(conversation_id, &applied, &owed);
+                    device.settle_reactions(e2ee_conv, &applied, &owed);
                 }
             }
             Ok(())
@@ -1654,18 +1905,34 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
 /// encrypted conversation can wait for the people of a new group to join it (`e2ee::send`), so
 /// it has a thread of its own, and does not hold up the plain ones.
 fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
-    if !super::safe_id(&conversation_id) {
+    send_spans(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), None, false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_spans(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: String,
+    client_id: String,
+    text: String,
+    reply_to: Option<String>,
+    spans: Vec<protocol::Span>,
+    sticker_id: Option<String>,
+    suppress_embeds: bool,
+) {
+    if !super::safe_id(&conversation_id) && split_thread_id(&conversation_id).is_none() {
         let outcome = Err(super::CHECK.to_owned());
         ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
+    let check_conv = split_thread_id(&conversation_id).map_or(conversation_id.as_str(), |(ch, _)| ch);
     // The same question the post asks, so a conversation the device knows is encrypted but the
     // list has not labelled yet still goes to the sealed queue and never holds up the plain one.
-    let account = send_account(saved, sealed_here(ctx, saved, &conversation_id) == Ok(true));
+    let account = send_account(saved, sealed_here(ctx, saved, check_conv) == Ok(true));
     let (posting, saved) = (ctx.clone(), saved.clone());
     in_order(account, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
-            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+            let outcome = post_message_with(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[], &spans, sticker_id.as_deref(), suppress_embeds);
             let sent = outcome.is_ok();
             posting.sent(&conversation_id, &client_id, outcome);
             crate::sendtime::stage("store");
@@ -1716,12 +1983,139 @@ fn in_order(account: (String, String), job: Job) {
     }
 }
 
-fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &str, text: &str, reply_to: Option<&str>, attachment_ids: &[String]) -> Result<Message, String> {
-    if !super::safe_id(conversation_id) {
-        return Err(super::CHECK.to_owned());
+fn emoji_media_id(id: &str) -> String {
+    format!("tiny-emoji-{id}")
+}
+
+fn strip_emoji_media_id(id: &str) -> &str {
+    id.strip_prefix("tiny-emoji-").unwrap_or(id)
+}
+
+/// Fetches the server's custom emoji & sticker set and registers + downloads every image up front
+/// so encrypted conversations never trigger on-demand fetches when rendering a message.
+fn sync_emoji(ctx: &Context, saved: &Saved) -> Vec<protocol::TinyEmoji> {
+    let items = super::manage::fetch_emoji_set(saved, &ctx.account);
+    let media: Vec<(MediaFile, String)> = items
+        .iter()
+        .map(|item| {
+            let mut file = MediaFile::new(emoji_media_id(&item.id), if item.animated { MediaKind::Gif } else { MediaKind::Image });
+            if !item.path.is_empty() {
+                file.path = Some(item.path.clone());
+            }
+            (file, format!("{}/v1/emoji/{}", saved.base_url.trim_end_matches('/'), item.id))
+        })
+        .collect();
+    if !media.is_empty() {
+        let _ = ctx.media(&media);
     }
-    if sealed_here(ctx, saved, conversation_id)? {
-        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids);
+    items
+}
+
+fn emoji_from_spans(text: &str, spans: &[protocol::Span]) -> Vec<e2ee_core::envelope::EmojiRef> {
+    let mut out = Vec::new();
+    for span in spans {
+        if out.len() >= 50 {
+            break;
+        }
+        let (start, end) = (span.start as usize, span.end as usize);
+        if start >= end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let protocol::Style::Emoji { file } = &span.style else {
+            continue;
+        };
+        let id = strip_emoji_media_id(&file.id);
+        if super::safe_id(id) {
+            out.push(e2ee_core::envelope::EmojiRef {
+                id: id.to_owned(),
+                start: span.start,
+                end: span.end,
+            });
+        }
+    }
+    out
+}
+
+fn server_has_feature(saved: &Saved, feature: &str) -> bool {
+    let was = super::manage::known(saved);
+    if was.checked {
+        return was.capabilities.has(feature);
+    }
+    super::manage::learn(saved).capabilities.has(feature)
+}
+
+fn mentions_from_spans(text: &str, spans: &[protocol::Span]) -> Vec<e2ee_core::envelope::MentionRef> {
+    let mut out = Vec::new();
+    for span in spans {
+        if out.len() >= 50 {
+            break;
+        }
+        let (start, end) = (span.start as usize, span.end as usize);
+        if start >= end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let protocol::Style::Mention { kind, id } = &span.style else {
+            continue;
+        };
+        let (kind_str, id_opt) = match kind {
+            protocol::MentionKind::User if !id.is_empty() => ("user", Some(id.clone())),
+            protocol::MentionKind::Role if !id.is_empty() => ("role", Some(id.clone())),
+            protocol::MentionKind::Everyone => ("everyone", None),
+            _ => continue,
+        };
+        out.push(e2ee_core::envelope::MentionRef {
+            kind: kind_str.to_owned(),
+            id: id_opt,
+            start: span.start,
+            end: span.end,
+        });
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn post_message(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachment_ids: &[String],
+    spans: &[protocol::Span],
+    sticker_id: Option<&str>,
+) -> Result<Message, String> {
+    post_message_with(ctx, saved, conversation_id, client_id, text, reply_to, attachment_ids, spans, sticker_id, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_message_with(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachment_ids: &[String],
+    spans: &[protocol::Span],
+    sticker_id: Option<&str>,
+    suppress_embeds: bool,
+) -> Result<Message, String> {
+    let (target_conv, thread_root) = match split_thread_id(conversation_id) {
+        Some((ch, root)) => {
+            thread_known(ctx, ch, root);
+            (ch, Some(root))
+        }
+        None => {
+            if !super::safe_id(conversation_id) {
+                return Err(super::CHECK.to_owned());
+            }
+            (conversation_id, None)
+        }
+    };
+    if sealed_here(ctx, saved, target_conv)? {
+        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids, spans, sticker_id, suppress_embeds);
     }
     let mut body = serde_json::Map::new();
     body.insert("body".to_owned(), Value::String(text.to_owned()));
@@ -1729,17 +2123,147 @@ fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: 
     if let Some(reply_to) = reply_to.filter(|id| super::safe_id(id)) {
         body.insert("reply_to".to_owned(), Value::String(reply_to.to_owned()));
     }
+    if let Some(root_id) = thread_root {
+        body.insert("thread_id".to_owned(), Value::String(root_id.to_owned()));
+    }
     if !attachment_ids.is_empty() {
         body.insert("attachment_ids".to_owned(), json!(attachment_ids));
     }
-    let path = format!("/v1/conversations/{conversation_id}/messages");
+    let mentions = mentions_from_spans(text, spans);
+    if !mentions.is_empty() && server_has_feature(saved, protocol::TINY_FEATURE_MENTIONS) {
+        body.insert("mentions".to_owned(), json!(mentions));
+    }
+    let emoji = emoji_from_spans(text, spans);
+    if !emoji.is_empty() && server_has_feature(saved, protocol::TINY_FEATURE_CUSTOM_EMOJI) {
+        body.insert("emoji".to_owned(), json!(emoji));
+    }
+    if let Some(sticker_id) = sticker_id.filter(|id| super::safe_id(id)) {
+        if server_has_feature(saved, protocol::TINY_FEATURE_STICKERS) {
+            body.insert("sticker_id".to_owned(), Value::String(sticker_id.to_owned()));
+        }
+    }
+    if !suppress_embeds && server_has_feature(saved, protocol::TINY_FEATURE_LINK_PREVIEWS) {
+        if let Some(preview_json) = fetch_plain_preview(saved, text) {
+            body.insert("previews".to_owned(), Value::Array(vec![preview_json]));
+        }
+    }
+    let path = format!("/v1/conversations/{target_conv}/messages");
     let answer = super::asked("POST", saved, &path, Some(Value::Object(body)));
     crate::sendtime::stage("post");
     match answer {
-        Ok((200 | 201, value)) => accept_message(ctx, saved, conversation_id, &value),
+        Ok((200 | 201, value)) => accept_message(ctx, saved, target_conv, &value),
         Ok((status, value)) => Err(super::explain(status, &value, super::Missing::Plain).to_owned()),
         Err(detail) => Err(detail.to_owned()),
     }
+}
+
+fn upload_media_bytes_plain(saved: &Saved, name: &str, mime: &str, bytes: &[u8]) -> Option<String> {
+    let boundary = format!("----TinyPreview{}", std::process::id());
+    let mut body = Vec::with_capacity(bytes.len() + 256);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: {mime}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let url = super::endpoint(&saved.base_url, "/v1/media");
+    let resp = super::agent()
+        .post(&url)
+        .header("Authorization", &format!("Bearer {}", saved.token))
+        .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .send(body.as_slice())
+        .ok()?;
+    if !(200..300).contains(&resp.status().as_u16()) {
+        return None;
+    }
+    let text = resp.into_body().read_to_string().ok()?;
+    let val: Value = serde_json::from_str(&text).ok()?;
+    let id = val
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| val.pointer("/media/id").and_then(Value::as_str))?;
+    super::safe_id(id).then(|| id.to_owned())
+}
+
+fn fetch_plain_preview(saved: &Saved, text: &str) -> Option<Value> {
+    let url = super::preview::first_https_url(text)?;
+    let fetched = super::preview::fetch_preview(&url)?;
+    let image_id = fetched
+        .image
+        .as_ref()
+        .and_then(|img| upload_media_bytes_plain(saved, "preview.jpg", "image/jpeg", &img.jpeg));
+    let mut obj = serde_json::Map::new();
+    obj.insert("url".to_owned(), Value::String(fetched.url));
+    if !fetched.site.is_empty() {
+        obj.insert("site".to_owned(), Value::String(fetched.site));
+    }
+    if !fetched.title.is_empty() {
+        obj.insert("title".to_owned(), Value::String(fetched.title));
+    }
+    if !fetched.description.is_empty() {
+        obj.insert("description".to_owned(), Value::String(fetched.description));
+    }
+    if let Some(id) = image_id {
+        obj.insert("image_attachment_id".to_owned(), Value::String(id));
+    }
+    Some(Value::Object(obj))
+}
+
+fn fetch_sealed_preview(saved: &Saved, conversation_id: &str, text: &str) -> Option<(e2ee_core::envelope::PreviewRef, Option<String>)> {
+    let url = super::preview::first_https_url(text)?;
+    let fetched = super::preview::fetch_preview(&url)?;
+    let mut img_ref = None;
+    let mut img_id = None;
+    if let Some(img) = fetched.image {
+        if let Ok(mut tmp) = tempfile::NamedTempFile::new() {
+            if std::io::Write::write_all(&mut tmp, &img.jpeg).is_ok() {
+                if let Ok(sealed) = super::sealing::seal(tmp.path(), "preview.jpg", "image/jpeg", true, conversation_id) {
+                    if let Ok(sealed_bytes) = std::fs::read(sealed.file.path()) {
+                        let boundary = format!("----TinySealedPrev{}", std::process::id());
+                        let mut body = Vec::with_capacity(sealed_bytes.len() + 512);
+                        body.extend_from_slice(
+                            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"sealed\"\r\n\r\n1\r\n").as_bytes(),
+                        );
+                        body.extend_from_slice(
+                            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"id\"\r\n\r\n{}\r\n", sealed.entry.id).as_bytes(),
+                        );
+                        body.extend_from_slice(
+                            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sealed.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
+                        );
+                        body.extend_from_slice(&sealed_bytes);
+                        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+                        let endpoint = super::endpoint(&saved.base_url, "/v1/media");
+                        if let Ok(resp) = super::agent()
+                            .post(&endpoint)
+                            .header("Authorization", &format!("Bearer {}", saved.token))
+                            .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+                            .send(body.as_slice())
+                        {
+                            if (200..300).contains(&resp.status().as_u16()) {
+                                let mut entry = sealed.entry;
+                                entry.width = img.width;
+                                entry.height = img.height;
+                                img_id = Some(entry.id.clone());
+                                img_ref = Some(entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some((
+        e2ee_core::envelope::PreviewRef {
+            url: fetched.url,
+            site: fetched.site,
+            title: fetched.title,
+            description: fetched.description,
+            image: img_ref,
+        },
+        img_id,
+    ))
 }
 
 /// Words for an encrypted conversation this device cannot send to yet.
@@ -1763,19 +2287,55 @@ fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bo
 /// An end-to-end encrypted message: the envelope is encrypted by this device and posted as
 /// ciphertext. What the server answers is read back through the cache, which holds the text.
 #[allow(clippy::too_many_arguments)]
-fn post_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &str, text: &str, reply_to: Option<&str>, attachments: Vec<e2ee_core::AttachmentRef>, attachment_ids: &[String]) -> Result<Message, String> {
+fn post_sealed(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachments: Vec<e2ee_core::AttachmentRef>,
+    attachment_ids: &[String],
+    spans: &[protocol::Span],
+    sticker_id: Option<&str>,
+    suppress_embeds: bool,
+) -> Result<Message, String> {
+    let (target_conv, thread_root) = match split_thread_id(conversation_id) {
+        Some((ch, root)) => {
+            thread_known(ctx, ch, root);
+            (ch, Some(root))
+        }
+        None => (conversation_id, None),
+    };
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
+    let mut all_ids = attachment_ids.to_vec();
+    let mut previews = Vec::new();
+    if !suppress_embeds && server_has_feature(saved, protocol::TINY_FEATURE_LINK_PREVIEWS) {
+        if let Some((preview, img_id)) = fetch_sealed_preview(saved, target_conv, text) {
+            if let Some(id) = img_id {
+                all_ids.push(id);
+            }
+            previews.push(preview);
+        }
+    }
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.reply_to = reply_to.filter(|id| super::safe_id(id)).map(str::to_owned);
+    envelope.thread_id = thread_root.map(str::to_owned);
     envelope.attachments = attachments;
+    envelope.mentions = mentions_from_spans(text, spans);
+    envelope.emoji = emoji_from_spans(text, spans);
+    envelope.sticker_id = sticker_id.filter(|id| super::safe_id(id)).map(str::to_owned);
+    envelope.previews = previews;
     envelope.sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
-    let answer = e2ee::send(&device, conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, attachment_ids)?;
-    accept_message(ctx, saved, conversation_id, &answer)
+    let answer = e2ee::send(&device, target_conv, client_id, e2ee_core::Kind::Message, None, &envelope, &all_ids)?;
+    accept_message(ctx, saved, target_conv, &answer)
 }
 
 fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
+    let sticker_id = outgoing.pick.as_ref().filter(|p| p.kind == CatalogKind::Stickers).map(|p| strip_emoji_media_id(&p.id).to_owned());
+    let suppress_embeds = outgoing.suppress_embeds;
     if outgoing.files.is_empty() {
-        send(ctx, saved, conversation_id, client_id, text, reply_to);
+        send_spans(ctx, saved, conversation_id, client_id, text, reply_to, outgoing.spans, sticker_id, suppress_embeds);
         return;
     }
     if outgoing.files.len() > protocol::ATTACHMENTS_LIMIT {
@@ -1791,7 +2351,8 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             return;
         }
     }
-    let sealed = match sealed_here(ctx, saved, &conversation_id) {
+    let e2ee_conv = split_thread_id(&conversation_id).map_or(conversation_id.as_str(), |(ch, _)| ch).to_owned();
+    let sealed = match sealed_here(ctx, saved, &e2ee_conv) {
         Ok(sealed) => sealed,
         Err(why) => {
             ctx.sent(&conversation_id, &client_id, Err(why));
@@ -1800,24 +2361,59 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
     };
     let saved = saved.clone();
     let posting = ctx.clone();
-    let files = outgoing.files;
+    let mut files = outgoing.files;
+    let spans = outgoing.spans;
+    let voice = outgoing.voice;
+    let voice_duration_secs = voice.as_ref().map(|v| {
+        if v.duration == 0 {
+            0
+        } else {
+            ((v.duration + 500) / 1000).max(1)
+        }
+    });
+    // tinyserver sniffs Ogg-Opus as `audio/ogg` and requires `.ogg`/`.oga` extension to match.
+    if voice.is_some() {
+        if let Some(last) = files.last_mut() {
+            let current = if last.name.is_empty() {
+                std::path::Path::new(&last.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("voice.ogg")
+                    .to_owned()
+            } else {
+                last.name.clone()
+            };
+            if current.to_ascii_lowercase().ends_with(".opus") {
+                let stem = &current[..current.len() - 5];
+                last.name = format!("{}.ogg", if stem.is_empty() { "voice" } else { stem });
+            }
+        }
+    }
     let posting_id = conversation_id.clone();
     let posting_client = client_id.clone();
     if sealed {
         upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
-            let refs = super::sealing::upload_sealed(upload, &saved, &posting_id)?;
+            let mut refs = super::sealing::upload_sealed(upload, &saved, &e2ee_conv)?;
+            if let (Some(voice), Some(last)) = (voice.as_ref(), refs.last_mut()) {
+                last.duration = voice_duration_secs.unwrap_or(0);
+                last.voice = true;
+                last.waveform = voice.waveform.clone();
+            }
             upload.check()?;
             let ids: Vec<String> = refs.iter().map(|file| file.id.clone()).collect();
-            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids)
+            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans, None, suppress_embeds)
         });
         return;
     }
     upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
         let mut ids = Vec::with_capacity(upload.files().len());
+        let last_ix = upload.files().len().saturating_sub(1);
         for at in 0..upload.files().len() {
             upload.check()?;
             let target = Target::post(super::endpoint(&saved.base_url, "/v1/media")).header("Authorization", &format!("Bearer {}", saved.token));
-            let answer = match upload.send_form(at, &target, "file", &[]) {
+            let dur_str = voice_duration_secs.filter(|&d| d > 0 && at == last_ix).map(|d| d.to_string());
+            let fields: Vec<(&str, &str)> = dur_str.as_deref().map(|d| vec![("duration", d)]).unwrap_or_default();
+            let answer = match upload.send_form(at, &target, "file", &fields) {
                 Ok(answer) => answer,
                 Err(why) => return Err(media_failure(&why)),
             };
@@ -1829,12 +2425,19 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             ids.push(id.to_owned());
         }
         upload.check()?;
-        post_message(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids)
+        post_message_with(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids, &spans, None, suppress_embeds)
     });
 }
 
 fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, emoji: &str, on: bool, reply: crate::adapters::Reply<()>) {
-    if !unicode_emoji(emoji) {
+    let custom_id = if unicode_emoji(emoji) {
+        None
+    } else {
+        let raw = strip_emoji_media_id(emoji);
+        let known = super::manage::known(saved);
+        known.emoji.iter().find(|e| e.kind == "emoji" && (e.id == raw || format!(":{}:", e.name) == emoji)).map(|e| e.id.clone())
+    };
+    if custom_id.is_none() && !unicode_emoji(emoji) {
         let _ = reply.send(Err(Refusal::Refused("That reaction isn't allowed here.".to_owned())));
         return;
     }
@@ -1842,7 +2445,8 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
     }
-    match sealed_here(ctx, saved, conversation_id) {
+    let e2ee_conv = split_thread_id(conversation_id).map_or(conversation_id, |(ch, _)| ch);
+    match sealed_here(ctx, saved, e2ee_conv) {
         Ok(true) => {
             let result = e2ee::started(saved)
                 .ok_or(NOT_SET_UP.to_owned())
@@ -1850,7 +2454,7 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
                     let landed = shared
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
-                        .react(conversation_id, message_id, emoji, on)?;
+                        .react(e2ee_conv, message_id, emoji, on)?;
                     Ok((shared, landed))
                 });
             match result {
@@ -1866,7 +2470,7 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
                                 owed.push((landed.message.clone(), landed.emoji.clone()));
                             }
                         }
-                        locked.settle_reactions(conversation_id, &[], &owed);
+                        locked.settle_reactions(e2ee_conv, &[], &owed);
                     }
                     drop(device);
                     let _ = reply.send(Ok(()));
@@ -1882,18 +2486,23 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
     }
     let path = format!("/v1/messages/{message_id}/reactions");
     let method = if on { "PUT" } else { "DELETE" };
-    let answer = super::asked(method, saved, &path, Some(json!({ "emoji": emoji })));
+    let body = match custom_id {
+        Some(id) => json!({ "emoji_id": id }),
+        None => json!({ "emoji": emoji }),
+    };
+    let answer = super::asked(method, saved, &path, Some(body));
     answer_ok(answer, reply);
 }
 
-fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str, reply: crate::adapters::Reply<()>) {
+fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str, spans: &[protocol::Span], reply: crate::adapters::Reply<()>) {
     if !super::safe_id(message_id) {
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
     }
-    match sealed_here(ctx, saved, conversation_id) {
+    let e2ee_conv = split_thread_id(conversation_id).map_or(conversation_id, |(ch, _)| ch);
+    match sealed_here(ctx, saved, e2ee_conv) {
         Ok(true) => {
-            let _ = reply.send(edit_sealed(ctx, saved, conversation_id, message_id, text).map_err(Refusal::Refused));
+            let _ = reply.send(edit_sealed(ctx, saved, conversation_id, e2ee_conv, message_id, text, spans).map_err(Refusal::Refused));
             return;
         }
         Ok(false) => {}
@@ -1903,13 +2512,20 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
         }
     }
     let path = format!("/v1/messages/{message_id}");
-    match super::asked("PATCH", saved, &path, Some(json!({ "body": text }))) {
+    let mut payload = serde_json::Map::new();
+    payload.insert("body".to_owned(), Value::String(text.to_owned()));
+    if server_has_feature(saved, protocol::TINY_FEATURE_MENTIONS) {
+        let mentions = mentions_from_spans(text, spans);
+        payload.insert("mentions".to_owned(), json!(mentions));
+    }
+    match super::asked("PATCH", saved, &path, Some(Value::Object(payload))) {
         Ok((200 | 201, value)) => {
             if let Ok(message) = accept_message(ctx, saved, conversation_id, &value) {
                 let _ = ctx.message(conversation_id, &message);
             } else if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
                 message.text = text.to_owned();
                 message.edited = true;
+                message.spans.clear();
                 relink(&mut message);
                 let _ = ctx.message(conversation_id, &message);
             }
@@ -1921,17 +2537,21 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
 
 /// An edit of an encrypted message: a ciphertext of kind `edit` that names it. It keeps the
 /// message's attachments; every member's device folds it in.
-fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str) -> Result<(), String> {
+fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, e2ee_conv: &str, message_id: &str, text: &str, spans: &[protocol::Span]) -> Result<(), String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut envelope = e2ee_core::Envelope::message(text);
-    envelope.attachments = device.editable_attachments(conversation_id, message_id)?;
+    envelope.attachments = device.editable_attachments(e2ee_conv, message_id)?;
+    envelope.mentions = mentions_from_spans(text, spans);
     let client_id = format!("edit-{message_id}-{}", crate::hub::now());
-    device.post(conversation_id, &client_id, e2ee_core::Kind::Edit, Some(message_id), &envelope, &[])?;
+    device.post(e2ee_conv, &client_id, e2ee_core::Kind::Edit, Some(message_id), &envelope, &[])?;
     drop(device);
     if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
         message.text = text.to_owned();
         message.edited = true;
+        message.spans.clear();
+        message.mentions_me = false;
+        apply_mentions(&mut message, saved, &envelope.mentions, true);
         relink(&mut message);
         let _ = ctx.message(conversation_id, &message);
     }
@@ -2227,10 +2847,16 @@ fn relate(
 }
 
 fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
-    if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
+    if !super::safe_id(message_id) {
         return;
     }
-    let path = format!("/v1/conversations/{conversation_id}/read");
+    let path = if let Some((_, root_id)) = split_thread_id(conversation_id) {
+        format!("/v1/messages/{root_id}/thread/read")
+    } else if super::safe_id(conversation_id) {
+        format!("/v1/conversations/{conversation_id}/read")
+    } else {
+        return;
+    };
     match super::asked("POST", saved, &path, Some(json!({ "message_id": message_id }))) {
         Ok((200 | 204, _)) => {}
         Ok((status, _)) => tracing::warn!("chatd: Tiny server: read answered {status}"),
@@ -2398,24 +3024,212 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
             let mut attachment = Attachment::new(title_or(&file.name, &file.id), stored);
             attachment.mime = file.mime.clone();
             attachment.duration = file.duration;
+            if kind == MediaKind::Audio
+                && file.duration > 0
+                && (file.mime.eq_ignore_ascii_case("audio/ogg")
+                    || file.name.to_ascii_lowercase().ends_with(".ogg")
+                    || file.name.to_ascii_lowercase().ends_with(".opus"))
+            {
+                attachment.waveform = default_voice_waveform();
+            }
             media.push((attachment.file.clone(), fetched_url(saved, file)));
             message.attachments.push(attachment);
         }
     }
     for reaction in &wire.reactions {
-        if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
+        if reaction.count == 0 {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        if let Some(emoji_id) = reaction.emoji_id.as_deref().filter(|id| super::safe_id(id)) {
+            let file = emoji_media_for(saved, emoji_id);
+            let label = reaction.name.as_deref().map(|n| format!(":{n}:")).unwrap_or_else(|| reaction.emoji.clone());
+            message.reactions.push(Reaction { emoji: label, file, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        } else if unicode_emoji(&reaction.emoji) {
+            message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        }
+    }
+    if !deleted {
+        apply_mentions(&mut message, saved, &wire.mentions, false);
+        apply_emoji(&mut message, saved, &wire.emoji);
+        if let Some(sticker_id) = wire.sticker_id.as_deref() {
+            apply_sticker(&mut message, saved, sticker_id);
+        }
+        apply_wire_previews(&mut message, saved, &wire.previews, media);
     }
     relink(&mut message);
     Some(message)
 }
 
-/// Web addresses in the text become links. The spans point into the text as it is now, so those
-/// from before an edit go; Tiny sends plain text and has no other styling.
+fn emoji_media_for(saved: &Saved, emoji_id: &str) -> Option<MediaFile> {
+    let known = super::manage::known(saved);
+    let item = known.emoji.iter().find(|e| e.id == emoji_id)?;
+    let mut file = MediaFile::new(emoji_media_id(&item.id), if item.animated { MediaKind::Gif } else { MediaKind::Image });
+    if !item.path.is_empty() {
+        file.path = Some(item.path.clone());
+    }
+    Some(file)
+}
+
+fn apply_emoji(message: &mut Message, saved: &Saved, spans: &[e2ee_core::envelope::EmojiRef]) {
+    if spans.is_empty() || message.text.is_empty() {
+        return;
+    }
+    for span in spans.iter().take(50) {
+        let (start, end) = (span.start as usize, span.end as usize);
+        if start >= end
+            || end > message.text.len()
+            || !message.text.is_char_boundary(start)
+            || !message.text.is_char_boundary(end)
+        {
+            continue;
+        }
+        // An emoji id no longer in the community list stays as `:name:` plain text.
+        if let Some(file) = emoji_media_for(saved, &span.id) {
+            message.spans.push(protocol::Span {
+                start: span.start,
+                end: span.end,
+                style: protocol::Style::Emoji { file },
+            });
+        }
+    }
+}
+
+fn apply_sticker(message: &mut Message, saved: &Saved, sticker_id: &str) {
+    if !super::safe_id(sticker_id) {
+        return;
+    }
+    let known = super::manage::known(saved);
+    let Some(item) = known.emoji.iter().find(|e| e.id == sticker_id && e.kind == "sticker") else {
+        return;
+    };
+    let mut file = MediaFile::new(emoji_media_id(&item.id), if item.animated { MediaKind::Gif } else { MediaKind::Image });
+    if !item.path.is_empty() {
+        file.path = Some(item.path.clone());
+    }
+    let mut attachment = Attachment::new(item.name.clone(), file);
+    attachment.sticker = true;
+    message.attachments.push(attachment);
+}
+
+fn apply_wire_previews(
+    message: &mut Message,
+    saved: &Saved,
+    previews: &[WirePreview],
+    media: &mut Vec<(MediaFile, String)>,
+) {
+    for p in previews.iter().take(e2ee_core::envelope::MAX_PREVIEWS) {
+        if !(p.url.starts_with("https://") || p.url.starts_with("http://")) {
+            continue;
+        }
+        let site = super::preview::real_host(&p.url);
+        if site.is_empty() {
+            continue;
+        }
+        let image = p
+            .image_attachment_id
+            .as_deref()
+            .filter(|id| super::safe_id(id))
+            .map(|id| {
+                let file = MediaFile::new(id, MediaKind::Image);
+                let url = format!("{}/v1/media/{id}", saved.base_url.trim_end_matches('/'));
+                media.push((file.clone(), url));
+                file
+            });
+        message.previews.push(protocol::Preview {
+            url: p.url.clone(),
+            site,
+            title: super::preview::clean_field(&p.title, 200),
+            description: super::preview::clean_field(&p.description, 500),
+            image,
+        });
+    }
+}
+
+fn apply_sealed_previews(
+    message: &mut Message,
+    saved: &Saved,
+    previews: &[e2ee::OpenedPreview],
+    media: &mut Vec<(MediaFile, String)>,
+) {
+    for p in previews.iter().take(e2ee_core::envelope::MAX_PREVIEWS) {
+        if !(p.url.starts_with("https://") || p.url.starts_with("http://")) {
+            continue;
+        }
+        let site = super::preview::real_host(&p.url);
+        if site.is_empty() {
+            continue;
+        }
+        let image = p
+            .image
+            .as_ref()
+            .filter(|img| super::safe_id(&img.id))
+            .map(|img| {
+                let mut file = MediaFile::new(&img.id, MediaKind::Image);
+                file.width = img.width;
+                file.height = img.height;
+                file.bytes = img.bytes;
+                let url = format!("{}/v1/media/{}", saved.base_url.trim_end_matches('/'), img.id);
+                media.push((file.clone(), url));
+                file
+            });
+        message.previews.push(protocol::Preview {
+            url: p.url.clone(),
+            site,
+            title: super::preview::clean_field(&p.title, 200),
+            description: super::preview::clean_field(&p.description, 500),
+            image,
+        });
+    }
+}
+
+/// Maps structured mentions onto `Style::Mention` spans, validates UTF-8 byte ranges against
+/// `message.text`, and sets `message.mentions_me` when an entry names this account, one of its
+/// roles, or everyone.
+fn apply_mentions(message: &mut Message, saved: &Saved, mentions: &[e2ee_core::envelope::MentionRef], _encrypted: bool) {
+    if mentions.is_empty() || message.text.is_empty() {
+        return;
+    }
+    let known = super::manage::known(saved);
+    let my_roles: &[String] = known.access.as_ref().map(|a| a.roles.as_slice()).unwrap_or(&[]);
+    for mention in mentions.iter().take(50) {
+        let (start, end) = (mention.start as usize, mention.end as usize);
+        if start >= end
+            || end > message.text.len()
+            || !message.text.is_char_boundary(start)
+            || !message.text.is_char_boundary(end)
+        {
+            continue;
+        }
+        let (kind, id, hits_me) = match mention.kind.as_str() {
+            "user" => {
+                let Some(id) = mention.id.as_deref().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                (protocol::MentionKind::User, id.to_owned(), id == saved.user_id)
+            }
+            "role" => {
+                let Some(id) = mention.id.as_deref().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                (protocol::MentionKind::Role, id.to_owned(), my_roles.iter().any(|r| r == id))
+            }
+            "everyone" => (protocol::MentionKind::Everyone, String::new(), true),
+            _ => continue,
+        };
+        message.spans.push(protocol::Span {
+            start: mention.start,
+            end: mention.end,
+            style: protocol::Style::Mention { kind, id },
+        });
+        if hits_me && !message.outgoing {
+            message.mentions_me = true;
+        }
+    }
+}
+
+/// Web addresses in the text become links, preserving any structured mention or custom-emoji spans.
 fn relink(message: &mut Message) {
-    message.spans.clear();
+    message.spans.retain(|span| !matches!(span.style, protocol::Style::Link { .. }));
     protocol::link::linkify(message);
 }
 
@@ -2471,6 +3285,12 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
                 message.edited = opened.edited_by.is_some();
                 message.reply_to = reply_of(opened.reply_to.as_ref().map(|id| Value::String(id.clone())).as_ref());
                 message.attachments = sealed_attachments(saved, opened, media);
+                apply_mentions(&mut message, saved, &opened.mentions, true);
+                apply_emoji(&mut message, saved, &opened.emoji);
+                if let Some(sticker_id) = opened.sticker_id.as_deref() {
+                    apply_sticker(&mut message, saved, sticker_id);
+                }
+                apply_sealed_previews(&mut message, saved, &opened.previews, media);
             }
             Some(Read::Edit) => return None,
             Some(Read::Undecryptable) | None => {
@@ -2497,11 +3317,15 @@ fn sealed_attachments(saved: &Saved, opened: &e2ee::Opened, media: &mut Vec<(Med
         if !super::safe_id(&file.id) {
             continue;
         }
-        let kind = match media_kind("", &file.mime) {
-            // A picture is shown as one only in a format the cache checks; anything else is a file.
-            MediaKind::Image if matches!(file.mime.as_str(), "image/png" | "image/jpeg" | "image/webp") => MediaKind::Image,
-            MediaKind::Gif => MediaKind::Gif,
-            _ => MediaKind::File,
+        let kind = if file.voice || file.mime.to_ascii_lowercase().starts_with("audio/") {
+            MediaKind::Audio
+        } else {
+            match media_kind("", &file.mime) {
+                // A picture is shown as one only in a format the cache checks; anything else is a file.
+                MediaKind::Image if matches!(file.mime.as_str(), "image/png" | "image/jpeg" | "image/webp") => MediaKind::Image,
+                MediaKind::Gif => MediaKind::Gif,
+                _ => MediaKind::File,
+            }
         };
         let mut stored = MediaFile::new(&file.id, kind);
         stored.width = file.width;
@@ -2509,25 +3333,38 @@ fn sealed_attachments(saved: &Saved, opened: &e2ee::Opened, media: &mut Vec<(Med
         stored.bytes = file.bytes;
         let mut attachment = Attachment::new(title_or(&file.name, "file"), stored);
         attachment.mime = file.mime.clone();
+        attachment.duration = file.duration;
+        if file.voice {
+            attachment.waveform = if file.waveform.is_empty() { default_voice_waveform() } else { file.waveform.clone() };
+        }
         media.push((attachment.file.clone(), format!("{}/v1/media/{}", saved.base_url.trim_end_matches('/'), file.id)));
         out.push(attachment);
     }
     out
 }
 
+/// Subtle fallback waveform for plaintext Tiny voice messages (the server stores `duration`
+/// without a waveform array).
+fn default_voice_waveform() -> Vec<u8> {
+    vec![64, 96, 128, 160, 112, 144, 176, 128, 96, 144, 160, 112, 80, 128, 160, 144, 112, 96, 128, 96, 80, 64, 80, 64]
+}
+
 fn media_kind(kind: &str, mime: &str) -> MediaKind {
+    let mime_lower = mime.to_ascii_lowercase();
     match kind {
         "image" => MediaKind::Image,
         "gif" => MediaKind::Gif,
         "video" => MediaKind::Video,
+        "file" if mime_lower.starts_with("audio/") => MediaKind::Audio,
         "file" => MediaKind::File,
         _ => {
-            let mime = mime.to_ascii_lowercase();
-            if mime == "image/gif" {
+            if mime_lower == "image/gif" {
                 MediaKind::Gif
-            } else if mime.starts_with("video/") {
+            } else if mime_lower.starts_with("video/") {
                 MediaKind::Video
-            } else if mime.starts_with("image/") {
+            } else if mime_lower.starts_with("audio/") {
+                MediaKind::Audio
+            } else if mime_lower.starts_with("image/") {
                 MediaKind::Image
             } else {
                 MediaKind::File
@@ -2570,22 +3407,36 @@ struct UploadLimits {
 /// What this account may send. `file_scan` is absent on an older server, which keeps today's upload.
 fn account_caps(saved: &Saved) -> Capabilities {
     let limits = upload_limits(saved);
-    let caps = super::manage::capabilities_of(saved);
-    let scans = caps.has(protocol::TINY_FEATURE_FILE_SCAN);
+    let server_caps = super::manage::capabilities_of(saved);
+    let scans = server_caps.has(protocol::TINY_FEATURE_FILE_SCAN);
+    let max_file_bytes = limits.image.max(limits.file);
+    let presence_status = server_caps.has(protocol::TINY_FEATURE_PRESENCE_STATUS);
     Capabilities {
-        max_file_bytes: limits.image.max(limits.file),
+        max_file_bytes,
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
         direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
+        abuse_reports: server_caps.has(protocol::TINY_FEATURE_ABUSE_REPORTS),
+        voice_notes: max_file_bytes > 0,
+        mention_spans: server_caps.has(protocol::TINY_FEATURE_MENTIONS),
+        custom_emoji: if server_caps.has(protocol::TINY_FEATURE_CUSTOM_EMOJI) {
+            protocol::EmojiScope::Space
+        } else {
+            protocol::EmojiScope::None
+        },
+        stickers: server_caps.has(protocol::TINY_FEATURE_STICKERS),
+        suppress_embeds: server_caps.has(protocol::TINY_FEATURE_LINK_PREVIEWS),
+        threads: server_caps.has(protocol::TINY_FEATURE_THREADS),
         reply: true,
         edit: true,
         delete: true,
-        pins: caps.has(protocol::TINY_FEATURE_PINS),
-        search: caps.has(protocol::TINY_FEATURE_MESSAGE_SEARCH),
-        blocks: caps.has(protocol::TINY_FEATURE_BLOCKS),
+        pins: server_caps.has(protocol::TINY_FEATURE_PINS),
+        search: server_caps.has(protocol::TINY_FEATURE_MESSAGE_SEARCH),
+        blocks: server_caps.has(protocol::TINY_FEATURE_BLOCKS),
         reactions: true,
         gif_file: true,
+        presence_status,
         profile_avatar: true,
         ..Capabilities::default()
     }
@@ -3068,6 +3919,8 @@ struct WireChannel {
     position: i32,
     #[serde(default, deserialize_with = "flex_u32")]
     unread: u32,
+    #[serde(default, deserialize_with = "flex_u32")]
+    mentions: u32,
     #[serde(default)]
     last_message: Option<WireLast>,
     /// End-to-end encrypted, for good once it is. Absent on a server older than encrypted text.
@@ -3095,6 +3948,8 @@ struct WireDirect {
     plaintext_history: bool,
     #[serde(default, deserialize_with = "flex_u32")]
     unread: u32,
+    #[serde(default, deserialize_with = "flex_u32")]
+    mentions: u32,
     #[serde(default)]
     last_read: Option<String>,
     #[serde(default)]
@@ -3255,6 +4110,42 @@ struct WireLast {
 }
 
 #[derive(Deserialize)]
+struct WireThreadSummary {
+    #[serde(default)]
+    replies: u32,
+    #[serde(default)]
+    last_reply_at: Option<String>,
+    #[serde(default)]
+    participants: Vec<String>,
+    #[serde(default)]
+    unread: u32,
+}
+
+#[derive(Deserialize)]
+struct WireFollowedThread {
+    channel_id: String,
+    message_id: String,
+    #[serde(default)]
+    message: Option<WireMessage>,
+    #[serde(default)]
+    thread: Option<WireThreadSummary>,
+}
+
+#[derive(Deserialize)]
+struct WirePreview {
+    url: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    site: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    image_attachment_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct WireMessage {
     id: String,
     #[serde(default)]
@@ -3263,6 +4154,10 @@ struct WireMessage {
     body: String,
     #[serde(default)]
     reply_to: Option<Value>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    thread: Option<WireThreadSummary>,
     #[serde(default)]
     client_id: Option<String>,
     #[serde(default)]
@@ -3279,6 +4174,14 @@ struct WireMessage {
     attachments: Vec<WireFile>,
     #[serde(default)]
     reactions: Vec<WireReaction>,
+    #[serde(default)]
+    mentions: Vec<e2ee_core::envelope::MentionRef>,
+    #[serde(default)]
+    emoji: Vec<e2ee_core::envelope::EmojiRef>,
+    #[serde(default)]
+    sticker_id: Option<String>,
+    #[serde(default)]
+    previews: Vec<WirePreview>,
     /// An end-to-end encrypted row: `body` is empty, and these say what it is.
     #[serde(default)]
     e2ee: bool,
@@ -3338,7 +4241,12 @@ struct WireFile {
 
 #[derive(Deserialize)]
 struct WireReaction {
+    #[serde(default)]
     emoji: String,
+    #[serde(default)]
+    emoji_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default, deserialize_with = "flex_u32")]
     count: u32,
     #[serde(default)]
@@ -3777,7 +4685,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["e2ee"], true, "call setup never creates plaintext text history");
-        assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[]).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
+        assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[], &[], None).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
     }
 
     #[test]
@@ -4639,7 +5547,7 @@ mod tests {
         let stored = ctx.stored_message("sealed-1", "s-1").unwrap().unwrap();
         assert_eq!(stored.text, protocol::UNDECRYPTABLE, "never a blank, and never the server's body");
         assert_eq!(stored.seal, Seal::Undecryptable);
-        let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[]);
+        let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[], &[], None);
         assert_eq!(outcome.err().as_deref(), Some(NOT_SET_UP));
         assert!(!posted.load(std::sync::atomic::Ordering::SeqCst), "nothing was posted in plain text");
     }
@@ -4725,7 +5633,7 @@ mod tests {
         pending.sender.id = ME.to_owned();
         pending.state = SendState::Pending;
         ctx.hub.store().ingest(&ctx.key("direct-1"), &pending, false).unwrap();
-        let outcome = post_message(&ctx, &saved, "direct-1", "client-1", "hi", None, &[]);
+        let outcome = post_message(&ctx, &saved, "direct-1", "client-1", "hi", None, &[], &[], None);
         ctx.sent("direct-1", "client-1", outcome);
         assert!(ctx.stored_message("direct-1", "client-1").unwrap().is_none());
         let stored = ctx.stored_message("direct-1", "server-1").unwrap().unwrap();
@@ -4747,7 +5655,7 @@ mod tests {
         message.sender.id = ME.to_owned();
         ctx.hub.store().ingest(&ctx.key("direct-1"), &message, false).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        edit(&ctx, &saved, "direct-1", "e-1", "changed", tx);
+        edit(&ctx, &saved, "direct-1", "e-1", "changed", &[], tx);
         assert_eq!(rx.recv().unwrap(), Ok(()));
         let stored = ctx.stored_message("direct-1", "e-1").unwrap().unwrap();
         assert_eq!(stored.text, "changed");
@@ -4977,5 +5885,473 @@ mod tests {
         assert_eq!(failed.as_deref(), Some("Tiny blocked that file"));
         assert!(bearer.load(Ordering::Relaxed), "the upload keeps the bearer");
         assert!(!posted.load(Ordering::Relaxed), "a blocked upload must not post the message");
+    }
+
+    #[test]
+    fn voice_notes_capability_and_plaintext_and_sealed_receive() {
+        let (_adapter, _ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny","image_max_bytes":8388608,"file_max_bytes":26214400}"#));
+            }
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["file_scan"]}"#));
+            }
+            None
+        });
+        assert!(account_caps(&saved).voice_notes, "voice_notes enabled when uploads are allowed");
+
+        // Plaintext voice attachment receives MediaKind::Audio, duration, and non-empty waveform.
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-voice",
+            "author_id": ME,
+            "body": "",
+            "created_at": WHEN,
+            "attachments": [{
+                "id": "file-v1",
+                "name": "voice.ogg",
+                "mime": "audio/ogg",
+                "kind": "file",
+                "bytes": 4096,
+                "duration": 9
+            }]
+        }))
+        .unwrap();
+        let mut media = Vec::new();
+        let msg = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].file.kind, MediaKind::Audio);
+        assert_eq!(msg.attachments[0].duration, 9);
+        assert!(!msg.attachments[0].waveform.is_empty());
+
+        // Sealed voice attachment preserves exact waveform and duration from envelope.
+        let opened = e2ee::Opened {
+            text: String::new(),
+            attachments: vec![e2ee::OpenedFile {
+                id: "file-v2".into(),
+                key: "a".into(),
+                name: "voice.ogg".into(),
+                mime: "audio/ogg".into(),
+                bytes: 2048,
+                sha256: "b".into(),
+                width: 0,
+                height: 0,
+                duration: 14,
+                voice: true,
+                waveform: vec![20, 120, 240, 80],
+            }],
+            ..e2ee::Opened::default()
+        };
+        let mut sealed_media = Vec::new();
+        let atts = sealed_attachments(&saved, &opened, &mut sealed_media);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].file.kind, MediaKind::Audio);
+        assert_eq!(atts[0].duration, 14);
+        assert_eq!(atts[0].waveform, vec![20, 120, 240, 80]);
+    }
+
+    #[test]
+    fn mentions_send_receive_edit_and_sealed_badge() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log_srv = log.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            log_srv.lock().unwrap().push(request.to_owned());
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["mentions"]}"#));
+            }
+            if request.starts_with("GET /v1/me ") {
+                return Some(http(200, "OK", r#"{"user_id":"11111111-1111-1111-1111-111111111111","owner":false,"roles":["role-dev"],"permissions":63,"rank":1}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            if request.starts_with("POST /v1/conversations/chan-1/messages ") {
+                return Some(http(201, "Created", &json!({
+                    "id": "m-10",
+                    "author_id": ME,
+                    "body": "hi @Bea",
+                    "created_at": WHEN,
+                    "mentions": [{"kind": "user", "id": PEER, "start": 3, "end": 7}]
+                }).to_string()));
+            }
+            if request.starts_with("PATCH /v1/messages/m-10 ") {
+                return Some(http(200, "OK", &json!({
+                    "id": "m-10",
+                    "author_id": ME,
+                    "body": "hey @everyone",
+                    "created_at": WHEN,
+                    "edited_at": WHEN,
+                    "mentions": [{"kind": "everyone", "start": 4, "end": 13}]
+                }).to_string()));
+            }
+            None
+        });
+        assert!(account_caps(&saved).mention_spans);
+        let spans = vec![protocol::Span {
+            start: 3,
+            end: 7,
+            style: protocol::Style::Mention { kind: protocol::MentionKind::User, id: PEER.to_owned() },
+        }];
+        let sent = post_message(&ctx, &saved, "chan-1", "c-1", "hi @Bea", None, &[], &spans, None).unwrap();
+        assert_eq!(sent.spans.len(), 1);
+        assert!(matches!(&sent.spans[0].style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == PEER));
+        assert!(!sent.mentions_me, "own message does not set mentions_me");
+
+        // Verify POST body carried structured mentions.
+        let post_req = log.lock().unwrap().iter().find(|r| r.starts_with("POST /v1/conversations/chan-1/messages ")).cloned().unwrap();
+        let body: Value = serde_json::from_str(post_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["mentions"][0]["kind"], "user");
+        assert_eq!(body["mentions"][0]["id"], PEER);
+        assert_eq!(body["mentions"][0]["start"], 3);
+        assert_eq!(body["mentions"][0]["end"], 7);
+
+        // Incoming plaintext mention of ME sets mentions_me and Style::Mention.
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-11",
+            "author_id": PEER,
+            "body": "ping @Ada https://example.com",
+            "created_at": WHEN,
+            "mentions": [{"kind": "user", "id": ME, "start": 5, "end": 9}]
+        })).unwrap();
+        let mut media = Vec::new();
+        let incoming = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert!(incoming.mentions_me);
+        assert!(incoming.spans.iter().any(|s| matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == ME)));
+        assert!(incoming.spans.iter().any(|s| matches!(&s.style, protocol::Style::Link { .. })), "relink preserves mentions alongside links");
+
+        // Edit sends updated mentions.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let edit_spans = vec![protocol::Span {
+            start: 4,
+            end: 13,
+            style: protocol::Style::Mention { kind: protocol::MentionKind::Everyone, id: String::new() },
+        }];
+        edit(&ctx, &saved, "chan-1", "m-10", "hey @everyone", &edit_spans, tx);
+        assert!(rx.recv().unwrap().is_ok());
+        let patch_req = log.lock().unwrap().iter().find(|r| r.starts_with("PATCH /v1/messages/m-10 ")).cloned().unwrap();
+        let patch_body: Value = serde_json::from_str(patch_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(patch_body["mentions"][0]["kind"], "everyone");
+
+        // Sealed incoming mention of ME sets mentions_me and Style::Mention.
+        let sealed_wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-12",
+            "author_id": PEER,
+            "e2ee": true,
+            "created_at": WHEN
+        })).unwrap();
+        let mut opened = HashMap::new();
+        opened.insert("m-12".to_owned(), Read::Opened(e2ee::Opened {
+            text: "secret @Ada".into(),
+            mentions: vec![e2ee_core::envelope::MentionRef { kind: "user".into(), id: Some(ME.to_owned()), start: 7, end: 11 }],
+            ..e2ee::Opened::default()
+        }));
+        let sealed_msg = map_message(&saved, &HashMap::new(), &sealed_wire, &opened, &mut media).unwrap();
+        assert!(sealed_msg.mentions_me);
+        assert!(sealed_msg.spans.iter().any(|s| matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == ME)));
+    }
+
+    #[test]
+    fn custom_emoji_and_stickers_catalog_send_receive_and_reactions() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log_srv = log.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            log_srv.lock().unwrap().push(request.to_owned());
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["custom_emoji","stickers"]}"#));
+            }
+            if request.starts_with("GET /v1/me ") {
+                return Some(http(200, "OK", r#"{"user_id":"11111111-1111-1111-1111-111111111111","owner":true,"roles":[],"permissions":8388607,"rank":2147483647}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            if request.starts_with("GET /v1/emoji ") {
+                return Some(http(200, "OK", r#"[{"id":"e-1","kind":"emoji","name":"party","animated":false,"sha256":"aabb"},{"id":"s-1","kind":"sticker","name":"wave","animated":false,"sha256":"ccdd"}]"#));
+            }
+            if request.starts_with("GET /v1/emoji/e-1 ") || request.starts_with("GET /v1/emoji/s-1 ") {
+                let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_vec();
+                resp.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+                return Some(resp);
+            }
+            if request.starts_with("POST /v1/conversations/chan-1/messages ") {
+                return Some(http(201, "Created", &json!({
+                    "id": "m-20",
+                    "author_id": ME,
+                    "body": "yay :party:",
+                    "created_at": WHEN,
+                    "emoji": [{"id": "e-1", "start": 4, "end": 11}],
+                    "sticker_id": "s-1",
+                    "reactions": [{"emoji": ":party:", "emoji_id": "e-1", "name": "party", "count": 1, "me": true}]
+                }).to_string()));
+            }
+            if request.starts_with("PUT /v1/messages/m-20/reactions ") {
+                return Some(http(200, "OK", r#"{"emoji":":party:","emoji_id":"e-1","name":"party","count":1,"me":true}"#));
+            }
+            None
+        });
+        let caps = account_caps(&saved);
+        assert_eq!(caps.custom_emoji, protocol::EmojiScope::Space);
+        assert!(caps.stickers);
+
+        // Catalog returns custom emoji and stickers filtered by query, and downloads images up front.
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::Catalog { kind: CatalogKind::Emoji, space_id: None, query: "par".into(), cursor: None, reply: tx });
+        let page = rx.recv().unwrap().unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name, ":party:");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::Catalog { kind: CatalogKind::Stickers, space_id: None, query: "".into(), cursor: None, reply: tx });
+        let page = rx.recv().unwrap().unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "s-1");
+
+        // Send message with custom emoji span + sticker_id.
+        let spans = vec![protocol::Span {
+            start: 4,
+            end: 11,
+            style: protocol::Style::Emoji { file: MediaFile::new("tiny-emoji-e-1", MediaKind::Image) },
+        }];
+        let msg = post_message(&ctx, &saved, "chan-1", "c-20", "yay :party:", None, &[], &spans, Some("s-1")).unwrap();
+        assert!(msg.spans.iter().any(|s| matches!(&s.style, protocol::Style::Emoji { file } if file.id == "tiny-emoji-e-1")));
+        assert!(msg.attachments.iter().any(|a| a.sticker && a.file.id == "tiny-emoji-s-1"));
+        assert_eq!(msg.reactions.len(), 1);
+        assert!(msg.reactions[0].file.is_some());
+
+        // Custom reaction sends {emoji_id}.
+        let (tx, rx) = std::sync::mpsc::channel();
+        react(&ctx, &saved, "chan-1", "m-20", "tiny-emoji-e-1", true, tx);
+        assert!(rx.recv().unwrap().is_ok());
+        let react_req = log.lock().unwrap().iter().find(|r| r.starts_with("PUT /v1/messages/m-20/reactions ")).cloned().unwrap();
+        let react_body: Value = serde_json::from_str(react_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(react_body["emoji_id"], "e-1");
+
+        // Deleted/unknown emoji id stays as plain `:gone:` text (no Style::Emoji span).
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-21",
+            "author_id": PEER,
+            "body": ":gone:",
+            "created_at": WHEN,
+            "emoji": [{"id": "e-deleted", "start": 0, "end": 6}]
+        })).unwrap();
+        let mut media = Vec::new();
+        let fallback = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert!(!fallback.spans.iter().any(|s| matches!(s.style, protocol::Style::Emoji { .. })));
+    }
+
+    #[test]
+    fn link_previews_capability_and_receive_forces_real_host() {
+        let (_adapter, _ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["link_previews"]}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            None
+        });
+        let caps = account_caps(&saved);
+        assert!(caps.suppress_embeds, "link_previews feature should enable composer link chip");
+
+        // Plaintext receive: spoofed site name is overridden with real host of url; image comes from Tiny server.
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-prev-1",
+            "author_id": PEER,
+            "body": "Read https://actual.example.org/story",
+            "created_at": WHEN,
+            "previews": [{
+                "url": "https://actual.example.org/story",
+                "site": "bank-of-trust.com",
+                "title": "Real Story",
+                "description": "Details here",
+                "image_attachment_id": "img-prev-1"
+            }]
+        })).unwrap();
+        let mut media = Vec::new();
+        let msg = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert_eq!(msg.previews.len(), 1);
+        assert_eq!(msg.previews[0].site, "actual.example.org");
+        assert_eq!(msg.previews[0].title, "Real Story");
+        assert_eq!(msg.previews[0].image.as_ref().map(|f| f.id.as_str()), Some("img-prev-1"));
+        assert!(media.iter().any(|(f, url)| f.id == "img-prev-1" && url.ends_with("/v1/media/img-prev-1")));
+
+        // Sealed receive: same host enforcement + Tiny server media registration.
+        let sealed_wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-prev-2",
+            "author_id": PEER,
+            "body": "",
+            "created_at": WHEN,
+            "e2ee": true,
+            "kind": "message",
+            "ciphertext": "AQID"
+        })).unwrap();
+        let opened = e2ee::Opened {
+            text: "See https://docs.example.net/guide".into(),
+            previews: vec![e2ee::OpenedPreview {
+                url: "https://docs.example.net/guide".into(),
+                site: "spoofed.evil".into(),
+                title: "Guide".into(),
+                description: "Docs".into(),
+                image: Some(e2ee::OpenedFile {
+                    id: "img-prev-sealed".into(),
+                    name: "preview.jpg".into(),
+                    mime: "image/jpeg".into(),
+                    bytes: 1234,
+                    width: 640,
+                    height: 360,
+                    ..e2ee::OpenedFile::default()
+                }),
+            }],
+            ..e2ee::Opened::default()
+        };
+        let mut opened_map = HashMap::new();
+        opened_map.insert("m-prev-2".into(), Read::Opened(opened));
+        let mut sealed_media = Vec::new();
+        let smsg = map_message(&saved, &HashMap::new(), &sealed_wire, &opened_map, &mut sealed_media).unwrap();
+        assert_eq!(smsg.previews.len(), 1);
+        assert_eq!(smsg.previews[0].site, "docs.example.net");
+        assert_eq!(smsg.previews[0].image.as_ref().map(|f| f.id.as_str()), Some("img-prev-sealed"));
+        assert!(sealed_media.iter().any(|(f, url)| f.id == "img-prev-sealed" && url.ends_with("/v1/media/img-prev-sealed")));
+    }
+
+    #[test]
+    fn threads_capability_history_send_read_live_and_open_threads() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log_srv = log.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            log_srv.lock().unwrap().push(request.to_owned());
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["threads"]}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            if request.starts_with("GET /v1/conversations/chan-1/messages?limit=50&threads=1 ") {
+                return Some(http(200, "OK", &json!({
+                    "messages": [{
+                        "id": "root-1",
+                        "author_id": PEER,
+                        "body": "Main topic",
+                        "created_at": WHEN,
+                        "thread": {
+                            "replies": 1,
+                            "last_reply_at": WHEN,
+                            "participants": [ME],
+                            "unread": 0
+                        }
+                    }]
+                }).to_string()));
+            }
+            if request.starts_with("GET /v1/messages/root-1/thread?limit=50 ") {
+                return Some(http(200, "OK", &json!({
+                    "messages": [{
+                        "id": "rep-1",
+                        "author_id": PEER,
+                        "body": "First reply",
+                        "thread_id": "root-1",
+                        "created_at": WHEN
+                    }]
+                }).to_string()));
+            }
+            if request.starts_with("POST /v1/conversations/chan-1/messages ") {
+                return Some(http(201, "Created", &json!({
+                    "id": "rep-2",
+                    "author_id": ME,
+                    "body": "Second reply",
+                    "thread_id": "root-1",
+                    "created_at": WHEN
+                }).to_string()));
+            }
+            if request.starts_with("POST /v1/messages/root-1/thread/read ") {
+                return Some(http(204, "No Content", ""));
+            }
+            if request.starts_with("PUT /v1/messages/root-1/thread/follow ")
+                || request.starts_with("DELETE /v1/messages/root-1/thread/follow ")
+            {
+                return Some(http(204, "No Content", ""));
+            }
+            if request.starts_with("GET /v1/threads ") {
+                return Some(http(200, "OK", &json!([{
+                    "channel_id": "chan-1",
+                    "message_id": "root-1",
+                    "message": {
+                        "id": "root-1",
+                        "author_id": PEER,
+                        "body": "Main topic",
+                        "created_at": WHEN
+                    },
+                    "thread": {
+                        "replies": 4,
+                        "last_reply_at": WHEN,
+                        "participants": [PEER, ME],
+                        "unread": 4
+                    }
+                }]).to_string()));
+            }
+            None
+        });
+
+        let caps = account_caps(&saved);
+        assert!(caps.threads, "threads feature must set Capabilities::threads");
+
+        // Channel history uses ?threads=1 and attaches ThreadSummary to root.
+        let mut ch = ConversationRow::new("chan-1", ConversationKind::Channel, "general");
+        ch.space = Some(SPACE.to_owned());
+        ctx.conversation(&ch).unwrap();
+        fetch_page(&ctx, &saved, "chan-1", None, 50).unwrap();
+        let root = ctx.stored_message("chan-1", "root-1").unwrap().unwrap();
+        let summary = root.thread.as_ref().expect("root has thread summary");
+        assert_eq!(summary.id, "chan-1:root-1");
+        assert_eq!(summary.replies, 1);
+
+        // Thread history reads GET /v1/messages/root-1/thread.
+        fetch_page(&ctx, &saved, "chan-1:root-1", None, 50).unwrap();
+        assert!(ctx.stored_message("chan-1:root-1", "rep-1").unwrap().is_some());
+
+        // Sending in thread conversation posts to parent channel with thread_id.
+        let sent = post_message(&ctx, &saved, "chan-1:root-1", "c-t1", "Second reply", None, &[], &[], None).unwrap();
+        assert_eq!(sent.id, "rep-2");
+        let post_req = log.lock().unwrap().iter().find(|r| r.starts_with("POST /v1/conversations/chan-1/messages ")).cloned().unwrap();
+        let post_body: Value = serde_json::from_str(post_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(post_body["thread_id"], "root-1");
+
+        // MarkRead on thread posts to /v1/messages/{root}/thread/read.
+        mark_read(&saved, "chan-1:root-1", "rep-2");
+        assert!(log.lock().unwrap().iter().any(|r| r.starts_with("POST /v1/messages/root-1/thread/read ")));
+
+        // Follow & unfollow helpers hit PUT/DELETE /v1/messages/{root}/thread/follow.
+        follow_thread(&saved, "root-1", true).unwrap();
+        follow_thread(&saved, "root-1", false).unwrap();
+
+        // Live thread.updated refreshes root's ThreadSummary.
+        on_live(&ctx, &saved, &HashMap::new(), "thread.updated", &json!({
+            "conversation_id": "chan-1",
+            "kind": "channel",
+            "message_id": "root-1",
+            "thread": { "replies": 3, "last_reply_at": WHEN, "participants": [PEER, ME], "unread": 2 }
+        }));
+        let updated = ctx.stored_message("chan-1", "root-1").unwrap().unwrap();
+        assert_eq!(updated.thread.as_ref().unwrap().replies, 3);
+        assert_eq!(updated.thread.as_ref().unwrap().unread, 2);
+
+        // Live reply with thread_id routes to thread conversation, not channel.
+        let reply_wire: WireMessage = serde_json::from_value(json!({
+            "id": "rep-3",
+            "author_id": PEER,
+            "body": "Live thread reply",
+            "thread_id": "root-1",
+            "created_at": WHEN
+        })).unwrap();
+        deliver(&ctx, &saved, &HashMap::new(), "chan-1", &reply_wire);
+        assert!(ctx.stored_message("chan-1:root-1", "rep-3").unwrap().is_some());
+        assert!(ctx.stored_message("chan-1", "rep-3").unwrap().is_none());
+
+        // OpenThreads loads GET /v1/threads and marks followed.
+        open_threads(&ctx, &saved);
+        let thread_row = ctx.known("chan-1:root-1").unwrap().unwrap();
+        assert!(thread_row.followed);
+        assert_eq!(thread_row.unread, 4);
     }
 }

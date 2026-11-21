@@ -76,6 +76,7 @@ pub const ROWS: &[Row] = &[
     row("M4", Messages, "", "Convert emoticons to emoji", &[], &["smiley", "emoji", "emoticon", ":)"]),
     row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
     row("M6", Messages, "", "Check spelling", &[], &["spell", "spelling", "spellcheck", "dictionary", "underline"]),
+    row("M7", Messages, "", "Show a preview for links I send", &[], &["link", "links", "preview", "previews", "card", "embed", "url", "tiny"]),
     row("LK", Privacy, "Lock", "Lock tinyclient", &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], &["touch id", "windows hello", "fingerprint", "face", "passcode", "pin", "biometric", "lock"]),
     row("LS", Privacy, "Lock", "When the screen locks", &[], &["screen lock", "away"]),
     row("LP", Privacy, "Lock", "Passphrase", &[], &["passphrase", "password", "linux"]),

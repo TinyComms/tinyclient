@@ -128,6 +128,24 @@ pub struct TinyBot {
     pub created_at: String,
 }
 
+/// One community custom emoji or sticker (`GET /v1/emoji`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyEmoji {
+    pub id: String,
+    /// `"emoji"` or `"sticker"`.
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub name: String,
+    #[serde(default)]
+    pub animated: bool,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub sha256: String,
+    /// Local cached file path filled in by chatd; omitted on the server wire.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+}
+
 /// One room, and who is in its call now, in the order they joined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyRoom {
@@ -419,6 +437,20 @@ pub const TINY_FEATURE_PINS: &str = "pins";
 pub const TINY_FEATURE_MESSAGE_SEARCH: &str = "message_search";
 /// Member block list (`GET/PUT/DELETE /v1/blocks`).
 pub const TINY_FEATURE_BLOCKS: &str = "blocks";
+/// Members can file abuse reports (`POST /v1/reports`) and moderators with `manage_reports` can work the queue.
+pub const TINY_FEATURE_ABUSE_REPORTS: &str = "abuse_reports";
+/// Structured @mentions (`mentions` on messages and unread mention counts).
+pub const TINY_FEATURE_MENTIONS: &str = "mentions";
+/// Community custom emoji (`GET/POST/PATCH/DELETE /v1/emoji`).
+pub const TINY_FEATURE_CUSTOM_EMOJI: &str = "custom_emoji";
+/// Community stickers (`kind=sticker` on `/v1/emoji` and `sticker_id` on messages).
+pub const TINY_FEATURE_STICKERS: &str = "stickers";
+/// Sender-built link preview cards (`previews` on messages).
+pub const TINY_FEATURE_LINK_PREVIEWS: &str = "link_previews";
+/// Channel message threads (`thread_id`, `/v1/messages/{id}/thread`, `/v1/threads`).
+pub const TINY_FEATURE_THREADS: &str = "threads";
+/// Custom presence states (`online`, `idle`, `dnd`, `invisible`) and status text on the live socket.
+pub const TINY_FEATURE_PRESENCE_STATUS: &str = "presence_status";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.
@@ -460,8 +492,9 @@ pub const TINY_VIEW_AUDIT_LOG: u64 = 1 << 18;
 pub const TINY_MANAGE_SERVER: u64 = 1 << 19;
 pub const TINY_MANAGE_REPORTS: u64 = 1 << 20;
 pub const TINY_MANAGE_MESSAGES: u64 = 1 << 21;
+pub const TINY_MENTION_EVERYONE: u64 = 1 << 22;
 /// Every bit there is.
-pub const TINY_ALL: u64 = (1 << 22) - 1;
+pub const TINY_ALL: u64 = (1 << 23) - 1;
 /// The bits a room's override may change.
 pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_CONNECT
@@ -475,13 +508,14 @@ pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_DEAFEN_MEMBERS
     | TINY_MOVE_MEMBERS
     | TINY_DISCONNECT_MEMBERS
-    | TINY_MANAGE_MESSAGES;
+    | TINY_MANAGE_MESSAGES
+    | TINY_MENTION_EVERYONE;
 /// What @everyone has on a server that was never changed.
 pub const TINY_EVERYONE_DEFAULT: u64 = TINY_VIEW_CHANNEL | TINY_CONNECT | TINY_SPEAK | TINY_VIDEO | TINY_SHARE_SCREEN | TINY_VOICE_ACTIVITY;
 
 /// Every permission, in the server's order, with its wire name: for the settings page's
 /// toggles. Bit `n` is `1 << n`.
-pub const TINY_PERMISSIONS: [(u64, &str); 22] = [
+pub const TINY_PERMISSIONS: [(u64, &str); 23] = [
     (TINY_VIEW_CHANNEL, "view_channel"),
     (TINY_CONNECT, "connect"),
     (TINY_SPEAK, "speak"),
@@ -504,6 +538,7 @@ pub const TINY_PERMISSIONS: [(u64, &str); 22] = [
     (TINY_MANAGE_SERVER, "manage_server"),
     (TINY_MANAGE_REPORTS, "manage_reports"),
     (TINY_MANAGE_MESSAGES, "manage_messages"),
+    (TINY_MENTION_EVERYONE, "mention_everyone"),
 ];
 
 /// The server's identity and settings, from `GET /v1/server`.
@@ -625,6 +660,9 @@ pub struct TinyRole {
     /// Shown as its own group in the member list.
     #[serde(default, deserialize_with = "or_default")]
     pub hoist: bool,
+    /// Whether any member may @mention this role without `mention_everyone`.
+    #[serde(default, deserialize_with = "or_default")]
+    pub mentionable: bool,
     /// @everyone.
     #[serde(default, deserialize_with = "or_default")]
     pub default: bool,
@@ -784,6 +822,7 @@ fn tiny_bits(id: &str) -> Option<u64> {
         "community.members.ban" | "community.bans.read" => TINY_BAN_MEMBERS,
         "community.members.timeout" => TINY_TIMEOUT_MEMBERS,
         "community.audit.read" => TINY_VIEW_AUDIT_LOG,
+        "community.reports.manage" => TINY_MANAGE_REPORTS,
         "community.server.edit" | "community.bots.manage" => TINY_MANAGE_SERVER,
         "community.rooms.create"
         | "community.rooms.rename"
@@ -1259,6 +1298,108 @@ pub struct TinyAuditFilter {
     /// Only actions starting with this, as `member.` or `role.create`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub action: String,
+}
+
+/// A person named on an abuse report (reported member, reporter, or note author).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportPerson {
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub user_id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub display_name: String,
+}
+
+/// A moderator annotation on an abuse report. Kept in memory only; never cached or logged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportNote {
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<TinyReportPerson>,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub body: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub created_at: String,
+}
+
+/// One row from `GET /v1/reports` (list view: no reporter note or evidence).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportSummary {
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub category: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub status: String,
+    #[serde(default)]
+    pub preserve: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<TinyReportPerson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<TinyReportPerson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_id: Option<String>,
+    #[serde(default)]
+    pub has_evidence: bool,
+    #[serde(default)]
+    pub evidence_unverified: bool,
+    #[serde(default)]
+    pub linked_audit_ids: Vec<i64>,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub created_at: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+}
+
+/// Full report from `GET /v1/reports/{id}` or `PATCH /v1/reports/{id}`. Kept in memory only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportDetail {
+    #[serde(flatten)]
+    pub summary: TinyReportSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_at: Option<String>,
+    #[serde(default)]
+    pub notes: Vec<TinyReportNote>,
+}
+
+/// Filters for `GET /v1/reports`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportFilter {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: u32,
+}
+
+/// Changes sent to `PATCH /v1/reports/{id}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_audit_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve: Option<bool>,
 }
 
 /// The most characters in a display name, after trimming.
@@ -2057,7 +2198,7 @@ mod tests {
         let options = TinyInviteOptions { max_uses: Some(5), ..TinyInviteOptions::default() };
         assert_eq!(serde_json::to_string(&options).unwrap(), r#"{"max_uses":5}"#);
         let names: Vec<&str> = TINY_PERMISSIONS.iter().map(|(_, name)| *name).collect();
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 23);
         assert!(TINY_PERMISSIONS.iter().enumerate().all(|(n, (bit, _))| *bit == 1 << n));
     }
 

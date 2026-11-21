@@ -58,6 +58,7 @@ pub(in crate::gui) const GROUPS: [(&str, &[(u64, &str, &str)]); 5] = [
             (TINY_DISCONNECT_MEMBERS, "Disconnect members", "Take someone out of a call."),
             (TINY_MANAGE_REPORTS, "Manage reports", "Read reports, including who reported whom, and act on them."),
             (TINY_MANAGE_MESSAGES, "Manage messages", "Delete other people's messages in channels."),
+            (TINY_MENTION_EVERYONE, "Mention @everyone", "Notify everyone in a channel with @everyone, @here, or any role."),
         ],
     ),
     (

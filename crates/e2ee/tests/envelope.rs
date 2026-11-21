@@ -14,6 +14,9 @@ fn attachment(n: u8) -> AttachmentRef {
         sha256: [n.wrapping_add(1); 32],
         width: 640,
         height: 480,
+        duration: 0,
+        voice: false,
+        waveform: Vec::new(),
     }
 }
 
@@ -49,6 +52,7 @@ fn a_message_and_an_edit_round_trip() {
         attachments: vec![attachment(1), attachment(2)],
         sent_at: Some(1_730_000_000_000),
         on: false,
+        ..Envelope::default()
     };
     let bytes = envelope.encode(Kind::Message).unwrap();
     assert_eq!(Envelope::decode(Kind::Message, &bytes).unwrap(), envelope);
@@ -291,4 +295,108 @@ fn the_kind_strings_are_the_servers() {
     assert_eq!(Kind::parse("edit").unwrap(), Kind::Edit);
     assert!(Kind::parse("Edit").is_err());
     assert!(Kind::parse("").is_err());
+}
+
+#[test]
+fn voice_attachment_fields_roundtrip_and_default_absent() {
+    let mut voice = attachment(3);
+    voice.name = "voice.ogg".into();
+    voice.mime = "audio/ogg".into();
+    voice.duration = 12;
+    voice.voice = true;
+    voice.waveform = vec![10, 80, 200, 150, 40];
+    let env = Envelope {
+        attachments: vec![voice.clone()],
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.attachments.len(), 1);
+    assert_eq!(decoded.attachments[0].duration, 12);
+    assert!(decoded.attachments[0].voice);
+    assert_eq!(decoded.attachments[0].waveform, vec![10, 80, 200, 150, 40]);
+}
+
+#[test]
+fn mention_refs_roundtrip_in_message_and_edit_envelopes() {
+    let mention = e2ee::envelope::MentionRef {
+        kind: "user".into(),
+        id: Some("u-42".into()),
+        start: 3,
+        end: 9,
+    };
+    let env = Envelope {
+        text: "hi @Mara!".into(),
+        mentions: vec![mention.clone()],
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.mentions, vec![mention.clone()]);
+
+    let edit_encoded = env.encode(Kind::Edit).unwrap();
+    let edit_decoded = Envelope::decode(Kind::Edit, &edit_encoded).unwrap();
+    assert_eq!(edit_decoded.mentions, vec![mention]);
+}
+
+#[test]
+fn custom_emoji_and_sticker_roundtrip_in_envelope() {
+    let env = Envelope {
+        text: "hi :party:".into(),
+        emoji: vec![e2ee::envelope::EmojiRef { id: "e-1".into(), start: 3, end: 10 }],
+        sticker_id: Some("s-1".into()),
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.emoji.len(), 1);
+    assert_eq!(decoded.emoji[0].id, "e-1");
+    assert_eq!(decoded.sticker_id.as_deref(), Some("s-1"));
+}
+
+#[test]
+fn link_preview_roundtrip_in_envelope() {
+    let img = AttachmentRef {
+        id: "p-img-1".into(),
+        key: AttachmentKey::from_bytes([7; 32]),
+        name: "preview.jpg".into(),
+        mime: "image/jpeg".into(),
+        bytes: 4096,
+        sha256: [9; 32],
+        width: 640,
+        height: 360,
+        duration: 0,
+        voice: false,
+        waveform: Vec::new(),
+    };
+    let preview = e2ee::envelope::PreviewRef {
+        url: "https://example.com/post".into(),
+        site: "example.com".into(),
+        title: "A Post".into(),
+        description: "Summary".into(),
+        image: Some(img),
+    };
+    let env = Envelope {
+        text: "Look at https://example.com/post".into(),
+        previews: vec![preview.clone()],
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.previews, vec![preview]);
+    let edit_decoded = Envelope::decode(Kind::Edit, &env.encode(Kind::Edit).unwrap()).unwrap();
+    assert!(edit_decoded.previews.is_empty());
+}
+
+#[test]
+fn thread_id_roundtrips_in_message_envelope_only() {
+    let env = Envelope {
+        text: "thread reply".into(),
+        thread_id: Some("root-99".into()),
+        ..Envelope::default()
+    };
+    let decoded = Envelope::decode(Kind::Message, &env.encode(Kind::Message).unwrap()).unwrap();
+    assert_eq!(decoded.thread_id.as_deref(), Some("root-99"));
+    let edit_decoded = Envelope::decode(Kind::Edit, &env.encode(Kind::Edit).unwrap()).unwrap();
+    assert!(edit_decoded.thread_id.is_none());
 }

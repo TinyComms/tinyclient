@@ -35,6 +35,9 @@ fn attachment_strategy() -> impl Strategy<Value = AttachmentRef> {
                 sha256,
                 width,
                 height,
+                duration: 0,
+                voice: false,
+                waveform: Vec::new(),
             },
         )
 }
@@ -53,6 +56,7 @@ fn envelope_strategy() -> impl Strategy<Value = Envelope> {
             sent_at,
             // A message or an edit never carries the reaction's word.
             on: false,
+            ..Envelope::default()
         })
 }
 

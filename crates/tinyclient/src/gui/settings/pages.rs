@@ -387,7 +387,7 @@ impl SettingsWindow {
                     .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
             // A phone has no Return key to choose: its keyboard's own key sends.
-            Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6"] } else { &["M1", "M2", "M3", "M4", "M5", "M6"] }, None, window, cx)],
+            Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6", "M7"] } else { &["M1", "M2", "M3", "M4", "M5", "M6", "M7"] }, None, window, cx)],
             Section::Privacy => {
                 let lock_rows: &[&str] = if cfg!(target_os = "linux") { &["LK", "LS", "LP"] } else { &["LK", "LS"] };
                 let mut groups = vec![self.group(lock_rows, Some("Lock"), window, cx).child(caption(crate::gui::lock::CAPTION))];
@@ -761,6 +761,10 @@ impl SettingsWindow {
             "M6" => {
                 let second = "Checked by the spelling service on this machine. Nothing is sent to a network.".to_owned();
                 self.switch_row(id, choices.spell, true, Some(second), |this, on, cx| this.choose(|c| c.spell = on, cx), cx)
+            }
+            "M7" => {
+                let second = "Tiny fetches the page from this device before sending.".to_owned();
+                self.switch_row(id, choices.send_link_previews, true, Some(second), |this, on, cx| this.choose(|c| c.send_link_previews = on, cx), cx)
             }
             // A finger never hovers: a phone plays them or it does not.
             "M5" if phone::active() => {

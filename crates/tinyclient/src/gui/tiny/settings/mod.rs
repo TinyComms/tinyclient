@@ -21,6 +21,7 @@ mod bans;
 mod bots;
 mod channels;
 mod danger;
+mod emoji;
 mod encryption;
 mod invites;
 mod kit;
@@ -29,6 +30,7 @@ mod members;
 mod overview;
 mod passkeys;
 mod privacy;
+mod reports;
 mod roles;
 mod signin;
 mod voice;
@@ -63,6 +65,7 @@ pub(in crate::gui) fn roles_in_order(community: &protocol::TinyCommunity) -> Vec
 pub(in crate::gui) enum Page {
     Overview,
     Roles,
+    Emoji,
     Members,
     Bots,
     Invites,
@@ -70,6 +73,7 @@ pub(in crate::gui) enum Page {
     Channels,
     Voice,
     Audit,
+    Reports,
     Privacy,
     SignIn,
     Encryption,
@@ -77,9 +81,10 @@ pub(in crate::gui) enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 13] = [
+    pub const ALL: [Page; 15] = [
         Page::Overview,
         Page::Roles,
+        Page::Emoji,
         Page::Members,
         Page::Bots,
         Page::Invites,
@@ -87,6 +92,7 @@ impl Page {
         Page::Channels,
         Page::Voice,
         Page::Audit,
+        Page::Reports,
         Page::Privacy,
         Page::SignIn,
         Page::Encryption,
@@ -97,6 +103,7 @@ impl Page {
         match self {
             Page::Overview => "Overview",
             Page::Roles => "Roles",
+            Page::Emoji => "Emoji",
             Page::Members => "Members",
             Page::Bots => "Bots",
             Page::Invites => "Invites",
@@ -104,6 +111,7 @@ impl Page {
             Page::Channels => "Channels",
             Page::Voice => "Voice & media",
             Page::Audit => "Audit log",
+            Page::Reports => "Reports",
             Page::Privacy => "Privacy",
             Page::SignIn => "Sign-in",
             Page::Encryption => "Encryption",
@@ -115,6 +123,7 @@ impl Page {
         match self {
             Page::Overview => "icons/server.svg",
             Page::Roles => "icons/shield.svg",
+            Page::Emoji => "icons/smile.svg",
             Page::Members => "icons/users.svg",
             Page::Bots => "icons/bot.svg",
             Page::Invites => "icons/user-plus.svg",
@@ -122,6 +131,7 @@ impl Page {
             Page::Channels => "icons/volume-2.svg",
             Page::Voice => "icons/signal.svg",
             Page::Audit => "icons/list.svg",
+            Page::Reports => "icons/flag.svg",
             Page::Privacy => "icons/eye-off.svg",
             Page::SignIn => "icons/key.svg",
             Page::Encryption => "icons/lock.svg",
@@ -132,10 +142,10 @@ impl Page {
     /// The column's group the page is under.
     fn group(self) -> &'static str {
         match self {
-            Page::Overview | Page::Roles => "Server",
+            Page::Overview | Page::Roles | Page::Emoji => "Server",
             Page::Members | Page::Bots | Page::Invites | Page::Bans => "People",
             Page::Channels | Page::Voice => "Voice",
-            Page::Audit | Page::Privacy | Page::SignIn | Page::Encryption | Page::Danger => "Security",
+            Page::Audit | Page::Reports | Page::Privacy | Page::SignIn | Page::Encryption | Page::Danger => "Security",
         }
     }
 
@@ -148,6 +158,7 @@ impl Page {
         match self {
             Page::Overview => true,
             Page::Roles => community.has(protocol::TINY_FEATURE_ROLES) && may.manage_roles,
+            Page::Emoji => (community.has(protocol::TINY_FEATURE_CUSTOM_EMOJI) || community.has(protocol::TINY_FEATURE_STICKERS)) && may.edit_server,
             Page::Members => may.manage_roles || can("community.members.remove") || can("community.members.timeout") || can("community.members.ban"),
             Page::Bots => can("community.bots.manage"),
             Page::Invites => may.read_invites,
@@ -155,6 +166,7 @@ impl Page {
             Page::Channels => may.make_room || may.edit_room || may.delete_room,
             Page::Voice => may.edit_server,
             Page::Audit => may.read_audit,
+            Page::Reports => community.has(protocol::TINY_FEATURE_ABUSE_REPORTS) && can("community.reports.manage"),
             // What the server keeps about everyone in it: every member may read it, an owner changes it.
             Page::Privacy => crate::tiny_setup::offered(community),
             // A member's own sign-in and passkeys, on a server new enough to have them (it has
@@ -177,7 +189,9 @@ pub(in crate::gui) struct Overlay {
     pub members: members::Draft,
     pub channels: channels::Draft,
     pub bots: bots::Draft,
+    pub emoji: emoji::Draft,
     pub audit: audit::Draft,
+    pub reports: reports::Draft,
     pub danger: danger::Draft,
     pub encryption: encryption::Draft,
     /// A save is with the server.
@@ -200,7 +214,9 @@ impl Overlay {
             members: Default::default(),
             channels: Default::default(),
             bots: Default::default(),
+            emoji: Default::default(),
             audit: Default::default(),
+            reports: Default::default(),
             danger: Default::default(),
             encryption: Default::default(),
             saving: false,
@@ -229,6 +245,8 @@ pub(in crate::gui) struct Fields {
     pub category_name: Entity<TextInput>,
     /// The name of a bot about to be created.
     pub bot_name: Entity<TextInput>,
+    /// The name of a custom emoji or sticker being uploaded or renamed.
+    pub emoji_name: Entity<TextInput>,
     /// What a dangerous modal asks to be typed.
     pub confirm: Entity<TextInput>,
     /// A new device's link code, on the Encryption page.
@@ -241,6 +259,8 @@ pub(in crate::gui) struct Fields {
     pub backup_passphrase: Entity<TextInput>,
     pub backup_again: Entity<TextInput>,
     pub backup_open: Entity<TextInput>,
+    /// Moderator note input on the Reports page.
+    pub report_note: Entity<TextInput>,
 }
 
 impl Fields {
@@ -258,6 +278,7 @@ impl Fields {
         let room_topic = cx.new(|cx| TextInput::new("What the channel is for", cx));
         let category_name = cx.new(|cx| TextInput::new("Category name", cx));
         let bot_name = cx.new(|cx| TextInput::new("Bot name", cx));
+        let emoji_name = cx.new(|cx| TextInput::new("emoji_name", cx));
         let confirm = cx.new(|cx| TextInput::new("Type the server's name", cx));
         let link_code = cx.new(|cx| TextInput::new("tiny-link-1.…", cx));
         let link_check = cx.new(|cx| TextInput::new("000 000", cx));
@@ -265,7 +286,8 @@ impl Fields {
         let backup_passphrase = cx.new(|cx| TextInput::secret("Passphrase · 12+ characters", cx));
         let backup_again = cx.new(|cx| TextInput::secret("Confirm passphrase", cx));
         let backup_open = cx.new(|cx| TextInput::secret("Backup passphrase", cx));
-        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open] {
+        let report_note = cx.new(|cx| TextInput::new("Add a moderator note…", cx));
+        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &emoji_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open, &report_note] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -275,7 +297,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, confirm, link_code, link_check, recovery_check, backup_passphrase, backup_again, backup_open }
+        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, emoji_name, confirm, link_code, link_check, recovery_check, backup_passphrase, backup_again, backup_open, report_note }
     }
 }
 
@@ -344,8 +366,14 @@ impl Shell {
         if page == Page::Audit && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.audit.asked) {
             self.tiny_audit_load(false, cx);
         }
+        if page == Page::Reports && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.reports.asked) {
+            self.tiny_reports_load(false, cx);
+        }
         if page == Page::Bots && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.bots.asked) {
             self.tiny_bots_load(cx);
+        }
+        if page == Page::Emoji && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.emoji.asked) {
+            self.tiny_emoji_load(cx);
         }
         if page == Page::Encryption {
             self.tiny_e2ee_load(cx);
@@ -615,11 +643,13 @@ impl Shell {
             Page::Roles => roles::roles(self, facts, window, cx),
             Page::Members => members::members(self, facts, window, cx),
             Page::Bots => bots::bots(self, facts, window, cx),
+            Page::Emoji => emoji::emoji(self, facts, window, cx),
             Page::Invites => invites::invites(self, facts, window, cx),
             Page::Bans => bans::bans(self, facts, window, cx),
             Page::Channels => channels::channels(self, facts, window, cx),
             Page::Voice => voice::voice(self, facts, window, cx),
             Page::Audit => audit::audit(self, facts, window, cx),
+            Page::Reports => reports::reports(self, facts, window, cx),
             Page::Privacy => privacy::privacy(self, facts, window, cx),
             Page::SignIn => signin::signin(self, facts, window, cx),
             Page::Encryption => encryption::encryption(self, facts, window, cx),
@@ -722,6 +752,10 @@ mod tests {
         modern.capabilities.features.push("first_run_setup".to_owned());
         assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Privacy", "Sign-in", "Encryption"]);
         modern.access = Some(TinyAccess { permissions: TINY_ALL, rank: 3, ..TinyAccess::default() });
+        assert!(!shown(&modern).contains(&"Reports"), "reports needs the abuse_reports server feature");
+        modern.capabilities.features.push("abuse_reports".to_owned());
+        modern.capabilities.features.push("custom_emoji".to_owned());
+        assert!(shown(&modern).contains(&"Reports"), "a moderator with manage_reports sees Reports");
         assert!(!shown(&modern).contains(&"Danger zone"), "only owners see the danger zone");
         modern.access = Some(TinyAccess { owner: true, ..TinyAccess::default() });
         assert_eq!(shown(&modern).len(), Page::ALL.len());

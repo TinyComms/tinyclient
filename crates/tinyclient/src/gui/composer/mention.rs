@@ -90,19 +90,21 @@ pub fn spans(text: &str, tokens: &[Token], structured: bool) -> Vec<protocol::Sp
     let mut out = Vec::new();
     let mut at = 0;
     for token in live {
-        if token.range.start < at || token.id.is_empty() {
+        if token.range.start < at {
             continue;
         }
-        let kind = match token.kind {
-            Kind::Person => MentionKind::User,
-            Kind::Channel => MentionKind::Channel,
-            Kind::Role => MentionKind::Role,
-            Kind::Emoji => continue,
+        let style = match token.kind {
+            Kind::Person if !token.id.is_empty() => Style::Mention { kind: MentionKind::User, id: token.id.clone() },
+            Kind::Channel if !token.id.is_empty() => Style::Mention { kind: MentionKind::Channel, id: token.id.clone() },
+            Kind::Role if token.id == "everyone" => Style::Mention { kind: MentionKind::Everyone, id: String::new() },
+            Kind::Role if !token.id.is_empty() => Style::Mention { kind: MentionKind::Role, id: token.id.clone() },
+            Kind::Emoji if !token.id.is_empty() => Style::Emoji { file: protocol::MediaFile::new(token.id.clone(), protocol::MediaKind::Image) },
+            _ => continue,
         };
         out.push(protocol::Span {
             start: token.range.start as u32,
             end: token.range.end as u32,
-            style: Style::Mention { kind, id: token.id.clone() },
+            style,
         });
         at = token.range.end;
     }
@@ -205,13 +207,13 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             Style::Strike => "~~",
             Style::Code => "`",
             Style::Mention { kind, id } => {
-                let kind = match kind {
-                    MentionKind::User => Kind::Person,
-                    MentionKind::Channel => Kind::Channel,
-                    MentionKind::Role => Kind::Role,
-                    MentionKind::Everyone => continue,
+                let (kind, id) = match kind {
+                    MentionKind::User => (Kind::Person, id.clone()),
+                    MentionKind::Channel => (Kind::Channel, id.clone()),
+                    MentionKind::Role => (Kind::Role, id.clone()),
+                    MentionKind::Everyone => (Kind::Role, "everyone".to_owned()),
                 };
-                mentions.push((start..end, kind, id.clone()));
+                mentions.push((start..end, kind, id));
                 continue;
             }
             _ => continue,

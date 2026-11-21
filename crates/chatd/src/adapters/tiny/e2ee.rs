@@ -460,6 +460,32 @@ struct Notes {
     revoked_device: Option<String>,
 }
 
+/// One link preview card in an opened sealed message.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OpenedPreview {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub site: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<OpenedFile>,
+}
+
+impl OpenedPreview {
+    pub(crate) fn of(p: &::e2ee::envelope::PreviewRef) -> OpenedPreview {
+        OpenedPreview {
+            url: p.url.clone(),
+            site: p.site.clone(),
+            title: p.title.clone(),
+            description: p.description.clone(),
+            image: p.image.as_ref().map(OpenedFile::of),
+        }
+    }
+}
+
 /// One opened message, as the cache keeps it.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Opened {
@@ -474,12 +500,22 @@ pub(crate) struct Opened {
     pub saved_attribution: Option<cache_auth::SavedAttribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     /// Sender's Unix milliseconds, authenticated inside the encrypted envelope. Absent in
     /// older caches; never copied to server-visible message metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<OpenedFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<::e2ee::envelope::MentionRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emoji: Vec<::e2ee::envelope::EmojiRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<OpenedPreview>,
     /// An edit: the message it edits. Its text replaces the target's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edits: Option<String>,
@@ -604,6 +640,12 @@ pub(crate) struct OpenedFile {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    #[serde(default)]
+    pub duration: u32,
+    #[serde(default)]
+    pub voice: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waveform: Vec<u8>,
 }
 
 impl OpenedFile {
@@ -617,6 +659,9 @@ impl OpenedFile {
             sha256: STANDARD.encode(file.sha256),
             width: file.width,
             height: file.height,
+            duration: file.duration,
+            voice: file.voice,
+            waveform: file.waveform.clone(),
         }
     }
 
@@ -632,6 +677,9 @@ impl OpenedFile {
             sha256,
             width: self.width,
             height: self.height,
+            duration: self.duration,
+            voice: self.voice,
+            waveform: self.waveform.clone(),
         })
     }
 
@@ -1444,6 +1492,15 @@ pub(crate) fn sign_out(saved: &Saved) {
     lock(devices()).remove(&key);
     lock(scratch_secrets()).remove(&key);
     start_over(&dir_of(saved));
+}
+
+/// Local wipe after the account itself was deleted on the server: drops in-memory state and erases
+/// this account's local directory and kept history key without calling any server route.
+pub(crate) fn forget_local(saved: &Saved) {
+    let key = (saved.base_url.clone(), saved.user_id.clone());
+    lock(devices()).remove(&key);
+    lock(scratch_secrets()).remove(&key);
+    erase_history(&saved.user_id);
 }
 
 /// The keychain item that keeps the cache keys of accounts signed out with their history kept:
@@ -2540,6 +2597,12 @@ impl Device {
             self.files
                 .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
         }
+        for preview in &opened.previews {
+            if let Some(file) = &preview.image {
+                self.files
+                    .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
+            }
+        }
         let Some(key) = self.cache_key.clone() else {
             return;
         };
@@ -2569,6 +2632,12 @@ impl Device {
         for file in &opened.attachments {
             self.files
                 .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
+        }
+        for preview in &opened.previews {
+            if let Some(file) = &preview.image {
+                self.files
+                    .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
+            }
         }
         Ok(())
     }
@@ -2756,6 +2825,7 @@ impl Device {
                 )),
                 saved_attribution: None,
                 reply_to: incoming.envelope.reply_to.clone(),
+                thread_id: incoming.envelope.thread_id.clone(),
                 sent_at: incoming.envelope.sent_at,
                 attachments: incoming
                     .envelope
@@ -2763,6 +2833,10 @@ impl Device {
                     .iter()
                     .map(OpenedFile::of)
                     .collect(),
+                mentions: incoming.envelope.mentions.clone(),
+                emoji: incoming.envelope.emoji.clone(),
+                sticker_id: incoming.envelope.sticker_id.clone(),
+                previews: incoming.envelope.previews.iter().map(OpenedPreview::of).collect(),
                 edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
                 edited_by: None,
                 at: super::messages::unix_of(row.created_at).unwrap_or(0),
@@ -2823,8 +2897,13 @@ impl Device {
             auth: None,
             saved_attribution: None,
             reply_to: envelope.reply_to.clone(),
+            thread_id: envelope.thread_id.clone(),
             sent_at: envelope.sent_at,
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
+            mentions: envelope.mentions.clone(),
+            emoji: envelope.emoji.clone(),
+            sticker_id: envelope.sticker_id.clone(),
+            previews: envelope.previews.iter().map(OpenedPreview::of).collect(),
             edits: target_id.map(str::to_owned),
             edited_by: None,
             at: std::time::SystemTime::now()
@@ -3607,6 +3686,7 @@ impl Device {
         for user in met {
             status.people.push(self.person_known(&user, names));
         }
+        status.community = community::read_status(&self.saved, &self.dir);
         status
     }
 
@@ -3984,6 +4064,16 @@ pub(crate) fn answer(
         | E2eeAsk::ExportBackup { .. }
         | E2eeAsk::ImportBackup { .. } => Response::Ok,
         E2eeAsk::Repair { .. } => unreachable!("repair starts before taking the device lock"),
+        E2eeAsk::PublishCommunityPolicy { policy, replace } => {
+            let dir = device.dir.clone();
+            drop(device);
+            done(community::publish_policy(saved, &dir, &policy, replace))
+        }
+        E2eeAsk::AcceptCommunityRoot => {
+            let dir = device.dir.clone();
+            drop(device);
+            done(community::accept_root(saved, &dir))
+        }
     }
 }
 
@@ -4094,6 +4184,7 @@ pub fn prove_encrypted_reaction() -> Result<(), String> {
 mod backup;
 mod linking;
 mod approval;
+mod community;
 mod repair;
 mod cache_auth;
 use cache_auth::Authentication;
