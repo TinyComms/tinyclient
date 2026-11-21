@@ -173,6 +173,18 @@ fn reason(fault: Fault) -> String {
                 return DEMANDS.iter().find(|(name, _)| *name == demand).map_or_else(String::new, |(_, words)| (*words).to_owned());
             }
             "not_in_channel" => "You are not in this channel.",
+            "cant_leave_general" => "You cannot leave the #general channel.",
+            "cant_archive_general" => "The #general channel cannot be archived.",
+            "already_archived" => "This channel is already archived.",
+            "not_archived" => "This channel is not archived.",
+            "name_taken" => "A channel with that name already exists.",
+            "invalid_name_required"
+            | "invalid_name_punctuation"
+            | "invalid_name_maxlength"
+            | "invalid_name_specials"
+            | "invalid_name_reserved"
+            | "invalid_name_nonmatching" => "That channel name is not valid for Slack.",
+            "not_authorized" => "You do not have permission to do that in this workspace.",
             "msg_too_long" => "The message is too long for Slack.",
             "is_archived" => "This channel is archived.",
             "channel_not_found" => "Slack cannot find this conversation.",
@@ -183,7 +195,7 @@ fn reason(fault: Fault) -> String {
             // takes. Slack's own search is one such: its web client may use an internal call.
             "not_allowed_token_type" => "Slack's own search isn't reachable with this session.",
             "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
-            error if error.starts_with("restricted_action") => "This workspace does not let you post here.",
+            error if error.starts_with("restricted_action") => "This workspace does not let you do that.",
             error => return format!("Slack refused ({error})."),
         },
     };
@@ -1444,8 +1456,27 @@ impl Slack {
                 answer(reply, self.members(&conversation_id, offset, limit));
             }
             Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
-            Command::CloseDirect { conversation_id, reply } | Command::Leave { conversation_id, reply } => {
+            Command::CloseDirect { conversation_id, reply } => {
                 answer(reply, self.close_direct(&conversation_id));
+            }
+            Command::Leave { conversation_id, reply } => {
+                answer(reply, self.leave(&conversation_id));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                if let Some(title) = title {
+                    answer(reply, self.rename_channel(&conversation_id, &title));
+                } else if topic.is_some() || description.is_some() {
+                    let _ = reply.send(Err(Refusal::Unsupported));
+                } else {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+            Command::File { conversation_id, archived, reply, .. } => {
+                if let Some(archive) = archived {
+                    answer(reply, self.archive_channel(&conversation_id, archive));
+                } else {
+                    let _ = reply.send(Err(Refusal::Unsupported));
+                }
             }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(Ok(self.download(url)));
@@ -1662,6 +1693,19 @@ impl Slack {
         }
         self.api("conversations.close", &[("channel", conversation_id)])?;
         self.forget_partner(conversation_id);
+        self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    /// Leaves a channel (`conversations.leave`), or closes a DM / group DM (`conversations.close`).
+    fn leave(&self, conversation_id: &str) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        let known = self.ctx.known(conversation_id).map_err(|err| Fault::Net(err.to_string()))?;
+        if known.as_ref().is_some_and(|c| matches!(c.kind, protocol::ConversationKind::Direct | protocol::ConversationKind::Group)) {
+            return self.close_direct(conversation_id);
+        }
+        self.api("conversations.leave", &[("channel", conversation_id)])?;
         self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
     }
 
@@ -2078,6 +2122,7 @@ fn capabilities() -> protocol::Capabilities {
         activity_feed: true,
         bookmarks: true,
         browse_channels: true,
+        archive: true,
         ..protocol::Capabilities::default()
     }
 }

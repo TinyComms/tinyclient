@@ -499,6 +499,23 @@ impl Fake {
                         }
                     }));
                 }
+                if channel == "C0ARCH" {
+                    return ok(json!({
+                        "ok": true,
+                        "channel": {
+                            "id": "C0ARCH",
+                            "name": "old-proj",
+                            "is_channel": true,
+                            "is_private": false,
+                            "is_archived": true,
+                            "is_member": false,
+                            "num_members": 3,
+                            "topic": {"value": "Retired"},
+                            "purpose": {"value": "Archived project"},
+                            "created": 1690000000
+                        }
+                    }));
+                }
                 let listed = self.fixture(token, "users.conversations").unwrap();
                 let known = listed["channels"].as_array().unwrap().iter().find(|known| known["id"] == channel).cloned();
                 known.map(|mut known| {
@@ -646,13 +663,18 @@ impl Fake {
             }
             "conversations.list" => {
                 let cursor = param("cursor");
+                let include_archived = param("exclude_archived") == "false";
                 if cursor.is_empty() {
+                    let mut list = vec![
+                        json!({"id": "C0GEN", "name": "general", "is_channel": true, "is_private": false, "is_member": true, "num_members": 12, "purpose": {"value": "Company wide"}}),
+                        json!({"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false, "is_member": false, "num_members": 42, "purpose": {"value": "Watercooler talk"}}),
+                    ];
+                    if include_archived {
+                        list.push(json!({"id": "C0ARCH", "name": "old-proj", "is_channel": true, "is_private": false, "is_archived": true, "is_member": false, "num_members": 3, "purpose": {"value": "Archived project"}}));
+                    }
                     Some(json!({
                         "ok": true,
-                        "channels": [
-                            {"id": "C0GEN", "name": "general", "is_channel": true, "is_private": false, "is_member": true, "num_members": 12, "purpose": {"value": "Company wide"}},
-                            {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false, "is_member": false, "num_members": 42, "purpose": {"value": "Watercooler talk"}}
-                        ],
+                        "channels": list,
                         "response_metadata": {"next_cursor": "page2"}
                     }))
                 } else {
@@ -664,6 +686,51 @@ impl Fake {
                         "response_metadata": {"next_cursor": ""}
                     }))
                 }
+            }
+            "conversations.leave" => {
+                if channel == "C0GEN" {
+                    return refused("cant_leave_general");
+                }
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.rename" => {
+                let name = param("name");
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                if name == "taken" {
+                    return refused("name_taken");
+                }
+                if name == "forbidden" {
+                    return refused("restricted_action");
+                }
+                Some(json!({
+                    "ok": true,
+                    "channel": {
+                        "id": channel,
+                        "name": name,
+                        "is_channel": true,
+                        "is_private": false
+                    }
+                }))
+            }
+            "conversations.archive" => {
+                if channel == "C0GEN" {
+                    return refused("cant_archive_general");
+                }
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.unarchive" => {
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({"ok": true}))
             }
             "conversations.join" => {
                 if channel.is_empty() {
@@ -3313,4 +3380,120 @@ fn slack_block_kit_images_video_stacked_cards_and_layout() {
     assert_eq!(cards[1].author, "AlertBot");
     assert_eq!(cards[1].title, "Staging warning");
     assert_eq!(cards[1].fields.len(), 1);
+}
+
+#[test]
+fn slack_leave_rename_archive_and_browse_archived_channels() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let side = alpha("C0SIDE");
+    assert!(world.account("T01ALPHA").can.archive, "Slack should advertise archive capability");
+
+    // Leaving #general refuses with a clear human-readable message.
+    let err = world.ask(Request::Leave { conversation: general.clone() });
+    match err {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("general"), "expected clear cant_leave_general message, got: {detail}");
+        }
+        other => panic!("expected Refused for leaving #general, got {other:?}"),
+    }
+    assert!(world.conversation(&general).is_some(), "#general must remain in the tree");
+
+    // Rename a channel: strips leading # and updates stored row.
+    let renamed = world.ask(Request::ConversationUpdate {
+        conversation: side.clone(),
+        title: Some("#side-renamed".into()),
+        topic: None,
+        description: None,
+    });
+    assert_eq!(renamed, Response::Ok);
+    let rename_calls = world.fake.calls(ALPHA, "conversations.rename");
+    assert_eq!(rename_calls.len(), 1);
+    assert_eq!(rename_calls[0].params["channel"], "C0SIDE");
+    assert_eq!(rename_calls[0].params["name"], "side-renamed");
+    assert_eq!(world.conversation(&side).unwrap().title, "#side-renamed");
+
+    // Rename refusal surfaces clear message.
+    let taken = world.ask(Request::ConversationUpdate {
+        conversation: side.clone(),
+        title: Some("taken".into()),
+        topic: None,
+        description: None,
+    });
+    match taken {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("already exists"), "got: {detail}");
+        }
+        other => panic!("expected Refused for name_taken, got {other:?}"),
+    }
+
+    // Archiving #general refuses with cant_archive_general.
+    let arch_gen = world.ask(Request::File {
+        conversation: general.clone(),
+        pinned: None,
+        archived: Some(true),
+        folder_add: None,
+        folder_remove: None,
+    });
+    match arch_gen {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("general"), "got: {detail}");
+        }
+        other => panic!("expected Refused for archiving #general, got {other:?}"),
+    }
+
+    // Archive and unarchive a channel.
+    let arch = world.ask(Request::File {
+        conversation: side.clone(),
+        pinned: None,
+        archived: Some(true),
+        folder_add: None,
+        folder_remove: None,
+    });
+    assert_eq!(arch, Response::Ok);
+    assert!(world.fake.calls(ALPHA, "conversations.archive").iter().any(|c| c.params["channel"] == "C0SIDE"));
+    let row = world.conversation(&side).unwrap();
+    assert!(row.archived && row.read_only, "archived channel must be marked archived and read-only");
+
+    let unarch = world.ask(Request::File {
+        conversation: side.clone(),
+        pinned: None,
+        archived: Some(false),
+        folder_add: None,
+        folder_remove: None,
+    });
+    assert_eq!(unarch, Response::Ok);
+    assert_eq!(world.fake.calls(ALPHA, "conversations.unarchive").len(), 1);
+    let row = world.conversation(&side).unwrap();
+    assert!(!row.archived && !row.read_only, "unarchived channel must clear archived and read-only");
+
+    // Leave a regular channel calls conversations.leave and drops it from the tree.
+    let left = world.ask(Request::Leave { conversation: side.clone() });
+    assert_eq!(left, Response::Ok);
+    let leave_calls = world.fake.calls(ALPHA, "conversations.leave");
+    assert!(leave_calls.iter().any(|c| c.params["channel"] == "C0SIDE"));
+    world.until("left channel to leave the tree", || world.conversation(&side).is_none().then_some(()));
+
+    // Channel browsing includes archived channels and previews them as read-only.
+    let Response::BrowsedChannels { channels, .. } = world.ask(Request::BrowseChannels {
+        space: alpha("T01ALPHA"),
+        query: "old-proj".into(),
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected BrowsedChannels");
+    };
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].name, "#old-proj");
+    assert!(channels[0].archived, "browsed archived channel must report archived=true");
+
+    let arch_key = alpha("C0ARCH");
+    let Response::Conversation { conversation: preview } = world.ask(Request::PreviewChannel {
+        conversation: arch_key,
+    }) else {
+        panic!("expected Conversation for archived channel preview");
+    };
+    assert!(preview.read_only && preview.archived, "previewed archived channel must be read-only and archived");
 }
