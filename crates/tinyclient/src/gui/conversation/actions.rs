@@ -265,8 +265,130 @@ enum MenuAct {
     SaveAs,
     /// This message becomes the first unread one.
     Unread,
+    /// Enter multi-message selection mode with this message ticked.
+    Select,
     /// A sent message: ask, unless the click held Shift.
     Delete,
+}
+
+/// Maximum number of messages that can be selected at once (matches Telegram's 100-message cap).
+pub const MULTI_SELECT_CAP: usize = 100;
+
+/// Multi-message selection mode state for a conversation pane.
+#[derive(Debug, Default, Clone)]
+pub struct MultiSelect {
+    pub active: bool,
+    pub ids: std::collections::HashSet<String>,
+    pub anchor: Option<String>,
+    /// True when the bulk-delete confirmation dialog is open.
+    pub confirm_delete: bool,
+}
+
+impl MultiSelect {
+    pub fn enter(&mut self, id: &str) {
+        self.active = true;
+        self.ids.clear();
+        self.ids.insert(id.to_owned());
+        self.anchor = Some(id.to_owned());
+        self.confirm_delete = false;
+    }
+
+    pub fn clear(&mut self) {
+        self.active = false;
+        self.ids.clear();
+        self.anchor = None;
+        self.confirm_delete = false;
+    }
+
+    pub fn count(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    /// Toggles one message id, respecting [`MULTI_SELECT_CAP`]. Returns true if selected after toggle.
+    pub fn toggle(&mut self, id: &str) -> bool {
+        self.active = true;
+        if self.ids.remove(id) {
+            self.anchor = Some(id.to_owned());
+            false
+        } else if self.ids.len() < MULTI_SELECT_CAP {
+            self.ids.insert(id.to_owned());
+            self.anchor = Some(id.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Selects the inclusive range between `anchor` and `to_id` in `ordered_ids`, capped at [`MULTI_SELECT_CAP`].
+    pub fn toggle_range(&mut self, ordered_ids: &[&str], to_id: &str) {
+        self.active = true;
+        let Some(anchor) = self.anchor.as_deref() else {
+            self.toggle(to_id);
+            return;
+        };
+        let Some(a) = ordered_ids.iter().position(|id| *id == anchor) else {
+            self.toggle(to_id);
+            return;
+        };
+        let Some(b) = ordered_ids.iter().position(|id| *id == to_id) else {
+            return;
+        };
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        for id in &ordered_ids[lo..=hi] {
+            if self.ids.len() >= MULTI_SELECT_CAP {
+                break;
+            }
+            self.ids.insert((*id).to_owned());
+        }
+        self.anchor = Some(to_id.to_owned());
+    }
+}
+
+/// Formats selected messages in chronological order with sender and time for clipboard copy.
+pub fn format_selected_messages(messages: &[&Message]) -> String {
+    let mut ordered: Vec<&Message> = messages.to_vec();
+    ordered.sort_by_key(|m| m.rank());
+    ordered
+        .into_iter()
+        .map(|m| {
+            let body = if m.text.is_empty() { "[Attachment]" } else { m.text.as_str() };
+            format!("[{}] {}: {}", time::clock(m.sent), m.shown_sender(), body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Returns the selected messages that may be deleted in bulk, along with their [`protocol::DeleteScope`].
+/// Bulk delete is intentionally omitted on Discord to avoid enforcement triggers.
+pub fn deletable_selected<'a>(
+    messages: &[&'a Message],
+    network: Network,
+    kind: ConversationKind,
+    in_thread: bool,
+    rights: protocol::ConversationRights,
+) -> Vec<(&'a Message, protocol::DeleteScope)> {
+    if network == Network::Discord {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&'a Message> = messages.to_vec();
+    ordered.sort_by_key(|m| m.rank());
+    ordered
+        .into_iter()
+        .filter_map(|m| {
+            let allowed = can_with_rights(m, network, kind, in_thread, rights);
+            if allowed.delete_everyone {
+                Some((m, protocol::DeleteScope::Everyone))
+            } else if allowed.delete_me {
+                Some((m, protocol::DeleteScope::Me))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// What the menu offers, in the order it is drawn and the order Up and Down move.
@@ -317,6 +439,7 @@ fn menu_acts(
     }
     if !can.unsent {
         acts.push(MenuAct::Unread);
+        acts.push(MenuAct::Select);
     }
     if can.delete {
         acts.push(MenuAct::Delete);
@@ -488,6 +611,12 @@ impl Pane {
             cx.notify();
         } else if self.link_ask.is_some() {
             self.close_link_ask(cx);
+        } else if self.multi_select.confirm_delete {
+            self.multi_select.confirm_delete = false;
+            cx.notify();
+        } else if self.multi_select.active {
+            self.multi_select.clear();
+            cx.notify();
         } else if self.menu.is_some() || self.picker.is_some() {
             self.close_menu(cx);
             self.close_picker(cx);
@@ -855,6 +984,11 @@ impl Pane {
                 }
             }
             MenuAct::Unread => self.mark_message_unread(&message, cx),
+            MenuAct::Select => {
+                self.multi_select.enter(&message.id);
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
     }
@@ -1016,6 +1150,15 @@ impl Pane {
                 rows.push(
                     row("sheet-unread", "icons/mail.svg", "Mark unread".into(), false)
                         .on_click(then(|this, message, _, cx| this.mark_message_unread(message, cx)))
+                        .into_any_element(),
+                );
+                rows.push(
+                    row("sheet-select", "icons/check.svg", "Select".into(), false)
+                        .on_click(then(|this, message, window, cx| {
+                            this.multi_select.enter(&message.id);
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        }))
                         .into_any_element(),
                 );
             }
@@ -1211,6 +1354,11 @@ impl Pane {
                     menu_item("unread", Some("icons/mail.svg"), "Mark unread", None)
                         .when(lit(MenuAct::Unread), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Unread)),
+                );
+                items = items.child(
+                    menu_item("select", Some("icons/check.svg"), "Select", None)
+                        .when(lit(MenuAct::Select), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Select)),
                 );
             }
             if can.delete {
@@ -1488,9 +1636,213 @@ impl Pane {
 
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
-            return [self.menu_sheet(window, cx), self.revisions_layer(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
+            return [
+                self.menu_sheet(window, cx),
+                self.revisions_layer(window, cx),
+                self.picker_sheet(window, cx),
+                self.confirm_layer(window, cx),
+                self.bulk_confirm_layer(window, cx),
+                self.link_layer(window, cx),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
         }
-        [self.menu_layer(window, cx), self.revisions_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
+        [
+            self.menu_layer(window, cx),
+            self.revisions_layer(window, cx),
+            self.picker_layer(window, cx),
+            self.confirm_layer(window, cx),
+            self.bulk_confirm_layer(window, cx),
+            self.link_layer(window, cx),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    pub(super) fn toggle_selected_row(&mut self, id: &str, shift: bool, cx: &mut Context<Self>) {
+        if shift {
+            let ordered: Vec<&str> = self.window.messages.iter().map(|m| m.id.as_str()).collect();
+            self.multi_select.toggle_range(&ordered, id);
+        } else {
+            self.multi_select.toggle(id);
+        }
+        if self.multi_select.count() == 0 {
+            self.multi_select.clear();
+        }
+        cx.notify();
+    }
+
+    fn selected_messages(&self) -> Vec<&Message> {
+        self.window
+            .messages
+            .iter()
+            .filter(|m| self.multi_select.contains(&m.id))
+            .map(Rc::as_ref)
+            .collect()
+    }
+
+    pub(super) fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        let msgs = self.selected_messages();
+        if msgs.is_empty() {
+            return;
+        }
+        let text = format_selected_messages(&msgs);
+        let count = msgs.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.multi_select.clear();
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.toast(Some(("icons/check.svg", theme::text_soft())), format!("Copied {count} messages"), cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn delete_selected_confirmed(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let conversation = open.key.clone();
+        let kind = open.kind;
+        let rights = open.rights;
+        let targets: Vec<(String, protocol::DeleteScope)> = deletable_selected(
+            &self.selected_messages(),
+            conversation.network,
+            kind,
+            self.is_thread(),
+            rights,
+        )
+        .into_iter()
+        .map(|(m, scope)| (m.id.clone(), scope))
+        .collect();
+        self.multi_select.clear();
+        cx.notify();
+        if targets.is_empty() {
+            return;
+        }
+        // Send deletes paced off-thread so we never burst the network.
+        cx.spawn(async move |_, cx| {
+            for (ix, (message_id, scope)) in targets.into_iter().enumerate() {
+                if ix > 0 {
+                    cx.background_executor().timer(std::time::Duration::from_millis(120)).await;
+                }
+                let req = Request::Delete { conversation: conversation.clone(), message_id, scope };
+                let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.multi_select.active {
+            return None;
+        }
+        let open = self.open.as_ref()?;
+        let count = self.multi_select.count();
+        let deletable = deletable_selected(
+            &self.selected_messages(),
+            open.key.network,
+            open.kind,
+            self.is_thread(),
+            open.rights,
+        )
+        .len();
+        let mut bar = div()
+            .id("selection-bar")
+            .absolute()
+            .left(px(12.))
+            .right(px(12.))
+            .bottom(px(12.))
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(theme::R_CARD))
+            .bg(theme::raised())
+            .border_1()
+            .border_color(super::tokens::border_strong())
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().flex_1().type_ui().font_weight(theme::SEMIBOLD).child(format!("{count} selected")))
+            .child(
+                button("sel-copy", ButtonKind::Secondary, "Copy")
+                    .h(px(28.))
+                    .px(px(10.))
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_selected(cx))),
+            );
+        if deletable > 0 {
+            bar = bar.child(
+                button("sel-delete", ButtonKind::Danger, format!("Delete ({deletable})"))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.multi_select.confirm_delete = true;
+                        cx.notify();
+                    })),
+            );
+        }
+        bar = bar.child(
+            button("sel-cancel", ButtonKind::Ghost, "Cancel")
+                .h(px(28.))
+                .px(px(8.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.multi_select.clear();
+                    cx.notify();
+                })),
+        );
+        Some(bar.into_any_element())
+    }
+
+    fn bulk_confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.multi_select.confirm_delete {
+            return None;
+        }
+        let open = self.open.as_ref()?;
+        let deletable = deletable_selected(
+            &self.selected_messages(),
+            open.key.network,
+            open.kind,
+            self.is_thread(),
+            open.rights,
+        )
+        .len();
+        if deletable == 0 {
+            return None;
+        }
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let panel = modal(format!("Delete {deletable} messages?"))
+            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .child(modal_body(format!("This removes {deletable} selected messages. This cannot be undone.")))
+            .child(
+                modal_buttons()
+                    .child(button("bulk-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.multi_select.confirm_delete = false;
+                        cx.notify();
+                    })))
+                    .child(button("bulk-delete", ButtonKind::Danger, format!("Delete {deletable}")).on_click(cx.listener(|this, _, _, cx| {
+                        this.delete_selected_confirmed(cx);
+                    }))),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("bulk-confirm")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.multi_select.confirm_delete = false;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("bulk-confirm-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
     /// Keys for whatever floats over the messages. True when the key was theirs.
@@ -1498,6 +1850,16 @@ impl Pane {
     pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         if self.link_key(event, cx) {
+            return true;
+        }
+        if key == "escape" && self.multi_select.confirm_delete {
+            self.multi_select.confirm_delete = false;
+            cx.notify();
+            return true;
+        }
+        if key == "escape" && self.multi_select.active {
+            self.multi_select.clear();
+            cx.notify();
             return true;
         }
         if key == "escape" && self.revisions.is_some() {
@@ -1648,6 +2010,7 @@ mod tests {
                 MenuAct::Link,
                 MenuAct::Open,
                 MenuAct::Unread,
+                MenuAct::Select,
             ]
         );
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
@@ -1660,7 +2023,7 @@ mod tests {
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
             menu_acts(on, false, 0, false, false, false, true),
-            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs, MenuAct::Unread],
+            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
     }
 
@@ -1804,5 +2167,53 @@ mod tests {
         // Telegram broadcast channel: delete-for-everyone only.
         let tg_chan = can_with_rights(&theirs, Network::Telegram, ConversationKind::Channel, false, mod_rights);
         assert!(tg_chan.delete && tg_chan.delete_everyone && !tg_chan.delete_me);
+    }
+
+    #[test]
+    fn multi_select_copies_three_rows_in_order_supports_shift_range_and_respects_cap_and_rights() {
+        let m1 = Message::plain("1", "Mara", "first", 1_700_000_000, false);
+        let m2 = Message::plain("2", "Robin", "second", 1_700_000_060, true);
+        let m3 = Message::plain("3", "Wren", "third", 1_700_000_120, false);
+
+        // Selecting three rows and copying produces three lines in chronological order.
+        let copied = format_selected_messages(&[&m3, &m1, &m2]);
+        let lines: Vec<&str> = copied.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Mara: first"), "{copied}");
+        assert!(lines[1].contains("Robin: second"), "{copied}");
+        assert!(lines[2].contains("Wren: third"), "{copied}");
+
+        // Shift-click range selection selects anchor..=target inclusively.
+        let mut sel = MultiSelect::default();
+        sel.enter("1");
+        sel.toggle_range(&["1", "2", "3", "4"], "3");
+        assert!(sel.active && sel.count() == 3 && sel.contains("1") && sel.contains("2") && sel.contains("3"));
+        assert!(!sel.contains("4"));
+
+        // Cap at MULTI_SELECT_CAP (100).
+        let many: Vec<String> = (0..150).map(|i| format!("m{i}")).collect();
+        let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        sel.enter("m0");
+        sel.toggle_range(&many_refs, "m149");
+        assert_eq!(sel.count(), MULTI_SELECT_CAP);
+
+        // Bulk delete respects rights & skips Discord.
+        let plain = protocol::ConversationRights::default();
+        let mod_rights = protocol::ConversationRights { delete_others: true, ..Default::default() };
+        assert!(
+            deletable_selected(&[&m1, &m2, &m3], Network::Discord, ConversationKind::Channel, false, mod_rights).is_empty(),
+            "Discord bulk delete stays disabled in selection mode"
+        );
+        let slack_plain = deletable_selected(&[&m1, &m2, &m3], Network::Slack, ConversationKind::Channel, false, plain);
+        assert_eq!(slack_plain.len(), 1);
+        assert_eq!(slack_plain[0].0.id, "2");
+        assert_eq!(slack_plain[0].1, protocol::DeleteScope::Everyone);
+
+        let slack_mod = deletable_selected(&[&m1, &m2, &m3], Network::Slack, ConversationKind::Channel, false, mod_rights);
+        assert_eq!(slack_mod.len(), 3);
+
+        let sms = deletable_selected(&[&m1, &m2], Network::Messages, ConversationKind::Direct, false, plain);
+        assert_eq!(sms.len(), 2);
+        assert!(sms.iter().all(|(_, scope)| *scope == protocol::DeleteScope::Me));
     }
 }

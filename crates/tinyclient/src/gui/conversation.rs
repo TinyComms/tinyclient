@@ -336,6 +336,8 @@ pub struct Pane {
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
+    /// Multi-message selection mode state (#795).
+    multi_select: actions::MultiSelect,
     /// The link a click asked about, until the person opens it or does not.
     link_ask: Option<links::LinkAsk>,
     /// Earlier wordings of one message, opened from its edited mark.
@@ -433,6 +435,7 @@ impl Pane {
             menu: None,
             picker: None,
             confirm: None,
+            multi_select: actions::MultiSelect::default(),
             link_ask: None,
             revisions: None,
             hold: None,
@@ -548,6 +551,7 @@ impl Pane {
         self.shown.clear();
         self.expanded.clear();
         self.code_colors.clear();
+        self.multi_select.clear();
         self.code_coloring.clear();
         self.copied = None;
         self.hovered = None;
@@ -1628,6 +1632,7 @@ impl Render for Pane {
             .children(self.live_call_row(cx))
             .children(self.history_banner(cx))
             .children(self.away.then(|| self.jump_button(cx)))
+            .children(self.selection_bar(cx))
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }
