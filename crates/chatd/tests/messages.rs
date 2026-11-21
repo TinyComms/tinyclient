@@ -577,6 +577,7 @@ fn a_file_we_send_is_read_and_shown_back() {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },
@@ -621,6 +622,7 @@ fn a_file_we_send_is_read_and_shown_back() {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },
@@ -671,6 +673,7 @@ fn a_mov_is_sent_as_a_video() {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },
@@ -726,6 +729,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
             spoiler: false,
             as_file: false,
             original: false,
+            media: None,
         });
     }
     let too_many = vec![files[0].clone(); 11];
@@ -805,6 +809,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },
@@ -1051,6 +1056,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },
@@ -1237,6 +1243,7 @@ fn an_rcs_reply_quotes_the_original_and_an_sms_reply_stays_plain() {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },

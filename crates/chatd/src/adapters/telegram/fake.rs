@@ -3177,7 +3177,33 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
                         tl::enums::DocumentAttribute::Filename(name) => Some(name.file_name.clone()),
                         _ => None,
                     });
-                    (format!("{kind}:{}", one.mime_type), file(&name.unwrap_or_default(), &one.mime_type))
+                    let video = one.attributes.iter().find_map(|attribute| match attribute {
+                        tl::enums::DocumentAttribute::Video(video) => Some(video),
+                        _ => None,
+                    });
+                    let music = one.attributes.iter().find_map(|attribute| match attribute {
+                        tl::enums::DocumentAttribute::Audio(audio) if !audio.voice => Some(audio),
+                        _ => None,
+                    });
+                    let label = if let Some(video) = video {
+                        format!(
+                            "video:{}x{}:{:.1}:stream={}:thumb={}",
+                            video.w,
+                            video.h,
+                            video.duration,
+                            video.supports_streaming,
+                            one.thumb.is_some()
+                        )
+                    } else if let Some(music) = music {
+                        format!(
+                            "audio:{}:{}",
+                            music.title.as_deref().unwrap_or(""),
+                            music.performer.as_deref().unwrap_or("")
+                        )
+                    } else {
+                        format!("{kind}:{}", one.mime_type)
+                    };
+                    (label, file(&name.unwrap_or_default(), &one.mime_type))
                 }
             };
             (kind, media)

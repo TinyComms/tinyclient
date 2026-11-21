@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn the_send_of_the_recorded_file_carries_its_facts() {
-        let file = |path: &str| OutgoingFile { path: path.into(), name: String::new(), spoiler: false, as_file: false, original: false };
+        let file = |path: &str| OutgoingFile { path: path.into(), name: String::new(), spoiler: false, as_file: false, original: false, media: None };
         let files = vec![file("voice-1.opus")];
         assert_eq!(sent_as(&Some(kept("voice-1.opus")), &files).unwrap(), VoiceNote { duration: 12_000, waveform: vec![31, 0] });
         // A send of anything else carries no facts.

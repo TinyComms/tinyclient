@@ -3965,6 +3965,7 @@ mod tests {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         };

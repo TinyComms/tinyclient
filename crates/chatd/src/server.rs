@@ -3067,6 +3067,7 @@ fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
             spoiler: attachment.spoiler,
             as_file: false,
             original: false,
+            media: None,
         })
     })
     .collect()
@@ -3384,6 +3385,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },
