@@ -393,9 +393,17 @@ impl Fake {
                 let asked: Value = serde_json::from_str(param("profile")).unwrap();
                 let mut profile = self.user(token, me(token)).unwrap()["profile"].clone();
                 profile["status_text"] = asked["status_text"].clone();
-                // Slack's default for a status with words and no emoji.
-                let emoji = if asked["status_text"] == "" { "" } else { ":speech_balloon:" };
+                // Slack echoes the requested emoji, or defaults to speech_balloon when words have no emoji.
+                let requested_emoji = asked["status_emoji"].as_str().unwrap_or("");
+                let emoji = if !requested_emoji.is_empty() {
+                    requested_emoji
+                } else if asked["status_text"] == "" {
+                    ""
+                } else {
+                    ":speech_balloon:"
+                };
                 profile["status_emoji"] = emoji.into();
+                profile["status_expiration"] = asked["status_expiration"].clone();
                 Some(json!({"ok": true, "username": "justin", "profile": profile}))
             }
             "client.counts" if busy => {
@@ -2228,7 +2236,7 @@ fn presence_a_profile_and_signing_out() {
     let account = AccountKey { network: Network::Slack, account: "T01ALPHA".to_owned() };
 
     // Away with a status: both reach Slack, and the account shows what Slack now shows others.
-    let away = Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: Some("Lunch".to_owned()), clear_at: None };
+    let away = Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: Some("Lunch".to_owned()), status_emoji: None, clear_at: None };
     assert_eq!(world.ask(away), Response::Ok);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").pop().unwrap().params["presence"], "away");
     let set = world.fake.calls(ALPHA, "users.profile.set").pop().unwrap();
@@ -2237,18 +2245,18 @@ fn presence_a_profile_and_signing_out() {
     let shown = world.account("T01ALPHA");
     assert_eq!((shown.presence, shown.status.as_str()), (Presence::Idle, "💬 Lunch"));
     // Back, with the status left alone: one call, and the text stays.
-    let back = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: None, clear_at: None };
+    let back = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: None, status_emoji: None, clear_at: None };
     assert_eq!(world.ask(back), Response::Ok);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").pop().unwrap().params["presence"], "auto");
     assert_eq!(world.fake.calls(ALPHA, "users.profile.set").len(), 1);
     let shown = world.account("T01ALPHA");
     assert_eq!((shown.presence, shown.status.as_str()), (Presence::Online, "💬 Lunch"));
     // Clearing the status.
-    let clear = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: Some(String::new()), clear_at: None };
+    let clear = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: Some(String::new()), status_emoji: None, clear_at: None };
     assert_eq!(world.ask(clear), Response::Ok);
     assert_eq!(world.account("T01ALPHA").status, "");
     // Do Not Disturb is not built: it is refused in words and nothing is shown as set.
-    let quiet = world.ask(Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: None, clear_at: None });
+    let quiet = world.ask(Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: None, status_emoji: None, clear_at: None });
     assert!(matches!(&quiet, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("Do Not Disturb")), "{quiet:?}");
     assert_eq!(world.account("T01ALPHA").presence, Presence::Online);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").len(), 3);
@@ -4286,4 +4294,92 @@ fn slack_notification_prefs_keywords_and_live_pref_change() {
     }));
     let non = world.until("non-boundary message stored", || world.message(&general, ts_non));
     assert!(!non.mentions_me, "substring without word boundary should not set mentions_me");
+}
+
+#[test]
+fn slack_rich_status_emoji_expiration_and_custom_emoji_read() {
+    let world = World::start();
+    world.ready();
+
+    let account = alpha("C0GEN").account();
+    let expiry = 1_900_000_000_i64;
+
+    // Set status with emoji and clear-after expiration -> sent to users.profile.set.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Vacation".into()),
+            status_emoji: Some("🌴".into()),
+            clear_at: Some(expiry),
+        }),
+        Response::Ok
+    );
+    let set_call = world.fake.calls(ALPHA, "users.profile.set").pop().expect("users.profile.set call");
+    let sent_profile: Value = serde_json::from_str(&set_call.params["profile"]).unwrap();
+    assert_eq!(sent_profile["status_text"], "Vacation");
+    assert_eq!(sent_profile["status_emoji"], ":palm_tree:");
+    assert_eq!(sent_profile["status_expiration"], expiry);
+
+    // Updating only text (status_emoji: None) preserves existing emoji instead of clearing it.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Still on vacation".into()),
+            status_emoji: None,
+            clear_at: Some(expiry),
+        }),
+        Response::Ok
+    );
+    let set_call2 = world.fake.calls(ALPHA, "users.profile.set").pop().expect("second users.profile.set");
+    let sent_profile2: Value = serde_json::from_str(&set_call2.params["profile"]).unwrap();
+    assert_eq!(sent_profile2["status_text"], "Still on vacation");
+    assert_eq!(sent_profile2["status_emoji"], ":palm_tree:");
+    assert_eq!(sent_profile2["status_expiration"], expiry);
+
+    // Clearing status clears text, emoji, and expiration.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some(String::new()),
+            status_emoji: Some(String::new()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let clear_call = world.fake.calls(ALPHA, "users.profile.set").pop().expect("clear users.profile.set");
+    let cleared: Value = serde_json::from_str(&clear_call.params["profile"]).unwrap();
+    assert_eq!(cleared["status_text"], "");
+    assert_eq!(cleared["status_emoji"], "");
+    assert_eq!(cleared["status_expiration"], 0);
+
+    // Reading another user's custom emoji status preserves `:custom_name:`.
+    world.fake.push(ALPHA, json!({
+        "type": "user_status_changed",
+        "user": {
+            "id": "U0ANA",
+            "name": "ana",
+            "profile": {
+                "display_name": "Ana",
+                "status_text": "Deploying",
+                "status_emoji": ":partyparrot:",
+                "status_expiration": expiry
+            }
+        }
+    }));
+    world.until("custom emoji status preserved on U0ANA", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Slack),
+            relation: None,
+            query: Some("Ana".into()),
+            offset: 0,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        let ana = people.into_iter().find(|p| p.key.id == "U0ANA")?;
+        (ana.emoji == ":partyparrot:" && ana.status.contains("Deploying")).then_some(())
+    });
 }

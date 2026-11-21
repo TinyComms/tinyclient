@@ -613,6 +613,7 @@ pub enum Command {
     SetPresence {
         presence: Presence,
         status: Option<String>,
+        status_emoji: Option<String>,
         clear_at: Option<i64>,
         reply: Reply<()>,
     },

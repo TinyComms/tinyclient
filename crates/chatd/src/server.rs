@@ -1645,7 +1645,7 @@ impl Chat {
     }
 
     /// Our own presence, shown at once and put back if the network refuses it.
-    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>, clear_at: Option<i64>) -> Response {
+    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>, status_emoji: Option<String>, clear_at: Option<i64>) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
@@ -1656,12 +1656,16 @@ impl Chat {
             clip(&mut status, 128);
             status
         });
+        let status_emoji = status_emoji.map(|mut emoji| {
+            clip(&mut emoji, 64);
+            emoji
+        });
         let before = me.as_ref().map(|me| self.hub.shown(me));
         if let (Some(me), Some((_, old))) = (&me, &before) {
             self.hub.set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
             self.hub.changed(Change::Status);
         }
-        match self.ask(&account, |reply| Command::SetPresence { presence, status, clear_at, reply }) {
+        match self.ask(&account, |reply| Command::SetPresence { presence, status, status_emoji, clear_at, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => {
                 if let (Some(me), Some((presence, status))) = (me, before) {
@@ -1696,7 +1700,7 @@ impl Chat {
                 return *refused;
             }
             let status = adapters::signal::profile_status(name.as_deref(), about.as_deref(), emoji.as_deref());
-            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), clear_at: None, reply }) {
+            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), status_emoji: None, clear_at: None, reply }) {
                 Ok(()) => {
                     self.forget_own_profile(&account, None);
                     Response::Ok
@@ -3042,7 +3046,7 @@ impl Chat {
             Request::Relate { person, action } => self.relate(person, action),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
-            Request::SetPresence { account, presence, status, clear_at } => self.set_presence(account, presence, status, clear_at),
+            Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
             Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
                 self.set_profile(account, name, about, pronouns, emoji, username, photo)
             }

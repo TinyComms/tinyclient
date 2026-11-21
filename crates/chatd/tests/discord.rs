@@ -1799,7 +1799,7 @@ fn a_dropped_socket_resumes_and_a_refused_token_expires_the_account() {
         Response::Status { accounts, .. } => accounts[0].presence,
         other => panic!("{other:?}"),
     };
-    let set = Request::SetPresence { account: world.account(), presence: Presence::Dnd, status: None, clear_at: None };
+    let set = Request::SetPresence { account: world.account(), presence: Presence::Dnd, status: None, status_emoji: None, clear_at: None };
     assert_eq!(world.ask(set), Response::Ok);
     let mine = own();
     assert_eq!(mine, Presence::Dnd);
@@ -2731,7 +2731,7 @@ fn friendships_presence_and_profiles_are_asked_of_discord_only_when_the_user_doe
 
     // Presence and the status line are saved as settings and told to the gateway.
     let present = |presence: Presence, status: Option<&str>| {
-        world.ask(Request::SetPresence { account: world.account(), presence, status: status.map(str::to_owned), clear_at: None })
+        world.ask(Request::SetPresence { account: world.account(), presence, status: status.map(str::to_owned), status_emoji: None, clear_at: None })
     };
     let saved = || {
         let saved = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");

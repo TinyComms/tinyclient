@@ -756,7 +756,7 @@ impl Shell {
             .map(|snapshot| snapshot.accounts.iter().filter(|account| account.link == Link::Connected).map(|account| account.key.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         for account in accounts {
-            let request = Request::SetPresence { account, presence, status: None, clear_at: None };
+            let request = Request::SetPresence { account, presence, status: None, status_emoji: None, clear_at: None };
             cx.background_executor().spawn(async move { ask(&request) }).detach();
         }
     }

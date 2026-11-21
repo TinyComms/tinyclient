@@ -598,6 +598,9 @@ pub struct Capabilities {
     /// This account supports saving/starring messages for Later and setting network reminders (`StarMessage`, `StarredMessages`, `Remind`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub save_messages: bool,
+    /// This account supports setting a status with an emoji and a clear-after expiration (`SetPresence` with `status_emoji` and `clear_at`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rich_status: bool,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].

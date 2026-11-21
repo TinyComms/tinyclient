@@ -1506,7 +1506,9 @@ impl Slack {
                     answer(reply, self.delete(&conversation_id, &message_id));
                 }
             }
-            Command::SetPresence { presence, status, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetPresence { presence, status, status_emoji, clear_at, reply } => {
+                answer(reply, self.set_presence(presence, status, status_emoji, clear_at))
+            }
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
             Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.watch(),
@@ -2063,8 +2065,14 @@ impl Slack {
         Ok(results)
     }
 
-    /// Our own presence, and the status text when one is given (empty clears it).
-    fn set_presence(&self, presence: Presence, status: Option<String>) -> Result<(), Fault> {
+    /// Our own presence, and the status text/emoji/expiration when given.
+    fn set_presence(
+        &self,
+        presence: Presence,
+        status: Option<String>,
+        status_emoji: Option<String>,
+        clear_at: Option<i64>,
+    ) -> Result<(), Fault> {
         let word = match presence {
             Presence::Online => Some("auto"),
             // Slack knows two words. Away is all it has for not being here.
@@ -2079,9 +2087,29 @@ impl Slack {
             self.api("users.setPresence", &[("presence", word)])?;
         }
         let me = self.me.get().cloned().unwrap_or_default();
-        if let Some(text) = &status {
-            // An emptied emoji with a text makes Slack show its default, the speech balloon.
-            let profile = json!({"status_text": text, "status_emoji": "", "status_expiration": 0}).to_string();
+        if status.is_some() || status_emoji.is_some() {
+            let clearing = status.as_deref() == Some("") && status_emoji.as_deref().unwrap_or("").is_empty();
+            let text = match &status {
+                Some(t) => t.clone(),
+                None => self.cached(&me).map(|u| u.status).unwrap_or_default(),
+            };
+            let emoji_code = if clearing {
+                String::new()
+            } else if let Some(raw) = &status_emoji {
+                slack_status_emoji(raw)
+            } else {
+                // Preserve existing emoji when only status text changes.
+                self.cached(&me)
+                    .map(|u| slack_status_emoji(&u.emoji))
+                    .unwrap_or_default()
+            };
+            let expiration = if clearing { 0 } else { clear_at.unwrap_or(0).max(0) };
+            let profile = json!({
+                "status_text": text,
+                "status_emoji": emoji_code,
+                "status_expiration": expiration,
+            })
+            .to_string();
             let set = self.api("users.profile.set", &[("profile", &profile)])?;
             if set["profile"].is_object() {
                 let handle = self.state().handle.clone();
@@ -2369,6 +2397,7 @@ fn capabilities() -> protocol::Capabilities {
         browse_channels: true,
         archive: true,
         save_messages: true,
+        rich_status: true,
         ..protocol::Capabilities::default()
     }
 }
@@ -2395,6 +2424,23 @@ fn download_headers(agent: &str, token: &str, cookie: &str, private: bool) -> Ve
 /// `stars.add` when starring, `stars.remove` when not. Tier 2, the same as the pacer holds them to.
 fn star_method(starred: bool) -> &'static str {
     if starred { "stars.add" } else { "stars.remove" }
+}
+
+/// Converts a Unicode emoji or `:name:` shortcode into Slack's `:name:` status_emoji wire format.
+fn slack_status_emoji(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(name) = emoji::name(trimmed) {
+        return format!(":{name}:");
+    }
+    let name = trimmed.trim_matches(':');
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!(":{name}:")
+    }
 }
 
 /// A conversation star on the socket: a channel, a direct conversation, or a private group.
