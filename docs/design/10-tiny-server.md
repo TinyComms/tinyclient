@@ -100,7 +100,7 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   occupancy, up to eight ringed faces 28, `Mara, Robin and 2 others`, and Join (or `You're
   here`, or `Full`). **Online, not in voice:** chips of 36 with the avatar, the name in its
   role colour and `You`; right-click is the person menu.
-- **Channel:** the call sends and receives one H.264 picture here (the share, otherwise the active speaker's camera). It is not drawn on another network's conversation. The stage holds a tile per person, 196 × 148, radius 12, `raised`, centred and
+- **Channel:** the room stage carries the call's video (`07-calls.md` §6): one received H.264 picture (a watched share, or the active speaker's camera) plus local self-view. Direct calls on a Tiny server draw their picture in the conversation's call view (and a compact preview above the dock while away). The stage holds a tile per person, 196 × 148, radius 12, `raised`, centred and
   wrapping: avatar 64, name 13/600 in the role colour, `You` chip, then the most serious state
   as a chip (`Server muted` and `Can't speak here` in `danger`, `Priority speaker` in
   `accent_soft`, else `text_soft`), and `Muted for you` or the volume I set for them. A
