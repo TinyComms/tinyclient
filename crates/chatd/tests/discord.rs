@@ -5430,3 +5430,115 @@ fn edit_suppresses_embeds_merging_existing_flags_and_removes_attachments() {
         other => panic!("expected Refused for empty text + empty attachments, got {other:?}"),
     }
 }
+
+#[test]
+fn text_attachment_head_preview_uses_range_request_and_keeps_full_download_separate() {
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::sync::mpsc::channel;
+
+    let payload: Vec<u8> = (1..=2500).flat_map(|n| format!("log line {n:04}: ok\n").into_bytes()).collect();
+    let payload_len = payload.len();
+    assert!(payload_len > protocol::TEXT_PREVIEW_MAX_BYTES as usize);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = channel::<Option<String>>();
+    let body_for_srv = payload.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(&stream);
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).is_err() {
+                continue;
+            }
+            let mut range_hdr = None;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.eq_ignore_ascii_case("range") {
+                        range_hdr = Some(v.trim().to_owned());
+                    }
+                }
+            }
+            let _ = tx.send(range_hdr.clone());
+            let mut out = stream;
+            if let Some(hdr) = range_hdr {
+                let end = hdr
+                    .strip_prefix("bytes=0-")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    .min(body_for_srv.len() - 1);
+                let slice = &body_for_srv[..=end];
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = out.write_all(slice);
+            } else {
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body_for_srv.len()
+                );
+                let _ = out.write_all(&body_for_srv);
+            }
+        }
+    });
+
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let url = format!("http://127.0.0.1:{port}/attachments/4101/88001/server.log");
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000001400",
+        "channel_id": "4101",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "",
+        "timestamp": "2026-10-13T09:30:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "pinned": false,
+        "attachments": [{
+            "id": "88001",
+            "filename": "server.log",
+            "size": payload_len,
+            "url": url,
+            "content_type": "text/plain"
+        }]
+    }));
+    let msg = wait("log attachment message", || {
+        world.messages("4101").into_iter().find(|m| m.id == "1300000010000001400")
+    });
+    assert_eq!(msg.attachments[0].file.id, "att:88001");
+
+    // 1. FetchPreview asks for only the first 100 KB via Range header and caches under head:att:88001.
+    let head_file = wait("head preview to land", || {
+        match world.ask(Request::FetchPreview {
+            account: world.account(),
+            ids: vec!["att:88001".into()],
+            max_bytes: protocol::TEXT_PREVIEW_MAX_BYTES,
+        }) {
+            Response::Media { files } => files.into_iter().find(|f| f.id == "head:att:88001" && f.path.is_some()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    });
+    let head_bytes = std::fs::read(head_file.path.as_deref().unwrap()).unwrap();
+    assert_eq!(head_bytes.len(), protocol::TEXT_PREVIEW_MAX_BYTES as usize);
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Some(format!("bytes=0-{}", protocol::TEXT_PREVIEW_MAX_BYTES - 1))
+    );
+
+    // 2. Full download via Request::Fetch still fetches the whole file separately (no Range header).
+    let full = world.fetched("att:88001", None, false);
+    let full_bytes = std::fs::read(full.path.as_deref().unwrap()).unwrap();
+    assert_eq!(full_bytes.len(), payload_len);
+    assert_eq!(rx.try_recv().unwrap(), None);
+}

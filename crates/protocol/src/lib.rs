@@ -43,6 +43,9 @@ pub use e2ee::*;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
+
+/// Maximum bytes fetched automatically for an inline text/code attachment preview (100 KB).
+pub const TEXT_PREVIEW_MAX_BYTES: u32 = 100 * 1024;
 pub use play::*;
 pub use react::*;
 pub use record::*;
@@ -1955,6 +1958,17 @@ pub enum Request {
         retry: bool,
     },
 
+    /// Fetches at most `max_bytes` (clamped to [`TEXT_PREVIEW_MAX_BYTES`]) from the head of
+    /// registered file attachments via a ranged HTTP request through chatd's media cache, for
+    /// inline text/code previews. Returned [`MediaFile`] ids carry a `"head:"` prefix so full
+    /// downloads stay separate; counts against the cache budget.
+    FetchPreview {
+        account: AccountKey,
+        ids: Vec<String>,
+        #[serde(default)]
+        max_bytes: u32,
+    },
+
     /// Opens the network's sign-in and keeps the session. Answers when the user is done.
     SignIn {
         network: Network,
@@ -3458,6 +3472,13 @@ mod tests {
     fn frames_written_before_these_fields_existed_still_read() {
         let request: Request = serde_json::from_str(r#"{"op":"fetch","account":{"network":"slack","account":"T1"},"ids":["a"]}"#).unwrap();
         assert!(matches!(request, Request::Fetch { size: None, retry: false, .. }));
+        let preview = Request::FetchPreview {
+            account: AccountKey { network: Network::Discord, account: "1".into() },
+            ids: vec!["att:42".into()],
+            max_bytes: TEXT_PREVIEW_MAX_BYTES,
+        };
+        let encoded = serde_json::to_string(&preview).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), preview);
         let request: Request = serde_json::from_str(r#"{"op":"sign_in","network":"slack"}"#).unwrap();
         assert!(matches!(request, Request::SignIn { at: None, .. }));
         let thread: ThreadSummary = serde_json::from_str(r#"{"id":"t","replies":2,"last":5}"#).unwrap();

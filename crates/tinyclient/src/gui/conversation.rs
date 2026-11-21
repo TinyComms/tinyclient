@@ -21,6 +21,7 @@ mod rows;
 mod shot;
 mod side;
 mod text;
+mod text_preview;
 mod tokens;
 mod video;
 mod viewer;
@@ -376,6 +377,16 @@ pub struct Pane {
     /// The message a jump landed on, tinted while it fades.
     flash: Option<String>,
     viewer: Option<viewer::Viewer>,
+    /// Expanded full-screen text/code attachment viewer (#385).
+    text_viewer: Option<viewer::TextViewer>,
+    /// Decoded inline text/code attachment previews by `file.id` (`None` = binary/unpreviewable).
+    text_previews: HashMap<String, Option<Rc<text_preview::TextPreview>>>,
+    /// Text attachment files currently being read/decoded off the UI thread.
+    text_preview_loading: HashSet<String>,
+    /// Text attachment ids rendered on screen that need a ranged head preview fetch.
+    want_text_previews: Vec<String>,
+    /// Text attachment ids already requested via `Request::FetchPreview`.
+    asked_text_previews: HashSet<String>,
     /// The message under the pointer, which shows the toolbar.
     hover: Option<String>,
     /// A phone's press on a message, where it went down, and the timer that shows the toolbar
@@ -498,6 +509,11 @@ impl Pane {
             on_text: false,
             flash: None,
             viewer: None,
+            text_viewer: None,
+            text_previews: HashMap::new(),
+            text_preview_loading: HashSet::new(),
+            want_text_previews: Vec::new(),
+            asked_text_previews: HashSet::new(),
             hover: None,
             press: None,
             menu: None,
@@ -745,6 +761,11 @@ impl Pane {
         self.dragging = false;
         self.flash = None;
         self.viewer = None;
+        self.text_viewer = None;
+        self.text_previews.clear();
+        self.text_preview_loading.clear();
+        self.want_text_previews.clear();
+        self.asked_text_previews.clear();
         self.hover = None;
         self.menu = None;
         self.picker = None;
@@ -1301,9 +1322,20 @@ impl Pane {
             if let Some((then, name)) = self.then.remove(&file.id) {
                 draw::open_file(path, &name, then, cx);
             }
+            if self.text_viewer.as_ref().is_some_and(|v| v.file_id == file.id) {
+                self.text_viewer_landed(path, cx);
+            }
             self.play_landed(&file.id, cx);
         } else if file.failed.is_some() {
             self.then.remove(&file.id);
+            if let Some(orig_id) = file.id.strip_prefix(text_preview::HEAD_PREFIX) {
+                self.text_previews.insert(orig_id.to_owned(), None);
+            }
+            if self.text_viewer.as_ref().is_some_and(|v| v.file_id == file.id) {
+                if let Some(viewer) = self.text_viewer.as_mut() {
+                    viewer.loading_full = false;
+                }
+            }
             if self.play_after.as_ref().is_some_and(|(wanted, ..)| *wanted == file.id) {
                 self.play_after = None;
             }
@@ -1340,12 +1372,55 @@ impl Pane {
     fn fetch_wanted(&mut self, cx: &mut Context<Self>) {
         if self.is_gated() {
             self.want.clear();
+            self.want_text_previews.clear();
             return;
         }
         let wanted = pages::unasked(std::mem::take(&mut self.want), &mut self.asked);
         for (size, ids) in wanted {
             self.fetch(ids, Some(size), false, cx);
         }
+        self.fetch_text_previews(cx);
+    }
+
+    /// Requests ranged head previews (capped at 100 KB) for text/code attachments currently drawn
+    /// on screen.
+    fn fetch_text_previews(&mut self, cx: &mut Context<Self>) {
+        if self.is_gated() {
+            self.want_text_previews.clear();
+            return;
+        }
+        let mut ids = Vec::new();
+        for id in std::mem::take(&mut self.want_text_previews) {
+            if self.asked_text_previews.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let Some(account) = self.key().map(Key::account) else {
+            return;
+        };
+        let request = Request::FetchPreview {
+            account: account.clone(),
+            ids,
+            max_bytes: protocol::TEXT_PREVIEW_MAX_BYTES,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let Ok(Response::Media { files }) = answer else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.key().map(Key::account) != Some(account) {
+                    return;
+                }
+                for file in files.iter().filter(|file| file.path.is_some() || file.failed.is_some()) {
+                    this.landed(file, false, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn fetch(&mut self, ids: Vec<String>, size: Option<u32>, retry: bool, cx: &mut Context<Self>) {
@@ -1674,6 +1749,12 @@ impl Pane {
     // Keys and the clipboard.
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_viewer.is_some() {
+            if self.text_viewer_key(event, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
         if self.viewer.is_some() {
             if self.viewer_key(event, window, cx) {
                 cx.stop_propagation();
@@ -2065,6 +2146,7 @@ impl Render for Pane {
             .children(self.selection_bar(cx))
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
+            .children(self.text_viewer_layer(window, cx))
     }
 }
 

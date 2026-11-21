@@ -2265,6 +2265,13 @@ impl Pane {
 
     fn file_row(&mut self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let attachment = &message.attachments[index];
+        if crate::gui::app::prefs::choices().text_previews && !attachment.spoiler && !self.is_gated() {
+            if let Some(lang) = super::text_preview::preview_language(attachment) {
+                if let Some(card) = self.text_preview_card(message, index, lang, cx) {
+                    return card;
+                }
+            }
+        }
         let file = attachment.file.clone();
         let on_disk = file.path.clone();
         let fetching = self.then.contains_key(&file.id);
@@ -2369,6 +2376,237 @@ impl Pane {
             None => row.child(tool("download", Icon::Download, 28.).tooltip(tip("Download", None))),
         };
         row.into_any_element()
+    }
+
+    /// Inline preview card for a text or code file attachment (#385). Fetches up to 100 KB via a
+    /// ranged request only when this row is drawn on screen, decodes UTF-8 lossily off the UI
+    /// thread, rejects binary-looking bytes, and renders with the same syntax-coloured code frame.
+    fn text_preview_card(
+        &mut self,
+        message: &Rc<Message>,
+        index: usize,
+        language: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let attachment = message.attachments[index].clone();
+        let file_id = attachment.file.id.clone();
+        let preview = match self.text_previews.get(&file_id) {
+            Some(Some(preview)) => Rc::clone(preview),
+            Some(None) => return None,
+            None => {
+                let head_key = super::text_preview::head_id(&file_id);
+                let disk_path = attachment
+                    .file
+                    .path
+                    .clone()
+                    .or_else(|| self.known.get(&file_id).cloned())
+                    .or_else(|| self.known.get(&head_key).cloned());
+                if let Some(path) = disk_path {
+                    if self.text_preview_loading.insert(file_id.clone()) {
+                        let declared = attachment.file.bytes;
+                        let id_for_task = file_id.clone();
+                        let path_buf = std::path::PathBuf::from(path);
+                        cx.spawn(async move |this, cx| {
+                            let decoded = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    super::text_preview::read_file_preview(&path_buf, declared, language)
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.text_preview_loading.remove(&id_for_task);
+                                this.text_previews.insert(id_for_task, decoded.map(Rc::new));
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                } else if attachment.file.failed.is_none() && !self.asked_text_previews.contains(&file_id) {
+                    self.want_text_previews.push(file_id);
+                }
+                return None;
+            }
+        };
+
+        let block_id = 10_000usize.saturating_add(index);
+        let key = (message.id.clone(), block_id);
+        let lines = preview.inline_lines;
+        let folded = lines > CODE_LINES && !self.expanded.contains(&key);
+        let lit = if lines > super::highlight::PLAIN_LINES {
+            None
+        } else {
+            self.code_colors(message, block_id, preview.language, &preview.inline_text, cx)
+        };
+        let shown = match &lit {
+            Some(lit) if folded => first_lines(&lit.text, CODE_LINES).to_owned(),
+            Some(lit) => lit.text.clone(),
+            None if folded => preview.inline_text.lines().take(CODE_LINES).collect::<Vec<_>>().join("\n"),
+            None => preview.inline_text.clone(),
+        };
+        let highlights = code_highlights(&shown, lit.as_ref().map(|lit| lit.runs.as_slice()).unwrap_or(&[]));
+        let copied = self.copied.as_ref() == Some(&key);
+        let phone = self.metrics == Metrics::PHONE;
+        let btn_size = if phone { 36. } else { 24. };
+        let copy_text = preview.head_text.clone();
+        let copy_key = key.clone();
+        let expand_att = attachment.clone();
+        let expand_text = preview.head_text.clone();
+        let expand_truncated = preview.truncated;
+        let expand_lang = preview.language;
+        let download_att = attachment.clone();
+        let mut meta = media::type_label(&attachment);
+        if attachment.file.bytes > 0 {
+            meta = format!("{meta} · {}", media::size_label(attachment.file.bytes));
+        }
+        let mut body = div().id(("text-preview-body", block_id)).overflow_x_scroll().px(px(12.)).pt(px(2.)).pb(px(9.));
+        body.style().restrict_scroll_to_axis = Some(true);
+
+        let footer = if folded {
+            let expand_key = key.clone();
+            Some(
+                div()
+                    .id(("text-preview-more", block_id))
+                    .h(px(28.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .type_small()
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .child(format!("Show {} more lines", lines - CODE_LINES))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.expanded.insert(expand_key.clone());
+                        cx.notify();
+                    })),
+            )
+        } else if preview.truncated {
+            let open_att = attachment.clone();
+            let open_text = preview.head_text.clone();
+            let open_lang = preview.language;
+            Some(
+                div()
+                    .id(("text-preview-full", block_id))
+                    .h(px(28.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .type_small()
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .child("Expand full file")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_text_viewer(open_att.clone(), open_lang, open_text.clone(), true, window, cx);
+                    })),
+            )
+        } else {
+            None
+        };
+
+        Some(
+            div()
+                .mt(px(5.))
+                .mb(px(3.))
+                .max_w(px(MEASURE))
+                .rounded(px(theme::R_CARD))
+                .bg(tokens::code_bg())
+                .border_1()
+                .border_color(theme::hairline())
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(if phone { 38. } else { 32. }))
+                        .pl(px(10.))
+                        .pr(px(4.))
+                        .border_b_1()
+                        .border_color(theme::hairline())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(icon(media::file_icon(&attachment), 14., theme::text_soft()))
+                                .child(div().min_w_0().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(attachment.name.clone()))
+                                .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(meta)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .child(
+                                    tool(("tp-copy", block_id), if copied { Icon::Check } else { Icon::Copy }, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Copy text", None)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                            this.copied = Some(copy_key.clone());
+                                            cx.notify();
+                                            let copy_key = copy_key.clone();
+                                            cx.spawn(async move |this, cx| {
+                                                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                                                let _ = this.update(cx, |this, cx| {
+                                                    if this.copied.as_ref() == Some(&copy_key) {
+                                                        this.copied = None;
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            })
+                                            .detach();
+                                        })),
+                                )
+                                .child(
+                                    tool(("tp-expand", block_id), Icon::Fit, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Expand", None)))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_text_viewer(
+                                                expand_att.clone(),
+                                                expand_lang,
+                                                expand_text.clone(),
+                                                expand_truncated,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    tool(("tp-download", block_id), Icon::Download, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Download", None)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.fetch_then(&download_att, Then::Open, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(crate::gui::components::scroll::scroll_content(
+                    ("tp-scroll-frame", block_id),
+                    body.pb(px(14.)).child(
+                        div()
+                            .type_code()
+                            .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
+                            .whitespace_nowrap()
+                            .child(if highlights.is_empty() {
+                                shown.into_any_element()
+                            } else {
+                                StyledText::new(SharedString::from(shown)).with_highlights(highlights).into_any_element()
+                            }),
+                    ),
+                ))
+                .children(footer)
+                .into_any_element(),
+        )
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.

@@ -720,6 +720,7 @@ impl Pane {
             || self.open_select.is_some()
             || self.link_ask.is_some()
             || self.viewer.is_some()
+            || self.text_viewer.is_some()
         {
             return;
         }
@@ -752,7 +753,8 @@ impl Pane {
             || self.action_confirm.is_some()
             || self.open_select.is_some()
             || self.link_ask.is_some()
-            || self.viewer.is_some();
+            || self.viewer.is_some()
+            || self.text_viewer.is_some();
         own || self.shell.upgrade().is_some_and(|shell| {
             let shell = shell.read(cx);
             shell.layout_state.menu.is_some() || shell.layout_state.floating || shell.sidebar_state.switcher.is_some() || shell.pane_card_open(cx)
@@ -810,7 +812,9 @@ impl Pane {
     /// message's sheet or the reaction picker closes before the conversation does. False when
     /// none of them was up.
     pub(in crate::gui) fn phone_back(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.viewer.is_some() {
+        if self.text_viewer.is_some() {
+            self.close_text_viewer(cx);
+        } else if self.viewer.is_some() {
             self.close_viewer(cx);
         } else if self.confirm.is_some() {
             self.confirm = None;

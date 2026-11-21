@@ -83,6 +83,7 @@ pub const ROWS: &[Row] = &[
     row("P1", Privacy, "Let others see when I am typing", "Let others see when I am typing", &[], &["typing", "indicator", "privacy"]),
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
+    row("P3T", Privacy, "", "Show inline previews for text and code files", &[], &["text", "code", "files", "attachments", "previews", "data"]),
     row("PL", Privacy, "Links", "Confirm before opening links", &[], &["link", "links", "url", "browser", "open", "phishing", "safe", "ask", "warn"]),
     row("PS", Privacy, "Links", "Strip tracking parameters when opening", &[], &["tracking", "utm", "fbclid", "gclid", "link", "links", "privacy", "clean"]),
     row("PF", Privacy, "Links", "Sites that open without asking", &[], &["link", "links", "trusted", "allow", "dont ask again", "forget", "domain"]),

@@ -102,6 +102,17 @@ pub struct Viewer {
     decoded: Vec<(String, u32)>,
 }
 
+/// Full-screen text/code viewer opened from "Expand" on an inline text attachment preview (#385).
+pub struct TextViewer {
+    pub attachment: Attachment,
+    pub file_id: String,
+    pub language: &'static str,
+    pub text: String,
+    pub loading_full: bool,
+    pub truncated: bool,
+    pub copied: bool,
+}
+
 /// What is kept around the picture: the sides, the bar above it, the caption below. A phone
 /// shows the picture edge to edge, under the status bar's band and its own strip, over the home
 /// indicator's.
@@ -802,6 +813,194 @@ impl Pane {
                     .child(action("copy", Icon::Copy).on_click(cx.listener(|this, _, _, cx| this.copy_viewed(cx))))
                     .child(action("save", Icon::Download).on_click(cx.listener(|this, _, _, cx| this.save_viewed(cx)))),
             )
+    }
+
+    // Full-screen text/code attachment viewer (#385).
+
+    /// Opens an expanded full-screen text viewer for a previewed text/code attachment. Starts
+    /// with `initial_text` immediately and fetches the full file if `truncated` or not on disk.
+    pub(super) fn open_text_viewer(
+        &mut self,
+        attachment: Attachment,
+        language: &'static str,
+        initial_text: String,
+        truncated: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_id = attachment.file.id.clone();
+        let full_path = attachment.file.path.clone().or_else(|| self.known.get(&file_id).cloned());
+        let needs_fetch = truncated && full_path.is_none();
+        self.text_viewer = Some(TextViewer {
+            attachment: attachment.clone(),
+            file_id: file_id.clone(),
+            language,
+            text: initial_text,
+            loading_full: needs_fetch,
+            truncated,
+            copied: false,
+        });
+        window.focus(&self.focus, cx);
+        if let Some(path) = full_path {
+            self.text_viewer_landed(&path, cx);
+        } else if needs_fetch {
+            self.fetch(vec![file_id], None, attachment.file.failed.is_some(), cx);
+        }
+        cx.notify();
+    }
+
+    /// Loads the full downloaded text file into the open text viewer off the UI thread.
+    pub(super) fn text_viewer_landed(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(file_id) = self.text_viewer.as_ref().map(|v| v.file_id.clone()) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { super::text_preview::read_full_text(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(viewer) = this.text_viewer.as_mut().filter(|v| v.file_id == file_id) {
+                    viewer.loading_full = false;
+                    if let Some((full_text, truncated)) = loaded {
+                        viewer.text = full_text;
+                        viewer.truncated = truncated;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn close_text_viewer(&mut self, cx: &mut Context<Self>) {
+        if self.text_viewer.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn text_viewer_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let keys = &event.keystroke;
+        let command = crate::gui::shortcuts::primary(keys.modifiers);
+        match (keys.key.as_str(), command) {
+            ("escape", _) => self.close_text_viewer(cx),
+            ("c", true) => {
+                if let Some(viewer) = self.text_viewer.as_mut() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(viewer.text.clone()));
+                    viewer.copied = true;
+                    cx.notify();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub(super) fn text_viewer_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let viewer = self.text_viewer.as_ref()?;
+        let size = window.viewport_size();
+        let name = if viewer.attachment.name.is_empty() {
+            "attachment.txt".to_owned()
+        } else {
+            viewer.attachment.name.clone()
+        };
+        let mut subtitle_parts = Vec::new();
+        if !viewer.language.is_empty() {
+            subtitle_parts.push(viewer.language.to_owned());
+        }
+        if viewer.attachment.file.bytes > 0 {
+            subtitle_parts.push(media::size_label(viewer.attachment.file.bytes));
+        }
+        if viewer.loading_full {
+            subtitle_parts.push("Loading full file…".to_owned());
+        } else if viewer.truncated {
+            subtitle_parts.push("Showing first 4 MB".to_owned());
+        }
+        let subtitle = subtitle_parts.join(" · ");
+        let copy_text = viewer.text.clone();
+        let copied = viewer.copied;
+        let download_att = viewer.attachment.clone();
+        let text_body = viewer.text.clone();
+        let bar = div()
+            .flex_none()
+            .h(px(TOP_BAR))
+            .px(px(16.))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .bg(theme::canvas())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(icon(media::file_icon(&viewer.attachment), 16., theme::text_soft()))
+                    .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(name))
+                    .when(!subtitle.is_empty(), |row| {
+                        row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(subtitle))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        bar_button("tv-copy", if copied { Icon::Check } else { Icon::Copy })
+                            .tooltip(tip(if copied { "Copied" } else { "Copy text" }, Some("⌘C")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                if let Some(v) = this.text_viewer.as_mut() {
+                                    v.copied = true;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        bar_button("tv-download", Icon::Download)
+                            .tooltip(tip("Download", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.fetch_then(&download_att, super::Then::Open, cx);
+                            })),
+                    )
+                    .child(
+                        bar_button("tv-close", Icon::Close)
+                            .tooltip(tip("Close", Some("Esc")))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_text_viewer(cx))),
+                    ),
+            );
+        let body = div()
+            .id("text-viewer-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_scroll()
+            .bg(tokens::code_bg())
+            .p(px(16.))
+            .child(
+                div()
+                    .type_code()
+                    .text_color(theme::text())
+                    .whitespace_nowrap()
+                    .child(text_body),
+            );
+        let panel = div()
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::canvas())
+            .occlude()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(bar)
+            .child(body);
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(panel)).priority(2).into_any_element())
     }
 }
 

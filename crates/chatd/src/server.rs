@@ -3489,6 +3489,14 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::FetchPreview { account, ids, max_bytes } => {
+                let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
+                let ids = &ids[..ids.len().min(PAGE_LIMIT as usize)];
+                match self.blobs.request_preview(&account, ids, max_bytes, adapter) {
+                    Ok(files) => Response::Media { files },
+                    Err(err) => internal(err),
+                }
+            }
 
             Request::SignIn { network, at } => self.sign_in(network, at),
             Request::SignInBegin { network } => self.sign_in_step(network, None),
