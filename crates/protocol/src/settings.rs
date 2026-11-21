@@ -51,6 +51,13 @@ pub const OUTPUT: &str = "output";
 /// V22. The camera, stored as V1 and V2 store theirs: absent is the first camera the system
 /// lists, else one by name, then a tab and the system's id for it.
 pub const CAMERA: &str = "camera";
+/// V23. Camera resolution/rate tier: `auto`, `hd`, `standard`, or `data_saver`.
+pub const CAMERA_QUALITY: &str = "camera_quality";
+pub const CAMERA_QUALITY_CHOICES: [&str; 4] = ["auto", "hd", "standard", "data_saver"];
+/// V24. Mirror the local camera self-view horizontally (never what peers see). Defaults on.
+pub const CAMERA_MIRROR: &str = "camera_mirror";
+/// V25. Apply lightweight on-device background blur before encoding camera video. Defaults off.
+pub const CAMERA_BLUR: &str = "camera_blur";
 /// The stored value of "System default" in V1 and V2.
 pub const SYSTEM_DEFAULT: &str = "@system";
 /// V4. Every join and every Accept starts muted.
@@ -271,6 +278,9 @@ fn kind(key: &str) -> Option<Kind> {
         ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
         NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
+        CAMERA_QUALITY => Kind::Word(&CAMERA_QUALITY_CHOICES, "auto"),
+        CAMERA_MIRROR => Kind::Switch(true),
+        CAMERA_BLUR => Kind::Switch(false),
         JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN => Kind::Switch(false),
         MUTED_TALK => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
@@ -278,7 +288,7 @@ fn kind(key: &str) -> Option<Kind> {
         VOICE_VOLUME => Kind::Percent(100),
         INPUT_VOLUME => Kind::Percent(100),
         SENSITIVITY => Kind::Percent(25),
-        INPUT | OUTPUT => Kind::Device,
+        INPUT | OUTPUT | CAMERA => Kind::Device,
         PTT_KEY | PRIORITY_KEY | MUTE_KEY | DEAFEN_KEY => Kind::Hotkey,
         _ if gain_user(key).is_some() => Kind::Gain,
         KEEP_DAYS => Kind::Choice(&KEEP_DAYS_CHOICES, 90),
@@ -640,6 +650,20 @@ impl Values {
     /// How clearly to encode on a Tiny call, within the room's bitrate.
     pub fn voice_quality(&self) -> crate::VoiceQuality {
         crate::VoiceQuality::parse(self.word(GLOBAL, VOICE_QUALITY)).unwrap_or_default()
+    }
+
+    /// V23: Auto, HD (720p30), Standard (360p15), or Data saver.
+    pub fn camera_quality(&self) -> crate::CameraQuality {
+        crate::CameraQuality::parse(self.word(GLOBAL, CAMERA_QUALITY)).unwrap_or_default()
+    }
+
+    /// V23–V25: camera quality, self-view mirror, and on-device background blur.
+    pub fn camera_settings(&self) -> crate::CameraSettings {
+        crate::CameraSettings {
+            quality: self.camera_quality(),
+            mirror: self.on(CAMERA_MIRROR),
+            blur: self.on(CAMERA_BLUR),
+        }
     }
 
     /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
@@ -1242,5 +1266,31 @@ mod tests {
         assert!(telegram_relay_only(false, true));
         assert!(telegram_relay_only(true, true));
         assert!(!telegram_relay_only(true, false));
+    }
+
+    #[test]
+    fn camera_quality_mirror_and_blur_settings_validate_and_resolve() {
+        let mut values = Values::default();
+        assert_eq!(values.camera_settings(), crate::CameraSettings {
+            quality: crate::CameraQuality::Auto,
+            mirror: true,
+            blur: false,
+        });
+        for q in CAMERA_QUALITY_CHOICES {
+            assert!(valid(GLOBAL, CAMERA_QUALITY, q), "{q}");
+        }
+        assert!(!valid(GLOBAL, CAMERA_QUALITY, "4k"));
+        assert!(valid(GLOBAL, CAMERA_MIRROR, "off") && valid(GLOBAL, CAMERA_MIRROR, "on"));
+        assert!(valid(GLOBAL, CAMERA_BLUR, "on") && valid(GLOBAL, CAMERA_BLUR, "off"));
+        assert!(valid(GLOBAL, CAMERA, "FaceTime HD\tcam-0"));
+
+        values.set(GLOBAL, CAMERA_QUALITY, Some("hd".into()));
+        values.set(GLOBAL, CAMERA_MIRROR, Some("off".into()));
+        values.set(GLOBAL, CAMERA_BLUR, Some("on".into()));
+        assert_eq!(values.camera_settings(), crate::CameraSettings {
+            quality: crate::CameraQuality::Hd,
+            mirror: false,
+            blur: true,
+        });
     }
 }

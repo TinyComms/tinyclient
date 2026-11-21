@@ -345,6 +345,7 @@ fn session_requests(settings: &protocol::settings::Values) -> Vec<MediaRequest> 
         MediaRequest::Input(input_mode(settings, false)),
         MediaRequest::Processing(settings.processing()),
         MediaRequest::Quality(settings.voice_quality()),
+        MediaRequest::CameraSettings(settings.camera_settings()),
         MediaRequest::Devices { input, output, camera },
     ];
     if let Some(guard) = protocol::log_policy::current() {
@@ -1172,6 +1173,7 @@ impl Calls {
             let _ = active.request(&MediaRequest::Processing(settings.processing()));
             let quality = settings.voice_quality();
             let _ = active.request(&MediaRequest::Quality(quality));
+            let _ = active.request(&MediaRequest::CameraSettings(settings.camera_settings()));
             // Re-apply the room bitrate under the new quality cap when we know the room's.
             let room_bitrate = crate::hub::lock(&active.live).room_bitrate;
             if let Some(kbps) = room_bitrate {

@@ -15,17 +15,17 @@ use crate::gui::theme::{self, Type};
 use gpui::{canvas, div, img, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, ObjectFit, SharedString, Window};
 use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
-    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
-    ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
-    PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
-    VOICE_VOLUME,
+    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CAMERA_BLUR, CAMERA_MIRROR, CAMERA_QUALITY, CAMERA_QUALITY_CHOICES,
+    CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS,
+    KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, QUALITY_CHOICES,
+    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
 
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
 pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8" | "V11" | "V21")
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8" | "V11" | "V21" | "V23")
 }
 
 /// `--settings-choice` names one of these.
@@ -45,6 +45,7 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "V8" => "V8",
         "V11" => "V11",
         "V21" => "V21",
+        "V23" => "V23",
         _ => return None,
     })
 }
@@ -66,6 +67,7 @@ fn choice_slot(id: &str) -> usize {
         "V8" => 48,
         "V11" => 49,
         "V21" => 50,
+        "V23" => 51,
         _ => 0,
     }
 }
@@ -108,6 +110,10 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
         "V21" => {
             let at = QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, VOICE_QUALITY)).unwrap_or(1);
             (QUALITY_CHOICES.iter().zip(["Data saver", "Standard", "High"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 1)
+        }
+        "V23" => {
+            let at = CAMERA_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, CAMERA_QUALITY)).unwrap_or(0);
+            (CAMERA_QUALITY_CHOICES.iter().zip(["Auto", "HD (720p)", "Standard (360p)", "Data saver"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
         }
         "N7" => (pairs(&["1 hour", "Until tomorrow", "Until I resume"]), 0, 0),
         _ => return None,
@@ -413,7 +419,7 @@ impl SettingsWindow {
                 self.group(&["V1"], Some("Microphone"), window, cx).child(caption("How your microphone opens, its level and its processing are in Voice.")),
                 self.group(&["V2", "V5"], Some("Speaker"), window, cx)
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
-                self.group(&["V22"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
+                self.group(&["V22", "V23", "V24", "V25"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
                 self.group(&["V4"], Some("Joining"), window, cx),
             ],
             Section::Voice => {
@@ -857,6 +863,21 @@ impl SettingsWindow {
             "P1" | "P2" => return self.per_account_rows(id, cx).unwrap_or_else(div),
             "V1" | "V2" => self.device_row(id, cx),
             "V22" => self.camera_row(cx),
+            "V23" => {
+                let at = CAMERA_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, CAMERA_QUALITY)).unwrap_or(0);
+                let second = Some("Auto sends 720p at 30 fps with a hardware encoder and adapts down on busy links. Data saver caps at 360p / 350 kb/s.".to_owned());
+                self.menu_choice_row(id, &["Auto", "HD (720p)", "Standard (360p)", "Data saver"], at, 0, second, None, cx)
+            }
+            "V24" => {
+                let on = values.on(CAMERA_MIRROR);
+                let second = Some("Flips your own camera preview only. Others always see you unmirrored.".to_owned());
+                self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, CAMERA_MIRROR, on, true, cx), cx)
+            }
+            "V25" => {
+                let on = values.on(CAMERA_BLUR);
+                let second = Some("Softens your background on this device before sending. No model is downloaded.".to_owned());
+                self.switch_row(id, on, false, second, move |this, on, cx| this.set_switch(id, CAMERA_BLUR, on, false, cx), cx)
+            }
             "V3" => self.meter_row(cx),
             "V8" => {
                 let push = values.on(PUSH_TO_TALK);
@@ -1241,6 +1262,11 @@ impl SettingsWindow {
                 let word = QUALITY_CHOICES[ix.min(QUALITY_CHOICES.len() - 1)];
                 let stored = (word != "standard").then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), VOICE_QUALITY, stored, cx);
+            }
+            "V23" => {
+                let word = CAMERA_QUALITY_CHOICES[ix.min(CAMERA_QUALITY_CHOICES.len() - 1)];
+                let stored = (word != "auto").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), CAMERA_QUALITY, stored, cx);
             }
             "N7" => {
                 let now = crate::view::now();
@@ -2500,7 +2526,7 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8", "V11", "V21"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8", "V11", "V21", "V23"] {
             assert!(menu_choice(id), "{id}");
         }
         for id in ["A3", "M1", "M2", "N5", "N7"] {

@@ -545,8 +545,11 @@ impl Chat {
             | settings::NOISE_SUPPRESSION
             | settings::AUTO_GAIN
             | settings::INPUT_VOLUME
-            | settings::VOICE_QUALITY => self.hub.calls.retune(&self.hub),
-            settings::INPUT | settings::OUTPUT => self.hub.calls.redevice(&self.hub),
+            | settings::VOICE_QUALITY
+            | settings::CAMERA_QUALITY
+            | settings::CAMERA_MIRROR
+            | settings::CAMERA_BLUR => self.hub.calls.retune(&self.hub),
+            settings::INPUT | settings::OUTPUT | settings::CAMERA => self.hub.calls.redevice(&self.hub),
             // `set_setting` has already moved chatd's own ceiling.
             settings::LOG_LEVEL => self.hub.calls.relevel(),
             _ => {}

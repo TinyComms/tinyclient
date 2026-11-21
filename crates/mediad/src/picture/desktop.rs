@@ -128,7 +128,13 @@ impl Backend {
     /// the first frame's, not the opener's.
     fn open_h264(bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
         let api = load_api()?;
-        let threads = if screen { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16 } else { 1 };
+        let threads = if screen {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16
+        } else if fps > 15. {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4) as u16
+        } else {
+            1
+        };
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bps))
             .rate_control_mode(RateControlMode::Bitrate)
@@ -349,12 +355,20 @@ struct Selfie {
 impl Selfie {
     /// Paints this grab, unless the last was painted less than [`super::SELF_VIEW_EVERY`] ago.
     fn shoot(&mut self, grabbed: &Rgba) {
+        self.shoot_mirrored(grabbed, false);
+    }
+
+    /// Paints this grab, optionally mirrored horizontally (for the local camera self-view only).
+    fn shoot_mirrored(&mut self, grabbed: &Rgba, mirror: bool) {
         if self.at.is_some_and(|at| at.elapsed() < super::SELF_VIEW_EVERY) {
             return;
         }
         self.at = Some(Instant::now());
         let (width, height) = fit(grabbed.width, grabbed.height, super::SELF_VIEW.0, super::SELF_VIEW.1);
-        let rgb = super::screens::shrink(grabbed, width, height);
+        let mut rgb = super::screens::shrink(grabbed, width, height);
+        if mirror {
+            super::mirror_rgb_horizontal(&mut rgb, width, height);
+        }
         self.generation = self.generation.wrapping_add(1);
         if let Some(painted) = self.canvas.paint(&rgb, width, height, self.generation) {
             self.painted = Some(painted);
@@ -470,19 +484,23 @@ impl Outgoing {
             load_api()?;
         }
         let began = Instant::now();
-        let grabbed = self.camera.frame()?;
+        let mut grabbed = self.camera.frame()?;
         self.camera_cost.note(began.elapsed(), (grabbed.width, grabbed.height));
-        self.selfie.shoot(&grabbed);
-        let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32| match ask {
+        if super::camera_blur() {
+            super::apply_background_blur(&mut grabbed);
+        }
+        self.selfie.shoot_mirrored(&grabbed, super::camera_mirror());
+        let profile = super::camera_profile();
+        let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32, fps: f32| match ask {
             Some(ask) => {
                 let (width, height) = fit(grabbed.width, grabbed.height, most.0, most.1);
                 let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
-                coded(slot, width, height, nominal, FULL_FPS, false)?.encode(&planes, &ask)
+                coded(slot, width, height, nominal, fps, false)?.encode(&planes, &ask)
             }
             None => Ok(Encoded::default()),
         };
-        let high = layer(&mut self.high, high, CAMERA_HIGH, CAMERA_HIGH_BPS)?;
-        let low = layer(&mut self.low, low, CAMERA_LOW, CAMERA_LOW_BPS)?;
+        let high = layer(&mut self.high, high, profile.max, profile.bps, profile.fps as f32)?;
+        let low = layer(&mut self.low, low, CAMERA_LOW, CAMERA_LOW_BPS, FULL_FPS)?;
         Ok((high, low))
     }
 

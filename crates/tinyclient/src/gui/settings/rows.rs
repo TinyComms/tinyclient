@@ -90,6 +90,9 @@ pub const ROWS: &[Row] = &[
     row("PE", Privacy, "Calls", "Only join end-to-end encrypted calls", &[], &["encryption", "encrypted", "e2ee", "end to end", "tiny", "call", "downgrade", "privacy"]),
     row("V1", Audio, "Microphone", "Microphone", &[], &["input", "mic", "device", "headset"]),
     row("V22", Audio, "Camera", "Camera", &[], &["webcam", "video", "device", "preview"]),
+    row("V23", Audio, "Camera", "Camera quality", &["Auto", "HD (720p)", "Standard (360p)", "Data saver"], &["camera", "video", "hd", "720p", "360p", "quality", "fps", "bandwidth", "data saver"]),
+    row("V24", Audio, "Camera", "Mirror my video", &[], &["camera", "mirror", "flip", "self view", "video"]),
+    row("V25", Audio, "Camera", "Background blur", &[], &["camera", "blur", "background", "privacy", "video"]),
     row("V2", Audio, "Speaker", "Speaker", &[], &["output", "headphones", "device", "speakers"]),
     row("V5", Audio, "Speaker", "Call volume", &[], &["volume", "loud", "quiet", "voices"]),
     row("V4", Audio, "Joining", "Join calls with my microphone muted", &[], &["mute", "muted", "join"]),
@@ -240,7 +243,7 @@ pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
-            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
+            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V23" | "V24" | "V25" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
 
