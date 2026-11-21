@@ -3394,6 +3394,7 @@ pub enum Response {
     /// Unread messages grouped by conversation (`Request::AllUnreads`, #606).
     AllUnreads {
         groups: Vec<UnreadGroup>,
+    },
     /// Members who have read a given message (`Request::ReadBy`).
     ReadBy {
         readers: Vec<ReadBy>,
