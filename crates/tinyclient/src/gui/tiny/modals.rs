@@ -70,9 +70,66 @@ impl Shell {
         self.tiny_state.modal_error.clone().map(|detail| div().mt(px(12.)).whitespace_normal().type_small().text_color(theme::danger()).child(detail))
     }
 
+    fn new_direct_modal(&self, page: &Page, window: &Window, cx: &mut Context<Self>) -> Div {
+        let query = self.tiny_state.search_input.read(cx).text().trim().to_lowercase();
+        let mut members: Vec<&protocol::TinyMember> = page
+            .community
+            .members
+            .iter()
+            .filter(|m| m.user_id != page.me)
+            .filter(|m| {
+                if query.is_empty() {
+                    return true;
+                }
+                model::name_of(m).to_lowercase().contains(&query) || m.email.to_lowercase().contains(&query)
+            })
+            .collect();
+        members.sort_by(|a, b| model::name_of(a).to_lowercase().cmp(&model::name_of(b).to_lowercase()));
+        let mut list = div().id("tiny-new-direct-list").mt(px(12.)).max_h(px(260.)).overflow_y_scroll().flex().flex_col().gap(px(2.));
+        if members.is_empty() {
+            list = list.child(div().py(px(16.)).flex().justify_center().type_small().text_color(theme::text_faint()).child("No matching members"));
+        } else {
+            for member in members {
+                let name = model::name_of(member);
+                let id = member.user_id.clone();
+                let mut avatar = crate::gui::components::Avatar::new(&page.key(&member.user_id), &name, 24.).image_at(page.picture(&member.user_id));
+                if let Some(presence) = page.online(&member.user_id) {
+                    avatar = avatar.presence(presence, theme::overlay());
+                }
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("tiny-new-dm-{}", member.user_id)))
+                        .h(px(36.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.tiny_message(id.clone(), cx)))
+                        .child(avatar.build())
+                        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(name)),
+                );
+            }
+        }
+        modal("New direct message")
+            .child(words("Choose someone on this server to message."))
+            .child(div().mt(px(12.)).child(self.input_box(&self.tiny_state.search_input, window, cx)))
+            .child(list)
+            .child(
+                div()
+                    .mt(px(16.))
+                    .flex()
+                    .justify_end()
+                    .child(button("tiny-modal-cancel", ButtonKind::Secondary, "Close").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
+            )
+    }
+
     pub(super) fn tiny_modal(&self, page: &Page, modal_on_show: &Modal, window: &Window, cx: &mut Context<Self>) -> Div {
         match modal_on_show {
             Modal::Share => self.tiny_share_modal(cx),
+            Modal::NewDirect => self.new_direct_modal(page, window, cx),
             Modal::Invite => self.invite_modal(page, window, cx),
             Modal::Code { paste, origin, terms, role } => self.code_modal(page, paste, origin, terms, role, cx),
             Modal::Kick(user_id) => {

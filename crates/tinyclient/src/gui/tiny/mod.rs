@@ -115,6 +115,8 @@ pub(super) enum Modal {
     RecoveryCodes(Vec<String>),
     /// One of this account's passkeys, to remove, by id, with its name for the words.
     RemovePasskey { id: String, label: String },
+    /// Pick a member of this server to open a direct message with.
+    NewDirect,
 }
 
 impl Modal {
@@ -1406,6 +1408,10 @@ impl Shell {
                 self.tiny_state.invite = InviteDraft::default();
                 None
             }
+            Modal::NewDirect => {
+                self.tiny_state.search_input.update(cx, |input, cx| input.set_text("", cx));
+                Some(self.tiny_state.search_input.clone())
+            }
             _ => None,
         };
         if let Some(input) = focus {
@@ -1421,8 +1427,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Opens a direct message with someone on this server. The chat is a People conversation,
-    /// not a channel of the server.
+    /// Opens a direct message with someone on this server in place, without leaving the server.
     pub(super) fn tiny_message(&mut self, user_id: String, cx: &mut Context<Self>) {
         let Some(page) = self.tiny_page_facts() else {
             return;
@@ -1435,7 +1440,6 @@ impl Shell {
         drop(page);
         self.close_modal(cx);
         self.tiny_close_float(cx);
-        self.go(Mode::People, cx);
         self.open_person(&person, cx);
     }
 
