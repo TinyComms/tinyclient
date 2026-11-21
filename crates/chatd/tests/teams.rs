@@ -470,6 +470,9 @@ impl Fake {
             limited.headers.push(("Retry-After", "7".to_owned()));
             return limited;
         }
+        if sent["content"].as_str().unwrap_or("").contains("moderated post") {
+            return answer("403 Forbidden", json!({"errorCode": 403, "message": "User is not allowed to post in this channel."}));
+        }
         let arrived = 1_760_001_000_000 + u64::from(self.posted.fetch_add(1, Ordering::Relaxed)) * 1000;
         let (thread, root) = conversation.split_once(";messageid=").map_or((conversation, None), |(thread, root)| (thread, Some(root.to_owned())));
         let root = root.or_else(|| thread.contains("@thread.tacv2").then(|| arrived.to_string()));
@@ -1746,4 +1749,77 @@ fn adaptive_connector_and_hero_cards_render_and_malformed_falls_back() {
     assert!(broken.card.is_none());
     assert_eq!(broken.text, "Card");
     assert!(matches!(broken.kind, MessageKind::Unsupported { ref link } if link.contains("1760000801004")));
+}
+
+#[test]
+fn channel_post_subject_announcements_moderation_and_threads_layout() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+
+    // 1. Account advertises channel_subject capability.
+    assert!(world.account(HOME).can.channel_subject);
+
+    // 2. Sending a channel post with a subject emits properties.subject and bolds the first line.
+    let client_id = "1760000999000617";
+    let req = Request::Send {
+        conversation: general.clone(),
+        client_id: client_id.to_owned(),
+        text: "Deployment window is Friday 10:00 UTC.".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            subject: Some("Maintenance window".to_owned()),
+            ..protocol::Outgoing::default()
+        },
+    };
+    assert!(matches!(world.ask(req), Response::Sent { .. }));
+    let sent = world.until("channel post with subject accepted", || {
+        world.messages(&general).into_iter().find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.text, "Maintenance window\nDeployment window is Friday 10:00 UTC.");
+    assert!(ranges(&sent).contains(&("Maintenance window", &Style::Bold)));
+    let posted = world.fake.calls("POST", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages")).pop().unwrap();
+    assert_eq!(posted.json()["properties"]["subject"].as_str(), Some("Maintenance window"));
+
+    // 3. Moderated channel 403 refusal surfaces a clear moderation message.
+    let mod_id = "1760000999000618";
+    world.send(&general, mod_id, "moderated post");
+    let refused = world.until("moderated post refusal", || {
+        world.message(&general, mod_id).filter(|m| m.state != SendState::Pending)
+    });
+    assert_eq!(
+        refused.state,
+        SendState::Failed { reason: "Only channel moderators can start new posts here.".to_owned() }
+    );
+
+    // 4. Announcement post extracts headline + subhead, treats banner as decoration, marks row.
+    let mut ann = message(GENERAL, Some("1760000810001"), 1_760_000_810_001, ANA, "Ana Ruiz", "<p>All hands at 14:00.</p>");
+    ann["properties"] = json!({
+        "cardType": "announcement",
+        "title": "Q4 Town Hall",
+        "subject": "Engineering & Product",
+        "bannerColor": "#5B5FC7",
+        "bannerImage": "https://external.example/banner.jpg"
+    });
+    world.fake.push("NewMessage", ann, false);
+    let stored_ann = world.until("announcement to arrive", || world.message(&general, "1760000810001"));
+    assert!(stored_ann.announcement);
+    assert_eq!(stored_ann.kind, MessageKind::Normal);
+    assert_eq!(stored_ann.text, "Q4 Town Hall\nEngineering & Product\nAll hands at 14:00.");
+    assert!(ranges(&stored_ann).contains(&("Q4 Town Hall", &Style::Bold)));
+    assert!(ranges(&stored_ann).contains(&("Engineering & Product", &Style::Italic)));
+    assert!(stored_ann.attachments.is_empty(), "announcement banner is decoration only");
+
+    // 5. Threads-layout channel reply using rootMessageId (without ;messageid= in conversationLink)
+    // still maps to the post's reply chain.
+    let mut threaded_reply = message(GENERAL, None, 1_760_000_810_050, BEN, "Ben Okafor", "<p>Count me in!</p>");
+    threaded_reply["rootMessageId"] = json!("1760000810001");
+    world.fake.push("NewMessage", threaded_reply, false);
+    let ann_with_reply = world.until("announcement thread summary", || {
+        world.message(&general, "1760000810001").filter(|m| m.thread.as_ref().is_some_and(|t| t.replies == 1))
+    });
+    assert_eq!(ann_with_reply.thread.unwrap().replies, 1);
+    let ann_chain = key(&format!("{GENERAL};messageid=1760000810001"));
+    assert_eq!(world.messages(&ann_chain).last().map(|m| m.text.as_str()), Some("Count me in!"));
 }

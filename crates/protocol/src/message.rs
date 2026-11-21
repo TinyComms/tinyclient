@@ -686,6 +686,9 @@ pub struct Message {
     /// Message importance (Teams: Normal / Important / Urgent).
     #[serde(default, skip_serializing_if = "crate::Importance::is_normal")]
     pub importance: crate::Importance,
+    /// Channel announcement post (Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub announcement: bool,
     /// Optional message effect identifier (Telegram).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<String>,
@@ -795,6 +798,7 @@ impl Message {
             can_edit: None,
             can_delete: None,
             importance: crate::Importance::Normal,
+            announcement: false,
             effect: None,
             contacts: Vec::new(),
             sent_via: None,
@@ -1050,5 +1054,21 @@ mod tests {
         // Older payloads without `actions` still deserialize.
         let legacy: Card = serde_json::from_str(r#"{"title":"Old"}"#).unwrap();
         assert!(legacy.actions.is_empty());
+    }
+
+    #[test]
+    fn channel_subject_and_announcement_round_trip() {
+        let plain = crate::Outgoing::default();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("subject"));
+        let with_subject = crate::Outgoing { subject: Some("Q4 kickoff".into()), ..crate::Outgoing::default() };
+        assert!(!with_subject.is_plain());
+        let wire = serde_json::to_string(&with_subject).unwrap();
+        assert_eq!(serde_json::from_str::<crate::Outgoing>(&wire).unwrap(), with_subject);
+
+        let mut msg = Message::plain("m3", "Ana", "Launch day", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("announcement"));
+        msg.announcement = true;
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(serde_json::from_str::<Message>(&wire).unwrap().announcement);
     }
 }

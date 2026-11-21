@@ -936,6 +936,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         can_edit: None,
         can_delete: None,
         importance: protocol::Importance::Normal,
+        announcement: false,
         effect: None,
         contacts: Vec::new(),
         sent_via: None,

@@ -907,6 +907,24 @@ impl Pane {
                 None => sent.children(said).children(attached),
             };
             sent = sent
+                .children(message.announcement.then(|| {
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(theme::accent())
+                                .type_micro()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(theme::accent_text())
+                                .child("ANNOUNCEMENT"),
+                        )
+                }))
                 .children((message.importance != protocol::Importance::Normal).then(|| {
                     let (label, color) = match message.importance {
                         protocol::Importance::Urgent => ("URGENT", theme::danger()),

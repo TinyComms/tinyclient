@@ -50,15 +50,60 @@ fn person(from: &str) -> &str {
 }
 
 /// The conversation a message is in and, in a channel, the post its reply chain hangs off:
-/// `…/conversations/19:x@thread.tacv2;messageid=1700000000000`.
+/// `…/conversations/19:x@thread.tacv2;messageid=1700000000000`. Newer threads-layout channels may
+/// carry `rootMessageId` or `properties.parentMessageId` instead of `;messageid=`.
 fn placed(raw: &Value) -> Option<(String, Option<String>)> {
     let link = raw["conversationLink"].as_str().unwrap_or("");
     let named = link.split_once("/conversations/").map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
     let named = named.or(raw["conversationid"].as_str()).filter(|named| !named.is_empty())?;
-    Some(match chain_of(named) {
+    let (channel, mut root) = match chain_of(named) {
         Some((channel, root)) => (channel.to_owned(), Some(root.to_owned())),
         None => (named.to_owned(), None),
-    })
+    };
+    if root.is_none() {
+        let fallback = [&raw["rootMessageId"], &raw["parentMessageId"], &raw["properties"]["parentMessageId"]]
+            .into_iter()
+            .map(id_of)
+            .find(|id| millis(id) > 0);
+        if let Some(parent) = fallback {
+            root = Some(parent);
+        }
+    }
+    Some((channel, root))
+}
+
+/// Detects a Teams channel announcement post and extracts its headline and optional subhead.
+/// Any banner image or color is treated as decoration only (never fetched).
+fn announcement_parts(props: &Value, content: &str) -> Option<(String, Option<String>)> {
+    let parsed_ann = match &props["announcement"] {
+        Value::String(text) if text.trim().starts_with('{') => serde_json::from_str::<Value>(text).ok(),
+        Value::Object(_) => Some(props["announcement"].clone()),
+        _ => None,
+    };
+    let is_ann = props["cardType"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("announcement"))
+        || props["postType"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("announcement"))
+        || props["isAnnouncement"] == true
+        || props["isAnnouncement"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"))
+        || parsed_ann.is_some()
+        || props["bannerImage"].as_str().is_some_and(|s| !s.trim().is_empty())
+        || props["bannerColor"].as_str().is_some_and(|s| !s.trim().is_empty())
+        || props["headerImage"].as_str().is_some_and(|s| !s.trim().is_empty())
+        || content.contains("http://schema.skype.com/Announcement");
+    if !is_ann {
+        return None;
+    }
+    let ann_title = parsed_ann.as_ref().and_then(|v| v["title"].as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let ann_sub = parsed_ann.as_ref().and_then(|v| v["subhead"].as_str().or(v["subtitle"].as_str())).map(str::trim).filter(|s| !s.is_empty());
+    let title = ann_title
+        .or_else(|| props["title"].as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .or_else(|| props["subject"].as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("")
+        .to_owned();
+    let subhead = ann_sub
+        .or_else(|| props["subhead"].as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .or_else(|| props["subject"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != title))
+        .map(str::to_owned);
+    Some((title, subhead))
 }
 
 /// A value Teams writes as a string, a number, or leaves out: `edittime`, `deletetime`.
@@ -447,10 +492,25 @@ impl Teams {
             "Text" => html::parse(&format!("<p>{}</p>", html::escape_plain(content)), &refs, &me),
             _ => html::parse(content, &refs, &me),
         };
-        // A channel post's headline is part of what it says.
-        let subject = [&props["subject"], &props["title"]].into_iter().filter_map(Value::as_str).find(|subject| !subject.trim().is_empty());
+        // A channel post's headline or announcement header is part of what it says.
+        let announcement = announcement_parts(props, content);
+        let subject = if let Some((ref headline, ref subhead)) = announcement {
+            message.announcement = true;
+            if !headline.is_empty() {
+                Some(headline.as_str())
+            } else {
+                subhead.as_deref()
+            }
+        } else {
+            [&props["subject"], &props["title"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|subject| !subject.is_empty())
+        };
+        let announcement_subhead = announcement.as_ref().and_then(|(h, s)| s.as_deref().filter(|sub| !h.is_empty() && *sub != h));
         if message.outgoing {
-            let subject_owned = subject.map(|s| s.trim().to_owned());
+            let subject_owned = subject.map(str::to_owned);
             let images_html = html::inline_images_html(content, |url| self.pictures(url));
             if subject_owned.is_some() || !images_html.is_empty() {
                 let mut state = self.state();
@@ -460,7 +520,16 @@ impl Teams {
                 state.own_meta.insert((conversation.to_owned(), id.clone()), OwnMeta { subject: subject_owned, images_html });
             }
         }
-        if let Some(subject) = subject.map(str::trim) {
+        if let Some(subhead) = announcement_subhead {
+            let shift = (subhead.len() + usize::from(!parsed.text.is_empty())) as u32;
+            for span in &mut parsed.spans {
+                span.start += shift;
+                span.end += shift;
+            }
+            parsed.text = if parsed.text.is_empty() { subhead.to_owned() } else { format!("{subhead}\n{}", parsed.text) };
+            parsed.spans.insert(0, Span { start: 0, end: subhead.len() as u32, style: Style::Italic });
+        }
+        if let Some(subject) = subject.map(str::trim).filter(|s| !s.is_empty()) {
             let shift = (subject.len() + usize::from(!parsed.text.is_empty())) as u32;
             for span in &mut parsed.spans {
                 span.start += shift;
@@ -1002,16 +1071,17 @@ impl Teams {
     /// in that chain. A reply to a message in a chat quotes it, as Teams does; a reply to a
     /// post in a channel goes into the post's chain and is shown in the channel as a reply.
     pub(super) fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
-        self.post_with_spans(conversation, client_id, text, reply_to, &[]);
+        self.post_with_outgoing(conversation, client_id, text, reply_to, &protocol::Outgoing::default());
     }
 
-    pub(super) fn post_with_spans(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[Span]) {
-        let outcome = self.posted_with(conversation, client_id, text, reply_to, spans, None).map_err(super::reason);
+    pub(super) fn post_with_outgoing(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing) {
+        let outcome = self.posted_with(conversation, client_id, text, reply_to, with, None).map_err(super::reason);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
     /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], mut properties: Option<Value>) -> Result<Message, Fault> {
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing, mut properties: Option<Value>) -> Result<Message, Fault> {
+        let mention_spans = &with.spans;
         let (mut content, mentions_json) = if !mention_spans.is_empty() {
             let (c, m) = html::compose_with_mentions(text, mention_spans);
             (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
@@ -1031,6 +1101,24 @@ impl Teams {
             None => None,
         };
         let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
+        let post_subject = if channel && reply_to.is_none() {
+            with.subject
+                .as_deref()
+                .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
+                .filter(|s| !s.is_empty())
+                .map(|mut s| {
+                    protocol::clip(&mut s, 200);
+                    s
+                })
+        } else {
+            None
+        };
+        if let Some(ref subject) = post_subject {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("subject".to_owned(), Value::String(subject.clone()));
+            }
+        }
         match (reply_to, &quote) {
             (Some(original), _) if channel => target = chain_id(conversation, original),
             (_, Some(quote)) => content = format!("{}{content}", quote_markup(quote)),
@@ -1041,7 +1129,13 @@ impl Teams {
         if let Some(properties) = properties {
             body["properties"] = properties;
         }
-        let answer = self.chat("POST", &path, Body::Json(&body), false)?;
+        let answer = self.chat("POST", &path, Body::Json(&body), false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } if channel && reply_to.is_none() => Fault::Refused {
+                status: 403,
+                message: "Only channel moderators can start new posts here.".to_owned(),
+            },
+            other => other,
+        })?;
         let id = id_of(&answer.body["OriginalArrivalTime"]);
         if millis(&id) == 0 {
             return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
@@ -1049,9 +1143,26 @@ impl Teams {
         let me = self.me();
         let name = self.own_name();
         let sent = millis(&id) / 1000;
-        let (shown, mut spans) = html::styled(text);
+        let (mut shown, mut spans) = html::styled(text);
         if !mention_spans.is_empty() && shown == text {
             spans.extend(mention_spans.iter().cloned());
+        }
+        if let Some(ref subject) = post_subject {
+            let shift = (subject.len() + usize::from(!shown.is_empty())) as u32;
+            for span in &mut spans {
+                span.start += shift;
+                span.end += shift;
+            }
+            shown = if shown.is_empty() { subject.clone() } else { format!("{subject}\n{shown}") };
+            spans.insert(0, Span { start: 0, end: subject.len() as u32, style: Style::Bold });
+            let mut state = self.state();
+            if state.own_meta.len() >= super::REMEMBERED {
+                state.own_meta.clear();
+            }
+            state.own_meta.insert(
+                (conversation.to_owned(), id.clone()),
+                OwnMeta { subject: Some(subject.clone()), images_html: String::new() },
+            );
         }
         let mut message = Message::plain(id, name.clone(), shown, sent, true);
         message.spans = spans;

@@ -32,6 +32,8 @@ pub struct Controls {
     pub effects: bool,
     /// View-once per-file toggle (`Capabilities::view_once`, Signal/Telegram).
     pub view_once: bool,
+    /// Optional one-line subject on new channel posts (`Capabilities::channel_subject`, Teams).
+    pub subject: bool,
 }
 
 /// `editing`: edit mode is text only on every network.
@@ -61,6 +63,7 @@ pub fn controls(can: &Capabilities, editing: bool) -> Controls {
         broadcast: can.thread_broadcast && !editing,
         effects: can.effects && !editing,
         view_once: can.view_once && !editing,
+        subject: can.channel_subject && !editing,
     }
 }
 

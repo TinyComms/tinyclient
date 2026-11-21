@@ -595,6 +595,9 @@ pub struct Capabilities {
     /// This account supports browsing unjoined public channels, previewing, and joining them (`BrowseChannels`, `PreviewChannel`, `Join`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub browse_channels: bool,
+    /// This account supports an optional subject line on new channel posts (Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channel_subject: bool,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
@@ -923,6 +926,9 @@ pub struct Outgoing {
     /// dual-SIM phone). `None` keeps the conversation's default line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_as: Option<String>,
+    /// Optional one-line subject for a new channel post (Teams).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -942,6 +948,7 @@ impl Default for Outgoing {
             effect: None,
             contact: None,
             send_as: None,
+            subject: None,
         }
     }
 }

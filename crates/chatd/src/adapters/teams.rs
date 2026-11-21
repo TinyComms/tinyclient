@@ -258,7 +258,13 @@ fn reason(fault: Fault) -> String {
         Fault::Limited(seconds) => format!("Teams is rate limiting you. Try again in {seconds} s."),
         Fault::Auth(why) => why,
         Fault::Net(_) => "Teams could not be reached.".to_owned(),
-        Fault::Refused { status: 403, .. } => "Teams does not let you do that here.".to_owned(),
+        Fault::Refused { status: 403, message } => {
+            if message.contains("moderator") || message.contains("Only channel") {
+                message
+            } else {
+                "Teams does not let you do that here.".to_owned()
+            }
+        }
         Fault::Refused { status: 404, .. } => "Teams cannot find that any more.".to_owned(),
         Fault::Refused { status: 413, .. } => "The message is too long for Teams.".to_owned(),
         Fault::Refused { status, message } if message.is_empty() => format!("Teams refused ({status})."),
@@ -893,6 +899,7 @@ impl Teams {
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
+            channel_subject: true,
             ..protocol::Capabilities::default()
         });
         {
