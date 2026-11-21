@@ -363,6 +363,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         view_once: false,
         blocks: true,
         share_contact: true,
+        save_gif: true,
         ..Capabilities::default()
     }
 }
@@ -1826,6 +1827,13 @@ pub(super) fn mapped(account: &Account, conversation: &str, raw: &[tl::enums::Me
     let mut wants = Vec::new();
     for one in &mut mapped {
         finish(account, conversation, one, &page);
+        for want in &one.wants {
+            if let tl::enums::InputFileLocation::InputDocumentFileLocation(loc) = &want.location {
+                if loc.thumb_size.is_empty() {
+                    super::catalog::remember_document(account, loc);
+                }
+            }
+        }
         wants.append(&mut one.wants);
     }
     (mapped.into_iter().map(|one| one.message).collect(), wants)

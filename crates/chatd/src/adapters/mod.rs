@@ -543,6 +543,12 @@ pub enum Command {
         note: String,
         reply: Reply<Vec<(String, Result<(), String>)>>,
     },
+    /// Save or remove a GIF in the user's saved GIFs collection (`messages.saveGif`).
+    SaveGif {
+        id: String,
+        unsave: bool,
+        reply: Reply<()>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -708,6 +714,7 @@ impl Command {
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

@@ -556,6 +556,8 @@ struct World {
     large_broke: bool,
     /// Chats marked as protected (`noforwards`) via `steer`.
     noforwards: HashSet<Who>,
+    /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
+    saved_gifs: Vec<i64>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -618,6 +620,7 @@ impl World {
             cdn_reuploaded: false,
             large_broke: false,
             noforwards: HashSet::new(),
+            saved_gifs: vec![6_200],
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -2864,8 +2867,21 @@ impl World {
         }
         if asked::<f::messages::GetSavedGifs>(body).is_some() {
             self.log("GetSavedGifs");
-            let found = tl::types::messages::SavedGifs { hash: 1, gifs: vec![gif(6_200).into()] };
+            let gifs = self.saved_gifs.iter().map(|&id| gif(id).into()).collect();
+            let found = tl::types::messages::SavedGifs { hash: 1, gifs };
             return Some(answer(tl::enums::messages::SavedGifs::Gifs(found)));
+        }
+        if let Some(request) = asked::<f::messages::SaveGif>(body) {
+            let doc_id = match &request.id {
+                tl::enums::InputDocument::Document(doc) => doc.id,
+                tl::enums::InputDocument::Empty => 0,
+            };
+            self.log(&format!("SaveGif d{doc_id} unsave={}", request.unsave));
+            self.saved_gifs.retain(|&id| id != doc_id);
+            if !request.unsave && doc_id != 0 {
+                self.saved_gifs.insert(0, doc_id);
+            }
+            return Some(answer(true));
         }
         if let Some(request) = asked::<f::contacts::ResolveUsername>(body) {
             self.log(&format!("ResolveUsername {}", request.username));

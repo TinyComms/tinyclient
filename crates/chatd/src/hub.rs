@@ -73,6 +73,11 @@ impl<K: Eq + Hash + Clone, V: Clone> Recent<K, V> {
     pub fn forget(&self, key: &K) {
         lock(&self.held).retain(|(held, _, _)| held != key);
     }
+
+    /// Forgets every cached entry whose key matches `predicate`.
+    pub fn forget_where(&self, mut predicate: impl FnMut(&K) -> bool) {
+        lock(&self.held).retain(|(held, _, _)| !predicate(held));
+    }
 }
 
 /// What changed, newest last. `seq` goes up by one per change; an entry is replaced when the same

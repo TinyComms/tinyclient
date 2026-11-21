@@ -2536,6 +2536,15 @@ impl Chat {
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
+            Request::SaveGif { account, id, unsave } => {
+                match self.ask(&account, |reply| Command::SaveGif { id, unsave, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Gifs);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {

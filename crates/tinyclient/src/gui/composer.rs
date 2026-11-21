@@ -2059,6 +2059,7 @@ impl Composer {
             known: Vec::new(),
             reacting: false,
             rules: None,
+            save_gif: target.can.save_gif,
         };
         let picker = cx.new(|cx| Picker::open(setup, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {

@@ -3499,3 +3499,76 @@ fn report_message_and_peer() {
         world.calls()
     );
 }
+
+#[test]
+fn save_and_unsave_gif() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.save_gif, "Telegram must advertise save_gif capability");
+
+    // Initial saved GIFs contain d6200.
+    let initial = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("expected Catalog, got {other:?}"),
+    };
+    assert!(initial.iter().any(|i| i.id == "d6200"), "expected d6200 in initial saved GIFs: {initial:?}");
+
+    // Unsave d6200 via Request::SaveGif { unsave: true }.
+    let resp = world.ask(Request::SaveGif {
+        account: account(),
+        id: "d6200".into(),
+        unsave: true,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok unsaving GIF, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c == "SaveGif d6200 unsave=true"),
+        "expected messages.saveGif unsave=true on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Saved GIFs list should no longer contain d6200.
+    let after_unsave = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("expected Catalog, got {other:?}"),
+    };
+    assert!(!after_unsave.iter().any(|i| i.id == "d6200"), "d6200 should be removed after unsave: {after_unsave:?}");
+
+    // Re-save d6200 via Request::SaveGif { unsave: false }.
+    let resp = world.ask(Request::SaveGif {
+        account: account(),
+        id: "d6200".into(),
+        unsave: false,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok saving GIF, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c == "SaveGif d6200 unsave=false"),
+        "expected messages.saveGif unsave=false on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Saved GIFs list should contain d6200 again.
+    let after_save = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("expected Catalog, got {other:?}"),
+    };
+    assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
+}

@@ -717,6 +717,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -861,6 +862,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
+        }
+        Command::SaveGif { id, unsave, reply } => {
+            let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
