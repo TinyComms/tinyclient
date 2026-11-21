@@ -5386,3 +5386,133 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
         json!({"max_age": 604_800, "max_uses": 0, "temporary": false, "flags": 0})
     );
 }
+
+#[test]
+fn custom_status_emoji_and_clear_after_round_trip_and_sync() {
+    let world = World::start();
+    let account = world.account();
+
+    let own = || match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account"),
+        other => panic!("{other:?}"),
+    };
+    assert!(own().can.rich_status, "Discord must advertise rich_status");
+
+    // 1. Set Unicode emoji + text + future expiry.
+    let future_secs = 2_000_000_000i64;
+    let future_ms_bytes = (future_secs as u64 * 1000).to_le_bytes();
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Dnd,
+            status: Some("Focusing".into()),
+            status_emoji: Some("🎯".into()),
+            clear_at: Some(future_secs),
+        }),
+        Response::Ok
+    );
+
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), 1);
+    let saved_proto_b64 = patches[0].body["settings"].as_str().unwrap().to_owned();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(&saved_proto_b64).unwrap();
+    assert!(decoded.windows(b"Focusing".len()).any(|w| w == b"Focusing"));
+    assert!(decoded.windows("🎯".len()).any(|w| w == "🎯".as_bytes()));
+    assert!(
+        decoded.windows(8).any(|w| w == future_ms_bytes),
+        "expires_at_ms fixed64 must be encoded in settings protobuf"
+    );
+
+    let frame = wait("gateway op 3 with unicode emoji", || {
+        world
+            .discord
+            .frames_of(3)
+            .into_iter()
+            .find(|f| f["d"]["activities"][0]["state"] == "Focusing")
+    });
+    assert_eq!(frame["d"]["status"], "dnd");
+    assert_eq!(
+        frame["d"]["activities"][0]["emoji"],
+        json!({"id": null, "name": "🎯", "animated": false})
+    );
+
+    let status = own();
+    assert_eq!(status.presence, Presence::Dnd);
+    assert_eq!(status.status, "Focusing");
+    assert_eq!(status.status_emoji, "🎯");
+    assert_eq!(status.status_until, Some(future_secs));
+
+    // 2. Set custom server emoji via :ferris: shortcode (resolves to guild 4000 emoji 7001), no expiry.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Rusting".into()),
+            status_emoji: Some(":ferris:".into()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), 2);
+    let decoded2 = base64::engine::general_purpose::STANDARD
+        .decode(patches[1].body["settings"].as_str().unwrap())
+        .unwrap();
+    let ferris_id_bytes = 7001u64.to_le_bytes();
+    assert!(decoded2.windows(8).any(|w| w == ferris_id_bytes), "custom emoji_id fixed64 must be encoded");
+    assert!(decoded2.windows(b"ferris".len()).any(|w| w == b"ferris"));
+
+    let frame2 = wait("gateway op 3 with custom emoji", || {
+        world
+            .discord
+            .frames_of(3)
+            .into_iter()
+            .find(|f| f["d"]["activities"][0]["state"] == "Rusting")
+    });
+    assert_eq!(
+        frame2["d"]["activities"][0]["emoji"],
+        json!({"id": "7001", "name": "ferris", "animated": false})
+    );
+    let status = own();
+    assert_eq!(status.status, "Rusting");
+    assert_eq!(status.status_emoji, "ferris");
+    assert_eq!(status.status_until, None);
+
+    // 3. Clear custom status (empty text + empty emoji).
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some(String::new()),
+            status_emoji: Some(String::new()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let frame3 = wait("gateway op 3 cleared activities", || {
+        world
+            .discord
+            .frames_of(3)
+            .into_iter()
+            .rev()
+            .find(|f| f["d"]["activities"] == json!([]))
+    });
+    assert_eq!(frame3["d"]["activities"], json!([]));
+    let status = own();
+    assert_eq!(status.status, "");
+    assert_eq!(status.status_emoji, "");
+    assert_eq!(status.status_until, None);
+
+    // 4. Receiving USER_SETTINGS_PROTO_UPDATE from another device restores emoji + clear-after live.
+    world.discord.push(
+        "USER_SETTINGS_PROTO_UPDATE",
+        json!({"settings": {"type": 1, "proto": saved_proto_b64}}),
+    );
+    wait("status restored from USER_SETTINGS_PROTO_UPDATE", || {
+        let s = own();
+        (s.status == "Focusing" && s.status_emoji == "🎯" && s.status_until == Some(future_secs)).then_some(())
+    });
+}

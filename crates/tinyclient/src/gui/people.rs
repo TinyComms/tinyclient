@@ -91,6 +91,8 @@ pub(in crate::gui) struct Own {
     pub me: String,
     pub presence: Presence,
     pub status: String,
+    pub status_emoji: String,
+    pub status_until: Option<i64>,
     pub avatar: Option<MediaFile>,
     pub can: protocol::Capabilities,
 }
@@ -359,6 +361,8 @@ impl Shell {
                     me: account.me.clone(),
                     presence: account.presence,
                     status: account.status.clone(),
+                    status_emoji: account.status_emoji.clone(),
+                    status_until: account.status_until,
                     avatar: account.avatar.clone(),
                     can: account.can,
                 })

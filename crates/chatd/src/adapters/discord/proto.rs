@@ -82,9 +82,8 @@ fn bytes_of(message: &[u8], wanted: u64) -> Option<&[u8]> {
     })
 }
 
-/// A length-delimited field: its tag, its length, its bytes.
-fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
-    let mut varint = |mut value: u64| loop {
+fn write_varint(into: &mut Vec<u8>, mut value: u64) {
+    loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
@@ -92,10 +91,37 @@ fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
             break;
         }
         into.push(byte | 0x80);
-    };
-    varint(number << 3 | 2);
-    varint(bytes.len() as u64);
+    }
+}
+
+/// A length-delimited field: its tag, its length, its bytes.
+fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
+    write_varint(into, number << 3 | 2);
+    write_varint(into, bytes.len() as u64);
     into.extend_from_slice(bytes);
+}
+
+/// A 64-bit little-endian fixed field (`fixed64`): its tag (wire type 1) and 8 bytes.
+fn write_fixed64(into: &mut Vec<u8>, number: u64, value: u64) {
+    write_varint(into, number << 3 | 1);
+    into.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Discord's `CustomStatus` protobuf message (field 2 of `StatusSettings`):
+/// field 1 = `text`, field 2 = `emoji_id` (fixed64), field 3 = `emoji_name`,
+/// field 4 = `expires_at_ms` (fixed64).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomStatus {
+    pub text: String,
+    pub emoji_id: Option<u64>,
+    pub emoji_name: String,
+    pub expires_at_ms: Option<u64>,
+}
+
+impl CustomStatus {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.emoji_name.is_empty() && self.emoji_id.is_none()
+    }
 }
 
 /// Our status settings as Discord sent them, out of the whole settings (or out of an update
@@ -105,34 +131,82 @@ pub fn status_settings(settings: &str) -> Option<Vec<u8>> {
     bytes_of(&bytes, 11).map(<[u8]>::to_vec)
 }
 
+/// What the status settings say: the presence word and the full custom status (text, emoji, expiry).
+pub fn own_custom_status(status: &[u8]) -> (String, CustomStatus) {
+    let word = bytes_of(status, 1)
+        .and_then(|bytes| bytes_of(bytes, 1))
+        .map_or_else(String::new, |inner| String::from_utf8_lossy(inner).into_owned());
+    let mut custom = CustomStatus::default();
+    if let Some(raw) = bytes_of(status, 2) {
+        for (number, field, _) in fields(raw) {
+            match (number, field) {
+                (1, Field::Bytes(bytes)) => custom.text = String::from_utf8_lossy(bytes).into_owned(),
+                (2, Field::Fixed64(id)) if id != 0 => custom.emoji_id = Some(id),
+                (3, Field::Bytes(bytes)) => custom.emoji_name = String::from_utf8_lossy(bytes).into_owned(),
+                (4, Field::Fixed64(ms)) if ms != 0 => custom.expires_at_ms = Some(ms),
+                _ => {}
+            }
+        }
+    }
+    (word, custom)
+}
+
 /// What the status settings say: the presence word and the custom status line.
 pub fn own_status(status: &[u8]) -> (String, String) {
-    let text = |bytes: Option<&[u8]>| {
-        let inner = bytes.and_then(|bytes| bytes_of(bytes, 1));
-        inner.map_or_else(String::new, |inner| String::from_utf8_lossy(inner).into_owned())
-    };
-    (text(bytes_of(status, 1)), text(bytes_of(status, 2)))
+    let (word, custom) = own_custom_status(status);
+    (word, custom.text)
+}
+
+/// The status settings with the presence word replaced, and the custom status replaced unless
+/// `custom` is `None` (an empty `CustomStatus` clears field 2). Unknown fields in both
+/// `StatusSettings` and `CustomStatus` are copied intact.
+pub fn with_custom_status(status: &[u8], word: &str, custom: Option<&CustomStatus>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(status.len() + word.len() + 32);
+    let mut prior_custom: Option<&[u8]> = None;
+    for (number, field, raw) in fields(status) {
+        if number == 2 {
+            if let Field::Bytes(bytes) = field {
+                prior_custom = Some(bytes);
+            }
+        }
+        if number != 1 && (number != 2 || custom.is_none()) {
+            out.extend_from_slice(raw);
+        }
+    }
+    let mut wrapped_word = Vec::with_capacity(word.len() + 2);
+    write(&mut wrapped_word, 1, word.as_bytes());
+    write(&mut out, 1, &wrapped_word);
+    if let Some(custom) = custom.filter(|c| !c.is_empty()) {
+        let mut inner = Vec::with_capacity(custom.text.len() + custom.emoji_name.len() + 32);
+        if let Some(prev) = prior_custom {
+            for (number, _, raw) in fields(prev) {
+                if !matches!(number, 1 | 2 | 3 | 4) {
+                    inner.extend_from_slice(raw);
+                }
+            }
+        }
+        if !custom.text.is_empty() {
+            write(&mut inner, 1, custom.text.as_bytes());
+        }
+        if let Some(id) = custom.emoji_id.filter(|&id| id != 0) {
+            write_fixed64(&mut inner, 2, id);
+        }
+        if !custom.emoji_name.is_empty() {
+            write(&mut inner, 3, custom.emoji_name.as_bytes());
+        }
+        if let Some(ms) = custom.expires_at_ms.filter(|&ms| ms != 0) {
+            write_fixed64(&mut inner, 4, ms);
+        }
+        write(&mut out, 2, &inner);
+    }
+    out
 }
 
 /// The status settings with the presence word replaced, and the custom status line too unless
 /// `custom` is `None` (empty takes it away). Everything else in them is copied as it was.
 pub fn with_status(status: &[u8], word: &str, custom: Option<&str>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(status.len() + word.len() + 8);
-    for (number, _, raw) in fields(status) {
-        if number != 1 && (number != 2 || custom.is_none()) {
-            out.extend_from_slice(raw);
-        }
-    }
-    let wrapped = |text: &str| {
-        let mut inner = Vec::with_capacity(text.len() + 2);
-        write(&mut inner, 1, text.as_bytes());
-        inner
-    };
-    write(&mut out, 1, &wrapped(word));
-    if let Some(custom) = custom.filter(|custom| !custom.is_empty()) {
-        write(&mut out, 2, &wrapped(custom));
-    }
-    out
+    let custom = custom.map(|text| CustomStatus { text: text.to_owned(), ..CustomStatus::default() });
+    with_custom_status(status, word, custom.as_ref())
 }
 
 /// Settings that hold only the status settings, as the body of a settings update.
@@ -300,5 +374,45 @@ mod tests {
         let cleared = with_status(&idle, "online", Some(""));
         assert_eq!((own_status(&cleared).1.as_str(), bytes_of(&cleared, 2)), ("", None));
         assert_eq!(status_settings("AAAA"), None);
+    }
+
+    #[test]
+    fn custom_status_round_trips_emoji_expiry_and_unknown_fields() {
+        // Seed StatusSettings with an unknown field 3 (varint 1) and CustomStatus with an unknown field 5 (varint 7).
+        let mut inner = Vec::new();
+        write(&mut inner, 1, b"old");
+        inner.extend([0x28, 0x07]); // field 5, wire type 0, value 7
+        let mut status = Vec::new();
+        write(&mut status, 1, &[0x0a, 6, b'o', b'n', b'l', b'i', b'n', b'e']);
+        write(&mut status, 2, &inner);
+        status.extend([0x18, 0x01]); // field 3, wire type 0, value 1
+
+        // 1. Unicode emoji + expiry
+        let unicode = CustomStatus {
+            text: "In a meeting".into(),
+            emoji_id: None,
+            emoji_name: "📅".into(),
+            expires_at_ms: Some(1_900_000_000_000),
+        };
+        let encoded = with_custom_status(&status, "dnd", Some(&unicode));
+        assert_eq!(own_custom_status(&encoded), ("dnd".into(), unicode.clone()));
+        assert!(encoded.windows(2).any(|p| p == [0x18, 0x01]), "unknown StatusSettings field dropped");
+        let custom_bytes = bytes_of(&encoded, 2).expect("custom_status bytes");
+        assert!(custom_bytes.windows(2).any(|p| p == [0x28, 0x07]), "unknown CustomStatus field dropped");
+
+        // 2. Custom server emoji (id + name), no text, no expiry
+        let server_emoji = CustomStatus {
+            text: String::new(),
+            emoji_id: Some(7001),
+            emoji_name: "ferris".into(),
+            expires_at_ms: None,
+        };
+        let encoded2 = with_custom_status(&encoded, "idle", Some(&server_emoji));
+        assert_eq!(own_custom_status(&encoded2), ("idle".into(), server_emoji));
+
+        // 3. Clearing removes field 2 completely
+        let cleared = with_custom_status(&encoded2, "online", Some(&CustomStatus::default()));
+        assert_eq!(own_custom_status(&cleared), ("online".into(), CustomStatus::default()));
+        assert_eq!(bytes_of(&cleared, 2), None);
     }
 }

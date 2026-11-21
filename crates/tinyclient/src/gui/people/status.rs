@@ -117,15 +117,17 @@ pub enum ClearAfter {
     Never,
     Minutes30,
     Hour1,
+    Hours4,
     Today,
     ThisWeek,
 }
 
 impl ClearAfter {
-    const ALL: [ClearAfter; 5] = [
+    const ALL: [ClearAfter; 6] = [
         ClearAfter::Never,
         ClearAfter::Minutes30,
         ClearAfter::Hour1,
+        ClearAfter::Hours4,
         ClearAfter::Today,
         ClearAfter::ThisWeek,
     ];
@@ -135,6 +137,7 @@ impl ClearAfter {
             ClearAfter::Never => "Don't clear",
             ClearAfter::Minutes30 => "30m",
             ClearAfter::Hour1 => "1h",
+            ClearAfter::Hours4 => "4h",
             ClearAfter::Today => "Today",
             ClearAfter::ThisWeek => "This week",
         }
@@ -145,6 +148,7 @@ impl ClearAfter {
             ClearAfter::Never => None,
             ClearAfter::Minutes30 => Some(now + 30 * 60),
             ClearAfter::Hour1 => Some(now + 3600),
+            ClearAfter::Hours4 => Some(now + 4 * 3600),
             ClearAfter::Today => Some(now + 24 * 3600 - (now.rem_euclid(24 * 3600))),
             ClearAfter::ThisWeek => Some(now + 7 * 24 * 3600),
         }
@@ -370,9 +374,12 @@ impl StatusMenu {
         if self.open.as_ref() == Some(account) {
             self.open = None;
         } else {
-            let said = self.own(account).map(|own| own.status.clone()).unwrap_or_default();
+            let (said, emoji) = self
+                .own(account)
+                .map(|own| (own.status.clone(), own.status_emoji.clone()))
+                .unwrap_or_default();
             self.field.update(cx, |field, cx| field.set_text(&said, cx));
-            self.emoji.clear();
+            self.emoji = emoji;
             self.clear_after = ClearAfter::Never;
             self.open = Some(account.clone());
         }
@@ -431,6 +438,8 @@ impl StatusMenu {
                 Some(String::new())
             } else if !self.emoji.is_empty() {
                 Some(self.emoji.clone())
+            } else if !own.status_emoji.is_empty() {
+                Some(String::new())
             } else {
                 None
             };
@@ -555,7 +564,10 @@ impl StatusMenu {
             return choices;
         }
         let focused = self.field.focus_handle(cx).is_focused(window);
-        let typed = !self.field.read(cx).text().is_empty();
+        let typed = !self.field.read(cx).text().is_empty()
+            || !self.emoji.is_empty()
+            || !own.status.is_empty()
+            || !own.status_emoji.is_empty();
         let clear = typed.then(|| {
             div()
                 .id("own-status-clear")
@@ -575,7 +587,9 @@ impl StatusMenu {
                 }))
                 .child(glyph("icons/x.svg", 14., theme::text_soft()))
         });
-        let unsent = self.field.read(cx).text().trim() != own.status.trim() || !self.emoji.is_empty();
+        let unsent = self.field.read(cx).text().trim() != own.status.trim()
+            || self.emoji != own.status_emoji
+            || self.clear_after != ClearAfter::Never;
         let leading = if !self.emoji.is_empty() {
             div().type_small().child(self.emoji.clone()).into_any_element()
         } else {
@@ -850,6 +864,8 @@ mod tests {
             me: "me".into(),
             presence,
             status: String::new(),
+            status_emoji: String::new(),
+            status_until: None,
             avatar: None,
             can: protocol::Capabilities::default(),
         }

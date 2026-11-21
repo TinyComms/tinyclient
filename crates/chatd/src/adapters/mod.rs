@@ -1589,6 +1589,11 @@ impl Context {
         self.hub.set_activity(self.key(person_id), emoji, activity, owned);
     }
 
+    /// When our own custom status automatically clears (`None` = never).
+    pub fn status_until(&self, person_id: &str, until: Option<i64>, owned: bool) {
+        self.hub.set_status_until(self.key(person_id), until, owned);
+    }
+
     /// What this account may send: file limits, pickers, options. Say it once the session
     /// tells (the plan, the workspace's settings); until then nothing is offered.
     pub fn capabilities(&self, can: Capabilities) {

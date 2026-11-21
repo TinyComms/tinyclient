@@ -849,6 +849,7 @@ impl Discord {
             leave_space: true,
             groups: 9,
             create_friend_invite: true,
+            rich_status: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -1009,23 +1010,34 @@ impl Discord {
         Ok(())
     }
 
-    /// Our own presence and status line, as the settings have them: at connect, and whenever
-    /// they change on any device.
+    /// Our own presence and custom status (text, emoji, clear-after), as the settings have them:
+    /// at connect, and whenever they change on any device.
     pub(super) fn own_status(&self, status: Vec<u8>) {
-        let (word, text) = proto::own_status(&status);
+        let (word, mut custom) = proto::own_custom_status(&status);
         let presence = match word.as_str() {
             "idle" => Presence::Idle,
             "dnd" => Presence::Dnd,
             "invisible" => Presence::Offline,
             _ => Presence::Online,
         };
+        let clock_ms = (now().max(0) as u64).saturating_mul(1000);
+        if custom.expires_at_ms.is_some_and(|ms| ms <= clock_ms) {
+            custom = proto::CustomStatus::default();
+        }
+        let until = custom.expires_at_ms.map(|ms| (ms / 1000) as i64);
         let me = {
             let mut state = self.state.lock().unwrap();
             state.status_settings = status;
-            state.own = (presence, text.clone());
+            state.own = (presence, custom.text.clone());
+            state.own_emoji = custom.emoji_name.clone();
+            state.own_emoji_id = custom.emoji_id;
+            state.own_status_until = until;
             state.me.clone()
         };
-        self.ctx.presence(&me, presence, &text, true);
+        self.ctx.presence(&me, presence, &custom.text, true);
+        self.ctx.activity(&me, &custom.emoji_name, None, true);
+        self.ctx.status_until(&me, until, true);
+        self.reschedule_unmute();
     }
 
     pub(super) fn supplemental(&self, more: Supplemental) {
@@ -1396,12 +1408,16 @@ impl Discord {
         Ok(())
     }
 
-    fn reschedule_unmute(&self) {
+    pub(super) fn reschedule_unmute(&self) {
         let now = now();
         let mut state = self.state.lock().unwrap();
         let ends = state.guilds.values().filter_map(|info| info.quiet.next_end(now));
         let timeouts = state.guilds.values().filter_map(|info| info.timed_out(now));
-        let next = ends.chain(timeouts).chain(state.quiet_directs.next_end(now)).min();
+        let next = ends
+            .chain(timeouts)
+            .chain(state.quiet_directs.next_end(now))
+            .chain(state.own_status_until)
+            .min();
         state.next_unmute = next;
     }
 
@@ -1465,14 +1481,14 @@ impl Discord {
         candidates.into_iter().next().map(|(_, id)| id)
     }
 
-    /// A timed mute or server timeout ran out: update the rows it covered.
+    /// A timed mute, server timeout, or custom status expiry ran out: update local state.
     pub(super) fn unmute_tick(&self) {
         let clock = now();
         let due = self.state.lock().unwrap().next_unmute.is_some_and(|at| at <= clock);
         if !due {
             return;
         }
-        let (guilds, expired_timeouts): (Vec<String>, Vec<String>) = {
+        let (guilds, expired_timeouts, expired_status): (Vec<String>, Vec<String>, Option<(String, Presence)>) = {
             let mut state = self.state.lock().unwrap();
             let guilds = state.guilds.keys().cloned().collect();
             let mut expired = Vec::new();
@@ -1482,8 +1498,22 @@ impl Discord {
                     expired.push(id.clone());
                 }
             }
-            (guilds, expired)
+            let expired_status = if state.own_status_until.is_some_and(|until| until <= clock) {
+                state.own.1.clear();
+                state.own_emoji.clear();
+                state.own_emoji_id = None;
+                state.own_status_until = None;
+                Some((state.me.clone(), state.own.0))
+            } else {
+                None
+            };
+            (guilds, expired, expired_status)
         };
+        if let Some((me, presence)) = expired_status {
+            self.ctx.presence(&me, presence, "", true);
+            self.ctx.activity(&me, "", None, true);
+            self.ctx.status_until(&me, None, true);
+        }
         for guild in guilds.iter().map(|guild| Some(guild.as_str())).chain([None]) {
             if let Err(err) = self.apply_quiet(guild) {
                 self.log("mute", err);

@@ -3291,6 +3291,8 @@ pub(crate) mod tests {
             avatar: None,
             presence: Presence::Unknown,
             status: String::new(),
+            status_emoji: String::new(),
+            status_until: None,
             can: Default::default(),
             send_as: Vec::new(),
         }

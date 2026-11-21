@@ -654,9 +654,9 @@ impl Chat {
             .into_iter()
             .map(|row| {
                 let linked = links.iter().find(|linked| linked.account == row.key);
-                let (presence, status) = match row.me.as_str() {
-                    "" => (Presence::Unknown, String::new()),
-                    me => self.hub.shown(&Key::new(&row.key, me)),
+                let doing = match row.me.as_str() {
+                    "" => crate::hub::Doing::default(),
+                    me => self.hub.doing(&Key::new(&row.key, me)),
                 };
                 // An account whose session is still being read, or was refused, is kept on
                 // screen as offline with the reason, never dropped as signed out.
@@ -685,8 +685,10 @@ impl Chat {
                     attention: row.attention,
                     unread: row.unread,
                     avatar: row.avatar,
-                    presence,
-                    status,
+                    presence: doing.presence,
+                    status: doing.status,
+                    status_emoji: doing.emoji,
+                    status_until: doing.status_until,
                     can: linked.map_or_else(Capabilities::default, |linked| linked.can),
                     send_as: linked.map_or_else(Vec::new, |linked| linked.send_as.clone()),
                 }
@@ -1802,16 +1804,33 @@ impl Chat {
             clip(&mut emoji, 64);
             emoji
         });
-        let before = me.as_ref().map(|me| self.hub.shown(me));
-        if let (Some(me), Some((_, old))) = (&me, &before) {
-            self.hub.set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
+        let before = me.as_ref().map(|me| self.hub.doing(me));
+        if let (Some(me), Some(old)) = (&me, &before) {
+            let next_status = status.as_deref().unwrap_or(&old.status);
+            let next_emoji = status_emoji.as_deref().unwrap_or(&old.emoji);
+            let next_until = if status.is_some() || status_emoji.is_some() || clear_at.is_some() {
+                if next_status.is_empty() && next_emoji.is_empty() {
+                    None
+                } else {
+                    clear_at.filter(|&at| at > 0)
+                }
+            } else {
+                old.status_until
+            };
+            self.hub.set_presence(me.clone(), presence, next_status, true);
+            if status_emoji.is_some() {
+                self.hub.set_activity(me.clone(), next_emoji, old.activity.clone(), true);
+            }
+            self.hub.set_status_until(me.clone(), next_until, true);
             self.hub.changed(Change::Status);
         }
         match self.ask(&account, |reply| Command::SetPresence { presence, status, status_emoji, clear_at, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => {
-                if let (Some(me), Some((presence, status))) = (me, before) {
-                    self.hub.set_presence(me, presence, &status, true);
+                if let (Some(me), Some(old)) = (me, before) {
+                    self.hub.set_presence(me.clone(), old.presence, &old.status, true);
+                    self.hub.set_activity(me.clone(), &old.emoji, old.activity, true);
+                    self.hub.set_status_until(me, old.status_until, true);
                     self.hub.changed(Change::Status);
                 }
                 *refused

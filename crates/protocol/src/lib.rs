@@ -219,6 +219,12 @@ pub struct AccountStatus {
     pub presence: Presence,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// Our own status emoji as the network shows it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_emoji: String,
+    /// Unix seconds when our own status automatically clears (`None` = never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_until: Option<i64>,
     /// What this account may send: file limits, pickers and options. All off until the adapter
     /// reports them.
     #[serde(default, skip_serializing_if = "Capabilities::is_none")]

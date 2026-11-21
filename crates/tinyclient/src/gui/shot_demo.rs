@@ -139,6 +139,8 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
         avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")),
         presence,
         status: String::new(),
+        status_emoji: String::new(),
+        status_until: None,
         can: Capabilities {
             max_file_bytes: 25 * 1024 * 1024,
             max_files: 10,

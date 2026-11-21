@@ -346,6 +346,9 @@ struct State {
     /// Our own presence and status line as the settings have them, and those settings as
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
+    own_emoji: String,
+    own_emoji_id: Option<u64>,
+    own_status_until: Option<i64>,
     status_settings: Vec<u8>,
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
@@ -1454,38 +1457,161 @@ impl Discord {
         Ok(format!("https://discord.gg/{code}"))
     }
 
-    /// Our own presence, and the status line unless it is `None`. Both are settings: the web
-    /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
-    /// does this.
+    /// Resolves a user-supplied status emoji string into `(emoji_id, emoji_name, animated)`.
+    /// Accepts Unicode glyphs (e.g. `"📅"`), custom Discord formats (`"<a:ferris:7001>"`,
+    /// `"<:ferris:7001>"`, `"ferris:7001"`), or a server emoji shortcode (`":ferris:"`).
+    fn resolve_status_emoji(state: &State, raw: &str) -> (Option<u64>, String, bool) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return (None, String::new(), false);
+        }
+        // `<a:name:id>` or `<:name:id>`
+        if let Some(inner) = trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+            let parts: Vec<&str> = inner.split(':').collect();
+            if parts.len() == 3 {
+                if let Ok(id) = parts[2].parse::<u64>() {
+                    return (Some(id), parts[1].to_owned(), parts[0] == "a");
+                }
+            }
+        }
+        // `name:id`
+        if let Some((name, id_str)) = trimmed.split_once(':') {
+            if !name.is_empty() && !id_str.is_empty() {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    let animated = state
+                        .guilds
+                        .values()
+                        .flat_map(|g| g.emojis.iter())
+                        .find(|e| e.id == id_str)
+                        .is_some_and(|e| e.animated);
+                    return (Some(id), name.to_owned(), animated);
+                }
+            }
+        }
+        // `:shortcode:` lookup in guild custom emojis
+        if let Some(code) = trimmed.strip_prefix(':').and_then(|s| s.strip_suffix(':')) {
+            if let Some(found) = state.guilds.values().flat_map(|g| g.emojis.iter()).find(|e| e.name == code) {
+                if let Ok(id) = found.id.parse::<u64>() {
+                    return (Some(id), found.name.clone(), found.animated);
+                }
+            }
+        }
+        (None, trimmed.to_owned(), false)
+    }
+
+    /// Our own presence, and custom status (text, emoji, clear-after) unless all three are `None`.
+    /// Both are settings: the web client saves them (protobuf, `settings-proto/1`) and tells the
+    /// gateway (op 3), and so does this.
     ///
     /// Unverified against a real account: the field numbers of the status settings are the
     /// community's (`proto.rs`), and the whole status block is sent back so nothing in it is
     /// lost if Discord replaces rather than merges it.
-    fn set_presence(&self, presence: Presence, status: Option<String>) -> Result<(), Refusal> {
+    fn set_presence(
+        &self,
+        presence: Presence,
+        status: Option<String>,
+        status_emoji: Option<String>,
+        clear_at: Option<i64>,
+    ) -> Result<(), Refusal> {
         let word = match presence {
             Presence::Idle => "idle",
             Presence::Dnd => "dnd",
             Presence::Offline => "invisible",
             Presence::Online | Presence::Unknown | Presence::Busy => "online",
         };
-        let (kept, text) = {
+        let changing_custom = status.is_some() || status_emoji.is_some() || clear_at.is_some();
+        let (kept, custom, animated) = {
             let state = crate::hub::lock(&self.state);
-            (state.status_settings.clone(), status.clone().unwrap_or_else(|| state.own.1.clone()))
+            let kept = state.status_settings.clone();
+            if changing_custom {
+                let text = status.unwrap_or_else(|| state.own.1.clone());
+                let (emoji_id, emoji_name, animated) = match status_emoji {
+                    Some(raw) => Self::resolve_status_emoji(&state, &raw),
+                    None => {
+                        let anim = state
+                            .own_emoji_id
+                            .and_then(|id| {
+                                let sid = id.to_string();
+                                state
+                                    .guilds
+                                    .values()
+                                    .flat_map(|g| g.emojis.iter())
+                                    .find(|e| e.id == sid)
+                                    .map(|e| e.animated)
+                            })
+                            .unwrap_or(false);
+                        (state.own_emoji_id, state.own_emoji.clone(), anim)
+                    }
+                };
+                let empty = text.is_empty() && emoji_name.is_empty() && emoji_id.is_none();
+                let expires_at_ms = if empty {
+                    None
+                } else {
+                    clear_at.filter(|&s| s > 0).map(|s| (s as u64).saturating_mul(1000))
+                };
+                (
+                    kept,
+                    proto::CustomStatus { text, emoji_id, emoji_name, expires_at_ms },
+                    animated,
+                )
+            } else {
+                let anim = state
+                    .own_emoji_id
+                    .and_then(|id| {
+                        let sid = id.to_string();
+                        state
+                            .guilds
+                            .values()
+                            .flat_map(|g| g.emojis.iter())
+                            .find(|e| e.id == sid)
+                            .map(|e| e.animated)
+                    })
+                    .unwrap_or(false);
+                (
+                    kept,
+                    proto::CustomStatus {
+                        text: state.own.1.clone(),
+                        emoji_id: state.own_emoji_id,
+                        emoji_name: state.own_emoji.clone(),
+                        expires_at_ms: state
+                            .own_status_until
+                            .filter(|&s| s > 0)
+                            .map(|s| (s as u64).saturating_mul(1000)),
+                    },
+                    anim,
+                )
+            }
         };
-        let settings = proto::with_status(&kept, word, status.as_deref());
+        let settings = proto::with_custom_status(&kept, word, changing_custom.then_some(&custom));
         let body = json!({"settings": proto::settings(&settings)});
         self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
-        let custom = match text.is_empty() {
-            true => json!([]),
-            false => json!([{"name": "Custom Status", "type": 4, "state": text, "emoji": null}]),
+        let activities = if custom.is_empty() {
+            json!([])
+        } else {
+            let emoji_json = if let Some(id) = custom.emoji_id {
+                json!({"id": id.to_string(), "name": custom.emoji_name, "animated": animated})
+            } else if !custom.emoji_name.is_empty() {
+                json!({"id": null, "name": custom.emoji_name, "animated": false})
+            } else {
+                Value::Null
+            };
+            json!([{"name": "Custom Status", "type": 4, "state": custom.text, "emoji": emoji_json}])
         };
-        self.tell(3, json!({"status": word, "since": 0, "activities": custom, "afk": false}));
+        self.tell(3, json!({"status": word, "since": 0, "activities": activities, "afk": false}));
+        let until = custom.expires_at_ms.map(|ms| (ms / 1000) as i64);
         {
             let mut state = crate::hub::lock(&self.state);
             state.status_settings = settings;
-            state.own = (presence, text.clone());
+            state.own = (presence, custom.text.clone());
+            state.own_emoji = custom.emoji_name.clone();
+            state.own_emoji_id = custom.emoji_id;
+            state.own_status_until = until;
         }
-        self.ctx.presence(&self.me(), presence, &text, true);
+        let me = self.me();
+        self.ctx.presence(&me, presence, &custom.text, true);
+        self.ctx.activity(&me, &custom.emoji_name, None, true);
+        self.ctx.status_until(&me, until, true);
+        self.reschedule_unmute();
         Ok(())
     }
 
@@ -2077,7 +2203,9 @@ impl Discord {
             Command::SetFriendNickname { person_id, nickname, reply } => {
                 answer(reply, self.set_friend_nickname(&person_id, nickname))
             }
-            Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetPresence { presence, status, status_emoji, clear_at, reply } => {
+                answer(reply, self.set_presence(presence, status, status_emoji, clear_at))
+            }
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
