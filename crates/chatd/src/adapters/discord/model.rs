@@ -39,6 +39,7 @@ pub const MEDIA_FORUM: u8 = 16;
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
+pub const MANAGE_CHANNELS: u64 = 1 << 4;
 pub const ADD_REACTIONS: u64 = 1 << 6;
 #[allow(dead_code)]
 pub const STREAM: u64 = 1 << 9;
@@ -52,6 +53,7 @@ pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;
 pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const MANAGE_THREADS: u64 = 1 << 34;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
@@ -348,6 +350,12 @@ pub struct Channel {
     pub is_message_request: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub is_spam: bool,
+    /// Slowmode interval in seconds, 0 when off.
+    #[serde(default, deserialize_with = "nullable")]
+    pub rate_limit_per_user: u32,
+    /// Default slowmode interval for newly created threads under this channel.
+    #[serde(default, deserialize_with = "nullable")]
+    pub default_thread_rate_limit_per_user: u32,
 }
 
 /// What is kept of a server's channel between connects, in a note: enough to work out again
@@ -375,6 +383,9 @@ pub struct Kept {
     pub topic: Option<String>,
     #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
     pub overwrites: Vec<(String, bool, u64, u64)>,
+    /// Slowmode interval in seconds, 0 when off.
+    #[serde(rename = "s", default, skip_serializing_if = "no_limit")]
+    pub slowmode: u32,
 }
 
 /// A count that means "none" stays off a note.
@@ -395,6 +406,7 @@ impl Kept {
             parent: channel.parent_id.clone(),
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
+            slowmode: channel.rate_limit_per_user,
         }
     }
 
@@ -410,6 +422,7 @@ impl Kept {
             parent_id: self.parent,
             topic: self.topic,
             permission_overwrites: overwrites.collect(),
+            rate_limit_per_user: self.slowmode,
             ..Channel::default()
         }
     }

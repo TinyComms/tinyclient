@@ -5,7 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    KICK_MEMBERS, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES, SEND_MESSAGES, VIEW_CHANNEL,
+    KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_THREADS, PIN_MESSAGES,
+    SEND_MESSAGES, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -203,6 +204,16 @@ pub(super) fn timeout_reason(until: i64, now: i64) -> String {
     format!("You are timed out in this server for {phrase}.")
 }
 
+/// Discord exempts moderators and channel/thread managers from slowmode.
+pub(super) fn slowmode_exempt(perms: u64, thread: bool) -> bool {
+    let mask = if thread {
+        MANAGE_MESSAGES | MANAGE_CHANNELS | MANAGE_THREADS
+    } else {
+        MANAGE_MESSAGES | MANAGE_CHANNELS
+    };
+    perms & mask != 0
+}
+
 impl GuildInfo {
     /// Unix seconds when our server timeout ends, if still active.
     pub(super) fn timed_out(&self, now: i64) -> Option<i64> {
@@ -286,6 +297,7 @@ impl GuildInfo {
             private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
             opted_out: self.quiet.opted_out(&channel.id, parent),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
+            slowmode_seconds: if slowmode_exempt(perms, false) { 0 } else { channel.rate_limit_per_user },
             ..ConversationRow::new(&channel.id, kind, name)
         })
     }
@@ -358,7 +370,7 @@ impl Discord {
     fn tree(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> Tree {
         let mut rows = Vec::new();
         let mut counts = Vec::new();
-        let mut placed: HashMap<&str, (Option<String>, i32, protocol::ConversationRights)> = HashMap::new();
+        let mut placed: HashMap<&str, (Option<String>, i32, protocol::ConversationRights, u64)> = HashMap::new();
         info.channels.clear();
         let standing = |channel: &Channel, joined: Option<i64>| {
             let state = read.get(&channel.id);
@@ -388,7 +400,8 @@ impl Discord {
             let Some(row) = info.row(&guild.id, me, channel) else {
                 continue;
             };
-            placed.insert(&channel.id, (row.group.clone(), row.position, row.rights));
+            let perms = info.permissions(&guild.id, me, channel);
+            placed.insert(&channel.id, (row.group.clone(), row.position, row.rights, perms));
             info.remember(&channel.id, channel.parent_id.as_deref());
             // A voice channel's chat is not "unread" in the tree. A forum's own marker is:
             // its posts hold no row to carry a badge, so the forum itself counts them, and a
@@ -410,7 +423,7 @@ impl Discord {
         let mut under: HashMap<&str, i32> = HashMap::new();
         for thread in &guild.threads {
             let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
-            let Some((group, position, parent_rights)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
+            let Some((group, position, parent_rights, parent_perms)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
                 continue;
             };
             if archived || !thread.is_thread() {
@@ -426,6 +439,7 @@ impl Discord {
                 read_only: timed_out.is_some(),
                 read_only_reason: timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default(),
                 rights: *parent_rights,
+                slowmode_seconds: if slowmode_exempt(*parent_perms, true) { 0 } else { thread.rate_limit_per_user },
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
                     followed: true,
@@ -532,6 +546,19 @@ impl Discord {
         let mut kept: Vec<Kept> = self.ctx.note(&note).and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
         change(&mut kept);
         self.ctx.set_note(&note, &serde_json::to_string(&kept).unwrap_or_default());
+    }
+
+    /// Computes our effective Discord permission bitmask for a kept channel in `guild`.
+    pub(super) fn channel_permissions(&self, guild: &str, channel_id: &str) -> Option<u64> {
+        let kept: Vec<Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|kept| serde_json::from_str(&kept).ok())?;
+        let channel = kept.into_iter().find(|entry| entry.id == channel_id)?.channel();
+        let me = self.me();
+        let state = self.state.lock().unwrap();
+        let info = state.guilds.get(guild)?;
+        Some(info.permissions(guild, &me, &channel))
     }
 
     /// Works out a server's visible channels again from what is kept of them, after a role's
@@ -1285,10 +1312,16 @@ impl Discord {
             return Ok(());
         };
         let name = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
+        let exempt = parent
+            .space
+            .as_deref()
+            .and_then(|guild| self.channel_permissions(guild, &parent.key.id))
+            .map_or(parent.rights.delete_others, |perms| slowmode_exempt(perms, true));
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
             rights: parent.rights,
+            slowmode_seconds: if exempt { 0 } else { thread.rate_limit_per_user },
             // Joined, or our membership came with it: followed. Otherwise left as it was.
             filing: (joined || thread.member.is_some()).then(|| Filing {
                 followed: true,

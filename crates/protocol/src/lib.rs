@@ -573,6 +573,13 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
+    /// Slowmode interval in seconds (`0` when off or when this account is exempt).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slowmode_seconds: u32,
+    /// Unix seconds until this account may send again in a slowmode conversation. Never stored:
+    /// kept live by chatd and rides on the row when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_until: Option<i64>,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -642,6 +649,8 @@ impl Conversation {
             moderate: false,
             can_pin: false,
             joined: true,
+            slowmode_seconds: 0,
+            slowmode_until: None,
         }
     }
 

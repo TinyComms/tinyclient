@@ -306,6 +306,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.read_only_reason = known.read_only_reason.clone();
     row.spam = known.spam;
     row.rights = known.rights;
+    row.slowmode_seconds = known.slowmode_seconds;
     row
 }
 
@@ -1567,6 +1568,20 @@ impl Discord {
         (unread, mentions, marker)
     }
 
+    /// Updates live slowmode cooldown after a send succeeds or is refused with Discord code 20016.
+    pub(super) fn note_send_slowmode(&self, channel: &str, conversation: &Conversation, outcome: &Result<String, Refused>) {
+        match outcome {
+            Ok(_) if conversation.slowmode_seconds > 0 => {
+                self.ctx.slowmode_until(channel, crate::hub::now() + i64::from(conversation.slowmode_seconds));
+            }
+            Err(Refused::Status { code: 20016, retry_after, .. }) => {
+                let wait = retry_after.unwrap_or(1.0).ceil().max(1.0) as i64;
+                self.ctx.slowmode_until(channel, crate::hub::now() + wait);
+            }
+            _ => {}
+        }
+    }
+
     fn send(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, String> {
         let premium = self.state.lock().unwrap().premium;
         if let Some(why) = too_long(premium, text) {
@@ -1590,9 +1605,9 @@ impl Discord {
             body["message_reference"] = reference;
             body["allowed_mentions"] = json!({"parse": ["users", "roles", "everyone"], "replied_user": true});
         }
-        let accepted = self
-            .call("POST", &format!("/channels/{channel}/messages"), Some(body))
-            .map_err(|refused| refused.reason())?;
+        let asked = self.call("POST", &format!("/channels/{channel}/messages"), Some(body));
+        self.note_send_slowmode(channel, &conversation, &asked);
+        let accepted = asked.map_err(|refused| refused.reason())?;
         let posted: Posted = serde_json::from_str(&accepted).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let _ = files.register(&self.ctx);

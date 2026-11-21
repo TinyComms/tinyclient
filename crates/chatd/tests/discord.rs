@@ -5238,3 +5238,73 @@ fn moderator_manage_messages_flag_delete_others_and_clear_reactions() {
         (!world.conversation("4101").rights.delete_others).then_some(())
     });
 }
+
+#[test]
+fn slowmode_reports_interval_exemption_and_cooldown() {
+    // 4101 has 30 s slowmode in READY; user 1000 has no MANAGE_MESSAGES / MANAGE_CHANNELS initially.
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    for channel in ready["guilds"][0]["channels"].as_array_mut().unwrap() {
+        if channel["id"] == "4101" {
+            channel["rate_limit_per_user"] = json!(30);
+        }
+    }
+    let world = World::launch(&[], |shared| *shared.ready.lock().unwrap() = ready.to_string());
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("slowmode on 4101", || (world.conversation("4101").slowmode_seconds == 30).then_some(()));
+    assert_eq!(world.conversation("4101").slowmode_until, None);
+
+    // Sending a message starts the local cooldown immediately on success.
+    let sent = world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "slow-1".into(),
+        text: "first message".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    wait("slowmode cooldown after send", || {
+        world.conversation("4101").slowmode_until.filter(|until| *until > 0)
+    });
+
+    // A Discord 20016 slowmode refusal updates slowmode_until from retry_after.
+    world.discord.script(
+        "/channels/4101/messages",
+        429,
+        json!({"message": "This message cannot be sent because you are sending messages too quickly.", "code": 20016, "retry_after": 17.2}),
+    );
+    let _ = world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "slow-2".into(),
+        text: "too fast".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    wait("slowmode failure recorded", || {
+        world.messages("4101").into_iter().find(|m| {
+            m.client_id.as_deref() == Some("slow-2") && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    assert!(world.conversation("4101").slowmode_until.is_some());
+
+    // CHANNEL_UPDATE updates the interval (e.g. raised to 60 s).
+    world.discord.push("CHANNEL_UPDATE", json!({
+        "id": "4101",
+        "guild_id": "4000",
+        "type": 0,
+        "name": "general",
+        "parent_id": "4100",
+        "position": 0,
+        "rate_limit_per_user": 60
+    }));
+    wait("slowmode updated to 60", || (world.conversation("4101").slowmode_seconds == 60).then_some(()));
+
+    // Granting MANAGE_MESSAGES exempts this account from slowmode (slowmode_seconds becomes 0).
+    let manage_messages: u64 = 1 << 13;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": manage_messages.to_string()}
+    }));
+    wait("slowmode exempt for moderator", || {
+        (world.conversation("4101").slowmode_seconds == 0).then_some(())
+    });
+}

@@ -146,6 +146,8 @@ struct Live {
     uploads: HashMap<(Key, String), Instant>,
     /// Rows whose preview was asked of their network.
     previews: HashSet<Key>,
+    /// Per-conversation slowmode cooldown end time (Unix seconds).
+    slowmode: HashMap<Key, i64>,
 }
 
 /// What the socket server and the adapters share: the store, each account's link, what changed,
@@ -223,6 +225,7 @@ impl Hub {
                 asked: Instant::now(),
                 uploads: HashMap::new(),
                 previews: HashSet::new(),
+                slowmode: HashMap::new(),
             }),
             reading: Mutex::default(),
             started: start / 1_000,
@@ -761,6 +764,32 @@ impl Hub {
         lock(&self.live).occupants.get(conversation).cloned()
     }
 
+    /// Records when this account may send again in a slowmode conversation (Unix seconds).
+    /// Never stored; announced via `Change::Conversation`.
+    pub fn set_slowmode_until(&self, conversation: Key, until: i64) {
+        let clock = now();
+        {
+            let mut live = lock(&self.live);
+            live.slowmode.retain(|_, end| *end > clock);
+            if until <= clock {
+                if live.slowmode.remove(&conversation).is_none() {
+                    return;
+                }
+            } else {
+                if live.slowmode.get(&conversation) == Some(&until) {
+                    return;
+                }
+                live.slowmode.insert(conversation.clone(), until);
+            }
+        }
+        self.changed(Change::Conversation { conversation });
+    }
+
+    pub fn slowmode_until(&self, conversation: &Key) -> Option<i64> {
+        let clock = now();
+        lock(&self.live).slowmode.get(conversation).copied().filter(|until| *until > clock)
+    }
+
     /// Someone is typing until `typist.until`, or stopped when `typing` is false. Lines past their
     /// time are dropped here whenever the conversation is touched; the shell times them out on
     /// screen itself.
@@ -812,6 +841,7 @@ impl Hub {
             let mut live = lock(&self.live);
             live.presence.retain(|person, _| person.account() != *account || Some(person) == keep);
             live.typing.retain(|conversation, _| conversation.account() != *account);
+            live.slowmode.retain(|conversation, _| conversation.account() != *account);
             let emptied = live.occupants.keys().filter(|conversation| conversation.account() == *account).cloned().collect();
             live.occupants.retain(|conversation, _| conversation.account() != *account);
             emptied

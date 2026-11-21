@@ -263,6 +263,36 @@ fn delete_later(paths: Vec<PathBuf>) {
     let _ = std::thread::Builder::new().name("outbox".into()).stack_size(64 * 1024).spawn(move || attach::delete_made(&attach::outbox(), &paths));
 }
 
+/// Remaining slowmode cooldown in seconds, or 0 when clear.
+fn slowmode_remaining(until: Option<i64>, now: i64) -> u32 {
+    until.map_or(0, |end| end.saturating_sub(now).max(0) as u32)
+}
+
+/// Formats a slowmode duration in concise units (`30 s`, `2 m`, `1 m 30 s`, `1 h`).
+fn format_slowmode(seconds: u32) -> String {
+    if seconds >= 3600 && seconds % 3600 == 0 {
+        format!("{} h", seconds / 3600)
+    } else if seconds >= 60 && seconds % 60 == 0 {
+        format!("{} m", seconds / 60)
+    } else if seconds >= 60 {
+        format!("{} m {} s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// Quiet line under the composer describing slowmode, or `None` when off.
+fn slowmode_words(seconds: u32, until: Option<i64>, now: i64) -> Option<String> {
+    let left = slowmode_remaining(until, now);
+    if left > 0 {
+        Some(format!("Slowmode · {} remaining", format_slowmode(left)))
+    } else if seconds > 0 {
+        Some(format!("Slowmode · {}", format_slowmode(seconds)))
+    } else {
+        None
+    }
+}
+
 /// Where the composer writes to.
 #[derive(Clone, PartialEq)]
 struct Target {
@@ -282,6 +312,10 @@ struct Target {
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
     send_as: Vec<protocol::SendAs>,
+    /// Slowmode interval in seconds (0 when off or exempt).
+    slowmode_seconds: u32,
+    /// Unix seconds until the next send is allowed in this conversation.
+    slowmode_until: Option<i64>,
 }
 
 /// Why nothing can be typed here, when that is so.
@@ -600,6 +634,8 @@ pub struct Composer {
     importance: protocol::Importance,
     broadcast: bool,
     effect: Option<String>,
+    /// One-second ticker while a slowmode countdown is active; never auto-sends.
+    slowmode_timer: Option<Task<()>>,
 }
 
 impl Composer {
@@ -704,6 +740,7 @@ impl Composer {
             importance: protocol::Importance::Normal,
             broadcast: false,
             effect: None,
+            slowmode_timer: None,
         }
     }
 
@@ -774,7 +811,42 @@ impl Composer {
             input.set_format_discord(discord, cx);
         });
         self.target = Some(target);
+        self.schedule_slowmode_tick(cx);
         cx.notify();
+    }
+
+    fn slowmode_left(&self) -> u32 {
+        self.target
+            .as_ref()
+            .map_or(0, |target| slowmode_remaining(target.slowmode_until, now()))
+    }
+
+    /// Runs a 1-second repaint ticker only while a slowmode countdown is active. Never auto-sends.
+    fn schedule_slowmode_tick(&mut self, cx: &mut Context<Self>) {
+        if self.slowmode_left() == 0 {
+            self.slowmode_timer = None;
+            return;
+        }
+        if self.slowmode_timer.is_some() {
+            return;
+        }
+        self.slowmode_timer = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let keep = this.update(cx, |this, cx| {
+                let left = this.slowmode_left();
+                let _ = this.shell.update(cx, |_, cx| cx.notify());
+                cx.notify();
+                if left == 0 {
+                    this.slowmode_timer = None;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !matches!(keep, Ok(true)) {
+                return;
+            }
+        }));
     }
 
     /// Leaving a conversation: an edit ends, and the draft is saved and kept for the way back,
@@ -953,6 +1025,12 @@ impl Composer {
             self.save_edit(&target, cx);
             return;
         }
+        if self.slowmode_left() > 0 {
+            self.schedule_at = None;
+            self.schedule_slowmode_tick(cx);
+            cx.notify();
+            return;
+        }
         self.follow_text(cx);
         self.send_menu = false;
         self.schedule_day = None;
@@ -1101,7 +1179,7 @@ impl Composer {
         let Some(target) = self.target.clone().filter(|target| target.locked().is_none()) else {
             return;
         };
-        if self.sending || !live() {
+        if self.sending || self.slowmode_left() > 0 || !live() {
             return;
         }
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
@@ -3109,7 +3187,10 @@ impl Composer {
 
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
-        let ready = !self.sending && !self.scan_blocks_current() && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
+        let ready = !self.sending
+            && !self.scan_blocks_current()
+            && (self.editing.is_some() || self.slowmode_left() == 0)
+            && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
@@ -3335,7 +3416,25 @@ impl Composer {
             let tone = if length::over(counted, target.can.text_limit) { Tone::Warning } else { Tone::Note };
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
-        let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
+        let slowmode_active = || {
+            (unlocked && self.editing.is_none() && slowmode_remaining(target.slowmode_until, now()) > 0)
+                .then(|| slowmode_words(target.slowmode_seconds, target.slowmode_until, now()).map(|words| (words, Tone::Note)))
+                .flatten()
+        };
+        let slowmode_quiet = || {
+            (unlocked && self.editing.is_none())
+                .then(|| slowmode_words(target.slowmode_seconds, target.slowmode_until, now()).map(|words| (words, Tone::Note)))
+                .flatten()
+        };
+        let said = self
+            .caption
+            .clone()
+            .or(recording)
+            .or_else(length_note)
+            .or_else(slowmode_active)
+            .or_else(note)
+            .or_else(|| (unlocked && target.link == Link::Offline).then(offline))
+            .or_else(slowmode_quiet);
         let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
@@ -3992,6 +4091,8 @@ impl Shell {
             special: open.special,
             can,
             send_as: self.send_as_of(&open.key),
+            slowmode_seconds: open.slowmode_seconds,
+            slowmode_until: open.slowmode_until,
         };
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));
@@ -4023,6 +4124,8 @@ impl Shell {
             special: protocol::Special::None,
             can: self.can_of(thread),
             send_as: self.send_as_of(thread),
+            slowmode_seconds: 0,
+            slowmode_until: None,
         };
         let composer = self.composer_in(true, cx);
         // A thread's row is not handed over, so its draft is the one this window remembers.
@@ -4403,10 +4506,28 @@ impl Shell {
         });
     }
 
+    /// Remaining slowmode cooldown for `conversation`, in seconds.
+    fn slowmode_remaining_for(&self, conversation: &Key, cx: &App) -> u32 {
+        let clock = now();
+        let check = |slot: &OnceCell<Entity<Composer>>| {
+            slot.get()
+                .and_then(|composer| {
+                    composer
+                        .read(cx)
+                        .target
+                        .as_ref()
+                        .filter(|target| &target.key == conversation)
+                        .and_then(|target| target.slowmode_until)
+                })
+                .map_or(0, |until| slowmode_remaining(Some(until), clock))
+        };
+        check(&self.composer_state.main).max(check(&self.composer_state.thread))
+    }
+
     /// Sends a failed message again. One chatd holds goes back to pending; one the hold gave
     /// up on goes now if its network is there, and otherwise waits another 60 s.
     pub(super) fn retry_send(&mut self, conversation: Key, client_id: String, cx: &mut Context<Self>) {
-        if !live() {
+        if !live() || self.slowmode_remaining_for(&conversation, cx) > 0 {
             return;
         }
         if self.composer_state.hold.has(&conversation, &client_id) {
@@ -4486,10 +4607,22 @@ impl Shell {
             (conversation.clone(), client_id.to_owned()),
             (conversation.clone(), client_id.to_owned()),
         );
+        let wait = self.slowmode_remaining_for(conversation, cx);
+        let retry_btn = if wait > 0 {
+            small("retry", "Retry")
+                .ml(px(2.))
+                .opacity(0.45)
+                .cursor_default()
+                .tooltip(tip(format!("Slowmode · {} remaining", format_slowmode(wait)), None))
+        } else {
+            small("retry", "Retry")
+                .ml(px(2.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.retry_send(retry.0.clone(), retry.1.clone(), cx);
+                }))
+        };
         let actions = div().min_w_0().max_w_full().flex().flex_wrap().gap(px(6.))
-            .child(small("retry", "Retry").ml(px(2.)).on_click(cx.listener(move |this, _, _, cx| {
-                this.retry_send(retry.0.clone(), retry.1.clone(), cx);
-            })))
+            .child(retry_btn)
             .child(small("discard", "Delete").on_click(cx.listener(move |this, _, _, cx| {
                 this.discard_send(discard.0.clone(), discard.1.clone(), cx);
             })));
@@ -4634,7 +4767,20 @@ mod tests {
             joined: true,
             can: Capabilities::default(),
             send_as: Vec::new(),
+            slowmode_seconds: 0,
+            slowmode_until: None,
         }
+    }
+
+    #[test]
+    fn slowmode_formats_interval_countdown_and_blocks_return_until_clear() {
+        assert_eq!(slowmode_words(0, None, 1000), None);
+        assert_eq!(slowmode_words(30, None, 1000).as_deref(), Some("Slowmode · 30 s"));
+        assert_eq!(slowmode_words(120, None, 1000).as_deref(), Some("Slowmode · 2 m"));
+        assert_eq!(slowmode_words(30, Some(1012), 1000).as_deref(), Some("Slowmode · 12 s remaining"));
+        assert_eq!(slowmode_remaining(Some(1012), 1000), 12);
+        assert_eq!(slowmode_remaining(Some(1000), 1000), 0);
+        assert_eq!(slowmode_words(30, Some(1000), 1000).as_deref(), Some("Slowmode · 30 s"));
     }
 
     #[test]

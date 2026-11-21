@@ -1094,6 +1094,11 @@ impl Context {
         self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
     }
 
+    /// Records when this account may send again in a slowmode conversation (Unix seconds).
+    pub fn slowmode_until(&self, conversation_id: &str, until: i64) {
+        self.hub.set_slowmode_until(self.key(conversation_id), until);
+    }
+
     /// One conversation: a direct message, or a channel created, renamed or moved.
     pub fn conversation(&self, row: &ConversationRow) -> Stores {
         self.hub.store().upsert_conversation(&self.account, row)?;
