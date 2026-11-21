@@ -44,7 +44,7 @@ mod wire;
 use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
-use crate::store::{ConversationRow, PersonRow};
+use crate::store::{ConversationRow, Filing, PersonRow};
 use protocol::{Attachment, Contact, ContactKind, ConversationKind, Delivery, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -542,6 +542,16 @@ struct Live {
     timers: HashMap<String, wire::Timer>,
     /// Incoming unread messages that carry a disappearing-messages timer, keyed by (conversation, message_id).
     expiring: HashMap<(String, String), u32>,
+    /// Conversations currently archived (filed on Shelf::Archive).
+    archived: HashSet<String>,
+    /// Ordered pinned conversation ids (lowest index sorts first).
+    pinned: Vec<String>,
+    /// Per-conversation mute expiry in ms since 1970 (0 = unmuted; >= i64::MAX = forever).
+    muted_until: HashMap<String, u64>,
+    /// Groups where mentions do not notify while the group is muted.
+    dont_notify_mentions: HashSet<String>,
+    /// Account setting: keep muted chats archived when new messages arrive.
+    keep_muted_archived: bool,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -645,6 +655,20 @@ impl Live {
 
     fn take_expiring(&mut self, conversation: &str, message_id: &str) -> Option<u32> {
         self.expiring.remove(&(conversation.to_owned(), message_id.to_owned()))
+    }
+
+    fn is_muted(&self, conversation: &str) -> bool {
+        self.muted_until.get(conversation).is_some_and(|&until| until > now_ms())
+    }
+
+    fn filing_for(&self, conversation: &str) -> Filing {
+        Filing {
+            folders: Vec::new(),
+            archived: self.archived.contains(conversation),
+            pin: self.pinned.iter().position(|id| id == conversation).map(|at| at as i32),
+            hidden: false,
+            followed: false,
+        }
     }
 
     /// Records a person's reaction, answering the one it replaced. Both memory and the file on
@@ -1065,6 +1089,26 @@ fn apply(account: &Account, event: Event) {
                 return;
             }
             let mut message = message(account, &text, outgoing);
+            if !outgoing {
+                let (suppress_mention, unarchive_filing) = {
+                    let mut live = account.live();
+                    let muted = live.is_muted(&conversation);
+                    let suppress = muted && live.dont_notify_mentions.contains(&conversation);
+                    let unarchive = if live.archived.contains(&conversation) && !(live.keep_muted_archived && muted) {
+                        live.archived.remove(&conversation);
+                        Some(live.filing_for(&conversation))
+                    } else {
+                        None
+                    };
+                    (suppress, unarchive)
+                };
+                if suppress_mention {
+                    message.mentions_me = false;
+                }
+                if let Some(filing) = unarchive_filing {
+                    let _ = ctx.filing(&conversation, &filing);
+                }
+            }
             if text.expire_timer > 0 || text.expire_timer_version > 0 {
                 account.live().note_timer(&conversation, text.expire_timer, text.expire_timer_version);
                 let _ = ctx.disappearing(&conversation, (text.expire_timer > 0).then_some(text.expire_timer));
@@ -1209,6 +1253,63 @@ fn apply(account: &Account, event: Event) {
             let mut msg = Message::plain(format!("signal-timer-{sent_ms}"), String::new(), line, (sent_ms / 1_000) as i64, false);
             msg.kind = MessageKind::System;
             let _ = ctx.message(&conversation, &msg);
+        }
+        Event::ChatStates { chats, pinned, keep_muted_archived } => {
+            let mut to_file: HashSet<String> = HashSet::new();
+            let mut mutes: Vec<(String, bool)> = Vec::new();
+            let mut mark_unreads: Vec<String> = Vec::new();
+            {
+                let mut live = account.live();
+                if let Some(keep) = keep_muted_archived {
+                    live.keep_muted_archived = keep;
+                }
+                if let Some(new_pins) = pinned {
+                    for old in &live.pinned {
+                        to_file.insert(old.clone());
+                    }
+                    live.pinned = new_pins.into_iter().map(|p| p.conversation()).collect();
+                    for id in &live.pinned {
+                        to_file.insert(id.clone());
+                    }
+                }
+                for chat in chats {
+                    let conv = chat.peer.conversation();
+                    if chat.muted_until > 0 {
+                        live.muted_until.insert(conv.clone(), chat.muted_until);
+                    } else {
+                        live.muted_until.remove(&conv);
+                    }
+                    if chat.dont_notify_for_mentions_if_muted {
+                        live.dont_notify_mentions.insert(conv.clone());
+                    } else {
+                        live.dont_notify_mentions.remove(&conv);
+                    }
+                    let is_muted = live.is_muted(&conv);
+                    mutes.push((conv.clone(), is_muted));
+                    let was_archived = live.archived.contains(&conv);
+                    if chat.archived {
+                        live.archived.insert(conv.clone());
+                    } else {
+                        live.archived.remove(&conv);
+                    }
+                    if was_archived != chat.archived || chat.archived {
+                        to_file.insert(conv.clone());
+                    }
+                    if chat.marked_unread {
+                        mark_unreads.push(conv);
+                    }
+                }
+            }
+            for (conv, muted) in mutes {
+                let _ = ctx.muted(&conv, muted);
+            }
+            for conv in to_file {
+                let filing = account.live().filing_for(&conv);
+                let _ = ctx.filing(&conv, &filing);
+            }
+            for conv in mark_unreads {
+                let _ = ctx.mark_unread(&conv);
+            }
         }
         Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
     }
@@ -1407,7 +1508,11 @@ fn offline(ctx: &Context, command: Command) {
             ctx.sent(&conversation_id, &client_id, Err("Signal is offline.".to_owned()));
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
-        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::React { reply, .. }
+        | Command::Edit { reply, .. }
+        | Command::Delete { reply, .. }
+        | Command::SetMute { reply, .. }
+        | Command::File { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -1449,6 +1554,8 @@ fn capabilities() -> protocol::Capabilities {
         view_once: false,
         profile_name: true,
         profile_about: true,
+        pin_chats: 4,
+        archive: true,
         ..protocol::Capabilities::default()
     }
 }
@@ -1457,6 +1564,79 @@ fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
+        Command::MarkUnread { conversation_id, .. } => {
+            if let Ok(to) = peer(&conversation_id) {
+                let _ = account.wire.set_marked_unread(&to, true);
+            }
+            let _ = ctx.mark_unread(&conversation_id);
+        }
+        Command::SetMute { conversation_id, notify, until, reply } => {
+            let outcome = (|| -> Result<(), Refusal> {
+                let to = peer(&conversation_id).map_err(refused)?;
+                let (muted, until_ms) = match notify {
+                    protocol::Notify::Nothing => {
+                        let ms = until
+                            .filter(|&s| s > 0)
+                            .map(|s| (s as u64).saturating_mul(1_000))
+                            .unwrap_or(i64::MAX as u64);
+                        (true, ms)
+                    }
+                    protocol::Notify::All | protocol::Notify::Mentions => (false, 0),
+                };
+                account.wire.set_mute(&to, until_ms).map_err(refused)?;
+                {
+                    let mut live = account.live();
+                    if muted {
+                        live.muted_until.insert(conversation_id.clone(), until_ms);
+                    } else {
+                        live.muted_until.remove(&conversation_id);
+                    }
+                }
+                let _ = ctx.muted(&conversation_id, muted);
+                Ok(())
+            })();
+            let _ = reply.send(outcome);
+        }
+        Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {
+            let outcome = (|| -> Result<(), Refusal> {
+                let to = peer(&conversation_id).map_err(refused)?;
+                if let Some(arch) = archived {
+                    account.wire.set_archived(&to, arch).map_err(refused)?;
+                    let mut live = account.live();
+                    if arch {
+                        live.archived.insert(conversation_id.clone());
+                    } else {
+                        live.archived.remove(&conversation_id);
+                    }
+                }
+                let mut affected_pins = Vec::new();
+                if let Some(pin) = pinned {
+                    account.wire.set_pinned(&to, pin).map_err(refused)?;
+                    let mut live = account.live();
+                    if pin {
+                        if !live.pinned.contains(&conversation_id) {
+                            if live.pinned.len() >= 4 {
+                                return Err(Refusal::Refused("Signal allows at most 4 pinned chats.".to_owned()));
+                            }
+                            live.pinned.push(conversation_id.clone());
+                        }
+                    } else {
+                        live.pinned.retain(|id| id != &conversation_id);
+                    }
+                    affected_pins = live.pinned.clone();
+                }
+                let filing = account.live().filing_for(&conversation_id);
+                let _ = ctx.filing(&conversation_id, &filing);
+                for id in affected_pins {
+                    if id != conversation_id {
+                        let f = account.live().filing_for(&id);
+                        let _ = ctx.filing(&id, &f);
+                    }
+                }
+                Ok(())
+            })();
+            let _ = reply.send(outcome);
+        }
         Command::Send { conversation_id, client_id, text, reply_to } => {
             let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[]);
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));

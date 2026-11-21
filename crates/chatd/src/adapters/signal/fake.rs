@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -397,6 +397,54 @@ fn steer(line: &str) -> Vec<Event> {
             left: false,
             rejoined: true,
         }],
+        "chat-state" => {
+            let target = next();
+            let peer = if target == "club" {
+                club()
+            } else if let Some((id, _)) = who(target) {
+                direct(id)
+            } else {
+                return Vec::new();
+            };
+            let mut state = ChatState {
+                peer,
+                muted_until: 0,
+                dont_notify_for_mentions_if_muted: false,
+                archived: false,
+                marked_unread: false,
+                blocked: false,
+                whitelisted: true,
+            };
+            for token in words {
+                if let Some((k, v)) = token.split_once('=') {
+                    match k {
+                        "muted" => state.muted_until = v.parse().unwrap_or(0),
+                        "dont_notify_mentions" => state.dont_notify_for_mentions_if_muted = v == "true" || v == "1",
+                        "archived" => state.archived = v == "true" || v == "1",
+                        "unread" => state.marked_unread = v == "true" || v == "1",
+                        "blocked" => state.blocked = v == "true" || v == "1",
+                        "whitelisted" => state.whitelisted = v == "true" || v == "1",
+                        _ => {}
+                    }
+                }
+            }
+            vec![Event::ChatStates { chats: vec![state], pinned: None, keep_muted_archived: None }]
+        }
+        "pin" => {
+            let mut pinned = Vec::new();
+            for target in words {
+                if target == "club" {
+                    pinned.push(club());
+                } else if let Some((id, _)) = who(target) {
+                    pinned.push(direct(id));
+                }
+            }
+            vec![Event::ChatStates { chats: Vec::new(), pinned: Some(pinned), keep_muted_archived: None }]
+        }
+        "keep-muted-archived" => {
+            let on = next() == "on";
+            vec![Event::ChatStates { chats: Vec::new(), pinned: None, keep_muted_archived: Some(on) }]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -527,6 +575,26 @@ impl Wire for Fake {
         record(&format!("lookup {username}"));
         let found = self.lookups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&username.to_ascii_lowercase()).cloned();
         Ok(found)
+    }
+
+    fn set_mute(&self, to: &Peer, until_ms: u64) -> Result<(), Fault> {
+        record(&format!("mute {} {until_ms}", describe(to)));
+        Ok(())
+    }
+
+    fn set_archived(&self, to: &Peer, archived: bool) -> Result<(), Fault> {
+        record(&format!("archive {} {archived}", describe(to)));
+        Ok(())
+    }
+
+    fn set_pinned(&self, to: &Peer, pinned: bool) -> Result<(), Fault> {
+        record(&format!("pin {} {pinned}", describe(to)));
+        Ok(())
+    }
+
+    fn set_marked_unread(&self, to: &Peer, unread: bool) -> Result<(), Fault> {
+        record(&format!("mark-unread {} {unread}", describe(to)));
+        Ok(())
     }
 
     fn close(&self) {

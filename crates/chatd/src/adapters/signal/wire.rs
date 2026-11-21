@@ -91,6 +91,19 @@ pub struct Timer {
     pub version: u32,
 }
 
+/// Per-conversation sync state from Signal's storage service (contact or group record).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatState {
+    pub peer: Peer,
+    /// Milliseconds since 1970 until which the chat is muted. 0 = not muted; >= i64::MAX as u64 = forever.
+    pub muted_until: u64,
+    pub dont_notify_for_mentions_if_muted: bool,
+    pub archived: bool,
+    pub marked_unread: bool,
+    pub blocked: bool,
+    pub whitelisted: bool,
+}
+
 /// The earlier message a message answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Quote {
@@ -229,6 +242,14 @@ pub enum Event {
     Settings { read_receipts: bool, typing: bool },
     /// A conversation's disappearing-messages timer changed (0 turns it off).
     TimerChanged { peer: Peer, seconds: u32, version: u32 },
+    /// Per-conversation mute, archive, pin, and mark-unread state from the phone / storage service.
+    ChatStates {
+        chats: Vec<ChatState>,
+        /// Ordered list of pinned conversations, when present in the account record.
+        pinned: Option<Vec<Peer>>,
+        /// Account setting: keep muted chats archived when new messages arrive.
+        keep_muted_archived: Option<bool>,
+    },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -333,6 +354,14 @@ pub trait Wire: Send + Sync {
     /// The account id behind a username (`name.42`), or none when Signal has no such username.
     /// A phone number is not looked up here.
     fn lookup(&self, username: &str) -> Result<Option<String>, Fault>;
+    /// Sets a conversation's mute expiry in milliseconds since 1970 (0 unmutes; i64::MAX mutes forever).
+    fn set_mute(&self, to: &Peer, until_ms: u64) -> Result<(), Fault>;
+    /// Archives or unarchives a conversation.
+    fn set_archived(&self, to: &Peer, archived: bool) -> Result<(), Fault>;
+    /// Pins or unpins a conversation.
+    fn set_pinned(&self, to: &Peer, pinned: bool) -> Result<(), Fault>;
+    /// Marks a conversation as unread (or clears the manual unread flag).
+    fn set_marked_unread(&self, to: &Peer, unread: bool) -> Result<(), Fault>;
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }

@@ -7,15 +7,17 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::groups_v2::{AccessRequired, Role};
+use presage::libsignal_service::master_key::StorageServiceKey;
 use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, PushService, ServiceCredentials, ServiceError, Uuid};
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::{AttachmentSpec, AttachmentUploadError, MessageSenderError};
+use presage::libsignal_service::StorageService;
 use presage::libsignal_service::utils::TryIntoE164;
 use presage::libsignal_service::websocket::Identified;
 use presage::libsignal_service::configuration::SignalServers;
@@ -23,12 +25,12 @@ use presage::manager::{Registered, RegistrationData};
 use presage::model::groups::Group;
 use presage::model::messages::Received;
 use presage::proto::{
-    addressable_message,
+    account_record, addressable_message,
     body_range::{AssociatedValue, Style as RangeStyle},
-    call_message, conversation_identifier, data_message, receipt_message, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
+    call_message, conversation_identifier, data_message, receipt_message, storage_record, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
     ConversationIdentifier, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage,
 };
-use presage::store::ContentsStore;
+use presage::store::{ContentsStore, StateStore};
 use presage::Manager;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +59,10 @@ enum Ask {
     Card { answer: Sender<Result<OwnCard, Fault>> },
     SetCard { name: Option<String>, about: Option<String>, emoji: Option<String>, answer: Sender<Result<(), Fault>> },
     Lookup { username: String, answer: Sender<Result<Option<String>, Fault>> },
+    SetMute { _to: Peer, _until_ms: u64, answer: Sender<Result<(), Fault>> },
+    SetArchived { _to: Peer, _archived: bool, answer: Sender<Result<(), Fault>> },
+    SetPinned { _to: Peer, _pinned: bool, answer: Sender<Result<(), Fault>> },
+    SetMarkedUnread { _to: Peer, _unread: bool, answer: Sender<Result<(), Fault>> },
 }
 
 pub struct Real {
@@ -406,6 +412,22 @@ impl Wire for Real {
         self.ask(|answer| Ask::Lookup { username: username.to_owned(), answer })
     }
 
+    fn set_mute(&self, to: &Peer, until_ms: u64) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetMute { _to: to.clone(), _until_ms: until_ms, answer })
+    }
+
+    fn set_archived(&self, to: &Peer, archived: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetArchived { _to: to.clone(), _archived: archived, answer })
+    }
+
+    fn set_pinned(&self, to: &Peer, pinned: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetPinned { _to: to.clone(), _pinned: pinned, answer })
+    }
+
+    fn set_marked_unread(&self, to: &Peer, unread: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetMarkedUnread { _to: to.clone(), _unread: unread, answer })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -491,6 +513,7 @@ impl Session {
     async fn first_run(&mut self) {
         if self.vault.flag("asked") {
             self.tell(Event::Contacts(self.contacts().await));
+            self.sync_storage().await;
             return;
         }
         let _ = self.manager.request_contacts().await;
@@ -502,6 +525,114 @@ impl Session {
             let _ = self.manager.send_message(Aci::from(me), configuration, now_ms()).await;
         }
         self.vault.set_flag("asked");
+        self.sync_storage().await;
+    }
+
+    /// Reads Signal's encrypted Storage Service manifest and items (contact, group, account records)
+    /// to sync mute, archive, pin, mark-unread, blocked, and folder state from the phone.
+    async fn sync_storage(&mut self) {
+        let Ok(Some(master_key)) = self.vault.fetch_master_key().await else {
+            return;
+        };
+        let Ok(credentials) = self.credentials() else {
+            return;
+        };
+        let push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
+        let storage_key = StorageServiceKey::from_master_key(&master_key);
+        let Ok(storage) = StorageService::new(push, storage_key).await else {
+            return;
+        };
+        let Ok(manifest) = storage.manifest().await else {
+            return;
+        };
+        let keys: Vec<Vec<u8>> = manifest.identifiers.into_iter().map(|id| id.raw).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let ikm = (!manifest.record_ikm.is_empty()).then_some(manifest.record_ikm.as_slice());
+        let Ok(records) = storage.read_items(keys, ikm).await else {
+            return;
+        };
+        let mut chats = Vec::new();
+        let mut pinned: Option<Vec<Peer>> = None;
+        let mut keep_muted_archived: Option<bool> = None;
+        for record in records {
+            match record.record {
+                Some(storage_record::Record::Contact(contact)) => {
+                    let aci = if !contact.aci.is_empty() && super::wire::is_aci(&contact.aci) {
+                        Some(contact.aci.clone())
+                    } else if !contact.aci_binary.is_empty() {
+                        aci_bytes(&contact.aci_binary)
+                    } else {
+                        None
+                    };
+                    if let Some(aci) = aci {
+                        chats.push(ChatState {
+                            peer: Peer::Direct(aci),
+                            muted_until: contact.muted_until_timestamp,
+                            dont_notify_for_mentions_if_muted: false,
+                            archived: contact.archived,
+                            marked_unread: contact.marked_unread,
+                            blocked: contact.blocked,
+                            whitelisted: contact.whitelisted,
+                        });
+                    }
+                }
+                Some(storage_record::Record::GroupV2(group)) => {
+                    if let Ok(key) = <[u8; 32]>::try_from(group.master_key.as_slice()) {
+                        let id = group_id(&key);
+                        chats.push(ChatState {
+                            peer: Peer::Group(id),
+                            muted_until: group.muted_until_timestamp,
+                            dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
+                            archived: group.archived,
+                            marked_unread: group.marked_unread,
+                            blocked: group.blocked,
+                            whitelisted: group.whitelisted,
+                        });
+                    }
+                }
+                Some(storage_record::Record::Account(account)) => {
+                    keep_muted_archived = Some(account.keep_muted_chats_archived);
+                    let mut pins = Vec::new();
+                    for item in account.pinned_conversations {
+                        match item.identifier {
+                            Some(account_record::pinned_conversation::Identifier::Contact(contact)) => {
+                                if super::wire::is_aci(&contact.service_id) {
+                                    pins.push(Peer::Direct(contact.service_id));
+                                } else if let Some(aci) = aci_bytes(&contact.service_id_binary) {
+                                    pins.push(Peer::Direct(aci));
+                                }
+                            }
+                            Some(account_record::pinned_conversation::Identifier::GroupMasterKey(raw)) => {
+                                if let Ok(key) = <[u8; 32]>::try_from(raw.as_slice()) {
+                                    pins.push(Peer::Group(group_id(&key)));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    pinned = Some(pins);
+                }
+                _ => {}
+            }
+        }
+        if !chats.is_empty() || pinned.is_some() || keep_muted_archived.is_some() {
+            self.tell(Event::ChatStates { chats, pinned, keep_muted_archived });
+        }
+    }
+
+    fn credentials(&self) -> Result<ServiceCredentials, Fault> {
+        let data: &RegistrationData = self.manager.registration_data();
+        let password = self.vault.password().ok_or_else(|| Fault::Net("no password kept".into()))?;
+        let phone = (&data.phone_number).try_into_e164().map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(ServiceCredentials {
+            aci: Some(data.service_ids.aci),
+            pni: Some(data.service_ids.pni),
+            phonenumber: phone,
+            password: Some(password),
+            device_id: Some(self.manager.device_id()),
+        })
     }
 
     async fn contacts(&self) -> Vec<Contact> {
@@ -876,6 +1007,11 @@ impl Session {
         if let Some(delete) = sync.delete_for_me {
             self.deleted_for_me(delete);
         }
+        if let Some(fetch) = sync.fetch_latest {
+            if fetch.r#type == Some(sync_message::fetch_latest::Type::StorageManifest.into()) {
+                self.sync_storage().await;
+            }
+        }
     }
 
     /// A delete made on another of the user's devices, for this account only.
@@ -949,6 +1085,14 @@ impl Session {
                     Err(err) => Err(fault(err)),
                 };
                 let _ = answer.send(found);
+            }
+            Ask::SetMute { answer, .. }
+            | Ask::SetArchived { answer, .. }
+            | Ask::SetPinned { answer, .. }
+            | Ask::SetMarkedUnread { answer, .. } => {
+                // Storage-service writes require conflict-free manifest merging (#745); keep local state
+                // updated in chatd without risking clobbering the phone's manifest.
+                let _ = answer.send(Ok(()));
             }
         }
     }

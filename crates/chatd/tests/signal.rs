@@ -1370,3 +1370,111 @@ fn sending_with_a_mention_span_sends_a_signal_mention_range() {
     );
     world.heard(&format!("send {CLUB} text hi \u{FFFC}! ranges=Mention({GRACE}):3+1"));
 }
+
+#[test]
+fn mute_archive_pin_and_mark_unread_sync_and_serve_commands() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|status| status.key == account()).expect("Signal account");
+    assert!(signal.can.pin_chats > 0, "Signal should advertise pin_chats");
+    assert!(signal.can.archive, "Signal should advertise archive");
+
+    // Create direct chats with Grace and Alan.
+    world.steer(&format!("incoming grace {} Hey", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer(&format!("incoming alan {} Yo", T0 + 2_000));
+    world.arrived(ALAN, &id(T0 + 2_000, ALAN));
+
+    // Sync from phone: Grace is muted, archived, and marked unread; CLUB is pinned.
+    world.steer("chat-state grace muted=9999999999999 archived=true unread=true");
+    world.steer("pin club");
+    world.until("Grace muted and archived", || {
+        let row = world.conversation(GRACE)?;
+        (row.muted && row.archived && row.unread > 0).then_some(())
+    });
+    world.until("Club pinned", || world.conversation(CLUB)?.pin.map(|p| p == 0).filter(|&ok| ok));
+
+    // Archive shelf contains Grace; Main shelf does not contain Grace and puts pinned CLUB first.
+    let Response::Conversations { conversations: archive_rows, .. } = world.ask(Request::Home {
+        network: Network::Signal,
+        account: Some(account()),
+        folder: None,
+        shelf: protocol::Shelf::Archive,
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Archive conversations");
+    };
+    assert!(archive_rows.iter().any(|c| c.key.id == GRACE), "Grace should be on Archive shelf");
+
+    let Response::Conversations { conversations: main_rows, .. } = world.ask(Request::Home {
+        network: Network::Signal,
+        account: Some(account()),
+        folder: None,
+        shelf: protocol::Shelf::Main,
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Main conversations");
+    };
+    assert!(!main_rows.iter().any(|c| c.key.id == GRACE), "Grace should not be on Main shelf");
+    assert_eq!(main_rows.first().map(|c| c.key.id.as_str()), Some(CLUB), "Pinned CLUB should sort first");
+
+    // Keep muted chats archived: with setting ON, a new message from muted Grace keeps her archived.
+    world.steer("keep-muted-archived on");
+    world.steer(&format!("incoming grace {} Still muted", T0 + 3_000));
+    world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    assert!(world.conversation(GRACE).unwrap().archived, "muted archived chat stays archived when keep_muted_archived is on");
+
+    // With setting OFF, a new message unarchives Grace back to Main.
+    world.steer("keep-muted-archived off");
+    world.steer(&format!("incoming grace {} Wake up", T0 + 4_000));
+    world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    world.until("Grace unarchived on new message", || (!world.conversation(GRACE)?.archived).then_some(()));
+
+    // Muted group with dont_notify_mentions suppresses mentions_me.
+    world.steer("chat-state club muted=9999999999999 dont_notify_mentions=true");
+    world.until("Club muted", || world.conversation(CLUB)?.muted.then_some(()));
+    world.steer(&format!("mention grace {} quiet ping", T0 + 5_000));
+    let quiet_mention = world.arrived(CLUB, &id(T0 + 5_000, GRACE));
+    assert!(!quiet_mention.mentions_me, "muted group with dontNotifyForMentionsIfMuted should suppress mentions_me");
+
+    // Serve SetMute, File (archive + pin), and MarkUnread from tinyclient.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(ALAN), notify: protocol::Notify::Nothing, until: None }),
+        Response::Ok
+    );
+    world.until("Alan muted", || world.conversation(ALAN)?.muted.then_some(()));
+    assert!(world.calls().iter().any(|c| c.starts_with(&format!("mute {ALAN} "))));
+
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key(ALAN), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    world.until("Alan unmuted", || (!world.conversation(ALAN)?.muted).then_some(()));
+    world.heard(&format!("mute {ALAN} 0"));
+
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key(ALAN),
+            pinned: Some(true),
+            archived: Some(true),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    world.until("Alan archived and pinned", || {
+        let row = world.conversation(ALAN)?;
+        (row.archived && row.pin.is_some()).then_some(())
+    });
+    world.heard(&format!("archive {ALAN} true"));
+    world.heard(&format!("pin {ALAN} true"));
+
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(ALAN), message_id: id(T0 + 2_000, ALAN) }), Response::Ok);
+    assert_eq!(world.ask(Request::MarkUnread { conversation: key(ALAN), message_id: String::new() }), Response::Ok);
+    world.until("Alan marked unread", || (world.conversation(ALAN)?.unread > 0).then_some(()));
+    world.heard(&format!("mark-unread {ALAN} true"));
+}

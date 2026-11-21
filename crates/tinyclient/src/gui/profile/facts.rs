@@ -589,8 +589,8 @@ fn tidy(mut items: Vec<Item>) -> Vec<Item> {
 /// already opens them in the network's app; a row's menu has no foot, so it says it here.
 pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<Item> {
     let mut items = Vec::new();
-    // Signal, Messages, and Tiny do not serve mute. A switch that snaps back is left out.
-    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Signal | Network::Messages | Network::Tiny)) {
+    // Messages and Tiny do not serve mute. A switch that snaps back is left out.
+    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Messages | Network::Tiny)) {
         items.extend([Item::Mute { muted }, Item::Separator]);
     }
     if !person.handle.trim_start_matches('@').is_empty() {
@@ -803,7 +803,7 @@ pub enum NotifyControl {
 
 pub fn notify_control(conversation: &Conversation) -> NotifyControl {
     match conversation.key.network {
-        Network::Signal => NotifyControl::Held("Set on your phone"),
+        Network::Signal => NotifyControl::Switch,
         Network::Messages => NotifyControl::Held("Stays on your phone"),
         Network::Tiny => NotifyControl::Held("Not available on Tiny"),
         _ => {
@@ -1231,7 +1231,10 @@ mod tests {
         let mut signal = row(Network::Signal, ConversationKind::Direct);
         signal.private = true;
         assert_eq!(conversation_tag(&signal, None), None);
-        assert_eq!(notify_control(&signal), NotifyControl::Held("Set on your phone"));
+        assert_eq!(notify_control(&signal), NotifyControl::Switch);
+        let signal_person = person(Network::Signal, Relation::Contact);
+        let signal_seen = Seen { in_their_dm: false, direct: Some((CallSupport::None, false)), online: true, ..Seen::default() };
+        assert!(person_menu(&signal_person, &signal_seen, false, false).contains(&Item::Mute { muted: false }));
         assert!(!can_leave(&row(Network::Signal, ConversationKind::Group)));
         assert!(!can_leave(&row(Network::Messages, ConversationKind::Group)));
         assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));
