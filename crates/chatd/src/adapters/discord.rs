@@ -1356,18 +1356,7 @@ impl Discord {
             }
             let mut err: Option<String> = None;
             for mid in message_ids {
-                let mut reference = serde_json::json!({
-                    "type": 1,
-                    "channel_id": from,
-                    "message_id": mid,
-                });
-                if let Some(guild) = &from_guild {
-                    reference["guild_id"] = serde_json::json!(guild);
-                }
-                let body = serde_json::json!({
-                    "content": "",
-                    "message_reference": reference,
-                });
+                let body = forward_message_body(from, mid, from_guild.as_deref());
                 if let Err(e) = self.call("POST", &format!("/channels/{target}/messages"), Some(body)) {
                     err = Some(match refusal(e) {
                         Refusal::Refused(why) => why,
@@ -2195,6 +2184,83 @@ fn message_report(reason: protocol::ReportReason) -> Option<(&'static str, &'sta
     }
 }
 
+/// The body `POST /channels/{target}/messages` sends for one forwarded message.
+fn forward_message_body(from: &str, message_id: &str, guild: Option<&str>) -> Value {
+    let mut reference = json!({
+        "type": 1,
+        "channel_id": from,
+        "message_id": message_id,
+    });
+    if let Some(guild) = guild {
+        reference["guild_id"] = json!(guild);
+    }
+    json!({
+        "content": "",
+        "message_reference": reference,
+    })
+}
+
+/// `TINYCLIENT_PROVE=discord-forward-report`. A forward is an empty type-1 reference, a
+/// report uses a captured message-menu leaf, and every snapshot is shown.
+pub(super) fn prove_forward_report() -> Result<(), String> {
+    let body = forward_message_body("4101", "1300000000000000100", Some("4000"));
+    let reference = &body["message_reference"];
+    if body["content"] != ""
+        || reference["type"] != 1
+        || reference["channel_id"] != "4101"
+        || reference["message_id"] != "1300000000000000100"
+        || reference["guild_id"] != "4000"
+    {
+        return Err("a forward is an empty message with a type-1 reference and the source guild".to_owned());
+    }
+    let (variant, crumbs) = message_report(protocol::ReportReason::Spam).ok_or("spam is a message report")?;
+    if variant != "98" || crumbs != [7, 98] {
+        return Err("spam uses the captured message-menu leaf".to_owned());
+    }
+    if message_report(protocol::ReportReason::Other).is_some() {
+        return Err("Discord has no general report, so Other is refused".to_owned());
+    }
+
+    struct Known;
+    impl Names for Known {
+        fn user(&self, _: &str) -> Option<String> { None }
+        fn role(&self, _: &str) -> Option<String> { None }
+        fn channel(&self, id: &str) -> Option<String> { (id == "4101").then(|| "general".to_owned()) }
+        fn space(&self, id: &str) -> Option<String> { (id == "4000").then(|| "Rustaceans".to_owned()) }
+    }
+    let account = protocol::AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+    let place = Place { account: &account, me: "me", guild: None, names: &Known, author: None };
+    let snap = |text: &str, id: &str| Posted {
+        content: Some(text.to_owned()),
+        attachments: Some(vec![model::Attachment { id: id.into(), filename: format!("{id}.txt"), size: 12, url: format!("https://cdn.discordapp.com/attachments/4101/{id}/{id}.txt"), ..Default::default() }]),
+        ..Default::default()
+    };
+    let posted = Posted {
+        id: "1300000000000000999".into(),
+        channel_id: "3001".into(),
+        message_reference: Some(model::Reference {
+            kind: 1,
+            channel_id: Some("4101".into()),
+            message_id: Some("1300000000000000100".into()),
+            guild_id: Some("4000".into()),
+        }),
+        message_snapshots: vec![
+            model::Snapshot { message: Box::new(snap("First snapshot", "1")) },
+            model::Snapshot { message: Box::new(snap("Second snapshot", "2")) },
+        ],
+        ..Default::default()
+    };
+    let (msg, _) = content::message(&posted, &place);
+    if !msg.text.contains("First snapshot") || !msg.text.contains("Second snapshot") || msg.attachments.len() != 2 {
+        return Err("every forwarded snapshot and its file is shown".to_owned());
+    }
+    let forwarded = msg.forwarded.as_ref().ok_or("a type-1 reference names where it came from")?;
+    if forwarded.from_title != "#general" || forwarded.from_space != "Rustaceans" {
+        return Err("a forward names the channel and the server".to_owned());
+    }
+    Ok(())
+}
+
 fn report_reasons(target: &protocol::ReportTarget) -> Result<Vec<protocol::ReportReason>, Refusal> {
     match target {
         protocol::ReportTarget::Message { .. } => Ok(vec![
@@ -2444,5 +2510,10 @@ mod tests {
         assert_eq!(payloads[0]["read_states"][0]["channel_id"], "chan1");
         assert_eq!(payloads[0]["read_states"][0]["message_id"], "msg1");
         assert_eq!(payloads[0]["read_states"][0]["read_state_type"], 0);
+    }
+
+    #[test]
+    fn forward_report_prove_passes() {
+        prove_forward_report().expect("forward and report");
     }
 }
