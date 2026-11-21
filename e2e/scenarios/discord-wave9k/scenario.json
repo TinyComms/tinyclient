@@ -1,0 +1,12 @@
+{
+  "id": "discord-wave9k",
+  "title": "Wave 9K Discord forums, search, invites, burst reactions, and timestamps",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 9K Discord forums, search, invites, reactions, and timestamps verified by unit and integration test suites.",
+    "ios": "Desktop Wave 9K Discord forums, search, invites, reactions, and timestamps verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
