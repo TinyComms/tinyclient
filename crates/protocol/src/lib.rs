@@ -1928,6 +1928,17 @@ pub enum Request {
     TinyDeleteAccount {
         account: AccountKey,
     },
+    /// Files an abuse report on a Tiny server (`POST /v1/reports`). Answers `TinyReported`.
+    TinyReport {
+        account: AccountKey,
+        kind: String,
+        target_id: String,
+        category: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+    },
     /// Makes a room, for an owner or an admin. Its call is empty until someone joins.
     TinyRoomCreate {
         account: AccountKey,
@@ -2631,6 +2642,11 @@ pub enum Response {
     TinyBotCreated {
         bot: TinyBot,
         token: String,
+    },
+    /// An abuse report was accepted (`POST /v1/reports`). `duplicate` is true on `200` when the
+    /// same reporter already has an open or reviewing report on this target.
+    TinyReported {
+        duplicate: bool,
     },
     /// What `E2eeAsk::Status` asked.
     TinyE2ee {

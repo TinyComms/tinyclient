@@ -19,7 +19,7 @@ use protocol::{
     tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyCapabilities, TinyCategory, TinyCode,
     TinyBot, TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
     TinyClaimLink, TinyPasskeys, TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
-    TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
+    TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_ABUSE_REPORTS, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
     TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
     TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
     TINY_WELCOME_MAX,
@@ -50,6 +50,14 @@ const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
 const PASSKEY_LABEL_MAX: usize = 60;
 const PASSKEY_GONE: &str = "That passkey is gone.";
 pub(crate) const DELETE_LAST_OWNER: &str = "You're the only owner. Hand the server to someone first.";
+const REPORT_NOTE_MAX: usize = 2000;
+const REPORT_EVIDENCE_MAX: usize = 32_768;
+const REPORT_KINDS: [&str; 3] = ["message", "member", "channel"];
+const REPORT_CATEGORIES: [&str; 8] = ["spam", "harassment", "hate", "violence", "sexual", "illegal", "impersonation", "other"];
+pub(crate) const REPORT_RATE_LIMIT: &str = "You've sent a lot of reports. Try again later.";
+pub(crate) const REPORT_NOT_FOUND: &str = "That is no longer available.";
+const REPORT_NOTE_SIZE: &str = "A note is at most 2000 characters.";
+const REPORT_EVIDENCE_SIZE: &str = "That message is too long to attach as evidence.";
 /// The longest reason the audit keeps from here.
 const REASON_MAX: usize = 500;
 /// The longest value of a setup choice, such as `activity_visibility`'s `everyone`, and the longest
@@ -1218,6 +1226,75 @@ pub(crate) fn delete_account(account: &AccountKey) -> Result<(), Response> {
             Err(refused(DELETE_LAST_OWNER))
         }
         Ok((status, body)) => Err(refused(explain(status, &body, Missing::Plain))),
+    }
+}
+
+/// Files an abuse report (`POST /v1/reports`) for a message, member, or channel.
+/// Never logs `note` or `evidence`.
+pub(crate) fn report_create(
+    account: AccountKey,
+    kind: String,
+    target_id: String,
+    category: String,
+    note: Option<String>,
+    evidence: Option<String>,
+) -> Response {
+    if !REPORT_KINDS.contains(&kind.as_str()) || !safe_id(&target_id) || !REPORT_CATEGORIES.contains(&category.as_str()) {
+        return refused(CHECK);
+    }
+    let has_disallowed_control = |text: &str| text.chars().any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'));
+    let note = match note {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.chars().count() > REPORT_NOTE_MAX {
+                return refused(REPORT_NOTE_SIZE);
+            } else if has_disallowed_control(trimmed) {
+                return refused(CHECK);
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        None => None,
+    };
+    let evidence = match evidence {
+        Some(raw) if !raw.is_empty() => {
+            if raw.len() > REPORT_EVIDENCE_MAX {
+                return refused(REPORT_EVIDENCE_SIZE);
+            }
+            if has_disallowed_control(&raw) {
+                return refused(CHECK);
+            }
+            Some(raw)
+        }
+        _ => None,
+    };
+    let saved = match allowed(&account, Some(TINY_FEATURE_ABUSE_REPORTS), "community.members.read") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let mut payload = Map::new();
+    payload.insert("kind".to_owned(), Value::String(kind));
+    payload.insert("target_id".to_owned(), Value::String(target_id));
+    payload.insert("category".to_owned(), Value::String(category));
+    if let Some(note) = note {
+        payload.insert("note".to_owned(), Value::String(note));
+    }
+    if let Some(evidence) = evidence {
+        payload.insert("evidence".to_owned(), Value::String(evidence));
+    }
+    match asked("POST", &saved, "/v1/reports", Some(Value::Object(payload))) {
+        Err(detail) => refused(detail),
+        Ok((201, body)) => Response::TinyReported {
+            duplicate: body.get("duplicate").and_then(Value::as_bool).unwrap_or(false),
+        },
+        Ok((200, body)) => Response::TinyReported {
+            duplicate: body.get("duplicate").and_then(Value::as_bool).unwrap_or(true),
+        },
+        Ok((429, _)) => refused(REPORT_RATE_LIMIT),
+        Ok((404, _)) => refused(REPORT_NOT_FOUND),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
 }
 

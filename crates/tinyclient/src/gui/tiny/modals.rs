@@ -311,7 +311,111 @@ impl Shell {
                     });
                 self.tiny_typed_confirm(panel, page, "Delete my account", window, cx, |this, cx| this.tiny_delete_account(cx))
             }
+            Modal::Report { kind, label, message_text, category, include_evidence, .. } => {
+                self.tiny_report_modal(kind, label, message_text.as_deref(), *category, *include_evidence, window, cx)
+            }
         }
+    }
+
+    /// Abuse report modal for a message, member, or channel on a Tiny server.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tiny_report_modal(
+        &self,
+        kind: &str,
+        target_label: &str,
+        message_text: Option<&str>,
+        category: &'static str,
+        include_evidence: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        const CATEGORIES: [(&str, &str); 8] = [
+            ("spam", "Spam"),
+            ("harassment", "Harassment"),
+            ("hate", "Hate speech"),
+            ("violence", "Violence"),
+            ("sexual", "Sexual content"),
+            ("illegal", "Illegal"),
+            ("impersonation", "Impersonation"),
+            ("other", "Other"),
+        ];
+        let title = match kind {
+            "message" => "Report message".to_owned(),
+            "channel" => format!("Report #{target_label}"),
+            _ => format!("Report {target_label}"),
+        };
+        let mut chips = div().flex().flex_wrap().gap(px(6.));
+        for (ix, (wire, name)) in CATEGORIES.into_iter().enumerate() {
+            let on = category == wire;
+            chips = chips.child(
+                div()
+                    .id(("tiny-report-cat", ix))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(14.))
+                    .border_1()
+                    .border_color(if on { theme::accent() } else { theme::border() })
+                    .bg(if on { theme::accent_soft() } else { theme::hover() })
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_small()
+                    .text_color(if on { theme::accent_text() } else { theme::text() })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(Modal::Report { category, .. }) = this.tiny_state.modal.as_mut() {
+                            *category = wire;
+                            cx.notify();
+                        }
+                    }))
+                    .child(name),
+            );
+        }
+        let mut panel = modal(title)
+            .w(px(460.))
+            .child(label("Category"))
+            .child(chips)
+            .child(label("Note (optional)"))
+            .child(self.input_box(&self.tiny_state.reason_input, window, cx));
+        if kind == "message" && message_text.is_some() {
+            panel = panel
+                .child(
+                    div()
+                        .id("tiny-report-evidence")
+                        .mt(px(14.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(Modal::Report { include_evidence, .. }) = this.tiny_state.modal.as_mut() {
+                                *include_evidence = !*include_evidence;
+                                cx.notify();
+                            }
+                        }))
+                        .child(super::settings::check_box("tiny-report-evidence-box", Some(include_evidence), true))
+                        .child(div().type_ui().text_color(theme::text()).child("Include this message's text")),
+                )
+                .child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(24.))
+                        .whitespace_normal()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child("Moderators will see the text you send. The server cannot check it is genuine."),
+                );
+        }
+        panel
+            .children(self.modal_error())
+            .child(self.buttons("Report", ButtonKind::Danger, cx, |this, cx| this.tiny_send_report(cx)))
+            .child(
+                div()
+                    .mt(px(10.))
+                    .whitespace_normal()
+                    .type_small()
+                    .text_color(theme::text_faint())
+                    .child("The moderators of this server will see that you reported this. The person you report is not told."),
+            )
     }
 
     /// A dangerous modal's end: the server's name to type, and the action quiet until it is.

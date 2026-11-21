@@ -506,6 +506,29 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         Command::ConversationInfo { conversation_id, reply } => {
             conversation_info(ctx, saved, &conversation_id, reply);
         }
+        Command::Report { target, reason, note, block: _, reply } => {
+            let (kind, target_id) = match &target {
+                protocol::ReportTarget::Message { message_id, .. } => ("message".to_owned(), message_id.clone()),
+                protocol::ReportTarget::Person(key) => ("member".to_owned(), key.id.clone()),
+                protocol::ReportTarget::Conversation(key) => ("channel".to_owned(), key.id.clone()),
+            };
+            let category = match reason {
+                protocol::ReportReason::Spam => "spam",
+                protocol::ReportReason::Harassment => "harassment",
+                protocol::ReportReason::Violence => "violence",
+                protocol::ReportReason::Illegal => "illegal",
+                protocol::ReportReason::Impersonation => "impersonation",
+                protocol::ReportReason::Other => "other",
+            }
+            .to_owned();
+            let note = (!note.trim().is_empty()).then_some(note);
+            let answer = match super::manage::report_create(ctx.account.clone(), kind, target_id, category, note, None) {
+                protocol::Response::TinyReported { .. } => Ok(()),
+                protocol::Response::Error { detail, .. } => Err(Refusal::Refused(detail)),
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
         other => other.unsupported(ctx),
     }
 }
@@ -2170,13 +2193,15 @@ struct UploadLimits {
 /// What this account may send. `file_scan` is absent on an older server, which keeps today's upload.
 fn account_caps(saved: &Saved) -> Capabilities {
     let limits = upload_limits(saved);
-    let scans = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_FILE_SCAN);
+    let server_caps = super::manage::capabilities_of(saved);
+    let scans = server_caps.has(protocol::TINY_FEATURE_FILE_SCAN);
     Capabilities {
         max_file_bytes: limits.image.max(limits.file),
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
         direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
+        abuse_reports: server_caps.has(protocol::TINY_FEATURE_ABUSE_REPORTS),
         reply: true,
         edit: true,
         delete: true,

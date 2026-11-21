@@ -751,3 +751,66 @@ fn delete_account_sends_confirm_and_handles_last_owner() {
         assert!(open(&account).is_ok(), "session remains in place on 500");
     });
 }
+
+#[test]
+fn report_create_sends_payload_and_maps_all_answers() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        if first.starts_with("GET /v1/capabilities") {
+            http(200, "OK", r#"{"version":"0.6.0","features":["abuse_reports"]}"#)
+        } else if first.starts_with("GET /v1/me ") {
+            http(200, "OK", OWNER)
+        } else if first.starts_with("POST /v1/reports ") {
+            if body.contains("\"dup\"") {
+                http(200, "OK", r#"{"id":"r1","duplicate":true}"#)
+            } else if body.contains("\"rate\"") {
+                http(429, "Too Many Requests", r#"{"error":"slow_down"}"#)
+            } else if body.contains("\"gone\"") {
+                http(404, "Not Found", r#"{"error":"not_found"}"#)
+            } else {
+                http(201, "Created", r#"{"id":"r2","duplicate":false}"#)
+            }
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base, "member", |account| {
+        // Without evidence: field omitted.
+        assert_eq!(
+            report_create(account.clone(), "member".into(), BEA.into(), "harassment".into(), Some("  rude  ".into()), None),
+            Response::TinyReported { duplicate: false }
+        );
+        let body = json_body(&last(&log, "POST /v1/reports "));
+        assert_eq!(body["kind"], "member");
+        assert_eq!(body["target_id"], BEA);
+        assert_eq!(body["category"], "harassment");
+        assert_eq!(body["note"], "rude");
+        assert!(body.get("evidence").is_none());
+
+        // With evidence: included verbatim.
+        assert_eq!(
+            report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), None, Some("buy now".into())),
+            Response::TinyReported { duplicate: false }
+        );
+        let body = json_body(&last(&log, "POST /v1/reports "));
+        assert_eq!(body["kind"], "message");
+        assert_eq!(body["evidence"], "buy now");
+        assert!(body.get("note").is_none());
+
+        // Duplicate (200), rate limit (429), missing (404).
+        assert_eq!(report_create(account.clone(), "channel".into(), "dup".into(), "other".into(), None, None), Response::TinyReported { duplicate: true });
+        assert_eq!(report_create(account.clone(), "channel".into(), "rate".into(), "other".into(), None, None), said(REPORT_RATE_LIMIT));
+        assert_eq!(report_create(account.clone(), "channel".into(), "gone".into(), "other".into(), None, None), said(REPORT_NOT_FOUND));
+
+        // Client-side size and shape validation.
+        assert_eq!(report_create(account.clone(), "bad".into(), "m1".into(), "spam".into(), None, None), said(CHECK));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "bogus".into(), None, None), said(CHECK));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), Some("a".repeat(2001)), None), said(REPORT_NOTE_SIZE));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), None, Some("b".repeat(32_769))), said(REPORT_EVIDENCE_SIZE));
+        assert_eq!(report_create(account.clone(), "message".into(), "m1".into(), "spam".into(), Some("bad\x00char".into()), None), said(CHECK));
+    });
+}

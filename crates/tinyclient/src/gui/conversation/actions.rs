@@ -141,6 +141,8 @@ pub struct Can {
     pub delete_me: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
+    /// May report this message to the server's moderators (Tiny `abuse_reports`, other people's messages).
+    pub report: bool,
 }
 
 /// What the menu and the toolbar call this message's thread.
@@ -260,6 +262,7 @@ pub fn can_with_network(
         delete_everyone,
         delete_me,
         unsent,
+        report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
     }
 }
 
@@ -316,6 +319,8 @@ enum MenuAct {
     Unread,
     /// Enter multi-message selection mode with this message ticked.
     Select,
+    /// Report another person's message on a Tiny server.
+    Report,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -495,6 +500,9 @@ fn menu_acts(
     if !can.unsent {
         acts.push(MenuAct::Unread);
         acts.push(MenuAct::Select);
+    }
+    if can.report {
+        acts.push(MenuAct::Report);
     }
     if can.delete {
         acts.push(MenuAct::Delete);
@@ -1095,6 +1103,16 @@ impl Pane {
                 window.focus(&self.focus, cx);
                 cx.notify();
             }
+            MenuAct::Report => {
+                if let Some(open) = self.open.as_ref() {
+                    let account = open.key.account();
+                    let id = message.id.clone();
+                    let text = (!message.text.is_empty()).then(|| message.text.clone());
+                    let _ = self.shell.update(cx, |shell, cx| {
+                        shell.tiny_open_report(account, "message", id, String::new(), text, window, cx);
+                    });
+                }
+            }
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
     }
@@ -1278,6 +1296,23 @@ impl Pane {
                             this.multi_select.enter(&message.id);
                             window.focus(&this.focus, cx);
                             cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if can.report {
+                rows.push(rule().into_any_element());
+                rows.push(
+                    row("sheet-report", "icons/triangle-alert.svg", "Report…".into(), true)
+                        .on_click(then(|this, message, window, cx| {
+                            if let Some(open) = this.open.as_ref() {
+                                let account = open.key.account();
+                                let id = message.id.clone();
+                                let text = (!message.text.is_empty()).then(|| message.text.clone());
+                                let _ = this.shell.update(cx, |shell, cx| {
+                                    shell.tiny_open_report(account, "message", id, String::new(), text, window, cx);
+                                });
+                            }
                         }))
                         .into_any_element(),
                 );
@@ -1495,6 +1530,13 @@ impl Pane {
                     menu_item("select", Some("icons/check.svg"), "Select", None)
                         .when(lit(MenuAct::Select), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Select)),
+                );
+            }
+            if can.report {
+                items = items.child(menu_separator()).child(
+                    menu_item_danger("report", Some("icons/triangle-alert.svg"), "Report…")
+                        .when(lit(MenuAct::Report), |row| row.bg(theme::danger_soft()))
+                        .on_click(go(MenuAct::Report)),
                 );
             }
             if can.delete {

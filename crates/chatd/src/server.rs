@@ -3132,6 +3132,9 @@ impl Chat {
                 Ok(()) => self.forget_deleted_tiny(account),
                 Err(answer) => answer,
             },
+            Request::TinyReport { account, kind, target_id, category, note, evidence } => {
+                adapters::tiny::manage::report_create(account, kind, target_id, category, note, evidence)
+            }
             Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
             Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
             Request::TinyAvatar { account, path } => adapters::tiny::manage::user_avatar(account, path),

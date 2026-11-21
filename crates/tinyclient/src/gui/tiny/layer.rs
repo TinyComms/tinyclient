@@ -18,10 +18,17 @@ impl Shell {
         if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() && !state.setup.prompt && state.full.is_none() {
             return None;
         }
-        // Sharing belongs to the active call, even while another chat is selected and
+        // Sharing and abuse reports work even while another chat is selected and
         // no Tiny community page is loaded.
         if matches!(state.modal, Some(super::Modal::Share)) {
             return Some(super::modals::layer(self.tiny_share_modal(cx), true, cx));
+        }
+        if let Some(super::Modal::Report { kind, label, message_text, category, include_evidence, .. }) = state.modal.clone() {
+            return Some(super::modals::layer(
+                self.tiny_report_modal(&kind, &label, message_text.as_deref(), category, include_evidence, window, cx),
+                true,
+                cx,
+            ));
         }
         let page = self.tiny_page_facts()?;
         let mut layer = div().absolute().top_0().left_0().size_full();
