@@ -173,6 +173,29 @@ fn reason(fault: Fault) -> String {
                 return DEMANDS.iter().find(|(name, _)| *name == demand).map_or_else(String::new, |(_, words)| (*words).to_owned());
             }
             "not_in_channel" => "You are not in this channel.",
+            "cant_leave_general" => "You cannot leave the #general channel.",
+            "cant_archive_general" => "The #general channel cannot be archived.",
+            "already_archived" => "This channel is already archived.",
+            "not_archived" => "This channel is not archived.",
+            "cant_kick_self" => "To remove yourself from a channel, leave it instead.",
+            "cant_kick_from_general" => "Members cannot be removed from #general.",
+            "cant_invite_self" => "You are already in this channel.",
+            "cant_invite" => "This workspace does not let you invite people to this channel.",
+            "already_in_channel" => "That person is already in this channel.",
+            "user_not_in_channel" => "That person is not in this channel.",
+            "name_taken" => "A channel with that name already exists.",
+            "invalid_name_required"
+            | "invalid_name_punctuation"
+            | "invalid_name_maxlength"
+            | "invalid_name_specials"
+            | "invalid_name_reserved"
+            | "invalid_name_nonmatching" => "That channel name is not valid for Slack.",
+            "not_authorized" => "You do not have permission to do that in this workspace.",
+            "permission_denied" => "This workspace does not let you pin messages here.",
+            "already_pinned" => "This message is already pinned.",
+            "no_pin" => "This message is not pinned.",
+            "not_pinnable" => "This message cannot be pinned.",
+            "too_long" => "That text is too long for Slack (250 character limit).",
             "msg_too_long" => "The message is too long for Slack.",
             "is_archived" => "This channel is archived.",
             "channel_not_found" => "Slack cannot find this conversation.",
@@ -183,7 +206,8 @@ fn reason(fault: Fault) -> String {
             // takes. Slack's own search is one such: its web client may use an internal call.
             "not_allowed_token_type" => "Slack's own search isn't reachable with this session.",
             "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
-            error if error.starts_with("restricted_action") => "This workspace does not let you post here.",
+            "restricted_action" => "This workspace does not let you do that.",
+            error if error.starts_with("restricted_action_") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
         },
     };
@@ -927,6 +951,7 @@ impl Slack {
             "pref_change" => self.muted(event["name"].as_str().unwrap_or(""), &event["value"]),
             // A conversation star. A message, file, or comment star is not the row's.
             "star_added" | "star_removed" => self.star_heard(event),
+            "pin_added" | "pin_removed" => self.pin_heard(event),
             "emoji_changed" => {
                 self.emoji_changed(event);
                 Ok(())
@@ -987,6 +1012,11 @@ impl Slack {
             Some("message_replied") => self.replied(channel, &event["message"]),
             Some("channel_topic" | "group_topic") => {
                 self.topic_changed(channel, event["topic"].as_str().unwrap_or(""))?;
+                self.ctx.info_stale(channel);
+                self.arrived(channel, event)
+            }
+            Some("channel_purpose" | "group_purpose") => {
+                self.purpose_changed(channel, event["purpose"].as_str().unwrap_or(""))?;
                 self.arrived(channel, event)
             }
             _ => self.arrived(channel, event),
@@ -1364,6 +1394,9 @@ impl Slack {
             }
             Command::OpenSpace(_) => self.report(self.open_space()),
             Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id)),
+            Command::MarkUnread { conversation_id, message_id, .. } => {
+                self.report(self.mark_unread(&conversation_id, &message_id))
+            }
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 self.send(&conversation_id, &client_id, &text, reply_to.as_deref(), false)
             }
@@ -1443,9 +1476,36 @@ impl Slack {
             Command::Members { conversation_id, offset, limit, reply } => {
                 answer(reply, self.members(&conversation_id, offset, limit));
             }
+            Command::MembersAdd { conversation_id, people, reply } => {
+                answer(reply, self.members_add(&conversation_id, &people));
+            }
+            Command::MembersRemove { conversation_id, person, reply } => {
+                answer(reply, self.members_remove(&conversation_id, &person));
+            }
             Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
-            Command::CloseDirect { conversation_id, reply } | Command::Leave { conversation_id, reply } => {
+            Command::CloseDirect { conversation_id, reply } => {
                 answer(reply, self.close_direct(&conversation_id));
+            }
+            Command::Leave { conversation_id, reply } => {
+                answer(reply, self.leave(&conversation_id));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                answer(
+                    reply,
+                    self.update_conversation(
+                        &conversation_id,
+                        title.as_deref(),
+                        topic.as_deref(),
+                        description.as_deref(),
+                    ),
+                );
+            }
+            Command::File { conversation_id, archived, reply, .. } => {
+                if let Some(archive) = archived {
+                    answer(reply, self.archive_channel(&conversation_id, archive));
+                } else {
+                    let _ = reply.send(Err(Refusal::Unsupported));
+                }
             }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(Ok(self.download(url)));
@@ -1513,6 +1573,32 @@ impl Slack {
                 self.api("conversations.mark", &[("channel", conversation), ("ts", ts)])?;
             }
         };
+        Ok(())
+    }
+
+    /// Moves the read marker back to `ts` (already computed by the store as the message before the
+    /// one the user marked unread, or empty when marking from the oldest cached message).
+    fn mark_unread(&self, conversation: &str, ts: &str) -> Result<(), Failure> {
+        let mark_ts = if ts.is_empty() {
+            "0.000000"
+        } else if ts.contains('.') {
+            ts
+        } else {
+            return Ok(());
+        };
+        match thread_of(conversation) {
+            Some((channel, root)) => {
+                self.api(
+                    "subscriptions.thread.mark",
+                    &[("channel", channel), ("thread_ts", root), ("ts", mark_ts), ("read", "0")],
+                )?;
+                let unread = self.ctx.known(conversation)?.map_or(1, |c| c.unread.max(1));
+                self.thread_unread(channel, root, unread)?;
+            }
+            None => {
+                self.api("conversations.mark", &[("channel", conversation), ("ts", mark_ts)])?;
+            }
+        }
         Ok(())
     }
 
@@ -1665,6 +1751,19 @@ impl Slack {
         self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
     }
 
+    /// Leaves a channel (`conversations.leave`), or closes a DM / group DM (`conversations.close`).
+    fn leave(&self, conversation_id: &str) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        let known = self.ctx.known(conversation_id).map_err(|err| Fault::Net(err.to_string()))?;
+        if known.as_ref().is_some_and(|c| matches!(c.kind, protocol::ConversationKind::Direct | protocol::ConversationKind::Group)) {
+            return self.close_direct(conversation_id);
+        }
+        self.api("conversations.leave", &[("channel", conversation_id)])?;
+        self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
+    }
+
     /// A `star_added` or `star_removed` for a conversation. A message star changes nothing here.
     fn star_heard(&self, event: &Value) -> Result<(), Failure> {
         let Some((id, starred)) = conversation_star(event) else {
@@ -1732,7 +1831,29 @@ impl Slack {
         let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
         let method = if pinned { "pins.add" } else { "pins.remove" };
         self.api(method, &[("channel", channel), ("timestamp", ts)])?;
-        self.ctx.pinned(channel, ts, pinned).map_err(|err| Fault::Net(err.to_string()))
+        self.ctx.pinned(channel, ts, pinned).map_err(|err| Fault::Net(err.to_string()))?;
+        if conversation != channel {
+            self.ctx.pinned(conversation, ts, pinned).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// `pin_added`, `pin_removed`: flips the stored message's pinned flag live without reloading history.
+    fn pin_heard(&self, event: &Value) -> Result<(), Failure> {
+        let added = event["type"] == "pin_added";
+        let item = &event["item"];
+        let Some(channel) = event["channel_id"].as_str().or_else(|| item["channel"].as_str()).filter(|c| !c.is_empty()) else {
+            return Ok(());
+        };
+        if let Some(ts) = item["message"]["ts"].as_str().or_else(|| item["ts"].as_str()).filter(|t| !t.is_empty()) {
+            self.ctx.pinned(channel, ts, added)?;
+            if let Some(root) = item["message"]["thread_ts"].as_str().filter(|r| !r.is_empty() && *r != ts) {
+                self.ctx.pinned(&thread_id(channel, root), ts, added)?;
+            }
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
     }
 
     fn forward(
@@ -2078,6 +2199,7 @@ fn capabilities() -> protocol::Capabilities {
         activity_feed: true,
         bookmarks: true,
         browse_channels: true,
+        archive: true,
         ..protocol::Capabilities::default()
     }
 }

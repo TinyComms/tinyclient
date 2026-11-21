@@ -351,16 +351,31 @@ impl Shell {
     }
 
     /// Who a call is with, or where, and the picture of each person in it.
-    pub(super) fn call_phone_face(&self, call: &Call, subject: &Subject, id: &str) -> Option<std::path::PathBuf> {
+    pub(super) fn call_phone_face(&self, call: &Call, subject: &Subject, id: &str, cx: &mut Context<Self>) -> Option<std::path::PathBuf> {
         #[cfg(feature = "gui-shot")]
         if let Some(face) = super::shot::phone_face(id) {
             return Some(face);
         }
+        let account = call.conversation.account();
+        if let Some(participant) = call.participants.iter().find(|p| p.id == id) {
+            if let Some(file) = participant.avatar.as_ref() {
+                if let Some(path) = self.people_state.hub().file(&account, file, cx).path {
+                    return Some(std::path::PathBuf::from(path));
+                }
+            }
+        }
         if subject.kind == ConversationKind::Direct && call.participants.first().is_some_and(|peer| peer.id == id) {
-            return self.media_path(&call.conversation, subject.avatar.as_ref());
+            if let Some(path) = self.media_path(&call.conversation, subject.avatar.as_ref()) {
+                return Some(path);
+            }
         }
         if call.conversation.network == Network::Tiny {
-            return self.tiny_page_facts().filter(|page| page.account == &call.conversation.account()).and_then(|page| page.picture(id));
+            if let Some(path) = self.tiny_page_facts().filter(|page| page.account == &account).and_then(|page| page.picture(id)) {
+                return Some(path);
+            }
+        }
+        if !id.is_empty() {
+            return self.person_picture(&Key::new(&account, id), cx);
         }
         None
     }
@@ -618,7 +633,7 @@ impl Shell {
         let clock = self.call_phone_clock(&call, cx);
         let off = call.muted || call.deafened;
         let peer_speaks = subject.kind == ConversationKind::Direct && talker.is_some();
-        let lead = self.call_phone_lead(&call.conversation, &subject, call.participants.first().map(|peer| peer.id.as_str()).map(|id| self.call_phone_face(&call, &subject, id)).flatten(), 32., peer_speaks);
+        let lead = self.call_phone_lead(&call.conversation, &subject, call.participants.first().map(|peer| peer.id.as_str()).and_then(|id| self.call_phone_face(&call, &subject, id, cx)), 32., peer_speaks);
         let mute = round("call-phone-bar-mute", if off { "icons/mic-off.svg" } else { "icons/mic.svg" }, "", if off { Look::Off } else { Look::Rest }, 40.)
             .flex_none()
             .w(px(44.))

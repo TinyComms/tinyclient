@@ -103,6 +103,8 @@ fn now() -> i64 {
 pub(super) enum Menu {
     Devices,
     People,
+    /// Add friends to a Discord 1:1 or group DM call.
+    AddPeople,
     /// How the call is protected (`security`).
     Security,
     /// Per-person volume and local mute for someone in any call.
@@ -462,6 +464,9 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         participants: Vec::new(),
         muted,
         deafened,
+        server_muted: false,
+        server_deafened: false,
+        suppressed: false,
         joined: 0,
         input: String::new(),
         output: String::new(),
@@ -1114,15 +1119,33 @@ impl Shell {
             .child(self.call_volume_controls(account, user_id, cx))
     }
 
+    /// Picture path for a call participant: their avatar reference when present (queued once
+    /// through the people hub's media path), falling back to what the people hub already knows
+    /// about that id (for partial voice states on large servers).
+    pub(super) fn call_participant_picture(
+        &self,
+        account: &protocol::AccountKey,
+        who: &protocol::Participant,
+        cx: &mut Context<Self>,
+    ) -> Option<std::path::PathBuf> {
+        if let Some(file) = who.avatar.as_ref() {
+            if let Some(path) = self.people_state.hub().file(account, file, cx).path {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+        let key = Key::new(account, &who.id);
+        self.person_picture(&key, cx)
+    }
+
     pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let account = call.conversation.account();
         let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
-        people.sort_by_key(|who| who.name.to_lowercase());
-        let count = people.len() + 1;
-        let noun = if count == 1 { "PERSON" } else { "PEOPLE" };
+        people.sort_by_key(|who| (who.ringing, who.name.to_lowercase()));
+        let joined_count = people.iter().filter(|p| !p.ringing).count() + 1;
+        let noun = if joined_count == 1 { "PERSON" } else { "PEOPLE" };
         let own = super::components::Avatar::named("You", 22.).build();
         let heard = call.speaking && !call.muted && !call.deafened;
-        let mut rows = Vec::with_capacity(count);
+        let mut rows = Vec::with_capacity(people.len() + 1);
         rows.push(
             div()
                 .w_full()
@@ -1140,6 +1163,55 @@ impl Shell {
                 .into_any_element(),
         );
         for who in people {
+            let key = Key { network: call.conversation.network, account: call.conversation.account.clone(), id: who.id.clone() };
+            let face = self.call_participant_picture(&account, who, cx);
+            let avatar = super::components::Avatar::new(&key, &who.name, 22.).image_at(face).build();
+            if who.ringing {
+                let stop_id = who.id.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("call-ringing-row-{}", who.id)))
+                        .w_full()
+                        .h(px(32.))
+                        .flex_none()
+                        .pl(px(12.))
+                        .pr(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(13.))
+                        .text_color(theme::text_faint())
+                        .child(ringed(avatar, 22., false))
+                        .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
+                        .child(div().flex_none().type_micro().text_color(theme::text_faint()).child("Ringing…"))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("call-stop-ring-{}", who.id)))
+                                .flex_none()
+                                .px(px(6.))
+                                .h(px(20.))
+                                .rounded(px(6.))
+                                .bg(theme::hover())
+                                .hover(|s| s.bg(theme::danger_soft()).text_color(theme::danger()))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .type_micro()
+                                .text_color(theme::text_soft())
+                                .tooltip(tip("Stop ringing", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.call_ask(
+                                        Request::CallStopRinging { people: Some(vec![stop_id.clone()]) },
+                                        cx,
+                                    );
+                                }))
+                                .child("Stop"),
+                        )
+                        .into_any_element(),
+                );
+                continue;
+            }
             let (percent, muted) = self.call_gain(&account, &who.id);
             let gain_tag = if muted {
                 Some("Muted for you".to_owned())
@@ -1148,8 +1220,6 @@ impl Shell {
             } else {
                 None
             };
-            let key = Key { network: call.conversation.network, account: call.conversation.account.clone(), id: who.id.clone() };
-            let avatar = super::components::Avatar::new(&key, &who.name, 22.).build();
             let menu_account = account.clone();
             let menu_id = who.id.clone();
             let menu_name = who.name.clone();
@@ -1179,11 +1249,20 @@ impl Shell {
                     .child(ringed(avatar, 22., who.speaking))
                     .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
                     .children(gain_tag.map(|tag| div().flex_none().type_micro().text_color(if muted { theme::warning() } else { theme::text_faint() }).child(tag)))
-                    .when(who.muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::text_faint())))
-                    .when(who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
+                    .when(who.server_muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::danger())))
+                    .when(!who.server_muted && who.suppressed, |r| r.child(glyph("icons/mic-off.svg", 13., theme::warning())))
+                    .when(!who.server_muted && !who.suppressed && who.muted && !who.deafened && !who.server_deafened, |r| {
+                        r.child(glyph("icons/mic-off.svg", 13., theme::text_faint()))
+                    })
+                    .when(who.server_deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::danger())))
+                    .when(!who.server_deafened && who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
                     .into_any_element(),
             );
         }
+        let can_ring_group = call.conversation.network == Network::Discord && subject.kind == ConversationKind::Group;
+        let can_add_people = call.conversation.network == Network::Discord
+            && subject.kind.is_direct()
+            && (call.participants.len() + 1) < 10;
         div()
             .flex()
             .flex_col()
@@ -1194,10 +1273,64 @@ impl Shell {
                     .px(px(12.))
                     .flex()
                     .items_center()
+                    .justify_between()
+                    .gap(px(4.))
                     .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text_faint())
-                    .child(format!("{} · {count} {noun}", subject.title.to_uppercase())),
+                    .child(format!("{} · {joined_count} {noun}", subject.title.to_uppercase()))
+                    .when(can_ring_group || can_add_people, |header| {
+                        header.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .when(can_add_people, |actions| {
+                                    actions.child(
+                                        div()
+                                            .id("call-add-people-open")
+                                            .px(px(6.))
+                                            .h(px(20.))
+                                            .rounded(px(6.))
+                                            .bg(theme::hover())
+                                            .hover(|s| s.bg(theme::selected()).text_color(theme::text()))
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .type_micro()
+                                            .text_color(theme::text_soft())
+                                            .tooltip(tip("Add friends to call", None))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.call_menu_set(Some(Menu::AddPeople), cx);
+                                            }))
+                                            .child("Add people"),
+                                    )
+                                })
+                                .when(can_ring_group, |actions| {
+                                    actions.child(
+                                        div()
+                                            .id("call-ring-group")
+                                            .px(px(6.))
+                                            .h(px(20.))
+                                            .rounded(px(6.))
+                                            .bg(theme::hover())
+                                            .hover(|s| s.bg(theme::selected()).text_color(theme::text()))
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .type_micro()
+                                            .text_color(theme::text_soft())
+                                            .tooltip(tip("Ring everyone in the group", None))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.call_ask(Request::CallRing { people: None }, cx);
+                                            }))
+                                            .child("Ring"),
+                                    )
+                                }),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1508,9 +1641,106 @@ impl Shell {
         self.call_state.asked = Some(Instant::now());
     }
 
+    /// Friend picker popover for adding friends to a Discord 1:1 or group DM call.
+    /// Filtered to `Relation::Friend` on the call's account, excluding people already in the call,
+    /// and respecting Discord's 10-person group DM ceiling.
+    pub(super) fn call_add_people_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        const LIMIT: usize = 10;
+        let account = call.conversation.account();
+        let me = self
+            .snapshot
+            .as_ref()
+            .and_then(|snap| snap.accounts.iter().find(|a| a.key == account))
+            .map(|a| a.me.clone())
+            .unwrap_or_default();
+        let in_call_ids: std::collections::HashSet<&str> = call.participants.iter().map(|p| p.id.as_str()).collect();
+        let seats_left = LIMIT.saturating_sub(call.participants.len() + 1);
+        let candidates: Vec<protocol::Person> = self
+            .people_state
+            .hub()
+            .friends(&account)
+            .into_iter()
+            .filter(|p| p.key.id != me && !in_call_ids.contains(p.key.id.as_str()))
+            .collect();
+        let rows: Vec<AnyElement> = if seats_left == 0 {
+            vec![div()
+                .px(px(12.))
+                .py(px(8.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("This group call is full (10 people).")
+                .into_any_element()]
+        } else if candidates.is_empty() {
+            vec![div()
+                .px(px(12.))
+                .py(px(8.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("No other friends available to add.")
+                .into_any_element()]
+        } else {
+            candidates
+                .into_iter()
+                .map(|friend| {
+                    let person_id = friend.key.id.clone();
+                    let face = self.person_picture(&friend.key, cx);
+                    let avatar = super::components::Avatar::new(&friend.key, &friend.name, 22.).image_at(face).build();
+                    div()
+                        .id(SharedString::from(format!("call-add-friend-{person_id}")))
+                        .w_full()
+                        .h(px(32.))
+                        .flex_none()
+                        .px(px(10.))
+                        .rounded(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .text_size(px(13.))
+                        .text_color(theme::text())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_menu_close(cx);
+                            this.call_ask(Request::CallAddPeople { people: vec![person_id.clone()] }, cx);
+                        }))
+                        .child(avatar)
+                        .child(div().flex_1().min_w_0().truncate().child(friend.name))
+                        .into_any_element()
+                })
+                .collect()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(26.))
+                    .flex_none()
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_faint())
+                    .child("ADD FRIENDS TO CALL")
+                    .child(format!("{seats_left} left")),
+            )
+            .child(
+                div()
+                    .id("call-add-people-rows")
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
+    }
+
     /// The name of whoever was in this call with me and is not any more.
     pub(super) fn call_left_alone(&self, call: &Call) -> Option<String> {
-        if call.state != CallState::Joined || !call.participants.is_empty() {
+        if call.state != CallState::Joined || call.participants.iter().any(|p| !p.ringing) {
             return None;
         }
         #[cfg(feature = "gui-shot")]
@@ -1611,6 +1841,9 @@ impl Shell {
         if !matches!(call.state, CallState::RingingOut | CallState::Connecting | CallState::Joined) {
             return;
         }
+        if call.server_muted || call.suppressed {
+            return;
+        }
         let (muted, deafened) = (call.muted, call.deafened);
         if deafened {
             self.call_state.mute_before_deafen = None;
@@ -1625,7 +1858,7 @@ impl Shell {
         let Some(call) = self.call_now() else {
             return;
         };
-        if call.state != CallState::Joined {
+        if call.state != CallState::Joined || call.server_deafened {
             return;
         }
         let (muted, deafened) = (call.muted, call.deafened);
@@ -2106,8 +2339,12 @@ mod tests {
         let person = |name: &&str| Occupant {
             person: Key { network: Network::Discord, account: "1".into(), id: name.to_lowercase() },
             name: (*name).to_owned(),
+            avatar: None,
             muted: false,
             deafened: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             streaming: false,
             camera: false,
             speaking: false,

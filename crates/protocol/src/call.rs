@@ -111,18 +111,20 @@ pub struct Participant {
     /// The person's id on the call's account.
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<crate::MediaFile>,
     #[serde(default)]
     pub speaking: bool,
     #[serde(default)]
     pub muted: bool,
     #[serde(default)]
     pub deafened: bool,
-    /// A Tiny server's moderators muted or deafened them in this room.
+    /// A moderator muted or deafened them in this channel or room.
     #[serde(default, skip_serializing_if = "is_false")]
     pub server_muted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub server_deafened: bool,
-    /// They may not speak in this room: nothing of theirs is heard.
+    /// They may not speak in this channel or room: nothing of theirs is heard.
     #[serde(default, skip_serializing_if = "is_false")]
     pub suppressed: bool,
     /// Holding priority speech: while they talk, everyone else is quieter.
@@ -134,6 +136,9 @@ pub struct Participant {
     /// They hold the room's share.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sharing: bool,
+    /// Being rung for this call and not yet joined (Discord DM / group DM calls).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ringing: bool,
 }
 
 /// The most screens and windows `mediad --screens` lists.
@@ -196,6 +201,14 @@ pub struct Call {
     pub participants: Vec<Participant>,
     pub muted: bool,
     pub deafened: bool,
+    /// A moderator muted or deafened us in this channel or room.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_deafened: bool,
+    /// We may not speak in this channel or room (missing Speak permission or stage audience).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppressed: bool,
     /// Unix seconds the call was joined. 0 before that.
     pub joined: i64,
     /// The microphone and speaker in use, as the system names them. Empty until mediad says.

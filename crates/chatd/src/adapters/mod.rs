@@ -654,6 +654,12 @@ pub enum Command {
     /// A camera, a screen share, or whose share to watch. Nothing answers: the call's own
     /// events say what the network did.
     CallPicture(Picture),
+    /// Rings everyone (`None`) or specific people (`Some`) in the current direct/group call.
+    CallRing { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
+    /// Stops ringing everyone (`None`) or specific people (`Some`) in the current direct/group call.
+    CallStopRinging { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
+    /// Adds friends to the current direct or group call, returning the resulting conversation id.
+    CallAddPeople { conversation_id: String, people: Vec<String>, reply: Reply<String> },
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),
@@ -679,7 +685,11 @@ impl Command {
             | Command::CreateChannel { reply, .. }
             | Command::CreateGroup { reply, .. }
             | Command::StartThread { reply, .. }
-            | Command::Handoff { reply, .. } => {
+            | Command::Handoff { reply, .. }
+            | Command::CallAddPeople { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1577,6 +1587,11 @@ impl Context {
     /// Everyone in the call but us, with their mute and deafen as the network shows them.
     pub fn participants(&self, conversation_id: &str, participants: Vec<Participant>) {
         self.hub.calls.set_participants(&self.hub, &self.key(conversation_id), participants);
+    }
+
+    /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
+    pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
+        self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);
     }
 
     /// A Tiny server call: mediad's offer for this room, with mediad started for it first. A

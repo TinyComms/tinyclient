@@ -323,8 +323,12 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
         let seated = |&(at, muted, deafened, streaming): &Seat| Occupant {
             person: Key::new(account, cast[at].id.clone()),
             name: cast[at].name.clone(),
+            avatar: None,
             muted,
             deafened,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             streaming,
             camera: false,
             speaking: false,

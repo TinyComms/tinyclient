@@ -1640,7 +1640,13 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
         let id = message.id.clone();
         let unpin_id = message.id.clone();
         let unpin_conv = conversation.clone();
-        let said = if message.text.is_empty() { "Attachment".to_owned() } else { message.text.clone() };
+        let said = if !message.text.is_empty() {
+            message.text.clone()
+        } else if let Some(first) = message.attachments.first() {
+            first.name.clone()
+        } else {
+            "Attachment".to_owned()
+        };
         div()
             .id(gpui::ElementId::Name(format!("pin-{}", message.id).into()))
             .px(px(theme::PANE_PAD))
@@ -1677,6 +1683,13 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
                     })),
             )
             .child(div().type_ui().text_color(theme::text_soft()).line_clamp(3).child(said))
+            .children(message.pinned_by.as_ref().map(|who| {
+                let meta = match message.pinned_at {
+                    Some(at) if at > 0 => format!("Pinned by {who} · {}", time::stamp(now, at)),
+                    _ => format!("Pinned by {who}"),
+                };
+                div().type_micro().text_color(theme::text_faint()).child(meta)
+            }))
             .on_click(cx.listener(move |shell, _, _, cx| shell.jump_to_pin(&id, cx)))
     });
     crate::gui::components::scroll::scroll_page("pins-scroll-frame", div().id("pins").size_full().overflow_y_scroll().py(px(4.)).children(rows)).into_any_element()

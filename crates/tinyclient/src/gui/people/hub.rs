@@ -513,6 +513,20 @@ impl Hub {
         self.0.borrow().people.get(person).cloned()
     }
 
+    /// Friends known on `account`, sorted by name.
+    pub fn friends(&self, account: &AccountKey) -> Vec<Person> {
+        let mut out: Vec<Person> = self
+            .0
+            .borrow()
+            .people
+            .values()
+            .filter(|p| p.key.account() == *account && p.relation == Relation::Friend)
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| p.name.to_lowercase());
+        out
+    }
+
     /// `Unknown` for anyone not watched: it draws as no dot at all.
     pub fn presence_of(&self, person: &Key) -> Presence {
         self.0.borrow().presence.get(person).map_or(Presence::Unknown, |seen| seen.presence)
@@ -797,7 +811,7 @@ mod tests {
         let occupants = |ids: &[&str]| Occupants {
             people: ids
                 .iter()
-                .map(|id| protocol::Occupant { person: key(id), name: (*id).into(), muted: false, deafened: false, streaming: false, camera: false, speaking: false })
+                .map(|id| protocol::Occupant { person: key(id), name: (*id).into(), avatar: None, muted: false, deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: false })
                 .collect(),
             total: ids.len() as u32,
         };

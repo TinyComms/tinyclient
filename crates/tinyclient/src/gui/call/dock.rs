@@ -870,16 +870,19 @@ impl Shell {
                 .filter(|peer| peer.muted)
                 .map(|_| glyph("icons/mic-off.svg", 13., theme::text_faint()).into_any_element()),
             (true, false) if call.participants.is_empty() => None,
-            (true, false) => Some(
-                people::stack(call)
-                    .id("call-stack")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.call_menu_toggle(Menu::People, cx);
-                    }))
-                    .into_any_element(),
-            ),
+            (true, false) => {
+                let account = call.conversation.account();
+                Some(
+                    people::stack(call, |who| self.call_participant_picture(&account, who, cx))
+                        .id("call-stack")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_menu_toggle(Menu::People, cx);
+                        }))
+                        .into_any_element(),
+                )
+            }
         };
         let signal = self.call_signal(call, cx);
         let security = self.call_security(call, Place::Dock, cx);
@@ -949,7 +952,18 @@ impl Shell {
         // Reconnecting keeps the joined controls, dead; only Leave is live.
         let enabled = call.state != CallState::Reconnecting;
         let menu = self.call_menu().filter(|_| enabled);
-        let off = call.muted || call.deafened;
+        let forced_mute = call.server_muted || call.suppressed;
+        let off = call.muted || call.deafened || forced_mute;
+        let mute_enabled = enabled && !forced_mute;
+        let mute_tip = if call.server_muted {
+            "Server muted"
+        } else if call.suppressed {
+            "Can't speak in this channel"
+        } else if off {
+            "Unmute"
+        } else {
+            "Mute"
+        };
 
         let mute = control(
             "call-mute",
@@ -959,14 +973,14 @@ impl Shell {
                 "icons/mic.svg"
             },
             if off { Look::Off } else { Look::Rest },
-            enabled,
+            mute_enabled,
         )
-        .when(enabled, |mute| {
-            mute.tooltip(tip(if off { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_mute(cx);
-                }))
+        .tooltip(tip(mute_tip, mute_enabled.then_some("⌘⇧M")))
+        .when(mute_enabled, |mute| {
+            mute.on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_mute(cx);
+            }))
         })
         // While I am heard: a 2 px ring inside the button, the same green as a speaker's.
         .when(call.speaking && !off && joined, |mute| {
@@ -981,26 +995,31 @@ impl Shell {
                     .border_color(theme::positive()),
             )
         });
+        let deafen_off = call.deafened || call.server_deafened;
+        let deafen_enabled = enabled && !call.server_deafened;
+        let deafen_tip = if call.server_deafened {
+            "Server deafened"
+        } else if call.deafened {
+            "Undeafen"
+        } else {
+            "Deafen"
+        };
         let deafen = control(
             "call-deafen",
-            if call.deafened {
+            if deafen_off {
                 "icons/headphone-off.svg"
             } else {
                 "icons/headphones.svg"
             },
-            if call.deafened { Look::Off } else { Look::Rest },
-            enabled,
+            if deafen_off { Look::Off } else { Look::Rest },
+            deafen_enabled,
         )
-        .when(enabled, |deafen| {
-            deafen
-                .tooltip(tip(
-                    if call.deafened { "Undeafen" } else { "Deafen" },
-                    Some("⌘⇧D"),
-                ))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_deafen(cx);
-                }))
+        .tooltip(tip(deafen_tip, deafen_enabled.then_some("⌘⇧D")))
+        .when(deafen_enabled, |deafen| {
+            deafen.on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_deafen(cx);
+            }))
         });
         let pictures = self.call_pictures(call);
         let share_on = encoding(call, Content::Share);
@@ -1055,6 +1074,37 @@ impl Shell {
                     }))
             })
         });
+        let ring_again = (call.conversation.network == Network::Discord
+            && subject.kind.is_direct()
+            && joined
+            && enabled
+            && alone.is_some())
+        .then(|| {
+            control("call-ring-again", "icons/phone-outgoing.svg", Look::Rest, true)
+                .tooltip(tip("Ring again", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_ask(Request::CallRing { people: None }, cx);
+                }))
+        });
+        let add_people = (call.conversation.network == Network::Discord
+            && subject.kind.is_direct()
+            && joined
+            && enabled
+            && (call.participants.len() + 1) < 10)
+        .then(|| {
+            control(
+                "call-add-people",
+                "icons/user-plus.svg",
+                if menu == Some(Menu::AddPeople) { Look::Open } else { Look::Rest },
+                true,
+            )
+            .tooltip(tip("Add people", None))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_menu_toggle(Menu::AddPeople, cx);
+            }))
+        });
         let devices = control(
             "call-devices",
             "icons/settings.svg",
@@ -1104,6 +1154,8 @@ impl Shell {
             .when(in_call(call), |row| row.child(deafen.flex_1().min_w_0()))
             .children(share.map(|button| button.flex_1().min_w_0()))
             .children(camera.map(|button| button.flex_1().min_w_0()))
+            .children(ring_again.map(|button| button.flex_1().min_w_0()))
+            .children(add_people.map(|button| button.flex_1().min_w_0()))
             .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
             .child(
                 end.when(in_call(call), |button| button.flex_1().min_w_0())
@@ -1116,6 +1168,7 @@ impl Shell {
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
             Some(Menu::People) if joined => Some((280., self.call_people_list(call, subject, cx).py(px(6.)))),
+            Some(Menu::AddPeople) if joined => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
             Some(Menu::Security) if self.call_security_open(Place::Dock) => {
                 Some((320., div().child(self.call_security_panel(call, cx))))
             }
@@ -1314,6 +1367,9 @@ mod tests {
             participants: Vec::new(),
             muted: false,
             deafened: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             joined,
             input: String::new(),
             output: String::new(),

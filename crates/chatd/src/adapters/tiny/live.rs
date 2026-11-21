@@ -1932,6 +1932,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
         let roster = others.map(|who| Participant {
             id: who.user.clone(),
             name: name(&who.user),
+            avatar: None,
             speaking: false,
             muted: who.muted,
             deafened: who.deafened,
@@ -1941,6 +1942,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             priority: who.priority,
             camera: who.camera,
             sharing: who.sharing,
+            ringing: false,
         });
         ctx.participants(room, roster.collect());
     }
@@ -1972,8 +1974,12 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
         .map(|who| Occupant {
             person: ctx.key(&who.user),
             name: name(&who.user),
+            avatar: None,
             muted: who.muted,
             deafened: who.deafened,
+            server_muted: who.server_muted,
+            server_deafened: who.server_deafened,
+            suppressed: who.suppressed,
             streaming: who.sharing,
             camera: who.camera,
             speaking: seat.speaking.contains(&who.user),
@@ -2648,6 +2654,7 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
         .map(|who| Participant {
             id: who.user.clone(),
             name: person_name(seat, &who.user),
+            avatar: None,
             speaking: false,
             muted: who.muted,
             deafened: who.deafened,
@@ -2657,6 +2664,7 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
             priority: who.priority,
             camera: who.camera,
             sharing: who.sharing,
+            ringing: false,
         });
     ctx.participants(direct_id, roster.collect());
 }

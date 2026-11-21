@@ -124,7 +124,7 @@ pub(super) fn halo(avatar: Div, size: f32, speaking: bool) -> Div {
 
 impl Shell {
     /// Who is on the stage: everyone else, then me.
-    fn call_phone_tiles(&self, call: &Call, subject: &Subject) -> Vec<Tile> {
+    fn call_phone_tiles(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Vec<Tile> {
         let mut tiles: Vec<Tile> = call
             .participants
             .iter()
@@ -133,7 +133,7 @@ impl Shell {
                 Tile {
                     id: who.id.clone(),
                     name: who.name.clone(),
-                    face: self.call_phone_face(call, subject, &who.id),
+                    face: self.call_phone_face(call, subject, &who.id, cx),
                     key,
                     speaking: who.speaking && !who.server_muted && !who.suppressed,
                     muted: who.muted || who.server_muted,
@@ -227,7 +227,7 @@ impl Shell {
         match layout {
             Layout::Hero => self.call_phone_hero(call, subject, cx).into_any_element(),
             Layout::Solo => {
-                let tiles = self.call_phone_tiles(call, subject);
+                let tiles = self.call_phone_tiles(call, subject, cx);
                 match tiles.into_iter().find(|tile| !tile.me) {
                     Some(peer) => self.call_phone_tile(&peer, wide, tall, cx).into_any_element(),
                     None => self.call_phone_hero(call, subject, cx).into_any_element(),
@@ -243,7 +243,7 @@ impl Shell {
         let peer = call.participants.first().filter(|_| subject.kind == ConversationKind::Direct);
         let live = in_call(call);
         let speaking = live && peer.is_some_and(|peer| peer.speaking);
-        let face = peer.and_then(|peer| self.call_phone_face(call, subject, &peer.id));
+        let face = peer.and_then(|peer| self.call_phone_face(call, subject, &peer.id, cx));
         let size = 128.;
         let lead = self.call_phone_lead(&call.conversation, subject, face, size, false);
         let peer_muted = live && peer.is_some_and(|peer| peer.muted);
@@ -321,7 +321,7 @@ impl Shell {
     /// grid scrolls.
     fn call_phone_grid(&self, call: &Call, subject: &Subject, layout: Layout, wide: f32, tall: f32, cx: &mut Context<Self>) -> AnyElement {
         let pip = self.call_phone_pip_shown(call, layout);
-        let tiles: Vec<Tile> = self.call_phone_tiles(call, subject).into_iter().filter(|tile| !(pip && tile.me)).collect();
+        let tiles: Vec<Tile> = self.call_phone_tiles(call, subject, cx).into_iter().filter(|tile| !(pip && tile.me)).collect();
         let (cols, rows) = grid(tiles.len());
         let tile_w = (wide - (cols as f32 - 1.) * GAP) / cols as f32;
         let fit = (tall - (rows as f32 - 1.) * GAP) / rows as f32;
@@ -430,7 +430,7 @@ impl Shell {
 
     /// Someone's screen on the stage, whole, on black; everyone in a strip under it.
     fn call_phone_share(&self, call: &Call, subject: &Subject, wide: f32, tall: f32, cx: &mut Context<Self>) -> Div {
-        let tiles = self.call_phone_tiles(call, subject);
+        let tiles = self.call_phone_tiles(call, subject, cx);
         let sharer = tiles.iter().find(|tile| tile.sharing && !tile.me);
         let frame = sharer.and_then(|tile| self.call_phone_frame(call, &tile.id, PictureKind::Share));
         let caption = sharer.map(|tile| format!("{} is sharing", first(&tile.name))).unwrap_or_else(|| "Screen share".into());

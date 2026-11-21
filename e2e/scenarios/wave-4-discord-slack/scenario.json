@@ -1,0 +1,12 @@
+{
+  "id": "wave-4-discord-slack",
+  "title": "Wave 4B Discord calls & voice UX and Slack channel management enhancements",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 4B Discord & Slack enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 4B Discord & Slack enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -462,7 +462,14 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
                         .flex()
                         .flex_col()
                         .child(div().type_small().font_weight(theme::SEMIBOLD).child(author.name))
-                        .child(div().type_ui().line_clamp(2).child(message.text.clone())),
+                        .child(div().type_ui().line_clamp(2).child(message.text.clone()))
+                        .children(message.pinned_by.as_ref().map(|who| {
+                            let meta = match message.pinned_at {
+                                Some(at) if at > 0 => format!("Pinned by {who} · {}", crate::gui::time::stamp(crate::view::now(), at)),
+                                _ => format!("Pinned by {who}"),
+                            };
+                            div().type_micro().text_color(theme::text_faint()).child(meta)
+                        })),
                 )
         })),
     }

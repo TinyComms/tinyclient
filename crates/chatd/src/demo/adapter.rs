@@ -528,8 +528,12 @@ impl Demo {
         let me = at.map(|at| occupants.people.remove(at)).unwrap_or(Occupant {
             person: ours,
             name: self.me.name.clone(),
+            avatar: None,
             muted: false,
             deafened: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             streaming: false,
             camera: false,
             speaking: false,
@@ -1001,6 +1005,12 @@ impl Demo {
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)));
+            }
+            Command::CallAddPeople { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)));
+            }
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

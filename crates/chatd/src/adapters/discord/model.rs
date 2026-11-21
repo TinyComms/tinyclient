@@ -205,6 +205,13 @@ pub fn avatar_variants(file: &str) -> Option<Vec<(u32, String)>> {
     Some([128, 256].into_iter().map(|size| (size, format!("{}/avatars/{user}/{hash}.webp?size={size}{}", cdn(), moving(hash)))).collect())
 }
 
+pub fn member_avatar(guild: &str, user: &str, hash: &str) -> (MediaFile, String) {
+    (
+        sized(format!("mavatar:{guild}:{user}:{hash}"), MediaKind::Avatar, 80),
+        format!("{}/guilds/{guild}/users/{user}/avatars/{hash}.webp?size=80{}", cdn(), moving(hash)),
+    )
+}
+
 pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
     (
         sized(format!("icon:{guild}:{hash}"), MediaKind::Icon, 96),
@@ -238,6 +245,8 @@ pub struct Member {
     #[serde(default)]
     pub nick: Option<String>,
     #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
     pub roles: Vec<String>,
     #[serde(default)]
     pub presence: Option<PresenceUpdate>,
@@ -260,6 +269,17 @@ impl Member {
             (_, Some(user)) => user.name(),
             _ => "",
         }
+    }
+
+    /// Server avatar when set on this guild member, otherwise the user's global avatar.
+    pub fn avatar(&self, guild: Option<&str>) -> Option<(MediaFile, String)> {
+        if let (Some(guild), Some(hash)) = (guild, self.avatar.as_deref().filter(|h| !h.is_empty())) {
+            let id = self.id();
+            if !id.is_empty() {
+                return Some(member_avatar(guild, id, hash));
+            }
+        }
+        self.user.as_ref().map(User::avatar)
     }
 }
 

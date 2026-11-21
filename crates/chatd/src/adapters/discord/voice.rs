@@ -7,7 +7,7 @@ use super::model::{self, VoiceState};
 use super::rest::Refused;
 use super::Discord;
 use protocol::{
-    CallFailure, CallSupport, ConversationKind, Dave, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, VoiceQuality, Watching,
+    CallFailure, CallSupport, ConversationKind, Dave, MediaFile, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, VoiceQuality, Watching,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,9 +20,15 @@ const HEARD: usize = 2_000;
 const PATIENCE: Duration = Duration::from_secs(15);
 /// How long our own voice state has to show up in a direct call before the other side is rung.
 const RING_AFTER: Duration = Duration::from_secs(5);
+/// A 1:1 ring that disappears sooner than this (without us stopping it) was declined; after this
+/// Discord timed out the ring itself (rang out).
+const RING_DECLINE_WINDOW: Duration = Duration::from_secs(50);
 /// The flags the web client sends with its voice state. From the community documentation;
 /// unconfirmed against a real account.
 const FLAGS: u8 = 2;
+
+/// A Discord group DM holds at most ten people, including us.
+const GROUP_DM_LIMIT: usize = 10;
 
 /// The words of each way a call ends here. No status code or Discord error text is among them.
 const NO_ANSWER: &str = "Nobody picked up.";
@@ -173,8 +179,12 @@ pub struct Heard {
     pub guild: Option<String>,
     channel: String,
     name: String,
+    avatar: Option<MediaFile>,
     muted: bool,
     deafened: bool,
+    server_muted: bool,
+    server_deafened: bool,
+    suppressed: bool,
     camera: bool,
     sharing: bool,
     /// On a stage's platform (`suppress` false there): who the channel hears. A voice
@@ -205,6 +215,10 @@ struct Joining {
     ring: bool,
     /// Discord showed the other side ringing; when that stops with nobody there, nobody answered.
     saw_ringing: bool,
+    /// When the current ring began, to tell an early decline from a ring that timed out.
+    ring_started: Option<Instant>,
+    /// True when we explicitly called `stop-ringing`, so a disappearing ring is not a decline.
+    stopped_by_us: bool,
     /// chatd has been told the other side picked up.
     answered: bool,
     /// Our camera is on. Discord is told with the voice state, and mediad tells it again on the
@@ -239,6 +253,8 @@ pub struct Voice {
     calls: HashSet<String>,
     /// Direct conversations whose call is ringing us.
     ringing: HashSet<String>,
+    /// User ids currently being rung per direct/group call, from `CALL_CREATE` / `CALL_UPDATE`.
+    ringing_out: HashMap<String, Vec<String>>,
     /// The server whose tree is on screen.
     shown: Option<String>,
     /// Channels chatd holds occupants for, each with its server, so it can be told when they
@@ -255,6 +271,7 @@ impl Voice {
     pub(super) fn reset(&mut self) {
         self.states.clear();
         self.told.clear();
+        self.ringing_out.clear();
     }
 
     /// True for a channel whose occupants chatd is to know: one of the server on screen, the
@@ -323,19 +340,39 @@ impl Discord {
                 return;
             };
             let there = state.voice.states.iter().filter(|(id, heard)| heard.channel == call.conversation && **id != state.me);
-            let participants: Vec<Participant> = there
+            let mut participants: Vec<Participant> = there
                 .map(|(id, heard)| Participant {
                     id: id.clone(),
                     name: heard.name.clone(),
+                    avatar: heard.avatar.clone(),
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    server_muted: heard.server_muted,
+                    server_deafened: heard.server_deafened,
+                    suppressed: heard.suppressed,
                     camera: heard.camera,
                     sharing: heard.sharing,
+                    ringing: false,
                     ..Participant::default()
                 })
                 .collect();
-            let answered = call.ring && !call.answered && !participants.is_empty();
+            let joined_any = !participants.is_empty();
+            if let Some(rung) = state.voice.ringing_out.get(&call.conversation) {
+                for id in rung {
+                    if *id == state.me || participants.iter().any(|p| p.id == *id) {
+                        continue;
+                    }
+                    let name = state.users.get(id).cloned().unwrap_or_else(|| id.clone());
+                    participants.push(Participant {
+                        id: id.clone(),
+                        name,
+                        ringing: true,
+                        ..Participant::default()
+                    });
+                }
+            }
+            let answered = call.ring && !call.answered && joined_any;
             call.answered |= answered;
             (call.conversation.clone(), participants, answered)
         };
@@ -384,8 +421,12 @@ impl Discord {
                 let people = there.into_iter().take(protocol::OCCUPANTS_LIMIT).map(|(id, heard)| Occupant {
                     person: self.ctx.key(id),
                     name: heard.name.clone(),
+                    avatar: heard.avatar.clone(),
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    server_muted: heard.server_muted,
+                    server_deafened: heard.server_deafened,
+                    suppressed: heard.suppressed,
                     streaming: heard.sharing,
                     camera: heard.camera,
                     speaking: heard.live,
@@ -453,6 +494,7 @@ impl Discord {
             .filter(|channel| self.ctx.known(channel).ok().flatten().is_some_and(|row| row.call == CallSupport::Handoff))
             .collect();
         let mut changed = BTreeSet::new();
+        let mut media_files: Vec<(MediaFile, String)> = Vec::new();
         {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
@@ -467,22 +509,40 @@ impl Discord {
                 if state.voice.states.len() >= HEARD && !kept {
                     continue;
                 }
+                let voice_guild = voice.guild_id.clone().or_else(|| guild.map(str::to_owned));
                 let named = voice.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
                 let named = named.or_else(|| state.users.get(&voice.user_id).cloned());
                 let me = (voice.user_id == state.me).then_some("You".to_owned());
+                let avatar = voice
+                    .member
+                    .as_ref()
+                    .and_then(|member| member.avatar(voice_guild.as_deref()))
+                    .map(|(file, url)| {
+                        media_files.push((file.clone(), url));
+                        file
+                    })
+                    .or_else(|| before.as_ref().and_then(|before| before.avatar.clone()));
+                let is_stage = stages.contains(channel.as_str());
                 let heard = Heard {
-                    guild: voice.guild_id.clone().or_else(|| guild.map(str::to_owned)),
+                    guild: voice_guild,
                     channel: channel.clone(),
                     name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
-                    muted: voice.self_mute || voice.mute,
-                    deafened: voice.self_deaf || voice.deaf,
+                    avatar,
+                    muted: voice.self_mute,
+                    deafened: voice.self_deaf,
+                    server_muted: voice.mute,
+                    server_deafened: voice.deaf,
+                    suppressed: !is_stage && voice.suppress,
                     camera: voice.self_video,
                     sharing: voice.self_stream,
-                    live: stages.contains(channel.as_str()) && !voice.suppress,
+                    live: is_stage && !voice.suppress,
                 };
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);
             }
+        }
+        if !media_files.is_empty() {
+            let _ = self.ctx.media(&media_files);
         }
         self.roster();
         self.occupancy(changed);
@@ -574,6 +634,7 @@ impl Discord {
         enum Ours {
             Left(String),
             Moved { from: String, to: String },
+            Here(String),
             Same,
         }
         let ours = {
@@ -589,7 +650,7 @@ impl Discord {
                         call.session = voice.session_id.clone();
                         call.reported = false;
                     }
-                    Ours::Same
+                    Ours::Here(call.conversation.clone())
                 }
                 Follow::Moved(to) => {
                     let from = std::mem::replace(&mut call.conversation, to.clone());
@@ -615,8 +676,13 @@ impl Discord {
             Ours::Left(conversation) => self.ctx.call_failed(&conversation, CallFailure::Refused, REMOVED),
             Ours::Moved { from, to } => {
                 self.ctx.tiny_moved(&from, &to);
+                self.ctx.self_moderation(&to, voice.mute, voice.deaf, voice.suppress);
                 self.roster();
                 self.occupancy(BTreeSet::from([from, to]));
+                self.report();
+            }
+            Ours::Here(conversation) => {
+                self.ctx.self_moderation(&conversation, voice.mute, voice.deaf, voice.suppress);
                 self.report();
             }
             Ours::Same => self.report(),
@@ -707,6 +773,8 @@ impl Discord {
                 deafened: false,
                 ring,
                 saw_ringing: false,
+                ring_started: ring.then(Instant::now),
+                stopped_by_us: false,
                 answered: false,
                 video: false,
                 told_kbps: None,
@@ -791,15 +859,235 @@ impl Discord {
         self.tell(4, frame);
     }
 
+    /// Rings everyone (`None`) or specific people (`Some`) in an active direct or group DM call.
+    /// Single explicit click -> single POST request, never retried.
+    pub(super) fn call_ring(&self, conversation_id: &str, people: Option<Vec<String>>) -> Result<(), super::Refusal> {
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_mut().filter(|call| call.conversation == conversation_id) else {
+                return Err(super::Refusal::Refused("You are not in this call.".to_owned()));
+            };
+            if call.guild.is_some() {
+                return Err(super::Refusal::Unsupported);
+            }
+            call.stopped_by_us = false;
+            call.ring_started = Some(Instant::now());
+        }
+        let body = match people {
+            Some(ids) => json!({ "recipients": ids }),
+            None => json!({ "recipients": null }),
+        };
+        self.call("POST", &format!("/channels/{conversation_id}/call/ring"), Some(body))
+            .map(drop)
+            .map_err(|refused| super::Refusal::Refused(ring_refused(&refused)))
+    }
+
+    /// Stops ringing everyone (`None`) or specific people (`Some`) in an active direct or group DM call.
+    pub(super) fn call_stop_ringing(&self, conversation_id: &str, people: Option<Vec<String>>) -> Result<(), super::Refusal> {
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_mut().filter(|call| call.conversation == conversation_id) else {
+                return Err(super::Refusal::Refused("You are not in this call.".to_owned()));
+            };
+            if call.guild.is_some() {
+                return Err(super::Refusal::Unsupported);
+            }
+            call.stopped_by_us = true;
+        }
+        let body = match people {
+            Some(ids) => json!({ "recipients": ids }),
+            None => json!({}),
+        };
+        self.call("POST", &format!("/channels/{conversation_id}/call/stop-ringing"), Some(body))
+            .map(drop)
+            .map_err(super::refusal)
+    }
+
+    /// Adds friends to an active DM or group DM call.
+    ///
+    /// - In a group DM: `PUT /channels/{group}/recipients/{user}`, then rings just them.
+    /// - In a 1:1 DM: creates a group DM (`POST /users/@me/channels` with `[peer, ...added]`),
+    ///   joins its voice state and rings everyone, moving the call there; if ringing fails after
+    ///   the group was created, restores the 1:1 voice state and leaves the call where it was.
+    pub(super) fn call_add_people(&self, conversation_id: &str, people: Vec<String>) -> Result<String, super::Refusal> {
+        let Ok(Some(conversation)) = self.ctx.known(conversation_id) else {
+            return Err(super::Refusal::Refused("This conversation is gone.".to_owned()));
+        };
+        if !conversation.kind.is_direct() {
+            return Err(super::Refusal::Unsupported);
+        }
+        let (me, added, peer_for_direct, current_group_count, audio_state) = {
+            let state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_ref().filter(|call| call.conversation == conversation_id) else {
+                return Err(super::Refusal::Refused("You are not in this call.".to_owned()));
+            };
+            if call.guild.is_some() {
+                return Err(super::Refusal::Unsupported);
+            }
+            let mut added: Vec<String> = Vec::new();
+            for id in people {
+                if id.is_empty() || id == state.me || added.contains(&id) {
+                    continue;
+                }
+                if state.relations.get(&id) != Some(&Relation::Friend) {
+                    return Err(super::Refusal::Refused("Only friends can be added to a Discord call.".to_owned()));
+                }
+                added.push(id);
+            }
+            if added.is_empty() {
+                return Err(super::Refusal::Refused("Choose at least one friend to add.".to_owned()));
+            }
+            let peer = state
+                .directs
+                .iter()
+                .find(|(_, ch)| ch.as_str() == conversation_id)
+                .map(|(user, _)| user.clone())
+                .or_else(|| {
+                    state
+                        .voice
+                        .states
+                        .iter()
+                        .find(|(id, h)| h.channel == conversation_id && **id != state.me)
+                        .map(|(id, _)| id.clone())
+                });
+            let group_members = state
+                .groups
+                .get(conversation_id)
+                .map(|g| g.recipients.len() + 1)
+                .unwrap_or(2);
+            (state.me.clone(), added, peer, group_members, (call.muted, call.deafened, call.video))
+        };
+
+        if conversation.kind == ConversationKind::Group {
+            let existing: HashSet<String> = {
+                let state = self.state.lock().unwrap();
+                state
+                    .groups
+                    .get(conversation_id)
+                    .map(|g| g.recipients.iter().cloned().collect())
+                    .unwrap_or_default()
+            };
+            let to_add: Vec<String> = added.into_iter().filter(|id| !existing.contains(id)).collect();
+            if to_add.is_empty() {
+                return Ok(conversation_id.to_owned());
+            }
+            if current_group_count + to_add.len() > GROUP_DM_LIMIT {
+                return Err(super::Refusal::Refused(format!(
+                    "A Discord group call can hold at most {GROUP_DM_LIMIT} people."
+                )));
+            }
+            for user in &to_add {
+                self.call("PUT", &format!("/channels/{conversation_id}/recipients/{user}"), None)
+                    .map_err(super::refusal)?;
+                if let Some(group) = self.state.lock().unwrap().groups.get_mut(conversation_id) {
+                    if !group.recipients.contains(user) {
+                        group.recipients.push(user.clone());
+                    }
+                }
+                self.call("POST", &format!("/channels/{conversation_id}/call/ring"), Some(json!({ "recipients": [user] })))
+                    .map_err(|refused| super::Refusal::Refused(ring_refused(&refused)))?;
+            }
+            return Ok(conversation_id.to_owned());
+        }
+
+        // 1:1 DM -> escalate to a new group DM, join its call, ring everyone, and move the call.
+        let mut recipients: Vec<String> = Vec::new();
+        if let Some(peer) = peer_for_direct {
+            if peer != me {
+                recipients.push(peer);
+            }
+        }
+        for id in added {
+            if !recipients.contains(&id) {
+                recipients.push(id);
+            }
+        }
+        if recipients.len() + 1 > GROUP_DM_LIMIT {
+            return Err(super::Refusal::Refused(format!(
+                "A Discord group call can hold at most {GROUP_DM_LIMIT} people."
+            )));
+        }
+
+        // Step 1: create the group DM. If this fails (including Captcha -> Refused::Challenge),
+        // the 1:1 call is untouched.
+        let created = self
+            .call("POST", "/users/@me/channels", Some(json!({ "recipients": recipients })))
+            .map_err(super::refusal)?;
+        let channel: model::Channel = serde_json::from_str(&created)
+            .map_err(|err| super::Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let new_id = channel.id.clone();
+        self.direct(&channel, &HashMap::new())
+            .map_err(|err| super::Refusal::Refused(err.to_string()))?;
+
+        // Step 2: move our voice state to the new group channel.
+        let (muted, deafened, video) = audio_state;
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_mut().filter(|call| call.conversation == conversation_id) else {
+                return Err(super::Refusal::Refused("The call ended while adding people.".to_owned()));
+            };
+            call.conversation = new_id.clone();
+            call.session = None;
+            call.server = None;
+            call.reported = false;
+            call.again = true;
+            call.ring = true;
+            call.saw_ringing = false;
+            call.ring_started = Some(Instant::now());
+            call.stopped_by_us = false;
+            call.answered = false;
+        }
+        // Tell chatd/shell the call moved BEFORE OP 4 so VOICE_STATE_UPDATE / VOICE_SERVER_UPDATE
+        // arriving while the HTTP ring request is in flight are not dropped by `Calls::join`.
+        self.ctx.tiny_moved(conversation_id, &new_id);
+        self.tell(4, voice_state(None, Some(&new_id), muted, deafened, video));
+
+        // Step 3: ring everyone in the new group DM. If ringing fails, undo Step 2 and return
+        // our voice state to the original 1:1 call.
+        if let Err(refused) = self.call("POST", &format!("/channels/{new_id}/call/ring"), Some(json!({ "recipients": null }))) {
+            self.log("ring", &refused);
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(call) = state.voice.call.as_mut().filter(|call| call.conversation == new_id) {
+                    call.conversation = conversation_id.to_owned();
+                    call.session = None;
+                    call.server = None;
+                    call.reported = false;
+                    call.again = true;
+                    call.ring = false;
+                }
+            }
+            self.ctx.tiny_moved(&new_id, conversation_id);
+            self.tell(4, voice_state(None, Some(conversation_id), muted, deafened, video));
+            return Err(super::Refusal::Refused(ring_refused(&refused)));
+        }
+
+        self.roster();
+        self.occupancy(BTreeSet::from([conversation_id.to_owned(), new_id.clone()]));
+        Ok(new_id)
+    }
+
     /// A direct call began or its ringing changed.
     pub(super) fn call_changed(&self, event: CallEvent) {
-        self.state.lock().unwrap().voice.calls.insert(event.channel_id.clone());
+        {
+            let mut state = self.state.lock().unwrap();
+            state.voice.calls.insert(event.channel_id.clone());
+            if event.ringing.is_empty() {
+                state.voice.ringing_out.remove(&event.channel_id);
+            } else {
+                state.voice.ringing_out.insert(event.channel_id.clone(), event.ringing.clone());
+            }
+        }
         // Whoever joined is the answer to a ring we placed (see `roster`).
         self.voice_states(None, &event.voice_states);
+        // Also refresh roster when `ringing` changed even if `voice_states` was empty.
+        if event.voice_states.is_empty() {
+            self.roster();
+        }
         enum Now {
             Ring(String),
             Quiet,
-            Unanswered(Option<String>),
+            Unanswered { guild: Option<String>, declined: bool },
             Nothing,
         }
         let now = {
@@ -809,9 +1097,15 @@ impl Discord {
             let others = state.voice.states.iter().any(|(id, heard)| heard.channel == event.channel_id && *id != state.me);
             match state.voice.call.as_mut().filter(|call| call.conversation == event.channel_id) {
                 Some(call) if call.ring => {
-                    call.saw_ringing |= !event.ringing.is_empty();
+                    if !event.ringing.is_empty() {
+                        call.saw_ringing = true;
+                        call.ring_started.get_or_insert_with(Instant::now);
+                    }
                     if call.saw_ringing && event.ringing.is_empty() && !others && !call.answered {
-                        Now::Unanswered(state.voice.call.take().and_then(|call| call.guild))
+                        let early = call.ring_started.is_some_and(|at| at.elapsed() < RING_DECLINE_WINDOW);
+                        let declined = early && !call.stopped_by_us;
+                        let guild = state.voice.call.take().and_then(|call| call.guild);
+                        Now::Unanswered { guild, declined }
                     } else {
                         Now::Nothing
                     }
@@ -838,14 +1132,10 @@ impl Discord {
                 self.ctx.ring(&event.channel_id, &from);
             }
             Now::Quiet => self.ctx.ring_stopped(&event.channel_id),
-            Now::Unanswered(guild) => {
+            Now::Unanswered { guild, declined } => {
                 self.tell(4, voice_state(guild.as_deref(), None, false, false, false));
-                // Discord stops the ringing itself only when the other side says no; a ring
-                // nobody touches goes on until we give up (chatd does, after a minute). With one
-                // person on the other side that makes this a decline. Unconfirmed against a
-                // real account; in a group it only says that nobody is left to answer.
                 let one = self.ctx.known(&event.channel_id).ok().flatten().is_some_and(|row| row.kind == ConversationKind::Direct);
-                let words = if one { DECLINED } else { NO_ANSWER };
+                let words = if one && declined { DECLINED } else { NO_ANSWER };
                 self.ctx.call_failed(&event.channel_id, CallFailure::NoAnswer, words);
             }
             Now::Nothing => {}
@@ -857,6 +1147,7 @@ impl Discord {
             let mut state = self.state.lock().unwrap();
             state.voice.calls.remove(&event.channel_id);
             state.voice.ringing.remove(&event.channel_id);
+            state.voice.ringing_out.remove(&event.channel_id);
             state.voice.states.retain(|_, heard| heard.channel != event.channel_id);
         }
         self.ctx.ring_stopped(&event.channel_id);
@@ -1317,6 +1608,8 @@ mod tests {
             deafened: false,
             ring: false,
             saw_ringing: false,
+            ring_started: None,
+            stopped_by_us: false,
             answered: false,
             video: false,
             told_kbps: None,
@@ -1364,8 +1657,12 @@ mod tests {
             guild: Some("g".into()),
             channel: "c".into(),
             name: "Ada".into(),
+            avatar: None,
             muted: false,
             deafened: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             camera: true,
             sharing: false,
             live: false,

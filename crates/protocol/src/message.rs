@@ -603,6 +603,12 @@ pub struct Message {
     pub prior_text: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Who pinned this message, when the network reports it (e.g. Slack `pins.list`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_by: Option<String>,
+    /// Unix seconds when this message was pinned, when the network reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<i64>,
     /// Starred on the network (Google Messages).
     #[serde(default, skip_serializing_if = "is_false")]
     pub starred: bool,
@@ -678,6 +684,9 @@ pub struct CallNote {
     pub caller_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seconds: Option<u32>,
+    /// User ids who took part in the call, when the network names them (e.g. Discord).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<String>,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that
@@ -738,6 +747,8 @@ impl Message {
             edited_at: None,
             prior_text: None,
             pinned: false,
+            pinned_by: None,
+            pinned_at: None,
             starred: false,
             views: None,
             mentions_me: false,
@@ -820,6 +831,12 @@ impl Message {
             clip(&mut delivery.failed, 200);
         }
         clip(&mut self.receipt_note, 200);
+        if let Some(call) = &mut self.call {
+            call.participants.truncate(32);
+            for id in &mut call.participants {
+                clip(id, 80);
+            }
+        }
         if let Some(effect) = &mut self.effect {
             clip(effect, 64);
         }
