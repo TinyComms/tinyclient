@@ -662,12 +662,43 @@ fn steer(line: &str) -> Vec<Event> {
             let mark = Mark {
                 emoji: "👍".into(),
                 who: vec![author.into()],
+                media: None,
             };
             vec![Event::Message(note(
                 author,
                 name,
                 author,
                 &format!("m-{author}-react"),
+                &text,
+                false,
+                Vec::new(),
+                vec![mark],
+            ))]
+        }
+        "photomoji" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let mode = words.next().unwrap_or("inline");
+            let text = rest(3);
+            let mark = if mode == "placeholder" {
+                Mark {
+                    emoji: "🖼️".into(),
+                    who: vec![author.into()],
+                    media: None,
+                }
+            } else {
+                Mark {
+                    emoji: ":photomoji:".into(),
+                    who: vec![author.into()],
+                    media: Some(photo_piece(true)),
+                }
+            };
+            vec![Event::Message(note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-photomoji-{mode}"),
                 &text,
                 false,
                 Vec::new(),

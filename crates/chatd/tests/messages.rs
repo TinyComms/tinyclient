@@ -2275,3 +2275,71 @@ fn voice_note_uploads_with_waveform_and_enforces_mms_cap() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+#[test]
+fn gif_file_capability_mms_gif_warning_and_photomoji_custom_reactions() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Messages advertises gif_file so the composer shows the GIF button without a third-party key.
+    let status = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages account status");
+    assert!(status.can.gif_file, "Messages must advertise gif_file");
+
+    // 2. Incoming Photomoji reaction with media is kept as a custom-emoji reaction (Reaction::file).
+    world.steer("photomoji grace inline Nice photo");
+    let with_media = world.arrived(GRACE, "Nice photo");
+    assert_eq!(with_media.reactions.len(), 1);
+    assert_eq!(with_media.reactions[0].emoji, ":photomoji:");
+    let file = with_media.reactions[0]
+        .file
+        .as_ref()
+        .expect("Photomoji reaction must carry custom emoji file");
+    assert_eq!(file.kind, MediaKind::Emoji);
+    assert!(file.path.is_some());
+
+    // 3. Incoming custom reaction without media is kept with a neutral placeholder instead of dropped.
+    world.steer("photomoji grace placeholder Still kept");
+    let placeholder = world.arrived(GRACE, "Still kept");
+    assert_eq!(placeholder.reactions.len(), 1);
+    assert_eq!(placeholder.reactions[0].emoji, "🖼️");
+    assert!(placeholder.reactions[0].file.is_none());
+
+    // 4. Sending a large GIF (> 1 MB) in an SMS/MMS chat emits the MMS GIF size warning.
+    world.steer("sms grace");
+    world.until("grace is SMS", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.topic.contains("Text message"))
+    });
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let gif_path = outbox.join("big.gif");
+    let mut gif_bytes = b"GIF89a".to_vec();
+    gif_bytes.resize(1024 * 1024 + 64, 0);
+    std::fs::write(&gif_path, &gif_bytes).unwrap();
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-big-gif".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: gif_path.to_string_lossy().into_owned(),
+                name: "big.gif".into(),
+                ..OutgoingFile::default()
+            }],
+            ..Outgoing::default()
+        },
+    });
+    world.until("MMS GIF warning", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.kind == MessageKind::System && m.text.contains("Large GIFs"))
+    });
+}

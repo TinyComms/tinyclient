@@ -1287,11 +1287,13 @@ pub struct Piece {
     pub height: u32,
 }
 
-/// One emoji on a message, and who put it there.
+/// One emoji or custom (Photomoji) reaction on a message, and who put it there.
 #[derive(Clone, Default)]
 pub struct Mark {
     pub emoji: String,
     pub who: Vec<String>,
+    /// Optional media reference for Photomoji / custom image reactions.
+    pub media: Option<Piece>,
 }
 
 /// A shared geographic location decoded from `MessageInfo.location` (field 5).
@@ -2991,19 +2993,34 @@ fn decode_reactions(msg: &[Field]) -> Vec<Mark> {
     for entry in msg.iter().filter(|field| field.number == 19) {
         let parts = fields(&entry.bytes);
         let data = fields(&field_bytes(&parts, 1));
-        let emoji = emoji_of(&field_text(&data, 1), field_int(&data, 2));
+        let kind = field_int(&data, 2);
+        let mut emoji = emoji_of(&field_text(&data, 1), kind);
+        let media = field(&data, 3)
+            .or_else(|| field(&parts, 3))
+            .filter(|f| !f.bytes.is_empty())
+            .and_then(|f| decode_piece(&f.bytes, ""));
         if emoji.is_empty() {
-            continue;
+            // Photomoji or another custom/unknown reaction: never drop it silently.
+            if media.is_some() {
+                emoji = ":photomoji:".to_owned();
+            } else if kind != 0 || !data.is_empty() {
+                emoji = "🖼️".to_owned();
+            } else {
+                continue;
+            }
         }
         let who = field_texts(&parts, 2);
-        if let Some(have) = marks.iter_mut().find(|mark| mark.emoji == emoji) {
+        if let Some(have) = marks
+            .iter_mut()
+            .find(|mark| mark.emoji == emoji && mark.media.is_none() && media.is_none())
+        {
             for id in who {
                 if !have.who.contains(&id) {
                     have.who.push(id);
                 }
             }
         } else {
-            marks.push(Mark { emoji, who });
+            marks.push(Mark { emoji, who, media });
         }
     }
     marks
@@ -4089,5 +4106,45 @@ mod tests {
         assert_eq!(field_text(&media, 2), "voice-1");
         assert_eq!(field_text(&media, 14), "audio/mp4");
         assert_eq!(field_int(&media, 18), 12, "duration seconds");
+    }
+
+    #[test]
+    fn photomoji_and_unknown_custom_reactions_are_kept_instead_of_dropped() {
+        // 1. Photomoji reaction with media reference in ReactionData field 3.
+        let mut media = Buf::new();
+        media.text(2, "photomoji-media-1");
+        media.text(4, "photomoji.png");
+        media.text(14, "image/png");
+        let mut data = Buf::new();
+        data.int(2, 13); // EMOTIFY / Photomoji
+        data.msg(3, &media.0);
+        let mut entry = Buf::new();
+        entry.msg(1, &data.0);
+        entry.text(2, "phone-grace");
+
+        // 2. Unknown custom reaction without media reference -> neutral placeholder.
+        let mut data2 = Buf::new();
+        data2.int(2, 99);
+        let mut entry2 = Buf::new();
+        entry2.msg(1, &data2.0);
+        entry2.text(2, "phone-alan");
+
+        let mut msg = Buf::new();
+        msg.text(1, "m-photo-react");
+        msg.text(7, "c1");
+        msg.msg(19, &entry.0);
+        msg.msg(19, &entry2.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].reactions.len(), 2);
+        assert_eq!(notes[0].reactions[0].emoji, ":photomoji:");
+        assert_eq!(
+            notes[0].reactions[0].media.as_ref().map(|p| p.media_id.as_str()),
+            Some("photomoji-media-1")
+        );
+        assert_eq!(notes[0].reactions[1].emoji, "🖼️");
+        assert!(notes[0].reactions[1].media.is_none());
     }
 }

@@ -673,6 +673,7 @@ fn connect(
     ctx.capabilities(Capabilities {
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
+        gif_file: true,
         voice_notes: true,
         edit: true,
         edit_window: bugle::EDIT_WINDOW_SECS,
@@ -1345,13 +1346,39 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
     message.reactions = note
         .reactions
         .iter()
-        .map(|mark| Reaction {
-            emoji: mark.emoji.clone(),
-            file: None,
-            count: mark.who.len().max(1) as u32,
-            mine: mark.who.iter().any(|who| who == &account.me),
-            // The phone names the participants who reacted, as the sender ids do.
-            who: mark.who.iter().take(protocol::REACTION_REACTORS).cloned().collect(),
+        .enumerate()
+        .map(|(idx, mark)| {
+            let file = mark.media.as_ref().and_then(|piece| {
+                if piece.inline.is_empty() && piece.media_id.is_empty() {
+                    return None;
+                }
+                let id = format!("messages:{}:react:{idx}", note.id);
+                let mut mf = MediaFile::new(id.clone(), MediaKind::Emoji);
+                mf.width = piece.width;
+                mf.height = piece.height;
+                mf.bytes = if piece.size == 0 {
+                    piece.inline.len() as u64
+                } else {
+                    piece.size
+                };
+                if !piece.inline.is_empty() {
+                    if let Some(path) = land(account, &mf, &piece.inline) {
+                        mf.path = Some(path);
+                        mf.bytes = piece.inline.len() as u64;
+                    }
+                } else if !piece.media_id.is_empty() {
+                    remember_held(account, &id, piece, &note.conversation, &note.id);
+                }
+                Some(mf)
+            });
+            Reaction {
+                emoji: mark.emoji.clone(),
+                file,
+                count: mark.who.len().max(1) as u32,
+                mine: mark.who.iter().any(|who| who == &account.me),
+                // The phone names the participants who reacted, as the sender ids do.
+                who: mark.who.iter().take(protocol::REACTION_REACTORS).cloned().collect(),
+            }
         })
         .collect();
     if message.attachments.is_empty() && note.file {
@@ -1994,7 +2021,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             if with.files.is_empty() {
                 post_text(account, &conversation_id, &client_id, text, reply_to);
             } else {
-                warn_mms(account, &conversation_id, &client_id);
+                warn_mms(account, &conversation_id, &client_id, &with.files);
                 let reply = carried_reply(account, &conversation_id, reply_to);
                 let voice = with.voice.clone();
                 let account = Arc::clone(account);
@@ -2251,14 +2278,27 @@ fn star_message(
     Ok(())
 }
 
-fn warn_mms(account: &Account, conversation: &str, client_id: &str) {
+const MMS_GIF_WARN_BYTES: u64 = 1024 * 1024;
+const MMS_GIF_WARNING: &str = "Large GIFs sent over MMS may be compressed or rejected by your carrier.";
+
+fn warn_mms(account: &Account, conversation: &str, client_id: &str, files: &[protocol::OutgoingFile]) {
     if carrier_of(account, conversation) != 1 {
         return;
     }
+    let large_gif = files.iter().any(|f| {
+        let is_gif = f.name.to_ascii_lowercase().ends_with(".gif")
+            || f.path.to_ascii_lowercase().ends_with(".gif");
+        is_gif && std::fs::metadata(&f.path).is_ok_and(|m| m.len() > MMS_GIF_WARN_BYTES)
+    });
+    let text = if large_gif {
+        MMS_GIF_WARNING
+    } else {
+        bugle::MMS_WARNING
+    };
     let mut line = Message::plain(
         format!("mms-warn-{client_id}"),
         String::new(),
-        bugle::MMS_WARNING,
+        text,
         crate::hub::now(),
         false,
     );
