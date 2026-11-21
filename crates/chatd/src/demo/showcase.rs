@@ -372,19 +372,21 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     let counted = [("👍", 4, true), ("❤️", 12, false), ("🎉", 9, true), ("👀", 7, false), ("🔥", 5, false), ("💯", 3, false), ("😂", 3, false), ("🙏", 2, false), ("🚀", 2, false), ("🤔", 1, false), ("🌿", 1, false)];
     loved.reactions = counted
         .into_iter()
-        .map(|(emoji, count, mine)| Reaction { emoji: emoji.to_owned(), file: None, count, mine })
+        .map(|(emoji, count, mine)| Reaction { emoji: emoji.to_owned(), file: None, count, mine, who: Vec::new() })
         .collect();
     loved.reactions.insert(2, Reaction {
         emoji: ":mossparrot:".to_owned(),
         file: Some(parrot),
         count: 6,
         mine: false,
+        who: Vec::new(),
     });
     loved.reactions.insert(3, Reaction {
         emoji: ":tailwag:".to_owned(),
         file: Some(wag),
         count: 3,
         mine: false,
+        who: Vec::new(),
     });
     feed.push(loved);
 

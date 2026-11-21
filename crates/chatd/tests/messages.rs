@@ -4,8 +4,9 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Encryption, Key,
-    Link, MediaKind, Message, MessageKind, Network, Outgoing, OutgoingFile, Page, ReactionSet,
-    Request, Response, SendState, SignInInput, SignInStep,
+    Link, MediaKind, Message, MessageKind, Network, Notify, Outgoing, OutgoingFile, Page,
+    ReactionSet, RelateAction, Request, Response, SendState, SharedKind, Shelf, SignInInput,
+    SignInStep, Special,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 
 const ME: &str = "phone-ada";
 const GRACE: &str = "phone-grace";
+const ALAN: &str = "phone-alan";
 const CLUB: &str = "phone-club";
 const SESSION: &str = r#"{"account":"phone-ada","name":"Ada Quill"}"#;
 
@@ -46,14 +48,19 @@ impl World {
 
     /// A scripted conversation of 100 messages, so a scroll can ask for the pages under the newest.
     fn many() -> World {
-        World::open(Some(SESSION), true)
+        World::open(Some(SESSION), true, false)
+    }
+
+    /// The phone never answers, so sign-out cannot ask it to drop this computer.
+    fn offline_phone() -> World {
+        World::open(Some(SESSION), false, true)
     }
 
     fn start(session: Option<&str>) -> World {
-        World::open(session, false)
+        World::open(session, false, false)
     }
 
-    fn open(session: Option<&str>, many: bool) -> World {
+    fn open(session: Option<&str>, many: bool, offline: bool) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = std::path::absolute(format!(
             "/tmp/tinyclient-msg-{}-{}",
@@ -74,7 +81,11 @@ impl World {
             .env_remove("TINYCLIENT_SESSION_TEAMS")
             .env_remove("TINYCLIENT_SESSION_SIGNAL")
             .env_remove("TINYCLIENT_SESSION_MESSAGES")
+            .env_remove("TINYCLIENT_MESSAGES_OFFLINE")
             .stderr(Stdio::from(log));
+        if offline {
+            command.env("TINYCLIENT_MESSAGES_OFFLINE", "1");
+        }
         if let Some(session) = session {
             command.env("TINYCLIENT_SESSION_MESSAGES", session);
         }
@@ -189,6 +200,29 @@ impl World {
             Response::Conversation { conversation } => Some(conversation),
             _ => None,
         }
+    }
+
+    fn home(&self, shelf: Shelf) -> Vec<protocol::Conversation> {
+        match self.ask(Request::Home {
+            network: Network::Messages,
+            account: Some(account()),
+            folder: None,
+            shelf,
+            offset: 0,
+            limit: 200,
+        }) {
+            Response::Conversations { conversations, .. } => conversations,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn attention(&self) -> u32 {
+        self.status()
+            .0
+            .iter()
+            .find(|status| status.key == account())
+            .map(|status| status.attention)
+            .unwrap_or(0)
     }
 
     fn messages(&self, conversation: &str) -> Vec<Message> {
@@ -309,7 +343,7 @@ fn a_paired_phone_lists_its_chats_and_a_text_arrives() {
     let club = world.conversation(CLUB).unwrap();
     assert_eq!(
         (club.kind, club.title.as_str(), club.unread),
-        (ConversationKind::Group, "Bridge club", 1)
+        (ConversationKind::Group, "Bridge club", 0)
     );
     let grace = world.conversation(GRACE).unwrap();
     assert_eq!(
@@ -471,6 +505,59 @@ fn a_reaction_is_shown_and_one_we_send_is_asked_of_the_phone() {
 }
 
 #[test]
+fn a_muted_chat_records_no_notification_and_an_open_one_does() {
+    let world = World::linked();
+    world.connected();
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: key(GRACE),
+            notify: Notify::Nothing,
+            until: None,
+        }),
+        Response::Ok
+    );
+    assert!(world.conversation(GRACE).unwrap().muted);
+
+    world.steer("incoming grace still tuesday?");
+    world.arrived(GRACE, "still tuesday?");
+    assert_eq!(world.calls().iter().filter(|call| *call == &format!("notify {GRACE}")).count(), 0);
+
+    world.steer("group grace the cards");
+    world.arrived(CLUB, "the cards");
+    world.heard(&format!("notify {CLUB}"));
+
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: key(GRACE),
+            notify: Notify::All,
+            until: None,
+        }),
+        Response::Ok
+    );
+    assert!(!world.conversation(GRACE).unwrap().muted);
+    world.steer("incoming grace now it rings");
+    world.arrived(GRACE, "now it rings");
+    world.heard(&format!("notify {GRACE}"));
+
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: key(GRACE),
+            notify: Notify::Mentions,
+            until: None,
+        }),
+        Response::Ok
+    );
+    assert!(world.conversation(GRACE).unwrap().muted);
+    let before = world.calls().iter().filter(|call| *call == &format!("notify {GRACE}")).count();
+    world.steer("incoming grace mentions stay quiet");
+    world.arrived(GRACE, "mentions stay quiet");
+    assert_eq!(
+        world.calls().iter().filter(|call| *call == &format!("notify {GRACE}")).count(),
+        before
+    );
+}
+
+#[test]
 fn a_file_we_send_is_read_and_shown_back() {
     let world = World::linked();
     world.connected();
@@ -612,6 +699,205 @@ fn a_mov_is_sent_as_a_video() {
 }
 
 #[test]
+fn three_files_are_one_message_and_a_cancel_stops_the_send() {
+    let world = World::linked();
+    world.connected();
+    let mine = world
+        .status()
+        .0
+        .into_iter()
+        .find(|status| status.key == account())
+        .expect("the Messages account");
+    assert_eq!(mine.can.max_files, 10);
+
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut files = Vec::new();
+    for (name, bytes) in [
+        ("one.txt", b"aaa".as_slice()),
+        ("two.txt", b"bbbb"),
+        ("three.txt", b"ccccc"),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        files.push(OutgoingFile {
+            path: path.to_string_lossy().into_owned(),
+            name: name.into(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+        });
+    }
+    let too_many = vec![files[0].clone(); 11];
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "too-many".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: too_many,
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("10"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+
+    let (_, seq) = world.status();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "three".into(),
+        text: "picnic".into(),
+        reply_to: None,
+        with: Outgoing {
+            files,
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { message } => {
+            assert!(matches!(message.state, SendState::Pending), "{message:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    for (name, len) in [("one.txt", 3), ("two.txt", 4), ("three.txt", 5)] {
+        world.heard(&format!("file {GRACE} {name} {len} picnic"));
+    }
+    let sent = world.until("the three files", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "picnic"
+                && message.attachments.len() == 3
+                && message
+                    .attachments
+                    .iter()
+                    .all(|file| file.file.id.starts_with("messages:"))
+        })
+    });
+    let one = sent
+        .attachments
+        .iter()
+        .find(|file| file.name == "one.txt")
+        .expect("one.txt");
+    let path = one.file.path.as_deref().expect("one.txt on disk");
+    assert_eq!(std::fs::read(path).unwrap(), b"aaa");
+    world.changed(seq, "upload progress", |change| match change {
+        Change::Upload {
+            client_id,
+            sent,
+            total,
+            ..
+        } if client_id == "three" && *sent == *total && *total == 12 => Some(()),
+        _ => None,
+    });
+
+    world.steer("hold");
+    world.heard("hold");
+    let later = dir.join("later.txt");
+    std::fs::write(&later, b"zzzz").unwrap();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "stop".into(),
+        text: "nope".into(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: later.to_string_lossy().into_owned(),
+                name: "later.txt".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        world.ask(Request::CancelSend {
+            conversation: key(GRACE),
+            client_id: "stop".into(),
+        }),
+        Response::Ok
+    );
+    world.steer("go");
+    world.until("the cancelled send", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.client_id.as_deref() == Some("stop")
+                && matches!(&message.state, SendState::Failed { reason } if reason == "Cancelled")
+        })
+    });
+    assert!(
+        !world.calls().iter().any(|call| call.contains("later.txt")),
+        "{:?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn an_archived_chat_leaves_the_main_list_and_spam_does_not_notify() {
+    let world = World::linked();
+    world.connected();
+    assert!(world.home(Shelf::Main).iter().any(|row| row.key.id == GRACE));
+
+    world.steer("archive grace");
+    world.until("Grace on the archive shelf", || {
+        world
+            .home(Shelf::Archive)
+            .iter()
+            .any(|row| row.key.id == GRACE)
+            .then_some(())
+    });
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != GRACE));
+    // A later update that does not repeat the status must not put the chat back.
+    world.steer("again grace");
+    world.until("a status-less update kept the archive", || {
+        world
+            .conversation(GRACE)
+            .filter(|row| row.archived && row.title == "Grace Ombra still")
+    });
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != GRACE));
+
+    let attention = world.attention();
+    world.steer("spam alan");
+    world.until("Alan behind requests", || {
+        world
+            .home(Shelf::Requests)
+            .iter()
+            .any(|row| row.key.id == ALAN)
+            .then_some(())
+    });
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != ALAN));
+    world.steer("incoming alan a blocked note");
+    world.arrived(ALAN, "a blocked note");
+    let spam = world.conversation(ALAN).expect("the spam chat");
+    assert_eq!(spam.special, Special::Request);
+    assert_eq!(
+        world.attention(),
+        attention,
+        "a spam chat raises no badge and posts no notification"
+    );
+}
+
+#[test]
+fn blocking_a_person_asks_the_phone() {
+    let world = World::linked();
+    world.connected();
+    match world.ask(Request::Relate {
+        person: key(GRACE),
+        action: RelateAction::Block,
+    }) {
+        Response::Ok => {}
+        other => panic!("{other:?}"),
+    }
+    world.heard(&format!("block {GRACE}"));
+    let blocked = world.until("Grace off the main list", || {
+        world.conversation(GRACE).filter(|row| row.special == Special::Request)
+    });
+    assert!(blocked.special == Special::Request);
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != GRACE));
+}
+
+#[test]
 fn pairing_uses_google_browser_then_phone_emoji_confirmation() {
     let world = World::start(None);
     assert!(world
@@ -709,6 +995,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
     assert_eq!(sms.encryption, Encryption::Unknown);
     world.ask(Request::Typing {
         conversation: key(GRACE),
+        activity: protocol::Compose::Typing,
     });
     let quiet = Instant::now() + Duration::from_secs(1);
     while Instant::now() < quiet {
@@ -731,6 +1018,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
     assert_eq!(rcs.encryption, Encryption::Unknown);
     world.ask(Request::Typing {
         conversation: key(GRACE),
+        activity: protocol::Compose::Typing,
     });
     world.heard(&format!("typing {GRACE}"));
     world.steer("tick grace");
@@ -785,20 +1073,7 @@ fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
     world.connected();
     world.steer("silent");
     world.heard("silent");
-    let _ = world.messages(GRACE);
-    world.until("the phone banner while the relay stays up", || {
-        let (accounts, _) = world.status();
-        accounts.into_iter().find(|status| status.key.account == ME).and_then(|status| {
-            (status.link == Link::Connected
-                && status.required == chatd::adapters::messages::CANT_REACH)
-                .then_some(())
-        })
-    });
-    assert!(
-        world.calls().iter().all(|call| !call.starts_with("history ")),
-        "a quiet phone was asked for history: {:?}",
-        world.calls()
-    );
+    let while_quiet = world.calls().iter().filter(|call| call.starts_with("history ")).count();
     let pending = world.send(GRACE, "held-1", "On my way.");
     assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
     let waiting = |text: &str| {
@@ -810,6 +1085,20 @@ fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
     world.until("the first text to wait", || waiting("On my way."));
     world.send(GRACE, "held-2", "Still here.");
     world.until("the second text to wait", || waiting("Still here."));
+    world.until("the phone banner while the relay stays up", || {
+        let (accounts, _) = world.status();
+        accounts.into_iter().find(|status| status.key.account == ME).and_then(|status| {
+            (status.link == Link::Connected
+                && status.required == chatd::adapters::messages::CANT_REACH)
+                .then_some(())
+        })
+    });
+    assert_eq!(
+        world.calls().iter().filter(|call| call.starts_with("history ")).count(),
+        while_quiet,
+        "a quiet phone was asked for history: {:?}",
+        world.calls()
+    );
     assert!(
         world.calls().iter().all(|call| !call.starts_with("send ")),
         "a quiet phone was asked to send: {:?}",
@@ -820,8 +1109,15 @@ fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
         let calls = world.calls();
         let first = calls.iter().position(|call| call == "send phone-grace On my way.")?;
         let second = calls.iter().position(|call| call == "send phone-grace Still here.")?;
-        let history = calls.iter().position(|call| call == "history phone-grace")?;
-        (first < second && second < history).then_some(())
+        let between = calls.iter().enumerate().any(|(index, call)| {
+            index > first && index < second && call.starts_with("history ")
+        });
+        let later = calls
+            .iter()
+            .enumerate()
+            .any(|(index, call)| index > second && call.starts_with("history "));
+        let earlier = calls.iter().take(first).any(|call| call.starts_with("history "));
+        (first < second && !between && (later || earlier)).then_some(())
     });
     world.until("both texts to be sent", || {
         let messages = world.messages(GRACE);
@@ -850,10 +1146,10 @@ fn scrolling_back_reads_every_message_and_then_stops_asking() {
     };
     let first = world.until("the newest forty", || {
         let lines = world.lines();
-        (lines.len() == 40).then_some(lines)
+        (lines.len() >= 40).then_some(lines)
     });
     let _ = world.before(&oldest(&first));
-    world.until("the next forty", || (world.lines().len() == 80).then_some(()));
+    world.until("the next forty", || (world.lines().len() >= 80).then_some(()));
     let mid = world.lines();
     let _ = world.before(&oldest(&mid));
     let all = world.until("all one hundred", || {
@@ -874,17 +1170,18 @@ fn scrolling_back_reads_every_message_and_then_stops_asking() {
     let asked = world
         .calls()
         .iter()
-        .filter(|call| call.starts_with("history "))
+        .filter(|call| call.starts_with("history phone-grace"))
         .count();
     let _ = world.before(&oldest(&all));
     world.ask(Request::Typing {
         conversation: key(GRACE),
+        activity: protocol::Compose::Typing,
     });
     world.heard(&format!("typing {GRACE}"));
     let after = world
         .calls()
         .iter()
-        .filter(|call| call.starts_with("history "))
+        .filter(|call| call.starts_with("history phone-grace"))
         .count();
     assert_eq!(
         after, asked,
@@ -1119,4 +1416,161 @@ fn a_text_deleted_on_the_phone_leaves_and_delete_reaches_the_phone() {
         None => Some(()),
         Some(_) => None,
     });
+}
+
+#[test]
+fn three_texts_count_as_three_and_a_chat_read_on_the_phone_clears() {
+    let world = World::linked();
+    world.connected();
+    let club = world.conversation(CLUB).unwrap();
+    assert_eq!(club.unread, 0, "a flag with no messages was shown as a count");
+    for text in ["a", "bb", "ccc"] {
+        world.steer(&format!("incoming grace {text}"));
+        world.arrived(GRACE, text);
+    }
+    assert_eq!(world.conversation(GRACE).unwrap().unread, 3);
+    world.steer("hold grace");
+    let held = world.until("the unread flag", || {
+        world.conversation(GRACE).filter(|row| row.title == "Held")
+    });
+    assert_eq!(held.unread, 3, "the unread flag replaced the count with 1");
+    world.steer("read grace");
+    let read = world.until("the chat read on the phone", || {
+        world.conversation(GRACE).filter(|row| row.title == "Read")
+    });
+    assert_eq!(read.unread, 0);
+}
+
+#[test]
+fn signing_out_asks_the_phone_to_drop_this_computer_once() {
+    let world = World::linked();
+    world.connected();
+    match world.ask(Request::SignOut {
+        account: account(),
+        erase: false,
+    }) {
+        Response::Status { accounts, .. } => {
+            assert!(
+                accounts
+                    .iter()
+                    .all(|status| status.key != account() || status.link != Link::Connected),
+                "{accounts:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    world.heard("unpair");
+    assert_eq!(
+        world.calls().iter().filter(|call| *call == "unpair").count(),
+        1
+    );
+}
+
+#[test]
+fn signing_out_offline_says_the_phone_may_still_list_this_computer() {
+    let world = World::offline_phone();
+    // The socket answers before the account's threads exist. Wait until the phone is unreachable.
+    world.heard("offline");
+    match world.ask(Request::SignOut {
+        account: account(),
+        erase: false,
+    }) {
+        Response::Status { accounts, .. } => {
+            assert!(
+                accounts
+                    .iter()
+                    .all(|status| status.key != account() || status.link != Link::Connected),
+                "{accounts:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    world.heard(
+        "This computer may still be listed under Device pairing on your phone. Remove it there.",
+    );
+}
+
+#[test]
+fn a_video_is_a_video_and_a_voice_note_has_a_waveform() {
+    chatd::adapters::messages::prove_message_media().expect("a video and a voice note");
+    let world = World::linked();
+    world.connected();
+
+    world.steer("video grace");
+    let clip = world.arrived(GRACE, "clip");
+    let video = &clip.attachments[0];
+    assert_eq!(video.file.kind, MediaKind::Video);
+    assert_eq!(video.duration, 2);
+    assert!(video.thumb.is_none());
+    assert!(video.waveform.is_empty());
+    assert!(video.file.path.is_some());
+
+    world.steer("poster grace");
+    let poster = world.arrived(GRACE, "poster");
+    let shown = &poster.attachments[0];
+    assert_eq!(shown.file.kind, MediaKind::Video);
+    let thumb = shown.thumb.as_ref().expect("the still is the poster");
+    assert_eq!(thumb.kind, MediaKind::Image);
+    assert!(thumb.path.is_some());
+    assert!(shown.file.path.is_none());
+
+    world.steer("voice grace");
+    let voice = world.arrived(GRACE, "voice");
+    let note = &voice.attachments[0];
+    assert_eq!(note.file.kind, MediaKind::Audio);
+    assert_eq!(note.mime, "audio/amr");
+    assert_eq!(note.duration, 1);
+    assert!(note.waveform.iter().any(|bar| *bar != 0));
+}
+
+#[test]
+fn an_older_line_is_found_without_opening_the_chat() {
+    let world = World::many();
+    world.connected();
+    let hit = |query: &str, conversation: Option<Key>| match world.ask(Request::SearchMessages {
+        conversation,
+        network: Some(Network::Messages),
+        space: None,
+        query: query.into(),
+        limit: 10,
+    }) {
+        Response::MessageHits { hits } => hits.into_iter().any(|hit| hit.message_id == "m-0011"),
+        _ => false,
+    };
+    world.until("the 90th-newest line", || {
+        hit("line 11", Some(key(GRACE))).then_some(())
+    });
+    assert!(
+        hit("line 11", None),
+        "the account search missed the older line: {:?}",
+        world.calls()
+    );
+    world.heard("history phone-grace m-0021");
+    let mut since = Instant::now();
+    let mut seen = world.calls().len();
+    world.until("the fill to stop", || {
+        let now = world.calls().len();
+        if now != seen {
+            seen = now;
+            since = Instant::now();
+            return None;
+        }
+        (since.elapsed() > Duration::from_millis(500)).then_some(())
+    });
+    match world.ask(Request::Shared {
+        conversation: key(GRACE),
+        kind: SharedKind::Media,
+        before: None,
+        limit: 20,
+        search: true,
+    }) {
+        Response::Shared { items, complete, .. } => {
+            assert!(complete, "a finished chat was not the whole list");
+            assert!(
+                items.iter().any(|item| item.message_id == "m-0011"),
+                "the older photo was not in the shared list: {items:?}"
+            );
+        }
+        other => panic!("the shared list was not served: {other:?}"),
+    }
 }

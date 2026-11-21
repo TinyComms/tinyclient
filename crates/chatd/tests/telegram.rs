@@ -9,7 +9,8 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Key, Link,
-    EmojiScope, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response,
+    EmojiScope, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, RelateAction, Relation, Request,
+    Response,
     SendState, SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
 };
 use std::io::Write;
@@ -136,6 +137,31 @@ impl World {
             sleep(Duration::from_millis(10));
         }
         World { child, dir }
+    }
+
+    /// Starts chatd again on the same store. The scripted wire starts fresh; lines already
+    /// taken stay taken, so a restart does not replay them.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(self.dir.join("chat.sock"));
+        let log = std::fs::File::create(self.dir.join("stderr.log")).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+            .env("TINYCLIENT_DIR", &self.dir)
+            .env("TINYCLIENT_TELEGRAM_FAKE", "30")
+            .env("TINYCLIENT_TELEGRAM_T0", t0().to_string())
+            .env_remove("TINYCLIENT_SESSION_DISCORD")
+            .env_remove("TINYCLIENT_SESSION_SLACK")
+            .env("TINYCLIENT_SESSION_TELEGRAM", SESSION)
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        self.child = child;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ChatStream::connect(&self.dir.join("chat.sock")).is_err() {
+            assert!(Instant::now() < deadline, "chatd did not open its socket after a restart");
+            sleep(Duration::from_millis(10));
+        }
     }
 
     fn ask(&self, request: Request) -> Response {
@@ -598,6 +624,153 @@ fn a_row_scrolled_away_before_its_picture_waits_unfetched_and_is_fetched_once_it
     });
 }
 
+/// The photo `photo-pages` writes into Trail crew: its thumbnail is one piece.
+const CREW_THUMB: &str = "GetFile photo 6020 m";
+
+/// An ask for a piece of the thumbnail of a photo post `photo-pages` wrote into Field Notes
+/// (`p7100m` up). Each is two pieces.
+fn channel_thumb(call: &str) -> bool {
+    call.starts_with("GetFile photo 71") && call.contains(" m at ")
+}
+
+/// The shell drawing these files on screen asks for them, as `fetch_wanted` does.
+fn on_screen(world: &World, ids: &[&str]) {
+    let ids = ids.iter().map(|id| (*id).to_owned()).collect();
+    match world.ask(Request::Fetch { account: account(), ids, size: Some(320), retry: false }) {
+        Response::Media { .. } => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+/// How many pieces of the channel's thumbnails Telegram was asked for from the `since`th call
+/// to the first that starts with `line`, and how many after it.
+fn channel_thumbs_around(world: &World, since: usize, line: &str) -> (usize, usize) {
+    let calls = world.calls();
+    let at = calls.iter().position(|call| call.starts_with(line)).unwrap_or_else(|| panic!("{line} in {calls:#?}"));
+    let count = |calls: &[String]| calls.iter().filter(|call| channel_thumb(call)).count();
+    (count(&calls[since.min(at)..at]), count(&calls[at + 1..]))
+}
+
+/// At most what was being fetched when a picture was asked for, and the one after it if the
+/// ask landed just as that began: two thumbnails of two pieces.
+const IN_FLIGHT: usize = 4;
+
+/// Waits until every piece of the `many` channel thumbnails has been asked for, so the order
+/// they went in is whole.
+fn all_channel_thumbs(world: &World, many: usize) {
+    world.within(Duration::from_secs(60), "every channel thumbnail", || {
+        (world.calls().iter().filter(|call| channel_thumb(call)).count() >= 2 * many).then_some(())
+    });
+}
+
+/// Opens Field Notes with `many` photo posts no thumbnail of which is on disk, and waits for
+/// the first of them to be fetched: the rest wait their turn behind it.
+fn channel_fetching(many: u32) -> World {
+    let world = World::signed_in();
+    world.connected();
+    world.steer(&format!("photo-pages {many}"));
+    world.messages("c9001");
+    world.until("the channel's first thumbnail", || world.calls().iter().any(|call| channel_thumb(call)).then_some(()));
+    world
+}
+
+#[test]
+fn the_pictures_on_screen_are_fetched_before_those_still_waiting_from_a_channel_left_or_off_screen() {
+    let world = channel_fetching(12);
+    // Scrolled up to the oldest post, whose thumbnail the page named last: it goes next.
+    let scrolled = world.calls().len();
+    on_screen(&world, &["p7100m"]);
+    world.within(Duration::from_secs(60), "the oldest post's thumbnail", || (world.called("GetFile photo 7100 m") > 0).then_some(()));
+
+    // Trail crew opened while the channel's thumbnails still wait: the photo it shows goes
+    // ahead of them, and three asks for it are one download.
+    world.messages("g8001");
+    world.until("the group's photo", || world.message("g8001", "90"));
+    let opened = world.calls().len();
+    for _ in 0..3 {
+        on_screen(&world, &["p6020m"]);
+    }
+    world.within(Duration::from_secs(60), "the group's thumbnail", || (world.called(CREW_THUMB) > 0).then_some(()));
+
+    // Every thumbnail still comes in the end, each once, and the ones on screen came next.
+    all_channel_thumbs(&world, 12);
+    let (waited, after) = channel_thumbs_around(&world, scrolled, "GetFile photo 7100 m at 0");
+    assert!(waited <= IN_FLIGHT && after > 0, "the oldest post's thumbnail waited behind {waited} pieces: {:#?}", world.calls());
+    let (waited, after) = channel_thumbs_around(&world, opened, CREW_THUMB);
+    assert!(waited <= IN_FLIGHT && after > 0, "the group's thumbnail waited behind {waited} pieces: {:#?}", world.calls());
+    for at in 0..12 {
+        assert_eq!(world.called(&format!("GetFile photo {} m at 0", 7_100 + at)), 1, "{:#?}", world.calls());
+    }
+    assert_eq!(world.called(CREW_THUMB), 1, "{:#?}", world.calls());
+    let landed = world.message("g8001", "90").and_then(|message| message.attachments[0].thumb.clone()).and_then(|thumb| thumb.path);
+    assert_eq!(std::fs::metadata(landed.expect("the group's thumbnail on disk")).unwrap().len(), include_bytes!("../src/adapters/telegram/fake_crew_m.jpg").len() as u64);
+}
+
+#[test]
+fn a_picture_asked_for_before_its_page_is_read_goes_ahead_once_the_page_names_it() {
+    let world = channel_fetching(12);
+    // The group's photo is on screen from what the store had, before its page is read again:
+    // nothing here knows yet where it is.
+    on_screen(&world, &["p6020m"]);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.called(CREW_THUMB), 0);
+    world.messages("g8001");
+    world.within(Duration::from_secs(60), "the group's thumbnail", || (world.called(CREW_THUMB) > 0).then_some(()));
+    all_channel_thumbs(&world, 12);
+    // From the moment its page was read, it waited only for what was being fetched.
+    let calls = world.calls();
+    let read = calls.iter().position(|call| call.starts_with("GetHistory g8001")).unwrap_or_else(|| panic!("{calls:#?}"));
+    let (waited, after) = channel_thumbs_around(&world, read, CREW_THUMB);
+    assert!(waited <= IN_FLIGHT && after > 0, "the group's thumbnail waited behind {waited} pieces: {calls:#?}");
+}
+
+#[test]
+fn the_original_the_viewer_waits_on_goes_before_the_pictures_on_screen() {
+    let world = channel_fetching(12);
+    world.messages("g8001");
+    world.until("the group's photo", || world.message("g8001", "90"));
+    // Telegram asks for a pause on the next piece: nothing is fetched while both are asked for,
+    // so their order is the line's and not the order they arrived in.
+    world.steer("flood-file 2");
+    world.until("Telegram to ask for a pause", || world.calls().iter().any(|call| call.ends_with(" refused 2")).then_some(()));
+    let paused = Instant::now();
+    // The group's photo on screen, then the viewer opened on the channel's newest post.
+    on_screen(&world, &["p6020m"]);
+    on_screen(&world, &["p7111y"]);
+    assert!(paused.elapsed() < Duration::from_millis(1_500), "asked for after the pause: {:?}", paused.elapsed());
+    world.within(Duration::from_secs(60), "the group's thumbnail", || (world.called(CREW_THUMB) > 0).then_some(()));
+    all_channel_thumbs(&world, 12);
+    // After the file that was paused: the original, in two pieces, then the group's photo, then
+    // the rest of the channel.
+    let calls = world.calls();
+    let refused = calls.iter().position(|call| call.ends_with(" refused 2")).unwrap();
+    let paused_file = calls[refused].trim_end_matches(" refused 2").to_owned() + " at ";
+    let next: Vec<&str> = calls[refused + 1..].iter().map(String::as_str).filter(|call| call.starts_with("GetFile") && !call.starts_with(&paused_file)).take(4).collect();
+    assert_eq!(&next[..3], ["GetFile photo 7111 y at 0", "GetFile photo 7111 y at 262144", "GetFile photo 6020 m at 0"], "{calls:#?}");
+    assert!(channel_thumb(next[3]), "{calls:#?}");
+}
+
+#[test]
+fn a_flood_wait_on_a_picture_on_screen_holds_every_file_until_it_has_passed() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("photo-pages 3");
+    world.steer("flood-file 2");
+    world.messages("g8001");
+    world.until("the group's photo", || world.message("g8001", "90"));
+    on_screen(&world, &["p6020m"]);
+    world.until("Telegram to ask for a pause", || (world.called("GetFile photo 6020 m refused 2") == 1).then_some(()));
+    let refused = Instant::now();
+    // The channel opened during the pause: its thumbnails wait for it to pass too.
+    world.messages("c9001");
+    world.until("the group's thumbnail after the pause", || (world.called("GetFile photo 6020 m at 0") == 1).then_some(()));
+    assert!(refused.elapsed() >= Duration::from_millis(1_700), "asked again after {:?}", refused.elapsed());
+    let calls = world.calls();
+    let at = |line: &str| calls.iter().position(|call| call == line).unwrap_or_else(|| panic!("{line} in {calls:#?}"));
+    assert!(calls[at("GetFile photo 6020 m refused 2") + 1..at("GetFile photo 6020 m at 0")].iter().all(|call| !call.starts_with("GetFile")), "{calls:#?}");
+    world.until("the channel's thumbnails after it", || world.calls().iter().any(|call| channel_thumb(call)).then_some(()));
+}
+
 #[test]
 fn a_chats_list_paints_what_it_has_while_the_pages_arrive() {
     // Five pages of the main list at sign-on; every page after the first is held at the wire.
@@ -687,6 +860,98 @@ fn a_pin_or_a_folder_change_is_told_row_by_row_and_never_rereads_the_chats() {
     assert_eq!(added, ["GetPinnedDialogs 0"], "one request for all three changes");
     assert_eq!(world.called("GetDialogs"), 2);
 }
+
+#[test]
+fn a_photos_stripped_preview_is_on_disk_while_its_thumbnail_is_still_downloading() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_FILE_HOLD", "1")]);
+    world.connected();
+    let on_disk = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+        Response::Media { mut files } => files.pop().and_then(|file| file.path),
+        other => panic!("{other:?}"),
+    };
+    // Posted while the chat is closed; opening it reads the page and wants what its rows show.
+    world.steer("photo-preview");
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    let posted = world.arrived("u7002", "24");
+    let attachment = &posted.attachments[0];
+    let preview = attachment.preview.as_ref().expect("the photo carries its stripped thumbnail");
+    assert_eq!((preview.id.as_str(), preview.kind, preview.width, preview.height), ("p6016i", MediaKind::Image, 40, 30));
+    assert_eq!(attachment.thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("p6016m"));
+
+    // The row's size is asked of Telegram, which holds it; the preview is on disk regardless.
+    world.until("the thumbnail asked for", || (world.called("GetFile photo 6016 m") > 0).then_some(()));
+    let kept = world.until("the preview on disk", || on_disk("p6016i"));
+    let jpeg = std::fs::read(&kept).unwrap();
+    assert_eq!((&jpeg[..2], &jpeg[jpeg.len() - 2..]), (&[0xff, 0xd8][..], &[0xff, 0xd9][..]), "a whole JPEG");
+    assert!(on_disk("p6016m").is_none(), "the thumbnail is still held at the wire");
+    assert_eq!(world.called("GetFile photo 6016 i"), 0, "nothing is asked for the preview");
+    // The stored message names where its preview is, for the next page read.
+    let stored = world.message("u7002", "24").unwrap();
+    assert_eq!(stored.attachments[0].preview.as_ref().and_then(|file| file.path.as_deref()), Some(kept.as_str()));
+
+    // Let go, the thumbnail lands beside it; the preview stays for the next open.
+    world.steer("file-go");
+    let thumb = world.until("the thumbnail on disk", || on_disk("p6016m"));
+    let served = include_bytes!("../src/adapters/telegram/fake_ridge_m.jpg");
+    assert_eq!(std::fs::read(&thumb).unwrap(), served);
+    assert_eq!(on_disk("p6016i").as_deref(), Some(kept.as_str()));
+}
+
+#[test]
+fn a_thumbnail_gone_from_disk_is_never_marked_failed_and_telegram_keeps_it_again() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    let asked = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+        Response::Media { mut files } => files.pop(),
+        other => panic!("{other:?}"),
+    };
+    world.steer("photo");
+    world.arrived("u7002", "14");
+    let landed = world.until("the thumbnail on disk", || asked("p6014m").and_then(|file| file.path));
+    // The cache evicted it, or something else deleted it: the row stays, the file is gone.
+    std::fs::remove_file(&landed).unwrap();
+
+    // The shell asks for it again. Only Telegram can fetch it: the cache must not try the
+    // address it was kept under, which would mark it failed while Telegram brings it back.
+    let again = asked("p6014m").expect("still known");
+    assert_eq!((again.path.as_deref(), again.failed.as_deref()), (None, None));
+    let deadline = Instant::now() + Duration::from_millis(1_500);
+    while Instant::now() < deadline {
+        let seen = asked("p6014m").expect("still known");
+        assert!(seen.failed.is_none(), "marked failed: {seen:?}");
+        sleep(Duration::from_millis(100));
+    }
+    assert!(!world.stderr().contains("does not serve files from that address"), "{}", world.stderr());
+
+    // Telegram knows where it is, and the shell asked for it because it is on screen: it is
+    // fetched again at once, ahead of what is not on screen, with no page read again for it.
+    world.until("Telegram to keep it again", || asked("p6014m").and_then(|file| file.path));
+    assert_eq!(world.called("GetFile photo 6014 m"), 4, "fetched once more, in its two pieces: {:#?}", world.calls());
+}
+
+#[test]
+fn a_live_location_moves_on_the_card_and_the_move_is_not_a_new_message() {
+    let world = World::signed_in();
+    world.connected();
+    world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("live-place");
+    let place = world.until("the live location", || world.message("u7002", "40").filter(|message| message.card.is_some()));
+    let card = place.card.expect("a live location is a card");
+    assert_eq!(card.title, "Live location");
+    assert!(card.text.contains("geo:37.7,-122.4"), "{}", card.text);
+    assert!(card.fields.iter().any(|(label, value)| label == "Status" && value == "Still sharing"), "{:?}", card.fields);
+    world.until("the live location counts once", || world.conversation("u7002").filter(|row| row.unread == 2));
+    world.steer("live-move");
+    let moved = world.until("the live location moved", || {
+        world.message("u7002", "40").filter(|message| message.card.as_ref().is_some_and(|card| card.text.contains("geo:37.8,-122.5")))
+    });
+    assert!(moved.card.unwrap().text.contains("geo:37.8,-122.5"));
+    assert_eq!(world.conversation("u7002").unwrap().unread, 2);
+}
+
 #[test]
 fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     let world = World::signed_in();
@@ -733,6 +998,8 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     assert_eq!((attachment.file.id.as_str(), attachment.file.kind, attachment.file.width, attachment.file.height), ("p6014y", MediaKind::Image, 1_280, 960));
     let thumb = attachment.thumb.as_ref().unwrap();
     assert_eq!((thumb.id.as_str(), thumb.width, thumb.height), ("p6014m", 320, 240));
+    // Its stripped thumbnail names a size and no picture: there is no preview to draw.
+    assert!(attachment.preview.is_none(), "{attachment:?}");
     let landed = world.until("the thumbnail on disk", || {
         match world.ask(Request::Fetch { account: account(), ids: vec!["p6014m".into()], size: None, retry: false }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),
@@ -797,6 +1064,34 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     world.steer("service");
     let renamed = world.arrived("g8001", "22");
     assert_eq!((renamed.kind, renamed.text.as_str()), (MessageKind::System, "Tobin Reyes renamed this to \"Ridge crew\""));
+}
+
+#[test]
+fn a_poll_shows_its_options_and_a_later_update_replaces_the_counts() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("poll-full");
+    let poll = world.arrived("g8001", "31");
+    assert_eq!(poll.text, "Poll: Saturday or Sunday?");
+    assert!(matches!(poll.kind, MessageKind::Unsupported { ref link } if link.contains("message_id=31")));
+    let card = poll.card.expect("a poll is a card");
+    assert_eq!(card.title, "Saturday or Sunday?");
+    assert_eq!(card.footer, "Open in Telegram");
+    assert_eq!(card.fields, vec![("3 votes".to_owned(), "Saturday".to_owned()), ("1 vote".to_owned(), "Sunday".to_owned())]);
+    world.steer("poll-update");
+    let updated = world.until("the new counts", || {
+        let message = world.message("g8001", "31")?;
+        let card = message.card.as_ref()?;
+        (card.fields.first().is_some_and(|(label, _)| label == "5 votes")).then_some(message)
+    });
+    let card = updated.card.expect("the card stays");
+    assert_eq!(card.fields, vec![("5 votes".to_owned(), "Saturday".to_owned()), ("2 votes".to_owned(), "Sunday".to_owned())]);
+    assert_eq!(card.text, "7 votes");
+    // Counts alone name options by their bytes, which the stored card does not keep.
+    world.steer("poll-counts");
+    sleep(Duration::from_millis(200));
+    let card = world.message("g8001", "31").and_then(|message| message.card).expect("the card stays");
+    assert_eq!(card.fields[0].0, "5 votes");
 }
 
 #[test]
@@ -1508,6 +1803,34 @@ fn a_read_lost_on_the_way_is_told_again_and_the_badge_stays() {
 }
 
 #[test]
+fn marking_a_chat_unread_sets_a_badge_and_tells_telegram() {
+    let world = World::signed_in();
+    world.connected();
+    let crew = world.until("the group on the list", || world.conversation("g8001"));
+    assert_eq!(crew.unread, 0);
+
+    assert_eq!(world.ask(Request::MarkUnread { conversation: key("g8001"), message_id: String::new() }), Response::Ok);
+    world.until("the unread mark to be told", || world.calls().iter().any(|call| call == "MarkDialogUnread g8001 unread").then_some(()));
+    assert_eq!(world.conversation("g8001").unwrap().unread, 1);
+
+    // Another device takes the mark off. Nothing in the chat is unread, so the badge goes.
+    world.steer("unread-mark off");
+    world.until("the mark to clear", || world.conversation("g8001").filter(|row| row.unread == 0));
+
+    // The phone puts the mark back on a chat this device had already read.
+    world.steer("unread-mark");
+    world.until("the mark to show", || world.conversation("g8001").filter(|row| row.unread == 1));
+
+    // Reading it tells Telegram both that the messages were seen and that the mark is off.
+    world.ask(Request::MarkRead { conversation: key("g8001"), message_id: "20".into() });
+    world.until("the mark to be cleared on the network", || {
+        let calls = world.calls();
+        (calls.iter().any(|call| call == "ReadHistory g8001 20") && calls.iter().any(|call| call == "MarkDialogUnread g8001 read")).then_some(())
+    });
+    assert_eq!(world.conversation("g8001").unwrap().unread, 0);
+}
+
+#[test]
 fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     let world = World::signed_in();
     world.connected();
@@ -1534,7 +1857,7 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     // Ours: typing is told while the user types, paced; reading is told when the shell says a
     // message was seen; and acting says we are here. No setting holds any of it back.
     for _ in 0..3 {
-        world.ask(Request::Typing { conversation: key("u7003") });
+        world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::Typing });
     }
     world.until("typing to be told", || (world.called("SetTyping u7003") == 1).then_some(()));
     world.ask(Request::MarkRead { conversation: key("g8001"), message_id: "20".into() });
@@ -1548,6 +1871,24 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     let connect_here = calls.iter().position(|call| call == "UpdateStatus");
     let acting = calls.iter().position(|call| call.starts_with("SetTyping u7003"));
     assert!(connect_here.is_some_and(|at| acting.is_some_and(|last| at < last)), "the connect must say we are here before acting does");
+}
+
+#[test]
+fn a_voice_recording_is_told_as_a_recording_and_heard_as_one() {
+    let world = World::signed_in();
+    world.connected();
+    let watch = || match world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), people: vec![key("u7002")], ..Watching::default() })) {
+        Response::Watching { typists, .. } => typists,
+        other => panic!("{other:?}"),
+    };
+    world.steer("record-audio");
+    let typists = world.until("a voice recording", || Some(watch()).filter(|typists| !typists.is_empty()));
+    assert_eq!(typists[0].activity, protocol::Compose::RecordingVoice);
+    assert_eq!(
+        world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::RecordingVoice }),
+        Response::Ok
+    );
+    world.until("the recording to be told", || (world.called("SetTyping u7003 record-audio") == 1).then_some(()));
 }
 
 #[test]
@@ -1606,7 +1947,10 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
     assert_eq!(world.messages("u7002").iter().filter(|message| message.text == "See you there").count(), 1);
     assert!(world.calls().contains(&"SendMessage u7002 See you there".to_owned()));
 
-    assert_eq!(world.ask(Request::Edit { conversation: key("u7002"), message_id: "101".into(), text: "See you at seven".into() }), Response::Ok);
+    assert_eq!(
+        world.ask(Request::Edit { conversation: key("u7002"), message_id: "101".into(), text: "See you at seven".into(), spans: Vec::new() }),
+        Response::Ok
+    );
     let edited = world.message("u7002", "101").unwrap();
     assert!(edited.edited && edited.text == "See you at seven");
 
@@ -1854,6 +2198,36 @@ fn following_a_sponsored_message_tells_telegram_of_the_click_but_a_post_does_not
 }
 
 #[test]
+fn a_hidden_last_seen_reads_in_words_and_common_groups_are_listed() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { people: vec![key("u7003")], ..Watching::default() });
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7003"), space: None }) else {
+        panic!("no profile");
+    };
+    assert_eq!(profile.person.presence, Presence::Unknown);
+    assert_eq!(profile.person.status, "last seen recently");
+    assert_eq!(profile.mutual_spaces, vec!["Trail crew".to_owned(), "Workshop".to_owned()]);
+    assert!(profile.fields.iter().any(|(label, value)| label == "Birthday" && value == "14 March"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Location" && value == "The hut"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Hours" && value == "Open now · Europe/Lisbon"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Also" && value.contains("@tobin_r")));
+    world.steer("rename");
+    // The list matches a prefix. "Hale" matches neither the old name nor the new one.
+    let renamed = world.until("the new name", || match world.ask(Request::People {
+        network: Some(Network::Telegram),
+        relation: None,
+        query: Some("Tobin Hale".into()),
+        offset: 0,
+        limit: 20,
+    }) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == "u7003"),
+        _ => None,
+    });
+    assert_eq!(renamed.name, "Tobin Hale");
+}
+
+#[test]
 fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     let world = World::signed_in();
     world.connected();
@@ -2057,6 +2431,7 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let sent = send("8105", "the ridge", protocol::Outgoing { files: vec![one(photo.clone(), true, false)], ..Default::default() });
     assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
     assert_eq!((world.called("SaveFilePart 0 524288"), world.called("SaveFilePart 1 192512")), (1, 1));
+    assert!(world.called("SetTyping u7002 upload-photo") >= 1, "{:?}", world.calls());
     assert_eq!(world.called("SendMedia u7002 photo+spoiler the ridge"), 1);
     let with = vec![one(photo.clone(), false, false), one(file("map.png", 1_000), false, false), one(file("plan.pdf", 2_000), false, true)];
     let album = send("8106", "trip", protocol::Outgoing { files: with, ..Default::default() });
@@ -2077,6 +2452,51 @@ fn pickers_and_sending_with_files_options_and_picks() {
     assert_eq!(send("8107", "", protocol::Outgoing { files: vec![one(big, false, false)], ..Default::default() }).state, SendState::Sent);
     assert_eq!((world.called("SaveBigFilePart 0/21 524288"), world.called("SaveBigFilePart 20/21 5")), (1, 1));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_inline_bot_query_lists_articles_and_a_pick_sends_the_result() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let (found, next) = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: Some(key("u7002")),
+        query: "@wiki rust".into(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, cursor } => (items, cursor),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name, "Rust");
+    assert_eq!(found[0].pack, "A language");
+    assert!(found[0].file.is_none(), "an article has no file");
+    assert_eq!(next.as_deref(), Some("2"));
+    assert_eq!(world.called("ResolveUsername wiki"), 1);
+    assert_eq!(world.called("GetInlineBotResults rust"), 1);
+    assert!(
+        world.calls().iter().any(|call| call.contains("7060") && call.contains("u7002")),
+        "the query is asked of that bot in the open chat: {:?}",
+        world.calls()
+    );
+    let asked = Request::Send {
+        conversation: key("u7002"),
+        client_id: "8201".into(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            pick: Some(protocol::Pick { kind: protocol::CatalogKind::Gifs, id: found[0].id.clone() }),
+            ..Default::default()
+        },
+    };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    let sent = world.until("the inline result is sent", || {
+        world.messages("u7002").into_iter().find(|message| message.client_id.as_deref() == Some("8201") && message.state != SendState::Pending)
+    });
+    assert_eq!(sent.state, SendState::Sent);
+    assert_eq!(world.called("SendInlineBotResult u7002 88 a1"), 1);
 }
 
 /// A send whose file is a voice message this client recorded: uploaded as any file, sent as a
@@ -2104,6 +2524,7 @@ fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
     let sent = send("8201", "", protocol::Outgoing { files: vec![one], voice: Some(voice), ..Default::default() });
     assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
     assert_eq!(world.called("SaveFilePart 0 2048"), 1, "{:?}", world.calls());
+    assert!(world.called("SetTyping u7002 upload-audio") >= 1, "{:?}", world.calls());
     assert_eq!(world.called("SendMedia u7002 voice-note:7"), 1, "the audio attribute, and no file name: {:?}", world.calls());
     let attachment = sent.attachments.first().unwrap();
     assert_eq!((attachment.name.as_str(), attachment.mime.as_str()), ("Voice message", "audio/ogg"));
@@ -2345,7 +2766,7 @@ fn markers_are_sent_as_entities_and_an_edit_keeps_the_bold() {
         world.calls()
     );
     assert_eq!(
-        world.ask(Request::Edit { conversation: key("u7002"), message_id: sent.id.clone(), text: "hi there".into() }),
+        world.ask(Request::Edit { conversation: key("u7002"), message_id: sent.id.clone(), text: "hi there".into(), spans: Vec::new() }),
         Response::Ok
     );
     let edited = world.until("the edit to keep the bold", || world.message("u7002", &sent.id).filter(|message| message.edited));
@@ -2494,4 +2915,233 @@ fn a_second_sign_in_keeps_the_telegram_account_already_there() {
         panic!("the second account has no chat");
     };
     assert_eq!(conversation.key, lea_key("u7002"));
+}
+
+#[test]
+fn block_sends_contacts_block_and_the_person_reads_blocked() {
+    let world = World::signed_in();
+    world.connected();
+    assert_eq!(world.called("GetContacts"), 1, "{:#?}", world.calls());
+    assert_eq!(world.called("contacts.getBlocked"), 1, "{:#?}", world.calls());
+
+    let listed = |relation: Relation| match world.ask(Request::People {
+        network: Some(Network::Telegram),
+        relation: Some(relation),
+        query: None,
+        offset: 0,
+        limit: 50,
+    }) {
+        Response::People { people, .. } => people,
+        other => panic!("{other:?}"),
+    };
+    assert!(listed(Relation::Blocked).is_empty());
+    assert!(listed(Relation::Contact).iter().any(|person| person.key.id == "u7002"));
+
+    assert_eq!(world.ask(Request::Relate { person: key("u7002"), action: RelateAction::Block }), Response::Ok);
+    assert_eq!(world.called("contacts.block u7002"), 1, "{:#?}", world.calls());
+    world.until("odalys blocked", || {
+        listed(Relation::Blocked)
+            .iter()
+            .any(|person| person.key.id == "u7002" && person.relation == Relation::Blocked)
+            .then_some(())
+    });
+    assert!(listed(Relation::Contact).iter().all(|person| person.key.id != "u7002"));
+
+    world.ask(Request::People {
+        network: Some(Network::Telegram),
+        relation: None,
+        query: Some("wren".into()),
+        offset: 0,
+        limit: 20,
+    });
+    world.until("the search to reach Telegram", || {
+        world.calls().contains(&"contacts.Search wren".to_owned()).then_some(())
+    });
+    assert_eq!(world.ask(Request::Relate { person: key("u7010"), action: RelateAction::Add }), Response::Ok);
+    assert!(
+        world.calls().iter().any(|call| call.starts_with("contacts.addContact u7010 ")),
+        "{:#?}",
+        world.calls()
+    );
+    assert!(listed(Relation::Contact).iter().any(|person| person.key.id == "u7010" && person.relation == Relation::Contact));
+
+    assert_eq!(world.ask(Request::Relate { person: key("u7010"), action: RelateAction::Remove }), Response::Ok);
+    assert_eq!(world.called("contacts.deleteContacts u7010"), 1, "{:#?}", world.calls());
+    assert!(listed(Relation::Contact).iter().all(|person| person.key.id != "u7010"));
+
+    assert_eq!(world.ask(Request::Relate { person: key("u7002"), action: RelateAction::Block }), Response::Ok);
+    assert_eq!(world.called("contacts.unblock u7002"), 1, "{:#?}", world.calls());
+    assert!(listed(Relation::Blocked).iter().all(|person| person.key.id != "u7002"));
+    assert!(listed(Relation::Contact).iter().any(|person| person.key.id == "u7002"));
+
+    world.steer("peer-blocked 7002");
+    world.until("the block update", || {
+        listed(Relation::Blocked).iter().any(|person| person.key.id == "u7002").then_some(())
+    });
+    assert_eq!(world.called("contacts.block u7002"), 1, "an update is not another block request");
+}
+
+#[test]
+fn a_private_delete_after_reconnect_removes_the_message() {
+    let mut world = World::signed_in();
+    world.connected();
+    world.steer("incoming");
+    let arrived = world.until("the incoming message", || world.message("u7002", "13"));
+    assert!(arrived.text.contains("dock"));
+    world.restart();
+    world.connected();
+    assert!(world.message("u7002", "13").is_some(), "the message stays until Telegram says it was deleted");
+    world.steer("delete");
+    world.within(Duration::from_secs(5), "the delete after a reconnect", || world.message("u7002", "13").is_none().then_some(()));
+}
+
+#[test]
+fn mentioning_someone_with_no_username_names_them_on_the_send() {
+    let world = World::signed_in();
+    world.connected();
+    world.send("u7002", "5341", "see @Tobin Reyes", None);
+    let sent = world.until("the name mention to be sent", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "see Tobin" && message.state == SendState::Sent)
+    });
+    assert!(
+        ranges(&sent).iter().any(|(text, style)| *text == "Tobin" && matches!(style, Style::Mention { kind: MentionKind::User, id } if id == "u7003")),
+        "{:?}",
+        ranges(&sent)
+    );
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7002 see Tobin") && call.contains("mention:4+5:7003")),
+        "{:#?}",
+        world.calls()
+    );
+
+    world.send("u7002", "5342", "see @Tobin Reyes and @Odalys Brandt", None);
+    let both = world.until("the username to stay a handle", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "see Tobin and @odalys" && message.state == SendState::Sent)
+    });
+    assert_eq!(both.text, "see Tobin and @odalys");
+    let shown = ranges(&both);
+    let mentions = shown.iter().filter(|(_, style)| matches!(style, Style::Mention { .. })).count();
+    assert_eq!(mentions, 1, "{shown:?}");
+    assert!(
+        world.calls().iter().any(|call| {
+            call.contains("SendMessage u7002 see Tobin and @odalys") && call.contains("mention:4+5:7003") && call.matches("mention:").count() == 1
+        }),
+        "{:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn a_secret_chat_is_a_row_that_says_it_stays_in_the_phone_apps() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("secret");
+    let row = world.until("the secret chat", || world.conversation("e42"));
+    assert_eq!(row.title, "Odalys Brandt");
+    assert!(row.read_only);
+    assert_eq!(row.encryption, protocol::Encryption::Unknown);
+    assert!(row.preview.contains("Odalys Brandt") && row.preview.contains("phone apps"), "{}", row.preview);
+    assert!(row.topic.contains("phone apps"), "{}", row.topic);
+    assert!(row.kind == ConversationKind::Direct);
+    let listed = world.home(None, Shelf::Main).into_iter().any(|row| row.key.id == "e42");
+    assert!(listed, "the secret chat is a row on the list");
+    let notice = world.until("the notice", || {
+        world.messages("e42").into_iter().find(|message| message.kind == MessageKind::System)
+    });
+    assert!(notice.text.contains("phone apps"), "{}", notice.text);
+    assert!(!world.calls().iter().any(|call| call.contains("AcceptEncryption")), "{:?}", world.calls());
+    // The row is read-only, so the composer never reaches Telegram. The notice on the row is
+    // what says the chat stays in the phone apps.
+    let refused = world.ask(Request::Send {
+        conversation: key("e42"),
+        client_id: "5301".into(),
+        text: "hello".into(),
+        reply_to: None,
+        with: Default::default(),
+    });
+    let Response::Error { code: ErrorCode::Refused, detail } = refused else {
+        panic!("{refused:?}");
+    };
+    assert!(detail.contains("Odalys Brandt"), "{detail}");
+    assert!(
+        !world.calls().iter().any(|call| call.contains("AcceptEncryption") || call.contains("RequestEncryption") || call.contains("DiscardEncryption")),
+        "{:?}",
+        world.calls()
+    );
+    world.steer("secret-gone");
+    world.until("the row to leave", || world.conversation("e42").is_none().then_some(()));
+    assert!(!world.home(None, Shelf::Main).iter().any(|row| row.key.id == "e42"));
+}
+
+fn fetch_path(world: &World, id: &str) -> Option<String> {
+    match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+        Response::Media { mut files } => files.pop().and_then(|file| file.path),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_cdn_file_is_decrypted_and_its_checksum_matches() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("cdn-file");
+    let message = world.arrived("u7002", "30");
+    let plain = b"ridge file from the cdn";
+    let file = &message.attachments[0].file;
+    assert_eq!((file.id.as_str(), file.kind, file.bytes), ("d9300", MediaKind::File, plain.len() as u64));
+    let landed = world.until("the cdn file on disk", || fetch_path(&world, "d9300"));
+    let bytes = std::fs::read(&landed).unwrap();
+    assert_eq!(bytes, plain);
+    let calls = world.calls();
+    let at = |name: &str| calls.iter().position(|call| call == name).unwrap_or_else(|| panic!("{name} missing in {calls:#?}"));
+    let asked = at("GetFile document 9300 at 0");
+    let hashes = at("GetCdnFileHashes");
+    let again = at("CdnReuploadNeeded");
+    let reupload = at("ReuploadCdnFile");
+    assert!(asked < hashes && hashes < again && again < reupload, "{calls:#?}");
+    assert_eq!(calls.iter().filter(|call| *call == "GetCdnFile").count(), 2, "{calls:#?}");
+    assert_eq!(world.called("ExportAuthorization 5"), 0, "{calls:#?}");
+}
+
+#[test]
+fn a_dropped_large_file_resumes_from_the_part() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("big-file");
+    let message = world.arrived("u7002", "31");
+    assert_eq!(message.attachments[0].file.id, "d9400");
+    assert_eq!(message.attachments[0].file.bytes, (1024 * 1024 + 64) as u64);
+    let landed = world.until("the resumed file on disk", || fetch_path(&world, "d9400"));
+    let bytes = std::fs::read(&landed).unwrap();
+    let expected: Vec<u8> = (0..(1024 * 1024 + 64)).map(|at| (at % 251) as u8).collect();
+    assert_eq!(bytes, expected);
+    assert_eq!(world.called("GetFile document 9400 at 0"), 1, "{:#?}", world.calls());
+    assert!(world.called("GetFile document 9400 at 1048576") >= 1, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_link_card_fetches_its_picture_and_not_the_full_photo() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("link");
+    let message = world.arrived("u7002", "32");
+    let card = &message.previews[0];
+    assert_eq!((card.url.as_str(), card.title.as_str(), card.site.as_str()), ("https://example.org/ridge", "Ridge", "Example"));
+    let image = card.image.as_ref().expect("the card names its picture");
+    assert_eq!((image.id.as_str(), image.width, image.height), ("p8801m", 320, 240));
+    let landed = world.until("the card's picture on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["p8801m".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(std::fs::metadata(&landed).unwrap().len(), FILE_BYTES);
+    assert_eq!(world.called("GetFile photo 8801 m"), 2, "{:#?}", world.calls());
+    assert_eq!(world.called("GetFile photo 8801 y"), 0, "{:#?}", world.calls());
 }

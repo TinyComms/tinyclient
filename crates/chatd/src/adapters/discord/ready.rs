@@ -754,6 +754,7 @@ impl Discord {
             allow_archives: false,
             voice_notes: false,
             direct_calls: false,
+            revisions: false,
         });
         self.state.lock().unwrap().premium = premium;
     }
@@ -1230,7 +1231,9 @@ impl Discord {
                 self.ctx.set_note(&note, &listed);
             }
         }
-        Ok(self.ctx.conversation(&row)?)
+        self.ctx.conversation(&row)?;
+        self.note_thread_update(&thread)?;
+        Ok(())
     }
 
     /// The user changed a mute or suppress setting in Discord.

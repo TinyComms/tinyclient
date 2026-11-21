@@ -33,7 +33,9 @@ use Section::*;
 
 /// Every row, in the order the sections draw them.
 pub const ROWS: &[Row] = &[
+    row("G1", General, "", "Open at login", &[], &["login", "log in", "startup", "launch", "autostart", "sign in"]),
     row("G2", General, "", "Keep receiving when the window is closed", &[], &["background", "quit", "close", "run", "daemon"]),
+    row("G3", General, "", "Keep tinyclient in the tray when I close the window", &[], &["tray", "notification area", "systray", "system tray", "icon", "hide", "background", "close"]),
     row("G4", General, "", "Install updates automatically", &[], &["update", "upgrade", "version", "install", "automatic"]),
     row("N1", Notifications, "", "Show notifications", &[], &["notify", "notification", "alert", "banner", "toast", "popup"]),
     row("N2", Notifications, "", "Notify me about", &["Direct messages and mentions", "All messages"], &["dm", "mention", "every message", "channel"]),
@@ -67,6 +69,9 @@ pub const ROWS: &[Row] = &[
     row("M4", Messages, "", "Convert emoticons to emoji", &[], &["smiley", "emoji", "emoticon", ":)"]),
     row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
     row("M6", Messages, "", "Check spelling", &[], &["spell", "spelling", "spellcheck", "dictionary", "underline"]),
+    row("LK", Privacy, "Lock", "Lock tinyclient", &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], &["touch id", "windows hello", "fingerprint", "face", "passcode", "pin", "biometric", "lock"]),
+    row("LS", Privacy, "Lock", "When the screen locks", &[], &["screen lock", "away"]),
+    row("LP", Privacy, "Lock", "Passphrase", &[], &["passphrase", "password", "linux"]),
     row("P1", Privacy, "Let others see when I am typing", "Let others see when I am typing", &[], &["typing", "indicator", "privacy"]),
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
@@ -114,20 +119,28 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("proxy", "tinyclient has no proxy setting yet."),
     ("socks", "tinyclient has no proxy setting yet."),
     ("reaction", "tinyclient does not notify about reactions yet."),
-    ("login", "tinyclient has no open-at-login setting yet."),
-    ("startup", "tinyclient has no open-at-login setting yet."),
-    ("launch", "tinyclient has no open-at-login setting yet."),
-    ("autostart", "tinyclient has no open-at-login setting yet."),
     ("theme", "tinyclient is dark only for now."),
     ("light", "tinyclient is dark only for now."),
     ("dark mode", "tinyclient is dark only for now."),
-    ("touch id", "tinyclient has no lock yet."),
-    ("menu bar", crate::host::NO_TRAY_ICON),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
     ("sync", crate::host::SETTINGS_STAY),
 ];
+
+/// The tray words, honest where the icon does not exist. Windows has one (G3), so there the
+/// words find its row instead; macOS and Linux say so until theirs land. macOS's menu bar
+/// and the tray are the same product area, named as each system names it.
+const NOT_YET_TRAY: &[(&str, &str)] = if cfg!(windows) {
+    &[]
+} else {
+    &[
+        ("tray", crate::host::NO_TRAY_ICON),
+        ("system tray", crate::host::NO_TRAY_ICON),
+        ("notification area", crate::host::NO_TRAY_ICON),
+        ("menu bar", crate::host::NO_TRAY_ICON),
+    ]
+};
 
 /// Lower case with the accents taken off, so "Résumé" finds "resume".
 fn fold(text: &str) -> String {
@@ -178,23 +191,30 @@ pub fn search(query: &str) -> Vec<&'static Row> {
 }
 
 /// Rows this system cannot honour, so they are neither drawn nor found here: macOS plays
-/// sounds at its own alert volume and hides previews on a locked screen itself; Linux has no
-/// badge or flash here.
+/// sounds at its own alert volume and hides previews on a locked screen itself; a phone keeps no
+/// sign-in list for Open at login to join.
 pub fn absent(id: &str) -> bool {
     match id {
+        "G1" => !crate::gui::autostart::supported(),
         "G2" => !cfg!(target_os = "macos"),
+        // The tray icon (and with it, close-to-tray) exists on Windows so far.
+        "G3" => !cfg!(windows),
         "SV" | "NL" => cfg!(target_os = "macos"),
-        "N10" | "N11" => !cfg!(any(windows, target_os = "macos")),
+        "N10" | "N11" => cfg!(any(target_os = "android", target_os = "ios")),
         // Nothing to forget until a link's "Don't ask again" has been used.
         "PF" => crate::gui::app::prefs::trusted_links().is_empty(),
+        // The passphrase is the Linux fallback. Other systems use the device prompt.
+        "LP" => !cfg!(target_os = "linux"),
         _ => false,
     }
 }
 
 /// The honest line for a search that found nothing, when it names something tinyclient lacks.
+/// The tray words do not reach this on Windows, where the icon exists (G3) and the words find
+/// its row; macOS and Linux say so until theirs land.
 pub fn not_yet(query: &str) -> Option<&'static str> {
     let query = fold(query.trim());
-    NOT_YET.iter().find(|(term, _)| query.contains(term) || (query.len() >= 3 && term.starts_with(&query))).map(|(_, words)| *words)
+    NOT_YET.iter().chain(NOT_YET_TRAY.iter()).find(|(term, _)| query.contains(term) || (query.len() >= 3 && term.starts_with(&query))).map(|(_, words)| *words)
 }
 
 /// A search result's breadcrumb: its section, and its group when it has one. P1 and P2 are a
@@ -352,7 +372,7 @@ mod tests {
         assert!(search("proxy").is_empty());
         assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
         // The words people reach for, not only the names in the product doc.
-        for words in ["launch", "start at login", "autostart", "reactions"] {
+        for words in ["reactions"] {
             assert!(search(words).is_empty(), "{words} finds a row");
             assert!(not_yet(words).is_some(), "{words} gets no line");
         }
@@ -363,6 +383,20 @@ mod tests {
         assert_eq!(not_yet("sound file"), None);
         assert!(search("custom sound").iter().any(|row| row.id == "S13"));
         assert_eq!(not_yet("zzz"), None);
+    }
+
+    #[test]
+    fn open_at_login_is_a_row_where_signing_in_can_start_the_app() {
+        let desktop = crate::gui::autostart::supported();
+        assert_eq!(search("open at login").iter().any(|row| row.id == "G1"), desktop);
+        // The words people reach for, not only the row's own label.
+        for words in ["login", "startup", "launch", "autostart", "sign in"] {
+            assert_eq!(search(words).iter().any(|row| row.id == "G1"), desktop, "{words}");
+        }
+        assert_eq!(not_yet("login"), None);
+        assert_eq!(not_yet("startup"), None);
+        assert_eq!(not_yet("launch"), None);
+        assert_eq!(not_yet("autostart"), None);
     }
 
     #[test]
@@ -378,6 +412,11 @@ mod tests {
             assert_eq!(not_yet(words), None, "{words} is built");
         }
         assert_eq!(ids("badge").contains(&"N11"), !absent("N11"));
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            assert!(!absent("N10"), "N10 (attention) should be present on desktop");
+            assert!(!absent("N11"), "N11 (unread badge) should be present on desktop");
+        }
     }
 
     #[test]
@@ -411,6 +450,15 @@ mod tests {
     #[test]
     fn keep_receiving_is_listed_only_where_closing_the_window_can_hide_the_app() {
         assert_eq!(search("keep receiving").iter().any(|row| row.id == "G2"), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn the_tray_words_reach_the_row_only_where_the_tray_exists() {
+        assert_eq!(search("tray").iter().any(|row| row.id == "G3"), cfg!(windows));
+        assert_eq!(search("notification area").iter().any(|row| row.id == "G3"), cfg!(windows));
+        for words in ["tray", "system tray", "notification area", "menu bar"] {
+            assert_eq!(not_yet(words).is_some(), !cfg!(windows), "{words}");
+        }
     }
 
     #[test]

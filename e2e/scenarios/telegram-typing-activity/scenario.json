@@ -1,0 +1,12 @@
+{
+  "id": "telegram-typing-activity",
+  "title": "Telegram: \"recording voice\", \"sending a photo\" and the rest all read as typing",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same activity is what a recording or an upload maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same activity is what a recording or an upload maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

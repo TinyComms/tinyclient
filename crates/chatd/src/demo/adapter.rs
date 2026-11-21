@@ -215,12 +215,14 @@ impl Demo {
                 file: Some(file),
                 count: 1,
                 mine: true,
+                who: Vec::new(),
             },
             None => Reaction {
                 emoji: emoji.to_owned(),
                 file: None,
                 count: 1,
                 mine: true,
+                who: Vec::new(),
             },
         }
     }
@@ -627,7 +629,7 @@ impl Demo {
                 let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji), on);
                 let _ = reply.send(reacted.map_err(|err| Refusal::Refused(err.to_string())));
             }
-            Command::Edit { conversation_id, message_id, text, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
             Command::Delete { conversation_id, message_id, reply } => {
@@ -656,6 +658,12 @@ impl Demo {
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let muted = demo.ctx.muted(&conversation_id, notify == Notify::Nothing);
                 let _ = reply.send(muted.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            // The demo has no Slack to tell. The flag is still Slack's for a Slack row: it is
+            // stored here, which is all the demo's network is.
+            Command::Star { conversation_id, starred, reply } => {
+                let set = demo.ctx.starred(&conversation_id, starred);
+                let _ = reply.send(set.map_err(|err| Refusal::Refused(err.to_string())));
             }
             Command::Leave { conversation_id, reply } => {
                 let left = demo.ctx.conversation_gone(&conversation_id);
@@ -727,7 +735,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::MarkUnread { .. }
             | Command::AckBulk { .. }
-            | Command::Typing(_)
+            | Command::Typing { .. }
             | Command::FollowLink { .. }
             | Command::Draft { .. }
             | Command::Watch(_)

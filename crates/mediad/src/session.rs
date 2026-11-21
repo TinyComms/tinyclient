@@ -13,7 +13,7 @@ use crate::discord_video::{self, Remote};
 use crate::gateway::{self, closed, Closed, Incoming, Socket};
 use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
-use crate::picture::{CAMERA_HIGH, CAMERA_HIGH_BPS, SHARE_BPS, SHARE_MAX};
+use crate::picture::{CAMERA_HIGH, CAMERA_HIGH_BPS};
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
 use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin, VoiceQuality};
@@ -428,6 +428,8 @@ struct Call {
     videos: Arc<Mutex<HashMap<u32, Remote>>>,
     /// Set after opcode 12 goes out. The media thread sends picture packets only while it is set.
     announced: Arc<AtomicBool>,
+    /// The share quality the last opcode 12 named. A later pick sends opcode 12 again.
+    told: Option<crate::picture::Quality>,
     /// The devices, kept open between one voice server and the next.
     audio: Option<Audio>,
     reports: Reports<FromMedia>,
@@ -776,6 +778,9 @@ impl Call {
                     return end;
                 }
             }
+            if let Err(end) = self.tell_share_again(socket) {
+                return end;
+            }
             let now = Instant::now();
             if let Some(interval) = self.heartbeat {
                 if now >= self.next_beat {
@@ -941,6 +946,7 @@ impl Call {
         }
         if !on {
             self.announced.store(false, Ordering::Relaxed);
+            self.told = None;
             if self.assigned.is_some() {
                 socket.send(gateway::VIDEO, self.video_body(false)).map_err(dropped)?;
             }
@@ -958,34 +964,88 @@ impl Call {
         }
         socket.send(gateway::VIDEO, self.video_body(true)).map_err(dropped)?;
         self.announced.store(true, Ordering::Relaxed);
+        self.told = Some(crate::picture::share_quality());
+        Ok(())
+    }
+
+    /// A share already announced, whose quality has since changed, is named again. The capture
+    /// thread does not report a quality change: the flag it watches only says on or off.
+    fn tell_share_again(&mut self, socket: &mut Socket) -> Result<(), End> {
+        if !self.join.stream || self.join.watch || !self.announced.load(Ordering::Relaxed) || self.assigned.is_none() {
+            return Ok(());
+        }
+        let quality = crate::picture::share_quality();
+        if self.told == Some(quality) {
+            return Ok(());
+        }
+        socket.send(gateway::VIDEO, video_announcement(true, self.ssrc, self.assigned, true, quality)).map_err(dropped)?;
+        self.told = Some(quality);
         Ok(())
     }
 
     /// Opcode 12's body. Off, or never assigned, is a video SSRC of 0 and no streams. The
     /// negotiated type is `video` on both legs; identify is what said `screen`.
     fn video_body(&self, active: bool) -> Value {
-        let Some((ssrc, rtx)) = self.assigned.filter(|_| active) else {
-            return json!({ "audio_ssrc": self.ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] });
-        };
         let screen = self.join.stream && !self.join.watch;
-        let ((width, height), bitrate) = if screen { (SHARE_MAX, SHARE_BPS) } else { (CAMERA_HIGH, CAMERA_HIGH_BPS) };
-        json!({
-            "audio_ssrc": self.ssrc,
-            "video_ssrc": ssrc,
-            "rtx_ssrc": rtx,
-            "streams": [{
-                "type": "video",
-                "rid": "100",
-                "ssrc": ssrc,
-                "rtx_ssrc": rtx,
-                "active": true,
-                "quality": 100,
-                "max_bitrate": bitrate,
-                "max_framerate": 15,
-                "max_resolution": { "type": "fixed", "width": width, "height": height },
-            }],
-        })
+        video_announcement(active, self.ssrc, self.assigned, screen, crate::picture::share_quality())
     }
+}
+
+/// Opcode 12 for one leg. A screen names the share that was picked. A camera stays one layer.
+/// Off, or never assigned, is a video SSRC of 0 and no streams.
+fn video_announcement(active: bool, audio_ssrc: u32, assigned: Option<(u32, u32)>, screen: bool, quality: crate::picture::Quality) -> Value {
+    let Some((ssrc, rtx)) = assigned.filter(|_| active) else {
+        return json!({ "audio_ssrc": audio_ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] });
+    };
+    let (width, height, fps, bitrate) = if screen {
+        (quality.max.0, quality.max.1, quality.fps, quality.bps)
+    } else {
+        (CAMERA_HIGH.0, CAMERA_HIGH.1, 15, CAMERA_HIGH_BPS)
+    };
+    json!({
+        "audio_ssrc": audio_ssrc,
+        "video_ssrc": ssrc,
+        "rtx_ssrc": rtx,
+        "streams": [{
+            "type": "video",
+            "rid": "100",
+            "ssrc": ssrc,
+            "rtx_ssrc": rtx,
+            "active": true,
+            "quality": 100,
+            "max_bitrate": bitrate,
+            "max_framerate": fps,
+            "max_resolution": { "type": "fixed", "width": width, "height": height },
+        }],
+    })
+}
+
+/// The lab's discord-share-quality driver. Opcode 12 names the share that was picked, and a
+/// camera stays one layer. A build from before the fix ignores the variable and stays up.
+pub fn prove_discord_share_quality() -> Result<(), String> {
+    let size = |quality: protocol::ShareQuality| {
+        let body = video_announcement(true, 1, Some((7, 8)), true, crate::picture::Quality::of(quality));
+        (
+            body["streams"][0]["max_resolution"]["width"].as_u64().unwrap_or(0),
+            body["streams"][0]["max_resolution"]["height"].as_u64().unwrap_or(0),
+            body["streams"][0]["max_framerate"].as_u64().unwrap_or(0),
+            body["streams"][0]["max_bitrate"].as_u64().unwrap_or(0),
+        )
+    };
+    if size(protocol::ShareQuality::Low) != (1280, 720, 15, 1_500_000) {
+        return Err("low is 720p at 15".into());
+    }
+    if size(protocol::ShareQuality::Balanced) != (1920, 1080, 30, 4_000_000) {
+        return Err("balanced is 1080p at 30".into());
+    }
+    if size(protocol::ShareQuality::Best) != (2560, 1440, 60, 8_000_000) {
+        return Err("best is 1440p at 60".into());
+    }
+    let camera = video_announcement(true, 1, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best));
+    if camera["streams"][0]["max_resolution"]["width"] != 640 || camera["streams"][0]["max_framerate"] != 15 {
+        return Err("a camera stays 640 by 360 at 15".into());
+    }
+    Ok(())
 }
 
 /// What we can send and receive. One H.264 layer. A watch leg does not encode.
@@ -1088,6 +1148,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
         assigned: None,
         videos: Arc::default(),
         announced: Arc::new(AtomicBool::new(false)),
+        told: None,
         audio: None,
         reports,
         from_media,
@@ -1241,6 +1302,27 @@ mod tests {
             watch,
             group_id: String::new(),
         }
+    }
+
+    #[test]
+    fn a_share_is_announced_at_the_quality_that_was_picked() {
+        let announced = |quality: protocol::ShareQuality| video_announcement(true, 1111, Some((7, 8)), true, crate::picture::Quality::of(quality));
+        let size = |body: &Value| {
+            (
+                body["streams"][0]["max_resolution"]["width"].as_u64().unwrap(),
+                body["streams"][0]["max_resolution"]["height"].as_u64().unwrap(),
+                body["streams"][0]["max_framerate"].as_u64().unwrap(),
+                body["streams"][0]["max_bitrate"].as_u64().unwrap(),
+            )
+        };
+        assert_eq!(size(&announced(protocol::ShareQuality::Low)), (1280, 720, 15, 1_500_000));
+        assert_eq!(size(&announced(protocol::ShareQuality::Balanced)), (1920, 1080, 30, 4_000_000));
+        assert_eq!(size(&announced(protocol::ShareQuality::Best)), (2560, 1440, 60, 8_000_000));
+        let camera = video_announcement(true, 1111, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best));
+        assert_eq!(size(&camera), (640, 360, 15, 500_000), "a camera stays one layer");
+        let off = video_announcement(false, 1111, Some((7, 8)), true, crate::picture::Quality::of(protocol::ShareQuality::Best));
+        assert_eq!(off["video_ssrc"], 0);
+        assert!(off["streams"].as_array().unwrap().is_empty());
     }
 
     #[test]

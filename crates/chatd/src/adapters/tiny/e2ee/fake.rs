@@ -9,8 +9,8 @@ use super::*;
 use e2ee::identity::DeviceKey;
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
-    ExternalProposal, GroupEpoch, GroupId, KeyPackageIn, MlsMessageOut, ProtocolVersion,
-    SenderExtensionIndex,
+    ExternalProposal, GroupEpoch, GroupId, KeyPackageIn, MlsMessageIn, MlsMessageOut,
+    ProtocolMessage, ProtocolVersion, SenderExtensionIndex,
 };
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider as _;
@@ -18,6 +18,7 @@ use openmls_traits::OpenMlsProvider as _;
 const CONVERSATION: &str = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
 const ADA: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const BEA: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CYD: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 struct Add {
     user: String,
@@ -48,6 +49,12 @@ struct Server {
     pending: Vec<Add>,
     feed: Vec<Handshake>,
     messages: Vec<Value>,
+    /// Every request line, as "METHOD path", for tests that assert what was not asked.
+    seen: Vec<String>,
+    /// Sealed reaction blobs, in `seq` order.
+    blobs: Vec<Value>,
+    /// Reaction list rows a misbehaving server adds: no id, no ciphertext, position only.
+    junk: Vec<Value>,
 }
 
 struct Fake {
@@ -69,6 +76,9 @@ impl Fake {
             pending: Vec::new(),
             feed: Vec::new(),
             messages: Vec::new(),
+            seen: Vec::new(),
+            blobs: Vec::new(),
+            junk: Vec::new(),
         }));
         let serving = server.clone();
         let base = crate::adapters::tiny::serve(move |request| {
@@ -125,6 +135,7 @@ impl Server {
             .unwrap_or_default();
         let body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         let conversation = format!("/v1/e2ee/conversations/{CONVERSATION}");
+        self.seen.push(format!("{method} {path}"));
         match method {
             "GET" if matches!(path, "/v1/channels" | "/v1/rooms") => (200, json!([])),
             "GET" if path == "/v1/directs" => (200, json!([{
@@ -205,6 +216,27 @@ impl Server {
             "POST" if path == format!("/v1/conversations/{CONVERSATION}/messages") => {
                 self.post(&caller, &body)
             }
+            // What the real server says to a plaintext reaction on an encrypted message.
+            "PUT" | "DELETE" if path.starts_with("/v1/messages/") && path.ends_with("/reactions") => {
+                (400, json!({ "error": "e2ee_required" }))
+            }
+            "POST" if path == format!("{conversation}/reactions") => self.reaction(&caller, &body),
+            "GET" if path == format!("{conversation}/reactions") => {
+                let after: i64 = param("after").parse().unwrap_or(0);
+                let mut rows: Vec<Value> = self
+                    .blobs
+                    .iter()
+                    .filter(|row| row["seq"].as_i64().unwrap_or(0) > after)
+                    .cloned()
+                    .collect();
+                rows.extend(
+                    self.junk
+                        .iter()
+                        .filter(|row| row["seq"].as_i64().unwrap_or(0) > after)
+                        .cloned(),
+                );
+                (200, Value::Array(rows))
+            }
             _ => (404, json!({ "error": "not_found" })),
         }
     }
@@ -220,13 +252,13 @@ impl Server {
         });
     }
 
-    /// Every device of the two people that is neither in the group nor waiting gets an Add, with
+    /// Every device of the three people that is neither in the group nor waiting gets an Add, with
     /// one of its key packages.
     fn reconcile(&mut self) {
         if self.epoch.is_none() {
             return;
         }
-        for user in [ADA, BEA] {
+        for user in [ADA, BEA, CYD] {
             for row in self.devices.get(user).cloned().unwrap_or_default() {
                 let device = row["device_id"].as_str().unwrap().to_owned();
                 if self.leaves.iter().any(|(_, leaf)| *leaf == device)
@@ -348,6 +380,79 @@ impl Server {
         self.messages.push(json!({ "id": id, "author_id": caller, "ciphertext": body["ciphertext"], "epoch": body["epoch"], "device_id": device, "client_id": body["client_id"] }));
         (201, json!({ "id": id }))
     }
+
+    /// What the real server's `POST /v1/e2ee/conversations/{id}/reactions` holds: the same
+    /// epoch, membership and client id checks, and the ciphertext must carry the reaction's
+    /// authenticated data (`docs/e2ee-text.md`, section 8). The blob is otherwise opaque.
+    fn reaction(&mut self, caller: &str, body: &Value) -> (u16, Value) {
+        let device = body["device_id"].as_str().unwrap_or("").to_owned();
+        let client = body["client_id"].as_str().unwrap_or("");
+        if client.is_empty() || client.len() > 64 || client.chars().any(|c| c.is_control()) {
+            return (400, json!({ "error": "invalid" }));
+        }
+        if body["epoch"].as_u64() != self.epoch {
+            return (409, json!({ "error": "stale_epoch" }));
+        }
+        if !self.leaves.iter().any(|(_, leaf)| *leaf == device) {
+            return (403, json!({ "error": "not_in_group" }));
+        }
+        let Some(data) = unb64(body["ciphertext"].as_str().unwrap_or("")) else {
+            return (400, json!({ "error": "bad_e2ee" }));
+        };
+        let Ok(message) = MlsMessageIn::tls_deserialize_exact_bytes(&data) else {
+            return (400, json!({ "error": "bad_e2ee" }));
+        };
+        let Ok(protocol) = message.try_into_protocol_message() else {
+            return (400, json!({ "error": "bad_e2ee" }));
+        };
+        let epoch = body["epoch"].as_u64().unwrap_or(0);
+        let private = match &protocol {
+            ProtocolMessage::PrivateMessage(private) => private,
+            _ => return (400, json!({ "error": "bad_e2ee" })),
+        };
+        if protocol.group_id().as_slice() != uuid(CONVERSATION).unwrap()
+            || protocol.epoch().as_u64() != epoch
+            || private.aad() != reaction_aad(CONVERSATION).as_slice()
+        {
+            return (400, json!({ "error": "bad_e2ee" }));
+        }
+        if let Some(kept) = self.blobs.iter().find(|row| {
+            row["device_id"] == body["device_id"] && row["client_id"] == body["client_id"]
+        }) {
+            return (
+                200,
+                json!({
+                    "id": kept["id"], "ciphertext": kept["ciphertext"], "epoch": kept["epoch"],
+                    "created_at": "2026-11-05T00:00:00Z", "seq": kept["seq"], "created": false
+                }),
+            );
+        }
+        let id = format!("00000000-0000-4000-8000-{:012}", 1000 + self.blobs.len() + 1);
+        let seq = self.blobs.len() as i64 + 1;
+        self.blobs.push(json!({
+            "id": id, "author_id": caller, "device_id": device, "client_id": body["client_id"],
+            "ciphertext": body["ciphertext"], "epoch": epoch, "seq": seq
+        }));
+        (
+            201,
+            json!({
+                "id": id, "ciphertext": body["ciphertext"], "epoch": epoch,
+                "created_at": "2026-11-05T00:00:00Z", "seq": seq, "created": true
+            }),
+        )
+    }
+}
+
+/// The authenticated data the real server demands of a reaction ciphertext: the message label,
+/// the `reaction` kind, no target, then the conversation (`crates/api/src/e2ee_text/mls.rs`).
+fn reaction_aad(conversation: &str) -> Vec<u8> {
+    let mut aad = b"tiny-e2ee-v1 msg".to_vec();
+    aad.push(0);
+    aad.extend_from_slice(b"reaction");
+    aad.push(0);
+    aad.push(0);
+    aad.extend_from_slice(conversation.as_bytes());
+    aad
 }
 
 /// A device of `user` against the fake, in a directory of its own, with keys of its own.
@@ -522,3 +627,587 @@ fn a_message_that_did_not_open_for_want_of_the_group_is_read_again_when_it_arriv
     assert!(matches!(inbox.try_recv(), Ok(crate::adapters::Command::Backfill(id)) if id == CONVERSATION),
         "later handshakes also refresh rows for linked-device catch-up");
 }
+
+/// Lab prove: a reaction in an encrypted conversation goes out sealed and lands on the message
+/// when its echo comes back. The lab sets `TINYCLIENT_PROVE=tiny-e2ee-reaction`.
+pub(crate) fn prove_encrypted_reaction() -> Result<(), String> {
+    encrypted_reaction_round_trip().map_err(|err| format!("sealed reaction: {err}"))
+}
+
+fn encrypted_reaction_round_trip() -> Result<(), String> {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "react-ada");
+    let mut bea = device(&fake, BEA, "react-bea");
+    ada.sync(CONVERSATION).map_err(|err| format!("Ada joins: {err}"))?;
+    bea.sync(CONVERSATION).map_err(|err| format!("Bea joins: {err}"))?;
+    ada.sync(CONVERSATION).map_err(|err| format!("Ada settles the join: {err}"))?;
+
+    // The adapter path, against the device this session started.
+    let saved_ada = ada.saved.clone();
+    let ada: Shared = Arc::new(Mutex::new(ada));
+    let registry_key = |saved: &Saved| (saved.base_url.clone(), saved.user_id.clone());
+    struct Registered(Vec<(String, String)>);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            let mut registry = lock(devices());
+            for key in &self.0 {
+                registry.remove(key);
+            }
+        }
+    }
+    let _registered = Registered(vec![registry_key(&saved_ada)]);
+    lock(devices()).insert(registry_key(&saved_ada), ada.clone());
+    let context = |saved: &Saved| {
+        let hub = Arc::new(crate::hub::Hub::new(crate::store::Store::open(Path::new(":memory:")).unwrap()));
+        crate::adapters::local(protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() }, hub)
+    };
+    let (_adapter, ctx, _inbox) = context(&saved_ada);
+    let live = super::super::live::Live::new().map_err(|err| err.to_string())?;
+    let serve = |ctx: &crate::adapters::Context, command: crate::adapters::Command| {
+        super::super::messages::serve(ctx, &saved_ada, &live, command)
+    };
+
+    // Ada says hello, through the adapter, so the message is in the store.
+    serve(
+        &ctx,
+        crate::adapters::Command::Send {
+            conversation_id: CONVERSATION.to_owned(),
+            client_id: "c-1".to_owned(),
+            text: "hello Bea".to_owned(),
+            reply_to: None,
+        },
+    );
+    let first = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows = lock(&fake.server).messages.clone();
+            if let Some(row) = rows.first() {
+                let id = row["id"].as_str().unwrap().to_owned();
+                if ctx.stored_message(CONVERSATION, &id).map_err(|err| err.to_string())?.is_some() {
+                    break id;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("the first message never landed".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Bea opens it, so what follows is about the reaction and not about the message.
+    let read = fake.read(&mut bea);
+    if text(&read, &first) != "hello Bea" {
+        return Err("Bea did not open the first message".into());
+    }
+
+    // Ada reacts. The sealed path must ask the server's encrypted reactions route, never the
+    // plaintext one it refuses.
+    let (reply, answer) = std::sync::mpsc::channel();
+    serve(
+        &ctx,
+        crate::adapters::Command::React {
+            conversation_id: CONVERSATION.to_owned(),
+            message_id: first.clone(),
+            emoji: "\u{1f44d}".to_owned(),
+            on: true,
+            reply,
+        },
+    );
+    let outcome = answer
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "the reaction was never answered".to_owned())?;
+    outcome.map_err(|refusal| format!("the reaction was refused: {refusal:?}"))?;
+    let blob = lock(&fake.server).blobs.first().cloned().ok_or("no reaction blob was stored")?;
+    if lock(&fake.server).seen.iter().any(|seen| {
+        seen.starts_with("PUT /v1/messages/") || seen.starts_with("DELETE /v1/messages/")
+    }) {
+        return Err("the plaintext reactions route was asked".into());
+    }
+
+    // The echo lands it on the message, for Ada and for Bea.
+    let frame = json!({
+        "conversation_id": CONVERSATION,
+        "id": blob["id"],
+        "ciphertext": blob["ciphertext"],
+        "epoch": blob["epoch"],
+        "created_at": "2026-11-05T00:00:00Z",
+    });
+    super::super::messages::on_live(&ctx, &saved_ada, &HashMap::new(), "e2ee.reaction", &frame);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = ctx.stored_message(CONVERSATION, &first)
+            .map_err(|err| err.to_string())?
+            .ok_or("the first message was lost")?;
+        let shown: Vec<(String, u32, bool)> = seen.reactions.iter().map(|have| (have.emoji.clone(), have.count, have.mine)).collect();
+        if shown == [("\u{1f44d}".to_owned(), 1, true)] {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("Ada's message shows {shown:?}, not the thumbs-up"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Bea folds the same reaction from the server's list alone, as she would after being away:
+    // the blob opens for her, and it is not hers.
+    let landed = bea.reaction_changes(CONVERSATION);
+    let bea_sees = landed.iter().find(|landed| landed.message == first && landed.emoji == "\u{1f44d}");
+    match bea_sees {
+        Some(landed) if landed.count == 1 && !landed.mine => {}
+        other => return Err(format!("Bea folds {other:?} from the list, not one thumbs-up of Ada's")),
+    }
+    // The event says nothing new once the list fold has it.
+    if !bea.heard_reaction(CONVERSATION).is_empty() {
+        return Err("the echo of a folded blob changed Bea's fold twice".into());
+    }
+
+    // Taking it back is another sealed blob, and the echo takes it off the message.
+    let (reply, answer) = std::sync::mpsc::channel();
+    serve(
+        &ctx,
+        crate::adapters::Command::React {
+            conversation_id: CONVERSATION.to_owned(),
+            message_id: first.clone(),
+            emoji: "\u{1f44d}".to_owned(),
+            on: false,
+            reply,
+        },
+    );
+    let outcome = answer
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "taking the reaction back was never answered".to_owned())?;
+    outcome.map_err(|refusal| format!("taking the reaction back was refused: {refusal:?}"))?;
+    let blob = lock(&fake.server).blobs.last().cloned().ok_or("no blob for taking the reaction back")?;
+    let frame = json!({
+        "conversation_id": CONVERSATION,
+        "id": blob["id"],
+        "ciphertext": blob["ciphertext"],
+        "epoch": blob["epoch"],
+        "created_at": "2026-11-05T00:00:00Z",
+    });
+    super::super::messages::on_live(&ctx, &saved_ada, &HashMap::new(), "e2ee.reaction", &frame);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown = ctx.stored_message(CONVERSATION, &first)
+            .map_err(|err| err.to_string())?
+            .ok_or("the first message was lost")?
+            .reactions
+            .iter()
+            .map(|have| (have.emoji.clone(), have.count))
+            .collect::<Vec<_>>();
+        if shown.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("taking the reaction back left {shown:?} on the message"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = bea.heard_reaction(CONVERSATION);
+    if bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_some_and(|landed| landed.count > 0) {
+        return Err("Bea still folds the thumbs-up after it was taken back".into());
+    }
+
+    // A restart folds again: the list in the server's order, own blobs from what was kept.
+    // Taking the reaction back before the restart must stay taken back.
+    lock(&ada).folds.clear();
+    let landed = lock(&ada).reaction_changes(CONVERSATION);
+    if landed.iter().any(|landed| landed.message == first && landed.count > 0) {
+        return Err(format!("a restart folded {landed:?} back onto the message"));
+    }
+    if lock(&ada).reaction_of(CONVERSATION, &first, "\u{1f44d}").is_some_and(|landed| landed.count > 0) {
+        return Err("a restart resurrected the taken-back reaction".into());
+    }
+    Ok(())
+}
+
+/// A reaction in an encrypted conversation is sealed, lands, and echoes back.
+#[test]
+fn a_reaction_in_an_encrypted_conversation_is_sealed_and_lands() {
+    prove_encrypted_reaction().expect("a sealed reaction lands and echoes back");
+}
+
+/// A device that restarts still sees the counts, from the fold that persisted in its sealed
+/// cache, without re-opening one old blob.
+#[test]
+fn a_restarted_device_still_sees_the_reaction_counts() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "restart-ada");
+    let mut bea = device(&fake, BEA, "restart-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    // Bea folds the empty list once: her cursor stands at the newest blob there is.
+    assert!(bea.reaction_changes(CONVERSATION).is_empty());
+    // Ada reacts; the echo says the list moved, and Bea folds the blob.
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+    let landed = bea.heard_reaction(CONVERSATION);
+    match landed.as_slice() {
+        [landed] if landed.count == 1 && !landed.mine => {}
+        other => panic!("Bea folds {other:?}, not one thumbs-up of Ada's"),
+    }
+    // The restart: the same session, her own directory, a fresh device over the state and the
+    // sealed cache she left behind.
+    let saved_bea = bea.saved.clone();
+    let dir_bea = bea.dir.clone();
+    drop(bea);
+    let mut bea = Device::new(&saved_bea);
+    bea.dir = dir_bea.clone();
+    bea.enrol();
+    assert_eq!(bea.state, DeviceState::Ready, "a restart is a ready device");
+    let asks_before = lock(&fake.server).seen.iter().filter(|seen| seen.starts_with("GET") && seen.contains("/reactions")).count();
+    // Nothing new on the list, and nothing folded again: the counts come from the fold that
+    // persisted, and the one catch-up ask continues from her cursor.
+    assert!(bea.reaction_changes(CONVERSATION).is_empty());
+    let seen = bea.reaction_of(CONVERSATION, &first, "\u{1f44d}");
+    match seen {
+        Some(landed) if landed.count == 1 && !landed.mine => {}
+        other => panic!("after the restart Bea folds {other:?}, not one thumbs-up of Ada's"),
+    }
+    let asks_after = lock(&fake.server).seen.iter().filter(|seen| seen.starts_with("GET") && seen.contains("/reactions")).count();
+    assert_eq!(asks_after, asks_before + 1, "the restart catches up with one ask");
+    // A new reaction after the restart folds from where the cursor stands. The old blob is
+    // never re-opened — its key is spent — so a lost cursor would stall behind it and the
+    // new one would not land.
+    ada.react(CONVERSATION, &first, "\u{2764}\u{fe0f}", true).unwrap();
+    let landed = bea.heard_reaction(CONVERSATION);
+    match landed.as_slice() {
+        [landed] if landed.message == first && landed.emoji == "\u{2764}\u{fe0f}" && landed.count == 1 && !landed.mine => {}
+        other => panic!("after the restart a new reaction folds {other:?}, not the heart"),
+    }
+    for (emoji, expected) in [("\u{1f44d}", 1u32), ("\u{2764}\u{fe0f}", 1)] {
+        match bea.reaction_of(CONVERSATION, &first, emoji) {
+            Some(landed) if landed.count == expected && !landed.mine => {}
+            other => panic!("Bea folds {emoji} as {other:?}, not {expected}"),
+        }
+    }
+}
+
+/// A conversation that is opened again, and its history fetched again, keeps the reaction
+/// chips the fold put on its messages: the wire rows of a sealed conversation never carry
+/// reactions, and the store does not let their absence take folded ones away.
+#[test]
+fn a_conversation_reopened_keeps_its_sealed_reaction_chips() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "reopen-ada");
+    let mut bea = device(&fake, BEA, "reopen-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+
+    let saved_ada = ada.saved.clone();
+    let ada: Shared = Arc::new(Mutex::new(ada));
+    let registry_key = |saved: &Saved| (saved.base_url.clone(), saved.user_id.clone());
+    struct Registered(Vec<(String, String)>);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            let mut registry = lock(devices());
+            for key in &self.0 {
+                registry.remove(key);
+            }
+        }
+    }
+    let _registered = Registered(vec![registry_key(&saved_ada)]);
+    lock(devices()).insert(registry_key(&saved_ada), ada.clone());
+    let context = |saved: &Saved| {
+        let hub = Arc::new(crate::hub::Hub::new(crate::store::Store::open(Path::new(":memory:")).unwrap()));
+        crate::adapters::local(protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() }, hub)
+    };
+    let (_adapter, ctx, _inbox) = context(&saved_ada);
+    let live = super::super::live::Live::new().map_err(|err| err.to_string()).unwrap();
+    let serve = |ctx: &crate::adapters::Context, command: crate::adapters::Command| {
+        super::super::messages::serve(ctx, &saved_ada, &live, command)
+    };
+
+    serve(
+        &ctx,
+        crate::adapters::Command::Send {
+            conversation_id: CONVERSATION.to_owned(),
+            client_id: "c-1".to_owned(),
+            text: "hello Bea".to_owned(),
+            reply_to: None,
+        },
+    );
+    let first = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows = lock(&fake.server).messages.clone();
+            if let Some(row) = rows.first() {
+                let id = row["id"].as_str().unwrap().to_owned();
+                if ctx.stored_message(CONVERSATION, &id).map_err(|err| err.to_string()).unwrap().is_some() {
+                    break id;
+                }
+            }
+            assert!(Instant::now() < deadline, "the first message never landed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let (reply, answer) = std::sync::mpsc::channel();
+    serve(
+        &ctx,
+        crate::adapters::Command::React {
+            conversation_id: CONVERSATION.to_owned(),
+            message_id: first.clone(),
+            emoji: "\u{1f44d}".to_owned(),
+            on: true,
+            reply,
+        },
+    );
+    assert!(answer.recv_timeout(Duration::from_secs(5)).unwrap().is_ok(), "the reaction was refused");
+    let blob = lock(&fake.server).blobs.first().cloned().unwrap();
+    let frame = json!({
+        "conversation_id": CONVERSATION, "id": blob["id"], "ciphertext": blob["ciphertext"],
+        "epoch": blob["epoch"], "created_at": "2026-11-05T00:00:00Z",
+    });
+    super::super::messages::on_live(&ctx, &saved_ada, &HashMap::new(), "e2ee.reaction", &frame);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown: Vec<(String, u32, bool)> = ctx.stored_message(CONVERSATION, &first).unwrap().unwrap()
+            .reactions.iter().map(|have| (have.emoji.clone(), have.count, have.mine)).collect();
+        if shown == [("\u{1f44d}".to_owned(), 1, true)] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the chip never landed: {shown:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The conversation is opened again, and its history fetched again, twice. The chips stay.
+    for _ in 0..2 {
+        serve(&ctx, crate::adapters::Command::Backfill(CONVERSATION.to_owned()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let history_done = lock(&fake.server).seen.iter().rev().any(|seen| seen.starts_with("GET /v1/conversations/"));
+            let shown: Vec<(String, u32, bool)> = ctx.stored_message(CONVERSATION, &first).unwrap().unwrap()
+                .reactions.iter().map(|have| (have.emoji.clone(), have.count, have.mine)).collect();
+            if history_done && shown == [("\u{1f44d}".to_owned(), 1, true)] {
+                break;
+            }
+            assert!(Instant::now() < deadline, "a refetch wiped or lost the chips: {shown:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// A reaction that arrives before this device has caught up with its commit is retried, not
+/// skipped: the cursor waits for it, and it lands once the epoch is here.
+#[test]
+fn a_reaction_that_cannot_open_yet_is_retried_when_its_epoch_arrives() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "retry-ada");
+    let mut bea = device(&fake, BEA, "retry-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    // A third person joins: the commit moves the group on, and only a device that has
+    // processed it can open what is sealed afterwards.
+    let mut cyd = device(&fake, CYD, "retry-cyd");
+    cyd.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+    // Bea folds without having caught up: the blob cannot open yet, so it is not folded, not
+    // marked seen, and the cursor does not pass it.
+    let before = lock(&fake.server).seen.iter().filter(|seen| seen.starts_with("GET") && seen.contains("/reactions")).count();
+    let landed = bea.reaction_changes(CONVERSATION);
+    assert!(landed.is_empty(), "Bea folded what she could not open yet: {landed:?}");
+    assert!(bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_none());
+    // Catching up brings the commit; the very same blob then folds.
+    bea.sync(CONVERSATION).unwrap();
+    let landed = bea.reaction_changes(CONVERSATION);
+    match landed.as_slice() {
+        [landed] if landed.message == first && landed.emoji == "\u{1f44d}" && landed.count == 1 && !landed.mine => {}
+        other => panic!("after catching up Bea folds {other:?}, not the thumbs-up"),
+    }
+    let asks = lock(&fake.server).seen.iter().filter(|seen| seen.starts_with("GET") && seen.contains("/reactions")).count();
+    assert_eq!(asks - before, 2, "the same blob was asked for again, from the waiting cursor");
+}
+
+/// A reaction that could not open three times is skipped for this process only: after a
+/// restart, with the keys it needs arrived, the fold steps back below it and lands it.
+#[test]
+fn a_blob_skipped_three_times_is_tried_again_after_a_restart() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "recheck-ada");
+    let mut bea = device(&fake, BEA, "recheck-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    // A third person joins: the commit moves the epoch, and a device behind it cannot
+    // open what is sealed after.
+    let mut cyd = device(&fake, CYD, "recheck-cyd");
+    cyd.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+    let blob_id = lock(&fake.server).blobs[0]["id"].as_str().unwrap().to_owned();
+    // Three folds cannot open the blob: the budget runs out, the fold moves past it, and
+    // the blob is remembered for a restart — not written off in what persists.
+    for _ in 0..3 {
+        assert!(bea.reaction_changes(CONVERSATION).is_empty());
+    }
+    assert!(bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_none());
+    let fold = bea.folds.get(CONVERSATION).unwrap();
+    assert_eq!(fold.state.at, 1, "the cursor passed the skipped blob");
+    assert!(fold.state.recheck.contains_key(&blob_id), "the blob waits for a restart");
+    assert!(!fold.state.seen.contains_key(&blob_id), "the skip is not persisted");
+    // The restart: a fresh device over Bea's own state and the sealed cache she left.
+    let saved_bea = bea.saved.clone();
+    let dir_bea = bea.dir.clone();
+    drop(bea);
+    let mut bea = Device::new(&saved_bea);
+    bea.dir = dir_bea.clone();
+    bea.enrol();
+    // Catching up brings the commit; the fold steps back below the blob and opens it.
+    bea.sync(CONVERSATION).unwrap();
+    let landed = bea.reaction_changes(CONVERSATION);
+    match landed.as_slice() {
+        [landed] if landed.message == first && landed.emoji == "\u{1f44d}" && landed.count == 1 && !landed.mine => {}
+        other => panic!("after the restart Bea folds {other:?}, not the thumbs-up"),
+    }
+    assert!(
+        !bea.folds.get(CONVERSATION).unwrap().state.recheck.contains_key(&blob_id),
+        "a landed blob is off the recheck list"
+    );
+}
+
+/// A page of reaction rows that says nothing this device can file moves the cursor past
+/// itself: the same window is never asked for again.
+#[test]
+fn a_page_of_rows_without_ids_moves_the_cursor_and_is_not_asked_for_twice() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "idless-ada");
+    let mut bea = device(&fake, BEA, "idless-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+    let landed = bea.heard_reaction(CONVERSATION);
+    match landed.as_slice() {
+        [landed] if landed.count == 1 => {}
+        other => panic!("Bea folds {other:?}, not one thumbs-up"),
+    }
+    // A misbehaving server: a full page of rows with no id and no ciphertext, behind the
+    // folded blob.
+    for seq in 2..=(REACTIONS_PAGE as i64 + 1) {
+        lock(&fake.server).junk.push(json!({ "seq": seq, "created_at": "2026-11-05T00:00:00Z" }));
+    }
+    let asks = |fake: &Fake| {
+        lock(&fake.server).seen.iter().filter(|seen| seen.starts_with("GET") && seen.contains("/reactions")).count()
+    };
+    // One pass walks the full page, one confirms the list moved, and the fold stops.
+    let _ = bea.heard_reaction(CONVERSATION);
+    let walked = asks(&fake);
+    assert!(walked <= 3, "a page of id-less rows was walked {walked} times in one fold");
+    assert_eq!(
+        bea.folds.get(CONVERSATION).unwrap().state.at,
+        REACTIONS_PAGE as i64 + 1,
+        "the cursor moved past the unreadable rows"
+    );
+    // The next fold does not ask for that window again.
+    let _ = bea.heard_reaction(CONVERSATION);
+    assert_eq!(asks(&fake) - walked, 1, "the id-less window was asked for again");
+}
+
+/// A fold kept dozens of times does not pile copies of itself into the sealed log: the log
+/// is rewritten with one fold line, and a restart still restores the chips from it.
+#[test]
+fn a_fold_kept_many_times_leaves_the_sealed_log_bounded() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "compact-ada");
+    let mut bea = device(&fake, BEA, "compact-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    let fold_lines = |bea: &Device| {
+        std::fs::read_to_string(bea.dir.join(format!("cache-{CONVERSATION}.log")))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("reactionfold "))
+            .count()
+    };
+    // Twice the compaction batch of folds: every reaction moves the cursor, every fold
+    // keeps it, and the log is rewritten somewhere along the way.
+    for _ in 0..(FOLD_LINES_PER_COMPACT * 2) {
+        ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+        let landed = bea.heard_reaction(CONVERSATION);
+        assert_eq!(landed.len(), 1, "every reaction is a change of its own");
+    }
+    let kept = fold_lines(&bea);
+    assert!(kept > 0, "the fold is in the sealed log");
+    assert!(
+        kept < FOLD_LINES_PER_COMPACT as usize,
+        "the log kept {kept} fold lines for {} folds",
+        FOLD_LINES_PER_COMPACT * 2
+    );
+    match bea.reaction_of(CONVERSATION, &first, "\u{1f44d}") {
+        Some(landed) if landed.count == 1 => {}
+        other => panic!("Bea folds {other:?}, not one thumbs-up of many"),
+    }
+    // The restart restores the fold from the rewritten log, and asks for nothing behind
+    // its cursor.
+    let saved_bea = bea.saved.clone();
+    let dir_bea = bea.dir.clone();
+    drop(bea);
+    let mut bea = Device::new(&saved_bea);
+    bea.dir = dir_bea.clone();
+    bea.enrol();
+    assert!(bea.reaction_changes(CONVERSATION).is_empty());
+    match bea.reaction_of(CONVERSATION, &first, "\u{1f44d}") {
+        Some(landed) if landed.count == 1 && !landed.mine => {}
+        other => panic!("after the restart Bea folds {other:?}, not the thumbs-up"),
+    }
+}
+
+/// A taken-back reaction leaves no empty entry behind, and the fold does not remember
+/// blobs its cursor has passed: the fold stays as big as the live reactions.
+#[test]
+fn a_taken_back_reaction_leaves_no_empty_entry_and_seen_stays_bounded() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "bound-ada");
+    let mut bea = device(&fake, BEA, "bound-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    let key = format!("{first}\u{1f}\u{1f44d}");
+    for _ in 0..4 {
+        ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+        let landed = bea.heard_reaction(CONVERSATION);
+        match landed.as_slice() {
+            [landed] if landed.count == 1 && !landed.mine => {}
+            other => panic!("Bea folds {other:?}, not one thumbs-up"),
+        }
+        ada.react(CONVERSATION, &first, "\u{1f44d}", false).unwrap();
+        // The take-back still tells the store: a count of zero, no entry left behind.
+        let landed = bea.heard_reaction(CONVERSATION);
+        match landed.as_slice() {
+            [landed] if landed.count == 0 => {}
+            other => panic!("a taken-back reaction folds {other:?}, not zero"),
+        }
+        let fold = bea.folds.get(CONVERSATION).unwrap();
+        assert!(!fold.state.on.contains_key(&key), "an empty entry stayed behind after the take-back");
+        assert!(fold.state.seen.is_empty(), "the fold kept blobs its cursor has passed");
+    }
+    assert!(bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_none());
+}
+

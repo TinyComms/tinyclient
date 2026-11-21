@@ -19,6 +19,7 @@ mod text;
 mod tree;
 
 pub(crate) use info::prove_connect_names;
+pub(crate) use text::prove_rich_text;
 use super::net::{address, browser, redact, Socket};
 use super::{keep_connected, serve_commands, About, Command, Context, Download, Failure, Refusal, Signed};
 use people::{Roster, User};
@@ -134,11 +135,11 @@ impl From<Fault> for Failure {
 }
 
 /// What reactions a Slack conversation takes. Slack takes a reaction by name, so the standard
-/// emoji are the ones chatd can name (`emoji::nameable`); a reaction already on a message is
-/// named there and can always be added to. The workspace's custom emoji are all usable. Slack's
-/// help centre puts the limits at 23 reactions a person and 50 different emoji a message
-/// (`too_many_reactions`, `too_many_emoji`); unverified against a real workspace. An archived
-/// channel, which takes none, is never listed (`exclude_archived`).
+/// emoji are every one the picker offers that chatd can name (`emoji::nameable`); a reaction
+/// already on a message is named there and can always be added to. The workspace's custom emoji
+/// are all usable. Slack's help centre puts the limits at 23 reactions a person and 50 different
+/// emoji a message (`too_many_reactions`, `too_many_emoji`); unverified against a real workspace.
+/// An archived channel, which takes none, is never listed (`exclude_archived`).
 pub(crate) fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: protocol::ReactionSet::Only,
@@ -264,7 +265,7 @@ struct Pacer {
 /// Slack does not say whether the web client's token is counted by the same tiers.
 fn per_minute(method: &str) -> f64 {
     match method {
-        "users.setPresence" | "reactions.remove" | "emoji.list" | "usergroups.list" | "dnd.setSnooze" => 20.,
+        "users.setPresence" | "reactions.remove" | "emoji.list" | "usergroups.list" | "dnd.setSnooze" | "stars.add" | "stars.remove" => 20.,
         "conversations.members" | "users.info" | "users.profile.get" => 100.,
         // One message a second per channel, and the sign-in check is in a tier of its own.
         "chat.postMessage" | "auth.test" => 60.,
@@ -437,6 +438,12 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
         return Err("the Slack session has no workspace".to_owned());
     }
     Ok(found)
+}
+
+/// The lab's slack-custom-emoji driver. A custom emoji is a picture, and a rename keeps the
+/// picture under the new name. A build without this stays up, so the driver fails there.
+pub(crate) fn prove_custom_emoji() -> Result<(), String> {
+    message::prove_custom_emoji()
 }
 
 /// The session without one workspace, or `None` when it was the last.
@@ -904,6 +911,8 @@ impl Slack {
                 Ok(())
             }
             "pref_change" => self.muted(event["name"].as_str().unwrap_or(""), &event["value"]),
+            // A conversation star. A message, file, or comment star is not the row's.
+            "star_added" | "star_removed" => self.star_heard(event),
             "emoji_changed" => {
                 self.emoji_changed(event);
                 Ok(())
@@ -1092,6 +1101,8 @@ impl Slack {
             file,
             count: 1,
             mine: self.me.get().is_some_and(|me| event["user"] == me.as_str()),
+            // The event names the one who acted; the store folds them into the list.
+            who: event["user"].as_str().map(|user| vec![user.to_owned()]).unwrap_or_default(),
         };
         let added = event["type"] == "reaction_added";
         // The event does not say which thread a reply is in. The message is found in the
@@ -1323,6 +1334,7 @@ impl Slack {
             Command::CancelSend { client_id, .. } => crate::blobs::upload::cancel(&self.ctx.account, &client_id),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
             Command::Search { query, scope, at, reply } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
@@ -1347,15 +1359,15 @@ impl Slack {
             Command::React { conversation_id, message_id, emoji, on, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
-            Command::Edit { conversation_id, message_id, text, reply } => {
-                answer(reply, self.edit(&conversation_id, &message_id, &text));
+            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+                answer(reply, self.edit(&conversation_id, &message_id, &text, &spans));
             }
             Command::Delete { conversation_id, message_id, reply } => {
                 answer(reply, self.delete(&conversation_id, &message_id));
             }
             Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
-            Command::Typing(conversation) => self.typing(&conversation),
+            Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.watch(),
             Command::SearchPeople(query) => self.search(&query),
             Command::Members { conversation_id, offset, limit, reply } => {
@@ -1450,23 +1462,54 @@ impl Slack {
         state.queue(frame);
     }
 
+    /// Slack `blocks` for a formatted send. `None` when the text is plain, so the call stays
+    /// `text` alone and an older message is unchanged.
+    pub(super) fn blocks_json(text: &str, spans: &[protocol::Span]) -> Option<String> {
+        let blocks = text::rich_blocks(text, spans);
+        if blocks.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&blocks).ok()
+        }
+    }
+
+    /// Puts those blocks on an event Slack answered without them, so the stored row keeps the
+    /// ranges. An event that already carries blocks is left as Slack sent it.
+    pub(super) fn with_blocks(mut event: Value, text: &str, spans: &[protocol::Span]) -> Value {
+        if spans.is_empty() || !event.is_object() {
+            return event;
+        }
+        if event["blocks"].as_array().is_some_and(|blocks| !blocks.is_empty()) {
+            return event;
+        }
+        let blocks = text::rich_blocks(text, spans);
+        if !blocks.is_empty() {
+            event["blocks"] = Value::Array(blocks);
+        }
+        event
+    }
+
     /// Posts a message and ends the send. In a thread's conversation it is a reply to that
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
     fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
-        let outcome = self.post(conversation, client_id, text, reply_to, suppress);
+        let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[]);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
     /// The post itself, answering what Slack accepted.
-    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) -> Result<Message, String> {
+    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool, spans: &[protocol::Span]) -> Result<Message, String> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
         };
         let nonce = client_msg_id(client_id);
         let escaped = escape(text);
+        let blocks = Self::blocks_json(text, spans);
         let mut params = vec![("channel", channel), ("text", escaped.as_str()), ("client_msg_id", nonce.as_str())];
+        if let Some(blocks) = blocks.as_deref() {
+            params.push(("blocks", blocks));
+        }
         let shown = reply_to.filter(|_| thread.is_none());
         if let Some(root) = thread.or(shown) {
             params.push(("thread_ts", root));
@@ -1484,6 +1527,7 @@ impl Slack {
             if event["ts"].is_null() {
                 event["ts"] = posted["ts"].clone();
             }
+            let event = Self::with_blocks(event, text, spans);
             let accepted = self.message(channel, &event);
             accepted.ok_or_else(|| "Slack accepted it but sent nothing back.".to_owned())
         });
@@ -1513,6 +1557,30 @@ impl Slack {
         }
     }
 
+    /// Stars or unstars a channel or direct conversation. Slack's documented call is `stars.add`
+    /// or `stars.remove` with the channel and no timestamp; a timestamp would star a message.
+    /// A thread is not a channel. `already_starred` and `not_starred` are the state we asked for.
+    fn star(&self, conversation_id: &str, starred: bool) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        match self.api(star_method(starred), &[("channel", conversation_id)]) {
+            Err(Fault::Slack(error)) if error == "already_starred" || error == "not_starred" => {}
+            other => {
+                other?;
+            }
+        }
+        self.ctx.starred(conversation_id, starred).map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    /// A `star_added` or `star_removed` for a conversation. A message star changes nothing here.
+    fn star_heard(&self, event: &Value) -> Result<(), Failure> {
+        let Some((id, starred)) = conversation_star(event) else {
+            return Ok(());
+        };
+        self.ctx.starred(&id, starred).map_err(|err| Failure::Dropped(err.to_string()))
+    }
+
     /// Adds or takes back our reaction. The store already shows it; Slack's own event for it
     /// arrives on the socket and counts once.
     fn react(&self, conversation: &str, ts: &str, emoji: &str, on: bool) -> Result<(), Fault> {
@@ -1527,12 +1595,18 @@ impl Slack {
     }
 
     /// Replaces the text of one of our messages and reports it as Slack now has it.
-    fn edit(&self, conversation: &str, ts: &str, text: &str) -> Result<(), Fault> {
+    fn edit(&self, conversation: &str, ts: &str, text: &str, spans: &[protocol::Span]) -> Result<(), Fault> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
         };
-        let updated = self.api("chat.update", &[("channel", channel), ("ts", ts), ("text", &escape(text))])?;
+        let escaped = escape(text);
+        let blocks = Self::blocks_json(text, spans);
+        let mut asked = vec![("channel", channel), ("ts", ts), ("text", escaped.as_str())];
+        if let Some(blocks) = blocks.as_deref() {
+            asked.push(("blocks", blocks));
+        }
+        let updated = self.api("chat.update", &asked)?;
         let mut inner = match &updated["message"] {
             message @ Value::Object(_) => message.clone(),
             _ => json!({"type": "message", "text": updated["text"].as_str().unwrap_or(&escape(text))}),
@@ -1547,6 +1621,7 @@ impl Slack {
         if let (Some(root), true) = (thread, inner["thread_ts"].is_null()) {
             inner["thread_ts"] = root.into();
         }
+        let inner = Self::with_blocks(inner, text, spans);
         self.changed(channel, &inner).map_err(kept)
     }
 
@@ -1594,17 +1669,21 @@ impl Slack {
         Ok(())
     }
 
-    /// One person's card. `users.info` alone carries all of it (the title in the profile, the
-    /// time zone and its offset beside it), so the one request the contract allows is enough
-    /// and `users.profile.get` is not called as well.
+    /// One person's card. `users.info` carries the title, the time zone and the two names.
+    /// Custom fields are labelled only by `users.profile.get` (`include_labels`), one more
+    /// call inside the same hour. A workspace that refuses it still answers the card.
     fn profile(&self, person: &str) -> Result<About, Fault> {
         if !self.info_due(person) {
             // Asked within the hour: the card read then, or what the row knows.
             return Ok(self.state().abouts.get(person).cloned().unwrap_or_default());
         }
         let info = self.api("users.info", &[("user", person)])?;
-        self.learn(std::slice::from_ref(&info["user"]));
-        Ok(self.keep_about(person, &info["user"]))
+        let mut user = info["user"].clone();
+        if let Ok(got) = self.api("users.profile.get", &[("user", person), ("include_labels", "true")]) {
+            merge_labelled_profile(&mut user, &got["profile"]);
+        }
+        self.learn(std::slice::from_ref(&user));
+        Ok(self.keep_about(person, &user))
     }
 
     /// The card in a `users.info` answer, kept for the hour no other is asked for.
@@ -1623,14 +1702,17 @@ impl Slack {
     }
 }
 
-/// A person's card from their `users.info` answer.
+/// A person's card from their user object. Custom fields are the labelled ones
+/// `users.profile.get` returns; a `users.info` field has an id and no label, so it is skipped.
+/// Department and the other typed lines fill their slots. A manager is that person's link.
+/// Shared channels are a private call and are not asked.
 fn about_of(user: &Value) -> About {
     let said = |key: &str| user["profile"][key].as_str().unwrap_or("").trim().to_owned();
     let contact = |kind, value: String| (!value.is_empty()).then_some(protocol::Contact { kind, value, masked: kind == protocol::ContactKind::Phone });
     let contacts = [contact(protocol::ContactKind::Email, said("email")), contact(protocol::ContactKind::Phone, said("phone"))];
     // Slack's status expiry, 0 for none.
     let until = user["profile"]["status_expiration"].as_i64().filter(|until| *until > 0);
-    About {
+    let mut about = About {
         // Slack has no bio: the title is a title (06, story 3).
         title: said("title"),
         pronouns: said("pronouns"),
@@ -1641,7 +1723,183 @@ fn about_of(user: &Value) -> About {
         utc_offset: user["tz_offset"].as_i64().map(|offset| offset as i32),
         status_until: until,
         ..About::default()
+    };
+    // An owner is also flagged as an admin. The card says Owner once.
+    if user["is_owner"] == true || user["is_primary_owner"] == true {
+        about.roles.push("Owner".to_owned());
+    } else if user["is_admin"] == true {
+        about.roles.push("Workspace admin".to_owned());
     }
+    let display = said("display_name");
+    let real = {
+        let named = said("real_name");
+        if named.is_empty() { user["real_name"].as_str().unwrap_or("").trim().to_owned() } else { named }
+    };
+    // The row keeps the display name. The card's second line is the full name when it differs.
+    if !display.is_empty() && !real.is_empty() && !display.eq_ignore_ascii_case(&real) {
+        push_field(&mut about, "Full name", real);
+    }
+    let started = said("start_date");
+    if !started.is_empty() {
+        push_field(&mut about, "Start date", started);
+    }
+    let team = user["team_id"].as_str().unwrap_or("").trim();
+    if let Some(fields) = user["profile"]["fields"].as_object() {
+        for field in fields.values() {
+            if field["is_hidden"] == true {
+                continue;
+            }
+            apply_custom_field(&mut about, field, team);
+        }
+    }
+    about
+}
+
+/// Copies labelled custom fields, and a start date or larger picture `users.info` left out,
+/// onto the user object the card is read from.
+fn merge_labelled_profile(user: &mut Value, profile: &Value) {
+    let Some(got) = profile.as_object() else {
+        return;
+    };
+    if !user["profile"].is_object() {
+        user["profile"] = json!({});
+    }
+    let Some(dest) = user["profile"].as_object_mut() else {
+        return;
+    };
+    if let Some(fields) = got.get("fields").filter(|fields| fields.is_object()) {
+        dest.insert("fields".to_owned(), fields.clone());
+    }
+    for key in ["start_date", "image_512"] {
+        let empty = dest.get(key).and_then(Value::as_str).unwrap_or("").is_empty();
+        if empty {
+            if let Some(value) = got.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()) {
+                dest.insert(key.to_owned(), value.into());
+            }
+        }
+    }
+}
+
+fn push_field(about: &mut About, label: &str, value: String) {
+    if value.is_empty() || about.fields.len() >= protocol::PROFILE_FIELDS {
+        return;
+    }
+    if about.fields.iter().any(|(held, _)| held.eq_ignore_ascii_case(label)) {
+        return;
+    }
+    about.fields.push((label.to_owned(), value));
+}
+
+fn apply_custom_field(about: &mut About, field: &Value, team: &str) {
+    let label = field["label"].as_str().unwrap_or("").trim();
+    if label.is_empty() {
+        return;
+    }
+    let value = field["value"].as_str().unwrap_or("").trim();
+    let alt = field["alt"].as_str().unwrap_or("").trim();
+    let kind = field["type"].as_str().unwrap_or("");
+    let text = if value.is_empty() { alt } else { value };
+    match label.to_lowercase().as_str() {
+        "department" if about.department.is_empty() && !text.is_empty() => about.department = text.to_owned(),
+        "pronouns" if about.pronouns.is_empty() && !text.is_empty() => about.pronouns = text.to_owned(),
+        "title" | "job title" if about.title.is_empty() && !text.is_empty() => about.title = text.to_owned(),
+        "email" | "e-mail" if !text.is_empty() && !about.contacts.iter().any(|contact| contact.kind == protocol::ContactKind::Email) => {
+            about.contacts.push(protocol::Contact { kind: protocol::ContactKind::Email, value: text.to_owned(), masked: false });
+        }
+        "phone" | "mobile" if !text.is_empty() && !about.contacts.iter().any(|contact| contact.kind == protocol::ContactKind::Phone) => {
+            about.contacts.push(protocol::Contact { kind: protocol::ContactKind::Phone, value: text.to_owned(), masked: true });
+        }
+        _ => {
+            if let Some(shown) = custom_value(label, value, alt, kind, team) {
+                push_field(about, label, shown);
+            }
+        }
+    }
+}
+
+/// A person field is their link, so the card can open them. A link field keeps its address.
+fn custom_value(label: &str, value: &str, alt: &str, kind: &str, team: &str) -> Option<String> {
+    let person = kind == "user" || (label.eq_ignore_ascii_case("manager") && looks_like_user(value));
+    if person && looks_like_user(value) {
+        if !team.is_empty() {
+            return Some(format!("slack://user?team={team}&id={value}"));
+        }
+        if !alt.is_empty() {
+            return Some(alt.to_owned());
+        }
+    }
+    if value.starts_with("https://") || value.starts_with("http://") {
+        return Some(value.to_owned());
+    }
+    let text = if value.is_empty() { alt } else { value };
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn looks_like_user(id: &str) -> bool {
+    let mut chars = id.chars();
+    matches!(chars.next(), Some('U' | 'W')) && chars.all(|c| c.is_ascii_alphanumeric()) && (2..=32).contains(&id.len())
+}
+
+/// Slack's 512px profile picture, when the profile names one. 72 and 192 are the row and the
+/// card; this is the size larger than those.
+fn stated_portrait(profile: &Value) -> Option<&str> {
+    profile["image_512"].as_str().filter(|url| !url.is_empty())
+}
+
+/// The lab's slack-profile-fields driver. A labelled profile keeps both names, the department,
+/// two custom fields and a manager link. A build without this stays up, so the driver fails.
+pub(crate) fn prove_profile_fields() -> Result<(), String> {
+    let user = json!({
+        "id": "U0ADA",
+        "team_id": "T01ALPHA",
+        "name": "ada",
+        "real_name": "Ada Quinn",
+        "is_admin": true,
+        "is_owner": false,
+        "tz": "Europe/Lisbon",
+        "tz_offset": 3600,
+        "profile": {
+            "display_name": "Ada",
+            "real_name": "Ada Quinn",
+            "title": "Engineer",
+            "pronouns": "she/her",
+            "email": "ada@example.com",
+            "phone": "+15551212",
+            "start_date": "2019-01-15",
+            "image_512": "https://avatars.slack-edge.com/ada_512.png",
+            "fields": {
+                "XfDEPT": {"label": "Department", "value": "Engineering", "alt": ""},
+                "XfLOC": {"label": "Location", "value": "Lisbon", "alt": ""},
+                "XfSITE": {"label": "Website", "value": "https://example.com/ada", "alt": "Ada"},
+                "XfMGR": {"label": "Manager", "value": "U0MGR", "alt": "Mina Cho"}
+            }
+        }
+    });
+    let about = about_of(&user);
+    if about.department != "Engineering" {
+        return Err(format!("department was {}", about.department));
+    }
+    if about.roles != ["Workspace admin"] {
+        return Err(format!("roles were {:?}", about.roles));
+    }
+    let has = |label: &str, value: &str| about.fields.iter().any(|(got, text)| got == label && text == value);
+    if !has("Full name", "Ada Quinn") || !has("Location", "Lisbon") || !has("Website", "https://example.com/ada") || !has("Manager", "slack://user?team=T01ALPHA&id=U0MGR") || !has("Start date", "2019-01-15") {
+        return Err(format!("fields were {:?}", about.fields));
+    }
+    if about.fields.iter().any(|(label, _)| label.eq_ignore_ascii_case("department")) {
+        return Err("department was also a leftover field".to_owned());
+    }
+    if about.fields.len() > protocol::PROFILE_FIELDS {
+        return Err(format!("too many fields: {}", about.fields.len()));
+    }
+    if stated_portrait(&user["profile"]) != Some("https://avatars.slack-edge.com/ada_512.png") {
+        return Err("the larger picture was not read".to_owned());
+    }
+    let owner = about_of(&json!({"id": "U0OWN", "is_owner": true, "is_admin": true, "is_primary_owner": true, "profile": {"display_name": "Owner"}}));
+    if owner.roles != ["Owner"] {
+        return Err(format!("owner roles were {:?}", owner.roles));
+    }
+    Ok(())
 }
 
 /// What a Slack account may send. The same on every plan (unverified: a workspace may lower
@@ -1682,9 +1940,91 @@ fn download_headers(agent: &str, token: &str, cookie: &str, private: bool) -> Ve
     headers
 }
 
+/// `stars.add` when starring, `stars.remove` when not. Tier 2, the same as the pacer holds them to.
+fn star_method(starred: bool) -> &'static str {
+    if starred { "stars.add" } else { "stars.remove" }
+}
+
+/// A conversation star on the socket: a channel, a direct conversation, or a private group.
+/// A message, file, or comment star is not one, and neither is an item with no channel.
+fn conversation_star(event: &Value) -> Option<(String, bool)> {
+    let starred = match event["type"].as_str()? {
+        "star_added" => true,
+        "star_removed" => false,
+        _ => return None,
+    };
+    let item = &event["item"];
+    if !matches!(item["type"].as_str()?, "channel" | "im" | "group") {
+        return None;
+    }
+    let id = item["channel"].as_str().filter(|id| !id.is_empty())?;
+    Some((id.to_owned(), starred))
+}
+
+/// What the slack-star-channel driver checks, with no workspace and no socket.
+pub(crate) fn prove_channel_star() -> Result<(), String> {
+    if star_method(true) != "stars.add" || star_method(false) != "stars.remove" {
+        return Err("a conversation star is stars.add or stars.remove".to_owned());
+    }
+    let channel = json!({"type": "star_added", "item": {"type": "channel", "channel": "C0GEN"}});
+    match conversation_star(&channel) {
+        Some((id, true)) if id == "C0GEN" => {}
+        other => return Err(format!("star_added on a channel was {other:?}")),
+    }
+    let direct = json!({"type": "star_removed", "item": {"type": "im", "channel": "D0ANA"}});
+    match conversation_star(&direct) {
+        Some((id, false)) if id == "D0ANA" => {}
+        other => return Err(format!("star_removed on a direct conversation was {other:?}")),
+    }
+    let group = json!({"type": "star_added", "item": {"type": "group", "channel": "G0GRP"}});
+    match conversation_star(&group) {
+        Some((id, true)) if id == "G0GRP" => {}
+        other => return Err(format!("star_added on a group was {other:?}")),
+    }
+    let message = json!({"type": "star_added", "item": {"type": "message", "channel": "C0GEN", "message": {"ts": "1.000"}}});
+    if conversation_star(&message).is_some() {
+        return Err("a message star is not the channel's star".to_owned());
+    }
+    let file = json!({"type": "star_removed", "item": {"type": "file", "file": "F0"}});
+    if conversation_star(&file).is_some() {
+        return Err("a file star is not a conversation star".to_owned());
+    }
+    if conversation_star(&json!({"type": "star_added", "item": {"type": "channel", "channel": ""}})).is_some() {
+        return Err("a star with no channel is nothing".to_owned());
+    }
+    let filed = tree::starred_from(&[("channels", &["C0GEN"]), ("stars", &["C0DEP", "D0ANA", "C0DEP"])]);
+    if filed != ["C0DEP", "D0ANA"] {
+        return Err(format!("the stars section marks {filed:?}"));
+    }
+    Ok(())
+}
+
+/// What the slack-call-cards driver checks, with no workspace and no socket.
+pub(crate) fn prove_call_cards() -> Result<(), String> {
+    message::prove_call_cards()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_profile_card_keeps_custom_fields_both_names_and_roles() {
+        super::prove_profile_fields().unwrap();
+        let mut crowded = json!({"id": "U0MANY", "team_id": "T1", "profile": {"display_name": "Many", "real_name": "Many Names", "fields": {}}});
+        let fields = crowded["profile"]["fields"].as_object_mut().unwrap();
+        for n in 0..20 {
+            fields.insert(format!("X{n}"), json!({"label": format!("Line {n}"), "value": "x"}));
+        }
+        let about = about_of(&crowded);
+        assert_eq!(about.fields.len(), protocol::PROFILE_FIELDS);
+        assert!(about.fields.iter().any(|(label, value)| label == "Full name" && value == "Many Names"));
+    }
+
+    #[test]
+    fn a_channel_star_is_slacks_and_a_message_star_is_not() {
+        super::prove_channel_star().unwrap();
+    }
 
     #[test]
     fn a_typed_mention_survives_the_escapes_and_nothing_else_does() {

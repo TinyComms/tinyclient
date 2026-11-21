@@ -513,6 +513,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         name: attached.filename.clone(),
         file,
         thumb,
+        preview: None,
         mime: mime.to_owned(),
         duration: attached.duration_secs.round() as u32,
         round: false,
@@ -545,6 +546,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         name: sticker.name.clone(),
         file,
         thumb: None,
+        preview: None,
         mime: mime.to_owned(),
         duration: 0,
         round: false,
@@ -647,6 +649,9 @@ fn reactions(rich: &mut Rich, reacted: &[model::Reacted]) -> Vec<Reaction> {
             file,
             count: reaction.count,
             mine: reaction.me,
+            // Discord's message payload counts reactions and never names who: the list
+            // would need one request per emoji, which this build does not make.
+            who: Vec::new(),
         }
     });
     mapped.collect()
@@ -804,8 +809,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         }),
         _ => None,
     };
-    // Discord does not say who replied in a thread or how much of it we read, short of
-    // fetching the thread: the faces and the count stay empty.
+    // The thread object names the count and the newest id. Faces and unread are filled
+    // as replies arrive, and a thread update can raise the count.
     let thread = posted.thread.as_ref().map(|thread| ThreadSummary {
         participants: Vec::new(),
         unread: 0,
@@ -845,14 +850,19 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         reactions,
         reply_to,
         thread,
+        poll: None,
         views: None,
         edited: posted.edited_timestamp.is_some(),
+        edited_at: posted.edited_timestamp.as_deref().and_then(model::iso_seconds),
+        prior_text: None,
         pinned: posted.pinned.unwrap_or(false),
         mentions_me: false,
         kind: message_kind,
         state: protocol::SendState::Sent,
         waiting: false,
         client_id,
+        deliveries: Vec::new(),
+        receipt_note: String::new(),
     };
     (message, rich.files)
 }
@@ -936,6 +946,7 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     }
     if update.edited_timestamp.is_some() {
         stored.edited = true;
+        stored.edited_at = update.edited_timestamp.as_deref().and_then(model::iso_seconds).or(stored.edited_at);
     }
     rich.files
 }

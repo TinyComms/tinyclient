@@ -1,14 +1,16 @@
 {"ok": true, "has_more": true, "pin_count": 0,
  "messages": [
   {"type": "message", "user": "U0ANA", "ts": "1760000300.000300", "client_msg_id": "6d0c1f3e-2a4b-4c5d-8e6f-0a1b2c3d4e5f", "team": "T01ALPHA",
-   "text": "Shipping *today* :rocket: <@U0ME>",
+   "text": "Shipping *today* :rocket: <@U0ME> :partyparrot:",
    "blocks": [{"type": "rich_text", "block_id": "b1", "elements": [{"type": "rich_text_section", "elements": [
      {"type": "text", "text": "Shipping "},
      {"type": "text", "text": "today", "style": {"bold": true}},
      {"type": "text", "text": " "},
      {"type": "emoji", "name": "rocket", "unicode": "1f680"},
      {"type": "text", "text": " "},
-     {"type": "user", "user_id": "U0ME"}]}]}],
+     {"type": "user", "user_id": "U0ME"},
+     {"type": "text", "text": " "},
+     {"type": "emoji", "name": "partyparrot"}]}]}],
    "files": [{"id": "F0IMG", "created": 1760000299, "timestamp": 1760000299, "name": "diagram.png", "title": "diagram.png", "mimetype": "image/png", "filetype": "png", "pretty_type": "PNG", "user": "U0ANA", "user_team": "T01ALPHA", "editable": false, "size": 48211, "mode": "hosted", "is_external": false, "is_public": true,
      "url_private": "https://files.slack.com/files-pri/T01ALPHA-F0IMG/diagram.png",
      "url_private_download": "https://files.slack.com/files-pri/T01ALPHA-F0IMG/download/diagram.png",

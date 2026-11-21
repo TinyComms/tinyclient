@@ -93,7 +93,7 @@ pub const DEAFEN_KEY: &str = "deafen_key";
 pub const GAIN_PREFIX: &str = "gain:";
 /// P1, per account. Off: the adapter sends no typing signal.
 pub const TYPING: &str = "typing";
-/// P2, per Teams account. Off: no read horizon is sent.
+/// P2, per Teams or Signal account. Off: nothing is sent that others would read as a receipt.
 pub const RECEIPTS: &str = "receipts";
 /// P4. Days messages are kept on this Mac: 7, 30 or 90.
 pub const KEEP_DAYS: &str = "keep_days";
@@ -133,10 +133,12 @@ pub const QUIET_FROM: &str = "quiet_from";
 pub const QUIET_TO: &str = "quiet_to";
 /// N9. A call still rings during a pause or quiet hours.
 pub const CALLS_THROUGH: &str = "calls_through";
-/// N10. Flash the taskbar button (Windows) or bounce the Dock icon when something notifies
-/// while the window is in the background.
+/// N10. Ask for attention when something notifies while the window is in the background: the
+/// taskbar button flashes (Windows), the Dock icon bounces (macOS), the window manager's
+/// urgency hint is set (Linux).
 pub const FLASH: &str = "flash";
-/// N11. The number on the taskbar button or the Dock icon.
+/// N11. The number on the taskbar button (Windows), the Dock icon (macOS) or the launcher
+/// icon (Linux).
 pub const BADGE: &str = "badge";
 /// S2, S3, S4: the sounds by [`SOUND_CHOICES`] word. S3 may also be `same`.
 pub const MESSAGE_SOUND: &str = "message_sound";
@@ -254,7 +256,7 @@ pub fn sound_word(value: &str) -> bool {
 fn scoped(key: &str, scope: &str) -> bool {
     match key {
         TYPING => account_of(scope).is_some_and(|account| typing_choice(account.network)),
-        RECEIPTS => account_of(scope).is_some_and(|account| account.network == Network::Teams),
+        RECEIPTS => account_of(scope).is_some_and(|account| matches!(account.network, Network::Teams | Network::Signal)),
         _ if gain_user(key).is_some() => account_of(scope).is_some(),
         NOTIFY_ABOUT => scope == GLOBAL || account_of(scope).is_some() || conversation_of(scope).is_some(),
         SOUND => account_of(scope).is_some() || conversation_of(scope).is_some(),
@@ -385,10 +387,11 @@ pub fn account_of(scope: &str) -> Option<AccountKey> {
     (!account.is_empty()).then(|| AccountKey { network, account: account.to_owned() })
 }
 
-/// Whether the user decides if this network is told I am typing. Telegram always sends it and
-/// Signal follows the phone's choice, so neither has a switch (P1).
+/// Whether the user decides if this network is told I am typing. Telegram always sends it, so it
+/// has no switch (P1). Signal has one, but it is a local stop only: the phone's setting still
+/// decides on top of it, and nothing here is written back to the account.
 pub fn typing_choice(network: Network) -> bool {
-    matches!(network, Network::Discord | Network::Slack | Network::Teams)
+    matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Signal)
 }
 
 /// P1's default: Discord off (its typing is loud in busy channels), the rest on.
@@ -538,7 +541,9 @@ impl Values {
         stored.map_or(typing_default(account.network), |value| value == "on")
     }
 
-    /// P2 for one account. Only Teams has a switch; elsewhere it is the network's to decide.
+    /// P2 for one account. Teams and Signal have a switch; elsewhere it is the network's to
+    /// decide. On Signal this is a local stop: the account's own setting is held separately in
+    /// the adapter, and stays off until the phone says otherwise.
     pub fn receipts(&self, account: &AccountKey) -> bool {
         self.stored(&account_scope(account), RECEIPTS).is_none_or(|value| value == "on")
     }
@@ -738,6 +743,8 @@ mod tests {
         assert!(!valid(&account_scope(&account(Network::Telegram)), TYPING, "off"), "Telegram always sends it");
         assert!(!valid(&discord, RECEIPTS, "off"), "Discord has no receipts");
         assert!(valid(&account_scope(&account(Network::Teams)), RECEIPTS, "off"));
+        let signal = account_scope(&account(Network::Signal));
+        assert!(valid(&signal, TYPING, "off") && valid(&signal, RECEIPTS, "off"), "Signal takes a local switch for both");
         assert!(valid(GLOBAL, INPUT, "Studio Display Microphone") && !valid(GLOBAL, INPUT, ""));
     }
 
@@ -766,6 +773,20 @@ mod tests {
         assert!(values.typing(&discord) && !values.typing(&slack));
         assert_eq!(account_of(&account_scope(&slack)), Some(slack));
         assert_eq!(account_of("account:myspace:1"), None);
+    }
+
+    #[test]
+    fn signal_takes_a_local_switch_that_stops_here_and_never_loosens_the_account() {
+        let mut values = Values::default();
+        let signal = account(Network::Signal);
+        // Nothing stored: both are on, and the phone's own setting still decides above them.
+        assert!(values.typing(&signal) && values.receipts(&signal));
+        values.set(&account_scope(&signal), TYPING, Some("off".into()));
+        values.set(&account_scope(&signal), RECEIPTS, Some("off".into()));
+        assert!(!values.typing(&signal) && !values.receipts(&signal), "off here stops the send");
+        values.set(&account_scope(&signal), TYPING, None);
+        values.set(&account_scope(&signal), RECEIPTS, None);
+        assert!(values.typing(&signal) && values.receipts(&signal), "a reset follows the account again");
     }
 
     #[test]

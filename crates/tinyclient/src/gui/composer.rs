@@ -824,7 +824,7 @@ impl Composer {
             return;
         }
         self.told_typing = Some((target.key.clone(), Instant::now()));
-        ask_later(cx, Request::Typing { conversation: target.key.clone() }, |_, _| {});
+        ask_later(cx, Request::Typing { conversation: target.key.clone(), activity: protocol::Compose::Typing }, |_, _| {});
     }
 
     /// Escape: the first that applies. It never clears what was typed.
@@ -955,6 +955,8 @@ impl Composer {
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
+            spans: Vec::new(),
+            poll: None,
         };
         let (shown, wire) = match as_file {
             true => (String::new(), String::new()),
@@ -1876,6 +1878,7 @@ impl Composer {
             conversation: key.clone(),
             message_id: id.clone(),
             text: wire,
+            spans: Vec::new(),
         };
         self.sending = true;
         cx.notify();

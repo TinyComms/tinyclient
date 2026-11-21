@@ -103,6 +103,7 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     html::prove_markdown()
 }
 mod info;
+mod links;
 pub(crate) mod message;
 
 /// The lab's teams-reactions driver. A build without this returns to the server and stays up.
@@ -132,10 +133,25 @@ pub fn prove_shared_file() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The lab's teams-team-info driver. A build without this returns to the server and stays up.
+pub fn prove_team_info() -> Result<(), String> {
+    people::prove_team_roster()
+}
 mod people;
 mod push;
 mod send;
 mod tree;
+
+/// The lab's teams-chain-paging driver. A build without this returns to the server and stays up.
+pub fn prove_chain_paging() -> Result<(), String> {
+    message::prove_chain_paging()
+}
+
+/// The lab's teams-copy-link driver. A build without this returns to the server and stays up.
+pub fn prove_share_links() -> Result<(), String> {
+    links::prove_share_links()
+}
 
 use super::net::{address, browser};
 use super::{keep_connected, serve_commands, Command, Context, Download, Failure, Refusal, Signed};
@@ -896,13 +912,13 @@ impl Teams {
                 let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
-            Command::Edit { conversation_id, message_id, text, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 let _ = reply.send(self.edit(&conversation_id, &message_id, &text).map_err(refuse));
             }
             Command::Delete { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
             }
-            Command::Typing(conversation) => self.typing(&conversation),
+            Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.report(self.watch().map_err(Failure::from)),
             Command::SearchPeople(query) => {
                 self.report(self.search(&query).map_err(Failure::from));
@@ -919,6 +935,9 @@ impl Teams {
             }
             Command::ConversationInfo { conversation_id, reply } => {
                 let _ = reply.send(self.conversation_info(&conversation_id).map_err(refuse));
+            }
+            Command::SpaceInfo { space_id, reply } => {
+                let _ = reply.send(self.space_info(&space_id).map_err(refuse));
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));

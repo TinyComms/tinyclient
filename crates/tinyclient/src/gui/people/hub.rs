@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn a_typist_is_dropped_at_until_or_twelve_seconds_after_hearing() {
-        let typist = |name: &str, until: i64| Typist { id: name.into(), name: name.into(), until };
+        let typist = |name: &str, until: i64| Typist { id: name.into(), name: name.into(), until, activity: protocol::Compose::Typing };
         let typists = [typist("ines", 105), typist("tomasz", 200)];
         let names = |now: i64| live(&typists, 100, now).map(|typist| typist.name.as_str()).collect::<Vec<_>>();
         assert_eq!(names(104), ["ines", "tomasz"]);

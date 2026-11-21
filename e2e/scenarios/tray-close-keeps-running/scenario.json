@@ -1,0 +1,14 @@
+{
+  "id": "tray-close-keeps-running",
+  "title": "With G3 on, closing the window keeps tinyclient running in the tray, the icon's click brings the window back, and its Quit ends tinyclient and chatd",
+  "platforms": ["windows"],
+  "not_applicable": {
+    "macos": "Closing already hides the window and keeps chatd receiving behind Keep receiving (G2); a menu bar icon is the macOS side of G3 and is not built.",
+    "linux": "The tray (StatusNotifierItem) is a later stage of the G3 work; the systemd user unit holds chatd today.",
+    "android": "The phone has no window close and no tray.",
+    "ios": "The phone has no window close and no tray."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 90
+}

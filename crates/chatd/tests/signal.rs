@@ -8,7 +8,8 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ContactKind, Conversation, ConversationKind, ErrorCode, Key, Link, Message,
-    MessageKind, Network, Page, Relation, Request, Response, SendState, SignInInput, SignInProblem, SignInStep,
+    MessageKind, Network, Outgoing, OutgoingFile, Page, PollDraft, Relation, Request, Response, SendState, SignInInput, SignInProblem,
+    SignInStep,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,9 +23,8 @@ const GRACE: &str = "b2b2b2b2-0000-4000-8000-000000000002";
 const ALAN: &str = "c3c3c3c3-0000-4000-8000-000000000003";
 const CLUB: &str = "g.5a175a175a175a175a175a175a175a175a175a175a175a175a175a175a175a17";
 const SESSION: &str = r#"{"aci":"a1a1a1a1-0000-4000-8000-000000000001","name":"Ada Quill","vault":"00"}"#;
-/// 2026-10-13 12:00 UTC in milliseconds, and what the fake sends with from there on.
+/// 2026-10-13 12:00 UTC in milliseconds. Scripted lines that name this are outside the windows.
 const T0: u64 = 1_791_892_800_000;
-const FIRST_SENT: u64 = T0 + 1_000_000;
 
 fn key(id: &str) -> Key {
     Key { network: Network::Signal, account: ME.into(), id: id.into() }
@@ -76,6 +76,31 @@ impl World {
             sleep(Duration::from_millis(10));
         }
         World { child, dir }
+    }
+
+    /// Stops chatd and starts it again on the same directory, so a reaction remembered only in
+    /// memory is gone and the store is what the next reaction has to replace against.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(self.dir.join("chat.sock"));
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("stderr.log")).unwrap();
+        self.child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+            .env("TINYCLIENT_DIR", &self.dir)
+            .env("TINYCLIENT_SIGNAL_FAKE", "1")
+            .env("TINYCLIENT_SESSION_SIGNAL", SESSION)
+            .env_remove("TINYCLIENT_SESSION_DISCORD")
+            .env_remove("TINYCLIENT_SESSION_SLACK")
+            .env_remove("TINYCLIENT_SESSION_TELEGRAM")
+            .env_remove("TINYCLIENT_SESSION_TEAMS")
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ChatStream::connect(&self.dir.join("chat.sock")).is_err() {
+            assert!(Instant::now() < deadline, "chatd did not open its socket again: {}", self.stderr());
+            sleep(Duration::from_millis(10));
+        }
     }
 
     fn ask(&self, request: Request) -> Response {
@@ -275,7 +300,9 @@ fn text_is_received_sent_answered_and_a_refusal_is_told() {
 
     let pending = world.send(GRACE, "1001", "Yes, seven sharp.", Some(&first.id));
     assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
-    let sent = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    let sent = world.until("our reply", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("1001") && message.id != "1001")
+    });
     assert_eq!((sent.text.as_str(), sent.outgoing, sent.sender.name.as_str()), ("Yes, seven sharp.", true, "Ada Quill"));
     assert_eq!(sent.client_id.as_deref(), Some("1001"));
     let answered = sent.reply_to.expect("it answers Grace");
@@ -334,25 +361,116 @@ fn a_group_mention_counts_and_what_cannot_be_drawn_says_so() {
 }
 
 #[test]
+fn a_view_once_message_says_where_it_opens_instead_of_promising_the_media() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("viewonce grace {}", T0 + 4_000));
+    let once = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    assert_eq!(
+        (once.text.as_str(), &once.kind),
+        ("View-once photo · open it on your phone", &MessageKind::Unsupported { link: String::new() })
+    );
+    // The media itself is not here: nothing to fetch, nothing to open twice.
+    assert!(once.attachments.is_empty());
+    world.steer(&format!("viewonce-video grace {}", T0 + 5_000));
+    let video = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!(video.text.as_str(), "View-once video · open it on your phone");
+    // A photo without the flag is still only labelled.
+    world.steer(&format!("photo grace {}", T0 + 6_000));
+    let photo = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    assert_eq!(photo.text.as_str(), "Photo");
+}
+
+#[test]
+fn a_long_text_is_the_message_not_a_file() {
+    let world = World::linked();
+    world.connected();
+    let body = "y".repeat(2_048);
+    world.steer(&format!("longtext grace {} {body}", T0 + 4_000));
+    let long = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    // What the body carried is the message, named as itself, with the note about the rest.
+    assert_eq!(&long.kind, &MessageKind::Normal, "{long:?}");
+    assert_eq!(long.text, format!("{body}\n\n(message continues on your phone)"));
+    // And it reads like any message.
+    world.send(GRACE, "5001", "Read it all.", None);
+    world.heard(&format!("send {GRACE} text Read it all."));
+}
+
+#[test]
+fn an_incoming_call_rings_and_leaves_a_missed_call_or_none_when_answered() {
+    let world = World::linked();
+    world.connected();
+    // An offer is not a message: the row appears, with nothing in it and nothing unread.
+    world.steer(&format!("call grace {}", T0 + 5_000));
+    let row = world.until("Grace's row to be recorded", || world.conversation(GRACE));
+    assert_eq!((row.kind, row.title.as_str(), row.unread), (ConversationKind::Direct, "Grace Ombra", 0));
+    assert!(world.messages(GRACE).is_empty());
+    // The caller gave up: one missed-call line, unread by one.
+    world.steer(&format!("hangup {}", T0 + 5_000));
+    let line = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!((&line.kind, line.text.as_str(), line.outgoing, line.sender.id.as_str()), (&MessageKind::System, "Missed voice call", false, GRACE));
+    world.until("one unread", || (world.conversation(GRACE)?.unread == 1).then_some(()));
+    // A missed video call reads as one.
+    world.steer(&format!("call-video grace {}", T0 + 6_000));
+    world.steer(&format!("hangup {}", T0 + 6_000));
+    let video = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    assert_eq!((&video.kind, video.text.as_str()), (&MessageKind::System, "Missed video call"));
+    // Answered on the phone: the ring ends and no line is left.
+    world.steer(&format!("call alan {}", T0 + 7_000));
+    world.until("Alan's row to be recorded", || world.conversation(ALAN).map(|row| row.unread == 0));
+    world.steer(&format!("hangup-accepted {}", T0 + 7_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(ALAN).is_empty(), "an answered call is not a missed one");
+    // A hangup for a call we never heard of leaves nothing.
+    world.steer(&format!("busy {}", T0 + 8_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(ALAN).is_empty());
+}
+
+#[test]
+fn a_newer_offer_takes_the_ring_and_only_its_own_hangup_ends_it() {
+    let world = World::linked();
+    world.connected();
+    // Grace rings, then Alan's newer offer takes the one ring slot.
+    world.steer(&format!("call grace {}", T0 + 5_000));
+    world.until("Grace's row to be recorded", || world.conversation(GRACE));
+    world.steer(&format!("call alan {}", T0 + 6_000));
+    world.until("Alan's row to be recorded", || world.conversation(ALAN));
+    // Grace's hangup is the displaced call's: it must not end Alan's ring or leave a line.
+    world.steer(&format!("hangup {}", T0 + 5_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(GRACE).is_empty() && world.messages(ALAN).is_empty());
+    // Only Alan's own hangup ends it: the caller gave up, so his missed-call line is left.
+    world.steer(&format!("hangup {}", T0 + 6_000));
+    let line = world.arrived(ALAN, &id(T0 + 6_000, ALAN));
+    assert_eq!((&line.kind, line.text.as_str(), line.outgoing, line.sender.id.as_str()), (&MessageKind::System, "Missed voice call", false, ALAN));
+    world.until("one unread", || (world.conversation(ALAN)?.unread == 1).then_some(()));
+}
+
+#[test]
 fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let world = World::linked();
     world.connected();
-    world.steer(&format!("incoming grace {} Lunch?", T0 + 1_000));
-    let theirs = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    let lunch = now_ms();
+    world.steer(&format!("incoming grace {lunch} Lunch?"));
+    let theirs = world.arrived(GRACE, &id(lunch, GRACE));
     world.send(GRACE, "3001", "Sure", None);
-    let ours = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    let ours = world.until("our message", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("3001") && message.id != "3001")
+    });
+    let ours_at = ours.id.split_once('-').unwrap().0;
 
     // Theirs: edited, reacted to (one reaction a person: the second replaces the first), deleted.
-    world.steer(&format!("edit grace {} Lunch at noon?", T0 + 1_000));
+    world.steer(&format!("edit grace {lunch} Lunch at noon?"));
     world.until("the edit", || world.messages(GRACE).into_iter().find(|m| m.id == theirs.id && m.edited && m.text == "Lunch at noon?"));
-    world.steer(&format!("react grace me {FIRST_SENT} 👍"));
+    world.steer(&format!("react grace me {ours_at} 👍"));
     world.until("their reaction", || world.messages(GRACE).into_iter().find(|m| m.id == ours.id && m.reactions.iter().any(|r| r.emoji == "👍")));
-    world.steer(&format!("react grace me {FIRST_SENT} ❤️"));
+    world.steer(&format!("react grace me {ours_at} ❤️"));
     let replaced = world.until("the second reaction", || {
         world.messages(GRACE).into_iter().find(|m| m.id == ours.id && m.reactions.iter().any(|r| r.emoji == "❤️"))
     });
     assert!(!replaced.reactions.iter().any(|r| r.emoji == "👍"), "{:?}", replaced.reactions);
-    world.steer(&format!("delete grace {}", T0 + 1_000));
+    world.steer(&format!("delete grace {lunch}"));
     world.until("the delete", || (!world.messages(GRACE).iter().any(|m| m.id == theirs.id)).then_some(()));
 
     // Ours: the user reacts, edits and deletes, and only their own messages can be changed.
@@ -374,19 +492,110 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let custom = world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: ":party:".into(), on: true });
     assert!(matches!(&custom, Response::Error { code: protocol::ErrorCode::Refused, .. }), "{custom:?}");
     assert!(!world.calls().iter().any(|call| call.contains(":party:")));
-    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into() }), Response::Ok);
-    world.heard(&format!("send {GRACE} edit {FIRST_SENT} Sure!"));
+    assert_eq!(
+        world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into(), spans: Vec::new() }),
+        Response::Ok
+    );
+
+    world.heard(&format!("send {GRACE} edit {ours_at} Sure!"));
     assert!(world.messages(GRACE).iter().any(|m| m.id == ours.id && m.edited && m.text == "Sure!"));
-    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into() });
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into(), spans: Vec::new() });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("own messages")), "{refused:?}");
     // Grace's phone has ours, then Grace read it.
     assert!(!world.conversation(GRACE).unwrap().delivered);
-    world.steer(&format!("delivered grace {FIRST_SENT}"));
+    world.steer(&format!("delivered grace {ours_at}"));
     world.until("delivered", || world.conversation(GRACE)?.delivered.then_some(()));
-    world.steer(&format!("seen grace {FIRST_SENT}"));
+    world.steer(&format!("seen grace {ours_at}"));
     world.until("seen", || world.conversation(GRACE)?.seen.then_some(()));
     assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: ours.id.clone() }), Response::Ok);
-    world.heard(&format!("send {GRACE} delete {FIRST_SENT}"));
+    world.heard(&format!("send {GRACE} delete {ours_at}"));
+}
+
+#[test]
+fn a_group_message_names_who_read_it_and_stays_unseen_until_both_have() {
+    let world = World::linked();
+    world.connected();
+    world.send(CLUB, "7301", "Deal?", None);
+    let ours = world.until("our group message", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("7301") && message.id != "7301")
+    });
+    let ours_at = ours.id.split_once('-').unwrap().0;
+    assert!(ours.deliveries.is_empty(), "{:?}", ours.deliveries);
+
+    world.steer(&format!("delivered grace {ours_at}"));
+    let grace = world.until("Grace's delivery", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        (message.deliveries.len() == 1).then_some(message)
+    });
+    assert_eq!(grace.deliveries[0].person, GRACE);
+    assert!(grace.deliveries[0].delivered.is_some());
+    assert!(!world.conversation(CLUB).unwrap().delivered, "one phone is not the whole group");
+    assert!(!world.conversation(CLUB).unwrap().seen);
+
+    world.steer(&format!("delivered alan {ours_at}"));
+    world.until("both deliveries", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        (message.deliveries.len() == 2).then_some(())
+    });
+    world.until("delivered once everyone has it", || world.conversation(CLUB)?.delivered.then_some(()));
+    assert!(!world.conversation(CLUB).unwrap().seen);
+
+    world.steer(&format!("seen grace {ours_at}"));
+    world.until("Grace's read", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        message.deliveries.iter().any(|delivery| delivery.person == GRACE && delivery.read.is_some()).then_some(())
+    });
+    assert!(!world.conversation(CLUB).unwrap().seen, "one reader is not the whole group");
+
+    world.steer(&format!("viewed alan {ours_at}"));
+    let both = world.until("both reads", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        let read = message.deliveries.iter().filter(|delivery| delivery.read.is_some()).count();
+        (read == 2).then_some(message)
+    });
+    let alan = both.deliveries.iter().find(|delivery| delivery.person == ALAN).expect("Alan");
+    assert!(alan.viewed.is_some() && alan.read.is_some());
+    world.until("seen once everyone has read", || world.conversation(CLUB)?.seen.then_some(()));
+}
+
+#[test]
+fn a_receipt_after_restart_stays_on_the_group_message() {
+    let mut world = World::linked();
+    world.connected();
+    world.send(CLUB, "7302", "Tuesday", None);
+    let ours = world.until("our group message", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("7302") && message.id != "7302")
+    });
+    let message_id = ours.id.clone();
+    let ours_at = ours.id.split_once('-').unwrap().0.to_owned();
+    world.restart();
+    world.connected();
+    world.steer(&format!("delivered grace {ours_at}"));
+    let message = world.until("the receipt on the group message", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == message_id)?;
+        message.deliveries.iter().any(|delivery| delivery.person == GRACE).then_some(message)
+    });
+    assert_eq!(message.deliveries.len(), 1);
+    assert!(world.messages(GRACE).iter().all(|message| message.id != message_id), "a group receipt was filed on the reader's direct chat");
+}
+
+#[test]
+fn a_message_says_when_read_receipts_are_off_and_names_who_a_send_missed() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} hi", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer("receipts off");
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 1_000, GRACE) }), Response::Ok);
+    world.heard(&format!("read receipts=false {}", id(T0 + 1_000, GRACE)));
+    world.steer("fail grace");
+    world.send(CLUB, "7303", "Quiet", None);
+    let ours = world.until("our group message", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("7303") && message.id != "7303")
+    });
+    assert_eq!(ours.receipt_note, "Read receipts are off");
+    let missed = ours.deliveries.iter().find(|delivery| delivery.person == GRACE).expect("Grace was missed");
+    assert_eq!(missed.failed, "Signal could not deliver this.");
 }
 
 #[test]
@@ -403,11 +612,46 @@ fn typing_is_heard_and_told_at_most_every_few_seconds() {
     });
     assert_eq!(typists.iter().map(|typist| typist.name.as_str()).collect::<Vec<_>>(), ["Grace Ombra"]);
     for _ in 0..3 {
-        world.ask(Request::Typing { conversation: key(GRACE) });
+        world.ask(Request::Typing { conversation: key(GRACE), activity: protocol::Compose::Typing });
     }
     world.heard(&format!("typing {GRACE} started"));
     sleep(Duration::from_millis(300));
     assert_eq!(world.calls().iter().filter(|call| call.starts_with("typing")).count(), 1);
+}
+
+#[test]
+fn typing_and_receipts_have_a_local_switch_that_stops_the_frames_here() {
+    let world = World::linked();
+    world.connected();
+    for (at, text) in [(1, "one"), (2, "two"), (3, "three")] {
+        world.steer(&format!("incoming grace {} {text}", T0 + at * 1_000));
+    }
+    world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    // Nothing stored: a read tells the author, as the account's own setting says.
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 1_000, GRACE) }), Response::Ok);
+    world.heard(&format!("read receipts=true {}", id(T0 + 1_000, GRACE)));
+    let scope = protocol::settings::account_scope(&account());
+    let set = |key: &str, value: Option<&str>| Request::Set { scope: scope.clone(), key: key.to_owned(), value: value.map(str::to_owned) };
+    // Receipts off: the chat is read here and nobody is told.
+    assert_eq!(world.ask(set(protocol::settings::RECEIPTS, Some("off"))), Response::Ok);
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 2_000, GRACE) }), Response::Ok);
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.calls().iter().filter(|call| call.starts_with("read ")).count(), 1, "a read went out with receipts off");
+    // Typing off: the wire is never asked.
+    assert_eq!(world.ask(set(protocol::settings::TYPING, Some("off"))), Response::Ok);
+    world.ask(Request::Typing { conversation: key(GRACE), activity: protocol::Compose::Typing });
+    sleep(Duration::from_millis(400));
+    assert!(world.calls().iter().all(|call| !call.starts_with("typing")), "a typing signal went out with typing off");
+    // Both back: the rows round-trip, and the frames go again.
+    assert_eq!(world.ask(set(protocol::settings::RECEIPTS, None)), Response::Ok);
+    assert_eq!(world.ask(set(protocol::settings::TYPING, None)), Response::Ok);
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 3_000, GRACE) }), Response::Ok);
+    world.heard(&format!("read receipts=true {},{}", id(T0 + 2_000, GRACE), id(T0 + 3_000, GRACE)));
+    // A fresh conversation, so the few-seconds memory of Grace's last one does not eat it.
+    world.steer(&format!("incoming alan {} hello", T0 + 4_000));
+    world.arrived(ALAN, &id(T0 + 4_000, ALAN));
+    world.ask(Request::Typing { conversation: key(ALAN), activity: protocol::Compose::Typing });
+    world.heard(&format!("typing {ALAN} started"));
 }
 
 #[test]
@@ -476,6 +720,75 @@ fn a_cancelled_link_stops_and_a_new_one_begins_afresh() {
     assert!(matches!(world.sign_in(Some(SignInInput::UseQr)), SignInStep::Failed { .. }));
     assert!(matches!(world.sign_in(None), SignInStep::Qr { .. }));
     world.ask(Request::SignInCancel { network: Network::Signal });
+}
+
+/// One pixel, so a send has a real picture to attach.
+fn card_png() -> Vec<u8> {
+    const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
+    (0..PNG.len()).step_by(2).map(|at| u8::from_str_radix(&PNG[at..at + 2], 16).unwrap()).collect()
+}
+
+#[test]
+fn a_file_is_sent_with_its_attachment_and_the_phones_copy_does_not_replace_it() {
+    let world = World::linked();
+    world.connected();
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|status| status.key == account()).expect("the Signal account");
+    assert_eq!(signal.can.max_file_bytes, 100 * 1024 * 1024);
+    assert_eq!(signal.can.max_files, 32);
+    assert_eq!(signal.can.caption_limit, 0);
+
+    // A direct chat exists once someone has written in it.
+    world.steer(&format!("incoming grace {} hello", T0 + 5_000));
+    world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("card.png");
+    std::fs::write(&path, card_png()).unwrap();
+    let asked = Request::Send {
+        conversation: key(GRACE),
+        client_id: "5001".into(),
+        text: "the hand".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: path.to_string_lossy().into_owned(),
+                name: "card.png".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..protocol::Outgoing::default()
+        },
+    };
+    let pending = match world.ask(asked) {
+        Response::Sent { message } => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
+    let sent = world.until("the sent file", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5001") && message.id != "5001")
+    });
+    let sent_at = sent.id.split_once('-').unwrap().0;
+    assert_eq!(sent.text.as_str(), "the hand");
+    assert!(matches!(sent.state, SendState::Sent), "{sent:?}");
+    assert_eq!(sent.attachments.len(), 1);
+    let file = &sent.attachments[0];
+    assert_eq!(file.name.as_str(), "card.png");
+    assert_eq!(file.file.kind, protocol::MediaKind::Image);
+    assert!(file.file.path.as_deref().is_some_and(|kept| std::fs::read(kept).is_ok_and(|bytes| !bytes.is_empty())));
+    world.heard(&format!("send {GRACE} files card.png the hand"));
+    assert_eq!(world.messages(GRACE).iter().filter(|message| message.outgoing).count(), 1);
+
+    // The phone's sync of the same send must not become a second row, or wipe the file.
+    world.steer(&format!("mine {sent_at} from the phone"));
+    sleep(Duration::from_millis(400));
+    let kept: Vec<Message> = world.messages(GRACE).into_iter().filter(|message| message.outgoing).collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].text.as_str(), "the hand");
+    assert_eq!(kept[0].attachments.len(), 1);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -568,4 +881,384 @@ fn note_to_self_from_the_phone_has_its_own_label() {
         (world.conversation(ME)?.title == "Note to Self").then_some(())
     });
     assert_eq!(world.messages(ME).len(), 1, "renaming must preserve messages");
+}
+
+#[test]
+fn a_payment_and_a_gift_badge_say_where_they_are_acting_on() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("payment grace {} for coffee", T0 + 4_000));
+    let paid = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    assert_eq!(
+        (paid.text.as_str(), &paid.kind),
+        ("Payment · open Signal on your phone — for coffee", &MessageKind::Unsupported { link: String::new() })
+    );
+    // No note, no dash.
+    world.steer(&format!("payment grace {}", T0 + 5_000));
+    let bare = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!(bare.text.as_str(), "Payment · open Signal on your phone");
+    // Redeeming is the phone's work, and the row says so.
+    world.steer(&format!("giftbadge grace {}", T0 + 6_000));
+    let badge = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    assert_eq!(badge.text.as_str(), "Gift badge · open Signal on your phone to redeem");
+}
+
+#[test]
+fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} hello", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.send(GRACE, "5001", "**Hold** ||the plan||", None);
+    let styled = world.until("styled message", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5001") && message.id != "5001")
+    });
+    let styled_at = styled.id.split_once('-').unwrap().0.to_owned();
+    assert_eq!(styled.text, "Hold the plan");
+    let bold = styled.spans.iter().any(|span| span.style == protocol::Style::Bold && styled.text.get(span.start as usize..span.end as usize) == Some("Hold"));
+    let hidden = styled.spans.iter().any(|span| span.style == protocol::Style::Spoiler && styled.text.get(span.start as usize..span.end as usize) == Some("the plan"));
+    assert!(bold && hidden, "{:?}", styled.spans);
+    world.heard(&format!("send {GRACE} text Hold the plan ranges=Bold:0+4,Spoiler:5+8"));
+    let preview = world.conversation(GRACE).unwrap().preview;
+    assert!(!preview.contains("plan"), "{preview}");
+    world.send(GRACE, "5002", "ok", Some(&styled.id));
+    let answered = world.until("reply to styled", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5002") && message.id != "5002")
+    });
+    assert_eq!(answered.reply_to.as_ref().map(|reply| reply.snippet.as_str()), Some("Hold Spoiler"));
+    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into(), spans: Vec::new() }), Response::Ok);
+    world.heard(&format!("send {GRACE} edit {styled_at} no ranges=Strike:0+2"));
+    let edited = world.until("the strike", || {
+        world.messages(GRACE).into_iter().find(|message| message.text == "no" && message.spans.iter().any(|span| span.style == protocol::Style::Strike))
+    });
+    assert_eq!(edited.text.get(edited.spans[0].start as usize..edited.spans[0].end as usize), Some("no"));
+}
+
+#[test]
+fn a_changed_reaction_after_restart_replaces_the_old_emoji() {
+    let mut world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} Lunch?", T0 + 1_000));
+    let theirs = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer(&format!("incoming grace {} Still there?", T0 + 2_000));
+    let again = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
+
+    world.steer(&format!("react grace grace {} 👍", T0 + 1_000));
+    world.until("Grace's first reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == theirs.id && message.reactions.iter().any(|reaction| reaction.emoji == "👍"))
+    });
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "👍".into(), on: true }), Response::Ok);
+    world.until("our first reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == again.id && message.reactions.iter().any(|reaction| reaction.emoji == "👍" && reaction.mine))
+    });
+
+    world.restart();
+    world.connected();
+
+    world.steer(&format!("react grace grace {} ❤️", T0 + 1_000));
+    let replaced = world.until("Grace's new reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == theirs.id && message.reactions.iter().any(|reaction| reaction.emoji == "❤️"))
+    });
+    let emojis: Vec<&str> = replaced.reactions.iter().map(|reaction| reaction.emoji.as_str()).collect();
+    assert_eq!(emojis, ["❤️"], "{:?}", replaced.reactions);
+
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "❤️".into(), on: true }), Response::Ok);
+    let held = world.until("our new reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == again.id && message.reactions.iter().any(|reaction| reaction.emoji == "❤️" && reaction.mine))
+    });
+    let mine: Vec<&str> = held.reactions.iter().map(|reaction| reaction.emoji.as_str()).collect();
+    assert_eq!(mine, ["❤️"], "{:?}", held.reactions);
+}
+
+#[test]
+fn a_username_lookup_opens_a_chat() {
+    let world = World::linked();
+    world.connected();
+    let ada = "d4d4d4d4-0000-4000-8000-000000000004";
+    world.steer(&format!("lookup ada.42 {ada}"));
+    let search = |query: &str| Request::People {
+        network: Some(Network::Signal),
+        relation: None,
+        query: Some(query.into()),
+        offset: 0,
+        limit: 20,
+    };
+    let Response::People { people, .. } = world.ask(search("ada.42")) else {
+        panic!("no people");
+    };
+    assert!(people.iter().all(|person| person.handle != "ada.42"));
+    let found = world.until("ada.42", || match world.ask(search("ada.42")) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.handle == "ada.42" && person.key.id == ada),
+        _ => None,
+    });
+    world.heard("lookup ada.42");
+    let Response::Conversation { conversation } = world.ask(Request::StartDirect { person: found.key }) else {
+        panic!("no conversation");
+    };
+    assert_eq!((conversation.key.id.as_str(), conversation.kind, conversation.title.as_str()), (ada, ConversationKind::Direct, "ada.42"));
+    let (_, seq) = world.status();
+    world.ask(search("Grace"));
+    world.changed(seq, "the name search to finish", |change| match change {
+        Change::Searched { query, .. } if query == "Grace" => Some(()),
+        _ => None,
+    });
+    assert!(!world.calls().iter().any(|call| call.contains("Grace")), "{:?}", world.calls());
+
+    // Looking up a username that resolves to an already-known contact keeps their name and avatar.
+    world.ask(Request::Watch(protocol::Watching { people: vec![key(GRACE)], ..Default::default() }));
+    let avatar = world.until("Grace's picture", || match world.ask(search("Grace")) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == GRACE).and_then(|person| person.avatar),
+        _ => None,
+    });
+    world.steer(&format!("lookup grace.42 {GRACE}"));
+    let (_, seq) = world.status();
+    world.ask(search("grace.42"));
+    world.changed(seq, "grace.42 lookup to finish", |change| match change {
+        Change::Searched { query, .. } if query == "grace.42" => Some(()),
+        _ => None,
+    });
+    let Response::People { people, .. } = world.ask(search("grace.42")) else {
+        panic!("no people");
+    };
+    let grace = people.into_iter().find(|person| person.key.id == GRACE).expect("Grace after username lookup");
+    assert_eq!((grace.name.as_str(), grace.handle.as_str()), ("Grace Ombra", "grace.42"));
+    assert_eq!(grace.avatar.as_ref().map(|file| &file.id), Some(&avatar.id));
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// The phone deleted one message for this device only. It leaves the chat, with no time limit.
+#[test]
+fn delete_for_me_from_the_phone_removes_the_message() {
+    let world = World::linked();
+    world.connected();
+    let sent = now_ms();
+    world.steer(&format!("incoming grace {sent} Keep this?"));
+    let message = world.arrived(GRACE, &id(sent, GRACE));
+    world.steer(&format!("delete-for-me grace {sent}"));
+    world.until("the message to leave", || (!world.messages(GRACE).iter().any(|m| m.id == message.id)).then_some(()));
+    assert!(world.conversation(GRACE).is_some(), "deleting one message keeps the chat");
+}
+
+/// A delete for everyone older than Signal's receive window stays. A fresh one still lands.
+#[test]
+fn a_late_delete_for_everyone_is_ignored() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {T0} Old"));
+    let old = world.arrived(GRACE, &id(T0, GRACE));
+    let fresh = now_ms();
+    world.steer(&format!("incoming grace {fresh} New"));
+    world.arrived(GRACE, &id(fresh, GRACE));
+    world.steer(&format!("delete grace {T0}"));
+    world.steer(&format!("delete grace {fresh}"));
+    world.until("the fresh delete", || (!world.messages(GRACE).iter().any(|m| m.id == id(fresh, GRACE))).then_some(()));
+    assert!(world.messages(GRACE).iter().any(|m| m.id == old.id), "a two-day-old delete for everyone is ignored");
+}
+
+/// Past the send window, Delete removes the message here and tells the phone, and does not tell everyone.
+#[test]
+fn deleting_an_old_message_is_delete_for_me() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("mine {T0} From the phone"));
+    let old = world.arrived(GRACE, &id(T0, ME));
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into(), spans: Vec::new() });
+    assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("no longer")), "{refused:?}");
+    assert!(!world.calls().iter().any(|call| call.contains(&format!("edit {T0}"))));
+    assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: old.id.clone() }), Response::Ok);
+    world.heard(&format!("send {GRACE} delete-for-me {T0}"));
+    assert!(!world.calls().iter().any(|call| call == &format!("send {GRACE} delete {T0}")));
+    world.until("the local delete", || (!world.messages(GRACE).iter().any(|m| m.id == old.id)).then_some(()));
+}
+
+/// The phone deleted the whole chat for this device.
+#[test]
+fn delete_chat_for_me_from_the_phone_removes_the_chat() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} hello", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer("delete-chat grace");
+    world.until("the chat to leave the list", || {
+        let row = world.conversation(GRACE)?;
+        (row.hidden && world.messages(GRACE).is_empty()).then_some(())
+    });
+}
+
+/// Signal's edit window is one day. There is no delete-window field to report beside it.
+#[test]
+fn signal_reports_a_one_day_edit_window() {
+    let world = World::linked();
+    world.connected();
+    let (accounts, _) = world.status();
+    let signal = accounts.into_iter().find(|status| status.key == account()).unwrap();
+    assert_eq!(signal.can.edit_window, 24 * 60 * 60);
+}
+
+/// A day-old message is not offered as a delete for everyone. Delete for me stays.
+#[test]
+fn a_delete_older_than_the_window_is_not_offered_for_everyone() {
+    let hour = 60 * 60 * 1000;
+    let now = 50 * hour;
+    let recent = chatd::adapters::signal::can(now - hour, now, true, false);
+    assert!(recent.edit && recent.delete_for_everyone && recent.delete_for_me);
+    let late = chatd::adapters::signal::can(now - 25 * hour, now, true, false);
+    assert!(!late.edit && !late.delete_for_everyone && late.delete_for_me, "{late:?}");
+    let note = chatd::adapters::signal::can(now - 25 * hour, now, true, true);
+    assert!(note.delete_for_everyone && !note.edit && note.delete_for_me);
+    let theirs = chatd::adapters::signal::can(now - hour, now, false, false);
+    assert!(!theirs.edit && !theirs.delete_for_everyone && theirs.delete_for_me);
+    assert!(chatd::adapters::signal::accept_remote(now - 47 * hour, now, false));
+    assert!(!chatd::adapters::signal::accept_remote(now - 49 * hour, now, false));
+    assert!(chatd::adapters::signal::accept_remote(now - 49 * hour, now, true));
+}
+
+/// A rename while connected updates the row and writes one system line. The first snapshot does not.
+#[test]
+fn a_renamed_group_takes_the_new_name_and_one_system_row() {
+    let world = World::linked();
+    world.connected();
+    assert_eq!(world.conversation(CLUB).unwrap().title, "Bridge club");
+    assert!(world.messages(CLUB).iter().all(|message| message.kind != MessageKind::System));
+    world.steer("group-title Wednesday club");
+    world.until("the new name", || (world.conversation(CLUB)?.title == "Wednesday club").then_some(()));
+    let systems: Vec<_> = world.messages(CLUB).into_iter().filter(|message| message.kind == MessageKind::System).collect();
+    assert_eq!(systems.len(), 1, "{systems:?}");
+    assert_eq!(systems[0].text, "The group name is now Wednesday club");
+    assert!(!world.conversation(CLUB).unwrap().read_only);
+
+    // Leaving marks the group read-only, a rename while removed keeps it read-only,
+    // and being re-added clears read-only again.
+    world.steer("group-leave");
+    world.until("read-only after leave", || world.conversation(CLUB)?.read_only.then_some(()));
+    world.steer("group-title Thursday club");
+    world.until("renamed while removed", || (world.conversation(CLUB)?.title == "Thursday club").then_some(()));
+    assert!(world.conversation(CLUB).unwrap().read_only);
+    world.steer("group-rejoin");
+    world.until("writable after rejoin", || (!world.conversation(CLUB)?.read_only).then_some(()));
+}
+
+/// The sentence for a rename, a join, and leaving. The connect snapshot is not a sentence.
+#[test]
+fn a_group_delta_names_the_rename_the_join_and_the_leave() {
+    chatd::adapters::signal::prove_signal_group_rename().expect("rename");
+    let before = chatd::adapters::signal::GroupSnap {
+        members: vec![chatd::adapters::signal::MemberSnap { id: ME.into(), admin: false }],
+        ..chatd::adapters::signal::GroupSnap::default()
+    };
+    let mut members = before.members.clone();
+    members.push(chatd::adapters::signal::MemberSnap { id: GRACE.into(), admin: false });
+    let after = chatd::adapters::signal::GroupSnap { members, ..chatd::adapters::signal::GroupSnap::default() };
+    let joined = chatd::adapters::signal::group_delta(&before, &after, ME, |id| if id == GRACE { "Grace Ombra".into() } else { String::new() });
+    assert_eq!(joined.lines, ["Grace Ombra joined the group"]);
+    assert!(!joined.left);
+}
+
+#[test]
+fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
+    let world = World::linked();
+    world.connected();
+    let sent = T0 + 4_000;
+    world.steer(&format!("poll grace {sent} Dinner? | Thai | Pizza"));
+    let poll = world.arrived(CLUB, &id(sent, GRACE));
+    let held = poll.poll.expect("a poll");
+    assert_eq!(poll.text, "Poll: Dinner?");
+    assert_eq!(poll.kind, MessageKind::Normal);
+    assert_eq!(held.question, "Dinner?");
+    assert!(!held.multiple && !held.closed && held.mine.is_empty());
+    assert_eq!(held.choices.iter().map(|choice| (choice.text.as_str(), choice.count)).collect::<Vec<_>>(), [("Thai", 0), ("Pizza", 0)]);
+
+    // Grace moves from Thai to Pizza; Alan picks Thai. Counts follow the latest vote.
+    world.steer(&format!("vote grace grace {sent} 0"));
+    world.steer(&format!("vote grace grace {sent} 1"));
+    world.steer(&format!("vote alan grace {sent} 0"));
+    let voted = world.until("both votes", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        let poll = message.poll.as_ref()?;
+        (poll.choices[0].count == 1 && poll.choices[1].count == 1).then_some(message)
+    });
+    let voted = voted.poll.unwrap();
+    assert_eq!(voted.choices[0].voters, vec![ALAN.to_owned()]);
+    assert_eq!(voted.choices[1].voters, vec![GRACE.to_owned()]);
+
+    let multiple_at = T0 + 8_000;
+    world.steer(&format!("pollmulti alan {multiple_at} Sides? | Soup | Salad"));
+    world.steer(&format!("vote alan alan {multiple_at} 0,1"));
+    world.until("both sides", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == id(multiple_at, ALAN))?;
+        let poll = message.poll.as_ref()?;
+        (poll.multiple && poll.choices.iter().all(|choice| choice.count == 1)).then_some(())
+    });
+
+    // A file cannot ride along. Nothing is asked of Signal.
+    let with_file = Request::Send {
+        conversation: key(CLUB),
+        client_id: "poll-file".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false }),
+            files: vec![OutgoingFile { path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false }],
+            ..Outgoing::default()
+        },
+    };
+    match world.ask(with_file) {
+        Response::Error { code: ErrorCode::Refused, detail } => assert_eq!(detail, "A poll can't carry a file."),
+        other => panic!("{other:?}"),
+    }
+    assert!(!world.calls().iter().any(|call| call.contains("poll")));
+
+    // Our vote is on the wire, then a retraction. Ending someone else's poll is refused.
+    assert_eq!(world.ask(Request::Poll { conversation: key(CLUB), message_id: poll.id.clone(), votes: Some(vec![0]) }), Response::Ok);
+    world.heard(&format!("send {CLUB} vote {sent}-{GRACE} 0 serial=1"));
+    world.until("our vote", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        let held = message.poll.as_ref()?;
+        (held.mine == vec![0] && held.choices[0].count == 2 && message.text == "Poll: Dinner?").then_some(())
+    });
+    assert_eq!(world.ask(Request::Poll { conversation: key(CLUB), message_id: poll.id.clone(), votes: Some(vec![]) }), Response::Ok);
+    world.heard(&format!("send {CLUB} vote {sent}-{GRACE} - serial=2"));
+    world.until("the retraction", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        let held = message.poll?;
+        (held.mine.is_empty() && held.choices[0].count == 1 && held.choices[1].count == 1).then_some(())
+    });
+    match world.ask(Request::Poll { conversation: key(CLUB), message_id: poll.id.clone(), votes: None }) {
+        Response::Error { code: ErrorCode::Refused, detail } => assert!(detail.contains("started"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+
+    let started = Request::Send {
+        conversation: key(CLUB),
+        client_id: "poll-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            poll: Some(PollDraft { question: "Next week?".into(), options: vec!["Yes".into(), "No".into()], multiple: false }),
+            ..Outgoing::default()
+        },
+    };
+    let Response::Sent { message: pending } = world.ask(started) else { panic!("not sent") };
+    assert_eq!(pending.text, "Poll: Next week?");
+    let ours = world.until("our poll", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("poll-1") && message.id != "poll-1")
+    });
+    let created = ours.id.split_once('-').unwrap().0;
+    assert_eq!(ours.client_id.as_deref(), Some("poll-1"));
+    assert_eq!(ours.poll.as_ref().map(|poll| poll.choices.len()), Some(2));
+    world.heard(&format!("send {CLUB} poll Next week? | Yes | No multi=false"));
+    assert_eq!(world.ask(Request::Poll { conversation: key(CLUB), message_id: ours.id.clone(), votes: None }), Response::Ok);
+    world.heard(&format!("send {CLUB} endpoll {created}"));
+    world.until("our poll to end", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        message.poll.as_ref().filter(|poll| poll.closed).map(|_| ())
+    });
+    world.steer(&format!("endpoll grace {sent}"));
+    world.until("Grace's poll to end", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        message.poll.as_ref().filter(|poll| poll.closed).map(|_| ())
+    });
 }

@@ -1,0 +1,12 @@
+{
+  "id": "command-palette",
+  "title": "Rebinding Quick Switcher moves the chord and the menu label",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. Shortcut rebinding is a keyboard's.",
+    "ios": "The phone proof build does not run the desktop window. Shortcut rebinding is a keyboard's."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

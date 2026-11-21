@@ -127,6 +127,11 @@ pub fn prove_first_encrypted_message() -> Result<(), String> {
     e2ee::prove_first_encrypted_message()
 }
 
+/// The lab's encrypted-reaction proof. See `e2ee::prove_encrypted_reaction`.
+pub fn prove_encrypted_reaction() -> Result<(), String> {
+    e2ee::prove_encrypted_reaction()
+}
+
 /// The lab's join-order proof. `call.join` is sent before the room's mediad settings.
 pub fn prove_join_before_room() -> Result<(), &'static str> {
     let steps = live::after_offer();

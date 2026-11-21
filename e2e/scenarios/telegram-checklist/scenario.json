@@ -1,0 +1,12 @@
+{
+  "id": "telegram-checklist",
+  "title": "A Telegram checklist shows its items, and a done item is checked",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same list text is what a checklist maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same list text is what a checklist maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

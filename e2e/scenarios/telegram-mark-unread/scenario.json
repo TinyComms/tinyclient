@@ -1,0 +1,12 @@
+{
+  "id": "telegram-mark-unread",
+  "title": "Telegram: mark a chat as unread",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The unread mark is the same badge a dialog's manual mark becomes.",
+    "ios": "The phone proof build does not run desktop chatd. The unread mark is the same badge a dialog's manual mark becomes."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -2,10 +2,18 @@ name: Site
 
 # Publishes site/ to tinyclient.io (Cloudflare Pages project "tinyclient"). The token can only
 # deploy Pages and edit the tinyclient.io zone.
+#
+# The size and memory numbers on the site are filled in from measurements, not typed
+# (.github/scripts/site-perf.py). CI measures the build of every push to main, so this also runs
+# when that CI run ends, and publishes the site again with that build's reading.
 on:
   push:
     branches: [main]
-    paths: ["site/**", ".github/workflows/site.yml", ".github/scripts/dns-aid.py"]
+    paths: ["site/**", ".github/workflows/site.yml", ".github/scripts/dns-aid.py", ".github/scripts/site-perf.py"]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -14,12 +22,36 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   deploy:
+    # A CI run that a pull request started says nothing about main.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     steps:
+      # main as it is now, whichever event started this: a run started by CI ending would
+      # otherwise publish the commit CI ran on, which may already be behind.
       - uses: actions/checkout@v5
+        with:
+          ref: main
+      # The newest reading CI has for main. Without one, the committed reading stays.
+      - name: Fill in the measured numbers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --event push --limit 15 --json databaseId --jq '.[].databaseId'); do
+            if gh run download "$run" --repo "$GITHUB_REPOSITORY" --name perf-build --dir "$RUNNER_TEMP/perf" 2>/dev/null; then
+              echo "reading from CI run $run"; cat "$RUNNER_TEMP/perf/build.json"
+              break
+            fi
+          done
+          if [ -f "$RUNNER_TEMP/perf/build.json" ]; then
+            python3 .github/scripts/site-perf.py --build "$RUNNER_TEMP/perf/build.json"
+          else
+            echo "no reading from CI yet; publishing the committed one"
+            python3 .github/scripts/site-perf.py
+          fi
       # The site promises it loads nothing from anywhere else; fail the deploy if a page would.
       - name: No third-party requests
         run: |

@@ -10,12 +10,12 @@ The tables under "Information architecture" are the control design. A row marked
 
 | Section | Rows | Notes |
 | --- | --- | --- |
-| General | G2, G4 | G2 "Keep receiving when the window is closed" is in the window on macOS only. Linux uses the systemd user unit when that unit is enabled; quitting the GUI then leaves chatd up either way. G4 is automatic updates from the public GitHub release. |
+| General | G1, G2, G3 (Windows), G4 | G1 starts tinyclient when the person signs in, through each system's own startup entry. G2 "Keep receiving when the window is closed" is in the window on macOS only. Linux uses the systemd user unit when that unit is enabled; quitting the GUI then leaves chatd up either way. G3 is the tray: closing the window hides it into the icon, which exists on Windows so far. G4 is automatic updates from the public GitHub release. |
 | Notifications | N1, N2, ND, NG, NM, NT, N4, NL, N5–N11, N13 | ND / NG / NM / NT are "Direct messages", "Group chats", "Mentions in channels", "Tiny servers". There is no N3 per-account menu. NL is the lock-screen preview and is hidden on macOS, where the OS does that. N10 and N11 use the host's flash and badge labels and are hidden on Linux. |
 | Sounds | S1–S4, SV | Five message sounds, two rings, or None. No "System alert sound". SV is notification volume and is hidden on macOS. |
 | Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
 | Messages | M1–M6 | Send key, where a conversation opens, typing line, emoticons, GIF and sticker autoplay, spelling. |
-| Privacy | P1–P4, PE | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal says the phone. Messages says the phone. |
+| Privacy | P1–P4, PE | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal has a local switch that stops tinyclient only; the phone still decides. Messages says the phone. |
 | Audio & video | V1, V2, V4, V5 | Microphone, speaker, join muted, call volume. |
 | Voice | V3, V6, V8, V10–V19, S7–S10 | Input level, sensitivity, voice activation or push-to-talk, echo cancellation, noise suppression, automatic gain, key recorders, release delay, call cues and their volume. |
 | Storage | D1–D3 | Usage, cap (default 500 MB), clear. Sign-ins, drafts, and settings stay. |
@@ -28,14 +28,12 @@ chatd keeps the notification, sound, privacy, voice, and storage values. The she
 
 | Gap | What search says, or what the code does |
 | --- | --- |
-| G1 Open at login | "tinyclient has no open-at-login setting yet." |
-| G3 Menu bar | No tray icon on this commit's search line. |
 | A1 Light theme | "tinyclient is dark only for now." |
 | N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. chatd can store an account-level notify word; the window does not show N3. |
 | N14, N15 | No reaction or thread-follow notify control. |
 | S5, S6 pickers | chatd will honor an account or conversation sound if one is stored. No row was found that writes them. |
 | S13 custom files, S14 ring-back | Both are in: sounds of your own in every picker, and a ring back while you call. |
-| P5 screen-share hide, P6 Touch ID, P7 Signal relay | In `NOT_YET` or absent. |
+| P5 screen-share hide, P7 Signal relay | In `NOT_YET` or absent. |
 | V7 camera device | "tinyclient has no camera yet." A Tiny call can still toggle the camera from the call dock. That is `06-calls.md`. |
 | V9 per-person volume | `CallGain` on a Tiny participant row, not a Settings row. |
 | Proxy, accent, font, language, sync | `NOT_YET`. |
@@ -96,7 +94,7 @@ Each setting has exactly one home. The Settings window reads and writes both.
 | --- | --- | --- |
 | chatd: table `settings(scope, key, value)` in `chat.sqlite` | Anything chatd acts on while the window may be closed: notifications, sounds, pause, quiet hours, privacy, call devices, storage, quit behaviour | chatd posts notifications and talks to the networks; the window may not be running |
 | Shell: `shell.prefs` | Anything only the window draws or reads: theme, text size, density, send key, list previews, last Settings section | It is read before the first frame, so the window opens looking right |
-| The OS | Notification permission, Focus. Open at login is not a setting (G1). | The OS is the source of truth; tinyclient reads it, never caches a copy |
+| The OS | Notification permission, Focus, and the sign-in entry G1 keeps: the per-user Run key, a LaunchAgent, an XDG autostart file | The entry is the OS's own: written and removed where that system reads it, and rewritten with the running path at launch while the switch is on |
 
 `scope` is `""` for global, `account:<network>:<id>` for one account (one Slack workspace is one
 account), and `conv:<network>:<id>` for one conversation.
@@ -122,14 +120,19 @@ One group per network, a row per account with state in words, Sign out, Sign in 
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| G1 | Open at login | Switch | | G | OS | Not in 0.2.35. Search: "tinyclient has no open-at-login setting yet." | not in 0.2.35 |
+| G1 | Open at login | Switch | Off | G | s | On: the system starts tinyclient at sign-in. Windows: the per-user Run key (the uninstaller removes it; a disable in Task Manager's Startup tab wins). macOS: a LaunchAgent in `~/Library/LaunchAgents`. Linux: an XDG autostart file in `~/.config/autostart`. Rewritten with the running path at every launch, so a moved portable copy keeps starting | in |
 | G2 | Keep receiving when the window is closed | Switch | On | G | d | On: closing the window hides it and chatd keeps running. Off: closing the window quits the window and chatd. In the window on macOS only. Linux uses the systemd user unit when that unit is enabled. | in |
-| G3 | Show in menu bar | Switch | Off | G | s | | Later |
+| G3 | Keep tinyclient in the tray when I close the window | Switch | Off | G | s | On (Windows so far): closing the window hides it and chatd keeps running; the icon's click reopens the window, its menu has Open and Quit, and Quit stops chatd like ⌘Q. Off: closing the window quits tinyclient, as it does today. macOS hides behind G2 instead; Linux waits for its StatusNotifierItem. Search answers "no tray icon yet" where the icon does not exist. | in |
 | G4 | Install updates automatically | Switch | On | G | s | On: a newer GitHub release is downloaded while the window is open and replaces this copy on quit. Off: the notice still appears and nothing is downloaded until asked | in |
 
 Caption under G2: "Closing the window leaves tinyclient running. Quit with ⌘Q to
 stop it." ⌘Q stops chatd and the window unless the optional Linux systemd user
 service is enabled; in that mode systemd owns the daemon's lifetime (see below).
+
+Caption under G3 (Windows): off, "Off: closing the window quits tinyclient, as it
+does now."; on, "Closing the window keeps tinyclient running in the tray. Quit
+tinyclient ends it." The first close after a start shows one balloon saying the
+app is still running and that the icon is how it comes back.
 
 ### Notifications
 
@@ -218,8 +221,8 @@ no control.
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| P1 | Let others see when I am typing | Per account switch; fixed rows for Telegram, Signal, and Messages | Discord off, Slack on, Teams on. Telegram: "Always on", caption "Telegram does not let an app turn this off." Signal: "Set on your phone". Messages: the phone decides. | A | d | Off: the adapter sends no typing signal | in |
-| P2 | Let others see what I have read | Teams switch; fixed rows for Telegram, Signal, and Messages | Teams on. Telegram "Always on". Signal "Set on your phone". Messages: the phone decides. | A | d | Teams off: no consumption-horizon update is sent; the chat is still marked read here. Caption: "Off also leaves chats unread on your other devices." Group caption: "Discord and Slack have no read receipts." | in |
+| P1 | Let others see when I am typing | Per account switch; fixed rows for Telegram and Messages | Discord off, Slack on, Teams on, Signal on. Telegram: "Always on", caption "Telegram does not let an app turn this off." Signal: a local stop only, caption "Your phone's setting decides too; this stops only tinyclient." Messages: the phone decides. | A | d | Off: the adapter sends no typing signal | in |
+| P2 | Let others see what I have read | Teams and Signal switch; fixed rows for Telegram and Messages | Teams on, Signal on. Telegram "Always on". Signal: a local stop; off also skips the read sync to this account's devices, and the phone's setting still decides. Messages: the phone decides. | A | d | Teams off: no consumption-horizon update is sent; the chat is still marked read here. Signal off: no receipt frame leaves, and no read sync either. Caption: "Off also leaves chats unread on your other devices." (Signal: "Off also leaves chats unread on your other devices. Your phone's setting decides too.") Group caption: "Discord and Slack have no read receipts." | in |
 | P3 | Load images and link previews automatically | Switch | On | G | s | Off: each image or preview is one line with its size; a click loads it. Nothing is fetched until clicked | in |
 | PL | Confirm before opening links | Switch | On | G | s | A click on a web link in a message shows the site it really goes to (registrable domain, with punycode decoded and the `xn--` form beside it for an internationalised name) and offers Open, Copy link and Cancel, plus "Don't ask again for <domain>", kept on this device (`link_ok` lines in `shell.prefs`; "Forget all" is PF). Off: links open at once. A name that mixes alphabets or passes for Latin letters, or an address with a user name before the `@`, is always asked about, and never gets "Don't ask again". Only http and https are ever links | in |
 | PS | Strip tracking parameters when opening | Switch | Off | G | s | On: `utm_*`, `fbclid`, `gclid`, `mc_eid`, `igshid` and the like are taken out of the address as it opens; the rest of the address is untouched. The address is handed to the system's opener alone, so no page is the referrer | in |
@@ -227,7 +230,7 @@ no control.
 | P4 | Keep messages on this computer for | Segmented: "7 days" / "30 days" / "90 days" | 90 days | G | d | The age half of the retention rule (`store.rs`); the 2,000 per conversation cap stays. Pruned within 1 min of the change and daily | in |
 | PE | Only join end-to-end encrypted calls | Switch | Off | G | s | Off on purpose: a server or an app that cannot encrypt calls would stop working. Either way a Tiny call whose server turns encryption off stops sending and playing ("Encryption was turned off" on the call badge); off, the security panel offers "Carry on without encryption", on, it offers only leaving, and a server with no end-to-end calls is not joined. Incognito hosts (`incognito.tinyclient.io` and names under it) and `e2ee_required` rooms behave as on whatever the switch says. Read when a call is joined | in |
 | P5 | Hide tinyclient from screen sharing and recordings | Switch | | G | s | | Later (spike: macOS 15 capture may ignore `sharingType`) |
-| P6 | Lock with Touch ID | Switch | | G | s | | Later |
+| P6 | Lock tinyclient | Off, after 1 minute, after 5 minutes, after 1 hour, and when the screen locks | Off | G | s | Covers the window. A notification then says "New message" with no sender or text, and Reply is refused. A ring can still be answered. Unlock uses device approval; Linux keeps a passphrase hash in the window prefs. The cache is not encrypted. A phone hides the app switcher while the lock is on. | in |
 | P7 | Signal: always relay calls | Switch | | A | d | | Later, with Signal calls |
 
 ### Audio & video
@@ -405,7 +408,8 @@ the control is not shown on that platform.
 - No setting is read from a network's account settings and copied into tinyclient. What the
   network enforces (mutes, Do Not Disturb, `suppress_everyone`, Signal's receipt and typing
   choices, a Teams admin's policy) is honoured live from the network's events and shown as a
-  fixed row or caption, never stored as a tinyclient value.
+  fixed row or caption, never stored as a tinyclient value. Signal's P1 and P2 switches are a
+  local stop on top of that, stricter than the account, never the account's value itself.
 - No setting is written to a network, except the mute that already exists (N12) and is the
   network's own.
 - No import from the official apps, browsers or other Macs. No export, no sync, no backup.
@@ -468,9 +472,13 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 "com.apple.usernotifications"'` or the e2e harness's capture.
 
 **General**
-- G1: not in 0.2.35. There is no open-at-login switch and no Login Items row.
+- G1: on, sign out and in: tinyclient starts by itself. Off then: the entry is gone. Windows: the
+  Run value; macOS: the LaunchAgent file; Linux: the autostart file.
 - G2: off, ⌘W: no shell and no chatd within 2 s. On, ⌘W: chatd still answers `ping`; a DM
   posts. ⌘Q in both cases: no tinyclient process within 2 s.
+- G3 (Windows): on, close the window: the window is gone, the process stays, `chatd` still
+  answers `ping`, and the icon's click brings the window back. Quit in the icon's menu: no
+  tinyclient and no chatd within 2 s. Off, closing the window quits as before.
 
 **Notifications**
 - N1: off, inject a DM: nothing posted; `list` shows unread 1; badge 1.
@@ -521,7 +529,8 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 **Privacy**
 - P1: Discord off, type in a Discord DM: no `POST /typing` in chatd's request log. On: at most one
   per 8 s.
-- P2: Teams off, read a chat: no consumption-horizon PUT; the row shows read here.
+- P2: Teams off, read a chat: no consumption-horizon PUT; the row shows read here. Signal off,
+  read a chat: no receipt frame and no read sync reaches the wire; the row shows read here.
 - P3: off: opening a conversation with images makes no `Fetch` request until a click.
 - P4: 7 days: rows older than 7 days are gone within 1 min (`sqlite3` count is 0).
 
@@ -546,7 +555,7 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
   are untouched.
 
 **Search and keyboard**
-- Searching "ding" lists S2, S3, S4. "dark" and "login" return the `NOT_YET` line (A1 and G1 are not in 0.2.35). "proxy" shows the honest line. "System alert sound" is not a result.
+- Searching "ding" lists S2, S3, S4. "dark" returns the `NOT_YET` line (A1 is not in 0.2.35). "login", "startup" and "autostart" find G1 Open at login. "proxy" shows the honest line. "System alert sound" is not a result.
 - With the mouse unplugged, every control that is in the window can be reached and changed from ⌘, (scripted
   keystrokes in the e2e harness).
 
@@ -558,8 +567,7 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 
 | Item | Waits on |
 | --- | --- |
-| G1 Open at login | A login item. Search says there is none yet. |
-| G3 Show in menu bar | No tray icon on this commit. |
+| G3 on Linux | The tray icon (StatusNotifierItem) and with it the switch; until then the systemd user unit holds chatd. Windows is in. |
 | A1 Light theme | Dark only. |
 | N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. |
 | N14 Reaction notifications, N15 thread replies | No reaction or thread-follow notify control. |
@@ -568,7 +576,6 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 | S13 Custom sound files | Built: Settings › Sounds › Your sounds. |
 | S14 Ring-back tone, longer looping ring | Ring back is built; an optional looping ringtone is not. |
 | P5 Hide from screen sharing | `NOT_YET`. |
-| P6 Touch ID lock | `NOT_YET`. |
 | P7 Signal always relay | `NOT_YET`. |
 | V7 Camera device | "tinyclient has no camera yet." The call-dock camera toggle is `06-calls.md`. |
 | Proxy, accent, font, language, sync | `NOT_YET`. A proxy, if it is ever offered, is Telegram only. It is not a setting. |

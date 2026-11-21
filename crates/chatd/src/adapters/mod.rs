@@ -37,6 +37,11 @@ pub fn prove_discord_group_dm() -> Result<(), String> {
 pub fn prove_discord_mark_unread() -> Result<(), String> {
     discord::prove_mark_unread()
 }
+
+/// `TINYCLIENT_PROVE=discord-voice-move`. A move to another voice channel in the same server is followed.
+pub fn prove_discord_voice_move() -> Result<(), String> {
+    discord::prove_voice_move()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -58,7 +63,7 @@ use protocol::{
     AccountKey, Activity, CallFailure, CallState, Capabilities, CatalogItem, CatalogKind, Change,
     Contact, Group, Key, Link, MediaFile, MemberSection, Message, MessageHit, Network, Notify,
     Occupant, Occupants, Outgoing, Participant, Person, Presence, Reaction, RelateAction, Relation,
-    SendState, SharedItem, SharedKind, Typist, VoiceJoin, Warning, Watching,
+    SendState, SharedItem, SharedKind, Compose, Typist, VoiceJoin, Warning, Watching,
 };
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -283,11 +288,13 @@ pub enum Command {
     /// network to judge.
     ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
     /// Replace the text of one of our messages. Report the edited message through
-    /// [`Context::message`] before answering: nothing was changed locally.
+    /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
+    /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
     Edit {
         conversation_id: String,
         message_id: String,
         text: String,
+        spans: Vec<protocol::Span>,
         reply: Reply<()>,
     },
     /// Delete a message for everyone. Report it through [`Context::deleted`] before answering.
@@ -296,8 +303,9 @@ pub enum Command {
         message_id: String,
         reply: Reply<()>,
     },
-    /// The user's draft is changing. Pace it: at most one signal per 8 s per conversation.
-    Typing(String),
+    /// The user's draft is changing. Pace it: at most one typing signal per 8 s per
+    /// conversation. `activity` is what they are doing; an adapter that only has typing ignores it.
+    Typing { conversation_id: String, activity: Compose },
     /// The user followed a link out of this message (the shell is opening it). Telegram's terms
     /// want a sponsored message's follow told; nothing waits on it.
     FollowLink { conversation_id: String, message_id: String },
@@ -346,6 +354,10 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
+    /// before answering, and only after the network has it. Answer `Err` to leave the local flag
+    /// as it was. Networks that do not serve this never receive it: their star stays local.
+    Star { conversation_id: String, starred: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
     Leave { conversation_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
@@ -410,9 +422,12 @@ pub enum Command {
         at: Instant,
         reply: Reply<Vec<MessageHit>>,
     },
-    /// The shell asked for these files and the media cache knows none of them. An adapter that
-    /// fetches files over its own session (Telegram) fetches those that are its own, such as the
-    /// original a picture's viewer opened, and records each as the cache would. Others ignore it.
+    /// The shell asked for these files and the media cache knows none of them, or knows them
+    /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
+    /// files over its own session (Telegram, Messages) fetches those that are its own, such as
+    /// the original a picture's viewer opened, and records each as the cache would. Telegram
+    /// also takes it as what is on screen: a picture a message shows goes ahead of those that
+    /// are not, even one no page has named yet. Others ignore it.
     Wanted(Vec<String>),
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
@@ -448,7 +463,10 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::CloseDirect { reply, .. } => {
+            Command::SetMute { reply, .. }
+            | Command::Leave { reply, .. }
+            | Command::CloseDirect { reply, .. }
+            | Command::Star { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -682,6 +700,17 @@ impl Context {
         Ok(())
     }
 
+    /// The user marked the conversation unread. The badge becomes at least one; a higher count
+    /// stays. The read marker is left where it is.
+    pub fn mark_unread(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().mark_unread_badge(&conversation)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
     /// A conversation this client already has was upgraded to end-to-end encryption. Only the
     /// label changes; the row is not rebuilt.
     pub fn mark_encryption(
@@ -708,6 +737,16 @@ impl Context {
         if self.hub.store().set_muted(&conversation, muted)? {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
+    /// The network's star on one conversation. On a network that serves stars, this is that
+    /// star; a row that is not on the network is left as it was.
+    pub fn starred(&self, conversation_id: &str, starred: bool) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_starred(&conversation, starred)? {
+            self.hub.changed(Change::Conversation { conversation });
         }
         Ok(())
     }
@@ -891,6 +930,12 @@ impl Context {
         self.hub.store().message(&self.key(conversation_id), message_id)
     }
 
+    /// The conversation a stored message is in. `None` when this account has no such message,
+    /// so a receipt for it is not filed onto some other chat.
+    pub fn conversation_of_message(&self, message_id: &str) -> rusqlite::Result<Option<String>> {
+        self.hub.store().conversation_of_message(&self.account, message_id)
+    }
+
     /// The ids stored between two message ids, both included, oldest first, at most `limit`: a
     /// page from the network is compared against this to find what was deleted while away.
     pub fn stored_ids(&self, conversation_id: &str, oldest: &str, newest: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
@@ -1069,10 +1114,16 @@ impl Context {
 
     /// Someone is typing, for `seconds` unless more is heard (the network's own timeout).
     pub fn typing(&self, conversation_id: &str, person_id: &str, name: &str, seconds: i64) {
+        self.typing_as(conversation_id, person_id, name, seconds, Compose::Typing);
+    }
+
+    /// The same, naming what they are doing. [`Compose::Typing`] is the only kind most networks have.
+    pub fn typing_as(&self, conversation_id: &str, person_id: &str, name: &str, seconds: i64, activity: Compose) {
         let typist = Typist {
             id: person_id.to_owned(),
             name: name.to_owned(),
             until: now() + seconds,
+            activity,
         };
         self.hub.set_typing(self.key(conversation_id), typist, true);
     }
@@ -1082,6 +1133,7 @@ impl Context {
             id: person_id.to_owned(),
             name: String::new(),
             until: 0,
+            activity: Compose::Typing,
         };
         self.hub.set_typing(self.key(conversation_id), typist, false);
     }
@@ -1169,6 +1221,17 @@ impl Context {
     /// The caller gave up, or another device answered.
     pub fn ring_stopped(&self, conversation_id: &str) {
         self.hub.calls.ring_stopped(&self.hub, &self.key(conversation_id));
+    }
+
+    /// Someone is calling on a network whose calls are answered on the phone (a Signal call):
+    /// one notification with one action, no call here. The same silence rules as other rings.
+    pub fn phone_ring(&self, conversation_id: &str, from: &str) {
+        self.hub.notify(crate::notify::Event::PhoneRing { conversation: self.key(conversation_id), from: from.to_owned() });
+    }
+
+    /// That call is over; its notification and its sound go.
+    pub fn phone_ring_stopped(&self, conversation_id: &str) {
+        self.hub.notify(crate::notify::Event::PhoneRingStopped(self.key(conversation_id)));
     }
 
     /// We are ringing the other side of a direct call and nobody has answered yet.
@@ -1592,6 +1655,52 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     teams::prove_teams_markdown()
 }
 
+/// The lab's slack-custom-emoji driver. A custom emoji is a picture, and renaming it keeps
+/// that picture under the new name.
+pub fn prove_slack_custom_emoji() -> Result<(), String> {
+    slack::prove_custom_emoji()
+}
+
+/// The lab's slack-profile-fields driver. A labelled profile keeps both names, the department,
+/// two custom fields and a manager link.
+pub fn prove_slack_profile_fields() -> Result<(), String> {
+    slack::prove_profile_fields()
+}
+
+/// The lab's slack-star-channel driver. Starring a Slack conversation is `stars.add` on the
+/// channel, a `star_removed` event clears it, and a message star is not the channel's.
+pub fn prove_slack_channel_star() -> Result<(), String> {
+    slack::prove_channel_star()
+}
+
+/// The lab's slack-call-cards driver. A Zoom, Meet, Teams or Webex call block is a card
+/// with a Join link, and an old Slack call says that it happened.
+pub fn prove_slack_call_cards() -> Result<(), String> {
+    slack::prove_call_cards()
+}
+
+/// The lab's discord-thread-chip driver. A thread chip counts new replies and keeps the
+/// newest faces. A build without this returns to the server and stays up.
+pub fn prove_discord_thread_chip() -> Result<(), String> {
+    discord::prove_thread_chip()
+}
+
+/// The lab's discord-code-colors driver. A fenced block is coloured from its language.
+/// A build without this returns to the server and stays up.
+pub fn prove_discord_code_colors() -> Result<(), String> {
+    discord::prove_code_colors()
+}
+
+/// The lab's teams-chain-paging driver. See `teams::prove_chain_paging`.
+pub fn prove_chain_paging() -> Result<(), String> {
+    teams::prove_chain_paging()
+}
+
+/// The lab's teams-copy-link driver. See `teams::prove_share_links`.
+pub fn prove_share_links() -> Result<(), String> {
+    teams::prove_share_links()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {
@@ -1616,6 +1725,39 @@ pub fn prove_teams_reactions() -> Result<(), String> {
     teams::prove_reactions()
 }
 
+/// The lab's reaction-reactors driver. A reaction keeps who the network named with it: events
+/// fold into the list one person at a time, and a taking-back lets that person go. Telegram's
+/// half is in `telegram::prove_telegram_reactors`.
+pub fn prove_reactors() -> Result<(), String> {
+    let mut store = crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let account = AccountKey { network: Network::Slack, account: "T1".to_owned() };
+    let conversation = Key::new(&account, "c1");
+    let said = Message::plain("m1", "Ada", "hello", 1_700_000_000, false);
+    store.ingest(&conversation, &said, false).map_err(|err| err.to_string())?;
+    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()] };
+    store.react(&conversation, "m1", &by("u-ana"), true).map_err(|err| err.to_string())?;
+    store.react(&conversation, "m1", &by("u-bea"), true).map_err(|err| err.to_string())?;
+    let who = |store: &crate::store::Store| -> Result<Vec<String>, String> {
+        Ok(store
+            .message(&conversation, "m1")
+            .map_err(|err| err.to_string())?
+            .ok_or("the message is gone")?
+            .reactions
+            .into_iter()
+            .next()
+            .ok_or("the reaction is gone")?
+            .who)
+    };
+    if who(&store)? != ["u-ana", "u-bea"] {
+        return Err(format!("the reactions the events named were not kept: {:?}", who(&store)?));
+    }
+    store.react(&conversation, "m1", &by("u-ana"), false).map_err(|err| err.to_string())?;
+    if who(&store)? != ["u-bea"] {
+        return Err(format!("taking a reaction back did not let its person go: {:?}", who(&store)?));
+    }
+    telegram::prove_telegram_reactors()
+}
+
 /// The lab's teams-file-download driver. See `teams::prove_shared_file`.
 pub fn prove_teams_shared_file() -> Result<(), String> {
     teams::prove_shared_file()
@@ -1629,6 +1771,16 @@ pub fn prove_teams_loop_component() -> Result<(), String> {
 /// The lab's slack-connect-org driver. See `slack::prove_connect_names`.
 pub fn prove_slack_connect_org() -> Result<(), String> {
     slack::prove_connect_names()
+}
+
+/// The lab's slack-rich-text driver. See `slack::prove_rich_text`.
+pub fn prove_slack_rich_text() -> Result<(), String> {
+    slack::prove_rich_text()
+}
+
+/// The lab's teams-team-info driver. See `teams::prove_team_info`.
+pub fn prove_teams_team_info() -> Result<(), String> {
+    teams::prove_team_info()
 }
 
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the

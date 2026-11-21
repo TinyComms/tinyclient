@@ -1,0 +1,12 @@
+{
+  "id": "discord-code-colors",
+  "title": "A fenced code block is coloured from its language",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window.",
+    "ios": "The phone proof build does not run the desktop window."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

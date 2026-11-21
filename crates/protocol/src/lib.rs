@@ -16,6 +16,7 @@ mod call;
 pub mod crash;
 pub mod device_approval;
 mod e2ee;
+pub mod highlight;
 pub mod hotkey;
 pub mod log_policy;
 pub mod media_host;
@@ -877,6 +878,28 @@ pub enum RelateAction {
     Block,
 }
 
+/// What someone is doing in a composer. Networks that only have typing leave this as [`Typing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compose {
+    #[default]
+    Typing,
+    RecordingVoice,
+    RecordingVideo,
+    UploadingPhoto,
+    UploadingVideo,
+    UploadingAudio,
+    UploadingFile,
+    ChoosingSticker,
+    PlayingGame,
+}
+
+impl Compose {
+    pub(crate) fn is_typing(&self) -> bool {
+        matches!(self, Compose::Typing)
+    }
+}
+
 /// Someone typing in a conversation right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Typist {
@@ -885,6 +908,9 @@ pub struct Typist {
     /// Unix seconds at which the line goes away if nothing more is heard. The shell times this
     /// out itself; chatd sends no change for it.
     pub until: i64,
+    /// What they are doing. Absent on an older frame, which means typing.
+    #[serde(default, skip_serializing_if = "Compose::is_typing")]
+    pub activity: Compose,
 }
 
 /// One section of a member list, with how many people it holds on the network.
@@ -1008,6 +1034,16 @@ pub struct MessageHit {
     pub outgoing: bool,
 }
 
+/// A reminder the user set on one message ("Remind me…"). Local to this device: no network
+/// hears of it, and it lives until it fires or the user cancels it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReminder {
+    /// The message the reminder is on.
+    pub message_id: String,
+    /// Unix seconds it is due at.
+    pub due: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1061,6 +1097,19 @@ pub enum Request {
     Star {
         conversation: Key,
         starred: bool,
+    },
+    /// Puts a reminder on one message, to be told about it when the time comes, or takes it
+    /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is
+    /// refused, and a message that is not in the cache has nothing to remind about.
+    Remind {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remind_at: Option<i64>,
+    },
+    /// The reminders still waiting in one conversation, due first.
+    Reminders {
+        conversation: Key,
     },
     /// Conversations whose title contains `query`, across every Space, most recent first. From
     /// the cache alone: a channel of a Space never opened is not in it.
@@ -1279,6 +1328,13 @@ pub enum Request {
         page: Page,
         limit: u32,
     },
+    /// Earlier wordings of one message, oldest first. Empty when this network does not keep
+    /// them (`Capabilities::revisions`) or when nothing earlier was stored. A live edit does
+    /// not fill this by itself.
+    Revisions {
+        conversation: Key,
+        message_id: String,
+    },
     /// The user saw the conversation up to this message: the window is active, the conversation is
     /// open and the message is on screen. Read here and on the network. An empty `message_id`
     /// means the newest message chatd knows, for "mark as read" before any message is on screen.
@@ -1294,10 +1350,15 @@ pub enum Request {
         message_id: String,
     },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
-    /// one; `None` is the whole Inbox. Message requests are read here only.
+    /// one; `space` to one Space's conversations; both `None` is the whole Inbox. Message
+    /// requests are read here only.
     MarkAllRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
+        /// The Space to read out, the account it belongs to and the network's own id. An older
+        /// peer that does not know the field ignores it and hears the wider request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
     },
     /// Drops this conversation's cached messages and its badge. A direct or group conversation
     /// leaves the Inbox until a newer message arrives. The network is not asked to delete
@@ -1340,8 +1401,11 @@ pub enum Request {
         client_id: String,
     },
     /// The user's draft is changing. chatd decides how often the network hears of it.
+    /// `activity` is what they are doing. Absent means typing.
     Typing {
         conversation: Key,
+        #[serde(default, skip_serializing_if = "Compose::is_typing")]
+        activity: Compose,
     },
     /// The user followed a link out of this message (the shell is opening it). Telegram's terms
     /// want a sponsored message's follow told to it; other networks have nothing to do.
@@ -1364,16 +1428,28 @@ pub enum Request {
         conversation: Key,
     },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
-    /// network accepts it; a refusal is the answer.
+    /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
+    /// empty keeps the edit as plain text. An older client omits them.
     Edit {
         conversation: Key,
         message_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<Span>,
     },
     /// Deletes a message for everyone. Waits for the network, like `Edit`.
     Delete {
         conversation: Key,
         message_id: String,
+    },
+    /// Vote on a poll, take a vote back, or end one. `votes` of `None` ends it (only the person
+    /// who started it), `Some` replaces our vote, and an empty list takes it back. Signal only.
+    /// The shell's composer menu that starts a poll is separate: that is a `Send` with `poll`.
+    Poll {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        votes: Option<Vec<u32>>,
     },
 
     /// Custom emoji, stickers or GIFs for the picker, asked when its tab opens and never before,
@@ -2074,9 +2150,20 @@ pub enum Response {
         /// The cache holds messages newer than the last one here.
         newer: bool,
     },
+    /// Answers `Revisions`: earlier wordings, oldest first.
+    Revisions {
+        conversation: Key,
+        message_id: String,
+        revisions: Vec<Revision>,
+    },
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {
         hits: Vec<MessageHit>,
+    },
+    /// Answers `Reminders`: what is still waiting in the conversation, due first.
+    Reminders {
+        conversation: Key,
+        reminders: Vec<MessageReminder>,
     },
     Sent {
         message: Message,
@@ -2447,6 +2534,16 @@ mod tests {
         let json = serde_json::to_string(&quiet).unwrap();
         assert_eq!(json, r#"{"ping":false}"#);
         assert_eq!(serde_json::from_str::<Outgoing>(&json).unwrap(), quiet);
+        let old: Request = serde_json::from_str(
+            r#"{"op":"edit","conversation":{"network":"slack","account":"T1","id":"C1"},"message_id":"1","text":"hi"}"#,
+        )
+        .unwrap();
+        let Request::Edit { spans, text, .. } = &old else { panic!("not an edit") };
+        assert!(spans.is_empty() && text == "hi");
+        assert!(!serde_json::to_string(&old).unwrap().contains("spans"));
+        let styled = Outgoing { spans: vec![Span { start: 0, end: 2, style: Style::Bold }], ..Outgoing::default() };
+        assert!(!styled.is_plain());
+        assert!(serde_json::to_string(&styled).unwrap().contains("bold"));
     }
 
     #[test]
@@ -2518,7 +2615,7 @@ mod tests {
             conversation: key(id),
             typists: names
                 .iter()
-                .map(|name| Typist { id: (*name).into(), name: (*name).into(), until: 0 })
+                .map(|name| Typist { id: (*name).into(), name: (*name).into(), until: 0, activity: Compose::Typing })
                 .collect(),
         };
         assert!(typing("a", &["ana"]).same_scope(&typing("a", &[])));
@@ -2540,6 +2637,11 @@ mod tests {
             "participants":[],"muted":false,"deafened":false,"joined":1,"engine_linked":true,"video":[]}"#;
         let call: Call = serde_json::from_str(call).unwrap();
         assert_eq!((call.speaking, call.level, call.inputs.len()), (false, None, 0));
+        let message: Message = serde_json::from_str(
+            r#"{"id":"1","sender":{"name":"mara"},"sent":1,"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!((message.edited, message.edited_at, message.prior_text.as_deref()), (false, None, None));
     }
 
     #[test]
@@ -2567,7 +2669,7 @@ mod tests {
     fn empty_fields_stay_off_the_wire() {
         let message = Message::plain("1", "mara", "hi", 1_700_000_000, false);
         let json = serde_json::to_string(&message).unwrap();
-        for absent in ["spans", "attachments", "reactions", "reply_to", "thread", "client_id", "card", "forwarded", "deleted"] {
+        for absent in ["spans", "attachments", "reactions", "reply_to", "thread", "client_id", "card", "forwarded", "deleted", "edited", "edited_at", "prior_text"] {
             assert!(!json.contains(absent), "{absent} in {json}");
         }
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);

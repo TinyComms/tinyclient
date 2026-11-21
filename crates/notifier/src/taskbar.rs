@@ -1,6 +1,8 @@
-//! The window's taskbar button (Windows) or Dock icon (macOS): a flash or bounce when something
-//! notifies while the window is in the background (N10), and the number of what needs me
-//! (N11). Called by the window process, on its main thread, since both belong to its window.
+//! The window's taskbar button (Windows), Dock icon (macOS) or launcher entry (Linux): a flash
+//! or bounce when something notifies while the window is in the background (N10), and the
+//! number of what needs me (N11). Called by the window process, on its main thread, since both
+//! belong to its window; on Linux the number goes out from a thread of its own, since the
+//! session bus is a socket.
 
 /// The badge's words: nothing for 0, the number, or "99+".
 pub fn badge_words(count: u32) -> Option<String> {
@@ -16,6 +18,11 @@ pub use self::windows::{badge, flash, raise};
 
 #[cfg(target_os = "macos")]
 pub use self::macos::{badge, flash, raise};
+
+// Linux speaks only the count: a flash asks the window manager through GPUI, whose window this
+// crate cannot reach (`gui/attention.rs`).
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+pub use self::linux::badge;
 
 #[cfg(windows)]
 mod windows {
@@ -209,6 +216,104 @@ mod macos {
         let tile = NSApplication::sharedApplication(main).dockTile();
         let words = badge_words(count).map(|words| NSString::from_str(&words));
         tile.setBadgeLabel(words.as_deref());
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+mod linux {
+    use super::badge_words;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use zbus::blocking::Connection;
+    use zbus::zvariant::Value;
+
+    /// The desktop file id the app is installed under (`packaging/linux`), which the launcher
+    /// entry is named by. Debug builds use their own, so a dev tree never draws on an installed
+    /// tinyclient's icon (`chatd::notify::app`).
+    const DESKTOP_ID: &str = if cfg!(debug_assertions) { "dev.tinyclient.app.debug" } else { "dev.tinyclient.app" };
+    /// The one signal Ubuntu Dock, Dash to Dock, KDE's task manager and the GNOME dock
+    /// extensions read; the same words Unity's launcher API gave it.
+    const INTERFACE: &str = "com.canonical.Unity.LauncherEntry";
+
+    /// The entry the signal names: the installed desktop file's id under `application://`.
+    fn entry() -> String {
+        format!("application://{DESKTOP_ID}.desktop")
+    }
+
+    /// What the entry should show now: the signal's dict, read for `count` (a number) and
+    /// `count-visible`. Nothing unread draws nothing, as on the other systems.
+    fn properties(count: u32) -> HashMap<&'static str, Value<'static>> {
+        let mut shown = HashMap::new();
+        shown.insert("count", Value::from(i64::from(count)));
+        shown.insert("count-visible", Value::from(badge_words(count).is_some()));
+        shown
+    }
+
+    /// One ask from the window's main thread.
+    struct Ask {
+        count: u32,
+    }
+
+    thread_local! {
+        /// The asks' way to the bus thread, made at the first number. `None` when the thread
+        /// could not be made; a desktop without it has no badge.
+        static SEND: RefCell<Option<mpsc::Sender<Ask>>> = const { RefCell::new(None) };
+    }
+
+    /// The number on the launcher icon, or none for 0. Never waits: the session bus is a
+    /// socket, and the window's main thread reads no socket. A desktop without a session bus
+    /// loses the badge silently.
+    pub fn badge(count: u32) {
+        SEND.with(|send| {
+            let mut send = send.borrow_mut();
+            if send.is_none() {
+                let (asks, take) = mpsc::channel();
+                let made = std::thread::Builder::new().name("launcher-entry".into()).spawn(move || speak(take));
+                if made.is_err() {
+                    return;
+                }
+                *send = Some(asks);
+            }
+            if let Some(send) = send.as_ref() {
+                let _ = send.send(Ask { count });
+            }
+        });
+    }
+
+    /// The bus thread: one connection for the process's life, one signal per ask. The
+    /// connection closes when the process leaves, and a launcher that follows the entry's
+    /// owner forgets the count with it.
+    fn speak(take: mpsc::Receiver<Ask>) {
+        let Ok(bus) = Connection::session() else { return };
+        for ask in take {
+            let body = (entry(), properties(ask.count));
+            let _ = bus.emit_signal(None::<&str>, "/", INTERFACE, "Update", &body);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_entry_names_the_installed_desktop_file() {
+            assert!(entry().starts_with("application://dev.tinyclient.app"), "{}", entry());
+            assert!(entry().ends_with(".desktop"), "{}", entry());
+        }
+
+        #[test]
+        fn the_properties_show_the_count_while_there_is_one() {
+            let none = properties(0);
+            assert_eq!(none["count"], Value::from(0i64));
+            assert_eq!(none["count-visible"], Value::from(false));
+            let some = properties(7);
+            assert_eq!(some["count"], Value::from(7i64));
+            assert_eq!(some["count-visible"], Value::from(true));
+            let many = properties(100);
+            assert_eq!(many["count"], Value::from(100i64));
+            assert_eq!(many["count-visible"], Value::from(true));
+        }
     }
 }
 

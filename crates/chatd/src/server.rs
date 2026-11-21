@@ -130,7 +130,7 @@ fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> 
 }
 
 pub struct Chat {
-    hub: Arc<Hub>,
+    pub(crate) hub: Arc<Hub>,
     adapters: Adapters,
     /// History catch-ups asked before that account's adapter was in the map.
     held: Mutex<Vec<(AccountKey, Command)>>,
@@ -183,7 +183,7 @@ fn call_error(err: CallError) -> Response {
 fn response_detail(response: &Response) -> String {
     match response {
         Response::Error { detail, .. } => detail.clone(),
-        _ => "That didn't work. Try again.".to_owned(),
+        _ => "Couldn't place that call. Try again.".to_owned(),
     }
 }
 
@@ -961,6 +961,18 @@ impl Chat {
         }
     }
 
+    /// Earlier wordings already stored for this message. Does not ask the network and does not
+    /// keep a wording that was only seen as a live edit.
+    fn revisions(&self, conversation: Key, message_id: String) -> Response {
+        if !self.shows(&conversation.account()) {
+            return hidden_history();
+        }
+        match self.hub.store().revisions(&conversation, &message_id) {
+            Ok(revisions) => Response::Revisions { conversation, message_id, revisions },
+            Err(err) => internal(err),
+        }
+    }
+
     fn messages(&self, conversation: Key, page: Page, limit: u32) -> Response {
         if !self.shows(&conversation.account()) {
             // Same refusal as Tree and Conversation. An empty Messages page is a successful
@@ -1083,17 +1095,15 @@ impl Chat {
     fn mark_unread(&self, conversation: Key, message_id: String) -> Response {
         match self.hub.store().mark_unread(&conversation, &message_id) {
             Ok(Some((marker, mentions))) => {
-                if !marker.is_empty() {
-                    let account = conversation.account();
-                    self.command(
-                        &account,
-                        Command::MarkUnread {
-                            conversation_id: conversation.id.clone(),
-                            message_id: marker,
-                            mentions,
-                        },
-                    );
-                }
+                let account = conversation.account();
+                self.command(
+                    &account,
+                    Command::MarkUnread {
+                        conversation_id: conversation.id.clone(),
+                        message_id: marker,
+                        mentions,
+                    },
+                );
                 self.hub.changed(Change::Conversation { conversation });
                 self.hub.changed(Change::Status);
                 Response::Ok
@@ -1104,9 +1114,10 @@ impl Chat {
     }
 
     /// Every badge goes. Discord hears one bulk ack per account; the other networks hear the
-    /// read they already know. A message request is read here and not announced.
-    fn mark_all_read(&self, network: Option<Network>) -> Response {
-        let marks = match self.hub.store().unread_marks(network) {
+    /// read they already know. A message request is read here and not announced. `network`
+    /// limits it to one network; `space` to one Space's conversations.
+    fn mark_all_read(&self, network: Option<Network>, space: Option<Key>) -> Response {
+        let marks = match self.hub.store().unread_marks(network, space.as_ref()) {
             Ok(marks) => marks,
             Err(err) => return internal(err),
         };
@@ -1181,6 +1192,14 @@ impl Chat {
             return error(ErrorCode::Offline, offline_words(&account, &with));
         }
         message.waiting = false;
+        if with.poll.is_some() {
+            if account.network != Network::Signal {
+                return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
+            }
+            if !with.files.is_empty() {
+                return error(ErrorCode::Refused, "A poll can't carry a file.");
+            }
+        }
         if let Err(refused) = self.allowed(&account, &with) {
             return *refused;
         }
@@ -1372,6 +1391,7 @@ impl Chat {
             })
             .collect();
         message.client_id = Some(client_id);
+        message.spans = with.spans.clone();
         let quoted = reply_to.and_then(|id| store.message(conversation, id).ok().flatten());
         message.reply_to = quoted.map(|quoted| protocol::ReplyTo {
             id: quoted.id,
@@ -1380,6 +1400,12 @@ impl Chat {
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
         });
+        if let Some(draft) = &with.poll {
+            let mut question = draft.question.clone();
+            clip(&mut question, 100);
+            message.text = format!("Poll: {question}");
+            message.poll = Some(Box::new(protocol::Poll::open(question, draft.options.iter().take(10).cloned(), draft.multiple)));
+        }
         message
     }
 
@@ -1425,6 +1451,9 @@ impl Chat {
             file: None,
             count: 1,
             mine: true,
+            // Ours is one person the store cannot name here; the network's word of the
+            // reaction carries the id, and a fresh payload corrects the list.
+            who: Vec::new(),
         };
         let message = match self.hub.store().message(&conversation, &message_id) {
             Ok(Some(message)) => message,
@@ -1491,7 +1520,7 @@ impl Chat {
 
     /// Edit and delete change nothing here: the answer is the network's, and the message
     /// changes when the adapter reports it.
-    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>) -> Response {
+    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -1512,6 +1541,7 @@ impl Chat {
                 conversation_id,
                 message_id,
                 text,
+                spans,
                 reply,
             }),
             None => self.ask(&account, |reply| Command::Delete {
@@ -1601,6 +1631,25 @@ impl Chat {
                 }
                 Response::Ok
             }
+            Err(refused) => *refused,
+        }
+    }
+
+    /// A vote, a retraction, or ending a poll. Not an edit: the poll may be someone else's, and
+    /// the message's text stays "Poll: …". Signal only; the adapter reads the sentinel.
+    fn poll(&self, conversation: Key, message_id: String, votes: Option<Vec<u32>>) -> Response {
+        let account = conversation.account();
+        if account.network != Network::Signal {
+            return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let votes = votes.map(|votes| votes.into_iter().take(10).collect::<Vec<_>>());
+        let text = adapters::signal::poll_command(votes.as_deref());
+        let conversation_id = conversation.id;
+        match self.ask(&account, |reply| Command::Edit { conversation_id, message_id, text, spans: Vec::new(), reply }) {
+            Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
     }
@@ -2358,15 +2407,57 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::Star { conversation, starred } => match self.hub.store().set_starred(&conversation, starred) {
-                Ok(changed) => {
-                    if changed {
-                        self.hub.changed(Change::Conversation { conversation });
+            Request::Star { conversation, starred } => {
+                // On Slack the star is Slack's. Other networks keep the local flag and are not asked.
+                if conversation.network == Network::Slack {
+                    if let Err(refused) = self.online(&conversation.account()) {
+                        return *refused;
                     }
-                    Response::Ok
+                    let conversation_id = conversation.id.clone();
+                    return match self.ask(&conversation.account(), |reply| Command::Star { conversation_id, starred, reply }) {
+                        Ok(()) => Response::Ok,
+                        Err(refused) => *refused,
+                    };
                 }
-                Err(err) => internal(err),
-            },
+                match self.hub.store().set_starred(&conversation, starred) {
+                    Ok(changed) => {
+                        if changed {
+                            self.hub.changed(Change::Conversation { conversation });
+                        }
+                        Response::Ok
+                    }
+                    Err(err) => internal(err),
+                }
+            }
+            Request::Remind { conversation, message_id, remind_at } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                if remind_at.is_some_and(|due| due <= now()) {
+                    return error(ErrorCode::Refused, "That time has passed.");
+                }
+                match self.hub.store().remind(&conversation, &message_id, remind_at) {
+                    Ok(crate::store::RemindOutcome::Set | crate::store::RemindOutcome::Cleared) => {
+                        // The notification thread's next wait is due at a different time now.
+                        self.hub.notify(crate::notify::Event::Remind);
+                        Response::Ok
+                    }
+                    Ok(crate::store::RemindOutcome::Missing) => error(ErrorCode::NotFound, "no such message"),
+                    Ok(crate::store::RemindOutcome::Full) => {
+                        error(ErrorCode::Refused, format!("You have {} reminders already. Cancel one first.", crate::store::REMINDER_CAP))
+                    }
+                    Err(err) => internal(err),
+                }
+            }
+            Request::Reminders { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.hub.store().reminders(&conversation) {
+                    Ok(reminders) => Response::Reminders { conversation, reminders },
+                    Err(err) => internal(err),
+                }
+            }
 
             Request::People { network, relation, query, offset, limit } => {
                 self.people(network, relation, query, offset, limit)
@@ -2436,9 +2527,10 @@ impl Chat {
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
+            Request::Revisions { conversation, message_id } => self.revisions(conversation, message_id),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
-            Request::MarkAllRead { network } => self.mark_all_read(network),
+            Request::MarkAllRead { network, space } => self.mark_all_read(network, space),
             Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {
                 let began = std::time::Instant::now();
@@ -2481,11 +2573,11 @@ impl Chat {
                 };
                 self.drop_unsent(conversation, &client_id, &message)
             }
-            Request::Typing { conversation } => {
+            Request::Typing { conversation, activity } => {
                 let account = conversation.account();
                 // P1: off, the network never hears it.
                 if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {
-                    self.command(&account, Command::Typing(conversation.id));
+                    self.command(&account, Command::Typing { conversation_id: conversation.id, activity });
                 }
                 Response::Ok
             }
@@ -2499,8 +2591,10 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
             Request::Reactions { conversation } => self.reactions(conversation),
-            Request::Edit { conversation, message_id, text } => self.rewrite(conversation, message_id, Some(text)),
-            Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None),
+            Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans),
+            Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None, Vec::new()),
+
+            Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 
             Request::Fetch { account, ids, size, retry } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
@@ -3304,7 +3398,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
     if !matches!(scheduled, Response::Error { code: ErrorCode::Offline, .. }) {
         return Err("a scheduled send while offline was stored".into());
     }
-    let edit = chat.handle(Request::Edit { conversation: conversation.clone(), message_id: "1".into(), text: "no".into() });
+    let edit = chat.handle(Request::Edit { conversation: conversation.clone(), message_id: "1".into(), text: "no".into(), spans: Vec::new() });
     let react = chat.handle(Request::React {
         conversation: conversation.clone(),
         message_id: "1".into(),
@@ -3406,6 +3500,43 @@ pub fn prove_offline_queue() -> Result<(), String> {
     }
     if third.waiting || third.state != SendState::Pending || third.sent < handed {
         return Err("a later queued send was not handed off".into());
+    }
+    Ok(())
+}
+
+/// The lab's space-mark-all-read driver. Reading one Space out leaves every other Space's and
+/// every direct row's badge alone, and a frame from an older peer without the Space still
+/// reads the whole Inbox.
+pub fn prove_space_mark_all_read() -> Result<(), String> {
+    match serde_json::from_value::<Request>(serde_json::json!({"op": "mark_all_read"})) {
+        Ok(Request::MarkAllRead { network: None, space: None }) => {}
+        _ => return Err("an older frame without a Space did not read".into()),
+    }
+    let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let account = AccountKey { network: Network::Discord, account: "ada".into() };
+    let mut room = crate::store::ConversationRow::new("general", ConversationKind::Channel, "general");
+    room.space = Some("4000".into());
+    store.upsert_conversation(&account, &room).map_err(|err| err.to_string())?;
+    store
+        .upsert_conversation(&account, &crate::store::ConversationRow::new("elsewhere", ConversationKind::Channel, "elsewhere"))
+        .map_err(|err| err.to_string())?;
+    let general = Key::new(&account, "general");
+    let elsewhere = Key::new(&account, "elsewhere");
+    store.ingest(&general, &Message::plain("8", "mara", "for this space", 10, false), true).map_err(|err| err.to_string())?;
+    store.ingest(&elsewhere, &Message::plain("9", "mara", "for another", 20, false), true).map_err(|err| err.to_string())?;
+    let chat = Arc::new(Chat::new(store));
+    let read = chat.handle(Request::MarkAllRead { network: Some(Network::Discord), space: Some(Key::new(&account, "4000")) });
+    if !matches!(read, Response::Ok) {
+        return Err(format!("the space-scoped read was refused: {read:?}"));
+    }
+    let row = |chat: &Chat, key: &Key| -> Result<Conversation, String> {
+        chat.hub.store().conversation(key).map_err(|err| err.to_string())?.ok_or_else(|| "the row vanished".into())
+    };
+    if row(&chat, &general)?.unread != 0 {
+        return Err("a conversation of the Space kept its badge".into());
+    }
+    if row(&chat, &elsewhere)?.unread != 1 {
+        return Err("another Space's badge was cleared".into());
     }
     Ok(())
 }
@@ -3564,6 +3695,50 @@ pub fn prove_pending_message_identity() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's edit-history driver. An edited message keeps the time the network gave it.
+/// A live edit does not store the words it replaced. A wording the network itself kept is
+/// answered by `Revisions`.
+pub fn prove_edit_history() -> Result<(), String> {
+    let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let account = AccountKey { network: Network::Signal, account: "me".into() };
+    store
+        .upsert_conversation(&account, &crate::store::ConversationRow::new("chat", ConversationKind::Direct, "Ada"))
+        .map_err(|err| err.to_string())?;
+    let key = Key::new(&account, "chat");
+    let mut message = Message::plain("m1", "Ada", "revised", 1_700_000_100, false);
+    message.edited = true;
+    message.edited_at = Some(1_700_000_200);
+    store.ingest(&key, &message, false).map_err(|err| err.to_string())?;
+    message.text = "revised again".into();
+    message.edited_at = Some(1_700_000_300);
+    store.ingest(&key, &message, false).map_err(|err| err.to_string())?;
+    if !store.revisions(&key, "m1").map_err(|err| err.to_string())?.is_empty() {
+        return Err("a live edit stored text the sender replaced".into());
+    }
+    store.note_revision(&key, "m1", "original", 1_700_000_000).map_err(|err| err.to_string())?;
+    let chat = Chat::new(store);
+    // A scratch directory shows seeded rows. A normal test process does not, until the account is connected.
+    chat.hub.set_link(&account, Link::Connected, "");
+    let shown = chat
+        .hub
+        .store()
+        .message(&key, "m1")
+        .map_err(|err| err.to_string())?
+        .ok_or("the edited message was not stored")?;
+    if shown.text != "revised again" || shown.edited_at != Some(1_700_000_300) || !shown.edited {
+        return Err("the edited message lost its time".into());
+    }
+    match chat.handle(Request::Revisions { conversation: key, message_id: "m1".into() }) {
+        Response::Revisions { revisions, .. }
+            if revisions.len() == 1 && revisions[0].text == "original" && revisions[0].at == 1_700_000_000 =>
+        {
+            Ok(())
+        }
+        Response::Revisions { .. } => Err("revisions did not answer the earlier text".into()),
+        _ => Err("revisions was not answered".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::published_link;
@@ -3572,8 +3747,20 @@ mod tests {
     use protocol::{AccountKey, ConversationKind, Key, Link, MediaFile, MediaKind, Message, Network, Outgoing};
 
     #[test]
+    fn a_missing_error_names_the_call() {
+        let words = super::response_detail(&protocol::Response::Ok);
+        assert!(words.starts_with("Couldn't place that call"), "{words}");
+        assert!(!words.contains("That didn't work"), "{words}");
+    }
+
+    #[test]
     fn a_pending_message_names_the_cached_self_sender_before_any_ack() {
         assert_eq!(super::prove_pending_message_identity(), Ok(()));
+    }
+
+    #[test]
+    fn an_edited_message_answers_its_time_and_only_a_noted_earlier_wording() {
+        assert_eq!(super::prove_edit_history(), Ok(()));
     }
 
     #[test]

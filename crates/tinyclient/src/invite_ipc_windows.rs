@@ -124,7 +124,7 @@ fn receive(file: &mut File, sender: &SyncSender<String>) -> io::Result<()> {
     let mut data = vec![0; len];
     read_exact_bounded(file, &mut data)?;
     let link = String::from_utf8(data).map_err(|_| io::ErrorKind::InvalidData)?;
-    if !link.starts_with("tinyclient://join#") || protocol::parse_invite_link(&link).is_none() { return Err(io::ErrorKind::InvalidData.into()); }
+    if !crate::quick::handoff(&link) { return Err(io::ErrorKind::InvalidData.into()); }
     sender.try_send(link).map_err(|_| io::Error::other("invite queue unavailable"))?;
     file.write_all(&[1])
 }
@@ -176,6 +176,11 @@ mod tests {
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), link);
         assert!(matches!(start(Some(&link)), Handoff::Delivered));
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), link);
+        // A quick action rides the same pipe; an unknown one is refused.
+        let action = crate::quick::QuickAction::Quit.link();
+        assert!(send(&pipe_name(), &action).is_ok());
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), action);
+        assert!(send(&pipe_name(), "tinyclient://action/nope").is_err());
         assert!(send(&pipe_name(), "tinyclient://join#invalid").is_err());
         assert!(receiver.try_recv().is_err());
     }

@@ -3,6 +3,7 @@
 //! call runs off the main thread.
 
 use super::app::{self, service::Service};
+use super::autostart;
 use super::layout::{self, Slots};
 use super::sidebar::{self, pages::PAGE, Mode};
 use super::{call, composer, conversation, people};
@@ -51,7 +52,7 @@ pub fn sign_in_words(network: Network, code: ErrorCode, detail: &str) -> Option<
         ErrorCode::SignInBlocked => Some(format!(
             "Your organization doesn't allow this app. {name} stays in the {name} app for this account."
         )),
-        _ => Some(crate::client::refusal_words(code, detail)),
+        _ => Some(crate::client::refusal_words("sign in", code, detail)),
     }
 }
 
@@ -254,6 +255,11 @@ pub struct Shell {
     pub(super) menus_set: RefCell<String>,
     /// Lines of `shell.prefs` this build does not know, written back as they were.
     pub(super) prefs_kept: Vec<String>,
+    /// The passphrase field on the Linux lock screen.
+    #[cfg(target_os = "linux")]
+    pub(super) lock_phrase: Option<gpui::Entity<super::input::TextInput>>,
+    /// Focus held by the lock cover so keys never reach the composer or sidebar behind it.
+    pub(super) lock_focus: FocusHandle,
     /// A window state forced by `--state`, for looking at it.
     #[cfg(feature = "gui-shot")]
     pub(super) forced_state: Option<app::service::Shown>,
@@ -268,11 +274,13 @@ impl Shell {
         Self::watch(cx);
         Self::watch_updates(cx);
         Self::wake_at_thresholds(cx);
+        Self::repair_sign_in_entry(cx);
         #[cfg(debug_assertions)]
         Self::debug_launch_watch(cx);
         let subscriptions = [
             cx.observe_window_activation(window, |this, window, cx| {
                 this.active = window.is_window_active();
+                super::lock::note_active(this.active);
                 this.focus_changed(this.active, cx);
                 cx.notify();
             }),
@@ -293,6 +301,7 @@ impl Shell {
             trouble: HashMap::new(),
             window_at: Cell::new(None),
             focus: cx.focus_handle(),
+            lock_focus: cx.focus_handle(),
             // The other slices' views, placed in this slice's frames.
             slots: Slots {
                 people: Some(people::draw_people),
@@ -319,6 +328,8 @@ impl Shell {
             settling: None,
             menus_set: RefCell::new(String::new()),
             prefs_kept: prefs.kept.clone(),
+            #[cfg(target_os = "linux")]
+            lock_phrase: None,
             #[cfg(feature = "gui-shot")]
             forced_state: None,
             #[cfg(feature = "gui-shot")]
@@ -337,7 +348,23 @@ impl Shell {
         if crate::update::announce().is_some() {
             shell.layout_state.update_alert = true;
         }
+        super::lock::note_active(shell.active);
         shell
+    }
+
+    /// Open at login (G1): while the switch is on, the sign-in entry is rewritten with this
+    /// build's path at every launch, so a copy that moved or was replaced keeps starting.
+    /// Off the main thread, and a screenshot run writes nothing, as `save_prefs` does not.
+    fn repair_sign_in_entry(cx: &mut Context<Self>) {
+        if cfg!(feature = "gui-shot") || !app::prefs::choices().open_at_login {
+            return;
+        }
+        cx.spawn(async move |_, cx| {
+            if let Err(word) = cx.background_executor().spawn(async { autostart::apply(true) }).await {
+                tracing::warn!("tinyclient: {word}");
+            }
+        })
+        .detach();
     }
 
     /// Runs `work` off the main thread and hands its answer back to the shell.

@@ -1,0 +1,12 @@
+{
+  "id": "signal-reaction-restart",
+  "title": "After a restart, a changed Signal reaction replaces the old emoji",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same reaction record is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd. The same reaction record is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

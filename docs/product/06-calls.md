@@ -24,7 +24,7 @@ When the server offers `e2ee_calls`, the same MLS group seals Opus and the H.264
 
 ## Pictures, on a Discord call
 
-A camera is one H.264 layer on the voice connection: rid `100`, 640×360, 15 frames a second. Go Live is a second voice connection. It sends the screen, fitted inside 1280×720, and it does not open a microphone. Watching someone else's share is a third connection that only receives. The voice connection stays up the whole time. The stream's MLS group is the stream server id minus one, not the channel id.
+A camera is one H.264 layer on the voice connection: rid `100`, 640×360, 15 frames a second. Go Live is a second voice connection. It sends the screen at the quality that was picked: 720p at 15 frames a second, 1080p at 30, or 1440p at 60. It does not open a microphone. Watching someone else's share is a third connection that only receives. The voice connection stays up the whole time. The stream's MLS group is the stream server id minus one, not the channel id.
 
 DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on the share, and no clips. A stage is still not joined.
 
@@ -36,7 +36,7 @@ DAVE seals the picture as well as the voice. The transport encryption is the sam
 | Teams | Calls and meetings open in Teams. |
 | Telegram | Calls open in Telegram. |
 | Android Messages | Opens in Messages. |
-| Signal | No call control. |
+| Signal | No call control. An incoming call rings as one notification with "Answer on your phone"; a call nobody answered here leaves a missed-call line in the conversation. |
 | Discord stage | Opens in Discord. |
 
 Gallery, recording, captions, a soundboard, stage channels, activities, a lobby, and breakout rooms are not built on any network.

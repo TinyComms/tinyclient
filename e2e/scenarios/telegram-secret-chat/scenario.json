@@ -1,0 +1,12 @@
+{
+  "id": "telegram-secret-chat",
+  "title": "A Telegram secret chat is a row that says it only works in the phone apps",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same notice is what a secret chat maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same notice is what a secret chat maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

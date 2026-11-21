@@ -66,6 +66,30 @@ pub(super) fn voice_kbps(channel_bps: u32, direct: bool, quality: VoiceQuality) 
     }
 }
 
+/// Where our own voice state puts the call we are in.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Follow {
+    /// Still the channel we joined.
+    Here,
+    /// Same guild, another channel. The official client follows a move, including one from another device.
+    Moved(String),
+    /// Another guild, or a direct call: not this call.
+    Elsewhere,
+    /// Discord took us out of the channel.
+    Left,
+}
+
+/// `guild` and `channel` are the voice state. `call_guild` is set for a server channel and
+/// absent for a direct or group call, which is left where it is.
+pub(super) fn follow(guild: Option<&str>, channel: Option<&str>, call_guild: Option<&str>, call_channel: &str) -> Follow {
+    match channel {
+        Some(channel) if channel == call_channel => Follow::Here,
+        Some(channel) if call_guild.is_some() && guild == call_guild => Follow::Moved(channel.to_owned()),
+        Some(_) => Follow::Elsewhere,
+        None => Follow::Left,
+    }
+}
+
 /// Where Discord takes a conversation: its own app when one is installed, else the web.
 fn link(guild: Option<&str>, channel: &str, app: bool) -> String {
     let place = format!("channels/{}/{channel}", guild.unwrap_or("@me"));
@@ -187,6 +211,8 @@ struct Joining {
     video: bool,
     /// The kb/s last handed to mediad, so the same rate is not sent again.
     told_kbps: Option<u32>,
+    /// The next report replaces a session mediad already has, so it is a rejoin.
+    again: bool,
 }
 
 /// A Go Live leg we have asked for and not yet given up. The voice call stays up beside it.
@@ -494,7 +520,10 @@ impl Discord {
             let (Some(session), Some((endpoint, token))) = (&call.session, &call.server) else {
                 return;
             };
+            let (session, endpoint, token) = (session.clone(), endpoint.clone(), token.clone());
+            let again = call.again;
             call.reported = true;
+            call.again = false;
             let join = VoiceJoin {
                 network: Network::Discord,
                 endpoint: endpoint.clone(),
@@ -516,8 +545,14 @@ impl Discord {
                 watch: false,
                 group_id: String::new(),
             };
-            (call.conversation.clone(), join)
+            (call.conversation.clone(), join, again)
         };
+        let channel = join.1.channel_id.clone();
+        if join.2 {
+            tracing::info!("discord voice rejoin channel={channel}");
+        } else {
+            tracing::info!("discord voice session channel={channel}");
+        }
         self.ctx.voice(&join.0, join.1);
         self.tell_bitrate();
         // A stream's events can arrive before this session id does.
@@ -531,29 +566,55 @@ impl Discord {
         if voice.user_id != self.me() {
             return;
         }
-        let dropped = {
+        enum Ours {
+            Left(String),
+            Moved { from: String, to: String },
+            Same,
+        }
+        let ours = {
             let mut state = self.state.lock().unwrap();
             let Some(call) = &mut state.voice.call else {
                 return;
             };
-            match &voice.channel_id {
-                Some(channel) if *channel == call.conversation => {
+            let guild = voice.guild_id.as_deref();
+            let channel = voice.channel_id.as_deref();
+            match follow(guild, channel, call.guild.as_deref(), &call.conversation) {
+                Follow::Here => {
                     if call.session != voice.session_id {
                         call.session = voice.session_id.clone();
                         call.reported = false;
                     }
-                    None
+                    Ours::Same
                 }
-                // Moved elsewhere from another device: not the call the user asked for here.
-                Some(_) => None,
+                Follow::Moved(to) => {
+                    let from = std::mem::replace(&mut call.conversation, to.clone());
+                    // mediad already has this session when both halves arrived, so the next
+                    // report is a rejoin carrying the channel we were moved to.
+                    call.again = call.session.is_some() && call.server.is_some();
+                    if call.session.as_ref() != voice.session_id.as_ref() {
+                        call.session = voice.session_id.clone();
+                    }
+                    call.reported = false;
+                    Ours::Moved { from, to }
+                }
+                Follow::Elsewhere => Ours::Same,
                 // We were in and Discord took us out: kicked, or the channel is gone.
-                None if call.reported => state.voice.call.take().map(|call| call.conversation),
-                None => None,
+                Follow::Left if call.reported => match state.voice.call.take() {
+                    Some(call) => Ours::Left(call.conversation),
+                    None => Ours::Same,
+                },
+                Follow::Left => Ours::Same,
             }
         };
-        match dropped {
-            Some(conversation) => self.ctx.call_failed(&conversation, CallFailure::Refused, REMOVED),
-            None => self.report(),
+        match ours {
+            Ours::Left(conversation) => self.ctx.call_failed(&conversation, CallFailure::Refused, REMOVED),
+            Ours::Moved { from, to } => {
+                self.ctx.tiny_moved(&from, &to);
+                self.roster();
+                self.occupancy(BTreeSet::from([from, to]));
+                self.report();
+            }
+            Ours::Same => self.report(),
         }
     }
 
@@ -606,6 +667,7 @@ impl Discord {
                 answered: false,
                 video: false,
                 told_kbps: None,
+                again: false,
             });
             ring
         };
@@ -1102,7 +1164,7 @@ impl Discord {
             let request = if watch {
                 MediaRequest::ShareWatch { source: None }
             } else {
-                MediaRequest::ShareSend { on: false, screen: None, quality: None }
+                MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None }
             };
             self.ctx.tell_media(&conversation, request);
         }
@@ -1215,6 +1277,7 @@ mod tests {
             answered: false,
             video: false,
             told_kbps: None,
+            again: false,
         });
         assert!(voice.watched("901", Some("82")), "the call we are in, wherever it is");
     }
@@ -1233,6 +1296,15 @@ mod tests {
         assert_eq!(voice_kbps(32_000, true, Standard), 64);
         assert_eq!(voice_kbps(32_000, true, High), 64);
         assert_eq!(voice_kbps(0, true, DataSaver), 32);
+    }
+
+    #[test]
+    fn a_same_guild_move_is_followed_and_a_direct_call_is_not() {
+        assert_eq!(follow(Some("4000"), Some("4203"), Some("4000"), "4201"), Follow::Moved("4203".into()));
+        assert_eq!(follow(Some("4000"), Some("4201"), Some("4000"), "4201"), Follow::Here);
+        assert_eq!(follow(Some("9"), Some("1"), Some("4000"), "4201"), Follow::Elsewhere);
+        assert_eq!(follow(None, Some("9"), None, "3001"), Follow::Elsewhere);
+        assert_eq!(follow(Some("4000"), None, Some("4000"), "4201"), Follow::Left);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use super::emoji;
 use protocol::{MediaFile, MentionKind, Span, Style};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// What a custom emoji name stands for.
 pub enum Custom {
@@ -197,6 +197,8 @@ impl<'a> Rich<'a> {
                     self.text.push_str(&format!("[image: {}]", label.unwrap_or("untitled")));
                 }
                 "divider" => {}
+                // A meeting card (`call`). Drawn as a card with a Join link, not as buttons.
+                "call" => {}
                 _ => self.undrawn = true,
             }
         }
@@ -411,8 +413,425 @@ fn closer(line: &str, open: usize, mark: u8) -> Option<usize> {
     })
 }
 
+fn block_style(style: &Style) -> bool {
+    matches!(
+        style,
+        Style::ListItem { .. } | Style::CodeBlock { .. } | Style::Quote
+    )
+}
+
+/// Slack `rich_text` blocks for `text` and its spans. Empty when there is no formatting to send:
+/// a plain message stays `text` alone. Reading the blocks back is the check that they match.
+pub(super) fn rich_blocks(text: &str, spans: &[Span]) -> Vec<Value> {
+    if text.is_empty() || spans.is_empty() {
+        return Vec::new();
+    }
+    let elements = block_elements(text, spans);
+    if elements.is_empty() {
+        return Vec::new();
+    }
+    vec![json!({"type": "rich_text", "elements": elements})]
+}
+
+fn block_elements(text: &str, spans: &[Span]) -> Vec<Value> {
+    let mut blocks: Vec<&Span> = spans
+        .iter()
+        .filter(|span| {
+            block_style(&span.style)
+                && text.is_char_boundary(span.start as usize)
+                && text.is_char_boundary(span.end as usize)
+                && span.start < span.end
+                && (span.end as usize) <= text.len()
+        })
+        .collect();
+    blocks.sort_by_key(|span| (span.start, span.end));
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    let mut i = 0usize;
+    let mut emitted = false;
+    let mut ends_with_nl = false;
+    while i < blocks.len() {
+        let span = blocks[i];
+        let start = span.start as usize;
+        if start < at {
+            i += 1;
+            continue;
+        }
+        if let Some((from, to)) = gap_range(text, at, start, emitted, ends_with_nl) {
+            push_section(&mut out, text, spans, from, to);
+            emitted = true;
+            ends_with_nl = text[from..to].ends_with('\n');
+        }
+        match &span.style {
+            Style::ListItem { ordered, depth } => {
+                let (ordered, depth) = (*ordered, *depth);
+                let mut items = vec![(start, span.end as usize)];
+                let mut end = span.end as usize;
+                while let Some(next) = blocks.get(i + 1) {
+                    let same = matches!(&next.style, Style::ListItem { ordered: next_ordered, depth: next_depth } if *next_ordered == ordered && *next_depth == depth);
+                    let next_start = next.start as usize;
+                    if same && text.get(end..next_start) == Some("\n") {
+                        items.push((next_start, next.end as usize));
+                        end = next.end as usize;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.push(list(ordered, depth, text, spans, &items));
+                at = end;
+                emitted = true;
+                ends_with_nl = text[start..end].ends_with('\n');
+            }
+            Style::CodeBlock { language } => {
+                let end = span.end as usize;
+                out.push(preformatted(text, spans, start, end, language));
+                at = end;
+                emitted = true;
+                ends_with_nl = text[start..end].ends_with('\n');
+            }
+            Style::Quote => {
+                let end = span.end as usize;
+                out.push(json!({"type": "rich_text_quote", "elements": inline_elements(text, spans, start, end)}));
+                at = end;
+                emitted = true;
+                ends_with_nl = text[start..end].ends_with('\n');
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some((from, to)) = gap_range(text, at, text.len(), emitted, ends_with_nl) {
+        push_section(&mut out, text, spans, from, to);
+    }
+    out
+}
+
+/// Bytes of the gap that are content. One leading newline is the break the reader inserts
+/// before a block when the text so far does not already end on one.
+fn gap_range(
+    text: &str,
+    at: usize,
+    start: usize,
+    emitted: bool,
+    ends_with_nl: bool,
+) -> Option<(usize, usize)> {
+    if at >= start {
+        return None;
+    }
+    let mut from = at;
+    if emitted && !ends_with_nl && text.as_bytes().get(from) == Some(&b'\n') {
+        from += 1;
+    }
+    (from < start).then_some((from, start))
+}
+
+fn push_section(out: &mut Vec<Value>, text: &str, spans: &[Span], from: usize, to: usize) {
+    let elements = inline_elements(text, spans, from, to);
+    if !elements.is_empty() {
+        out.push(json!({"type": "rich_text_section", "elements": elements}));
+    }
+}
+
+fn list(ordered: bool, depth: u8, text: &str, spans: &[Span], items: &[(usize, usize)]) -> Value {
+    let elements: Vec<Value> = items
+        .iter()
+        .map(|(start, end)| json!({"type": "rich_text_section", "elements": inline_elements(text, spans, *start, *end)}))
+        .collect();
+    let style = if ordered { "ordered" } else { "bullet" };
+    let mut element = json!({"type": "rich_text_list", "style": style, "elements": elements});
+    if depth > 0 {
+        element["indent"] = json!(depth);
+    }
+    element
+}
+
+fn preformatted(text: &str, spans: &[Span], start: usize, end: usize, language: &str) -> Value {
+    let mut element = json!({"type": "rich_text_preformatted", "elements": inline_elements(text, spans, start, end)});
+    if !language.is_empty() {
+        element["language"] = json!(language);
+    }
+    element
+}
+
+fn inline_elements(text: &str, spans: &[Span], from: usize, to: usize) -> Vec<Value> {
+    if from >= to {
+        return Vec::new();
+    }
+    let mut points = vec![from, to];
+    for span in spans {
+        if block_style(&span.style) {
+            continue;
+        }
+        let start = span.start as usize;
+        let end = span.end as usize;
+        if (from..to).contains(&start) && text.is_char_boundary(start) {
+            points.push(start);
+        }
+        if (from..to).contains(&end) && text.is_char_boundary(end) {
+            points.push(end);
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut out = Vec::new();
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let Some(slice) = text.get(a..b).filter(|slice| !slice.is_empty()) else {
+            continue;
+        };
+        let active: Vec<&Span> = spans
+            .iter()
+            .filter(|span| {
+                !block_style(&span.style) && (span.start as usize) <= a && (span.end as usize) >= b
+            })
+            .collect();
+        let exact: Vec<&Span> = active
+            .iter()
+            .copied()
+            .filter(|span| span.start as usize == a && span.end as usize == b)
+            .collect();
+        out.push(element(slice, &active, &exact));
+    }
+    out
+}
+
+fn element(slice: &str, active: &[&Span], exact: &[&Span]) -> Value {
+    let marked = |mut value: Value| {
+        if let Some(style) = flags(active) {
+            value["style"] = style;
+        }
+        value
+    };
+    if let Some(Style::Mention { kind, id }) = exact.iter().find_map(|span| match &span.style {
+        style @ Style::Mention { .. } => Some(style),
+        _ => None,
+    }) {
+        let value = match kind {
+            MentionKind::User => json!({"type": "user", "user_id": id}),
+            MentionKind::Channel => json!({"type": "channel", "channel_id": id}),
+            MentionKind::Role => json!({"type": "usergroup", "usergroup_id": id}),
+            MentionKind::Everyone => json!({"type": "broadcast", "range": id}),
+        };
+        return marked(value);
+    }
+    if let Some(Style::Link { url }) = exact.iter().find_map(|span| match &span.style {
+        style @ Style::Link { .. } => Some(style),
+        _ => None,
+    }) {
+        return marked(json!({"type": "link", "url": url, "text": slice}));
+    }
+    if let Some(Style::Emoji { .. }) = exact.iter().find_map(|span| match &span.style {
+        style @ Style::Emoji { .. } => Some(style),
+        _ => None,
+    }) {
+        let name = slice.trim_matches(':');
+        if !name.is_empty() && !name.contains(':') {
+            return marked(json!({"type": "emoji", "name": name}));
+        }
+    }
+    if exact.is_empty() {
+        if let Some(name) = emoji::name(slice) {
+            if emoji::standard(&name).as_deref() == Some(slice) {
+                return json!({"type": "emoji", "name": name});
+            }
+        }
+    }
+    marked(json!({"type": "text", "text": slice}))
+}
+
+fn flags(active: &[&Span]) -> Option<Value> {
+    let mut style = serde_json::Map::new();
+    for span in active {
+        let key = match span.style {
+            Style::Bold => "bold",
+            Style::Italic => "italic",
+            Style::Strike => "strike",
+            Style::Underline => "underline",
+            Style::Code => "code",
+            _ => continue,
+        };
+        style.insert(key.to_owned(), Value::Bool(true));
+    }
+    (!style.is_empty()).then_some(Value::Object(style))
+}
+
+struct Ledger;
+
+impl Names for Ledger {
+    fn me(&self) -> &str {
+        "UME"
+    }
+    fn user(&self, id: &str) -> String {
+        format!("name-of-{id}")
+    }
+    fn channel(&self, id: &str) -> Option<String> {
+        (id == "C9").then(|| "#platform".to_owned())
+    }
+    fn usergroup(&self, id: &str) -> Option<String> {
+        (id == "S1").then(|| "oncall".to_owned())
+    }
+    fn custom(&self, name: &str) -> Option<Custom> {
+        (name == "partyparrot").then(|| {
+            Custom::File(protocol::MediaFile::new(
+                "emoji:partyparrot",
+                protocol::MediaKind::Emoji,
+            ))
+        })
+    }
+}
+
+fn cover(text: &str, piece: &str, style: Style) -> Span {
+    let start = text.find(piece).unwrap_or(0) as u32;
+    Span {
+        start,
+        end: start + piece.len() as u32,
+        style,
+    }
+}
+
+fn round_trip(text: &str, spans: &[Span]) -> Result<(), String> {
+    let blocks = rich_blocks(text, spans);
+    if blocks.is_empty() {
+        return Err("formatted text was sent as plain text".into());
+    }
+    let mut rich = Rich::new(&Ledger);
+    if !rich.blocks(&blocks) {
+        return Err("rich text blocks carried no text".into());
+    }
+    rich.finish();
+    if rich.text != text {
+        return Err(format!("sent {text:?} and read {:?}", rich.text));
+    }
+    if rich.spans != spans {
+        return Err(format!("sent {spans:?} and read {:?}", rich.spans));
+    }
+    Ok(())
+}
+
+/// The lab's slack-rich-text driver. A build without this stays up and the driver fails.
+/// The same blocks a send posts are what the reader turns back into text and spans.
+pub(crate) fn prove_rich_text() -> Result<(), String> {
+    let shaped = "Ship today 🚀 cc @name-of-UME @oncall #platform plan\nbuild\ndeploy\ncargo test\nlooks good";
+    round_trip(
+        shaped,
+        &[
+            cover(shaped, "today", Style::Bold),
+            cover(shaped, "today", Style::Italic),
+            cover(
+                shaped,
+                "@name-of-UME",
+                Style::Mention {
+                    kind: MentionKind::User,
+                    id: "UME".into(),
+                },
+            ),
+            cover(
+                shaped,
+                "@oncall",
+                Style::Mention {
+                    kind: MentionKind::Role,
+                    id: "S1".into(),
+                },
+            ),
+            cover(
+                shaped,
+                "#platform",
+                Style::Mention {
+                    kind: MentionKind::Channel,
+                    id: "C9".into(),
+                },
+            ),
+            cover(
+                shaped,
+                "plan",
+                Style::Link {
+                    url: "https://ex.com".into(),
+                },
+            ),
+            cover(
+                shaped,
+                "build",
+                Style::ListItem {
+                    ordered: true,
+                    depth: 1,
+                },
+            ),
+            cover(
+                shaped,
+                "deploy",
+                Style::ListItem {
+                    ordered: true,
+                    depth: 1,
+                },
+            ),
+            cover(
+                shaped,
+                "cargo test",
+                Style::CodeBlock {
+                    language: "rust".into(),
+                },
+            ),
+            cover(shaped, "looks good", Style::Quote),
+        ],
+    )?;
+    let linked = "see the doc";
+    round_trip(
+        linked,
+        &[cover(
+            linked,
+            "the doc",
+            Style::Link {
+                url: "https://ex.com/a?b=1&c=2".into(),
+            },
+        )],
+    )?;
+    let nested = "one\ntwo\nchild";
+    round_trip(
+        nested,
+        &[
+            cover(
+                nested,
+                "one",
+                Style::ListItem {
+                    ordered: false,
+                    depth: 0,
+                },
+            ),
+            cover(
+                nested,
+                "two",
+                Style::ListItem {
+                    ordered: false,
+                    depth: 0,
+                },
+            ),
+            cover(
+                nested,
+                "child",
+                Style::ListItem {
+                    ordered: false,
+                    depth: 1,
+                },
+            ),
+        ],
+    )?;
+    let custom = "wave :partyparrot:";
+    round_trip(
+        custom,
+        &[cover(
+            custom,
+            ":partyparrot:",
+            Style::Emoji {
+                file: protocol::MediaFile::new("emoji:partyparrot", protocol::MediaKind::Emoji),
+            },
+        )],
+    )?;
+    Ok(())
+}
+
 /// The closing colon of an emoji name opened at `open`.
-fn emoji_end(line: &str, open: usize) -> Option<usize> {
+pub(super) fn emoji_end(line: &str, open: usize) -> Option<usize> {
     let rest = &line[open + 1..];
     let len = rest.find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || "_+-'".contains(c)))?;
     let mut close = open + 1 + len;
@@ -558,4 +977,8 @@ mod tests {
         assert_eq!(rich.text, "Deploy #42\nmain is green\nTook: 4 min");
         assert!(rich.undrawn);
     }
-}
+
+    #[test]
+    fn sending_rich_text_reads_back_as_the_same_text_and_spans() {
+        super::prove_rich_text().unwrap();
+    }}

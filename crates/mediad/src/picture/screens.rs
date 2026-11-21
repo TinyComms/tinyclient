@@ -121,7 +121,11 @@ pub(super) fn capture(id: Option<&str>) -> Result<Rgba, String> {
         return Err("The screen has no size.".to_owned());
     };
     match duplicated(&display.device) {
-        Ok(frame) => Ok(frame),
+        Ok(mut frame) => {
+            // The duplication frame has no pointer in it; it is blended in where it is now.
+            super::cursor::blend(&mut frame, display.rect.left, display.rect.top);
+            Ok(frame)
+        }
         Err(words) => {
             tracing::debug!(words, "the screen fell back to GDI for a frame");
             win::capture_rect(display.rect)
@@ -290,7 +294,14 @@ mod win {
             if dc.is_null() {
                 return Err("tinyclient can't record the screen.".to_owned());
             }
-            let grabbed = grab(dc, width, height, |memory| BitBlt(memory, 0, 0, width, height, dc, rect.left, rect.top, SRCCOPY) != 0);
+            let grabbed = grab(dc, width, height, |memory| {
+                let drawn = BitBlt(memory, 0, 0, width, height, dc, rect.left, rect.top, SRCCOPY) != 0;
+                if drawn {
+                    // A GDI grab has no pointer in it; it is drawn on before the read-back.
+                    super::super::cursor::draw_on(memory, rect.left, rect.top, rect.right, rect.bottom);
+                }
+                drawn
+            });
             ReleaseDC(std::ptr::null_mut(), dc);
             grabbed.ok_or_else(|| "tinyclient can't record the screen.".to_owned())
         }
@@ -320,7 +331,14 @@ mod win {
             if dc.is_null() {
                 return Err("tinyclient can't record the window.".to_owned());
             }
-            let grabbed = grab(dc, width, height, |memory| PrintWindow(hwnd, memory, PW_RENDERFULLCONTENT) != 0);
+            let grabbed = grab(dc, width, height, |memory| {
+                let drawn = PrintWindow(hwnd, memory, PW_RENDERFULLCONTENT) != 0;
+                if drawn {
+                    // A drawn window has no pointer in it either; drawn on when it is over it.
+                    super::super::cursor::draw_on(memory, rect.left, rect.top, rect.right, rect.bottom);
+                }
+                drawn
+            });
             ReleaseDC(std::ptr::null_mut(), dc);
             grabbed.ok_or_else(|| "tinyclient can't record the window.".to_owned())
         }

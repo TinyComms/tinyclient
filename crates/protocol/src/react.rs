@@ -9,8 +9,9 @@
 use crate::{is_false, is_zero, EmojiScope, Reaction};
 use serde::{Deserialize, Serialize};
 
-/// Most emoji [`ReactionRules::only`] lists. Telegram's whole set is under a hundred.
-pub const REACTIONS_LISTED: usize = 500;
+/// Most emoji [`ReactionRules::only`] lists. Slack names every picker emoji, about two
+/// thousand; Telegram's whole set is under a hundred.
+pub const REACTIONS_LISTED: usize = 4096;
 
 fn is_true(value: &bool) -> bool {
     *value
@@ -205,7 +206,7 @@ mod tests {
     use super::*;
 
     fn on(emoji: &str, count: u32, mine: bool) -> Reaction {
-        Reaction { emoji: emoji.into(), file: None, count, mine }
+        Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new() }
     }
 
     #[test]

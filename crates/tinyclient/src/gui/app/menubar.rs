@@ -137,39 +137,50 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
 /// The keys of the menu bar's items. The rest are bound in `gui::bind_keys`.
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
-    cx.bind_keys([
-        KeyBinding::new("secondary-,", Settings, None),
-        KeyBinding::new("secondary-n", NewMessage, None),
-        KeyBinding::new("secondary-u", AttachFile, None),
-        KeyBinding::new("secondary-w", CloseWindow, None),
-        KeyBinding::new("secondary-f", SearchConversation, None),
-        KeyBinding::new("secondary-shift-f", SearchEverywhere, None),
-        KeyBinding::new("secondary-=", BiggerText, None),
-        KeyBinding::new("secondary-+", BiggerText, None),
-        KeyBinding::new("secondary--", SmallerText, None),
-        KeyBinding::new("secondary-0", ActualSize, None),
-        KeyBinding::new(if cfg!(target_os = "macos") { "ctrl-cmd-f" } else { "ctrl-alt-f" }, FullScreen, None),
-        KeyBinding::new("alt-secondary-u", MarkUnread, None),
-        KeyBinding::new("alt-secondary-i", ShowDetails, None),
-        KeyBinding::new("secondary-shift-c", StartCall, None),
-        KeyBinding::new("alt-secondary-o", OpenInNetwork, None),
-        KeyBinding::new("secondary-m", Minimize, None),
-        KeyBinding::new("secondary-/", KeyboardShortcuts, None),
-        KeyBinding::new("secondary-shift-l", ShowLogs, None),
-    ]);
+    macro_rules! bind {
+        ($id:literal, $action:expr) => {
+            for chord in crate::gui::keymap::chords($id) {
+                cx.bind_keys([KeyBinding::new(&chord, $action, None)]);
+            }
+        };
+    }
+    bind!("settings", Settings);
+    bind!("new-message", NewMessage);
+    bind!("attach", AttachFile);
+    bind!("close-window", CloseWindow);
+    bind!("search-here", SearchConversation);
+    bind!("search-all", SearchEverywhere);
+    bind!("bigger-text", BiggerText);
+    bind!("smaller-text", SmallerText);
+    bind!("actual-size", ActualSize);
+    bind!("full-screen", FullScreen);
+    cx.bind_keys([KeyBinding::new("alt-secondary-u", MarkUnread, None)]);
+    bind!("details", ShowDetails);
+    bind!("start-call", StartCall);
+    bind!("open-in", OpenInNetwork);
+    bind!("minimize", Minimize);
+    bind!("shortcuts-page", KeyboardShortcuts);
+    bind!("show-logs", ShowLogs);
     super::super::logs::bind_keys(cx);
     // Hiding is macOS's. Linux ignores it, and GPUI on Windows panics at Hide Others.
     if cfg!(target_os = "macos") {
-        cx.bind_keys([KeyBinding::new("secondary-h", Hide, None), KeyBinding::new("alt-secondary-h", HideOthers, None)]);
+        bind!("hide", Hide);
+        bind!("hide-others", HideOthers);
     }
 }
 
 /// ⌘Q. chatd is stopped by `stop_chatd_on_quit`, as for every other way out.
 pub fn quit(cx: &mut App) {
     tracing::warn!("tinyclient: quit asked");
+    #[cfg(windows)]
+    notifier::tray::remove();
     if let Some(guard) = protocol::log_policy::current() {
         guard.flush();
     }
+    // The launcher entry goes to 0 first: a quit without it leaves the icon with a dead app's
+    // number. The ask is sent before anything is torn down.
+    #[cfg(target_os = "linux")]
+    notifier::taskbar::badge(0);
     cx.quit();
 }
 
@@ -195,8 +206,8 @@ pub fn stop_chatd_on_quit(cx: &mut App) {
 }
 
 /// Closing the main window quits on Linux and Windows, where application hiding is not
-/// implemented. On macOS, Keep receiving hides the window and leaves chatd receiving;
-/// otherwise closing quits there too.
+/// implemented — unless the tray holds it (G3, Windows only so far). On macOS, Keep receiving
+/// hides the window and leaves chatd receiving; otherwise closing quits there too.
 pub fn close_window(cx: &mut App) {
     if cfg!(target_os = "macos") && super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
         tracing::warn!("tinyclient: close window hides (Keep receiving)");
@@ -204,11 +215,37 @@ pub fn close_window(cx: &mut App) {
             guard.flush();
         }
         cx.hide();
+    } else if holds_in_tray() {
+        tracing::warn!("tinyclient: close window hides (tray)");
+        if let Some(guard) = protocol::log_policy::current() {
+            guard.flush();
+        }
+        close_into_tray();
     } else {
         tracing::warn!("tinyclient: close window quits");
         quit(cx);
     }
 }
+
+/// G3 keeps the window alive in the tray: the choice is on and the icon exists, so the click
+/// on it is the way back in. Windows only so far; `notifier::tray` has no other backend yet.
+#[cfg(windows)]
+fn holds_in_tray() -> bool {
+    super::prefs::choices().tray && notifier::tray::active()
+}
+
+#[cfg(not(windows))]
+fn holds_in_tray() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn close_into_tray() {
+    notifier::tray::close_into_tray()
+}
+
+#[cfg(not(windows))]
+fn close_into_tray() {}
 
 /// The app-wide handlers: they act on the app, not on what has focus.
 pub fn app_actions(cx: &mut App) {

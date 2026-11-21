@@ -55,7 +55,7 @@ const SCAM: usize = 7;
 /// Puts reactions on a message already recorded.
 fn reacted(s: &mut Seeder, conversation: &Key, id: &str, list: &[(&str, u32, bool)]) -> Fallible<()> {
     if let Some(mut message) = s.store.message(conversation, id)? {
-        message.reactions = list.iter().map(|(emoji, count, mine)| Reaction { emoji: (*emoji).to_owned(), file: None, count: *count, mine: *mine }).collect();
+        message.reactions = list.iter().map(|(emoji, count, mine)| Reaction { emoji: (*emoji).to_owned(), file: None, count: *count, mine: *mine, who: Vec::new() }).collect();
         s.post(conversation, &message)?;
     }
     Ok(())

@@ -1,0 +1,12 @@
+{
+  "id": "signal-message-info",
+  "title": "A Signal group message lists who has it and is seen only once everyone has read it",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run this chatd check.",
+    "ios": "The phone proof build does not run this chatd check."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

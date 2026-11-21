@@ -8,14 +8,15 @@
 //! encoded, so this crate still builds with no C toolchain. The camera is the system's own
 //! (Media Foundation, AVFoundation, V4L2), and on Linux a camera V4L2 cannot open is asked for
 //! through the desktop portal. The screen is GDI or Desktop Duplication on Windows, Core Graphics
-//! on macOS, the X11 root on an X11 session, and that same portal on Wayland. A capture that fails
+//! on macOS, the X11 root on an X11 session, and that same portal on Wayland, with the sharer's
+//! pointer drawn in where the platform can (`cursor`, and the portal's own embedded mode). A capture that fails
 //! is said in words and the voice call stays. A phone captures and codes through its `platform`
 //! (`phone`). All of it is slow, and none of it runs on the call's tick: `video` holds the threads.
 
 use protocol::{PictureKind, ShareQuality};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -40,6 +41,10 @@ pub fn cameras(_folder: Option<&std::path::Path>) -> Vec<protocol::CameraSource>
 /// A screen through Desktop Duplication, which is what a share at 60 frames a second needs.
 #[cfg(windows)]
 mod duplicate;
+/// The sharer's pointer for a share's frames: Windows never puts it in a GDI grab or a
+/// duplication frame, so it is fetched once per shape and drawn onto each frame (`#797`).
+#[cfg(windows)]
+mod cursor;
 /// PipeWire's SPA pods and the struct layout a `dlopen` has to match, plus which Linux session
 /// this is. Compiled into the tests on every desktop; only a Linux build loads PipeWire.
 #[cfg(any(test, all(target_os = "linux", not(target_env = "ohos"))))]
@@ -118,6 +123,22 @@ impl Quality {
 /// The quality the next share goes at. One call per process, so one choice per process. A
 /// phone has no choice: its hardware codec gets `Low`.
 static QUALITY: AtomicU8 = AtomicU8::new(ShareQuality::Best as u8);
+
+/// Whether the next share draws the sharer's pointer. On by default: viewers follow what is
+/// pointed at, which is what the Wayland portal already embedded. One call per process, so
+/// one choice per process.
+static CURSOR: AtomicBool = AtomicBool::new(true);
+
+/// What a share does with the pointer from its next frame on. `None` leaves it shown, as a
+/// shell that says nothing is an older one.
+pub fn choose_cursor(show: Option<bool>) {
+    CURSOR.store(show != Some(false), Ordering::Relaxed);
+}
+
+/// Whether the capture draws the pointer into the share's frames now.
+pub fn cursor_shown() -> bool {
+    CURSOR.load(Ordering::Relaxed)
+}
 
 /// What a share spends from its next frame on. On a desktop only: see [`share_quality`].
 pub fn choose_quality(quality: Option<ShareQuality>) {
@@ -500,5 +521,17 @@ mod tests {
         assert!(planes.v[0] > 200, "v {}", planes.v[0]);
         let colors = rgb(&planes);
         assert!(colors[0] > 200 && colors[1] < 40 && colors[2] < 40, "{colors:?}");
+    }
+
+    #[test]
+    fn the_pointer_is_shown_unless_a_share_asks_for_none() {
+        assert!(cursor_shown(), "the default is on: viewers follow what is pointed at");
+        choose_cursor(Some(false));
+        assert!(!cursor_shown());
+        choose_cursor(Some(true));
+        assert!(cursor_shown());
+        // A shell that says nothing is an older one, and leaves it shown.
+        choose_cursor(None);
+        assert!(cursor_shown());
     }
 }

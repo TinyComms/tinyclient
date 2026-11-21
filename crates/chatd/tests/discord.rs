@@ -1378,6 +1378,75 @@ fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
     assert!(world.discord.requests_to("POST", "/channels/3001/messages/").iter().all(|seen| !seen.path.contains("/threads")));
 }
 
+/// Replies in a thread show on the starter message: the count, two faces, and the thread's unread.
+/// A later thread update raises the count without dropping the faces. Opening the thread does not
+/// count the reply Discord had already included.
+#[test]
+fn a_thread_chip_counts_replies_and_shows_their_faces() {
+    let world = World::start();
+    let starter = "1300000000000000100";
+    wait("the channel's history", || {
+        world.messages("4101").into_iter().find(|message| message.id == starter).filter(|message| {
+            message.thread.as_ref().is_some_and(|thread| thread.id == "4500" && thread.replies == 4 && thread.participants.is_empty())
+        })
+    });
+
+    wait("the thread's messages", || Some(world.messages("4500")).filter(|messages| !messages.is_empty()));
+    let opened_chip = world.messages("4101").into_iter().find(|message| message.id == starter).unwrap();
+    let opened_thread = opened_chip.thread.as_ref().unwrap();
+    assert_eq!(opened_thread.replies, 4, "a reply already in Discord's count must not be counted again");
+    assert!(opened_thread.participants.is_empty());
+
+    let author = |id: &str, username: &str, name: &str| {
+        json!({"id": id, "username": username, "global_name": name, "discriminator": "0", "avatar": null})
+    };
+    world.incoming("4500", Some("4000"), "one", json!({"author": author("2001", "mara", "Mara")}));
+    world.incoming("4500", Some("4000"), "two", json!({"author": author("2002", "dev", "Dev")}));
+    let chip = wait("the chip after two replies", || {
+        let arrived = world.messages("4500").iter().filter(|message| message.text == "one" || message.text == "two").count();
+        if arrived < 2 {
+            return None;
+        }
+        world.messages("4101").into_iter().find(|message| message.id == starter).and_then(|message| {
+            let thread = message.thread?;
+            (thread.replies == 6 && thread.participants.len() == 2).then_some(thread)
+        })
+    });
+    assert_eq!(chip.participants.iter().map(|person| person.id.as_str()).collect::<Vec<_>>(), ["2002", "2001"]);
+    let row = world.conversation("4500");
+    assert_eq!(chip.unread, row.unread);
+    assert!(chip.last > 0);
+
+    let newer = world.discord.snowflake();
+    world.discord.push(
+        "THREAD_UPDATE",
+        json!({
+            "id": "4500",
+            "type": 11,
+            "name": "release plan",
+            "parent_id": "4101",
+            "guild_id": "4000",
+            "message_count": 9,
+            "last_message_id": newer,
+            "thread_metadata": {"archived": false, "locked": false},
+            "member": {"join_timestamp": "2024-10-20T00:00:00+00:00"},
+        }),
+    );
+    let raised = wait("the count from the thread update", || {
+        world.messages("4101").into_iter().find(|message| message.id == starter).and_then(|message| {
+            let thread = message.thread?;
+            (thread.replies == 9).then_some(thread)
+        })
+    });
+    assert_eq!(raised.participants.iter().map(|person| person.id.as_str()).collect::<Vec<_>>(), ["2002", "2001"]);
+    assert_eq!(raised.last, model_seconds(&newer));
+}
+
+fn model_seconds(id: &str) -> i64 {
+    let id: u64 = id.parse().unwrap_or(0);
+    (((id >> 22) + 1_420_070_400_000) / 1000) as i64
+}
+
 #[test]
 fn typing_appears_expires_and_is_paced_on_the_way_out() {
     let world = World::start();
@@ -1415,7 +1484,7 @@ fn typing_appears_expires_and_is_paced_on_the_way_out() {
     allow_typing(&world, &dm);
     // The draft changing three times is one signal to Discord.
     for _ in 0..3 {
-        assert_eq!(world.ask(Request::Typing { conversation: dm.clone() }), Response::Ok);
+        assert_eq!(world.ask(Request::Typing { conversation: dm.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     }
     wait("the typing signal", || (!world.discord.requests_to("POST", "/channels/3001/typing").is_empty()).then_some(()));
     sleep(Duration::from_secs(1));
@@ -1528,6 +1597,7 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
         conversation: free.key("3001"),
         message_id: "1300000000000000009".into(),
         text: three.clone(),
+        spans: Vec::new(),
     });
     match edit {
         Response::Error { detail, .. } => assert!(detail.contains("2000"), "{detail}"),
@@ -1563,7 +1633,7 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     assert_eq!(posted.len(), 2);
     assert_eq!(posted.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
 
-    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three });
+    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three, spans: Vec::new() });
     assert_eq!(edited, Response::Ok);
     let patched = nitro.discord.requests_to("PATCH", "/channels/3002/messages");
     assert_eq!(patched.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
@@ -1661,7 +1731,7 @@ fn marking_a_message_unread_moves_the_marker_back_and_a_manual_ack_does_too() {
 fn marking_everything_read_tells_discord_in_one_bulk_ack() {
     let world = World::start();
     assert!(world.conversation("3001").unread > 0);
-    assert_eq!(world.ask(Request::MarkAllRead { network: None }), Response::Ok);
+    assert_eq!(world.ask(Request::MarkAllRead { network: None, space: None }), Response::Ok);
     assert_eq!(world.conversation("3001").unread, 0);
     let bulk = wait("the bulk ack", || {
         let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
@@ -1671,6 +1741,41 @@ fn marking_everything_read_tells_discord_in_one_bulk_ack() {
         seen.body["read_states"].as_array().is_some_and(|rows| rows.iter().any(|row| row["channel_id"] == "3001"))
     });
     assert!(named, "channel 3001 is in the bulk ack");
+}
+
+#[test]
+fn marking_one_space_read_leaves_the_other_spaces_badges_alone() {
+    let world = World::start();
+    // The ready state carries badges in guild 4000 (4101, 4104, and muted 4105), in guild
+    // 5000 (5001) and among the direct messages (3001).
+    wait("the badges from the ready state", || {
+        let (four, five, dm) = (world.conversation("4101").unread, world.conversation("5001").unread, world.conversation("3001").unread);
+        (four > 0 && five > 0 && dm > 0).then_some(())
+    });
+    assert_eq!(
+        world.ask(Request::MarkAllRead { network: Some(Network::Discord), space: Some(world.key("4000")) }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation("4101").unread, 0, "the space's channels are read");
+    assert_eq!(world.conversation("4104").unread, 0);
+    assert_eq!(world.conversation("4105").unread, 0, "a muted channel of the space is read too");
+    assert!(world.conversation("5001").unread > 0, "another space keeps its badge");
+    assert!(world.conversation("3001").unread > 0, "a direct message keeps its badge");
+    let bulks = wait("the bulk ack for the space", || {
+        let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
+        (!found.is_empty()).then_some(found)
+    });
+    assert!(
+        bulks.iter().any(|seen| seen.body["read_states"].as_array().is_some_and(|rows| rows.iter().any(|row| row["channel_id"] == "4101"))),
+        "the space's channel is acked"
+    );
+    for seen in &bulks {
+        let named = |channel: &str| {
+            seen.body["read_states"].as_array().is_some_and(|rows| rows.iter().any(|row| row["channel_id"] == channel))
+        };
+        assert!(!named("5001"), "another space's channel is not acked");
+        assert!(!named("3001"), "a direct message is not acked by a space's read");
+    }
 }
 
 #[test]
@@ -2211,6 +2316,49 @@ fn a_32_kbps_voice_channel_asks_mediad_for_32() {
 }
 
 #[test]
+fn a_move_to_another_voice_channel_is_followed() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = tungstenite::accept(stream);
+        sleep(Duration::from_secs(20));
+    });
+    let world = World::launch(&[("TINYCLIENT_MEDIAD_AUDIO", "null"), ("TINYCLIENT_VOICE_PLAIN", "1")], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+    let ours = |channel: &str| {
+        json!({"guild_id": "4000", "channel_id": channel, "user_id": "1000", "session_id": "voice-us",
+               "self_mute": false, "self_deaf": false, "mute": false, "deaf": false})
+    };
+    world.discord.push("VOICE_STATE_UPDATE", ours("4201"));
+    world.discord.push("VOICE_SERVER_UPDATE", json!({"token": "voice-token", "guild_id": "4000", "endpoint": endpoint}));
+    let log = world.dir.join("logs").join("chatd.log");
+    wait("the first session", || {
+        let text = std::fs::read_to_string(&log).ok()?;
+        text.contains("discord voice session channel=4201").then_some(())
+    });
+    world.discord.push("VOICE_STATE_UPDATE", ours("4203"));
+    let moved = wait("the call to follow the move", || call().filter(|call| call.conversation.id == "4203"));
+    assert_eq!(moved.conversation, world.key("4203"));
+    wait("the rejoin to carry the new channel", || {
+        let text = std::fs::read_to_string(&log).ok()?;
+        text.contains("discord voice rejoin channel=4203").then_some(())
+    });
+    // Another guild, and a direct call, are not this call.
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "9", "channel_id": "9999", "user_id": "1000", "session_id": "voice-us"}));
+    sleep(Duration::from_millis(200));
+    assert_eq!(call().expect("the call stays").conversation.id, "4203");
+}
+
+#[test]
 fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
     let world = World::start();
     let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
@@ -2418,7 +2566,7 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
 
     // An edit changes nothing until Discord accepts it; then the store has Discord's version.
     let edit = |text: &str| {
-        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned() })
+        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned(), spans: Vec::new() })
     };
     assert_eq!(edit("is the *deploy* done yet?"), Response::Ok);
     let patched = world.discord.requests_to("PATCH", &format!("{reactions}/{mine}"));
@@ -2782,7 +2930,7 @@ fn a_run_of_refusals_stops_every_request_and_says_so() {
     let why = world.failure("3002", "1730000000000000031");
     assert!(why.contains("refused too many requests") && why.contains("10 min"), "{why}");
     allow_typing(&world, &world.key("3002"));
-    world.ask(Request::Typing { conversation: world.key("3002") });
+    world.ask(Request::Typing { conversation: world.key("3002"), activity: protocol::Compose::Typing });
     settled(&world);
     assert_eq!(world.discord.requests.lock().unwrap().len(), before);
 }
@@ -2795,7 +2943,7 @@ fn a_rate_limit_that_is_not_json_is_waited_out_from_its_headers_and_tried_once_m
         world.discord.script_raw("/channels/3002/typing", 429, "Retry-After: 2\r\nContent-Type: text/html\r\n", "<html>error code: 1015</html>");
     }
     allow_typing(&world, &world.key("3002"));
-    world.ask(Request::Typing { conversation: world.key("3002") });
+    world.ask(Request::Typing { conversation: world.key("3002"), activity: protocol::Compose::Typing });
     let typed = wait("the second attempt", || Some(world.discord.requests_to("POST", "/channels/3002/typing")).filter(|typed| typed.len() == 2));
     let waited = typed[1].at.duration_since(typed[0].at);
     assert!(waited >= Duration::from_millis(1950), "tried again after {waited:?}");
@@ -3218,7 +3366,7 @@ fn a_challenge_stops_every_request_and_shows_on_the_account() {
     world.send("3002", "1730000000000000042", "hello again", None);
     world.failure("3002", "1730000000000000042");
     allow_typing(&world, &world.key("3002"));
-    world.ask(Request::Typing { conversation: world.key("3002") });
+    world.ask(Request::Typing { conversation: world.key("3002"), activity: protocol::Compose::Typing });
     world.messages("3004");
     settled(&world);
     assert_eq!(world.discord.requests.lock().unwrap().len(), asked);

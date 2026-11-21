@@ -555,7 +555,7 @@ mod tests {
     }
 
     fn on(emoji: &str, count: u32, mine: bool) -> Reaction {
-        Reaction { emoji: emoji.into(), file: None, count, mine }
+        Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new() }
     }
 
     #[test]

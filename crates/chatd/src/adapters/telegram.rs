@@ -11,11 +11,11 @@
 //! | Idle memory | +2.8 MB footprint loaded with no parameters set: a floor. With its database and a connection it could not be measured without an app id; the docs' estimate is 20 to 50 MB. | +0.2 MB footprint, +1.2 MB RSS over an empty process, measured connected to a datacenter with the key exchange done. |
 //! | Second cache | Its own SQLite beside ours: every message stored twice. | None: messages go to chatd's store as they arrive. |
 //! | Maintained | By Telegram. | One maintainer plus contributors; archived on GitHub 2026-02-10 and moved to Codeberg, where it is active: 0.10.0 on 2026-07-02, schema layer bumped 2026-10-10, commits the day this was written. |
-//! | Covers | Everything, secret chats and call signalling included. | Phone login and 2FA as methods; QR login, folders, topics, reactions, typing, read state and files through its raw request call, which reaches the whole schema. No secret chats, no calls. |
+//! | Covers | Everything, secret chats and call signalling included. | Phone login and 2FA as methods; QR login, folders, topics, reactions, typing, read state and files through its raw request call, which reaches the whole schema. A secret chat is a row that says it stays in Telegram's phone apps. No calls. |
 //!
 //! grammers wins on the two things this app is about, weight and one cache, and it is the only
 //! one of the two that can be built on the machine tinyclient is developed on. What it costs: a
-//! schema change at Telegram waits on one maintainer, secret chats are out, and calls (a later
+//! schema change at Telegram waits on one maintainer, secret-chat messages are not carried, and calls (a later
 //! stage, tgcalls either way) will need their signalling written here. If grammers is ever
 //! abandoned, everything above `wire::Wire` speaks Telegram's schema, not grammers, so the
 //! transport can be replaced without touching the mapping.
@@ -63,6 +63,7 @@ mod peers;
 mod premium;
 pub(crate) mod react;
 mod real;
+mod secret;
 mod send;
 pub mod signin;
 mod sync;
@@ -72,7 +73,7 @@ use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, 
 use crate::session;
 use grammers_tl_types as tl;
 use peers::{Directory, Who};
-use protocol::{Link, Person, Presence, Relation};
+use protocol::{Link, Person, Presence, RelateAction, Relation};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -228,6 +229,8 @@ struct Live {
     /// Where recent messages are, for the updates that name a message and not its place: a
     /// deletion outside a channel, anything inside a forum.
     placed: VecDeque<((Who, i32), String)>,
+    /// Users blocked on this connection. A second Block of one of them unblocks them.
+    blocked: HashSet<i64>,
     /// Messages we sent and the id the shell knows each by, until the echo has passed.
     sent: VecDeque<(i32, String)>,
     random: VecDeque<(i64, String)>,
@@ -359,12 +362,14 @@ impl Account {
         self.dir().input_channel(who).ok_or_else(|| Fault::Rpc { code: 400, name: "CHANNEL_INVALID".to_owned(), value: None })
     }
 
-    /// Remembers where a message is.
+    /// Remembers where a message is, in this connection and in a note that outlives it.
     fn place(&self, who: Who, message: i32, conversation: &str) {
         // A channel that is not a forum says where its messages are by itself.
         if matches!(who, Who::Channel(_)) && !conversation.contains('_') {
             return;
         }
+        let channel = matches!(who, Who::Channel(_)).then(|| who.text());
+        self.ctx.set_note(&message_note(channel.as_deref(), message), conversation);
         let mut live = self.live();
         if live.placed.len() >= PLACED {
             live.placed.pop_front();
@@ -373,12 +378,47 @@ impl Account {
     }
 
     fn placed(&self, who: Option<Who>, message: i32) -> Option<String> {
-        let live = self.live();
-        let found = live.placed.iter().rev().find(|((peer, id), _)| *id == message && match who {
-            Some(who) => *peer == who,
-            None => !matches!(peer, Who::Channel(_)),
+        let memory = {
+            let live = self.live();
+            live.placed.iter().rev().find(|((peer, id), _)| *id == message && match who {
+                Some(who) => *peer == who,
+                None => !matches!(peer, Who::Channel(_)),
+            }).map(|(_, conversation)| conversation.clone())
+        };
+        let channel = match who {
+            Some(Who::Channel(_)) => who.map(|who| who.text()),
+            _ => None,
+        };
+        remembered(memory.as_deref(), self.ctx.note(&message_note(channel.as_deref(), message)).as_deref())
+    }
+
+    /// The id was deleted, so a later message must not inherit its chat.
+    fn forget_placed(&self, who: Option<Who>, message: i32) {
+        let channel = match who {
+            Some(Who::Channel(_)) => who.map(|who| who.text()),
+            _ => None,
+        };
+        self.ctx.set_note(&message_note(channel.as_deref(), message), "");
+        let mut live = self.live();
+        live.placed.retain(|((peer, id), _)| {
+            !(*id == message && match who {
+                Some(who) => *peer == who,
+                None => !matches!(peer, Who::Channel(_)),
+            })
         });
-        found.map(|(_, conversation)| conversation.clone())
+    }
+
+    fn user_blocked(&self, id: i64) -> bool {
+        self.live().blocked.contains(&id)
+    }
+
+    fn set_user_blocked(&self, id: i64, blocked: bool) {
+        let mut live = self.live();
+        if blocked {
+            live.blocked.insert(id);
+        } else {
+            live.blocked.remove(&id);
+        }
     }
 
     /// Writes the session out again when a key was made for another datacenter. The stored
@@ -409,6 +449,46 @@ impl Account {
 
 fn refused(fault: Fault) -> Refusal {
     Refusal::Refused(fault.words())
+}
+
+/// The note a message's conversation is kept under. A private chat and a basic group share
+/// one id space, so the id is enough. A channel's ids are its own.
+pub(super) fn message_note(who: Option<&str>, message: i32) -> String {
+    match who {
+        Some(who) => format!("tg-msg:{who}:{message}"),
+        None => format!("tg-msg:{message}"),
+    }
+}
+
+/// The conversation a message was seen in. This connection wins. An empty note was cleared.
+pub(super) fn remembered(memory: Option<&str>, note: Option<&str>) -> Option<String> {
+    let kept = |place: Option<&str>| place.filter(|place| !place.is_empty()).map(str::to_owned);
+    kept(memory).or_else(|| kept(note))
+}
+
+/// The lab's telegram-delete-placed driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_delete_placed() -> Result<(), String> {
+    if message_note(None, 13) != "tg-msg:13" {
+        return Err("a private message is remembered by its id".to_owned());
+    }
+    if message_note(Some("c9002"), 41) != "tg-msg:c9002:41" {
+        return Err("a channel message is remembered with its channel".to_owned());
+    }
+    if remembered(None, Some("u7002")).as_deref() != Some("u7002") {
+        return Err("a note finds the chat after a reconnect".to_owned());
+    }
+    if remembered(Some("u7002"), Some("")).as_deref() != Some("u7002") {
+        return Err("this connection's place wins over a cleared note".to_owned());
+    }
+    if remembered(None, Some("")).is_some() {
+        return Err("a cleared note is not a chat".to_owned());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-view-once driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_view_once() -> Result<(), String> {
+    content::prove_view_once()
 }
 
 /// A user's last-seen as the contract's presence. Where Telegram hides the time ("recently",
@@ -666,6 +746,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
+        Command::MarkUnread { conversation_id, .. } => mark_dialog_unread(account, &conversation_id, true),
         Command::Send { conversation_id, client_id, text, reply_to } => {
             account.here();
             let outcome = send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default());
@@ -674,20 +755,20 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
             send::send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
         }
-        Command::CancelSend { client_id, .. } => send::cancel(account, &client_id),
+        Command::CancelSend { conversation_id, client_id } => send::cancel(account, &conversation_id, &client_id),
         Command::React { conversation_id, message_id, emoji, on, reply } => {
             let _ = reply.send(react::react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
         }
-        Command::Edit { conversation_id, message_id, text, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
-        Command::Typing(conversation_id) => typing(account, &conversation_id),
+        Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
@@ -749,8 +830,8 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
         }
-        Command::Catalog { kind, query, cursor, reply, .. } => {
-            let _ = reply.send(catalog::catalog(account, kind, &query, cursor.as_deref()).map_err(refused));
+        Command::Catalog { kind, space_id, query, cursor, reply } => {
+            let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
@@ -763,6 +844,15 @@ fn serve(account: &Arc<Account>, command: Command) {
                 }
             });
             let _ = reply.send(link.ok_or(Refusal::Unsupported));
+        }
+        Command::Relate { person_id, action, reply } => {
+            let answer = match action {
+                RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {
+                    Err(Refusal::Refused("Telegram has no friend request.".to_owned()))
+                }
+                action => relate(account, &person_id, action).map_err(refused),
+            };
+            let _ = reply.send(answer);
         }
         Command::SignOut(reply) => {
             // Ends the session on Telegram, so the device list no longer shows it. What the
@@ -801,12 +891,36 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     if let Err(fault) = told {
         tracing::warn!("chatd: Telegram: read: {fault}");
     }
+    // Reading does not clear a manual unread mark. Telegram's own apps send both.
+    if topic.is_none() {
+        mark_dialog_unread(account, conversation, false);
+    }
     // The comments were read: the badge on the post they hang off goes with them.
     if let (true, who @ Who::Channel(_), Some(root)) = (read, who, topic) {
         if account.dir().get(who).is_some_and(|known| known.broadcast) {
             sync::comment_unread(account, who, root, 0);
         }
     }
+}
+
+/// `messages.markDialogUnread`. A topic has no dialog mark of its own; the forum's does.
+fn mark_dialog_unread(account: &Account, conversation: &str, unread: bool) {
+    let Some((who, None)) = Who::parse(conversation) else {
+        return;
+    };
+    let Ok(peer) = account.input(who) else {
+        return;
+    };
+    account.here();
+    let request = tl::functions::messages::MarkDialogUnread {
+        unread,
+        parent_peer: None,
+        peer: tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer }),
+    };
+    if let Err(fault) = account.ask(&request) {
+        tracing::warn!("chatd: Telegram: unread mark: {fault}");
+    }
+    filing::facts_changed(account, who, |facts| facts.read = !unread);
 }
 
 /// The nonce Telegram dedupes a send by, from the shell's client id.
@@ -934,14 +1048,34 @@ fn delete(account: &Account, conversation: &str, message: &str) -> Result<(), Fa
         }
     }
     let _ = account.ctx.deleted(conversation, message);
+    let noted = match who {
+        Who::Channel(_) => Some(who),
+        _ => None,
+    };
+    account.forget_placed(noted, id);
     Ok(())
 }
 
-fn typing(account: &Account, conversation: &str) {
+fn typing(account: &Account, conversation: &str, activity: protocol::Compose) {
+    // Keystrokes are paced. A recording or an upload is not: the other person should see it now.
+    deliver(account, conversation, activity_action(activity, 0), activity == protocol::Compose::Typing);
+}
+
+/// An upload's progress, 0 to 100. Not paced: each new percent is one signal.
+pub(super) fn show_upload(account: &Account, conversation: &str, activity: protocol::Compose, progress: i32) {
+    deliver(account, conversation, activity_action(activity, progress), false);
+}
+
+/// The other person should see that an upload was abandoned.
+pub(super) fn deliver_cancel(account: &Account, conversation: &str) {
+    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, false);
+}
+
+fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, paced: bool) {
     let Some((who, topic)) = Who::parse(conversation) else {
         return;
     };
-    {
+    if paced {
         let mut live = account.live();
         if live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
             return;
@@ -951,13 +1085,25 @@ fn typing(account: &Account, conversation: &str) {
     }
     account.here();
     if let Ok(peer) = account.input(who) {
-        let request = tl::functions::messages::SetTyping {
-            peer,
-            top_msg_id: topic,
-            action: tl::enums::SendMessageAction::SendMessageTypingAction,
-        };
+        let request = tl::functions::messages::SetTyping { peer, top_msg_id: topic, action };
         // Not `ask`: a typing signal is not worth waiting out a flood for.
         let _ = wire::call(account.wire.as_ref(), &request);
+    }
+}
+
+fn activity_action(activity: protocol::Compose, progress: i32) -> tl::enums::SendMessageAction {
+    let progress = progress.clamp(0, 100);
+    use tl::enums::SendMessageAction::*;
+    match activity {
+        protocol::Compose::Typing => SendMessageTypingAction,
+        protocol::Compose::RecordingVoice => SendMessageRecordAudioAction,
+        protocol::Compose::RecordingVideo => SendMessageRecordVideoAction,
+        protocol::Compose::UploadingPhoto => SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress }),
+        protocol::Compose::UploadingVideo => SendMessageUploadVideoAction(tl::types::SendMessageUploadVideoAction { progress }),
+        protocol::Compose::UploadingAudio => SendMessageUploadAudioAction(tl::types::SendMessageUploadAudioAction { progress }),
+        protocol::Compose::UploadingFile => SendMessageUploadDocumentAction(tl::types::SendMessageUploadDocumentAction { progress }),
+        protocol::Compose::ChoosingSticker => SendMessageChooseStickerAction,
+        protocol::Compose::PlayingGame => SendMessageGamePlayAction,
     }
 }
 
@@ -1028,8 +1174,9 @@ fn person(account: &Account, who: Who, relation: Relation, rank: &str) -> Person
     }
 }
 
-/// Composer text as Telegram should receive it: markers become entities, and a custom emoji
-/// the catalog offered (`:alt:`) becomes that emoji's fallback glyph.
+/// Composer text as Telegram should receive it: markers become entities, a custom emoji
+/// the catalog offered (`:alt:`) becomes that emoji's fallback glyph, and `@Display Name`
+/// becomes a username or a text mention.
 fn prepared(account: &Account, conversation: &str, text: &str) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
     let (plain, entities) = content::outgoing(text);
     dress(account, conversation, plain, entities)
@@ -1041,16 +1188,19 @@ fn dress(
     plain: String,
     entities: Option<Vec<tl::enums::MessageEntity>>,
 ) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
-    if !plain.contains(':') {
-        return (plain, entities);
-    }
-    let labels: Vec<content::EmojiLabel> = account.live().emoji_labels.iter().cloned().collect();
-    if labels.is_empty() {
-        return (plain, entities);
-    }
-    let allow = custom_allowed(account, conversation);
-    let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, allow);
-    (plain, (!entities.is_empty()).then_some(entities))
+    let (plain, entities) = if plain.contains(':') {
+        let labels: Vec<content::EmojiLabel> = account.live().emoji_labels.iter().cloned().collect();
+        if labels.is_empty() {
+            (plain, entities)
+        } else {
+            let allow = custom_allowed(account, conversation);
+            let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, allow);
+            (plain, (!entities.is_empty()).then_some(entities))
+        }
+    } else {
+        (plain, entities)
+    };
+    named(account, plain, entities)
 }
 
 /// Premium may send a custom emoji in any chat. Anyone may send one in Saved Messages.
@@ -1060,6 +1210,50 @@ fn custom_allowed(account: &Account, conversation: &str) -> bool {
         return true;
     }
     matches!(Who::parse(conversation), Some((Who::User(id), _)) if id == account.me)
+}
+
+fn named(account: &Account, plain: String, entities: Option<Vec<tl::enums::MessageEntity>>) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    if !plain.contains('@') {
+        return (plain, entities);
+    }
+    let people = mention_people(account);
+    if people.is_empty() {
+        return (plain, entities);
+    }
+    let (plain, entities) = content::apply_mentions(&plain, entities.unwrap_or_default(), &people);
+    (plain, (!entities.is_empty()).then_some(entities))
+}
+
+/// People a typed `@Full Name` can notify. The same name twice is skipped: a send cannot know which.
+fn mention_people(account: &Account) -> Vec<content::MentionTarget> {
+    let dir = account.dir();
+    let mut people = Vec::new();
+    for (id, known) in dir.users() {
+        if id == account.me || known.deleted {
+            continue;
+        }
+        let Some(access_hash) = known.hash else {
+            continue;
+        };
+        let name = known.name.trim();
+        if name.is_empty() || name == "Unknown" || name == "Deleted Account" {
+            continue;
+        }
+        let first = name.split_once(' ').map(|(first, _)| first).unwrap_or(name);
+        if first.is_empty() {
+            continue;
+        }
+        people.push(content::MentionTarget {
+            name: name.to_owned(),
+            first: first.to_owned(),
+            handle: known.handle.clone(),
+            user_id: id,
+            access_hash,
+        });
+    }
+    let names: Vec<String> = people.iter().map(|person| person.name.clone()).collect();
+    people.retain(|person| names.iter().filter(|name| *name == &person.name).count() == 1);
+    people
 }
 
 /// The lab's telegram-markers driver. A build without this returns to the server below and stays up.
@@ -1088,6 +1282,43 @@ pub fn prove_telegram_markers() -> Result<(), String> {
     let still = content::spans(&plain, &kept);
     if !still.iter().any(|span| matches!(span.style, protocol::Style::Bold) && span.start == 0 && span.end == 2) {
         return Err("the bold run was not kept on edit".into());
+    }
+    Ok(())
+}
+
+/// The lab's reaction-reactors driver, Telegram's half. The list sent with the message names
+/// each reactor where Telegram shows it; a hidden list (`can_see_list` unset) leaves the chip
+/// a number.
+pub fn prove_telegram_reactors() -> Result<(), String> {
+    let emoji = |emoticon: &str| tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into());
+    let reacted = |user: i64, emoticon: &str| tl::types::MessagePeerReaction {
+        big: false,
+        unread: false,
+        my: false,
+        peer_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: user }),
+        date: 0,
+        reaction: emoji(emoticon),
+    };
+    let results = |count: i32, emoticon: &str| tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+        chosen_order: None,
+        reaction: emoji(emoticon),
+        count,
+    });
+    let mut shown = tl::types::MessageReactions {
+        min: false,
+        can_see_list: true,
+        reactions_as_tags: false,
+        results: vec![results(2, "👍")],
+        recent_reactions: Some(vec![reacted(42, "👍").into(), reacted(43, "👍").into()]),
+        top_reactors: None,
+    };
+    let read = content::reactions_of(&shown.clone().into());
+    if read.first().map(|one| one.who.as_slice()) != Some(&["u42".to_owned(), "u43".to_owned()][..]) {
+        return Err(format!("the reactors the message carried were dropped: {:?}", read.first().map(|one| &one.who)));
+    }
+    shown.can_see_list = false;
+    if content::reactions_of(&shown.into()).iter().any(|one| !one.who.is_empty()) {
+        return Err("a list Telegram hides was shown anyway".into());
     }
     Ok(())
 }
@@ -1125,6 +1356,11 @@ pub fn prove_telegram_custom_emoji() -> Result<(), String> {
 /// The lab's telegram-service-lines driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_service_lines() -> Result<(), String> {
     content::prove_service_lines()
+}
+
+/// The lab's telegram-edited driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_edited() -> Result<(), String> {
+    content::prove_edited()
 }
 
 /// The lab's telegram-premium driver. A build without this stays up and the driver fails.
@@ -1182,6 +1418,64 @@ pub fn prove_telegram_location() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-polls driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_polls() -> Result<(), String> {
+    content::prove_polls()
+}
+
+/// The lab's telegram-profile driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_profile() -> Result<(), String> {
+    let recently = tl::enums::UserStatus::Recently(tl::types::UserStatusRecently { by_me: false });
+    let week = tl::enums::UserStatus::LastWeek(tl::types::UserStatusLastWeek { by_me: false });
+    let month = tl::enums::UserStatus::LastMonth(tl::types::UserStatusLastMonth { by_me: false });
+    let empty = tl::enums::UserStatus::Empty;
+    if peers::rough_seen(Some(&recently)) != "last seen recently" {
+        return Err("recently did not read as last seen recently".into());
+    }
+    if peers::rough_seen(Some(&week)) != "last seen within a week" || peers::rough_seen(Some(&month)) != "last seen within a month" {
+        return Err("a week or a month was not named".into());
+    }
+    if !peers::rough_seen(Some(&empty)).is_empty() || presence(Some(&recently)) != Presence::Unknown {
+        return Err("a hidden or empty last seen was treated as offline".into());
+    }
+    if !peers::row_status(true, true, "last seen recently").is_empty() {
+        return Err("our own row carried a last seen".into());
+    }
+    if info::birthday_line(14, 3, None).as_deref() != Some("14 March") || info::birthday_line(14, 3, Some(1990)).as_deref() != Some("14 March 1990") {
+        return Err("a birthday was not named".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-inline-bots driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_inline_bots() -> Result<(), String> {
+    content::prove_inline_bots()?;
+    match catalog::bot_query("@wiki rust") {
+        Some(("wiki", "rust")) => {}
+        other => return Err(format!("@wiki rust was not that bot's query, got {other:?}")),
+    }
+    if catalog::bot_query("hike").is_some() {
+        return Err("a GIF search was treated as a bot".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-live-location driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_live_location() -> Result<(), String> {
+    content::prove_live_location()
+}
+
+/// The lab's telegram-mark-unread driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_mark_unread() -> Result<(), String> {
+    if sync::unread_of(0, true) != 1 || sync::unread_of(4, true) != 4 {
+        return Err("a manual unread mark does not leave a badge of at least one".into());
+    }
+    if sync::unread_of(0, false) != 0 || sync::unread_of(3, false) != 3 {
+        return Err("clearing the mark did not keep the dialog's own unread count".into());
+    }
+    Ok(())
+}
+
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()
@@ -1217,6 +1511,80 @@ pub fn prove_telegram_mute_until() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-mention-name driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_mention_name() -> Result<(), String> {
+    let nameless = content::MentionTarget {
+        name: "Ada Stone".to_owned(),
+        first: "Ada".to_owned(),
+        handle: String::new(),
+        user_id: 7_003,
+        access_hash: 7,
+    };
+    let named = content::MentionTarget {
+        name: "Bea Moss".to_owned(),
+        first: "Bea".to_owned(),
+        handle: "bea_m".to_owned(),
+        user_id: 7_002,
+        access_hash: 8,
+    };
+    let (plain, entities) = content::apply_mentions("see @Ada Stone", Vec::new(), std::slice::from_ref(&nameless));
+    if plain != "see Ada" {
+        return Err(format!("a person with no username was not reduced to their first name: {plain}"));
+    }
+    let told = entities.iter().any(|entity| {
+        matches!(entity, tl::enums::MessageEntity::InputMessageEntityMentionName(mention)
+            if mention.offset == 4 && mention.length == 3 && matches!(&mention.user_id, tl::enums::InputUser::User(user) if user.user_id == 7_003))
+    });
+    if !told {
+        return Err("the text mention was not named on the send".into());
+    }
+    let (plain, entities) = content::apply_mentions("see @Ada Stone and @Bea Moss", Vec::new(), &[nameless, named]);
+    if plain != "see Ada and @bea_m" {
+        return Err(format!("a username was not written as the handle: {plain}"));
+    }
+    if entities.iter().filter(|entity| matches!(entity, tl::enums::MessageEntity::InputMessageEntityMentionName(_))).count() != 1 {
+        return Err("a person with a username was also given a text mention".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-secret-chat driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_secret_chat() -> Result<(), String> {
+    secret::prove()
+}
+
+/// The lab's telegram-large-files driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_large_files() -> Result<(), String> {
+    files::prove_large_files()
+}
+
+/// The lab's telegram-link-preview driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_link_preview() -> Result<(), String> {
+    content::prove_link_preview()
+}
+
+/// The lab's telegram-typing-activity driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_typing_activity() -> Result<(), String> {
+    use tl::enums::SendMessageAction::*;
+    if live::noted(&SendMessageRecordAudioAction) != Some(protocol::Compose::RecordingVoice) {
+        return Err("a voice recording was read as typing".into());
+    }
+    if live::noted(&SendMessageCancelAction).is_some() {
+        return Err("a cancelled action was still shown".into());
+    }
+    let photo = SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress: 40 });
+    if live::noted(&photo) != Some(protocol::Compose::UploadingPhoto) {
+        return Err("sending a photo was read as typing".into());
+    }
+    if live::noted(&SendMessageChooseStickerAction) != Some(protocol::Compose::ChoosingSticker) {
+        return Err("choosing a sticker was read as typing".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::RecordingVoice, 0)) != "record-audio" {
+        return Err("recording a voice note was not told as a recording".into());
+    }
+    Ok(())
+}
+
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_dice() -> Result<(), String> {
     content::prove_dice_roll()?;
@@ -1227,4 +1595,103 @@ pub fn prove_telegram_dice() -> Result<(), String> {
         return Err("words around a dice emoji stay ordinary text".into());
     }
     Ok(())
+}
+
+/// Whether `Block` blocks or, when they are already blocked, unblocks, and the relation that leaves.
+fn block_choice(already: bool, contact: bool) -> (bool, Relation) {
+    if already {
+        (true, if contact { Relation::Contact } else { Relation::None })
+    } else {
+        (false, Relation::Blocked)
+    }
+}
+
+fn split_name(name: &str) -> (String, String) {
+    match name.split_once(' ') {
+        Some((first, last)) => (first.to_owned(), last.to_owned()),
+        None => (name.to_owned(), String::new()),
+    }
+}
+
+fn learn_updates(account: &Account, answer: &tl::enums::Updates) {
+    match answer {
+        tl::enums::Updates::Updates(updates) => account.learn(&updates.users, &updates.chats),
+        tl::enums::Updates::Combined(updates) => account.learn(&updates.users, &updates.chats),
+        _ => {}
+    }
+}
+
+fn relate(account: &Account, person_id: &str, action: RelateAction) -> Result<(), Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "USER_ID_INVALID".to_owned(), value: None };
+    let (who @ Who::User(user_id), None) = Who::parse(person_id).ok_or_else(invalid)? else {
+        return Err(invalid());
+    };
+    match action {
+        RelateAction::Block => {
+            let peer = account.input(who)?;
+            let contact = account.dir().get(who).is_some_and(|known| known.contact);
+            let (unblock, relation) = block_choice(account.user_blocked(user_id), contact);
+            if unblock {
+                account.ask(&tl::functions::contacts::Unblock { my_stories_from: false, id: peer })?;
+            } else {
+                account.ask(&tl::functions::contacts::Block { my_stories_from: false, id: peer })?;
+            }
+            account.set_user_blocked(user_id, !unblock);
+            let _ = account.ctx.relation(person_id, relation);
+        }
+        RelateAction::Add => {
+            let id = account.dir().input_user(who).ok_or_else(invalid)?;
+            let known = account.dir().get(who).cloned().unwrap_or_default();
+            let (first_name, last_name) = split_name(&known.name);
+            let answer = account.ask(&tl::functions::contacts::AddContact {
+                add_phone_privacy_exception: false,
+                id,
+                first_name,
+                last_name,
+                phone: String::new(),
+                note: None,
+            })?;
+            learn_updates(account, &answer);
+            let _ = account.ctx.relation(person_id, Relation::Contact);
+        }
+        RelateAction::Remove => {
+            let id = account.dir().input_user(who).ok_or_else(invalid)?;
+            let answer = account.ask(&tl::functions::contacts::DeleteContacts { id: vec![id] })?;
+            learn_updates(account, &answer);
+            if !account.user_blocked(user_id) {
+                let _ = account.ctx.relation(person_id, Relation::None);
+            }
+        }
+        RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {}
+    }
+    Ok(())
+}
+
+/// The lab's telegram-block-contact driver. A build without this returns to the server below and stays up.
+pub fn prove_telegram_block_contact() -> Result<(), String> {
+    let (unblock, relation) = block_choice(false, true);
+    if unblock || relation != Relation::Blocked {
+        return Err("block did not mark the person blocked".into());
+    }
+    let (unblock, relation) = block_choice(true, true);
+    if !unblock || relation != Relation::Contact {
+        return Err("blocking someone already blocked did not unblock a contact".into());
+    }
+    let (unblock, relation) = block_choice(true, false);
+    if !unblock || relation != Relation::None {
+        return Err("unblocking a stranger did not clear the block".into());
+    }
+    let (first, last) = split_name("Wren Halloran");
+    if first != "Wren" || last != "Halloran" {
+        return Err(format!("contact name split left {first} {last}"));
+    }
+    if !split_name("Wren").1.is_empty() {
+        return Err("a one-word name invented a last name".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-checklist driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_checklist() -> Result<(), String> {
+    content::prove_checklist()
 }

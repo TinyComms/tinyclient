@@ -445,6 +445,36 @@ fn a_ring_is_posted_once_with_accept_and_decline_and_withdrawn_when_it_stops() {
 }
 
 #[test]
+fn a_call_answered_on_the_phone_posts_one_action_and_a_newer_ring_takes_the_slot() {
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let room = key(Network::Signal, "b2b2");
+    let verdict = |room| decide_ring(&Values::default(), room, &moment());
+    assert_eq!(notes.phone_ring(&room, "Grace Ombra", verdict(&room), "", "Signal").as_deref(), ours("soft_ring"));
+    let id = ring_id(&room);
+    let shown = fake.log().shown[&id].clone();
+    assert_eq!((shown.title.as_str(), shown.subtitle.as_str(), shown.kind), ("Grace Ombra", "Signal · Incoming call", Kind::CallOnPhone));
+    assert_eq!(notes.conversation(&id), Some(&room));
+    // A newer offer takes the one ring: the note that was showing goes with it.
+    let other = key(Network::Signal, "c3c3");
+    assert_eq!(notes.phone_ring(&other, "Alan Trend", verdict(&other), "", "Signal").as_deref(), ours("soft_ring"));
+    assert!(fake.log().shown.get(&id).is_none(), "the newer ring withdraws the note it replaces");
+    assert_eq!(notes.conversation(&ring_id(&other)), Some(&other));
+    // The displaced call's hangup finds nothing of its own: the newer ring still stands.
+    assert_eq!(notes.phone_ring_stopped(&room), None);
+    assert_eq!(notes.conversation(&ring_id(&other)), Some(&other));
+    // The newer caller gave up: withdrawn, and the ring sound stops.
+    assert_eq!(notes.phone_ring_stopped(&other).as_deref(), Some(""));
+    assert!(fake.log().shown.is_empty() && notes.conversation(&ring_id(&other)).is_none());
+    assert_eq!(notes.phone_ring_stopped(&other), None);
+    // A call whose rules are off (calls off) is not shown at all.
+    let mut values = Values::default();
+    set(&mut values, GLOBAL, settings::CALLS, "off");
+    assert_eq!(notes.phone_ring(&room, "Grace Ombra", decide_ring_in(&values, &room, &moment(), true), "", "Signal"), None);
+    assert!(fake.log().shown.is_empty());
+}
+
+#[test]
 fn the_test_notification_uses_the_preview_and_the_message_sound() {
     let fake = Fake::default();
     let mut notes = Notes::new(Box::new(fake.clone()));
@@ -520,4 +550,44 @@ fn a_ring_with_the_window_in_focus_is_still_heard() {
     assert!(!verdict.banner);
     assert_eq!(notes.call(Some(&call), Some(verdict), "", "Slack"), Some("soft_ring".to_owned()));
     assert!(fake.log().shown.is_empty(), "the card is all the window shows");
+}
+
+#[test]
+fn an_app_lock_names_the_message_and_refuses_the_reply() {
+    let (title, subtitle, body, reply) = redact_for_app_lock("Ines".into(), "Tiny".into(), "the plan".into(), true, true);
+    assert_eq!(title, "New message");
+    assert!(subtitle.is_empty() && body.is_empty() && !reply);
+    let (title, subtitle, body, reply) = redact_for_app_lock("Ines".into(), "Tiny".into(), "the plan".into(), true, false);
+    assert_eq!((title, subtitle, body, reply), ("Ines".into(), "Tiny".into(), "the plan".into(), true));
+}
+
+#[test]
+fn a_due_reminder_posts_silent_and_is_taken_out_but_waits_out_a_hush() {
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).unwrap()));
+    let account = protocol::AccountKey { network: Network::Slack, account: "T1".into() };
+    hub.store().upsert_conversation(&account, &crate::store::ConversationRow::new("later", ConversationKind::Channel, "#later")).unwrap();
+    let conversation = Key { network: Network::Slack, account: "T1".into(), id: "later".into() };
+    let saved: Message = serde_json::from_value(serde_json::json!({
+        "id": "m1", "sender": { "id": "u1", "name": "Mara" }, "sent": NOW, "text": "read this"
+    }))
+    .unwrap();
+    hub.store().ingest(&conversation, &saved, false).unwrap();
+    hub.store().remind(&conversation, "m1", Some(now())).unwrap();
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    // A pause holds the reminder back: nothing posts, nothing is lost.
+    let mut paused = Values::default();
+    set(&mut paused, GLOBAL, settings::PAUSED_UNTIL, "resume");
+    due(&hub, &mut notes, &paused);
+    assert!(fake.log().posted.is_empty(), "a pause holds a reminder back");
+    assert_eq!(hub.store().reminders(&conversation).unwrap().len(), 1);
+    // Once the hush lifts it posts one silent note, and the store forgets it.
+    let values = Values::default();
+    due(&hub, &mut notes, &values);
+    let posted = fake.log().posted.clone();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].id, reminder_id(&conversation, "m1"));
+    assert_eq!((posted[0].kind, posted[0].sound.as_deref(), posted[0].body.as_str()), (Kind::Plain, None, "read this"));
+    assert!(hub.store().reminders(&conversation).unwrap().is_empty(), "a fired reminder is gone");
+    assert_eq!(hub.store().next_reminder_due().unwrap(), None);
 }

@@ -576,17 +576,17 @@ fn mediad_exits_when_chatd_is_killed_mid_call() {
 fn a_share_is_one_encode_and_one_subscribed_decode() {
     let chatd = Daemon::start(standup);
 
-    let no_call = chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }));
+    let no_call = chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None }));
     assert!(matches!(no_call, Response::Error { code: ErrorCode::NoCall, .. }), "{no_call:?}");
     assert_eq!(chatd.mediad_pids(), Vec::<u32>::new());
 
     chatd.ask(call_start());
     let watch = |source: &str| Request::Media(MediaRequest::ShareWatch { source: Some(source.into()) });
     let speaker = |source: &str| Request::Media(MediaRequest::Speaker { source: Some(source.into()) });
-    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }));
+    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None }));
     chatd.ask(watch("alice"));
     chatd.ask(speaker("carol"));
-    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }));
+    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None }));
     chatd.ask(speaker("dave"));
     let last = chatd.ask(watch("bob"));
 
@@ -715,7 +715,7 @@ fn what_only_a_network_can_answer_is_refused_in_words_and_the_cache_answers_the_
     assert_eq!(fetched, Response::Media { files: vec![icon] });
 
     // Typing to a network that is not connected is dropped quietly; it is not an error to type.
-    assert_eq!(chatd.ask(Request::Typing { conversation }), Response::Ok);
+    assert_eq!(chatd.ask(Request::Typing { conversation, activity: protocol::Compose::Typing }), Response::Ok);
     let missing = chatd.ask(Request::Tree { space: key(Network::Discord, "G2"), offset: 0, limit: 50, peek: false });
     assert!(matches!(missing, Response::Error { code: ErrorCode::NotFound, .. }), "{missing:?}");
 }
@@ -955,7 +955,7 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     let mine = find("Same spot as this one");
     assert!(mine.outgoing && !mine.edited);
     let edit = |message: &Message, text: &str| {
-        chatd.ask(Request::Edit { conversation: room.clone(), message_id: message.id.clone(), text: text.into() })
+        chatd.ask(Request::Edit { conversation: room.clone(), message_id: message.id.clone(), text: text.into(), spans: Vec::new() })
     };
     assert_eq!(edit(&mine, "Same spot, and the camera was level."), Response::Ok);
     let edited = find("Same spot, and the camera was level.");

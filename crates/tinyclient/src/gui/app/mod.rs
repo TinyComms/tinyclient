@@ -569,6 +569,7 @@ impl Shell {
             tiny_members: self.tiny_state.members_open(),
             me: prefs::me(),
             trusted_links: prefs::trusted_links(),
+            lock: crate::gui::lock::policy(),
         }
     }
 
@@ -658,6 +659,7 @@ impl Shell {
         for account in self.snapshot.iter().flat_map(|s| &s.accounts) {
             text.push_str(&format!("{}: {:?}{}\n", account.key.network.label(), account.link, if account.reconnecting { " (reconnecting)" } else { "" }));
         }
+        text.push_str(&crate::client::fallback_notes());
         protocol::redact(&text)
     }
 

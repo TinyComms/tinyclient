@@ -48,14 +48,19 @@ gpui::actions!(call, [ToggleMute, ToggleDeafen, Leave, Accept, Decline, Jump]);
 /// input or the window. They are bound the first time a call view is drawn (`ensure_keys`), so
 /// nothing outside this file has to call this.
 pub(super) fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-shift-m", ToggleMute, None),
-        KeyBinding::new("secondary-shift-d", ToggleDeafen, None),
-        KeyBinding::new("secondary-shift-h", Leave, None),
-        KeyBinding::new("secondary-shift-a", Accept, None),
-        KeyBinding::new("secondary-shift-r", Decline, None),
-        KeyBinding::new("secondary-shift-j", Jump, None),
-    ]);
+    macro_rules! bind {
+        ($id:literal, $action:expr) => {
+            for chord in super::keymap::chords($id) {
+                cx.bind_keys([KeyBinding::new(&chord, $action, None)]);
+            }
+        };
+    }
+    bind!("mute", ToggleMute);
+    bind!("deafen", ToggleDeafen);
+    bind!("leave-call", Leave);
+    bind!("accept", Accept);
+    bind!("decline", Decline);
+    bind!("go-to-call", Jump);
 }
 
 /// Set once the shortcuts are bound and their handlers registered.
@@ -174,9 +179,9 @@ const BRIEFLY: Duration = Duration::from_secs(4);
 const MOVE_ASKED: Duration = Duration::from_secs(10);
 /// How often the meter is asked for again while muted, should something have turned it off.
 const METER_AGAIN: Duration = Duration::from_secs(2);
-/// The call went from one room of a Tiny server to another of the same server.
+/// The call went from one room of a Tiny server, or one Discord voice channel, to another of the same account.
 fn moved(from: &Key, to: &Key) -> bool {
-    from != to && from.network == Network::Tiny && to.network == Network::Tiny && from.account == to.account
+    from != to && from.network == to.network && from.account == to.account && matches!(from.network, Network::Tiny | Network::Discord)
 }
 
 /// Turns the call's microphone meter on or off. Nothing is shown if it is refused.
@@ -683,8 +688,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// A Tiny server moved the call to another room without my asking: said where to, as a
-    /// toast that is seen whatever is on screen, and for a few seconds in the dock.
+    /// A Tiny server moved the call to another room, or Discord moved it to another voice
+    /// channel, without my asking: said where to, as a toast that is seen whatever is on
+    /// screen, and for a few seconds in the dock.
     fn call_note_moved(&mut self, call: &Call, subject: &Subject, cx: &mut Context<Self>) {
         let Some(was) = self.call_state.was.as_ref() else {
             return;
@@ -1419,7 +1425,8 @@ mod tests {
         assert!(moved(&room(Network::Tiny, "a", "lounge"), &room(Network::Tiny, "a", "raid")));
         assert!(!moved(&room(Network::Tiny, "a", "lounge"), &room(Network::Tiny, "a", "lounge")));
         assert!(!moved(&room(Network::Tiny, "a", "lounge"), &room(Network::Tiny, "b", "raid")), "another server");
-        assert!(!moved(&room(Network::Discord, "a", "1"), &room(Network::Discord, "a", "2")), "Discord calls are not moved");
+        assert!(moved(&room(Network::Discord, "a", "1"), &room(Network::Discord, "a", "2")), "a Discord voice channel change");
+        assert!(!moved(&room(Network::Discord, "a", "1"), &room(Network::Discord, "b", "2")), "another Discord account");
     }
 
     #[test]

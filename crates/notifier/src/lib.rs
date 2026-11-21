@@ -1,8 +1,8 @@
-//! The system's notifications, for chatd, and the taskbar button or Dock icon, for the window
-//! (`docs/design/06-live-signals.md` §6 and §8). What to post is chatd's to decide
-//! (`chatd/src/notify.rs`); this crate only shows it, withdraws it and reports what the user
-//! did with it. Every backend takes the same [`Note`], so the rules are tested once, against
-//! [`Fake`].
+//! The system's notifications, for chatd, and the taskbar button, Dock icon or launcher entry,
+//! for the window (`docs/design/06-live-signals.md` §6 and §8). What to post is chatd's to
+//! decide (`chatd/src/notify.rs`); this crate only shows it, withdraws it and reports what the
+//! user did with it. Every backend takes the same [`Note`], so the rules are tested once,
+//! against [`Fake`].
 //!
 //! - Windows: WinRT toasts under tinyclient's AppUserModelID. An unpackaged app needs the ID
 //!   registered: the installer's Start menu shortcut carries it, and [`App::register`] writes
@@ -15,6 +15,10 @@
 //!   elsewhere nothing is posted and the reason is logged. The bundle carries the sound files.
 //! - Linux: org.freedesktop.Notifications, with `suppress-sound` as on Windows.
 //! - Android and iOS: nothing yet; each post is refused with the reason.
+//!
+//! Beside the notifications, the window's taskbar button or Dock icon lives here
+//! ([`taskbar`]), and so does the tray icon (Windows; G3 in `docs/product/09-settings.md`,
+//! [`tray`]) — both called by the window process on its main thread, never by chatd.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -26,8 +30,10 @@ mod macos;
 mod linux;
 #[cfg(windows)]
 mod windows;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios")))))]
 pub mod taskbar;
+#[cfg(windows)]
+pub mod tray;
 
 /// What a notification is for, which decides its buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +44,8 @@ pub enum Kind {
     ReadOnly,
     /// Accept and Decline, shown as a call.
     Call,
+    /// A call answered on the phone: one action opens the app, and nothing starts here.
+    CallOnPhone,
     /// No buttons: the test notification, a sign-out.
     Plain,
 }
@@ -225,7 +233,7 @@ fn escape(text: &str) -> String {
 #[allow(dead_code)]
 fn toast_xml(note: &Note) -> String {
     let id = escape(&note.id);
-    let scenario = if note.kind == Kind::Call { " scenario=\"incomingCall\"" } else { "" };
+    let scenario = if matches!(note.kind, Kind::Call | Kind::CallOnPhone) { " scenario=\"incomingCall\"" } else { "" };
     let mut xml = format!("<toast launch=\"open:{id}\" activationType=\"foreground\"{scenario}><visual><binding template=\"ToastGeneric\">");
     xml.push_str(&format!("<text>{}</text>", escape(&note.title)));
     if !note.body.is_empty() {
@@ -248,6 +256,9 @@ fn toast_xml(note: &Note) -> String {
         Kind::Call => xml.push_str(&format!(
             "<actions><action content=\"Accept\" arguments=\"accept:{id}\" activationType=\"foreground\"/>\
              <action content=\"Decline\" arguments=\"decline:{id}\" activationType=\"foreground\"/></actions>"
+        )),
+        Kind::CallOnPhone => xml.push_str(&format!(
+            "<actions><action content=\"Answer on your phone\" arguments=\"open:{id}\" activationType=\"foreground\"/></actions>"
         )),
         Kind::Plain => {}
     }
@@ -302,6 +313,9 @@ mod tests {
         assert!(xml.ends_with("<audio silent=\"true\"/></toast>"));
         let call = toast_xml(&note(Kind::Call));
         assert!(call.contains("scenario=\"incomingCall\"") && call.contains("accept:m:1") && call.contains("decline:m:1"));
+        let on_phone = toast_xml(&note(Kind::CallOnPhone));
+        assert!(on_phone.contains("scenario=\"incomingCall\"") && on_phone.contains("content=\"Answer on your phone\"") && on_phone.contains("arguments=\"open:m:1\""), "{on_phone}");
+        assert!(!on_phone.contains("accept:") && !on_phone.contains("decline:"));
         assert!(!toast_xml(&note(Kind::Plain)).contains("<actions>"));
         let locked = toast_xml(&note(Kind::ReadOnly));
         assert!(locked.contains("arguments=\"read:m:1\""), "{locked}");

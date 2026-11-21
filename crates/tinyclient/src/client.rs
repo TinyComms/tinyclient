@@ -91,23 +91,27 @@ pub fn failure_class(err: &io::Error) -> &'static str {
 }
 
 /// What a failed request says to the user, in place of the system's error text (C14).
-/// Logs `action failed` with `op` and [`failure_class`], never the error's display.
+/// A fallback names `op` and a short ref. The log line with that ref has the real error.
 pub fn trouble_words(op: &'static str, err: &io::Error) -> String {
-    tracing::warn!(op, class = failure_class(err), "action failed");
     if is_gone(err) {
+        tracing::warn!(op, class = failure_class(err), "action failed");
         "tinyclient's background service isn't running. It is being started again; try again in a moment.".to_owned()
     } else if is_slow(err) {
+        tracing::warn!(op, class = failure_class(err), "action failed");
         "That took too long. Try again.".to_owned()
     } else if is_other_version(err) {
+        tracing::warn!(op, class = failure_class(err), "action failed");
         OTHER_ANSWER.to_owned()
     } else {
-        "That didn't work. Try again.".to_owned()
+        with_ref(op, failure_class(err), &err.to_string(), &format!("Couldn't {}. Try again.", action_phrase(op)))
     }
 }
 
 /// What a refusal from chatd says to the user, for the codes that carry no words of their own.
-/// Never names chatd, a Rust value or a command (C14).
-pub fn refusal_words(code: ErrorCode, detail: &str) -> String {
+/// `action` is required, so a fallback can name what was tried. Never names chatd, a Rust
+/// value or a command (C14). A server's own words are shown as sent, unless they are the
+/// bare fallback.
+pub fn refusal_words(action: &'static str, code: ErrorCode, detail: &str) -> String {
     match code {
         ErrorCode::TooLarge => "That was too much to load at once. Try a smaller part.".to_owned(),
         ErrorCode::Unsupported if detail.is_empty() => {
@@ -115,9 +119,136 @@ pub fn refusal_words(code: ErrorCode, detail: &str) -> String {
         }
         ErrorCode::Offline if !detail.is_empty() => detail.to_owned(),
         ErrorCode::Offline => "Not connected.".to_owned(),
-        ErrorCode::Internal => "Something went wrong inside tinyclient. Try again.".to_owned(),
-        _ if !detail.is_empty() => detail.to_owned(),
-        _ => "That didn't work. Try again.".to_owned(),
+        ErrorCode::Internal => with_ref(
+            action,
+            "internal",
+            "internal",
+            &format!("Couldn't {}. Something went wrong inside tinyclient. Try again.", action_phrase(action)),
+        ),
+        _ if !detail.is_empty() && !is_bare(detail) => detail.to_owned(),
+        _ => with_ref(action, "refused", code_name(code), &format!("Couldn't {}. Try again.", action_phrase(action))),
+    }
+}
+
+/// The lab's error-text driver. A build without it opens the window and stays up.
+pub fn prove_error_text() -> Result<(), &'static str> {
+    let words = trouble_words("send", &io::Error::other("blocked"));
+    if words.contains("That didn't work") || !words.contains("Couldn't send that") || !words.contains("(ref ") {
+        return Err("a failure still has no action");
+    }
+    let refused = refusal_words("pin that message", ErrorCode::NotFound, "");
+    if !refused.starts_with("Couldn't pin that message") || !refused.contains("(ref ") || refused.contains("That didn't work") {
+        return Err("a refusal still has no action");
+    }
+    let bare = refusal_words("pin that message", ErrorCode::Refused, "That didn't work. Try again.");
+    if !bare.starts_with("Couldn't pin that message") || bare.contains("That didn't work") {
+        return Err("the bare sentence is still shown");
+    }
+    if !fallback_notes().contains("send") {
+        return Err("diagnostics omit the ref");
+    }
+    Ok(())
+}
+
+/// Recent fallbacks for Copy diagnostics: the ref, the action, and how many times.
+/// The real error stays in the log.
+pub fn fallback_notes() -> String {
+    let rows = fallbacks().lock().unwrap_or_else(|err| err.into_inner());
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("recent failures:\n");
+    for row in rows.iter() {
+        text.push_str(&format!("ref {} {} ({})\n", row.quote, row.action, row.hits));
+    }
+    text
+}
+
+struct Fallback {
+    quote: String,
+    action: &'static str,
+    hits: u32,
+}
+
+fn fallbacks() -> &'static std::sync::Mutex<Vec<Fallback>> {
+    static ROWS: std::sync::OnceLock<std::sync::Mutex<Vec<Fallback>>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Shows `sentence` and appends `(ref XXXX)`. Logs `cause` with the same ref, and counts the hit.
+fn with_ref(action: &'static str, class: &str, cause: &str, sentence: &str) -> String {
+    let quote = quote_code(action, class);
+    let hits = note_fallback(action, &quote);
+    let cause = one_line(cause);
+    tracing::warn!(action, quote = %quote, hits, cause = %cause, "fallback");
+    format!("{sentence} (ref {quote}).")
+}
+
+fn note_fallback(action: &'static str, quote: &str) -> u32 {
+    let mut rows = fallbacks().lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(row) = rows.iter_mut().find(|row| row.quote == quote) {
+        row.hits = row.hits.saturating_add(1);
+        return row.hits;
+    }
+    if rows.len() >= 8 {
+        rows.remove(0);
+    }
+    rows.push(Fallback { quote: quote.to_owned(), action, hits: 1 });
+    1
+}
+
+fn quote_code(action: &str, class: &str) -> String {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in action.bytes().chain(class.bytes()) {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{:04X}", (hash >> 16) as u16)
+}
+
+fn one_line(cause: &str) -> String {
+    cause.chars().map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch }).take(180).collect()
+}
+
+fn is_bare(detail: &str) -> bool {
+    matches!(
+        detail.trim(),
+        "That didn't work. Try again." | "That didn't work. Try again" | "That didn't work." | "That didn't work"
+            | "That didn't work. Check it and try again." | "That didn't work. Check it and try again"
+    )
+}
+
+fn action_phrase(action: &str) -> &str {
+    match action {
+        "send" => "send that",
+        "inbox" => "refresh the list",
+        "tiny" => "do that on this server",
+        "load" => "open that conversation",
+        "people" => "load people",
+        "call" => "change the call",
+        "page" => "load that page",
+        "save" => "save that",
+        "play" => "play that",
+        "search" => "search",
+        "sign-in" => "sign in",
+        other => other,
+    }
+}
+
+fn code_name(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::Offline => "offline",
+        ErrorCode::NotFound => "not found",
+        ErrorCode::CallActive => "call active",
+        ErrorCode::NoCall => "no call",
+        ErrorCode::Media => "media",
+        ErrorCode::SignIn => "sign in",
+        ErrorCode::SignInUnreachable => "sign in unreachable",
+        ErrorCode::SignInBlocked => "sign in blocked",
+        ErrorCode::Unsupported => "unsupported",
+        ErrorCode::Refused => "refused",
+        ErrorCode::TooLarge => "too large",
+        ErrorCode::Internal => "internal",
     }
 }
 
@@ -147,14 +278,14 @@ mod tests {
     #[test]
     fn refusals_read_as_words_and_never_name_the_service() {
         for code in [ErrorCode::TooLarge, ErrorCode::Unsupported, ErrorCode::Internal, ErrorCode::NotFound] {
-            let words = refusal_words(code, "");
+            let words = refusal_words("pin that message", code, "");
             assert!(!words.contains("chatd") && !words.contains("Unsupported") && words.ends_with('.'), "{words}");
         }
-        assert!(refusal_words(ErrorCode::Unsupported, "").contains("different versions"));
-        assert_eq!(refusal_words(ErrorCode::Refused, "Slow mode is on."), "Slow mode is on.");
-        assert_eq!(refusal_words(ErrorCode::Offline, ""), "Not connected.");
+        assert!(refusal_words("pin that message", ErrorCode::Unsupported, "").contains("different versions"));
+        assert_eq!(refusal_words("pin that message", ErrorCode::Refused, "Slow mode is on."), "Slow mode is on.");
+        assert_eq!(refusal_words("pin that message", ErrorCode::Offline, ""), "Not connected.");
         assert_eq!(
-            refusal_words(ErrorCode::Offline, "Discord is offline. Files need a connection."),
+            refusal_words("pin that message", ErrorCode::Offline, "Discord is offline. Files need a connection."),
             "Discord is offline. Files need a connection."
         );
         assert!(is_gone(&io::Error::from(io::ErrorKind::ConnectionRefused)));
@@ -163,6 +294,26 @@ mod tests {
             assert!(!words.contains("chatd") && !words.contains("os error") && words.ends_with('.'), "{words}");
         }
         assert!(is_slow(&io::Error::from(io::ErrorKind::WouldBlock)) && !is_gone(&io::Error::from(io::ErrorKind::TimedOut)));
+    }
+
+    #[test]
+    fn a_fallback_names_the_action_and_a_ref() {
+        let err = io::Error::other("os error 5");
+        let words = trouble_words("send", &err);
+        assert!(words.contains("Couldn't send that"), "{words}");
+        assert!(words.contains("(ref "), "{words}");
+        assert!(!words.contains("That didn't work"), "{words}");
+        assert!(!words.contains("os error"), "{words}");
+        let refused = refusal_words("pin that message", ErrorCode::NotFound, "");
+        assert!(refused.starts_with("Couldn't pin that message"), "{refused}");
+        assert!(refused.contains("(ref "), "{refused}");
+        assert!(!refused.contains("That didn't work"), "{refused}");
+        let bare = refusal_words("pin that message", ErrorCode::Refused, "That didn't work. Try again.");
+        assert!(bare.starts_with("Couldn't pin that message"), "{bare}");
+        assert!(!bare.contains("That didn't work"), "{bare}");
+        let notes = fallback_notes();
+        assert!(notes.contains("send"), "{notes}");
+        assert!(notes.contains("pin that message"), "{notes}");
     }
 
     #[test]

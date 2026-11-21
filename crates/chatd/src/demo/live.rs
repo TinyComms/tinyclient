@@ -67,6 +67,7 @@ impl Plan {
             id: self.yusuf.id.clone(),
             name: self.yusuf.name.clone(),
             until: now() + 8,
+            activity: protocol::Compose::Typing,
         };
         hub.set_typing(self.conversation.clone(), typist, typing);
     }
@@ -132,6 +133,7 @@ impl Plan {
                     file: None,
                     count: 1,
                     mine: false,
+                    who: Vec::new(),
                 };
                 let reacted = hub.store().react(&self.conversation, &message.id, &reaction, true);
                 if matches!(reacted, Ok(true)) {

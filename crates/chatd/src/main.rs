@@ -82,10 +82,28 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's encrypted-reaction driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-e2ee-reaction") {
+        if let Err(err) = chatd::adapters::tiny::prove_encrypted_reaction() {
+            eprintln!("tiny-e2ee-reaction: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's linkify driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("linkify") {
         if let Err(err) = chatd::adapters::tiny::prove_linkify() {
             eprintln!("linkify: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's telegram-edited driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-edited") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_edited() {
+            eprintln!("telegram-edited: {err}");
             std::process::exit(1);
         }
         eprintln!("prove-exit:0");
@@ -179,6 +197,15 @@ fn main() -> io::Result<()> {
             eprintln!("refused-list: {err}");
             std::process::exit(1);
         }
+        return Ok(());
+    }
+    // The lab's reaction-reactors driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("reaction-reactors") {
+        if let Err(err) = chatd::adapters::prove_reactors() {
+            eprintln!("reaction-reactors: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-reaction-reactors:0");
         return Ok(());
     }
     // The lab's empty-list driver. A build without this returns to the server below and stays up.
@@ -280,6 +307,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-voice-bitrate:0");
         return Ok(());
     }
+    // The lab's discord-voice-move driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-voice-move") {
+        if let Err(err) = chatd::adapters::prove_discord_voice_move() {
+            eprintln!("discord-voice-move: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-voice-move:0");
+        return Ok(());
+    }
     // The lab's discord-nitro-length driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-nitro-length") {
         if let Err(err) = chatd::adapters::prove_discord_nitro_length() {
@@ -305,6 +341,15 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-discord-group-members:0");
+        return Ok(());
+    }
+    // The lab's space-mark-all-read driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("space-mark-all-read") {
+        if let Err(err) = chatd::server::prove_space_mark_all_read() {
+            eprintln!("space-mark-all-read: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-space-mark-all-read:0");
         return Ok(());
     }
     // The lab's call-leave-clears driver. A build without this returns to the server below and stays up.
@@ -352,6 +397,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-history:0");
         return Ok(());
     }
+    // The lab's edit-history driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("edit-history") {
+        if let Err(err) = chatd::server::prove_edit_history() {
+            eprintln!("edit-history: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-edit-history:0");
+        return Ok(());
+    }
     // The lab's messages-reply driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-reply") {
         if let Err(err) = chatd::adapters::messages::prove_message_reply() {
@@ -368,6 +422,33 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-messages-failed-send:0");
+        return Ok(());
+    }
+    // The lab's messages-media driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-media") {
+        if let Err(err) = chatd::adapters::messages::prove_message_media() {
+            eprintln!("messages-media: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-media:0");
+        return Ok(());
+    }
+    // The lab's messages-folders driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-folders") {
+        if let Err(err) = chatd::adapters::messages::prove_message_folders() {
+            eprintln!("messages-folders: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-folders:0");
+        return Ok(());
+    }
+    // The lab's messages-search driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-search") {
+        if let Err(err) = chatd::adapters::messages::prove_message_search() {
+            eprintln!("messages-search: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-search:0");
         return Ok(());
     }
     // The lab's teams-reactions driver. A build without this returns to the server below and stays up.
@@ -397,6 +478,51 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's slack-custom-emoji driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-custom-emoji") {
+        if let Err(err) = chatd::adapters::prove_slack_custom_emoji() {
+            eprintln!("slack-custom-emoji: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-custom-emoji:0");
+        return Ok(());
+    }
+    // The lab's teams-copy-link driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-copy-link") {
+        if let Err(err) = chatd::adapters::prove_share_links() {
+            eprintln!("teams-copy-link: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's teams-team-info driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-team-info") {
+        if let Err(err) = chatd::adapters::prove_teams_team_info() {
+            eprintln!("teams-team-info: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-teams-team-info:0");
+        return Ok(());
+    }
+    // The lab's messages-unread driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unread") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_unread() {
+            eprintln!("messages-unread: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-unread:0");
+        return Ok(());
+    }
+    // The lab's signal-message-info driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-message-info") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_message_info() {
+            eprintln!("signal-message-info: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-message-info:0");
+        return Ok(());
+    }
     // The lab's discord-forum-landing driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-forum-landing") {
         if let Err(err) = chatd::demo::prove_discord_forum_landing() {
@@ -413,6 +539,15 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's telegram-block-contact driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-block-contact") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_block_contact() {
+            eprintln!("telegram-block-contact: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-block-contact:0");
         return Ok(());
     }
     // The lab's telegram-markers driver. A build without this returns to the server below and stays up.
@@ -460,6 +595,33 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-stickers:0");
         return Ok(());
     }
+    // The lab's telegram-mention-name driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-mention-name") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_mention_name() {
+            eprintln!("telegram-mention-name: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-mention-name:0");
+        return Ok(());
+    }
+    // The lab's telegram-large-files driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-large-files") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_large_files() {
+            eprintln!("telegram-large-files: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-large-files:0");
+        return Ok(());
+    }
+    // The lab's telegram-link-preview driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-link-preview") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_link_preview() {
+            eprintln!("telegram-link-preview: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-link-preview:0");
+        return Ok(());
+    }
     // The lab's telegram-dice driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-dice") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_dice() {
@@ -505,6 +667,24 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-location:0");
         return Ok(());
     }
+    // The lab's telegram-inline-bots driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-inline-bots") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_inline_bots() {
+            eprintln!("telegram-inline-bots: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-inline-bots:0");
+        return Ok(());
+    }
+    // The lab's telegram-live-location driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-live-location") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_live_location() {
+            eprintln!("telegram-live-location: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-live-location:0");
+        return Ok(());
+    }
     // The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-member-sections") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_member_sections() {
@@ -523,6 +703,33 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-mute-until:0");
         return Ok(());
     }
+    // The lab's telegram-mark-unread driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-mark-unread") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_mark_unread() {
+            eprintln!("telegram-mark-unread: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-mark-unread:0");
+        return Ok(());
+    }
+    // The lab's message-remind driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("message-remind") {
+        if let Err(err) = chatd::notify::prove_message_remind() {
+            eprintln!("message-remind: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-message-remind:0");
+        return Ok(());
+    }
+    // The lab's telegram-typing-activity driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-typing-activity") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_typing_activity() {
+            eprintln!("telegram-typing-activity: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-typing-activity:0");
+        return Ok(());
+    }
     // The lab's telegram-accounts driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-accounts") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_accounts() {
@@ -530,6 +737,33 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-telegram-accounts:0");
+        return Ok(());
+    }
+    // The lab's telegram-secret-chat driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-secret-chat") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_secret_chat() {
+            eprintln!("telegram-secret-chat: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-secret-chat:0");
+        return Ok(());
+    }
+    // The lab's telegram-polls driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-polls") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_polls() {
+            eprintln!("telegram-polls: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-polls:0");
+        return Ok(());
+    }
+    // The lab's telegram-profile driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-profile") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_profile() {
+            eprintln!("telegram-profile: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-profile:0");
         return Ok(());
     }
     // The lab's slack-connect-org driver. A build without this returns to the server below and stays up.
@@ -550,6 +784,51 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-own-profile:0");
         return Ok(());
     }
+    // The lab's signal-payment-labels driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-payment-labels") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_payment_labels() {
+            eprintln!("signal-payment-labels: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-payment-labels:0");
+        return Ok(());
+    }
+    // The lab's signal-view-once driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-view-once") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_view_once() {
+            eprintln!("signal-view-once: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-view-once:0");
+        return Ok(());
+    }
+    // The lab's signal-long-text driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-long-text") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_long_text() {
+            eprintln!("signal-long-text: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-long-text:0");
+        return Ok(());
+    }
+    // The lab's signal-privacy-local driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-privacy-local") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_privacy_local() {
+            eprintln!("signal-privacy-local: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-privacy-local:0");
+        return Ok(());
+    }
+    // The lab's signal-poll driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-poll") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_poll() {
+            eprintln!("signal-poll: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-poll:0");
+        return Ok(());
+    }
     // The lab's messages-unpaired driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unpaired") {
         if let Err(err) = chatd::adapters::messages::prove_messages_unpaired() {
@@ -566,6 +845,177 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-messages-delete:0");
+        return Ok(());
+    }
+    // The lab's slack-profile-fields driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-profile-fields") {
+        if let Err(err) = chatd::adapters::prove_slack_profile_fields() {
+            eprintln!("slack-profile-fields: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-profile-fields:0");
+        return Ok(());
+    }
+    // The lab's slack-star-channel driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-star-channel") {
+        if let Err(err) = chatd::adapters::prove_slack_channel_star() {
+            eprintln!("slack-star-channel: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-star-channel:0");
+        return Ok(());
+    }
+    // The lab's slack-call-cards driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-call-cards") {
+        if let Err(err) = chatd::adapters::prove_slack_call_cards() {
+            eprintln!("slack-call-cards: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-call-cards:0");
+        return Ok(());
+    }
+    // The lab's slack-rich-text driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-rich-text") {
+        if let Err(err) = chatd::adapters::prove_slack_rich_text() {
+            eprintln!("slack-rich-text: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-rich-text:0");
+        return Ok(());
+    }
+    // The lab's telegram-delete-placed driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-delete-placed") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_delete_placed() {
+            eprintln!("telegram-delete-placed: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-delete-placed:0");
+        return Ok(());
+    }
+    // The lab's telegram-view-once driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-view-once") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_view_once() {
+            eprintln!("telegram-view-once: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-view-once:0");
+        return Ok(());
+    }
+    // The lab's telegram-checklist driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-checklist") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_checklist() {
+            eprintln!("telegram-checklist: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-checklist:0");
+        return Ok(());
+    }
+    // The lab's signal-text-styles driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-text-styles") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_styles() {
+            eprintln!("signal-text-styles: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-text-styles:0");
+        return Ok(());
+    }
+    // The lab's signal-reaction-restart driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-reaction-restart") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_reaction_restart() {
+            eprintln!("signal-reaction-restart: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-reaction-restart:0");
+        return Ok(());
+    }
+    // The lab's signal-username driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-username") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_username() {
+            eprintln!("signal-username: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-username:0");
+        return Ok(());
+    }
+    // The lab's signal-delete-for-me driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-delete-for-me") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_delete_for_me() {
+            eprintln!("signal-delete-for-me: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-delete-for-me:0");
+        return Ok(());
+    }
+    // The lab's signal-group-rename driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-group-rename") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_group_rename() {
+            eprintln!("signal-group-rename: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-group-rename:0");
+        return Ok(());
+    }
+    // The lab's signal-send-file driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-send-file") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_send_file() {
+            eprintln!("prove-signal-send-file: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-send-file:0");
+        return Ok(());
+    }
+    // The lab's discord-thread-chip driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-thread-chip") {
+        if let Err(err) = chatd::adapters::prove_discord_thread_chip() {
+            eprintln!("discord-thread-chip: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-thread-chip:0");
+        return Ok(());
+    }
+    // The lab's discord-code-colors driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-code-colors") {
+        if let Err(err) = chatd::adapters::prove_discord_code_colors() {
+            eprintln!("discord-code-colors: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-code-colors:0");
+        return Ok(());
+    }
+    // The lab's teams-chain-paging driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-chain-paging") {
+        if let Err(err) = chatd::adapters::prove_chain_paging() {
+            eprintln!("teams-chain-paging: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's messages-several-files driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-several-files") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_several_files() {
+            eprintln!("messages-several-files: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-several-files:0");
+        return Ok(());
+    }
+    // The lab's messages-mute driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-mute") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_mute() {
+            eprintln!("messages-mute: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-mute:0");
+        return Ok(());
+    }
+    // The lab's messages-sign-out driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-sign-out") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_sign_out() {
+            eprintln!("messages-sign-out: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-sign-out:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

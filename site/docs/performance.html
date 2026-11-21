@@ -70,6 +70,7 @@
 
   <main id="main" class="prose">
     <h1>Size &amp; performance</h1>
+    <!-- perf:page -->
     <p class="lede">How big tinyclient is next to the official apps, what it uses while it runs, and how each number was taken. Every number here was measured on 0.2.0.</p>
 
     <h2 id="size">App size on disk</h2>
@@ -109,6 +110,22 @@
     </div>
     <p>Of tinyclient&rsquo;s 91&nbsp;MB, the window was 69&nbsp;MB and <code>chatd</code> was 22&nbsp;MB. Teams&rsquo; footprint is one WebView renderer at 1,196&nbsp;MB plus helpers. Most of Teams, Slack, Signal and Discord is compressed: 1,649&nbsp;MB, 693&nbsp;MB, 524&nbsp;MB and 493&nbsp;MB. The Teams audio driver is in the resident column and not in the footprint, because <code>footprint</code> could not read it. An earlier reading the same evening, of tinyclient 0.1.0, was 42&nbsp;MB resident. 0.2.0 was the latest release then, and it is the build in this table. Later releases, with Tiny server calls, notifications and audio processing, have not been measured yet; these numbers are for 0.2.0.</p>
 
+    <!-- perf:build -->
+    <h2 id="build">Every build</h2>
+    <p>Each change that reaches <code>main</code> is built for release and measured before this site is published again, so these numbers are never older than the code. The build runs on invented data, since a build machine has no account: Discord, two Slack workspaces, Telegram, Teams, Signal and a Tiny server, with the window open for 20 seconds before the reading.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="The newest build">
+      <table>
+        <caption>tinyclient 0.2.71, measured 2026-11-17 on one Windows 11 desktop.</caption>
+        <thead><tr><th scope="col">Processes</th><th scope="col">Memory</th><th scope="col">Working set</th><th scope="col">Commit</th><th scope="col">The four programs on disk</th></tr></thead>
+        <tbody>
+          <tr><td class="num">2</td><td class="num">34 MB</td><td class="num">125 MB</td><td class="num">104 MB</td><td class="num">104 MB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>This reading and the table above are not the same test. Invented data is smaller than five real accounts, and a build machine draws the window without a graphics card. It is here to show which way each change moves the number. The reading is <a href="../perf/build.json"><code>build.json</code></a>.</p>
+    <!-- /perf:build -->
+
+    <!-- /perf:page -->
     <h2 id="processes">Four programs, each only when needed</h2>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Memory by process">
       <table>

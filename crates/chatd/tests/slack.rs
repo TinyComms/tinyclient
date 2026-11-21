@@ -430,6 +430,13 @@ impl Fake {
                 "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
                             "user": param("users"), "is_open": true, "priority": 0},
             })),
+            // A conversation star is the channel alone. A timestamp would star a message.
+            "stars.add" | "stars.remove" => {
+                if channel.is_empty() || !param("timestamp").is_empty() {
+                    return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
             "users.info" => self.user(token, param("user")).map(|user| json!({"ok": true, "user": user})),
             // A team id asks for that workspace. No id is the current one, from the fixture.
             "team.info" if !param("team").is_empty() => {
@@ -1043,7 +1050,7 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
 
     // Rich text, a mention of me, an image and reactions.
     let shipping = by_id("1760000300.000300");
-    assert_eq!(shipping.text, "Shipping today 🚀 @Justin");
+    assert_eq!(shipping.text, "Shipping today 🚀 @Justin :partyparrot:");
     assert!(ranges(shipping).contains(&("today", &Style::Bold)));
     let me_named = Style::Mention { kind: MentionKind::User, id: "U0ME".to_owned() };
     assert!(ranges(shipping).contains(&("@Justin", &me_named)));
@@ -1064,10 +1071,10 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
         .iter()
         .map(|reaction| (reaction.emoji.as_str(), reaction.count, reaction.mine, reaction.file.is_some()))
         .collect();
-    // A custom emoji shows by name: the workspace's list is read when the picker asks for
-    // it, never because a message arrived.
-    assert_eq!(reactions, [("🎉", 2, true, false), (":partyparrot:", 1, false, false)]);
-    assert!(world.fake.calls(ALPHA, "emoji.list").is_empty());
+    // A custom emoji is a picture once the workspace list has been read, which a message
+    // that names one does. The picker is not required.
+    assert_eq!(reactions, [("🎉", 2, true, false), (":partyparrot:", 1, false, true)]);
+    assert_eq!(world.fake.calls(ALPHA, "emoji.list").len(), 1);
 
     // Its files are registered with their sizes before any byte is fetched. Only the upload is
     // asked for here: its address is the fake's, and the avatar's and emoji's are Slack's own.
@@ -1395,7 +1402,7 @@ fn a_thread_is_a_conversation_that_can_be_read_and_answered() {
     });
 
     // Typing in the thread says where.
-    assert_eq!(world.ask(Request::Typing { conversation: thread.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: thread.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     let typing = world.until("typing to reach Slack", || world.fake.heard(ALPHA, "user_typing").pop());
     assert_eq!((typing["channel"].as_str(), typing["thread_ts"].as_str()), (Some("C0GEN"), Some(ROOT)));
 
@@ -1523,15 +1530,15 @@ fn sending_typing_presence_and_people_go_through_slack() {
     // fast the draft changes, and each conversation is paced on its own.
     let typed = |channel: &str| world.fake.heard(ALPHA, "user_typing").iter().filter(|frame| frame["channel"] == channel).count();
     for _ in 0..3 {
-        assert_eq!(world.ask(Request::Typing { conversation: general.clone() }), Response::Ok);
+        assert_eq!(world.ask(Request::Typing { conversation: general.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     }
     let typing = world.until("typing to reach Slack", || world.fake.heard(ALPHA, "user_typing").pop());
     let first_typed = Instant::now();
     assert_eq!((typing["channel"].as_str(), typing.get("thread_ts")), (Some("C0GEN"), None));
-    assert_eq!(world.ask(Request::Typing { conversation: alpha("D0ANA") }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: alpha("D0ANA"), activity: protocol::Compose::Typing }), Response::Ok);
     world.until("typing in another conversation", || (typed("D0ANA") == 1).then_some(()));
     sleep(Duration::from_millis(4000));
-    assert_eq!(world.ask(Request::Typing { conversation: general.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: general.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     sleep(Duration::from_millis(500));
     assert_eq!((typed("C0GEN"), typed("D0ANA")), (1, 1), "three seconds on is still too soon");
     assert!(world.fake.heard(BETA, "user_typing").is_empty());
@@ -1633,7 +1640,7 @@ fn sending_typing_presence_and_people_go_through_slack() {
 
     // Eight seconds after the first signal the next one goes out.
     sleep(Duration::from_millis(8200).saturating_sub(first_typed.elapsed()));
-    assert_eq!(world.ask(Request::Typing { conversation: general.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: general.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     world.until("typing again once the eight seconds are over", || (typed("C0GEN") == 2).then_some(()));
 
     // A huddle opens in the official app.
@@ -1784,15 +1791,22 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
         panic!("no rules");
     };
     assert_eq!((rules.set, rules.custom, rules.mine, rules.distinct, rules.tones), (ReactionSet::Only, EmojiScope::All, 23, 50, true));
-    assert!(rules.only.contains(&"👀".to_owned()) && !rules.only.contains(&"🫥".to_owned()));
-    let unnamed = react("🫥", true);
+    assert!(rules.only.contains(&"👀".to_owned()));
+    assert!(rules.only.len() > 1_500, "{}", rules.only.len());
+    assert!(rules.only.iter().any(|emoji| emoji == "🏴󠁧󠁢󠁷󠁬󠁳󠁿"));
+    let unnamed = react("\u{E000}", true);
     assert_eq!(unnamed, Response::Error { code: ErrorCode::Refused, detail: "That reaction isn't allowed here.".to_owned() });
     assert_eq!(world.fake.calls(ALPHA, "reactions.add").len(), 4, "never asked of Slack");
-    assert_eq!(reaction("🫥"), None);
+    assert_eq!(reaction("\u{E000}"), None);
 
     // An edit changes nothing until Slack accepts it, and is there when the answer is.
     let mine = "1760000100.000100";
-    let edit = Request::Edit { conversation: general.clone(), message_id: mine.to_owned(), text: "good morning <team> & all".to_owned() };
+    let edit = Request::Edit {
+        conversation: general.clone(),
+        message_id: mine.to_owned(),
+        text: "good morning <team> & all".to_owned(),
+        spans: Vec::new(),
+    };
     assert_eq!(world.ask(edit), Response::Ok);
     let edited = world.message(&general, mine).unwrap();
     assert_eq!((edited.text.as_str(), edited.edited, edited.outgoing), ("good morning <team> & all", true, true));
@@ -1800,7 +1814,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     assert_eq!((said(&updated, "channel"), said(&updated, "ts")), ("C0GEN".to_owned(), mine.to_owned()));
     assert_eq!(updated.params["text"], "good morning &lt;team&gt; &amp; all");
     // Only my own: chatd refuses the rest before Slack hears of it.
-    let theirs = Request::Edit { conversation: general.clone(), message_id: ROOT.to_owned(), text: "mine now".to_owned() };
+    let theirs = Request::Edit { conversation: general.clone(), message_id: ROOT.to_owned(), text: "mine now".to_owned(), spans: Vec::new() };
     assert!(matches!(world.ask(theirs), Response::Error { code: ErrorCode::Refused, .. }), "someone else's message is not mine to edit");
     assert_eq!(world.fake.calls(ALPHA, "chat.update").len(), 1);
 
@@ -1865,25 +1879,30 @@ fn presence_a_profile_and_signing_out() {
     world.fake.push(ALPHA, json!({"type": "manual_presence_change", "presence": "away"}));
     world.until("my own presence from elsewhere", || (world.account("T01ALPHA").presence == Presence::Idle).then_some(()));
 
-    // A profile card is one request, and only because it was opened.
+    // A profile card is users.info plus one labelled profile, and only because it was opened.
     let before = world.fake.calls(ALPHA, "users.info").len();
     world.until("Ana to be known", || world.conversation(&alpha("D0ANA")));
     let Response::Profile { profile } = world.ask(Request::Profile { person: alpha("U0ANA"), space: None }) else {
         panic!("no profile");
     };
-    // The title is a title, not a bio (06, story 3).
+    // The title is a title, not a bio (06, story 3). The display name stays the row; the full
+    // name is the card's other line.
     assert_eq!((profile.title.as_str(), profile.bio.as_str()), ("Design lead", ""));
     assert_eq!((profile.time_zone.as_str(), profile.utc_offset), ("Europe/Lisbon", Some(3600)));
     assert_eq!((profile.person.name.as_str(), profile.person.link.as_str()), ("Ana", "slack://user?team=T01ALPHA&id=U0ANA"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Full name" && value == "Ana Lima"));
     assert_eq!(world.fake.calls(ALPHA, "users.info").len(), before + 1);
-    assert!(world.fake.calls(ALPHA, "users.profile.get").is_empty());
+    let labelled = world.fake.calls(ALPHA, "users.profile.get");
+    assert_eq!(labelled.len(), 1);
+    assert_eq!((labelled[0].params.get("user").map(String::as_str), labelled[0].params.get("include_labels").map(String::as_str)), (Some("U0ANA"), Some("true")));
     // Opened again from the Space (an answer chatd itself has not kept), Slack is still not
-    // asked again: one `users.info` per person per hour, the card read then answered again.
+    // asked again: one `users.info` and one labelled profile per person per hour.
     let Response::Profile { profile } = world.ask(Request::Profile { person: alpha("U0ANA"), space: Some(alpha("T01ALPHA")) }) else {
         panic!("no profile");
     };
     assert_eq!(profile.title.as_str(), "Design lead");
     assert_eq!(world.fake.calls(ALPHA, "users.info").len(), before + 1);
+    assert_eq!(world.fake.calls(ALPHA, "users.profile.get").len(), 1);
 
     // Signing out of one workspace has nothing to end on Slack, so it answers at once, and the
     // browser's session, which the other workspace shares, is left alone.
@@ -2393,4 +2412,212 @@ fn a_slack_connect_channel_names_the_other_organisation() {
     let opened = world.fake.calls(ALPHA, "conversations.open");
     assert_eq!(opened.len(), before);
     assert!(opened.iter().all(|call| !call.params["users"].contains('@')));
+}
+
+/// The picture id `emoji.list` gives a custom emoji, without asking the picker.
+fn emoji_id(name: &str, url: &str) -> String {
+    let hash = url.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    format!("emoji:{name}:{hash:x}")
+}
+
+fn emoji_span<'a>(message: &'a Message, name: &str) -> Option<&'a protocol::MediaFile> {
+    let needle = format!(":{name}:");
+    message.spans.iter().find_map(|span| {
+        let Style::Emoji { file } = &span.style else {
+            return None;
+        };
+        let text = &message.text[span.start as usize..span.end as usize];
+        (text == needle).then_some(file)
+    })
+}
+
+#[test]
+fn a_custom_emoji_is_a_picture_without_opening_the_picker() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let shipping = world.general().into_iter().find(|message| message.id == "1760000300.000300").unwrap();
+    let file = emoji_span(&shipping, "partyparrot").expect("the custom emoji is a picture, and the picker was never opened");
+    assert!(file.id.starts_with("emoji:partyparrot:") && file.kind == MediaKind::Emoji, "{}", file.id);
+    let reaction = shipping.reactions.iter().find(|reaction| reaction.emoji == ":partyparrot:").unwrap();
+    assert_eq!(reaction.file.as_ref().map(|file| file.id.as_str()), Some(file.id.as_str()));
+    assert_eq!(world.fake.calls(ALPHA, "emoji.list").len(), 1, "one list for the workspace, not a catalog request");
+
+    let wave = "https://emoji.slack-edge.com/T01ALPHA/waveblob/89ab.gif";
+    world.fake.push(ALPHA, json!({
+        "type": "user_status_changed",
+        "user": {
+            "id": "U0ANA", "name": "ana",
+            "profile": {"display_name": "Ana", "title": "Design lead", "status_text": "shipping", "status_emoji": ":waveblob:"},
+        },
+    }));
+    let ana = world.until("a custom status emoji", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Slack), relation: None, query: Some("Ana".into()), offset: 0, limit: 10,
+        }) else {
+            return None;
+        };
+        people.into_iter().find(|person| person.key == alpha("U0ANA") && person.emoji == ":waveblob:" && person.status.contains("shipping"))
+    });
+    assert_eq!(ana.emoji, ":waveblob:");
+    let id = emoji_id("waveblob", wave);
+    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![id.clone()] }) else {
+        panic!("no media");
+    };
+    assert!(files.iter().any(|file| file.id == id && file.kind == MediaKind::Emoji), "the status emoji is registered as a file");
+
+    world.ask(Request::Watch(Watching { conversation: Some(general.clone()), ..Watching::default() }));
+    world.fake.push(ALPHA, json!({
+        "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": "go :party-parrot:",
+        "ts": "1760000501.000501", "event_ts": "1760000501.000501", "channel_type": "channel",
+    }));
+    world.until("the new name before it is renamed", || {
+        world.message(&general, "1760000501.000501").filter(|message| emoji_span(message, "party-parrot").is_none())
+    });
+    world.fake.push(ALPHA, json!({
+        "type": "emoji_changed", "subtype": "rename",
+        "old_name": "partyparrot", "new_name": "party-parrot",
+        "value": "https://emoji.slack-edge.com/T01ALPHA/partyparrot/0123abcd4567.gif",
+        "event_ts": "1760000500.000500",
+    }));
+    let renamed = world.until("a rename is a picture without another list", || {
+        world.message(&general, "1760000501.000501").and_then(|message| emoji_span(&message, "party-parrot").map(|file| file.id.clone()))
+    });
+    assert!(renamed.starts_with("emoji:party-parrot:") && world.fake.calls(ALPHA, "emoji.list").len() == 1, "{renamed}");
+}
+
+#[test]
+fn starring_a_channel_tells_slack_and_a_removal_clears_it() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    assert!(!world.conversation(&general).unwrap().starred);
+
+    let starred = world.ask(Request::Star { conversation: general.clone(), starred: true });
+    assert!(matches!(starred, Response::Ok), "{starred:?}");
+    let added = world.fake.calls(ALPHA, "stars.add");
+    assert_eq!(added.len(), 1, "one star is one stars.add: {added:?}");
+    assert_eq!(added[0].params.get("channel").map(String::as_str), Some("C0GEN"));
+    assert!(!added[0].params.contains_key("timestamp"), "a channel star carries no message timestamp");
+    world.until("#general to be starred", || world.conversation(&general).filter(|row| row.starred).map(|_| ()));
+
+    world.fake.push(ALPHA, json!({
+        "type": "star_removed",
+        "user": "U0ME",
+        "item": {"type": "channel", "channel": "C0GEN"},
+        "event_ts": "1760003000.000000",
+    }));
+    world.until("Slack removing the star to clear it here", || world.conversation(&general).filter(|row| !row.starred).map(|_| ()));
+
+    // A message star is Later, not the channel's star.
+    world.fake.push(ALPHA, json!({
+        "type": "star_added",
+        "user": "U0ME",
+        "item": {"type": "message", "channel": "C0GEN", "message": {"ts": "1760000100.000100"}},
+        "event_ts": "1760003001.000000",
+    }));
+    sleep(Duration::from_millis(400));
+    assert!(!world.conversation(&general).unwrap().starred, "starring a message does not star the channel");
+
+    let again = world.ask(Request::Star { conversation: general.clone(), starred: true });
+    assert!(matches!(again, Response::Ok), "{again:?}");
+    let off = world.ask(Request::Star { conversation: general.clone(), starred: false });
+    assert!(matches!(off, Response::Ok), "{off:?}");
+    let removed = world.fake.calls(ALPHA, "stars.remove");
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!(removed[0].params.get("channel").map(String::as_str), Some("C0GEN"));
+    assert!(!removed[0].params.contains_key("timestamp"));
+    assert!(!world.conversation(&general).unwrap().starred);
+}
+
+/// A posted `/zoom` (or Meet, Teams, Webex) call is a `call` block. Slack fills `call.v1` when
+/// the message is delivered. An old Slack call is `sh_room_created` with the same room clock a
+/// huddle uses.
+#[test]
+fn a_call_block_is_a_meeting_card_with_a_join_link_and_an_old_call_names_itself() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let push = |ts: &str, event: Value| {
+        world.fake.push(ALPHA, event);
+        world.until("the call message", || world.message(&general, ts))
+    };
+    let started = 1_700_000_000_i64;
+
+    let zoom = push("1760000600.000100", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": "", "ts": "1760000600.000100",
+        "blocks": [{
+            "type": "call", "call_id": "R0ZOOM",
+            "call": {
+                "media_backend_type": "zoom",
+                "v1": {
+                    "id": "R0ZOOM", "name": "Standup", "join_url": "https://zoom.us/j/123456789",
+                    "date_start": started,
+                    "active_participants": [{"slack_id": "U0ANA"}, {"slack_id": "U0BEN"}, {"slack_id": "U0ME"}],
+                },
+            },
+        }],
+    }));
+    assert_eq!(zoom.kind, MessageKind::Normal, "a call is not an interactive placeholder: {}", zoom.text);
+    assert!(!zoom.text.contains("interactive message"));
+    let card = zoom.card.as_deref().expect("the call is a card");
+    assert_eq!((card.title.as_str(), card.text.as_str()), ("Standup", "Zoom meeting · 3 people"));
+    let join = zoom.previews.first().expect("Join opens the meeting");
+    assert_eq!((join.title.as_str(), join.url.as_str()), ("Join", "https://zoom.us/j/123456789"));
+
+    let ended = push("1760000600.000200", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": "", "ts": "1760000600.000200",
+        "blocks": [{
+            "type": "call", "call_id": "R0MEET",
+            "call": {
+                "media_backend_type": "google_meet",
+                "v1": {
+                    "name": "Planning", "join_url": "https://meet.google.com/abc-defg-hij",
+                    "date_start": started, "date_end": started + 25 * 60,
+                    "active_participants": [],
+                },
+            },
+        }],
+    }));
+    let card = ended.card.as_deref().expect("an ended call is still a card");
+    assert_eq!((card.title.as_str(), card.text.as_str()), ("Planning", "Ended · 25 min"));
+    assert_eq!(ended.previews.first().map(|preview| preview.url.as_str()), Some("https://meet.google.com/abc-defg-hij"));
+
+    let teams = push("1760000600.000300", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0BEN", "text": "", "ts": "1760000600.000300",
+        "blocks": [{
+            "type": "call", "call_id": "R0TEAMS",
+            "call": {
+                "v1": {
+                    "media_backend_type": "microsoft_teams", "name": "Review",
+                    "join_url": "https://teams.microsoft.com/l/meetup-join/19:meeting",
+                    "date_start": started, "active_participants": [{"slack_id": "U0BEN"}],
+                },
+            },
+        }],
+    }));
+    assert_eq!(teams.card.as_deref().map(|card| card.text.as_str()), Some("Microsoft Teams meeting · 1 person"));
+
+    let webex = push("1760000600.000400", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0BEN", "text": "", "ts": "1760000600.000400",
+        "blocks": [{
+            "type": "call", "call_id": "R0WEBEX",
+            "call": { "v1": { "media_backend_type": "webex", "name": "Sync", "date_start": started, "join_url": "https://webex.example/meet/sync" } },
+        }],
+    }));
+    assert_eq!(webex.card.as_deref().map(|card| card.text.as_str()), Some("Webex meeting"));
+
+    let old = push("1760000600.000500", json!({
+        "type": "message", "subtype": "sh_room_created", "channel": "C0GEN", "user": "U0ANA", "text": "",
+        "ts": "1760000600.000500",
+        "room": { "date_start": started, "date_end": started + 25 * 60, "has_ended": true },
+    }));
+    assert_eq!((old.kind.clone(), old.text.as_str()), (MessageKind::System, "A call happened · 25 min"));
+
+    let huddle = push("1760000600.000600", json!({
+        "type": "message", "subtype": "huddle_thread", "channel": "C0GEN", "user": "U0ANA", "text": "",
+        "ts": "1760000600.000600",
+        "room": { "date_start": started, "date_end": started + 25 * 60, "has_ended": true, "call_family": "huddle" },
+    }));
+    assert_eq!(huddle.text, "A huddle happened · 25 min");
 }

@@ -34,6 +34,34 @@ struct Section {
     channels: Vec<String>,
 }
 
+/// Channel ids Slack filed in its stars section. Those rows are starred on Slack.
+fn starred_channels(sections: &[Section]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for section in sections.iter().filter(|section| section.kind == "stars") {
+        for id in &section.channels {
+            if !id.is_empty() && !ids.iter().any(|held| held == id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// The same, from section kinds, so a proof can name a stars section without a workspace.
+pub(super) fn starred_from(kinds: &[(&str, &[&str])]) -> Vec<String> {
+    let sections: Vec<Section> = kinds
+        .iter()
+        .enumerate()
+        .map(|(at, (kind, channels))| Section {
+            id: format!("S{at}"),
+            name: String::new(),
+            kind: (*kind).to_owned(),
+            channels: channels.iter().map(|id| (*id).to_owned()).collect(),
+        })
+        .collect();
+    starred_channels(&sections)
+}
+
 fn section(id: &str, name: &str) -> Section {
     Section {
         id: id.to_owned(),
@@ -353,8 +381,13 @@ impl Slack {
                 ..Group::new(DIRECTS, "Direct messages", sections.len() as i32)
             });
         }
+        let have: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        let starred: Vec<String> = starred_channels(&sections).into_iter().filter(|id| have.contains(id.as_str())).collect();
         self.ctx.tree(&self.ctx.account.account, &groups, &rows)?;
         drop(rows);
+        for id in starred {
+            self.ctx.starred(&id, true)?;
+        }
 
         // The list the user owns on Slack: the people they have a direct conversation with.
         let relations: Vec<(String, Relation)> = direct.keys().map(|person| (person.clone(), Relation::Contact)).collect();

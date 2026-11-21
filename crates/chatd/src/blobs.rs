@@ -18,6 +18,11 @@
 //! - Only the address the adapter registered is fetched (`Store::register_media`), and only
 //!   from the network's own hosts (`fetch::Hosts`). The adapter's `Command::Download` supplies
 //!   the session's headers or a fresh signed address. Never an arbitrary link from a message.
+//! - A file Telegram kept over its own session is registered under a name no host serves
+//!   (`tg://file/<id>`). Once it is gone from disk the cache does not try that name and does not
+//!   mark the file failed: it stays not fetched yet until Telegram keeps it again, when it next
+//!   reads the message, or at once when the shell asks for it on screen: an original the viewer
+//!   opened, or a picture a message shows (`Command::Wanted`).
 //! - A file is streamed to a part file through one buffer and renamed when whole. Its size is
 //!   capped by kind, from the headers and again while it arrives.
 //! - [`CACHE_BYTES`] on disk in all; least recently used goes first (`Store::media_on_disk`),
@@ -261,6 +266,13 @@ pub struct Blobs {
     cache: Arc<Cache>,
 }
 
+/// Whether `address` is Telegram's name for a file it kept over its own session, which no host
+/// serves. Signal's and Messages' names are refused with a reason as before: Signal does not
+/// answer `Command::Wanted`, and Messages answers it with a download each time it hears it.
+fn kept_by_telegram(address: &str) -> bool {
+    address.starts_with("tg://file/")
+}
+
 /// A test's override. Read only in a scratch directory, like the sessions in `session::load`.
 fn scratch(name: &str) -> Option<String> {
     if session::enabled() {
@@ -442,20 +454,22 @@ impl Cache {
 
     /// [`Blobs::request`].
     fn request(&self, account: &AccountKey, ids: &[String], adapter: Option<Sender<Command>>) -> rusqlite::Result<Vec<MediaFile>> {
-        let mut files: Vec<MediaFile> = {
+        let mut files: Vec<(MediaFile, String)> = {
             let mut store = self.hub.store();
             store.media_used(account, ids, now())?;
             let mut files = Vec::with_capacity(ids.len());
-            for (mut file, _) in store.media(account, ids)? {
+            for (mut file, url) in store.media(account, ids)? {
                 // Something else deleted it: it is simply not fetched yet.
                 if file.path.as_ref().is_some_and(|path| !Path::new(path).exists()) {
                     store.media_evicted(account, &file.id)?;
                     file.path = None;
                 }
-                files.push(file);
+                files.push((file, url));
             }
             files
         };
+        // Files the adapter kept itself and that have left the disk: theirs to fetch again.
+        let mut theirs = Vec::new();
         let screen = self.screen();
         let mut dropped = Vec::new();
         let mut picking = false;
@@ -464,7 +478,7 @@ impl Cache {
             let at = Instant::now();
             queue.asked.retain(|_, asked| at.duration_since(*asked) < self.on_screen);
             let epoch = queue.epochs.get(account).copied().unwrap_or(0);
-            for file in &mut files {
+            for (file, url) in &mut files {
                 let key = (account.clone(), file.id.clone());
                 queue.asked.insert(key.clone(), at);
                 // The picker asking for a preview is the picker being open. Its session's
@@ -482,6 +496,13 @@ impl Cache {
                 // A failure stands until `Fetch` says `retry` (the server clears it before
                 // this) or the adapter registers a fresh address.
                 if file.path.is_some() || file.failed.is_some() || queue.fetching.contains(&key) {
+                    continue;
+                }
+                // Telegram's name for where it got the file over its own session. Fetching it
+                // could only fail, and the failure would stand in the box where the picture is
+                // about to land: it waits for Telegram instead.
+                if kept_by_telegram(url) {
+                    theirs.push(file.id.clone());
                     continue;
                 }
                 // A failure of the line rests a while, and is answered with why until then.
@@ -509,6 +530,9 @@ impl Cache {
         if picking {
             self.picks.notify_all();
         }
+        if let (false, Some(adapter)) = (theirs.is_empty(), &adapter) {
+            let _ = adapter.send(Command::Wanted(theirs));
+        }
         // Whoever asked for what gave way is told it did not arrive, so nothing waits on it.
         for (account, id) in dropped {
             let known = self.hub.store().media(&account, &[id])?;
@@ -516,7 +540,7 @@ impl Cache {
                 self.announce(&account, file);
             }
         }
-        Ok(files)
+        Ok(files.into_iter().map(|(file, _)| file).collect())
     }
 
     /// What is on screen now, as files. Worked out again only when `Watching` changed; then the
@@ -694,9 +718,12 @@ impl Cache {
     /// Makes the directory and the store agree, once, at start. A file no row points to is
     /// removed, parts of interrupted downloads included; a row whose file is gone loses its path.
     fn reconcile(&self) {
-        match self.hub.store().media_forgive(fetch::passing) {
+        // The cache's own refusal of Telegram's name for a file was an older chatd trying to
+        // fetch it itself. Any other failure recorded there is the file's own and stands.
+        let refused = |why: &str, url: &str| kept_by_telegram(url) && why.ends_with("does not serve files from that address.");
+        match self.hub.store().media_forgive(|why, url| fetch::passing(why) || refused(why, url)) {
             Ok(0) => {}
-            Ok(forgiven) => tracing::warn!("chatd: media: {forgiven} files that failed for a moment's trouble will be fetched again"),
+            Ok(forgiven) => tracing::warn!("chatd: media: {forgiven} files that failed for a moment's trouble, or that only Telegram fetches, will be fetched again"),
             Err(err) => tracing::warn!("chatd: media: {err}"),
         }
         for network in Network::ALL {
@@ -1019,6 +1046,17 @@ fn stale(picked: &HashMap<AccountKey, Picker>, at: Instant, idle: Duration) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_file_telegram_kept_is_left_to_telegram() {
+        assert!(kept_by_telegram("tg://file/p6014m"));
+        // Everything else is the cache's to fetch, or to refuse with a reason, as before: an
+        // address on the web, a link Telegram would open, and the other adapters' own names.
+        let others = ["https://cdn.discordapp.com/a.png", "http://127.0.0.1:9/x", "tg://user?id=7002", "signal://avatar/u1", "messages://file/m1", ""];
+        for address in others {
+            assert!(!kept_by_telegram(address), "{address}");
+        }
+    }
 
     #[test]
     fn a_failure_of_the_line_rests_longer_each_time_up_to_a_limit() {

@@ -413,6 +413,7 @@ impl Shell {
     }
 
     fn resize(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        super::lock::touch();
         let Some(edge) = self.layout_state.resizing else {
             return;
         };
@@ -809,13 +810,14 @@ impl Shell {
                     );
                 }
             }
-            // CONTRACT: of the Space menu in `02-layout-navigation.md` only pinning has a
-            // request behind it. Nothing marks a whole Space read or mutes it, and a Space
-            // carries no link to open it in the network's app, so those items are left out.
+            // CONTRACT: of the Space menu in `02-layout-navigation.md` pinning and mark-as-read
+            // have a request behind them. Nothing mutes a whole Space, and a Space carries no
+            // link to open it in the network's app, so those items are left out.
             Menu::Space(space) => {
                 let pinned = self.sidebar_state.pins.contains(space);
                 let key = space.clone();
                 let shown = space.clone();
+                let read = space.clone();
                 items.push(
                     menu_item("details", Some("icons/info.svg"), "Details", None)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -829,6 +831,14 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
                             this.pin(key.clone(), !pinned, cx);
+                        }))
+                        .into_any_element(),
+                );
+                items.push(
+                    menu_item("space-read", Some("icons/check.svg"), "Mark as read", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.mark_space_read(read.clone(), cx);
                         }))
                         .into_any_element(),
                 );
@@ -1216,6 +1226,48 @@ impl Render for Shell {
             tracing::warn!("tinyclient: frame {frame} at {} ms", super::LAUNCHED.get().map_or(0, |at| at.elapsed().as_millis()));
         }
         super::feed_platform_insets(window);
+        // The form is decided once per frame, with hysteresis (`phone::form`), and the phone's
+        // own entities exist before any of its screens is drawn.
+        let viewport = window.viewport_size();
+        let phone_form = super::phone::form(super::phone::active(), f32::from(viewport.width), f32::from(viewport.height));
+        super::phone::set_active(phone_form);
+        super::phone::tokens::set_landscape(phone_form && viewport.width > viewport.height);
+        // A phone's window does not shrink for the soft keyboard (Android's NativeActivity and
+        // iOS's full-screen view both keep their size and report the keyboard as an inset), so
+        // the shell lifts its content above it; the composer then sits on the keyboard's edge
+        // (`tokens::bottom_padding`).
+        let keyboard = if super::phone::active() { super::phone::tokens::keyboard() } else { 0. };
+        super::lock::tick();
+        if super::lock::held() {
+            let ringing = self.snapshot.as_ref().is_some_and(|snapshot| {
+                let incoming = |call: &protocol::Call| matches!(call.state, CallState::RingingIn { .. });
+                snapshot.call.as_ref().is_some_and(incoming) || snapshot.ring.as_ref().is_some_and(incoming)
+            });
+            let cover = self.lock_cover(ringing, window, cx);
+            let locked_root = div()
+                .size_full()
+                .relative()
+                .flex()
+                .bg(theme::canvas())
+                .text_color(theme::text())
+                .type_ui()
+                .font_family(theme::FONT)
+                .when(keyboard > 0., |root| root.pb(px(keyboard)))
+                .track_focus(&self.lock_focus)
+                .key_context("ScreenLock")
+                // Swallow app-level window-opening actions and any keys not handled by the unlock
+                // input, so the lock cannot be bypassed from the keyboard.
+                .on_action(|_: &super::Settings, _, _| {})
+                .on_action(|_: &super::About, _, _| {})
+                .on_action(|_: &super::KeyboardShortcuts, _, _| {})
+                .on_action(|_: &super::ShowLogs, _, _| {})
+                .on_action(|_: &super::CheckForUpdates, _, _| {})
+                .on_action(|_: &super::NewMessage, _, _| {})
+                .on_action(|_: &super::AddAccount, _, _| {})
+                .on_key_down(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .child(cover);
+            return if phone_form { locked_root } else { locked_root.children(window_chrome(window)) };
+        }
         let root = self
             .keys(div(), cx)
             .size_full()
@@ -1238,11 +1290,6 @@ impl Render for Shell {
             self.go(super::sidebar::Mode::Network(protocol::Network::Tiny), cx);
             self.prefer_tiny(account, cx);
         }
-        // A phone's window does not shrink for the soft keyboard (Android's NativeActivity and
-        // iOS's full-screen view both keep their size and report the keyboard as an inset), so
-        // the shell lifts its content above it; the composer then sits on the keyboard's edge
-        // (`tokens::bottom_padding`).
-        let keyboard = if super::phone::active() { super::phone::tokens::keyboard() } else { 0. };
         let root = root.when(keyboard > 0., |root| root.pb(px(keyboard)));
         let root = root.children(super::signin::layer(window, cx));
         #[cfg(feature = "gui-shot")]
@@ -1253,12 +1300,6 @@ impl Render for Shell {
         self.follow_changes(cx);
         self.refresh_menus(cx);
         self.note_tiny_page(cx);
-        // The form is decided once per frame, with hysteresis (`phone::form`), and the phone's
-        // own entities exist before any of its screens is drawn.
-        let viewport = window.viewport_size();
-        let phone_form = super::phone::form(super::phone::active(), f32::from(viewport.width), f32::from(viewport.height));
-        super::phone::set_active(phone_form);
-        super::phone::tokens::set_landscape(phone_form && viewport.width > viewport.height);
         // Before the first answer the window is still drawn: rail, strips, an empty list, and
         // what it waits on. Never a blank canvas, never a developer message.
         let placeholder;
@@ -1367,6 +1408,105 @@ impl Render for Shell {
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
+    }
+}
+
+impl Shell {
+    /// The only thing drawn while the screen lock is held. A ring can still be answered.
+    fn lock_cover(&mut self, ringing: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let error = super::lock::unlock_error();
+        let asking = super::lock::asking();
+        #[cfg(target_os = "linux")]
+        let phrase = {
+            let phrase = self.lock_field(cx);
+            let phrase_focus = gpui::Focusable::focus_handle(phrase.read(cx), cx);
+            if !self.lock_focus.is_focused(window) && !phrase_focus.is_focused(window) {
+                window.focus(&phrase_focus, cx);
+            }
+            phrase
+        };
+        #[cfg(not(target_os = "linux"))]
+        if !self.lock_focus.is_focused(window) {
+            window.focus(&self.lock_focus, cx);
+        }
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .bg(theme::canvas())
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.))
+            .px(px(24.))
+            .child(div().type_title().child("tinyclient is locked"))
+            .child(div().max_w(px(420.)).type_small().text_color(theme::text_soft()).child(super::lock::CAPTION))
+            .when(ringing, |cover| {
+                cover.child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(button("lock-answer", ButtonKind::Primary, "Answer").on_click(cx.listener(|this, _, _, cx| this.call_accept(cx))))
+                        .child(button("lock-decline", ButtonKind::Secondary, "Decline").on_click(cx.listener(|this, _, _, cx| this.call_decline(cx)))),
+                )
+            })
+            .when(cfg!(target_os = "linux"), |cover| {
+                #[cfg(target_os = "linux")]
+                let cover = cover.child(div().w(px(240.)).child(phrase));
+                cover
+            })
+            .child(
+                button("lock-unlock", ButtonKind::Primary, if asking { "Asking the system…" } else { "Unlock" }).on_click(cx.listener(|this, _, _, cx| this.unlock_screen(cx))),
+            )
+            .when(!error.is_empty(), |cover| cover.child(div().type_small().text_color(theme::danger()).child(error)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lock_field(&mut self, cx: &mut Context<Self>) -> gpui::Entity<super::input::TextInput> {
+        if self.lock_phrase.is_none() {
+            self.lock_phrase = Some(cx.new(|cx| super::input::TextInput::secret("Passphrase", cx)));
+        }
+        self.lock_phrase.clone().expect("the passphrase field was just created")
+    }
+
+    fn unlock_screen(&mut self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "linux")]
+        {
+            let phrase = self.lock_phrase.as_ref().map(|input| input.read(cx).text().to_owned()).unwrap_or_default();
+            if super::lock::unlock_phrase(&phrase) {
+                if let Some(input) = &self.lock_phrase {
+                    input.update(cx, |input, cx| input.clear(cx));
+                }
+                cx.notify();
+                return;
+            }
+            cx.notify();
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if super::lock::asking() {
+                return;
+            }
+            super::lock::set_asking(true);
+            cx.notify();
+            self.off_thread(
+                cx,
+                super::lock::verify_owner,
+                |_, result, cx| {
+                    super::lock::set_asking(false);
+                    match result {
+                        Ok(outcome) if super::lock::accept_outcome(outcome) => super::lock::unlock_verified(),
+                        Ok(outcome) => super::lock::set_unlock_error(super::lock::outcome_words(outcome)),
+                        Err(words) => super::lock::set_unlock_error(words),
+                    }
+                    cx.notify();
+                },
+            );
+        }
     }
 }
 

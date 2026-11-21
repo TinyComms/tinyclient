@@ -1,0 +1,12 @@
+{
+  "id": "error-text",
+  "title": "A failure names the action and a ref, not a bare try-again",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same sentences are what a phone shows.",
+    "ios": "The phone proof build does not run the desktop window. The same sentences are what a phone shows."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

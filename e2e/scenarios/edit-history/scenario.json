@@ -1,0 +1,12 @@
+{
+  "id": "edit-history",
+  "title": "An edited message shows when it was edited, and an earlier wording when one was kept",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same edit check keeps the time and the earlier wording.",
+    "ios": "The phone proof build does not run desktop chatd. The same edit check keeps the time and the earlier wording."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

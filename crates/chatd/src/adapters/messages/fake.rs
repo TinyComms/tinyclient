@@ -3,16 +3,20 @@
 //! `messages.signin.ctl` while linking: `confirm`, `expire`, `fail`.
 //! `messages.ctl` once linked:
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
-//! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `quote WHO ID TEXT…`,
-//! `typing WHO`, `typing-stop WHO`,
-//! `refuse WORDS…`, `status CODE`, `drop`, `unlinked`, `silent`, `answer`,
+//! `file WHO NAME`, `video WHO`, `poster WHO`, `voice WHO`, `remote WHO`,
+//! `react WHO TEXT`, `quote WHO ID TEXT…`, `typing WHO`, `typing-stop WHO`,
+//! `archive WHO`, `spam WHO`, `again WHO`,
+//! `refuse WORDS…`, `status CODE`, `hold`, `go`, `drop`, `unlinked`, `silent`, `answer`,
 //! `revoke`, `revoke-offline`, `auth`.
+//! `archive` files the chat as archived. `spam` files it as spam. `again` repeats the
+//! chat with a new title and no status, which must keep the folder it already had.
 //! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
 //! and tells the adapter the phone is back.
+//! `hold` pauses a file upload until `go`, so a cancel can land while it is still unsent.
 //! WHO is `grace` or `alan`. `status` reports that code on the last text this computer sent.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
+use crate::adapters::messages::bugle::{Chat, Mark, MediaPart, Note, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
 use crate::adapters::script;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -36,14 +40,14 @@ struct SentCopy {
     phone_id: String,
 }
 
-fn record(line: &str) {
+pub(super) fn record(line: &str) {
     let path = protocol::support_dir().join("messages.calls");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -56,6 +60,8 @@ pub struct Fake {
     quiet: Arc<AtomicBool>,
     sent: AtomicU32,
     last: Arc<Mutex<Option<SentCopy>>>,
+    /// A scripted upload waits while this is set (`hold` / `go` on `messages.ctl`).
+    hold: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -74,6 +80,7 @@ impl Fake {
                 quiet: Arc::default(),
                 sent: AtomicU32::new(0),
                 last: Arc::default(),
+                hold: Arc::default(),
             };
         }
         let (events, heard) = channel();
@@ -89,7 +96,7 @@ impl Fake {
                 carrier: 0,
                 updated: 0,
                 phones: false,
-                gone: false,
+                status: 1,
             },
             Chat {
                 id: CLUB.into(),
@@ -101,7 +108,7 @@ impl Fake {
                 carrier: 0,
                 updated: 0,
                 phones: false,
-                gone: false,
+                status: 1,
             },
         ]));
         let fake = Fake {
@@ -112,13 +119,15 @@ impl Fake {
             quiet: Arc::default(),
             sent: AtomicU32::new(0),
             last: Arc::default(),
+            hold: Arc::default(),
         };
-        let (events, closed, refuse, quiet, last) = (
+        let (events, closed, refuse, quiet, last, hold) = (
             fake.events.clone(),
             fake.closed.clone(),
             fake.refuse.clone(),
             fake.quiet.clone(),
             fake.last.clone(),
+            fake.hold.clone(),
         );
         let control = script::control("messages.ctl");
         let _ = std::thread::Builder::new()
@@ -172,6 +181,16 @@ impl Fake {
                             spoken.sent = crate::hub::now();
                             let _ = events.send(Event::Message(spoken));
                         }
+                        return true;
+                    }
+                    if line == "hold" {
+                        hold.store(true, Ordering::Release);
+                        record("hold");
+                        return true;
+                    }
+                    if line == "go" {
+                        hold.store(false, Ordering::Release);
+                        record("go");
                         return true;
                     }
                     for event in steer(line) {
@@ -236,6 +255,11 @@ fn scripted_page(conversation: &str, before: Option<&str>) -> Vec<Note> {
         .map(|n| {
             let mut line = note(GRACE, "Grace Ombra", GRACE, &format!("m-{n:04}"), &format!("line {n}"), false, Vec::new(), Vec::new());
             line.sent = 1_700_000_000 + n;
+            // The 90th-newest line. A photo here is older than the first page, so a shared
+            // search that only saw that page would miss it.
+            if n == 11 {
+                line.pieces = vec![photo_piece(true)];
+            }
             line
         })
         .collect()
@@ -289,12 +313,68 @@ fn photo_piece(inline: bool) -> Piece {
     }
 }
 
+/// A video, a video with a still in the inline bytes, or a voice note.
+fn media_note(
+    who_word: &str,
+    text: &str,
+    filename: &str,
+    mime: &str,
+    inline: Vec<u8>,
+    media_id: String,
+) -> Vec<Event> {
+    let Some((author, name)) = who(who_word) else {
+        return Vec::new();
+    };
+    let size = if media_id.is_empty() {
+        inline.len() as u64
+    } else {
+        120_000
+    };
+    let piece = Piece {
+        name: filename.into(),
+        mime: mime.into(),
+        media_id,
+        inline,
+        size,
+        ..Piece::default()
+    };
+    vec![Event::Message(note(
+        author,
+        name,
+        author,
+        &format!("m-{author}-{text}"),
+        text,
+        true,
+        vec![piece],
+        Vec::new(),
+    ))]
+}
+
 fn png() -> Vec<u8> {
     const BYTES: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
     (0..BYTES.len())
         .step_by(2)
         .map(|at| u8::from_str_radix(&BYTES[at..at + 2], 16).unwrap())
         .collect()
+}
+
+fn listed(id: &str, title: &str, status: u64) -> Chat {
+    Chat {
+        id: id.into(),
+        title: title.into(),
+        group: false,
+        unread: false,
+        mine: ME.into(),
+        peer: if id == GRACE {
+            GRACE_PARTICIPANT.into()
+        } else {
+            String::new()
+        },
+        carrier: 0,
+        updated: 0,
+        phones: false,
+        status,
+    }
 }
 
 fn who(word: &str) -> Option<(&'static str, &'static str)> {
@@ -352,6 +432,30 @@ fn steer(line: &str) -> Vec<Event> {
                 Vec::new(),
             ))]
         }
+        "video" => media_note(
+            words.next().unwrap_or(""),
+            "clip",
+            "clip.mp4",
+            "video/mp4",
+            super::clip_bytes(),
+            String::new(),
+        ),
+        "poster" => media_note(
+            words.next().unwrap_or(""),
+            "poster",
+            "clip.mp4",
+            "video/mp4",
+            png(),
+            "clip-1".into(),
+        ),
+        "voice" => media_note(
+            words.next().unwrap_or(""),
+            "voice",
+            "note.amr",
+            "audio/amr",
+            super::voice_bytes(),
+            String::new(),
+        ),
         "file" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
                 return Vec::new();
@@ -470,8 +574,19 @@ fn steer(line: &str) -> Vec<Event> {
                 carrier,
                 updated: 0,
                 phones,
-                gone: false,
+                status: 0,
             }])]
+        }
+        "archive" | "spam" | "again" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let (title, status) = match command {
+                "archive" => (name.to_owned(), 2),
+                "spam" => (name.to_owned(), 5),
+                _ => (format!("{name} still"), 0),
+            };
+            vec![Event::Chats(vec![listed(author, &title, status)])]
         }
         "tick" => {
             let Some((author, _)) = who(words.next().unwrap_or("")) else {
@@ -534,7 +649,29 @@ fn steer(line: &str) -> Vec<Event> {
                 carrier: 0,
                 updated: 0,
                 phones: false,
-                gone: true,
+                status: 3,
+            }])]
+        }
+        "hold" | "read" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let unread = command == "hold";
+            vec![Event::Chats(vec![Chat {
+                id: author.into(),
+                title: if unread { "Held".into() } else { "Read".into() },
+                group: false,
+                unread,
+                mine: ME.into(),
+                peer: if author == GRACE {
+                    GRACE_PARTICIPANT.into()
+                } else {
+                    String::new()
+                },
+                carrier: 0,
+                updated: 0,
+                phones: false,
+                status: 1,
             }])]
         }
         _ => Vec::new(),
@@ -588,12 +725,21 @@ impl Drive for Fake {
         }
         Ok(relay_id)
     }
-    fn send_file(
+    fn upload_media(&self, _packed: &[u8], _mime: &str) -> Result<String, String> {
+        while self.hold.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        Ok("media".into())
+    }
+    fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
@@ -601,13 +747,14 @@ impl Drive for Fake {
         if let Some(words) = self.refusal() {
             return Err(words);
         }
-        let bytes = std::fs::read(path).map_err(|_| format!("Messages couldn't read {name}."))?;
         let relay_id = self.remember(conversation, caption);
         noted(&relay_id);
-        record(&format!(
-            "file {conversation} {name} {} {caption}",
-            bytes.len()
-        ));
+        for part in parts {
+            record(&format!(
+                "file {conversation} {} {} {caption}",
+                part.name, part.size
+            ));
+        }
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
         }
@@ -667,6 +814,15 @@ impl Drive for Fake {
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         record(&format!("delete-chat {conversation}"));
+        Ok(())
+    }
+    fn unpair(&self) -> Result<(), String> {
+        record("unpair");
+        Ok(())
+    }
+    fn block(&self, conversation: &str) -> Result<(), String> {
+        self.unanswered()?;
+        record(&format!("block {conversation}"));
         Ok(())
     }
     fn close(&self) {

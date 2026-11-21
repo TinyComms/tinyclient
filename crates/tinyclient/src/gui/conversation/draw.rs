@@ -3,6 +3,7 @@
 //! row is its final height before any file arrives.
 
 use palette::IntoColor;
+use super::actions::reactor_words;
 use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
@@ -12,7 +13,7 @@ use super::rows::Item;
 use super::text::{Look, Rich, TextEvent};
 use super::tokens::{self, Metrics, MEASURE};
 use super::when;
-use super::{Pane, PaneEvent, Selection, Then};
+use super::{edited_tip, Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{glyph, tip, Avatar, Shape};
 use crate::gui::phone::tokens as tokens_phone;
@@ -22,11 +23,14 @@ use crate::view::{age, now};
 use crate::client::ask;
 use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
-    Hsla, MouseButton, ObjectFit, SharedString, Stateful, Window,
+    FontWeight, HighlightStyle, Hsla, MouseButton, ObjectFit, Pixels, Point, RenderImage, SharedString, Stateful, StyledText, Window,
 };
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, SendState};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, Response, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long the tint on a jump's target takes to fade.
@@ -38,6 +42,58 @@ pub(crate) fn waiting_line(network: &str) -> String {
 }
 /// Lines of a code block shown before "Show more".
 const CODE_LINES: usize = 20;
+
+fn ink_style(ink: super::highlight::Ink) -> HighlightStyle {
+    let paint = |color: gpui::Rgba| Some(color.into_color());
+    match ink {
+        super::highlight::Ink::Keyword => HighlightStyle { color: paint(tokens::code_keyword()), ..Default::default() },
+        super::highlight::Ink::String => HighlightStyle { color: paint(tokens::code_string()), ..Default::default() },
+        super::highlight::Ink::Comment => HighlightStyle { color: paint(tokens::code_comment()), ..Default::default() },
+        super::highlight::Ink::Number => HighlightStyle { color: paint(tokens::code_number()), ..Default::default() },
+        super::highlight::Ink::Type => HighlightStyle { color: paint(tokens::code_type()), ..Default::default() },
+        super::highlight::Ink::Function => HighlightStyle { color: paint(tokens::code_function()), ..Default::default() },
+        super::highlight::Ink::Added => HighlightStyle {
+            color: paint(tokens::code_added()),
+            background_color: paint(tokens::code_added_bg()),
+            ..Default::default()
+        },
+        super::highlight::Ink::Removed => HighlightStyle {
+            color: paint(tokens::code_removed()),
+            background_color: paint(tokens::code_removed_bg()),
+            ..Default::default()
+        },
+        super::highlight::Ink::Ansi { fg, bg, bold } => HighlightStyle {
+            color: tokens::code_ansi(fg).map(|color| color.into_color()),
+            background_color: tokens::code_ansi(bg).map(|color| color.into_color()),
+            font_weight: bold.then_some(FontWeight::BOLD),
+            ..Default::default()
+        },
+    }
+}
+
+/// The first `count` lines, as a byte prefix, so colour ranges stay on the text that is drawn.
+fn first_lines(text: &str, count: usize) -> &str {
+    let mut lines = 0;
+    for (at, _) in text.match_indices('\n') {
+        lines += 1;
+        if lines == count {
+            return &text[..at];
+        }
+    }
+    text.trim_end_matches(['\n', '\r'])
+}
+
+fn code_highlights(text: &str, runs: &[super::highlight::Paint]) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let mut highlights = Vec::new();
+    for run in runs {
+        let start = run.start as usize;
+        let end = (run.end as usize).min(text.len());
+        if start < end && text.is_char_boundary(start) && text.is_char_boundary(end) {
+            highlights.push((start..end, ink_style(run.ink)));
+        }
+    }
+    highlights
+}
 /// Link cards drawn per message; further links stay text.
 const CARDS: usize = 3;
 /// Reaction chips drawn before the rest are counted.
@@ -718,14 +774,14 @@ impl Pane {
             .into_any_element()
     }
 
-    fn person(&self, id: &str) -> Option<Key> {
+    pub(super) fn person(&self, id: &str) -> Option<Key> {
         let open = self.open.as_ref()?;
         (!id.is_empty()).then(|| Key { id: id.to_owned(), ..open.key.clone() })
     }
 
     /// Someone in this conversation, from what its messages say of them, else from the people
     /// hub: their name and their picture.
-    fn who(&self, person: &Key, cx: &mut Context<Self>) -> (String, Option<MediaFile>) {
+    pub(super) fn who(&self, person: &Key, cx: &Context<Self>) -> (String, Option<MediaFile>) {
         if let Some(message) = said_by(self.root(), &self.window.messages, &person.id) {
             return (message.sender.name.clone(), message.sender.avatar.clone());
         }
@@ -860,7 +916,6 @@ impl Pane {
     // Words.
 
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let edited = || div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)").into_any_element();
         let phone = self.metrics == Metrics::PHONE;
         // An encrypted message this device can't open says so, quietly, and never as its text.
         if message.seal == protocol::Seal::Undecryptable {
@@ -878,7 +933,7 @@ impl Pane {
                 .into_any_element()];
         }
         if message.text.trim().is_empty() {
-            return message.edited.then(edited).into_iter().collect();
+            return message.edited.then(|| self.edited_mark(message, cx)).into_iter().collect();
         }
         if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
             return vec![self.jumbo(&emoji, window, cx)];
@@ -894,14 +949,21 @@ impl Pane {
             let element = match block {
                 // A flex column, so the text is a flex item that is measured on its own: in a
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
-                Block::Text(inline) => div()
-                    .max_w(px(MEASURE))
-                    .flex()
-                    .flex_col()
-                    .type_body()
-                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
-                    .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx))
-                    .into_any_element(),
+                Block::Text(inline) => {
+                    let marked = inline.runs.iter().any(|run| run.mark);
+                    let block = div()
+                        .max_w(px(MEASURE))
+                        .flex()
+                        .flex_col()
+                        .type_body()
+                        .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                        .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
+                    if marked {
+                        block.id(name_id("edited", &message.id)).tooltip(tip(edited_tip(message.edited_at), None)).into_any_element()
+                    } else {
+                        block.into_any_element()
+                    }
+                }
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
                     .mt(px(3.))
@@ -935,9 +997,74 @@ impl Pane {
             out.push(element);
         }
         if edited_alone {
-            out.push(edited());
+            out.push(self.edited_mark(message, cx));
         }
         out
+    }
+
+    /// "(edited)", with the time it was edited. A network that keeps earlier wordings opens them on a click.
+    fn edited_mark(&mut self, message: &Message, cx: &mut Context<Self>) -> AnyElement {
+        let words = edited_tip(message.edited_at);
+        let id = message.id.clone();
+        let history = self.keeps_revisions(cx);
+        div()
+            .id(name_id("edited", &id))
+            .h(px(16.))
+            .type_micro()
+            .text_color(theme::text_faint())
+            .tooltip(tip(words, None))
+            .when(history, |mark| {
+                mark.cursor_pointer().on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    this.open_revisions(&id, event.position(), cx);
+                }))
+            })
+            .child("(edited)")
+            .into_any_element()
+    }
+
+    /// This account's network keeps earlier wordings (`Capabilities::revisions`).
+    fn keeps_revisions(&self, cx: &gpui::App) -> bool {
+        let Some(key) = self.key().cloned() else {
+            return false;
+        };
+        self.shell
+            .upgrade()
+            .and_then(|shell| {
+                shell.read(cx).snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|account| account.can.revisions)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Asks for earlier wordings and opens the list at the click.
+    fn open_revisions(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.keeps_revisions(cx) {
+            return;
+        }
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        self.menu = None;
+        let message_id = id.to_owned();
+        self.revisions = Some(super::Earlier { message: message_id.clone(), at, rows: Vec::new(), ready: false });
+        cx.notify();
+        let request = Request::Revisions { conversation, message_id: message_id.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(open) = this.revisions.as_mut() else {
+                    return;
+                };
+                if open.message != message_id {
+                    return;
+                }
+                open.ready = true;
+                if let Ok(Response::Revisions { revisions, .. }) = answer {
+                    open.rows = revisions;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The decoded picture of a file on disk, `edge` pixels on its longer side. Asking queues
@@ -971,6 +1098,7 @@ impl Pane {
         let edge = media::square_size(18., window.scale_factor());
         let this = cx.weak_entity();
         let id = message.id.clone();
+        let history = self.keeps_revisions(cx) && message.edited;
         let mut emoji = |file: &MediaFile| match self.still(file, edge, edge, None, cx) {
             Picture::Ready(image) => Some(image),
             _ => None,
@@ -984,6 +1112,7 @@ impl Pane {
             emoji: &mut emoji,
             selection,
             dragging,
+            history,
         };
         Rich::new(("text", block), inline, look, move |event, window, cx| {
             let _ = this.update(cx, |this, cx| this.text_event(&id, block, event, window, cx));
@@ -1028,7 +1157,10 @@ impl Pane {
                 let Some(message) = self.find(id) else {
                     return;
                 };
-                let blocks = rich::blocks(&message.text, &message.spans);
+                let mut blocks = rich::blocks(&message.text, &message.spans);
+                if let (true, Some(Block::Text(last))) = (message.edited, blocks.last_mut()) {
+                    last.mark_edited();
+                }
                 let inline = match blocks.get(block) {
                     Some(Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. }) => inline,
                     _ => return,
@@ -1036,6 +1168,10 @@ impl Pane {
                 let Some(run) = inline.runs.get(run) else {
                     return;
                 };
+                if run.mark {
+                    self.open_revisions(id, window.mouse_position(), cx);
+                    return;
+                }
                 if let Some(spoiler) = run.spoiler {
                     if self.revealed.insert((id.to_owned(), spoiler)) {
                         cx.notify();
@@ -1080,15 +1216,61 @@ impl Pane {
         line.into_any_element()
     }
 
+    /// Colours for this block, started off the UI thread the first time it is drawn.
+    fn code_colors(&mut self, message: &Message, block: usize, language: &str, text: &str, cx: &mut Context<Self>) -> Option<Rc<super::highlight::Lit>> {
+        let mut hasher = DefaultHasher::new();
+        language.hash(&mut hasher);
+        text.hash(&mut hasher);
+        let stamp = hasher.finish();
+        let key = (message.id.clone(), block);
+        if let Some((have, lit)) = self.code_colors.get(&key) {
+            if *have == stamp {
+                return Some(Rc::clone(lit));
+            }
+        }
+        if !self.code_coloring.insert(key.clone()) {
+            return self.code_colors.get(&key).map(|(_, lit)| Rc::clone(lit));
+        }
+        let language = language.to_owned();
+        let source = text.to_owned();
+        let source_len = source.len();
+        let id = message.id.clone();
+        cx.spawn(async move |this, cx| {
+            let lit = cx.background_executor().spawn(async move { super::highlight::highlight(&language, &source) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.code_coloring.remove(&key);
+                if this.code_colors.len() >= 64 {
+                    this.code_colors.clear();
+                }
+                let resized = lit.text.len() != source_len;
+                this.code_colors.insert(key, (stamp, Rc::new(lit)));
+                if resized {
+                    for (ix, item) in this.items.iter().enumerate() {
+                        if item.message().is_some_and(|message| message.id == id) {
+                            this.list.splice(ix..ix + 1, 1);
+                            break;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        None
+    }
+
     fn code_block(&mut self, message: &Message, block: usize, language: &str, text: &str, cx: &mut Context<Self>) -> AnyElement {
         let key = (message.id.clone(), block);
         let lines = text.lines().count();
         let folded = lines > CODE_LINES && !self.expanded.contains(&key);
-        let shown: String = if folded {
-            text.lines().take(CODE_LINES).collect::<Vec<_>>().join("\n")
-        } else {
-            text.to_owned()
+        let lit = if lines > super::highlight::PLAIN_LINES { None } else { self.code_colors(message, block, language, text, cx) };
+        let shown = match &lit {
+            Some(lit) if folded => first_lines(&lit.text, CODE_LINES).to_owned(),
+            Some(lit) => lit.text.clone(),
+            None if folded => text.lines().take(CODE_LINES).collect::<Vec<_>>().join("\n"),
+            None => text.to_owned(),
         };
+        let highlights = code_highlights(&shown, lit.as_ref().map(|lit| lit.runs.as_slice()).unwrap_or(&[]));
         let copied = self.copied.as_ref() == Some(&key);
         let (copy, text) = (key.clone(), text.to_owned());
         // A phone: the block is the column's width and the code scrolls sideways inside it; its
@@ -1141,7 +1323,11 @@ impl Pane {
                     .type_code()
                     .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
                     .whitespace_nowrap()
-                    .child(shown),
+                    .child(if highlights.is_empty() {
+                        shown.into_any_element()
+                    } else {
+                        StyledText::new(SharedString::from(shown)).with_highlights(highlights).into_any_element()
+                    }),
             )))
             .children(folded.then(|| {
                 div()
@@ -1281,6 +1467,19 @@ impl Pane {
         }
     }
 
+    /// The few pixels of a picture that came inside its message (`Attachment::preview`),
+    /// decoded at their own size: stretched to the still's box they draw soft. `None` while
+    /// they are not on disk, and when they could not be read: the box keeps its placeholder.
+    /// A spoiler not yet revealed and a picture Load images holds back never get this far.
+    fn preview(&mut self, attachment: &Attachment, crop: Option<f32>, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
+        let preview = attachment.preview.as_ref()?;
+        let edge = preview.width.max(preview.height).max(1);
+        match self.still(preview, edge, edge, crop, cx) {
+            Picture::Ready(image) => Some(image),
+            Picture::Loading | Picture::Failed => None,
+        }
+    }
+
     /// What a picture's box shows when its file could not be fetched: the reason on hover, and
     /// a Retry that asks once per click.
     fn failed_box(&self, holder: Stateful<Div>, file: &MediaFile, words: bool, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1361,26 +1560,35 @@ impl Pane {
         let crop = (fit == Fit::CoverTop).then_some(height / width);
         // Whether the picture moves, and whether its frames are here to move in place.
         let (mut moves, mut frames) = (false, false);
+        // A picture smaller than its box sits in the middle at its own size. Its preview takes
+        // the same place, so the sharper picture lands exactly where the soft one was.
+        let (wide, tall) = match fit {
+            Fit::Contain if natural.0 > 0 && natural.1 > 0 => {
+                let scale = (width / natural.0 as f32).min(height / natural.1 as f32).min(1.);
+                ((natural.0 as f32 * scale).round(), (natural.1 as f32 * scale).round())
+            }
+            _ => (width, height),
+        };
+        let placed = |tile: Stateful<Div>, image, object_fit| {
+            tile.child(
+                div().absolute().inset_0().flex().items_center().justify_center().child(
+                    div().w(px(wide)).h(px(tall)).flex_none().child(anim::picture(image, object_fit, theme::R_CARD, Play::Inline)),
+                ),
+            )
+        };
         let tile = match self.still(&still, size, edge, crop, cx) {
             Picture::Ready(image) => {
-                // A picture smaller than its box sits in the middle at its own size.
-                let (wide, tall) = match fit {
-                    Fit::Contain if natural.0 > 0 && natural.1 > 0 => {
-                        let scale = (width / natural.0 as f32).min(height / natural.1 as f32).min(1.);
-                        ((natural.0 as f32 * scale).round(), (natural.1 as f32 * scale).round())
-                    }
-                    _ => (width, height),
-                };
                 let object_fit = if fit == Fit::Contain { ObjectFit::Contain } else { ObjectFit::Cover };
                 frames = image.frame_count() > 1;
                 moves = self.images.moves(&image);
-                tile.child(
-                    div().absolute().inset_0().flex().items_center().justify_center().child(
-                        div().w(px(wide)).h(px(tall)).flex_none().child(anim::picture(image, object_fit, theme::R_CARD, Play::Inline)),
-                    ),
-                )
+                placed(tile, image, object_fit)
             }
-            Picture::Loading => tile.child(in_box(Icon::Image, None)),
+            // Until the still is decoded, the few pixels the message carried stand in for it,
+            // stretched over its whole place.
+            Picture::Loading => match self.preview(attachment, crop, cx) {
+                Some(preview) => placed(tile, preview, ObjectFit::Cover),
+                None => tile.child(in_box(Icon::Image, None)),
+            },
             Picture::Failed => {
                 let tile = self.failed_box(tile, &still, height >= 100. && width >= 180., cx);
                 return tile.child(edge_line()).into_any_element();
@@ -1747,18 +1955,41 @@ impl Pane {
             // Joining one the conversation no longer takes, or past a limit, is not offered:
             // the chip says why instead.
             let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
-            let words = match (&refused, reaction.mine) {
+            // Who reacted, where the network said; a chip that is only a count keeps its
+            // own words.
+            let named = !reaction.who.is_empty();
+            let names = named.then(|| {
+                let said = |id: &str| match self.person(id) {
+                    Some(person) => self.who(&person, cx).0,
+                    None => String::new(),
+                };
+                reactor_words(&reaction.who, said).unwrap_or_default()
+            });
+            let words = match (&refused, &names) {
                 (Some(why), _) => why.clone(),
-                (None, true) => "Take back your reaction".to_owned(),
-                (None, false) => "React with this too".to_owned(),
+                (None, Some(names)) => names.clone(),
+                (None, None) if reaction.mine => "Take back your reaction".to_owned(),
+                (None, None) => "React with this too".to_owned(),
             };
             let joins = acts && refused.is_none();
+            // Right-click names them in a list, where one was sent. Left-click keeps its
+            // work: joining or taking the reaction back.
+            let list = (!phone && named).then(|| {
+                let open = message.clone();
+                cx.listener(move |this: &mut Pane, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let at = event.position;
+                    let open = open.clone();
+                    this.open_reactors(open, ix, at, window, cx);
+                })
+            });
             row = row.child(
                 chip(("chip", ix).into(), reaction.mine)
                     .child(emoji)
                     .child(count)
                     .when(acts && !phone, |chip| chip.tooltip(tip(words, None)))
                     .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
+                    .when_some(list, |chip, list| chip.on_mouse_down(MouseButton::Right, list))
                     .when(!joins, |chip| chip.cursor_default()),
             );
         }

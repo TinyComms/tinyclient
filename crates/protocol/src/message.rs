@@ -10,6 +10,14 @@ pub const THREAD_FACES: usize = 3;
 pub const CARD_FIELDS: usize = 10;
 /// Most bytes of a voice message's waveform.
 pub const WAVEFORM_LIMIT: usize = 256;
+/// Most choices one poll lists. Signal allows ten.
+pub const POLL_OPTIONS: usize = 10;
+/// Most voters named on one choice. The count can be higher.
+pub const POLL_VOTERS: usize = 200;
+/// Most characters a message keeps of the text it said before its last edit.
+pub const PRIOR_LIMIT: usize = 4_000;
+/// Most people a message's info lists. A larger group keeps the first ones named.
+pub const DELIVERIES_LIMIT: usize = 256;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -139,6 +147,13 @@ pub struct Attachment {
     /// What an image, video or GIF shows inline. Small enough to fetch when on screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb: Option<MediaFile>,
+    /// A few dozen pixels of the picture that came inside the message (Telegram's stripped
+    /// thumbnail), on disk as soon as the message is. Drawn soft, stretched to `thumb`'s box,
+    /// until `thumb` is ready to draw; never fetched over the network. `None` from every other
+    /// network, and from a shell's point of view always optional: a box without it shows the
+    /// usual placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<MediaFile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mime: String,
     /// Seconds, for audio and video.
@@ -166,6 +181,7 @@ impl Attachment {
             name: name.into(),
             file,
             thumb: None,
+            preview: None,
             mime: String::new(),
             duration: 0,
             spoiler: false,
@@ -191,6 +207,10 @@ pub struct Preview {
     pub image: Option<MediaFile>,
 }
 
+/// How many reactors a reaction carries: what a network names in the payload it already
+/// sends, never a reason to ask again.
+pub const REACTION_REACTORS: usize = 50;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     /// The emoji itself, or `:name:` for a custom one.
@@ -200,6 +220,12 @@ pub struct Reaction {
     pub count: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mine: bool,
+    /// Who gave it, where the network said: their ids as `Sender::id` spells them, at most
+    /// [`REACTION_REACTORS`], in the network's own order. Empty where the network serves
+    /// only a count (Discord's message payload, Tiny's history rows) or hides the list
+    /// (Telegram in channels and large groups): the chip then stays a number and says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub who: Vec<String>,
 }
 
 /// The earlier message this one answers, as one line.
@@ -320,6 +346,79 @@ pub struct Sender {
     pub bot: bool,
 }
 
+/// One person a message was sent to, and what their phone has said about it. Times are
+/// milliseconds since 1970. A read or a view implies it was delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delivery {
+    /// Their account id on this network.
+    pub person: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<i64>,
+    /// A voice note or a video played.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewed: Option<i64>,
+    /// Why it did not reach them. Empty when it did, or when that is not known yet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failed: String,
+}
+
+/// One choice on a [`Poll`], and who currently picked it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollChoice {
+    pub text: String,
+    #[serde(default)]
+    pub count: u32,
+    /// People who picked this, when the network names them. Shorter than `count` once the list is full.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voters: Vec<String>,
+}
+
+/// One person's current vote. `serial` is Signal's `voteCount`: a later vote replaces an earlier
+/// one only when it is higher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollBallot {
+    pub person: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<u32>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub serial: u32,
+}
+
+/// A poll on a message: the question, the choices and their counts, which I picked, and whether
+/// it has ended. `ballots` is who voted for what, so a later vote from the same person replaces
+/// theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Poll {
+    pub question: String,
+    pub choices: Vec<PollChoice>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiple: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mine: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ballots: Vec<PollBallot>,
+}
+
+impl Poll {
+    /// A poll nobody has voted on yet.
+    pub fn open(question: impl Into<String>, options: impl IntoIterator<Item = impl Into<String>>, multiple: bool) -> Poll {
+        Poll {
+            question: question.into(),
+            choices: options.into_iter().map(|text| PollChoice { text: text.into(), count: 0, voters: Vec::new() }).collect(),
+            multiple,
+            closed: false,
+            mine: Vec::new(),
+            ballots: Vec::new(),
+        }
+    }
+}
+
 /// One message. Which conversation it is in comes from the answer that carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -367,12 +466,24 @@ pub struct Message {
     pub forwarded: Option<Box<Forwarded>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<Box<Card>>,
+    /// Boxed, like `card`: few messages are a poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Box<Poll>>,
     /// A message that was deleted but still has a thread hanging off it. Everything it said
     /// is gone; the row stays so the thread has somewhere to hang.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deleted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
+    /// Unix seconds of the last edit, from a network that hands one over. `None`: never
+    /// edited, or only the fact is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<i64>,
+    /// What the message said before its last edit, at most [`PRIOR_LIMIT`] characters. The
+    /// store keeps one prior text when an edit changes the words. `None`: never edited, or
+    /// nothing kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_text: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
     /// How many people saw a channel's post, when the network counts them.
@@ -396,6 +507,23 @@ pub struct Message {
     /// network that does not say, and for a plaintext message of a Tiny server.
     #[serde(default, skip_serializing_if = "crate::Seal::is_plain")]
     pub seal: crate::Seal,
+    /// Who this was sent to, and what each phone has said. Empty when the network does not
+    /// say, and on a message that is not ours.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<Delivery>,
+    /// Why a read list is empty. "Read receipts are off" when this account does not share them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub receipt_note: String,
+}
+
+/// An earlier wording of one message, oldest first when several are kept. Only a network that
+/// shows its own history has these. A live edit on any other network does not store the words
+/// the sender replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub text: String,
+    /// Unix seconds of this wording.
+    pub at: i64,
 }
 
 impl Message {
@@ -438,8 +566,11 @@ impl Message {
             thread: None,
             forwarded: None,
             card: None,
+            poll: None,
             deleted: false,
             edited: false,
+            edited_at: None,
+            prior_text: None,
             pinned: false,
             views: None,
             mentions_me: false,
@@ -448,6 +579,8 @@ impl Message {
             waiting: false,
             client_id: None,
             seal: crate::Seal::Plain,
+            deliveries: Vec::new(),
+            receipt_note: String::new(),
         }
     }
 
@@ -469,10 +602,19 @@ impl Message {
         if let Some(thread) = &mut self.thread {
             thread.participants.truncate(THREAD_FACES);
         }
+        for reaction in &mut self.reactions {
+            reaction.who.truncate(REACTION_REACTORS);
+            for id in &mut reaction.who {
+                clip(id, 200);
+            }
+        }
         if let Some(forwarded) = &mut self.forwarded {
             clip(&mut forwarded.from_title, 200);
             clip(&mut forwarded.from_space, 200);
             clip(&mut forwarded.link, 2_000);
+        }
+        if let Some(prior) = &mut self.prior_text {
+            clip(prior, PRIOR_LIMIT);
         }
         if let Some(card) = &mut self.card {
             clip(&mut card.title, 256);
@@ -484,6 +626,26 @@ impl Message {
                 clip(value, 1_000);
             }
         }
+        if let Some(poll) = &mut self.poll {
+            clip(&mut poll.question, 100);
+            poll.choices.truncate(POLL_OPTIONS);
+            for choice in &mut poll.choices {
+                clip(&mut choice.text, 100);
+                choice.voters.truncate(POLL_VOTERS);
+            }
+            poll.mine.truncate(POLL_OPTIONS);
+            poll.ballots.truncate(1_024);
+            for ballot in &mut poll.ballots {
+                ballot.choices.truncate(POLL_OPTIONS);
+            }
+        }
+        self.deliveries.truncate(DELIVERIES_LIMIT);
+        for delivery in &mut self.deliveries {
+            clip(&mut delivery.person, 80);
+            clip(&mut delivery.name, 200);
+            clip(&mut delivery.failed, 200);
+        }
+        clip(&mut self.receipt_note, 200);
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
@@ -496,6 +658,9 @@ impl Message {
         self.reply_to = None;
         self.forwarded = None;
         self.card = None;
+        self.poll = None;
+        self.deliveries.clear();
+        self.receipt_note.clear();
         self.pinned = false;
         self.mentions_me = false;
         self.deleted = true;
@@ -506,7 +671,7 @@ impl Message {
         let attached = self
             .attachments
             .iter()
-            .flat_map(|attachment| std::iter::once(&attachment.file).chain(&attachment.thumb));
+            .flat_map(|attachment| std::iter::once(&attachment.file).chain(&attachment.thumb).chain(&attachment.preview));
         let emoji = self.spans.iter().filter_map(|span| match &span.style {
             Style::Emoji { file } => Some(file),
             _ => None,
@@ -523,7 +688,7 @@ impl Message {
         let attached = self
             .attachments
             .iter_mut()
-            .flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb));
+            .flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb).chain(&mut attachment.preview));
         let emoji = self.spans.iter_mut().filter_map(|span| match &mut span.style {
             Style::Emoji { file } => Some(file),
             _ => None,
@@ -533,5 +698,32 @@ impl Message {
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
             .chain(&mut self.sender.avatar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An older frame without `who` still reads, an empty list stays off the wire, and `bound`
+    /// holds the list to its cap.
+    #[test]
+    fn reaction_reactors_read_and_stay_bounded() {
+        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new() };
+        let on = serde_json::to_string(&plain).unwrap();
+        assert!(!on.contains("who"), "an empty list stays off the wire");
+        assert_eq!(serde_json::from_str::<Reaction>(&on).unwrap(), plain);
+
+        let older = r#"{"emoji":"👍","count":2,"mine":false}"#;
+        assert_eq!(serde_json::from_str::<Reaction>(older).unwrap().who, Vec::<String>::new());
+
+        let mut message = Message::plain("m1", "Ada", "hi", 1_700_000_000, false);
+        let many: Vec<String> = (0..REACTION_REACTORS - 1).map(|one| format!("u{one}")).collect();
+        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many };
+        named.who.insert(1, "u".repeat(500));
+        message.reactions.push(named);
+        message.bound();
+        assert_eq!(message.reactions[0].who.len(), REACTION_REACTORS);
+        assert_eq!(message.reactions[0].who[1].len(), 200, "a long id is clipped");
     }
 }

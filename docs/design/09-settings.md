@@ -92,7 +92,7 @@ Specified for V8 push to talk, which is Later; no recorder is in the v1 build, a
 ### 3.9 Per-network override row
 One row per signed-in account, in rail order, grouped under a label such as "Each account". Leading: the network's mark 16 in full color (01 Icons), 8 gap, then the account name 13/18 `text` ("Lumen Labs", "mira.k"). Two accounts on one network show the network in a second line: "Slack · mira@halden.example". Trailing: the same control as the global row, as an inheriting dropdown (3.4), or a switch where the setting has no global value (P1, P2). Accounts that are signed out keep their row, mark at 40% opacity. No accounts: the group is absent.
 
-**Fixed rows** say what the network decides. The control's place holds the value as 13/18 `text_soft` ("Always on", "Set on your phone"), there is no reset slot, and the second line names the reason: "Telegram does not let an app turn this off."
+**Fixed rows** say what the network decides. The control's place holds the value as 13/18 `text_soft` ("Always on", "Sent to the phone"), there is no reset slot, and the second line names the reason: "Telegram does not let an app turn this off."
 
 ### 3.10 Reset to default
 The reset slot holds an icon-only ghost button, 24 × 24, `rotate-ccw` 14 `text_faint` (hover `text`), drawn only while the value differs from its default. The 28 is reserved on every resettable row whether or not the button shows, so controls stay in one column and nothing shifts. Tooltip and label: "Reset to default (Pebble)". It sends `Set { value: None }`; on an override row that means "inherit again". Buttons, links and fixed rows have no slot. Reset all is About › "Reset all settings…" (B3).
@@ -175,9 +175,9 @@ Caption: "Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion and Increase Co
 ### Privacy
 | Group | Row | Control | Second line |
 |---|---|---|---|
-| Let others see when I am typing | One row per account (P1) | Switch; Telegram fixed "Always on"; Signal fixed "Set on your phone" | Telegram: "Telegram does not let an app turn this off." |
-| Let others see what I have read | Teams accounts (P2) | Switch | "Off also leaves chats unread on your other devices." |
-| Let others see what I have read | Telegram, Signal | Fixed "Always on" / "Set on your phone" | |
+| Let others see when I am typing | One row per account (P1) | Switch; Telegram fixed "Always on" | Telegram: "Telegram does not let an app turn this off." Signal: "Your phone's setting decides too; this stops only tinyclient." |
+| Let others see what I have read | Teams and Signal accounts (P2) | Switch | "Off also leaves chats unread on your other devices." Signal adds: "Your phone's setting decides too." |
+| Let others see what I have read | Telegram | Fixed "Always on" | |
 | | "Load images and link previews automatically" (P3) | Switch | Off: "Nothing is fetched until you click it." |
 | | "Keep messages on this Mac for" (P4) | Segmented: "7 days" / "30 days" / "90 days" | |
 | Calls | "Only join end-to-end encrypted calls" (PE) | Switch | Caption: "When a server turns a call's encryption off, the call stops until you choose to carry on unencrypted. With this on you can't: you leave instead, and a Tiny server that cannot encrypt calls is not joined. Always the case on Incognito servers and in rooms that require it. Takes effect the next time you join." |

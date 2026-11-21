@@ -405,6 +405,7 @@ mod tests {
             name: name.into(),
             file: MediaFile::new("f", kind),
             thumb: thumb.then(|| MediaFile::new("t", MediaKind::Image)),
+            preview: None,
             mime: mime.into(),
             duration,
             round: false,

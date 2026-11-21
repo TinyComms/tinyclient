@@ -10,17 +10,34 @@
 //! | --- | --- |
 //! | `incoming WHO SENT TEXT…` | WHO wrote TEXT to us, sent at SENT (ms) |
 //! | `group WHO SENT TEXT…` | the same, in the group |
+//! | `group-title TITLE…` | the group was renamed to TITLE |
 //! | `mention WHO SENT TEXT…` | the same, in the group, naming us |
 //! | `photo WHO SENT` | WHO sent a photo with no caption |
+//! | `payment WHO SENT NOTE…` | WHO sent a payment notification; its note, when words follow |
+//! | `giftbadge WHO SENT` | WHO sent a gift badge, redeemed on the phone |
+//! | `viewonce WHO SENT` | WHO sent a view-once photo, which opens on the phone |
+//! | `viewonce-video WHO SENT` | WHO sent a view-once video, which opens on the phone |
+//! | `longtext WHO SENT TEXT…` | WHO sent text too long for one message: TEXT is the part in the body, the rest on the phone |
 //! | `quote WHO SENT QUOTED TEXT…` | WHO answered our message sent at QUOTED |
 //! | `mine SENT TEXT…` | we wrote TEXT to Grace from the phone |
 //! | `note SENT TEXT…` | we wrote TEXT to Note to Self from the phone |
 //! | `edit WHO TARGET TEXT…`, `delete WHO TARGET` | WHO changed or took back their message |
+//! | `delete-for-me WHO SENT` | the phone deleted WHO's message, sent at SENT, for this device only |
+//! | `delete-chat WHO` | the phone deleted the whole chat with WHO for this device only |
 //! | `react WHO AUTHOR TARGET EMOJI`, `unreact …` | WHO reacted to AUTHOR's message |
+//! | `poll WHO SENT QUESTION \| OPT…`, `pollmulti …` | WHO started a poll in the group; `pollmulti` allows more than one choice |
+//! | `vote WHO AUTHOR TARGET INDEXES`, `unvote WHO AUTHOR TARGET` | WHO voted on AUTHOR's poll (indexes `0` or `0,1`), or took it back |
+//! | `endpoll AUTHOR TARGET` | AUTHOR ended their poll |
 //! | `read WHO SENT` | we read WHO's message on the phone |
-//! | `seen WHO SENT` | WHO read our message |
+//! | `seen WHO SENT`, `delivered WHO SENT`, `viewed WHO SENT` | WHO read our message, their phone has it, or they played it. SENT may list several times, separated by commas |
+//! | `receipts off` | this account stops sharing read receipts |
+//! | `fail WHO` | the next group send does not reach WHO |
 //! | `typing WHO`, `typing-stop WHO` | WHO is typing to us, or stopped |
+//! | `call WHO SENT`, `call-video WHO SENT` | WHO calls us (a voice offer, or a video one), call id SENT |
+//! | `hangup SENT`, `busy SENT` | the call SENT ended, or we were busy on the other side |
+//! | `hangup-accepted SENT` | the call SENT was answered on another of our devices |
 //! | `refuse WORDS…` | the next send is refused, in those words |
+//! | `lookup USERNAME ACI` | a later username search for USERNAME answers ACI |
 //! | `drop`, `unlinked` | the connection ends; the phone removed this device |
 //!
 //! WHO is `grace` or `alan`. Every request it is sent is appended to `signal.calls`, one line
@@ -29,9 +46,10 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,7 +62,8 @@ pub const ALAN: &str = "c3c3c3c3-0000-4000-8000-000000000003";
 pub const CLUB: &str = "5a175a175a175a175a175a175a175a175a175a175a175a175a175a175a175a17";
 /// What the fake keeps as the key to a state it does not have.
 const VAULT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-/// 2026-10-13 12:00 UTC, in milliseconds: what the fake sends with is counted on from here.
+/// 2026-10-13 12:00 UTC, in milliseconds. A scripted line that names no time uses this, which is
+/// outside the edit and delete-for-everyone windows. A send from the test uses the clock below.
 const T0: u64 = 1_791_892_800_000;
 /// The link the fake shows, and the one after it expires.
 pub const LINK: &str = "sgnl://linkdevice?uuid=fake-1&pub_key=BfakeKey1";
@@ -70,9 +89,15 @@ pub struct Fake {
     heard: Mutex<Option<Receiver<Event>>>,
     closed: Arc<AtomicBool>,
     refuse: Arc<Mutex<Option<String>>>,
+    /// One person the next group send does not reach, named by a test.
+    fail_one: Arc<Mutex<Option<String>>>,
+    /// Taken by the adapter after that send.
+    missed: Mutex<Vec<String>>,
     clock: AtomicU64,
     control: PathBuf,
     card: Arc<Mutex<OwnCard>>,
+    /// Usernames a test has scripted, lower case, to an account id.
+    lookups: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Fake {
@@ -82,7 +107,14 @@ impl Fake {
         let grace = Contact { id: GRACE.into(), name: "Grace Ombra".into(), phone: "+15550100002".into() };
         let alan = Contact { id: ALAN.into(), name: "Alan Ferro".into(), phone: String::new() };
         let _ = events.send(Event::Contacts(vec![grace, alan]));
-        let club = GroupInfo { id: CLUB.into(), title: "Bridge club".into(), description: "Tuesdays, 7 pm".into(), members: 3 };
+        let club = GroupInfo {
+            id: CLUB.into(),
+            title: "Bridge club".into(),
+            description: "Tuesdays, 7 pm".into(),
+            members: 3,
+            member: true,
+            member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+        };
         let _ = events.send(Event::Groups(vec![club]));
         let _ = events.send(Event::Settings { read_receipts: true, typing: true });
         let _ = events.send(Event::Caught);
@@ -91,7 +123,9 @@ impl Fake {
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
             refuse: Arc::default(),
-            clock: AtomicU64::new(T0 + 1_000_000),
+            fail_one: Arc::default(),
+            missed: Mutex::default(),
+            clock: AtomicU64::new(super::now_ms()),
             control: script::control("signal.ctl"),
             // A scripted card. The link is invented: nothing here reserves a username.
             card: Arc::new(Mutex::new(OwnCard {
@@ -102,6 +136,7 @@ impl Fake {
                 phone: "+15550100001".into(),
                 link: "https://signal.me/#eu/fake-ada".into(),
             })),
+            lookups: Arc::default(),
         };
         fake.listen();
         fake
@@ -109,7 +144,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, control) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone());
+        let (events, closed, refuse, fail_one, control, lookups) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.fail_one.clone(), self.control.clone(), self.lookups.clone());
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
@@ -118,8 +153,21 @@ impl Fake {
                 let Some(line) = line.map(str::trim) else {
                     return true;
                 };
+                if let Some(rest) = line.strip_prefix("lookup ") {
+                    let mut parts = rest.split_whitespace();
+                    let username = parts.next().unwrap_or("");
+                    let aci = parts.next().unwrap_or("");
+                    if !username.is_empty() && super::wire::is_aci(aci) {
+                        lookups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(username.to_ascii_lowercase(), aci.to_owned());
+                    }
+                    return true;
+                }
                 if let Some(words) = line.strip_prefix("refuse ") {
                     *refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(words.to_owned());
+                    return true;
+                }
+                if let Some(who_word) = line.strip_prefix("fail ") {
+                    *fail_one.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = who(who_word.trim()).map(|(id, _)| id.to_owned());
                     return true;
                 }
                 for event in steer(line) {
@@ -140,7 +188,7 @@ fn steer(line: &str) -> Vec<Event> {
     let club = || Peer::Group(CLUB.to_owned());
     let rest = |line: &str, skip: usize| line.split_whitespace().skip(skip).collect::<Vec<_>>().join(" ");
     match command {
-        "incoming" | "group" | "mention" | "photo" | "quote" => {
+        "incoming" | "group" | "mention" | "photo" | "quote" | "payment" | "giftbadge" | "viewonce" | "viewonce-video" | "longtext" => {
             let Some((author, name)) = who(next()) else {
                 return Vec::new();
             };
@@ -148,14 +196,25 @@ fn steer(line: &str) -> Vec<Event> {
             let mut text = Text { author: author.into(), name: name.into(), sent, ..Text::default() };
             match command {
                 "photo" => text.unsupported = Some("Photo".into()),
+                "payment" => {
+                    let note = rest(line, 3);
+                    text.unsupported = Some(payment_label((!note.is_empty()).then_some(note.as_str())));
+                }
+                "giftbadge" => text.unsupported = Some(gift_badge_label().to_owned()),
+                "viewonce" => text.unsupported = Some(view_once_label(Some("image/jpeg")).to_owned()),
+                "viewonce-video" => text.unsupported = Some(view_once_label(Some("video/mp4")).to_owned()),
                 "quote" => {
                     let quoted = next().parse().unwrap_or(0);
-                    text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new() });
+                    text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new(), spans: Vec::new() });
                     text.text = rest(line, 4);
                 }
                 "mention" => {
                     text.text = format!("@Ada Quill {}", rest(line, 3));
                     text.mentions_me = true;
+                }
+                "longtext" => {
+                    let body = rest(line, 3);
+                    text.text = format!("{body}{CONTINUES}");
                 }
                 _ => text.text = rest(line, 3),
             }
@@ -168,15 +227,23 @@ fn steer(line: &str) -> Vec<Event> {
             let peer = direct(if command == "note" { ME } else { GRACE });
             vec![Event::Message { peer, text, outgoing: true }]
         }
-        "edit" | "delete" => {
+        "edit" | "delete" | "delete-for-me" => {
             let Some((author, _)) = who(next()) else {
                 return Vec::new();
             };
             let target = next().parse().unwrap_or(0);
+            let peer = direct(author);
             match command {
-                "edit" => vec![Event::Edited { peer: direct(author), author: author.into(), target, text: rest(line, 3) }],
-                _ => vec![Event::Deleted { peer: direct(author), author: author.into(), target }],
+                "edit" => vec![Event::Edited { peer, author: author.into(), target, at: T0 + 60_000, text: rest(line, 3), spans: Vec::new() }],
+                "delete-for-me" => vec![Event::DeletedForMe { peer, author: author.into(), target }],
+                _ => vec![Event::Deleted { peer, author: author.into(), target }],
             }
+        }
+        "delete-chat" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            vec![Event::Forgot(direct(author))]
         }
         "react" | "unreact" => {
             let Some((by, _)) = who(next()) else {
@@ -190,17 +257,66 @@ fn steer(line: &str) -> Vec<Event> {
             let emoji = next().to_owned();
             vec![Event::Reacted { peer: direct(by), by: by.into(), author: author.into(), target, emoji, removed: command == "unreact" }]
         }
+        "poll" | "pollmulti" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let body = rest(line, 3);
+            let mut parts = body.split('|').map(|part| part.trim().to_owned());
+            let question = parts.next().unwrap_or_default();
+            let options: Vec<String> = parts.filter(|part| !part.is_empty()).collect();
+            vec![Event::Poll {
+                peer: club(),
+                author: author.into(),
+                name: name.into(),
+                sent,
+                question,
+                options,
+                multiple: command == "pollmulti",
+                outgoing: false,
+            }]
+        }
+        "vote" | "unvote" => {
+            let Some((by, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let author = match next() {
+                "me" => ME,
+                other => who(other).map_or(ME, |(id, _)| id),
+            };
+            let target = next().parse().unwrap_or(0);
+            let indexes = if command == "unvote" { Vec::new() } else { next().split(',').filter_map(|part| part.parse().ok()).collect() };
+            vec![Event::PollVote { peer: club(), by: by.into(), author: author.into(), target, indexes, serial: 0 }]
+        }
+        "endpoll" => {
+            let author = match next() {
+                "me" => ME.to_owned(),
+                other => who(other).map(|(id, _)| id.to_owned()).unwrap_or_default(),
+            };
+            if author.is_empty() {
+                return Vec::new();
+            }
+            let target = next().parse().unwrap_or(0);
+            vec![Event::PollEnded { peer: club(), author, target }]
+        }
         "read" => {
             let Some((author, _)) = who(next()) else {
                 return Vec::new();
             };
             vec![Event::ReadElsewhere(vec![(author.into(), next().parse().unwrap_or(0))])]
         }
-        "seen" | "delivered" => {
+        "seen" | "delivered" | "viewed" => {
             let Some((by, _)) = who(next()) else {
                 return Vec::new();
             };
-            vec![Event::Receipt { by: by.into(), sent: vec![next().parse().unwrap_or(0)], read: command == "seen" }]
+            let sent: Vec<u64> = next().split(',').filter_map(|part| part.parse().ok()).collect();
+            let at = sent.iter().copied().max().unwrap_or(0).saturating_add(60_000);
+            vec![Event::Receipt { by: by.into(), sent, read: command != "delivered", viewed: command == "viewed", at }]
+        }
+        "receipts" => {
+            let read_receipts = next() != "off";
+            vec![Event::Settings { read_receipts, typing: true }]
         }
         "typing" | "typing-stop" => {
             let Some((by, name)) = who(next()) else {
@@ -208,6 +324,50 @@ fn steer(line: &str) -> Vec<Event> {
             };
             vec![Event::Typing { peer: direct(by), by: by.into(), name: name.into(), started: command == "typing" }]
         }
+        "call" | "call-video" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            vec![Event::Call { peer: direct(author), by: author.into(), name: name.into(), video: command == "call-video", id: sent, sent }]
+        }
+        "hangup" | "hangup-accepted" | "busy" => {
+            let id = next().parse().unwrap_or(T0);
+            vec![Event::CallEnded { id, answered: command == "hangup-accepted" }]
+        }
+        "group-title" => {
+            let title = rest(line, 1);
+            if title.is_empty() {
+                return Vec::new();
+            }
+            vec![Event::GroupChanged {
+                peer: club(),
+                by: String::new(),
+                changes: vec![format!("The group name is now {title}")],
+                title: Some(title),
+                description: None,
+                left: false,
+                rejoined: false,
+            }]
+        }
+        "group-leave" => vec![Event::GroupChanged {
+            peer: club(),
+            by: String::new(),
+            changes: vec!["You are no longer in this group".to_owned()],
+            title: None,
+            description: None,
+            left: true,
+            rejoined: false,
+        }],
+        "group-rejoin" => vec![Event::GroupChanged {
+            peer: club(),
+            by: String::new(),
+            changes: vec!["You joined the group".to_owned()],
+            title: None,
+            description: None,
+            left: false,
+            rejoined: true,
+        }],
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -216,6 +376,22 @@ fn steer(line: &str) -> Vec<Event> {
 
 fn describe(to: &Peer) -> String {
     to.conversation()
+}
+
+/// Style ranges on a send, empty when there are none so an unstyled send reads as before.
+fn noted(ranges: &[super::style::Range]) -> String {
+    let parts: Vec<String> = ranges
+        .iter()
+        .filter_map(|range| match range {
+            super::style::Range::Style { start, length, style } => Some(format!("{style:?}:{start}+{length}")),
+            super::style::Range::Mention { .. } => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ranges={}", parts.join(","))
+    }
 }
 
 impl Wire for Fake {
@@ -233,17 +409,39 @@ impl Wire for Fake {
             return Err(Fault::Net("closed".into()));
         }
         let line = match &body {
-            Body::Text { text, quote: Some(quote) } => format!("send {} text {text} (answering {}-{})", describe(to), quote.sent, quote.author),
-            Body::Text { text, quote: None } => format!("send {} text {text}", describe(to)),
+            Body::Text { text, quote: Some(quote), ranges } => {
+                format!("send {} text {text}{} (answering {}-{})", describe(to), noted(ranges), quote.sent, quote.author)
+            }
+            Body::Text { text, quote: None, ranges } => format!("send {} text {text}{}", describe(to), noted(ranges)),
+            Body::Files { text, quote, files } => {
+                let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
+                super::files::call_line(&describe(to), &names, text, quote.as_ref())
+            }
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
-            Body::Edit { target, text } => format!("send {} edit {target} {text}", describe(to)),
+            Body::Edit { target, text, ranges } => format!("send {} edit {target} {text}{}", describe(to), noted(ranges)),
             Body::Delete { target } => format!("send {} delete {target}", describe(to)),
+            Body::DeleteForMe { target, .. } => format!("send {} delete-for-me {target}", describe(to)),
+            Body::Poll { question, options, multiple } => format!("send {} poll {question} | {} multi={multiple}", describe(to), options.join(" | ")),
+            Body::PollVote { author, target, indexes, serial } => {
+                let picked = if indexes.is_empty() { "-".to_owned() } else { indexes.iter().map(|index| index.to_string()).collect::<Vec<_>>().join(",") };
+                format!("send {} vote {target}-{author} {picked} serial={serial}", describe(to))
+            }
+            Body::PollEnd { target } => format!("send {} endpoll {target}", describe(to)),
         };
         record(&line);
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             return Err(Fault::Refused(words));
         }
+        if matches!(to, Peer::Group(_)) {
+            if let Some(person) = self.fail_one.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+                self.missed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(person);
+            }
+        }
         Ok(self.clock.fetch_add(1_000, Ordering::Relaxed))
+    }
+
+    fn missed(&self) -> Vec<String> {
+        std::mem::take(&mut *self.missed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     fn typing(&self, to: &Peer, started: bool) -> Result<(), Fault> {
@@ -291,6 +489,12 @@ impl Wire for Fake {
         const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
         let png = (0..PNG.len()).step_by(2).filter_map(|at| u8::from_str_radix(&PNG[at..at + 2], 16).ok()).collect();
         Ok((*of == Peer::Direct(GRACE.to_owned())).then_some(png))
+    }
+
+    fn lookup(&self, username: &str) -> Result<Option<String>, Fault> {
+        record(&format!("lookup {username}"));
+        let found = self.lookups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&username.to_ascii_lowercase()).cloned();
+        Ok(found)
     }
 
     fn close(&self) {

@@ -2,7 +2,7 @@
 //! everything done to messages: pages, sending, editing, deleting, reacting.
 
 use super::html::{self, Lookup};
-use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
+use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
 use protocol::{
     Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind, Reaction,
     ReplyTo, Span, Style, ThreadSummary,
@@ -327,14 +327,13 @@ fn quote_markup(reply: &ReplyTo) -> String {
 }
 
 impl Teams {
-    /// Where the official app opens one message.
-    fn message_link(&self, conversation: &str, id: &str) -> String {
-        let chat = if conversation.contains("@thread.tacv2") || conversation.contains("@thread.skype") {
-            ""
-        } else {
-            "&context=%7B%22contextType%22%3A%22chat%22%7D"
-        };
-        format!("{TEAMS}/l/message/{}/{id}?tenantId={}{chat}", escaped(conversation), escaped(&self.session.tenant))
+    /// Where the official app opens one message. A reply names its post as `parentMessageId`.
+    fn message_link(&self, conversation: &str, id: &str, raw: &Value) -> String {
+        let placed = placed(raw);
+        let thread = placed.as_ref().map(|(channel, _)| channel.as_str()).unwrap_or_else(|| thread_of(conversation));
+        let parent = placed.as_ref().and_then(|(_, root)| root.as_deref()).filter(|root| *root != id);
+        let parent = parent.or_else(|| chain_of(conversation).map(|(_, root)| root).filter(|root| *root != id));
+        super::links::message_share(thread, id, &self.session.tenant, parent)
     }
 
     /// `ThreadActivity/…`: who joined, left or renamed the conversation, in words. Names come
@@ -411,6 +410,7 @@ impl Teams {
         message.sender.avatar = self.picture(&from, &name);
         message.sender.id = from;
         message.edited = set(&props["edittime"]);
+        message.edited_at = props["edittime"].as_str().filter(|_| message.edited).map(seconds).filter(|at| *at > 0);
         let content = raw["content"].as_str().unwrap_or("");
         match kind {
             "Event/Call" => {
@@ -427,7 +427,7 @@ impl Teams {
                 return Read::Message(Box::new(message));
             }
             "RichText/Media_CallRecording" | "RichText/Media_CallTranscript" => {
-                message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+                message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
                 message.text = "Meeting recording".to_owned();
                 return Read::Message(Box::new(message));
             }
@@ -540,17 +540,17 @@ impl Teams {
                 message.text.push('\n');
                 message.text.push_str(&label);
             }
-            let link = if component.url.is_empty() { self.message_link(conversation, &id) } else { component.url };
+            let link = if component.url.is_empty() { self.message_link(conversation, &id, raw) } else { component.url };
             message.kind = MessageKind::Unsupported { link };
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
             let title = cards.iter().find_map(|card| card_title(card, 6));
             if message.text.is_empty() {
                 message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
             }
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         } else if message.text.is_empty() && message.attachments.is_empty() {
             message.text = "Unsupported message".to_owned();
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
         Read::Message(Box::new(message))
@@ -583,6 +583,7 @@ impl Teams {
                 file: None,
                 count: people.len() as u32,
                 mine: people.contains(&me),
+                who: people.iter().take(protocol::REACTION_REACTORS).map(|mri| (*mri).to_owned()).collect(),
             });
         }
         found
@@ -722,8 +723,9 @@ impl Teams {
     }
 
     /// Records a page. In a channel the posts are its own and each reply goes to its chain; a
-    /// chain, a chat and anything else holds every message itself.
-    fn record(&self, conversation: &str, raws: &[Value]) -> Result<(), Fault> {
+    /// chain, a chat and anything else holds every message itself. `more_before` is true when
+    /// Teams gave a cursor for a still older page.
+    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<(), Fault> {
         let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
         let (mut own, mut replies): (Vec<Message>, Vec<(String, Message)>) = (Vec::new(), Vec::new());
         for raw in raws {
@@ -738,23 +740,22 @@ impl Teams {
             }
         }
         let of = |root: &str| -> Vec<&Message> { replies.iter().filter(|(of, _)| of == root).map(|(_, reply)| reply).collect() };
-        if let Some((parent, root)) = chain_of(conversation) {
-            // The chain whole: the post's summary is exactly what is here.
-            let answers: Vec<&Message> = own.iter().filter(|message| message.id != root).collect();
-            if let Some(mut first) = self.ctx.stored_message(parent, root)?.filter(|_| answers.len() < CHAIN as usize - 1) {
-                let exact = self.summary(parent, root, None, &answers);
-                if exact != first.thread {
-                    first.thread = exact;
-                    self.ctx.history(parent, &[first])?;
-                }
-            }
-        } else if channel {
+        if channel {
             for post in &mut own {
                 let before = self.ctx.stored_message(conversation, &post.id)?.and_then(|stored| stored.thread);
                 post.thread = self.summary(conversation, &post.id, before, &of(&post.id));
             }
         }
         self.ctx.history(conversation, &own)?;
+        if let Some((parent, root)) = chain_of(conversation) {
+            let on_page = own.iter().filter(|message| message.id != root).count();
+            // A short page with no older cursor is the start of the chain. The count is every
+            // reply stored, not only this page, so the last page of a long chain does not
+            // replace the total with itself. No client names a reply-count field on the post.
+            if !more_before && on_page < CHAIN as usize - 1 {
+                self.exact_chain(parent, root)?;
+            }
+        }
         // A chain named "Replies" before its post was read is titled by the post now.
         if channel {
             for post in own.iter().filter(|post| post.thread.is_some()) {
@@ -778,20 +779,52 @@ impl Teams {
         Ok(())
     }
 
-    /// The newest page of a conversation; a reply chain whole, from its post on.
+    /// The newest page. A reply chain keeps the cursor, the same way a chat does, so scrolling
+    /// up reads the pages under it.
     pub(super) fn backfill(&self, conversation: &str) -> Result<(), Fault> {
         if !self.known(conversation)? {
             return Ok(());
         }
         if let Some((channel, root)) = chain_of(conversation) {
             self.chain_known(channel, root)?;
-            let (messages, _) = self.page(conversation, CHAIN, "startTime=1")?;
-            return self.record(conversation, &messages);
+            let (messages, older) = self.page(conversation, CHAIN, "startTime=1")?;
+            self.remember_cursor(conversation, &messages, &older);
+            return self.record(conversation, &messages, !older.is_empty());
         }
         let (messages, older) = self.page(conversation, PAGE, "startTime=1")?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages)?;
+        self.record(conversation, &messages, !older.is_empty())?;
         self.seen_by(conversation)
+    }
+
+    /// Every reply stored in a chain, once its first page has been reached.
+    fn exact_chain(&self, parent: &str, root: &str) -> Result<(), Fault> {
+        let Some(mut first) = self.ctx.stored_message(parent, root)? else {
+            return Ok(());
+        };
+        let replies = self.replies_held(&chain_id(parent, root), root)?;
+        let refs: Vec<&Message> = replies.iter().collect();
+        let exact = self.summary(parent, root, None, &refs);
+        if exact != first.thread {
+            first.thread = exact;
+            self.ctx.history(parent, &[first])?;
+        }
+        Ok(())
+    }
+
+    fn replies_held(&self, conversation: &str, root: &str) -> Result<Vec<Message>, Fault> {
+        let newest = self.ctx.newest(conversation)?.unwrap_or_default();
+        if newest.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = self.ctx.stored_ids(conversation, "", &newest, CHAIN.saturating_mul(4))?;
+        let mut replies = Vec::new();
+        for id in ids.into_iter().filter(|id| id != root) {
+            if let Some(message) = self.ctx.stored_message(conversation, &id)? {
+                replies.push(message);
+            }
+        }
+        Ok(replies)
     }
 
     /// Where the page before the oldest message of this one starts, for when it is asked for.
@@ -803,19 +836,25 @@ impl Teams {
     }
 
     /// The page before `before`: by the cursor Teams gave with the page that ended there, or
-    /// by time when another page was read since.
+    /// by time when another page was read since. A reply chain uses that same cursor.
     pub(super) fn older(&self, conversation: &str, before: &str) -> Result<(), Fault> {
-        if chain_of(conversation).is_some() || millis(before) == 0 {
+        if millis(before) == 0 {
+            return Ok(());
+        }
+        let chain = chain_of(conversation).is_some();
+        if chain && self.held_older(conversation, before)? {
             return Ok(());
         }
         let note = self.ctx.note(&format!("older:{conversation}")).unwrap_or_default();
-        let window = match note.split_once(' ') {
-            Some((oldest, cursor)) if oldest == before => format!("startTime=1&syncState={cursor}"),
-            _ => format!("startTime=1&endTime={}", millis(before) - 1),
-        };
-        let (messages, older) = self.page(conversation, PAGE, &window)?;
+        let (messages, older) = self.page(conversation, history_limit(conversation), &older_window(&note, before))?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages)
+        self.record(conversation, &messages, !older.is_empty())
+    }
+
+    /// True when a reply older than `before` is already stored, so this scroll was fetched.
+    fn held_older(&self, conversation: &str, before: &str) -> Result<bool, Fault> {
+        let ids = self.ctx.stored_ids(conversation, "", before, 8)?;
+        Ok(ids.iter().any(|id| id != before && millis(id) > 0 && millis(id) < millis(before)))
     }
 
     /// The page after `after`, when the cache has a gap there. Unverified: Teams answers the
@@ -830,16 +869,24 @@ impl Teams {
             return Ok(());
         }
         let (messages, _) = self.page(conversation, PAGE, &format!("startTime={}", millis(after)))?;
-        self.record(conversation, &messages)
+        self.record(conversation, &messages, true)
     }
 
     /// The page that ends just after `around`; what follows it is asked for as it is read.
+    /// A reply chain answers too, and keeps the cursor so scrolling up from there continues.
     pub(super) fn around(&self, conversation: &str, around: &str) -> Result<(), Fault> {
-        if chain_of(conversation).is_some() || millis(around) == 0 {
+        if millis(around) == 0 {
             return Ok(());
         }
-        let (messages, _) = self.page(conversation, PAGE, &format!("startTime=1&endTime={}", millis(around).saturating_add(1)))?;
-        self.record(conversation, &messages)
+        let chain = chain_of(conversation).is_some();
+        if chain && self.ctx.stored_message(conversation, around)?.is_some() {
+            return Ok(());
+        }
+        let (messages, older) = self.page(conversation, history_limit(conversation), &around_window(around))?;
+        if chain {
+            self.remember_cursor(conversation, &messages, &older);
+        }
+        self.record(conversation, &messages, !older.is_empty())
     }
 
     // Acting on messages.
@@ -978,6 +1025,65 @@ impl Teams {
     }
 }
 
+/// How many messages one history fetch asks for. A reply chain is 200; a chat or channel is 50.
+fn history_limit(conversation: &str) -> u32 {
+    if chain_of(conversation).is_some() { CHAIN } else { PAGE }
+}
+
+/// The query for the page before `before`. The cursor Teams sent with the page that ended
+/// there wins; otherwise the page ends at that message's time.
+fn older_window(note: &str, before: &str) -> String {
+    match note.split_once(' ') {
+        Some((oldest, cursor)) if oldest == before && !cursor.is_empty() => format!("startTime=1&syncState={cursor}"),
+        _ => format!("startTime=1&endTime={}", millis(before) - 1),
+    }
+}
+
+/// The query for the page that ends just after `around`.
+fn around_window(around: &str) -> String {
+    format!("startTime=1&endTime={}", millis(around).saturating_add(1))
+}
+
+/// The lab's teams-chain-paging driver. Three pages of 200 cover 450 replies, and the page
+/// before a message follows the cursor Teams gave with the page that ended there.
+pub(super) fn prove_chain_paging() -> Result<(), String> {
+    let chain = "19:channel@thread.tacv2;messageid=1760000400400";
+    let chat = "19:chat@unq.gbl.spaces";
+    if history_limit(chain) != CHAIN || history_limit(chat) != PAGE {
+        return Err("a reply chain is not paged at 200".to_owned());
+    }
+    let mut left = 450u32;
+    let mut requests = 0u32;
+    let mut note = String::new();
+    let mut before = String::new();
+    while left > 0 {
+        requests += 1;
+        if requests > 3 {
+            return Err(format!("{left} replies were still unread after three pages"));
+        }
+        if requests > 1 {
+            let window = older_window(&note, &before);
+            if !window.contains("syncState=chaincursor") {
+                return Err(format!("page {requests} ignored the chain cursor: {window}"));
+            }
+        }
+        let take = left.min(history_limit(chain));
+        left -= take;
+        before = format!("{}", 1_760_001_000_000u64 + u64::from(left + 1) * 1000);
+        if left > 0 {
+            note = format!("{before} chaincursor{requests}");
+        }
+    }
+    if requests != 3 {
+        return Err(format!("450 replies took {requests} pages"));
+    }
+    let jump = around_window("1760001010000");
+    if jump != "startTime=1&endTime=1760001010001" {
+        return Err(format!("a jump into a chain did not ask by time: {jump}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,5 +1210,51 @@ mod tests {
         let quote = parsed.quote.unwrap();
         assert_eq!(parsed.text, "yes");
         assert_eq!((quote.id.as_str(), quote.name.as_str(), quote.preview.as_str()), ("1760000100100", "Ana <Ruiz>", "is it \"green\"?"));
+    }
+
+    #[test]
+    fn documented_links_round_trip_to_the_chat_channel_message_and_team() {
+        let tenant = "11111111-1111-4111-8111-111111111111";
+        let channel = "19:platform0general@thread.tacv2";
+        let chat = "19:grp1@thread.v2";
+        let group = "e0873025-0000-4000-8000-00000000beef";
+        let chat_link = super::super::links::chat_share(chat);
+        let channel_link = super::super::links::channel_share(channel, "General", group, tenant);
+        let message_link = super::super::links::message_share(channel, "1760000210210", tenant, Some("1760000200200"));
+        let team_link = super::super::links::team_share(channel, group, tenant);
+        assert_eq!(chat_link, "https://teams.microsoft.com/l/chat/19%3Agrp1%40thread.v2/conversations");
+        assert_eq!(
+            channel_link,
+            format!("https://teams.microsoft.com/l/channel/19%3Aplatform0general%40thread.tacv2/General?groupId={group}&tenantId={tenant}")
+        );
+        assert_eq!(
+            message_link,
+            format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000210210?tenantId={tenant}&parentMessageId=1760000200200")
+        );
+        assert_eq!(
+            team_link,
+            format!("https://teams.microsoft.com/l/team/19%3Aplatform0general%40thread.tacv2/conversations?groupId={group}&tenantId={tenant}")
+        );
+        assert_eq!(super::super::links::parse_share(&chat_link).map(|found| found.conversation), Some(chat.to_owned()));
+        let channel_back = super::super::links::parse_share(&channel_link).expect("channel");
+        assert_eq!(
+            (channel_back.kind, channel_back.conversation.as_str(), channel_back.group.as_str(), channel_back.title.as_str()),
+            (super::super::links::ShareKind::Channel, channel, group, "General")
+        );
+        let message_back = super::super::links::parse_share(&message_link).expect("message");
+        assert_eq!((message_back.kind, message_back.message.as_str(), message_back.parent.as_str()), (super::super::links::ShareKind::Message, "1760000210210", "1760000200200"));
+        let team_back = super::super::links::parse_share(&team_link).expect("team");
+        assert_eq!((team_back.kind, team_back.group.as_str()), (super::super::links::ShareKind::Team, group));
+        // A chat message uses the documented context. A post's own id is not a parent.
+        let in_chat = super::super::links::message_share(chat, "1563480968434", tenant, None);
+        assert!(in_chat.contains("context=%7B%22contextType%22%3A%22chat%22%7D"), "{in_chat}");
+        assert_eq!(super::super::links::parse_share(&in_chat).map(|found| found.conversation), Some(chat.to_owned()));
+        let post = super::super::links::message_share(channel, "1760000200200", tenant, Some("1760000200200"));
+        assert!(!post.contains("parentMessageId"), "{post}");
+        // The desktop scheme opens the same place. A link that is not Teams does not.
+        let desktop = chat_link.replacen("https://teams.microsoft.com", "msteams:", 1);
+        assert_eq!(super::super::links::parse_share(&desktop).map(|found| (found.kind, found.conversation)), Some((super::super::links::ShareKind::Chat, chat.to_owned())));
+        assert!(super::super::links::parse_share("https://ex.com/plan").is_none());
+        assert!(super::super::links::parse_share("https://teams.microsoft.com/l/chat/0/0?users=a@contoso.com").is_none());
     }
 }

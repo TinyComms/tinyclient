@@ -8,6 +8,7 @@ mod anim;
 mod app;
 mod attention;
 mod assets;
+mod autostart;
 // `pub(crate)` so the mobile layer can reach the call's platform hooks (`call::phone::hooks`).
 pub(crate) mod call;
 mod chrome;
@@ -18,7 +19,10 @@ mod conversation;
 pub(crate) mod debug_launch;
 mod hotkeys;
 mod input;
+mod keymap;
 mod layout;
+// `pub(crate)` so the mobile layer can read `lock::hides_switcher()`.
+pub(crate) mod lock;
 mod logs;
 mod pane;
 mod people;
@@ -163,7 +167,23 @@ pub(crate) fn prove_discord_format() -> Result<(), &'static str> {
     composer::format::prove()
 }
 
-use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
+/// The lab's open-at-login driver. The row is there, off by default, and the switch writes and
+/// removes the entry the system reads at sign-in.
+pub(crate) fn prove_open_at_login() -> Result<(), &'static str> {
+    autostart::prove()
+}
+
+/// The lab's command-palette driver. Rebinding Quick Switcher moves the chord and the label.
+pub(crate) fn prove_command_palette() -> Result<(), &'static str> {
+    keymap::prove()
+}
+
+/// The lab's screen-lock driver. Idle past the timeout covers the window and a message names nothing.
+pub(crate) fn prove_screen_lock() -> Result<(), &'static str> {
+    lock::prove()
+}
+
+use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
 /// The windows' Wayland app id and X11 class: a desktop matches them to `dev.tinyclient.app.desktop`
@@ -253,6 +273,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &MarkUnread, _, cx| this.mark_open_unread(cx)))
             .on_action(cx.listener(|this, _: &FocusNext, window, cx| this.focus_region(true, window, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| this.focus_region(false, window, cx)))
+            .on_key_down(cx.listener(|_, _: &gpui::KeyDownEvent, _, _| lock::touch()))
             .on_key_down(cx.listener(Self::typed))
             .on_key_down(cx.listener(Self::page_sidebar))
             .on_action(cx.listener(|this, _: &CloseRight, window, cx| this.close_right(Some(window), cx)))
@@ -306,6 +327,15 @@ fn typed_text(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| !c.is_control()) && text != " "
 }
 
+/// Drops every chord and binds the stock map plus whatever Settings saved.
+pub(crate) fn rebind_keys(cx: &mut App) {
+    cx.clear_key_bindings();
+    input::bind_keys(cx);
+    call::bind_keys(cx);
+    bind_keys(cx);
+    settings::bind_keys(cx);
+}
+
 fn bind_keys(cx: &mut App) {
     app::menubar::bind_keys(cx);
     cx.bind_keys(shell_bindings());
@@ -324,38 +354,125 @@ fn bind_keys(cx: &mut App) {
 }
 
 fn shell_bindings() -> Vec<KeyBinding> {
+    let mut out = Vec::new();
     let shell = Some("Shell");
-    vec![
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-k", Switcher, None),
-        KeyBinding::new("secondary-[", Back, None),
-        KeyBinding::new("secondary-]", Forward, None),
-        KeyBinding::new("secondary-up", UpLevel, shell),
-        KeyBinding::new("secondary-\\", ToggleSidebar, None),
-        KeyBinding::new("secondary-.", CloseRight, None),
-        KeyBinding::new("escape", CloseTop, shell),
-        KeyBinding::new("shift-escape", MarkRead, shell),
-        KeyBinding::new("tab", FocusNext, shell),
-        KeyBinding::new("shift-tab", FocusPrevious, shell),
-        KeyBinding::new("alt-down", NextRow, None),
-        KeyBinding::new("alt-up", PreviousRow, None),
-        KeyBinding::new("alt-shift-down", NextUnread, None),
-        KeyBinding::new("alt-shift-up", PreviousUnread, None),
-        KeyBinding::new("down", ListDown, shell),
-        KeyBinding::new("up", ListUp, shell),
-        KeyBinding::new("enter", ListOpen, shell),
-        KeyBinding::new("left", ListFold, shell),
-        KeyBinding::new("right", ListUnfold, shell),
-        KeyBinding::new("secondary-1", Place1, None),
-        KeyBinding::new("secondary-2", Place2, None),
-        KeyBinding::new("secondary-3", Place3, None),
-        KeyBinding::new("secondary-4", Place4, None),
-        KeyBinding::new("secondary-5", Place5, None),
-        KeyBinding::new("secondary-6", Place6, None),
-        KeyBinding::new("secondary-7", Place7, None),
-        KeyBinding::new("secondary-8", Place8, None),
-        KeyBinding::new("secondary-9", Place9, None),
-    ]
+    macro_rules! bind {
+        ($id:literal, $action:expr, $context:expr) => {
+            for chord in keymap::chords($id) {
+                out.push(KeyBinding::new(&chord, $action, $context));
+            }
+        };
+    }
+    bind!("quit", Quit, None);
+    bind!("quick-switcher", Switcher, None);
+    bind!("back", Back, None);
+    bind!("forward", Forward, None);
+    bind!("up-level", UpLevel, shell);
+    bind!("hide-sidebar", ToggleSidebar, None);
+    bind!("close-right", CloseRight, None);
+    bind!("close-top", CloseTop, shell);
+    bind!("mark-read", MarkRead, shell);
+    bind!("focus-next", FocusNext, shell);
+    bind!("focus-previous", FocusPrevious, shell);
+    bind!("next", NextRow, None);
+    bind!("previous", PreviousRow, None);
+    bind!("next-unread", NextUnread, None);
+    bind!("previous-unread", PreviousUnread, None);
+    bind!("list-down", ListDown, shell);
+    bind!("list-up", ListUp, shell);
+    bind!("list-open", ListOpen, shell);
+    bind!("list-fold", ListFold, shell);
+    bind!("list-unfold", ListUnfold, shell);
+    bind!("place-1", Place1, None);
+    bind!("place-2", Place2, None);
+    bind!("place-3", Place3, None);
+    bind!("place-4", Place4, None);
+    bind!("place-5", Place5, None);
+    bind!("place-6", Place6, None);
+    bind!("place-7", Place7, None);
+    bind!("place-8", Place8, None);
+    bind!("place-9", Place9, None);
+    out
+}
+
+/// Runs a palette row that is one of the menu actions.
+pub(crate) fn dispatch_binding(id: &str, window: &mut gpui::Window, cx: &mut App) -> bool {
+    use gpui::Action;
+    macro_rules! go {
+        ($action:expr) => {
+            Some(Box::new($action) as Box<dyn Action>)
+        };
+    }
+    let action: Option<Box<dyn Action>> = match id {
+        "quit" => go!(Quit),
+        "quick-switcher" => go!(Switcher),
+        "back" => go!(Back),
+        "forward" => go!(Forward),
+        "up-level" => go!(UpLevel),
+        "hide-sidebar" => go!(ToggleSidebar),
+        "close-right" => go!(CloseRight),
+        "close-top" => go!(CloseTop),
+        "mark-read" => go!(MarkRead),
+        "focus-next" => go!(FocusNext),
+        "focus-previous" => go!(FocusPrevious),
+        "next" => go!(NextRow),
+        "previous" => go!(PreviousRow),
+        "next-unread" => go!(NextUnread),
+        "previous-unread" => go!(PreviousUnread),
+        "list-down" => go!(ListDown),
+        "list-up" => go!(ListUp),
+        "list-open" => go!(ListOpen),
+        "list-fold" => go!(ListFold),
+        "list-unfold" => go!(ListUnfold),
+        "place-1" => go!(Place1),
+        "place-2" => go!(Place2),
+        "place-3" => go!(Place3),
+        "place-4" => go!(Place4),
+        "place-5" => go!(Place5),
+        "place-6" => go!(Place6),
+        "place-7" => go!(Place7),
+        "place-8" => go!(Place8),
+        "place-9" => go!(Place9),
+        "settings" => go!(Settings),
+        "new-message" => go!(NewMessage),
+        "attach" => go!(AttachFile),
+        "close-window" => go!(CloseWindow),
+        "search-here" => go!(SearchConversation),
+        "search-all" => go!(SearchEverywhere),
+        "bigger-text" => go!(BiggerText),
+        "smaller-text" => go!(SmallerText),
+        "actual-size" => go!(ActualSize),
+        "full-screen" => go!(FullScreen),
+        "details" => go!(ShowDetails),
+        "start-call" => go!(StartCall),
+        "open-in" => go!(OpenInNetwork),
+        "minimize" => go!(Minimize),
+        "shortcuts-page" => go!(KeyboardShortcuts),
+        "show-logs" => go!(ShowLogs),
+        "hide" => go!(Hide),
+        "hide-others" => go!(HideOthers),
+        "mute" | "toggle-mute" => go!(call::ToggleMute),
+        "deafen" => go!(call::ToggleDeafen),
+        "leave-call" => go!(call::Leave),
+        "accept" => go!(call::Accept),
+        "decline" => go!(call::Decline),
+        "go-to-call" => go!(call::Jump),
+        "about" => go!(About),
+        "check-updates" => go!(CheckForUpdates),
+        "add-account" => go!(AddAccount),
+        "copy-diagnostics" => go!(CopyDiagnostics),
+        "star" => go!(Star),
+        "conversation-mute" => go!(Mute),
+        "show-all" => go!(ShowAll),
+        "zoom" => go!(Zoom),
+        "show-window" => go!(ShowWindow),
+        _ => None,
+    };
+    let Some(action) = action else {
+        return false;
+    };
+    window.dispatch_action(action, cx);
+    true
 }
 
 /// `--shot out.png` draws one state with live data, writes the frame and quits, so every state
@@ -866,16 +983,17 @@ pub(crate) fn feed_platform_insets(window: &gpui::Window) {
     let _ = window;
 }
 
-/// Opens the window. `invite` is a `tinyclient://join#…` link the launch carried; `incoming`
-/// delivers the links a second launch hands this one.
-pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
-    run_with(gpui_platform::application(), invite, incoming);
+/// Opens the window. `invite` is a `tinyclient://join#…` link the launch carried, `action` a
+/// quick action (`--action`/`--dock-action`); `incoming` delivers the links a second launch
+/// hands this one.
+pub fn run(invite: Option<String>, action: Option<crate::quick::QuickAction>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
+    run_with(gpui_platform::application(), invite, action, incoming);
 }
 
 /// Runs the window on an application the caller built. Android builds its own (see
 /// `android_main`): `gpui_platform::application()` there has no NativeActivity session, so
 /// GPUI would open the window before the surface exists.
-pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
+pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, action: Option<crate::quick::QuickAction>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
     #[cfg(feature = "gui-shot")]
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
@@ -889,6 +1007,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
     let prefs = if shot_demo::on() { app::prefs::Prefs::default() } else { prefs };
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
+    lock::install(prefs.lock.clone());
     app::prefs::set_trusted_links(prefs.trusted_links.clone());
     anim::set_autoplay(prefs.autoplay);
     let application = application.with_assets(assets::Assets);
@@ -907,14 +1026,26 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
     // The Dock icon brings the hidden window back unchanged.
     application.on_reopen(|cx| cx.activate(true));
     application.run(move |cx: &mut App| {
-            input::bind_keys(cx);
-            call::bind_keys(cx);
-            bind_keys(cx);
+            keymap::load();
+            rebind_keys(cx);
             app::menubar::app_actions(cx);
             if !cfg!(feature = "gui-shot") {
                 crate::update::recall();
             }
             cx.set_menus(app::menubar::menus(&[], None, crate::update::menu_label()));
+            // The same three quick actions on every launcher: the Dock menu (macOS) and the
+            // taskbar's jump list (Windows) here, the desktop file's Actions on Linux
+            // (`packaging/linux/dev.tinyclient.app.desktop`). The Windows list is written under
+            // the identity the installer's shortcuts carry, so it groups with them
+            // (`packaging/windows/tinyclient.iss`). A shot run leaves the user's own list alone.
+            if !cfg!(feature = "gui-shot") {
+                cx.set_app_identity(APP_ID, "tinyclient");
+                cx.set_dock_menu(vec![
+                    MenuItem::action("New Message", NewMessage),
+                    MenuItem::action("Inbox", Place1),
+                    MenuItem::action("Quit tinyclient", Quit),
+                ]);
+            }
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds(prefs.frame, cx))),
@@ -933,7 +1064,12 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                 app_id: Some(APP_ID.into()),
                 ..Default::default()
             };
+            #[cfg(windows)]
+            let tray = prefs.choices.tray;
             let opened = cx.open_window(options, |window, cx| {
+                // The launcher entry and the flash's urgency hint are this window's from now.
+                #[cfg(target_os = "linux")]
+                attention::note_window(window.window_handle());
                 // The red button closes the window as ⌘W does (Keep receiving decides how).
                 window.on_window_should_close(cx, |_, cx| {
                     tracing::warn!("tinyclient: window should close");
@@ -978,12 +1114,27 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
             // The HWND can die while GPUI's loop keeps spinning on "Invalid window handle"
             // and never drains timers. Watch from a plain OS thread so a hung UI still exits.
             watch_for_vanished_window();
+            // The tray icon (G3, Windows so far) exists exactly while the choice is on: it is
+            // what makes closing mean hide, and the click on it the way back in
+            // (docs/product/09-settings.md). Off, as prefs ship, nothing is added.
+            #[cfg(windows)]
+            notifier::tray::set(tray);
             if let Some(invite) = invite {
                 links.borrow_mut().push_back(invite);
+            }
+            if let Some(action) = action {
+                links.borrow_mut().push_back(action.link());
             }
             cx.spawn(async move |cx| {
                 loop {
                     cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                    // The tray's Quit (G3) is a flag the icon's window set from GPUI's own
+                    // thread; this loop delivers it, so the ask waits at most one tick and
+                    // runs the menu bar's quit, which stops chatd.
+                    #[cfg(windows)]
+                    if notifier::tray::take_quit() {
+                        let _ = cx.update(|cx| app::menubar::quit(cx));
+                    }
                     if let Some(incoming) = incoming.as_ref() {
                         while links.borrow().len() < 8 {
                             let Ok(link) = incoming.try_recv() else { break; };
@@ -993,7 +1144,16 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                     }
                     let next = links.borrow().front().cloned();
                     if let Some(next) = next {
-                        if cx.update(|cx| signin::open_invite(&next, cx)) {
+                        if let Some(action) = crate::quick::parse_link(&next) {
+                            // A quick action a second launch handed over: the same action as
+                            // its menu bar item, once, then the next link in line.
+                            links.borrow_mut().pop_front();
+                            cx.update(|cx| {
+                                dispatch_quick(action, cx);
+                                cx.refresh_windows();
+                                cx.activate(true);
+                            });
+                        } else if cx.update(|cx| signin::open_invite(&next, cx)) {
                             links.borrow_mut().pop_front();
                             cx.update(|cx| { cx.refresh_windows(); cx.activate(true); });
                         }
@@ -1007,6 +1167,17 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
             let _ = window;
             cx.activate(true);
         });
+}
+
+/// What a quick action does when it reaches the window: the same action as its menu bar item,
+/// handled where the others are (`app::menubar`, the shell's keys). Unsigned in, New Message
+/// does what the menu item does with nothing signed in: nothing.
+fn dispatch_quick(action: crate::quick::QuickAction, cx: &mut App) {
+    match action {
+        crate::quick::QuickAction::NewMessage => cx.dispatch_action(&NewMessage),
+        crate::quick::QuickAction::Inbox => cx.dispatch_action(&Place1),
+        crate::quick::QuickAction::Quit => cx.dispatch_action(&Quit),
+    }
 }
 
 /// Watches for the main HWND vanishing while the process hangs. OS thread, not GPUI timers.

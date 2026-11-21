@@ -256,6 +256,15 @@ pub(crate) fn on_live(
                 } else {
                     deliver(ctx, saved, names, &conversation, &wire);
                 }
+                // Off the socket's thread: owe_reactions takes the device mutex, which
+                // syncs and repairs can hold across network I/O.
+                if e2ee::started(saved).is_some() {
+                    let (ctx, saved, conversation) =
+                        (ctx.clone(), saved.clone(), conversation.clone());
+                    let _ = std::thread::Builder::new()
+                        .name("tiny-e2ee-owed".into())
+                        .spawn(move || owe_reactions(&ctx, &saved, &conversation));
+                }
             }
         }
         "message.deleted" => {
@@ -266,6 +275,36 @@ pub(crate) fn on_live(
             }
         }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
+        // The sealed kind: a reaction blob in an encrypted conversation, opaque to the server.
+        // Off the socket's thread: the event only says the server's list moved; the list folds.
+        "e2ee.reaction" => {
+            let conversation_id = field(frame, "conversation_id");
+            if super::safe_id(conversation_id) {
+                if let Some(device) = e2ee::started(saved) {
+                    let (conversation_id, ctx, saved) =
+                        (conversation_id.to_owned(), ctx.clone(), saved.clone());
+                    let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+                        // The list is paged without the device mutex: sends and the socket
+                        // thread must not wait on the server.
+                        let mut landed = e2ee::fold_reactions_unlocked(&device, &saved, &conversation_id);
+                        let (mut applied, mut owed) = (Vec::new(), Vec::new());
+                        {
+                            let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
+                            landed.extend(device.owed_reactions(&conversation_id));
+                            for reaction in &landed {
+                                let pair = (reaction.message.clone(), reaction.emoji.clone());
+                                if apply_reaction(&ctx, &conversation_id, reaction) {
+                                    applied.push(pair);
+                                } else {
+                                    owed.push(pair);
+                                }
+                            }
+                            device.settle_reactions(&conversation_id, &applied, &owed);
+                        }
+                    });
+                }
+            }
+        }
         "read.updated" => read_updated(ctx, saved, frame),
         "server.updated" => ctx.capabilities(account_caps(saved)),
         // The group of an encrypted conversation changed, this device's key packages ran low, or
@@ -300,6 +339,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "message.edited"
             | "message.deleted"
             | "reaction.updated"
+            | "e2ee.reaction"
             | "read.updated"
             | "e2ee.handshake"
             | "e2ee.keys_low"
@@ -362,6 +402,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             conversation_id,
             message_id,
             text,
+            spans: _,
             reply,
         } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
         Command::Delete {
@@ -369,7 +410,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             message_id,
             reply,
         } => delete(ctx, saved, &conversation_id, &message_id, reply),
-        Command::Typing(conversation_id) => {
+        Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
             }
@@ -1304,9 +1345,57 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
             message.reactions[at].mine = mine;
         }
     } else {
-        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false) });
+        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false), who: Vec::new() });
     }
     let _ = ctx.message(conversation_id, &message);
+}
+
+/// One folded encrypted reaction, onto the stored message it landed on: the count and
+/// ownership as this device folds everyone's blobs. `False` when the message is not stored
+/// (yet): the fold keeps the pair owed, and it is applied when the message lands.
+fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionLanded) -> bool {
+    if !super::safe_id(&landed.message) || !unicode_emoji(&landed.emoji) {
+        return false;
+    }
+    let Ok(Some(mut message)) = ctx.stored_message(conversation_id, &landed.message) else {
+        return false;
+    };
+    let at = message.reactions.iter().position(|have| have.emoji == landed.emoji);
+    if landed.count == 0 {
+        if let Some(at) = at {
+            message.reactions.remove(at);
+        }
+    } else if let Some(at) = at {
+        message.reactions[at].count = landed.count;
+        message.reactions[at].mine = landed.mine;
+    } else {
+        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine, who: Vec::new() });
+    }
+    let _ = ctx.message(conversation_id, &message);
+    true
+}
+
+/// Applies the folded reactions a message's arrival still owed: a blob can fold before the
+/// message it lands on is stored.
+fn owe_reactions(ctx: &Context, saved: &Saved, conversation_id: &str) {
+    let Some(device) = e2ee::started(saved) else {
+        return;
+    };
+    let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
+    let landed = device.owed_reactions(conversation_id);
+    if landed.is_empty() {
+        return;
+    }
+    let (mut applied, mut owed) = (Vec::new(), Vec::new());
+    for reaction in &landed {
+        let pair = (reaction.message.clone(), reaction.emoji.clone());
+        if apply_reaction(ctx, conversation_id, reaction) {
+            applied.push(pair);
+        } else {
+            owed.push(pair);
+        }
+    }
+    device.settle_reactions(conversation_id, &applied, &owed);
 }
 
 fn read_updated(ctx: &Context, saved: &Saved, frame: &Value) {
@@ -1356,6 +1445,27 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             }
             if !messages.is_empty() {
                 ctx.history(conversation_id, &messages).map_err(|err| err.to_string())?;
+            }
+            // The reactions of an encrypted conversation are not rows of this page; the folded
+            // ones that changed while this device was away are asked for now, with anything a
+            // page before this one still owed. The list is paged without the device mutex,
+            // so the network holds up no other user of this device.
+            if sealed_here(ctx, saved, conversation_id) == Ok(true) {
+                if let Some(device) = e2ee::started(saved) {
+                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, conversation_id);
+                    let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
+                    landed.extend(device.owed_reactions(conversation_id));
+                    let (mut applied, mut owed) = (Vec::new(), Vec::new());
+                    for reaction in &landed {
+                        let pair = (reaction.message.clone(), reaction.emoji.clone());
+                        if apply_reaction(ctx, conversation_id, reaction) {
+                            applied.push(pair);
+                        } else {
+                            owed.push(pair);
+                        }
+                    }
+                    device.settle_reactions(conversation_id, &applied, &owed);
+                }
             }
             Ok(())
         }
@@ -1561,9 +1671,37 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
     }
     match sealed_here(ctx, saved, conversation_id) {
         Ok(true) => {
-            let result = e2ee::started(saved).ok_or("Encryption isn't set up on this device.".to_owned())
-                .and_then(|shared| shared.lock().unwrap_or_else(|err| err.into_inner()).react_generation(conversation_id, message_id, emoji, on));
-            let _ = reply.send(result.map_err(Refusal::Refused));
+            let result = e2ee::started(saved)
+                .ok_or(NOT_SET_UP.to_owned())
+                .and_then(|shared| {
+                    let landed = shared
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .react(conversation_id, message_id, emoji, on)?;
+                    Ok((shared, landed))
+                });
+            match result {
+                Ok((device, landed)) => {
+                    {
+                        let mut locked = device.lock().unwrap_or_else(|err| err.into_inner());
+                        let mut owed = Vec::new();
+                        if let Some(landed) = &landed {
+                            if !apply_reaction(ctx, conversation_id, landed) {
+                                // The message is not stored yet (a reaction from a
+                                // notification, say): the fold already knows, so keep the
+                                // pair owed for when the message lands.
+                                owed.push((landed.message.clone(), landed.emoji.clone()));
+                            }
+                        }
+                        locked.settle_reactions(conversation_id, &[], &owed);
+                    }
+                    drop(device);
+                    let _ = reply.send(Ok(()));
+                }
+                Err(why) => {
+                    let _ = reply.send(Err(Refusal::Refused(why)));
+                }
+            }
             return;
         }
         Ok(false) => {}
@@ -1790,6 +1928,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     let mut message = Message::plain(&wire.id, name_of(names, saved, &wire.author_id), if deleted { "" } else { &wire.body }, sent, outgoing);
     message.sender.id = wire.author_id.clone();
     message.edited = present(&wire.edited_at);
+    message.edited_at = wire.edited_at.as_deref().and_then(unix_of);
     message.deleted = deleted;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;
@@ -1815,7 +1954,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
+        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
     }
     relink(&mut message);
     Some(message)
@@ -1886,7 +2025,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
+        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
     }
     relink(&mut message);
     Some(message)
@@ -1941,7 +2080,7 @@ fn media_kind(kind: &str, mime: &str) -> MediaKind {
 
 /// Unicode emoji only. A shortcode, a word, or a path is not one. A keycap is one, though it
 /// starts with an ASCII digit (1️⃣ is `1`, U+FE0F, U+20E3), and tinyserver takes it.
-fn unicode_emoji(emoji: &str) -> bool {
+pub(crate) fn unicode_emoji(emoji: &str) -> bool {
     let mut textual = false;
     if emoji.is_empty() {
         return false;
