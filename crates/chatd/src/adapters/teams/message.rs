@@ -4,8 +4,8 @@
 use super::html::{self, Lookup};
 use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
 use protocol::{
-    Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind, Reaction,
-    ReplyTo, Span, Style, ThreadSummary,
+    Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview,
+    Reaction, ReplyTo, Span, Style, ThreadSummary,
 };
 use serde_json::{json, Value};
 
@@ -317,6 +317,141 @@ impl Lookup for Refs<'_> {
     }
 }
 
+/// Extracts the first `https://` or `http://` URL from outgoing text.
+pub(super) fn first_url(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| matches!(c, '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\''));
+        let cleaned = trimmed.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'));
+        if (cleaned.starts_with("https://") || cleaned.starts_with("http://")) && cleaned.len() > 10 {
+            return Some(cleaned.to_owned());
+        }
+    }
+    None
+}
+
+/// Maps a Microsoft 365 file extension to a human-readable app label.
+fn m365_app(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "doc" | "docx" => Some("Word"),
+        "xls" | "xlsx" | "csv" => Some("Excel"),
+        "ppt" | "pptx" => Some("PowerPoint"),
+        "one" => Some("OneNote"),
+        "pdf" => Some("PDF"),
+        _ => None,
+    }
+}
+
+/// Parses Teams `properties.links` and `properties.urlpreviews` into `protocol::Preview` cards,
+/// including Microsoft 365 file link metadata. Preview images are registered only when `hosted`
+/// confirms they live on Teams' own media host.
+pub(super) fn parse_link_previews(
+    props: &Value,
+    msg_id: &str,
+    hosted: impl Fn(&str) -> bool,
+    media: &mut Vec<(MediaFile, String)>,
+) -> Vec<Preview> {
+    let mut entries = listed(&props["links"]);
+    entries.extend(listed(&props["urlpreviews"]));
+    let mut previews = Vec::new();
+    for (idx, item) in entries.into_iter().enumerate() {
+        let url = [&item["url"], &item["originalUrl"], &item["href"], &item["webUrl"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or("");
+        if url.is_empty() || previews.iter().any(|p: &Preview| p.url == url) {
+            continue;
+        }
+        let file_name = [&item["fileName"], &item["name"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty());
+        let file_type = [&item["fileType"], &item["type"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+        let host = super::https_host(url).unwrap_or("");
+        let is_m365 = file_name.is_some()
+            || super::within(host, "sharepoint.com")
+            || super::within(host, "1drv.ms")
+            || super::within(host, "onedrive.live.com")
+            || super::within(host, "office.com")
+            || item["@type"].as_str().is_some_and(|t| t.contains("File") || t.contains("SharePoint"));
+        let title = [&item["title"], &item["previewTitle"], &item["fileName"], &item["name"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        let description = [&item["description"], &item["previewDescription"], &item["snippet"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        let raw_site = [&item["site"], &item["siteName"], &item["domain"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty());
+        let site = if is_m365 {
+            let service = raw_site.unwrap_or_else(|| {
+                if super::within(host, "sharepoint.com") {
+                    "SharePoint"
+                } else if super::within(host, "1drv.ms") || super::within(host, "onedrive.live.com") {
+                    "OneDrive"
+                } else {
+                    "Microsoft 365"
+                }
+            });
+            let ext = if !file_type.is_empty() && !file_type.contains('/') {
+                file_type
+            } else {
+                file_name.and_then(|n| n.rsplit_once('.').map(|(_, e)| e)).unwrap_or("")
+            };
+            match m365_app(ext) {
+                Some(app) if !service.eq_ignore_ascii_case(app) => format!("{app} · {service}"),
+                _ => service.to_owned(),
+            }
+        } else {
+            raw_site.map(str::to_owned).unwrap_or_else(|| host.to_owned())
+        };
+        let img_url = [
+            item["image"].as_str(),
+            item["previewImage"].as_str(),
+            item["previewImage"]["url"].as_str(),
+            item["thumbnailUrl"].as_str(),
+            item["imageUrl"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|u| !u.is_empty() && hosted(u));
+        let image = img_url.map(|u| {
+            let file = MediaFile::new(format!("preview:{msg_id}:{idx}"), MediaKind::Image);
+            media.push((file.clone(), u.to_owned()));
+            file
+        });
+        if title.is_empty() && description.is_empty() && image.is_none() && !is_m365 {
+            continue;
+        }
+        previews.push(Preview {
+            url: url.to_owned(),
+            site,
+            title,
+            description,
+            image,
+        });
+    }
+    previews
+}
+
 /// The header of a quoted reply, as Teams' own client writes it.
 fn quote_markup(reply: &ReplyTo) -> String {
     // A quote's name and preview are already plain text. Escaping them must not read markdown.
@@ -520,6 +655,7 @@ impl Teams {
                 parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
             }
         }
+        message.previews = parse_link_previews(props, &id, |url| self.pictures(url) || self.ours(url), &mut media);
         if let Err(err) = self.ctx.media(&media) {
             tracing::warn!("chatd: Teams: {err}");
         }
@@ -566,7 +702,7 @@ impl Teams {
                 message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
             }
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
-        } else if message.text.is_empty() && message.attachments.is_empty() {
+        } else if message.text.is_empty() && message.attachments.is_empty() && message.previews.is_empty() {
             message.text = "Unsupported message".to_owned();
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
@@ -989,16 +1125,77 @@ impl Teams {
     /// in that chain. A reply to a message in a chat quotes it, as Teams does; a reply to a
     /// post in a channel goes into the post's chain and is shown in the channel as a reply.
     pub(super) fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
-        self.post_with_spans(conversation, client_id, text, reply_to, &[]);
+        self.post_with_options(conversation, client_id, text, reply_to, &[], false);
     }
 
-    pub(super) fn post_with_spans(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[Span]) {
-        let outcome = self.posted_with(conversation, client_id, text, reply_to, spans, None).map_err(super::reason);
+    pub(super) fn post_with_options(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[Span], suppress_embeds: bool) {
+        let outcome = self.posted_with(conversation, client_id, text, reply_to, spans, suppress_embeds, None).map_err(super::reason);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
-    /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], mut properties: Option<Value>) -> Result<Message, Fault> {
+    /// Asks Teams' own middle-tier unfurl service for link preview metadata.
+    /// Never fetches the target URL directly.
+    fn unfurl_link(&self, url: &str) -> Option<(Value, Preview)> {
+        let place = self.place().ok()?;
+        let endpoint = format!("{}/v1/urlpreview", place.middle);
+        let body = json!({"url": url});
+        let answer = self.call("POST", &endpoint, super::Auth::Both(super::SPACES), Body::Json(&body), false).ok()?;
+        let info = &answer.body;
+        let title = [&info["title"], &info["previewTitle"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
+        let description = [&info["description"], &info["previewDescription"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
+        if title.is_empty() && description.is_empty() {
+            return None;
+        }
+        let site = [&info["siteName"], &info["site"], &info["domain"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .find(|s| !s.is_empty())
+            .unwrap_or_else(|| super::https_host(url).unwrap_or(""));
+        let mut entry = json!({
+            "url": url,
+            "title": title,
+            "description": description,
+            "siteName": site,
+        });
+        let img_url = [&info["image"], &info["previewImage"], &info["thumbnailUrl"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .find(|u| !u.is_empty() && (self.pictures(u) || self.ours(u)));
+        let mut media = Vec::new();
+        let image = img_url.map(|u| {
+            entry["previewImage"] = Value::String(u.to_owned());
+            let file = MediaFile::new(format!("preview:sent:{}", escaped(url)), MediaKind::Image);
+            media.push((file.clone(), u.to_owned()));
+            file
+        });
+        if !media.is_empty() {
+            let _ = self.ctx.media(&media);
+        }
+        let preview = Preview {
+            url: url.to_owned(),
+            site: site.to_owned(),
+            title: title.to_owned(),
+            description: description.to_owned(),
+            image,
+        };
+        Some((entry, preview))
+    }
+
+    /// The same, with `properties` (the files or links a message names) beside the body.
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], suppress_embeds: bool, mut properties: Option<Value>) -> Result<Message, Fault> {
+        let mut sent_previews = Vec::new();
+        let allow_previews = !suppress_embeds && self.ctx.hub.settings().on(protocol::settings::LINK_PREVIEWS);
+        if allow_previews {
+            if let Some(url) = first_url(text) {
+                if let Some((entry, preview)) = self.unfurl_link(&url) {
+                    let props = properties.get_or_insert_with(|| json!({}));
+                    if let Some(map) = props.as_object_mut() {
+                        map.insert("links".to_owned(), Value::String(Value::Array(vec![entry]).to_string()));
+                    }
+                    sent_previews.push(preview);
+                }
+            }
+        }
         let (mut content, mentions_json) = if !mention_spans.is_empty() {
             let (c, m) = html::compose_with_mentions(text, mention_spans);
             (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
@@ -1042,6 +1239,7 @@ impl Teams {
         }
         let mut message = Message::plain(id, name.clone(), shown, sent, true);
         message.spans = spans;
+        message.previews = sent_previews;
         message.sender.avatar = self.picture(&me, &name);
         message.sender.id = me;
         if let Some((channel, root)) = chain_of(&target) {
@@ -1396,5 +1594,45 @@ mod tests {
         assert_eq!(super::super::links::parse_share(&desktop).map(|found| (found.kind, found.conversation)), Some((super::super::links::ShareKind::Chat, chat.to_owned())));
         assert!(super::super::links::parse_share("https://ex.com/plan").is_none());
         assert!(super::super::links::parse_share("https://teams.microsoft.com/l/chat/0/0?users=a@contoso.com").is_none());
+    }
+
+    #[test]
+    fn link_previews_and_m365_cards_are_parsed_with_safe_image_filtering() {
+        let props = json!({
+            "links": json!([
+                {
+                    "url": "https://example.com/post",
+                    "title": "Release Notes",
+                    "description": "What shipped today",
+                    "siteName": "Example",
+                    "previewImage": "https://eu-api.asm.skype.com/v1/objects/abc/views/imgo"
+                },
+                {
+                    "url": "https://evil.example/track",
+                    "title": "External Img",
+                    "description": "Should not register external image",
+                    "previewImage": "https://evil.example/pixel.png"
+                }
+            ]).to_string(),
+            "urlpreviews": [
+                {
+                    "url": "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF",
+                    "fileName": "Q4 Budget.xlsx",
+                    "fileType": "xlsx",
+                    "description": "Platform team spreadsheet"
+                }
+            ]
+        });
+        let mut media = Vec::new();
+        let previews = parse_link_previews(&props, "1760000900000", |u| u.contains("asm.skype.com"), &mut media);
+        assert_eq!(previews.len(), 3);
+        assert_eq!((previews[0].title.as_str(), previews[0].site.as_str()), ("Release Notes", "Example"));
+        assert!(previews[0].image.is_some());
+        assert_eq!(media.len(), 1);
+        assert_eq!(previews[1].title, "External Img");
+        assert!(previews[1].image.is_none(), "non-Teams image host must not be registered");
+        assert_eq!((previews[2].title.as_str(), previews[2].site.as_str()), ("Q4 Budget.xlsx", "Excel · SharePoint"));
+        assert_eq!(first_url("Check out https://example.com/release!"), Some("https://example.com/release".to_owned()));
+        assert_eq!(first_url("no links here"), None);
     }
 }

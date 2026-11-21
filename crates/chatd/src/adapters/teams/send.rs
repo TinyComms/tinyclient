@@ -26,19 +26,19 @@ impl Teams {
     pub(super) fn send_with(self: &Arc<Self>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
         if with.files.is_empty() {
             // Teams has no silent or scheduled send, and the shell offers none; a pick has no
-            // catalog here. What is left is the text and any mention spans.
-            self.post_with_spans(conversation, client_id, text, reply_to, &with.spans);
+            // catalog here. What is left is the text, mention spans, and link preview opt-out.
+            self.post_with_options(conversation, client_id, text, reply_to, &with.spans, with.suppress_embeds);
             return;
         }
-        let (teams, conversation_id, client, text, reply, spans) = (self.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned), with.spans);
-        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &spans, up));
+        let (teams, conversation_id, client, text, reply, spans, suppress) = (self.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned), with.spans, with.suppress_embeds);
+        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &spans, suppress, up));
     }
 
     pub(super) fn cancel_send(&self, client_id: &str) {
         upload::cancel(&self.ctx.account, client_id);
     }
 
-    fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[protocol::Span], up: &mut Upload) -> Result<Message, String> {
+    fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[protocol::Span], suppress_embeds: bool, up: &mut Upload) -> Result<Message, String> {
         let mut named = Vec::new();
         let mut attachments = Vec::new();
         for at in 0..up.files().len() {
@@ -48,7 +48,7 @@ impl Teams {
         }
         up.check()?;
         let properties = json!({"files": Value::Array(named).to_string()});
-        let mut message = self.posted_with(conversation, client_id, text, reply_to, spans, Some(properties)).map_err(super::reason)?;
+        let mut message = self.posted_with(conversation, client_id, text, reply_to, spans, suppress_embeds, Some(properties)).map_err(super::reason)?;
         message.attachments = attachments;
         Ok(message)
     }

@@ -893,6 +893,7 @@ impl Teams {
             pin_chats: 15,
             close_direct: true,
             clear_history: true,
+            suppress_embeds: true,
             forward: false,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,

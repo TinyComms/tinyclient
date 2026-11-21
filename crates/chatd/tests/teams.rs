@@ -530,6 +530,19 @@ impl Fake {
             let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
         }
+        if call.path.ends_with("/v1/urlpreview") {
+            let asked = call.json();
+            let url = asked["url"].as_str().unwrap_or("");
+            if url == "https://example.com/release" {
+                return ok(json!({
+                    "url": url,
+                    "title": "TinyClient Release",
+                    "description": "Wave 4D Teams improvements",
+                    "siteName": "Example",
+                    "previewImage": format!("{}/ams/v1/objects/preview-1/views/imgo", self.base),
+                }));
+            }
+        }
         answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
     }
 
@@ -1757,4 +1770,71 @@ fn chat_pin_hide_and_delete_sync_with_teams() {
         world.ask(Request::ClearHistory { conversation: key(GENERAL), delete_chat: true, revoke: false }),
         Response::Error { .. }
     ));
+}
+
+#[test]
+fn link_previews_received_sent_and_opted_out() {
+    let world = World::start();
+    world.ready();
+
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.suppress_embeds);
+
+    // 1. Received message with web link preview and M365 file link card.
+    let chat = key(CHAT_ANA);
+    let mut incoming = message(CHAT_ANA, None, 1_760_000_950_000, ANA, "Ana Ruiz", "<p>See https://example.com/doc</p>");
+    incoming["properties"]["links"] = json!(json!([
+        {
+            "url": "https://example.com/doc",
+            "title": "Architecture Doc",
+            "description": "Design overview",
+            "siteName": "Example",
+            "previewImage": format!("{}/ams/v1/objects/img-1/views/imgo", world.fake.base),
+        },
+        {
+            "url": "https://contoso.sharepoint.com/:w:/s/Platform/Doc1",
+            "fileName": "Spec.docx",
+            "fileType": "docx",
+            "description": "Shared specification"
+        }
+    ]).to_string());
+    world.fake.push("NewMessage", incoming, false);
+    let received = world.until("received message with previews", || world.message(&chat, "1760000950000"));
+    assert_eq!(received.previews.len(), 2);
+    assert_eq!((received.previews[0].title.as_str(), received.previews[0].site.as_str()), ("Architecture Doc", "Example"));
+    assert!(received.previews[0].image.is_some());
+    assert_eq!((received.previews[1].title.as_str(), received.previews[1].site.as_str()), ("Spec.docx", "Word · SharePoint"));
+
+    // 2. Sent message with a URL unfurls through Teams' middle tier and attaches properties.links.
+    world.send(&chat, "1760000960000001", "Check https://example.com/release");
+    let sent = world.until("sent message with preview", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000001") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.previews.len(), 1);
+    assert_eq!(sent.previews[0].title, "TinyClient Release");
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1);
+    let posted = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted.json()["properties"]["links"].as_str().unwrap_or("").contains("TinyClient Release"));
+
+    // 3. Opting out via suppress_embeds skips unfurl and omits properties.links.
+    match world.ask(Request::Send {
+        conversation: chat.clone(),
+        client_id: "1760000960000002".to_owned(),
+        text: "No preview https://example.com/release".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { suppress_embeds: true, ..Default::default() },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    let opted_out = world.until("opted-out message sent", || {
+        world.messages(&chat).into_iter().find(|m| m.client_id.as_deref() == Some("1760000960000002") && m.state == SendState::Sent)
+    });
+    assert!(opted_out.previews.is_empty());
+    assert_eq!(world.fake.calls("POST", "/v1/urlpreview").len(), 1, "suppress_embeds must not call urlpreview");
+    let posted2 = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(posted2.json()["properties"]["links"].is_null());
 }
