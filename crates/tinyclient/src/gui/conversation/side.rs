@@ -527,13 +527,14 @@ impl Shell {
             .map(|status| status.can)
             .unwrap_or_default();
         let me = self.me(conversation);
+        let (age_restricted, gated) = self.thread_age_gate(&key, conversation);
         let shell = cx.weak_entity();
         let root = root.clone();
         let view = cx.new(|cx| {
             // On a phone the thread is a page of its own, read as the conversation is.
             let metrics = if crate::gui::phone::active() { super::tokens::Metrics::PHONE } else { super::tokens::Metrics::DENSE };
             let mut view = Pane::new(metrics, true, shell, cx);
-            view.show_thread(key, &title, &me, can, rights, root, cx);
+            view.show_thread(key, &title, &me, can, rights, root, age_restricted, gated, cx);
             view
         });
         *self.conversation_state.thread.borrow_mut() = Some(view);
@@ -1479,15 +1480,20 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                             .items_center()
                             .gap(px(6.))
                             .child({
-                                let highlights: Vec<(Range<usize>, HighlightStyle)> =
-                                    matched(&hit.snippet, &page.words).into_iter().map(|range| (range, lit())).collect();
+                                let gated = shell.conversation_age_gated(&hit.conversation);
+                                let snippet = if gated { chat::AGE_GATE_LINE.to_owned() } else { hit.snippet.clone() };
+                                let highlights: Vec<(Range<usize>, HighlightStyle)> = if gated {
+                                    Vec::new()
+                                } else {
+                                    matched(&hit.snippet, &page.words).into_iter().map(|range| (range, lit())).collect()
+                                };
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .type_small()
                                     .text_color(theme::text_soft())
-                                    .child(StyledText::new(SharedString::from(hit.snippet.clone())).with_highlights(highlights))
+                                    .child(StyledText::new(SharedString::from(snippet)).with_highlights(highlights))
                             })
                             .when(*cached, |row| {
                                 row.child(div().flex_none().type_micro().text_color(theme::text_soft()).child("cached"))

@@ -1764,6 +1764,11 @@ impl Chat {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
+        match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) if message.published => return Response::Ok,
+            Ok(_) => {}
+            Err(err) => return internal(err),
+        }
         match self.ask(&account, |reply| Command::Publish {
             conversation_id: conversation.id,
             message_id,
@@ -1781,6 +1786,22 @@ impl Chat {
         }
         if let Err(refused) = self.online(&account) {
             return *refused;
+        }
+        let allowed = {
+            let store = self.hub.store();
+            match (store.conversation(&conversation), store.conversation(&into)) {
+                (Ok(source), Ok(target)) => {
+                    source.is_some_and(|row| row.kind == ConversationKind::Announcement)
+                        && target.is_some_and(|row| row.rights.manage_webhooks)
+                }
+                (Err(err), _) | (_, Err(err)) => return internal(err),
+            }
+        };
+        if !allowed {
+            return error(
+                ErrorCode::Refused,
+                "Follow an announcement channel into a channel where you can manage webhooks.",
+            );
         }
         match self.ask(&account, |reply| Command::Follow {
             conversation_id: conversation.id,

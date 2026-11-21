@@ -846,9 +846,7 @@ impl Discord {
             announcement_follow: true,
             ..Default::default()
         });
-        let mut state = self.state.lock().unwrap();
-        state.premium = premium;
-        state.nsfw_blocked = age_restricted_blocked;
+        self.state.lock().unwrap().premium = premium;
     }
 
     /// The user's own order of servers: folders flattened, then anything they do not mention on

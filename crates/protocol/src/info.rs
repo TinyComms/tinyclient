@@ -421,7 +421,8 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
-    const MANAGE_WEBHOOKS: i64 = 1 << 8;
+    /// Bit 14. Bits 8–12 are already conversation rights on other Discord branches.
+    const MANAGE_WEBHOOKS: i64 = 1 << 14;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()

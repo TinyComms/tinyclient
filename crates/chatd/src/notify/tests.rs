@@ -674,6 +674,11 @@ fn reactions_to_my_messages_notify_according_to_scope_and_withdraw_when_read() {
     set(&mut values, GLOBAL, settings::NOTIFY_REACTIONS, "everywhere");
     assert!(decide_reaction(&values, &channel(), true, &now).is_some());
     assert!(decide_reaction(&values, &Conversation { muted: true, ..channel() }, true, &now).is_none());
+    // An age-restricted channel downgrades a full preview to the sender, as a message does.
+    set(&mut values, GLOBAL, settings::PREVIEW, "full");
+    let nsfw = Conversation { age_restricted: true, ..channel() };
+    let gated = decide_reaction(&values, &nsfw, true, &now).expect("still notifies");
+    assert_eq!(gated.preview, Preview::Sender);
 
     // Posting formats "Ines reacted 👍 to: <snippet>" and reading withdraws it.
     set(&mut values, GLOBAL, settings::PREVIEW, "full");

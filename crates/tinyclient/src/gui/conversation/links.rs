@@ -440,11 +440,11 @@ mod tests {
     fn message_link_round_trips_through_parse_network_link() {
         let mut key = protocol::Key { network: protocol::Network::Discord, account: "1".into(), id: "12345".into() };
         let said = protocol::Message::plain("67890", "Mara", "hello", 1, false);
-        let url = message_link(&key, Some("G7"), &said).unwrap();
-        assert_eq!(url, "https://discord.com/channels/G7/12345/67890");
+        let url = message_link(&key, Some("4000"), &said).unwrap();
+        assert_eq!(url, "https://discord.com/channels/4000/12345/67890");
         let parsed = protocol::link::parse_network_link(&url).unwrap();
         assert_eq!(parsed.network, protocol::Network::Discord);
-        assert_eq!(parsed.space.as_deref(), Some("G7"));
+        assert_eq!(parsed.space.as_deref(), Some("4000"));
         assert_eq!(parsed.channel, "12345");
         assert_eq!(parsed.message_id.as_deref(), Some("67890"));
 
@@ -472,11 +472,11 @@ mod tests {
             "engineering",
         );
         assert_eq!(
-            network_link_chip("https://discord.com/channels/G7/12345/67890", &[conv.clone()]).as_deref(),
+            network_link_chip("https://discord.com/channels/4000/12345/67890", &[conv.clone()]).as_deref(),
             Some("#engineering ↗")
         );
         assert_eq!(
-            network_link_chip("https://discord.com/channels/G7/99999/67890", &[conv]),
+            network_link_chip("https://discord.com/channels/4000/99999/67890", &[conv]),
             None
         );
     }

@@ -1711,15 +1711,23 @@ impl Store {
                 return None;
             }
             if let Some(space) = &link.space {
+                let discord = link.network == Network::Discord;
                 let lower = space.to_ascii_lowercase();
                 if let Some(hit) = candidates.iter().find(|c| {
-                    c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space))
-                        || c.space_title.to_ascii_lowercase().contains(&lower)
-                        || c.key.account.to_ascii_lowercase().contains(&lower)
+                    let same_space = c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space));
+                    if discord {
+                        same_space
+                    } else {
+                        same_space
+                            || c.space_title.to_ascii_lowercase().contains(&lower)
+                            || c.key.account.to_ascii_lowercase().contains(&lower)
+                    }
                 }) {
                     return Some(hit.clone());
                 }
-                if link.network == Network::Slack {
+                // A Discord guild that did not match must not fall through to another row
+                // that happens to share the channel id.
+                if link.network == Network::Slack || discord {
                     return None;
                 }
             }

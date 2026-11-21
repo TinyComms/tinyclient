@@ -5207,6 +5207,20 @@ fn announcement_publish_crosspost_source_and_follow() {
     });
     assert!(after.published);
 
+    // A second publish of the same message does not call Discord again.
+    assert_eq!(
+        world.ask(Request::Publish {
+            conversation: world.key("4109"),
+            message_id: "1300000010000001100".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("POST", "/channels/4109/messages/1300000010000001100/crosspost").len(),
+        1,
+        "an already published message must not crosspost again"
+    );
+
     // 2. Rate-limited crosspost (429) surfaces Discord's refusal.
     world.discord.script(
         "/channels/4109/messages/1300000010000001101/crosspost",
@@ -5259,6 +5273,33 @@ fn announcement_publish_crosspost_source_and_follow() {
     let follow_reqs = world.discord.requests_to("POST", "/channels/4109/followers");
     assert_eq!(follow_reqs.len(), 1);
     assert_eq!(follow_reqs[0].body, json!({"webhook_channel_id": "4101"}));
+
+    // A text channel is not an announcement source, so nothing is posted.
+    match world.ask(Request::Follow {
+        conversation: world.key("4101"),
+        into: world.key("4101"),
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected refusal for a non-announcement source, got {other:?}"),
+    }
+    assert!(
+        world.discord.requests_to("POST", "/channels/4101/followers").is_empty(),
+        "a refused follow must not call Discord"
+    );
+
+    // An announcement followed into a channel without Manage Webhooks is refused too.
+    match world.ask(Request::Follow {
+        conversation: world.key("4109"),
+        into: world.key("3001"),
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected refusal without manage webhooks, got {other:?}"),
+    }
+    assert_eq!(
+        world.discord.requests_to("POST", "/channels/4109/followers").len(),
+        1,
+        "the refused follow must not post another followers request"
+    );
 }
 
 #[test]
@@ -5309,6 +5350,21 @@ fn channel_mentions_message_links_and_special_tokens_resolve_in_app() {
         Response::Resolved { conversation, .. } => assert_eq!(conversation, None),
         other => panic!("expected Response::Resolved, got {other:?}"),
     }
+
+    // A guild that is not a snowflake does not parse, and a real channel id under the wrong
+    // guild must not fall through to that channel's newest row.
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/G7/4102/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, .. } => assert_eq!(conversation, None),
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/9999/4102/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, .. } => assert_eq!(conversation, None, "wrong guild must not match channel 4102"),
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
 }
 
 #[test]
@@ -5347,12 +5403,13 @@ fn edit_suppresses_embeds_merging_existing_flags_and_removes_attachments() {
     });
 
     // Moderator suppresses embeds on another user's message: merges SUPPRESS_EMBEDS (4) with 4097 -> 4101,
-    // and omits "content" from the PATCH body.
-    world.discord.script("/channels/4101/messages", 200, json!([other_msg.clone()]));
+    // and omits "content" from the PATCH body. The flags read is GET of that one message.
+    let message_path = format!("/channels/4101/messages/{other_id}");
+    world.discord.script(&message_path, 200, other_msg.clone());
     let mut suppressed = other_msg.clone();
     suppressed["flags"] = json!(4101);
     suppressed["embeds"] = json!([]);
-    world.discord.script(&format!("/channels/4101/messages/{other_id}"), 200, suppressed);
+    world.discord.script(&message_path, 200, suppressed);
     assert_eq!(
         world.ask(Request::Edit {
             conversation: world.key("4101"),
@@ -5429,6 +5486,46 @@ fn edit_suppresses_embeds_merging_existing_flags_and_removes_attachments() {
         Response::Error { code: ErrorCode::Refused, .. } => {}
         other => panic!("expected Refused for empty text + empty attachments, got {other:?}"),
     }
+
+    // A flags GET that misses must not PATCH. The around list would have answered 200 without
+    // this id and the old code would have sent flags 4.
+    let gone = "1300000010000001399";
+    let gone_path = format!("/channels/4101/messages/{gone}");
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": gone,
+        "channel_id": "4101",
+        "type": 0,
+        "author": me(),
+        "content": "https://example.org/gone",
+        "timestamp": "2026-10-13T09:22:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [{"type": "link", "url": "https://example.org/gone", "title": "Gone"}],
+        "attachments": [],
+        "pinned": false,
+        "flags": 4097
+    }));
+    wait("message whose flags read will miss", || {
+        world.messages("4101").into_iter().find(|m| m.id == gone)
+    });
+    world.discord.script(&gone_path, 404, json!({"message": "Unknown Message", "code": 10008}));
+    match world.ask(Request::Edit {
+        conversation: world.key("4101"),
+        message_id: gone.into(),
+        text: String::new(),
+        spans: Vec::new(),
+        suppress_embeds: true,
+        keep_attachments: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused when the flags read misses, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("GET", &gone_path).len(), 1, "suppress reads that one message");
+    assert!(
+        world.discord.requests_to("PATCH", &gone_path).is_empty(),
+        "a missed flags read must not patch"
+    );
 }
 
 #[test]

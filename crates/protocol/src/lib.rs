@@ -3639,6 +3639,10 @@ mod tests {
             manage_webhooks: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
+        let webhooks = ConversationRights { manage_webhooks: true, ..ConversationRights::default() };
+        assert_eq!(webhooks.to_bits(), 1 << 14);
+        assert_eq!(ConversationRights::from_bits(1 << 14), webhooks);
+        assert!(!ConversationRights::from_bits(1 << 8).manage_webhooks);
 
         let pub_req = Request::Publish {
             conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },

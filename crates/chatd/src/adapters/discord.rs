@@ -352,8 +352,6 @@ struct State {
     renewed: HashMap<String, String>,
     /// Our plan (`premium_type`), which says what may be sent.
     premium: u8,
-    /// `true` when Discord says this account cannot enter age-restricted channels (`nsfw_allowed == false`).
-    nsfw_blocked: bool,
     /// `true` only when Discord's sensitive-media filter is set to Show (`0`); otherwise flagged media is blurred.
     show_explicit_media: bool,
     /// Friends' status emoji and what they are doing, as their presence last said, so a voice
@@ -1146,6 +1144,7 @@ impl Discord {
         if suppress_embeds {
             // Read current flags before patching so existing bits (e.g. IS_VOICE_MESSAGE,
             // CROSSPOSTED, SUPPRESS_NOTIFICATIONS) are preserved rather than cleared.
+            // A miss refuses: inventing 0 and sending SUPPRESS_EMBEDS alone would clear them.
             let existing = self.message_flags(channel, message)?;
             body.insert("flags".to_owned(), json!(existing | model::SUPPRESS_EMBEDS));
         }
@@ -1168,13 +1167,20 @@ impl Discord {
         })
     }
 
-    /// Reads the current `flags` bitmask of a message so PATCH merges rather than overwrites it.
+    /// Reads the current `flags` bitmask of one message so PATCH merges rather than overwrites it.
+    /// The single-message route is required: a list that does not contain the id is a miss, and
+    /// a miss must not be treated as flags 0.
     fn message_flags(&self, channel: &str, message: &str) -> Result<u64, Refusal> {
-        let path = format!("/channels/{channel}/messages?around={message}&limit=1");
+        let path = format!("/channels/{channel}/messages/{message}");
         let body = self.call("GET", &path, None).map_err(refusal)?;
-        let found: Vec<Posted> = serde_json::from_str(&body)
+        let posted: Posted = serde_json::from_str(&body)
             .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
-        Ok(found.into_iter().find(|p| p.id == message).and_then(|p| p.flags).unwrap_or(0))
+        if posted.id != message {
+            return Err(Refusal::Refused("That message is gone.".to_owned()));
+        }
+        posted
+            .flags
+            .ok_or_else(|| Refusal::Refused("Discord's answer was unreadable: missing flags".to_owned()))
     }
 
     /// Fetches the raw markdown source of a single message for lossless editing.
@@ -1240,15 +1246,21 @@ impl Discord {
     }
 
     /// Publishes (crossposts) a message in an announcement channel (`POST /channels/{id}/messages/{msg}/crosspost`).
+    /// A message the store already has as published is left alone. A body that is not a message
+    /// is the same unreadable fault as any other Discord answer we cannot apply.
     fn publish(&self, channel: &str, message: &str) -> Result<(), Refusal> {
+        if self.ctx.stored_message(channel, message).ok().flatten().is_some_and(|stored| stored.published) {
+            return Ok(());
+        }
         let raw = self
             .call("POST", &format!("/channels/{channel}/messages/{message}/crosspost"), None)
             .map_err(refusal)?;
-        if let Ok(posted) = serde_json::from_str::<Posted>(&raw) {
-            if !posted.id.is_empty() {
-                let _ = self.updated(posted);
-            }
+        let posted: Posted = serde_json::from_str(&raw)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        if posted.id.is_empty() {
+            return Err(Refusal::Refused("Discord's answer was unreadable: not a message".to_owned()));
         }
+        let _ = self.updated(posted);
         Ok(())
     }
 
