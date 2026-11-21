@@ -45,7 +45,7 @@ use super::{keep_connected, serve_commands, About, Command, Context, Failure, Re
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, Filing, FolderRow, PersonRow};
-use protocol::{Attachment, Contact, ContactKind, ConversationKind, Delivery, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
+use protocol::{Attachment, Contact, ContactKind, ConversationKind, Delivery, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, RelateAction, Relation, ReplyTo, ReportReason, ReportTarget, Span, Special};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -556,6 +556,14 @@ struct Live {
     folders: Vec<wire::ChatFolder>,
     /// Conversations known to this adapter, for re-evaluating folder membership.
     known_conversations: HashSet<String>,
+    /// ACIs in our contacts list.
+    contacts: HashSet<String>,
+    /// Blocked conversation ids (direct ACIs and `g.<hex>` group ids).
+    blocked: HashSet<String>,
+    /// Conversations whose message request has been accepted (or known contacts/groups).
+    accepted: HashSet<String>,
+    /// Direct conversations currently waiting as unaccepted message requests.
+    requests: HashSet<String>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -970,11 +978,21 @@ fn ensure_row(account: &Account, peer: &Peer, title: &str) {
     // The phone need not include ourselves in its contact list.
     let title = if matches!(peer, Peer::Direct(aci) if aci == &account.me) { "Note to Self" } else { title };
     let id = peer.conversation();
-    account.live().known_conversations.insert(id.clone());
+    let is_request = {
+        let mut live = account.live();
+        live.known_conversations.insert(id.clone());
+        live.requests.contains(&id)
+    };
+    let special = if is_request { Special::Request } else { Special::None };
     match account.ctx.known(&id) {
-        Ok(Some(known)) if title.is_empty() || known.title == title => {}
+        Ok(Some(known)) if (title.is_empty() || known.title == title) && known.special == special => {}
         // A picture fetched earlier stays the row's.
-        Ok(Some(_)) | Ok(None) => drop(account.ctx.conversation(&ConversationRow { avatar: account.ctx.avatar_of(&id), ..row(peer, title) })),
+        Ok(Some(_)) | Ok(None) => {
+            let mut next = row(peer, title);
+            next.avatar = account.ctx.avatar_of(&id);
+            next.special = special;
+            drop(account.ctx.conversation(&next));
+        }
         Err(err) => tracing::warn!("chatd: Signal: {err}"),
     }
 }
@@ -1058,12 +1076,26 @@ fn apply(account: &Account, event: Event) {
                 .collect();
             {
                 let mut live = account.live();
-                for contact in contacts.iter().filter(|contact| !contact.name.is_empty()) {
-                    live.names.insert(contact.id.clone(), contact.name.clone());
+                for contact in &contacts {
+                    live.contacts.insert(contact.id.clone());
+                    live.accepted.insert(contact.id.clone());
+                    live.requests.remove(&contact.id);
+                    if !contact.name.is_empty() {
+                        live.names.insert(contact.id.clone(), contact.name.clone());
+                    }
                 }
             }
             let _ = ctx.people(&people);
-            let owned: Vec<(String, Relation)> = contacts.iter().map(|contact| (contact.id.clone(), Relation::Contact)).collect();
+            let owned: Vec<(String, Relation)> = {
+                let live = account.live();
+                contacts
+                    .iter()
+                    .map(|contact| {
+                        let rel = if live.blocked.contains(&contact.id) { Relation::Blocked } else { Relation::Contact };
+                        (contact.id.clone(), rel)
+                    })
+                    .collect()
+            };
             let _ = ctx.relations(&owned);
             // A row named before the contact was known takes the contact's name.
             for contact in contacts.iter().filter(|contact| !contact.name.is_empty()) {
@@ -1080,6 +1112,7 @@ fn apply(account: &Account, event: Event) {
                     let mut live = account.live();
                     live.groups.insert(conv.clone(), group.member_ids.clone());
                     live.known_conversations.insert(conv.clone());
+                    live.accepted.insert(conv.clone());
                     if group.timer_secs > 0 {
                         live.note_timer(&conv, group.timer_secs, 0);
                     }
@@ -1121,6 +1154,21 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Message { peer, text, outgoing } => {
             let conversation = peer.conversation();
+            // Drop messages from blocked senders or blocked groups.
+            {
+                let mut live = account.live();
+                if live.blocked.contains(&conversation) || (!outgoing && live.blocked.contains(&text.author)) {
+                    return;
+                }
+                if outgoing {
+                    live.accepted.insert(conversation.clone());
+                    live.requests.remove(&conversation);
+                } else if let Peer::Direct(aci) = &peer {
+                    if aci != &account.me && !live.contacts.contains(aci) && !live.accepted.contains(aci) {
+                        live.requests.insert(conversation.clone());
+                    }
+                }
+            }
             if !outgoing && !text.name.is_empty() {
                 let mut live = account.live();
                 if !live.names.contains_key(&text.author) {
@@ -1286,6 +1334,12 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Typing { peer, by, name, started } => {
             let conversation = peer.conversation();
+            {
+                let live = account.live();
+                if live.blocked.contains(&conversation) || live.blocked.contains(&by) {
+                    return;
+                }
+            }
             if started {
                 let name = if name.is_empty() { account.live().name(&by) } else { name };
                 ctx.typing(&conversation, &by, &name, TYPING_SHOWN);
@@ -1322,6 +1376,7 @@ fn apply(account: &Account, event: Event) {
             let mut to_file: HashSet<String> = HashSet::new();
             let mut mutes: Vec<(String, bool)> = Vec::new();
             let mut mark_unreads: Vec<String> = Vec::new();
+            let mut relation_updates: Vec<(String, Relation)> = Vec::new();
             {
                 let mut live = account.live();
                 if let Some(keep) = keep_muted_archived {
@@ -1338,6 +1393,16 @@ fn apply(account: &Account, event: Event) {
                 }
                 for chat in chats {
                     let conv = chat.peer.conversation();
+                    if chat.whitelisted {
+                        live.accepted.insert(conv.clone());
+                        live.requests.remove(&conv);
+                    }
+                    if chat.blocked {
+                        live.blocked.insert(conv.clone());
+                        if let Peer::Direct(aci) = &chat.peer {
+                            relation_updates.push((aci.clone(), Relation::Blocked));
+                        }
+                    }
                     if chat.muted_until > 0 {
                         live.muted_until.insert(conv.clone(), chat.muted_until);
                     } else {
@@ -1364,6 +1429,9 @@ fn apply(account: &Account, event: Event) {
                     }
                 }
             }
+            for (person_id, rel) in relation_updates {
+                let _ = ctx.relation(&person_id, rel);
+            }
             for (conv, muted) in mutes {
                 let _ = ctx.muted(&conv, muted);
                 if !account.live().folders.is_empty() {
@@ -1389,6 +1457,71 @@ fn apply(account: &Account, event: Event) {
             let _ = ctx.folders(&rows);
             for conv in known {
                 sync_filing(account, &conv);
+            }
+        }
+        Event::Blocked { people, groups } => {
+            let mut relation_updates: Vec<(String, Relation)> = Vec::new();
+            {
+                let mut live = account.live();
+                let mut next: HashSet<String> = HashSet::new();
+                for aci in &people {
+                    next.insert(aci.clone());
+                }
+                for gid in &groups {
+                    next.insert(Peer::Group(gid.clone()).conversation());
+                }
+                for old in live.blocked.difference(&next) {
+                    if wire::is_aci(old) {
+                        let rel = if live.contacts.contains(old) { Relation::Contact } else { Relation::None };
+                        relation_updates.push((old.clone(), rel));
+                    }
+                }
+                for added in &people {
+                    relation_updates.push((added.clone(), Relation::Blocked));
+                }
+                live.blocked = next;
+            }
+            for (person_id, rel) in relation_updates {
+                let _ = ctx.relation(&person_id, rel);
+            }
+        }
+        Event::MessageRequestResponse { peer, action } => {
+            let conv = peer.conversation();
+            match action {
+                wire::MessageRequestAction::Accept => {
+                    let title = {
+                        let mut live = account.live();
+                        live.requests.remove(&conv);
+                        live.accepted.insert(conv.clone());
+                        live.names.get(&conv).cloned().unwrap_or_default()
+                    };
+                    ensure_row(account, &peer, &title);
+                }
+                wire::MessageRequestAction::Delete | wire::MessageRequestAction::Spam => {
+                    account.live().requests.remove(&conv);
+                    let _ = ctx.forget_conversation(&conv);
+                }
+                wire::MessageRequestAction::Block => {
+                    {
+                        let mut live = account.live();
+                        live.requests.remove(&conv);
+                        live.blocked.insert(conv.clone());
+                    }
+                    if let Peer::Direct(aci) = &peer {
+                        let _ = ctx.relation(aci, Relation::Blocked);
+                    }
+                }
+                wire::MessageRequestAction::BlockAndDelete | wire::MessageRequestAction::BlockAndSpam => {
+                    {
+                        let mut live = account.live();
+                        live.requests.remove(&conv);
+                        live.blocked.insert(conv.clone());
+                    }
+                    if let Peer::Direct(aci) = &peer {
+                        let _ = ctx.relation(aci, Relation::Blocked);
+                    }
+                    let _ = ctx.forget_conversation(&conv);
+                }
             }
         }
         Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
@@ -1595,7 +1728,10 @@ fn offline(ctx: &Context, command: Command) {
         | Command::Edit { reply, .. }
         | Command::Delete { reply, .. }
         | Command::SetMute { reply, .. }
-        | Command::File { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::File { reply, .. }
+        | Command::Relate { reply, .. }
+        | Command::AnswerMessageRequest { reply, .. }
+        | Command::Report { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -1801,6 +1937,88 @@ fn serve(account: &Arc<Account>, command: Command) {
                 return;
             };
             let _ = reply.send(set_own(account, name, about, emoji));
+        }
+        Command::Relate { person_id, action, reply } => {
+            let outcome = match action {
+                RelateAction::Block | RelateAction::Unblock => {
+                    let block = action == RelateAction::Block;
+                    if !wire::is_aci(&person_id) {
+                        Err(Refusal::Refused("That person isn't one Signal knows.".to_owned()))
+                    } else {
+                        account.wire.set_blocked(&Peer::Direct(person_id.clone()), block).map_err(refused).map(|()| {
+                            let rel = {
+                                let mut live = account.live();
+                                if block {
+                                    live.blocked.insert(person_id.clone());
+                                    Relation::Blocked
+                                } else {
+                                    live.blocked.remove(&person_id);
+                                    if live.contacts.contains(&person_id) { Relation::Contact } else { Relation::None }
+                                }
+                            };
+                            let _ = ctx.relation(&person_id, rel);
+                        })
+                    }
+                }
+                _ => Err(Refusal::Refused("Signal only supports blocking and unblocking.".to_owned())),
+            };
+            let _ = reply.send(outcome);
+        }
+        Command::AnswerMessageRequest { conversation_id, accept, reply } => {
+            let outcome = (|| -> Result<(), Refusal> {
+                let to = peer(&conversation_id).map_err(refused)?;
+                let action = if accept { wire::MessageRequestAction::Accept } else { wire::MessageRequestAction::Delete };
+                account.wire.respond_message_request(&to, action).map_err(refused)?;
+                if accept {
+                    let title = {
+                        let mut live = account.live();
+                        live.requests.remove(&conversation_id);
+                        live.accepted.insert(conversation_id.clone());
+                        live.names.get(&conversation_id).cloned().unwrap_or_default()
+                    };
+                    ensure_row(account, &to, &title);
+                } else {
+                    account.live().requests.remove(&conversation_id);
+                    let _ = ctx.forget_conversation(&conversation_id);
+                }
+                Ok(())
+            })();
+            let _ = reply.send(outcome);
+        }
+        Command::ReportReasons { reply, .. } => {
+            let _ = reply.send(Ok(vec![ReportReason::Spam, ReportReason::Harassment, ReportReason::Other]));
+        }
+        Command::Report { target, block, reply, .. } => {
+            let outcome = (|| -> Result<(), Refusal> {
+                let to = match &target {
+                    ReportTarget::Message { conversation, .. } | ReportTarget::Conversation(conversation) => {
+                        peer(&conversation.id).map_err(refused)?
+                    }
+                    ReportTarget::Person(person) => {
+                        if wire::is_aci(&person.id) {
+                            Peer::Direct(person.id.clone())
+                        } else {
+                            return Err(Refusal::Refused("That person isn't one Signal knows.".to_owned()));
+                        }
+                    }
+                };
+                let action = if block { wire::MessageRequestAction::BlockAndSpam } else { wire::MessageRequestAction::Spam };
+                account.wire.respond_message_request(&to, action).map_err(refused)?;
+                if block {
+                    let _ = account.wire.set_blocked(&to, true);
+                    let conv = to.conversation();
+                    {
+                        let mut live = account.live();
+                        live.blocked.insert(conv.clone());
+                        live.requests.remove(&conv);
+                    }
+                    if let Peer::Direct(aci) = &to {
+                        let _ = ctx.relation(aci, Relation::Blocked);
+                    }
+                }
+                Ok(())
+            })();
+            let _ = reply.send(outcome);
         }
         Command::SetDisappearing { conversation_id, seconds, reply } => {
             let next_version = {
@@ -2156,6 +2374,10 @@ fn start_expiry(account: &Account, conversation: &str, message_id: &str, seconds
 /// The user read up to a message: the user's other devices are told, and the authors too when
 /// the user's Signal settings send read receipts.
 fn mark_read(account: &Account, conversation: &str, message_id: &str) {
+    // Message requests from strangers send no read receipts until accepted.
+    if account.live().requests.contains(conversation) {
+        return;
+    }
     let Ok((upto, author)) = target(message_id) else {
         return;
     };
@@ -2397,7 +2619,10 @@ fn typing(account: &Account, conversation: &str) {
     };
     {
         let mut live = account.live();
-        if !live.typing || live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
+        if live.requests.contains(conversation)
+            || !live.typing
+            || live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY)
+        {
             return;
         }
         live.typed.retain(|_, told| told.elapsed() < TYPING_EVERY);

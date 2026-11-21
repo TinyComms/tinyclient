@@ -7,7 +7,7 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -63,6 +63,8 @@ enum Ask {
     SetArchived { _to: Peer, _archived: bool, answer: Sender<Result<(), Fault>> },
     SetPinned { _to: Peer, _pinned: bool, answer: Sender<Result<(), Fault>> },
     SetMarkedUnread { _to: Peer, _unread: bool, answer: Sender<Result<(), Fault>> },
+    SetBlocked { peer: Peer, blocked: bool, answer: Sender<Result<(), Fault>> },
+    RespondMessageRequest { peer: Peer, action: MessageRequestAction, answer: Sender<Result<(), Fault>> },
 }
 
 pub struct Real {
@@ -328,7 +330,7 @@ impl Real {
                     };
                     let aci = manager.registration_data().service_ids.aci.to_string();
                     let name = own_name(&mut manager).await.unwrap_or(fallback);
-                    let mut wire = Session { manager, vault, me: aci.clone(), events, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default() };
+                    let mut wire = Session { manager, vault, me: aci.clone(), events, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new() };
                     let _ = ready.send(Ok((aci, name)));
                     wire.first_run().await;
                     wire.groups_changed().await;
@@ -428,6 +430,14 @@ impl Wire for Real {
         self.ask(|answer| Ask::SetMarkedUnread { _to: to.clone(), _unread: unread, answer })
     }
 
+    fn set_blocked(&self, peer: &Peer, blocked: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetBlocked { peer: peer.clone(), blocked, answer })
+    }
+
+    fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault> {
+        self.ask(|answer| Ask::RespondMessageRequest { peer: peer.clone(), action, answer })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -502,6 +512,9 @@ struct Session {
     groups: HashMap<String, [u8; 32]>,
     /// Last revision applied for a group, and the snapshot behind it. The first one is not announced.
     known: GroupRevisions,
+    /// Currently blocked ACIs and group ids, so a `SyncMessage.blocked` write sends the full list.
+    blocked_acis: HashSet<String>,
+    blocked_groups: HashSet<String>,
 }
 
 impl Session {
@@ -1051,6 +1064,46 @@ impl Session {
         if let Some(delete) = sync.delete_for_me {
             self.deleted_for_me(delete);
         }
+        if let Some(blocked) = sync.blocked {
+            let mut people = Vec::new();
+            for aci in blocked.acis {
+                if super::wire::is_aci(&aci) {
+                    people.push(aci);
+                }
+            }
+            for raw in blocked.acis_binary {
+                if let Some(aci) = aci_bytes(&raw) {
+                    if !people.contains(&aci) {
+                        people.push(aci);
+                    }
+                }
+            }
+            let groups: Vec<String> = blocked.group_ids.into_iter().map(|id| hex(&id)).collect();
+            self.blocked_acis = people.iter().cloned().collect();
+            self.blocked_groups = groups.iter().cloned().collect();
+            self.tell(Event::Blocked { people, groups });
+        }
+        if let Some(resp) = sync.message_request_response {
+            let peer = if let Some(aci) = resp.thread_aci.filter(|s| super::wire::is_aci(s)) {
+                Some(Peer::Direct(aci))
+            } else if let Some(aci) = resp.thread_aci_binary.as_deref().and_then(aci_bytes) {
+                Some(Peer::Direct(aci))
+            } else {
+                resp.group_id.map(|id| Peer::Group(hex(&id)))
+            };
+            let action = match resp.r#type.and_then(|v| sync_message::message_request_response::Type::try_from(v).ok()) {
+                Some(sync_message::message_request_response::Type::Accept) => Some(MessageRequestAction::Accept),
+                Some(sync_message::message_request_response::Type::Delete) => Some(MessageRequestAction::Delete),
+                Some(sync_message::message_request_response::Type::Block) => Some(MessageRequestAction::Block),
+                Some(sync_message::message_request_response::Type::BlockAndDelete) => Some(MessageRequestAction::BlockAndDelete),
+                Some(sync_message::message_request_response::Type::Spam) => Some(MessageRequestAction::Spam),
+                Some(sync_message::message_request_response::Type::BlockAndSpam) => Some(MessageRequestAction::BlockAndSpam),
+                _ => None,
+            };
+            if let (Some(peer), Some(action)) = (peer, action) {
+                self.tell(Event::MessageRequestResponse { peer, action });
+            }
+        }
         if let Some(fetch) = sync.fetch_latest {
             if fetch.r#type == Some(sync_message::fetch_latest::Type::StorageManifest.into()) {
                 self.sync_storage().await;
@@ -1138,7 +1191,83 @@ impl Session {
                 // updated in chatd without risking clobbering the phone's manifest.
                 let _ = answer.send(Ok(()));
             }
+            Ask::SetBlocked { peer, blocked, answer } => {
+                let _ = answer.send(self.set_blocked(&peer, blocked).await);
+            }
+            Ask::RespondMessageRequest { peer, action, answer } => {
+                let _ = answer.send(self.respond_message_request(&peer, action).await);
+            }
         }
+    }
+
+    async fn set_blocked(&mut self, peer: &Peer, blocked: bool) -> Result<(), Fault> {
+        match peer {
+            Peer::Direct(aci) => {
+                if blocked {
+                    self.blocked_acis.insert(aci.clone());
+                } else {
+                    self.blocked_acis.remove(aci);
+                }
+            }
+            Peer::Group(id) => {
+                if blocked {
+                    self.blocked_groups.insert(id.clone());
+                } else {
+                    self.blocked_groups.remove(id);
+                }
+            }
+        }
+        let acis: Vec<String> = self.blocked_acis.iter().cloned().collect();
+        let group_ids: Vec<Vec<u8>> = self.blocked_groups.iter().filter_map(|id| unhex(id)).collect();
+        let sync = SyncMessage {
+            blocked: Some(sync_message::Blocked {
+                acis,
+                group_ids,
+                ..Default::default()
+            }),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.sync_to_self(sync).await
+    }
+
+    async fn respond_message_request(&mut self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault> {
+        let kind = match action {
+            MessageRequestAction::Accept => sync_message::message_request_response::Type::Accept,
+            MessageRequestAction::Delete => sync_message::message_request_response::Type::Delete,
+            MessageRequestAction::Block => sync_message::message_request_response::Type::Block,
+            MessageRequestAction::BlockAndDelete => sync_message::message_request_response::Type::BlockAndDelete,
+            MessageRequestAction::Spam => sync_message::message_request_response::Type::Spam,
+            MessageRequestAction::BlockAndSpam => sync_message::message_request_response::Type::BlockAndSpam,
+        };
+        let (thread_aci, group_id) = match peer {
+            Peer::Direct(aci) => (Some(aci.clone()), None),
+            Peer::Group(id) => (None, unhex(id)),
+        };
+        let sync = SyncMessage {
+            message_request_response: Some(sync_message::MessageRequestResponse {
+                thread_aci,
+                group_id,
+                r#type: Some(kind.into()),
+                ..Default::default()
+            }),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.sync_to_self(sync).await?;
+        // On Accept for a direct chat, share our profile key with the sender so they see our name.
+        if action == MessageRequestAction::Accept {
+            if let Peer::Direct(_) = peer {
+                let profile_key = self.manager.registration_data().profile_key().get_bytes().to_vec();
+                let dm = DataMessage {
+                    // DataMessage.Flags.PROFILE_KEY_UPDATE == 4.
+                    flags: Some(4),
+                    profile_key: Some(profile_key),
+                    timestamp: Some(now_ms()),
+                    ..Default::default()
+                };
+                let _ = self.deliver(peer, ContentBody::DataMessage(dm), now_ms()).await;
+            }
+        }
+        Ok(())
     }
 
     /// Name, about, emoji, and the number this device registered with. A username is not on
@@ -1523,7 +1652,7 @@ impl Linker for RealLinker {
         let name = local.block_on(&runtime, own_name(&mut manager)).unwrap_or_default();
         // Closed before the user saw it finish: undone, never left on the account.
         if cancelled.load(Ordering::Relaxed) {
-            let mut session = Session { manager, vault: store.clone(), me: aci, events: channel().0, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default() };
+            let mut session = Session { manager, vault: store.clone(), me: aci, events: channel().0, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new() };
             let _ = local.block_on(&runtime, session.unlink());
             drop(session);
             vault::remove(&pending);

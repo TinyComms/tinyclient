@@ -118,6 +118,17 @@ pub struct ChatFolder {
     pub excluded: Vec<Peer>,
 }
 
+/// Response to a Signal message request (`SyncMessage.MessageRequestResponse.Type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRequestAction {
+    Accept,
+    Delete,
+    Block,
+    BlockAndDelete,
+    Spam,
+    BlockAndSpam,
+}
+
 /// The earlier message a message answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Quote {
@@ -266,6 +277,10 @@ pub enum Event {
     },
     /// Chat folders synced from the phone's storage service.
     Folders(Vec<ChatFolder>),
+    /// Block list synced from the phone (`SyncMessage.blocked`): blocked ACIs and group public ids.
+    Blocked { people: Vec<String>, groups: Vec<String> },
+    /// A message request was answered on another device (`SyncMessage.messageRequestResponse`).
+    MessageRequestResponse { peer: Peer, action: MessageRequestAction },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -378,6 +393,10 @@ pub trait Wire: Send + Sync {
     fn set_pinned(&self, to: &Peer, pinned: bool) -> Result<(), Fault>;
     /// Marks a conversation as unread (or clears the manual unread flag).
     fn set_marked_unread(&self, to: &Peer, unread: bool) -> Result<(), Fault>;
+    /// Blocks or unblocks a person or group, syncing the updated block list to other devices.
+    fn set_blocked(&self, peer: &Peer, blocked: bool) -> Result<(), Fault>;
+    /// Responds to a message request (Accept, Delete, Block, Spam, etc.) and syncs to other devices.
+    fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault>;
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }

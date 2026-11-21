@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -59,6 +59,7 @@ use std::sync::{Arc, Mutex};
 pub const ME: &str = "a1a1a1a1-0000-4000-8000-000000000001";
 pub const GRACE: &str = "b2b2b2b2-0000-4000-8000-000000000002";
 pub const ALAN: &str = "c3c3c3c3-0000-4000-8000-000000000003";
+pub const STRANGER: &str = "d4d4d4d4-0000-4000-8000-000000000004";
 pub const CLUB: &str = "5a175a175a175a175a175a175a175a175a175a175a175a175a175a175a175a17";
 /// What the fake keeps as the key to a state it does not have.
 const VAULT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -493,6 +494,57 @@ fn steer(line: &str) -> Vec<Event> {
             }
             vec![Event::Folders(list)]
         }
+        "stranger" => {
+            let sent = next().parse().unwrap_or(T0);
+            let text = Text {
+                author: STRANGER.into(),
+                name: "Sam Stranger".into(),
+                sent,
+                text: rest(line, 2),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(STRANGER), text, outgoing: false }]
+        }
+        "blocked" => {
+            let mut people = Vec::new();
+            let mut groups = Vec::new();
+            for token in words {
+                if token == "club" {
+                    groups.push(CLUB.to_owned());
+                } else if token == "stranger" {
+                    people.push(STRANGER.to_owned());
+                } else if let Some((id, _)) = who(token) {
+                    people.push(id.to_owned());
+                } else if super::wire::is_aci(token) {
+                    people.push(token.to_owned());
+                }
+            }
+            vec![Event::Blocked { people, groups }]
+        }
+        "request-response" => {
+            let target = next();
+            let peer = if target == "club" {
+                club()
+            } else if target == "stranger" {
+                direct(STRANGER)
+            } else if let Some((id, _)) = who(target) {
+                direct(id)
+            } else if super::wire::is_aci(target) {
+                direct(target)
+            } else {
+                return Vec::new();
+            };
+            let action = match next() {
+                "accept" => MessageRequestAction::Accept,
+                "delete" => MessageRequestAction::Delete,
+                "block" => MessageRequestAction::Block,
+                "block-delete" => MessageRequestAction::BlockAndDelete,
+                "spam" => MessageRequestAction::Spam,
+                "block-spam" => MessageRequestAction::BlockAndSpam,
+                _ => return Vec::new(),
+            };
+            vec![Event::MessageRequestResponse { peer, action }]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -642,6 +694,24 @@ impl Wire for Fake {
 
     fn set_marked_unread(&self, to: &Peer, unread: bool) -> Result<(), Fault> {
         record(&format!("mark-unread {} {unread}", describe(to)));
+        Ok(())
+    }
+
+    fn set_blocked(&self, peer: &Peer, blocked: bool) -> Result<(), Fault> {
+        record(&format!("{} {}", if blocked { "block" } else { "unblock" }, describe(peer)));
+        Ok(())
+    }
+
+    fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault> {
+        let label = match action {
+            MessageRequestAction::Accept => "accept",
+            MessageRequestAction::Delete => "delete",
+            MessageRequestAction::Block => "block",
+            MessageRequestAction::BlockAndDelete => "block-delete",
+            MessageRequestAction::Spam => "spam",
+            MessageRequestAction::BlockAndSpam => "block-spam",
+        };
+        record(&format!("request-response {} {label}", describe(peer)));
         Ok(())
     }
 

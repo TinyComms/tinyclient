@@ -564,10 +564,10 @@ pub enum Item {
 
 /// Remove friend and Block, where the network has them.
 // CONTRACT: nothing says which networks can block or unfriend; friends exist where a network
-// reports one, and Block is offered where the network has a blocked list (Discord, Telegram).
+// reports one, and Block is offered where the network has a blocked list (Discord, Telegram, Signal).
 pub fn offers(person: &Person) -> (bool, bool) {
     let remove = person.relation == Relation::Friend && person.key.network == Network::Discord;
-    let block = matches!(person.key.network, Network::Discord | Network::Telegram)
+    let block = matches!(person.key.network, Network::Discord | Network::Telegram | Network::Signal)
         && person.relation != Relation::Blocked
         && !person.bot;
     (remove, block)
@@ -623,7 +623,7 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     }
     if block {
         items.push(Item::Block);
-    } else if person.relation == Relation::Blocked && matches!(person.key.network, Network::Discord | Network::Telegram) {
+    } else if person.relation == Relation::Blocked && matches!(person.key.network, Network::Discord | Network::Telegram | Network::Signal) {
         items.push(Item::Unblock);
     }
     if !person.bot && (block || matches!(person.key.network, Network::Signal | Network::Messages | Network::Teams)) {
@@ -1234,7 +1234,11 @@ mod tests {
         assert_eq!(notify_control(&signal), NotifyControl::Switch);
         let signal_person = person(Network::Signal, Relation::Contact);
         let signal_seen = Seen { in_their_dm: false, direct: Some((CallSupport::None, false)), online: true, ..Seen::default() };
-        assert!(person_menu(&signal_person, &signal_seen, false, false).contains(&Item::Mute { muted: false }));
+        let sig_menu = person_menu(&signal_person, &signal_seen, false, false);
+        assert!(sig_menu.contains(&Item::Mute { muted: false }));
+        assert!(sig_menu.contains(&Item::Block));
+        let blocked_signal = person(Network::Signal, Relation::Blocked);
+        assert!(person_menu(&blocked_signal, &signal_seen, false, false).contains(&Item::Unblock));
         assert!(!can_leave(&row(Network::Signal, ConversationKind::Group)));
         assert!(!can_leave(&row(Network::Messages, ConversationKind::Group)));
         assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));

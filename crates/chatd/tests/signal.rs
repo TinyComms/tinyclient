@@ -1549,3 +1549,85 @@ fn chat_folders_from_phone_filter_chats_and_react_to_mute_and_unread() {
     assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 1_000, GRACE) }), Response::Ok);
     world.until("Grace leaves Unread when read", || unread_ids().is_empty().then_some(()));
 }
+
+#[test]
+fn message_requests_from_strangers_and_blocking_work_end_to_end() {
+    const STRANGER: &str = "d4d4d4d4-0000-4000-8000-000000000004";
+    let world = World::linked();
+    world.connected();
+
+    // A stranger not in contacts writes first -> lands on Requests shelf with Special::Request.
+    world.steer(&format!("stranger {} Who is this?", T0 + 1_000));
+    world.arrived(STRANGER, &id(T0 + 1_000, STRANGER));
+    let req_row = world.conversation(STRANGER).expect("stranger row");
+    assert_eq!(req_row.special, protocol::Special::Request);
+
+    let Response::Conversations { conversations: reqs, .. } = world.ask(Request::Home {
+        network: Network::Signal,
+        account: Some(account()),
+        folder: None,
+        shelf: protocol::Shelf::Requests,
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Requests shelf");
+    };
+    assert!(reqs.iter().any(|c| c.key.id == STRANGER), "stranger must appear on Requests shelf");
+
+    // MarkRead and Typing on an unaccepted request send NO receipt and NO typing.
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(STRANGER), message_id: id(T0 + 1_000, STRANGER) }), Response::Ok);
+    world.ask(Request::Typing { conversation: key(STRANGER), activity: protocol::Compose::Typing });
+    sleep(Duration::from_millis(300));
+    assert!(world.calls().iter().all(|c| !c.starts_with("read ") && !c.starts_with("typing ")), "no read or typing should go to an unaccepted stranger");
+
+    // Accept moves the stranger to the main list and sends the response sync.
+    assert_eq!(world.ask(Request::AnswerMessageRequest { conversation: key(STRANGER), accept: true }), Response::Ok);
+    world.heard(&format!("request-response {STRANGER} accept"));
+    world.until("stranger promoted to normal chat", || {
+        (world.conversation(STRANGER)?.special == protocol::Special::None).then_some(())
+    });
+
+    // Block Grace via Relate: wire hears it, relation becomes Blocked, and her next message is dropped.
+    assert_eq!(world.ask(Request::Relate { person: key(GRACE), action: protocol::RelateAction::Block }), Response::Ok);
+    world.heard(&format!("block {GRACE}"));
+    world.until("Grace marked Blocked", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return None;
+        };
+        people.iter().any(|p| p.key.id == GRACE).then_some(())
+    });
+
+    world.steer(&format!("incoming grace {} Blocked msg", T0 + 2_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(GRACE).is_empty(), "messages from blocked sender must be dropped");
+
+    // Unblock Grace via Relate: wire hears it and her next message arrives.
+    assert_eq!(world.ask(Request::Relate { person: key(GRACE), action: protocol::RelateAction::Unblock }), Response::Ok);
+    world.heard(&format!("unblock {GRACE}"));
+    world.steer(&format!("incoming grace {} Back now", T0 + 3_000));
+    world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+
+    // Phone syncs block list: blocking Alan from the phone drops his message.
+    world.steer("blocked alan");
+    world.until("Alan blocked from phone", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) else {
+            return None;
+        };
+        people.iter().any(|p| p.key.id == ALAN).then_some(())
+    });
+    world.steer(&format!("incoming alan {} Should drop", T0 + 4_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(ALAN).is_empty(), "messages from phone-blocked sender must be dropped");
+}
