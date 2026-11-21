@@ -1491,10 +1491,13 @@ impl Slack {
                     None => drop(reply.send(Err(Refusal::Unsupported))),
                 }
             }
-            // Only the workspace's emoji: Slack has no GIFs or stickers of its own (see
-            // `capabilities`).
+            // Workspace custom emoji and GIF picker (`CatalogKind::Emoji` / `CatalogKind::Gifs`).
+            // Slack has no stickers catalog.
             Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
                 answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
+            }
+            Command::Catalog { kind: protocol::CatalogKind::Gifs, query, cursor, reply, .. } => {
+                answer(reply, self.gif_catalog(&query, cursor.as_deref()))
             }
             Command::ActivityFeed { kind, cursor, limit, reply } => {
                 answer(reply, self.activity_feed(kind, cursor.as_deref(), limit))
@@ -2613,17 +2616,15 @@ pub(crate) fn prove_profile_fields() -> Result<(), String> {
 }
 
 /// What a Slack account may send. The same on every plan (unverified: a workspace may lower
-/// the file limit or turn uploads off, which Slack then refuses in words). No GIF picker:
-/// Slack has no GIF search of its own. Its GIFs come from the Giphy app a workspace may
-/// install, run as `/giphy`, which a client can only reach through the web client's
-/// undocumented `chat.command` (an imitation the account rules rule out, ruling 09); any other
-/// search would be a third-party service with a key of ours. A GIF pasted as a link still
-/// unfurls, and one sent as a file plays.
+/// the file limit or turn uploads off, which Slack then refuses in words). GIFs are enabled
+/// through `CatalogKind::Gifs` (`gifs.trending` / `gifs.search`) and posted as unfurled GIF URLs;
+/// a GIF pasted as a link or sent as a file also plays.
 fn capabilities() -> protocol::Capabilities {
     protocol::Capabilities {
         max_file_bytes: send::LARGEST,
         max_files: send::FILES as u32,
         custom_emoji: protocol::EmojiScope::All,
+        gifs: true,
         schedule: true,
         suppress_embeds: true,
         search: true,

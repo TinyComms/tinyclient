@@ -556,6 +556,91 @@ impl Slack {
         Ok(CatalogPage { items, cursor: more.then(|| walked.to_string()) })
     }
 
+    /// Trending or searched GIFs for the composer's GIF picker (`CatalogKind::Gifs`).
+    /// Preview thumbnails are registered with chatd's media store; `Command::Download` never
+    /// sends Slack credentials to third-party hosts (GIPHY/Tenor).
+    pub(super) fn gif_catalog(&self, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Fault> {
+        let q = query.trim();
+        let next_in = cursor.unwrap_or("");
+        let resp = if q.is_empty() {
+            self.api("gifs.trending", &[("limit", "24"), ("cursor", next_in)])?
+        } else {
+            self.api("gifs.search", &[("q", q), ("limit", "24"), ("cursor", next_in)])?
+        };
+        let entries = resp["results"]
+            .as_array()
+            .or_else(|| resp["gifs"].as_array())
+            .or_else(|| resp["data"].as_array())
+            .map_or(&[][..], Vec::as_slice);
+        let mut items = Vec::with_capacity(entries.len());
+        let mut files = Vec::new();
+        for entry in entries {
+            let gif_url = entry["url"]
+                .as_str()
+                .or_else(|| entry["media_url"].as_str())
+                .or_else(|| entry["images"]["original"]["url"].as_str())
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"));
+            let Some(gif_url) = gif_url else {
+                continue;
+            };
+            let preview_url = entry["preview_url"]
+                .as_str()
+                .or_else(|| entry["thumb_url"].as_str())
+                .or_else(|| entry["images"]["fixed_height_small"]["url"].as_str())
+                .or_else(|| entry["images"]["fixed_width_small"]["url"].as_str())
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .unwrap_or(gif_url);
+            let width = entry["width"]
+                .as_u64()
+                .or_else(|| entry["images"]["fixed_height_small"]["width"].as_str().and_then(|s| s.parse().ok()))
+                .or_else(|| entry["images"]["original"]["width"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(240)
+                .min(u64::from(u32::MAX)) as u32;
+            let height = entry["height"]
+                .as_u64()
+                .or_else(|| entry["images"]["fixed_height_small"]["height"].as_str().and_then(|s| s.parse().ok()))
+                .or_else(|| entry["images"]["original"]["height"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(180)
+                .min(u64::from(u32::MAX)) as u32;
+            let name = entry["title"]
+                .as_str()
+                .or_else(|| entry["name"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let pack = entry["pack"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| if q.is_empty() { "Trending".to_owned() } else { String::new() });
+            let file = MediaFile {
+                width,
+                height,
+                ..MediaFile::new(format!("gif:{:x}", fnv(preview_url)), MediaKind::Image)
+            };
+            files.push((file.clone(), preview_url.to_owned()));
+            items.push(CatalogItem {
+                id: gif_url.to_owned(),
+                name,
+                file: Some(file),
+                pack,
+                animated: true,
+            });
+        }
+        if !files.is_empty() {
+            self.ctx.media(&files).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        let next_cursor = resp["response_metadata"]["next_cursor"]
+            .as_str()
+            .or_else(|| resp["next_cursor"].as_str())
+            .or_else(|| resp["next"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Ok(CatalogPage { items, cursor: next_cursor })
+    }
+
     /// The threads the user follows, asked once when the Threads list opens (and not again
     /// for ten minutes): each recorded as a followed thread with its newest replies.
     ///

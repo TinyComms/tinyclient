@@ -28,8 +28,21 @@ impl Slack {
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
     /// the files and ends the send through `Context::sent`.
     pub(super) fn send_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
-        if with.pick.is_some() {
-            return Err("Slack has no GIFs or stickers to pick from. Paste a GIF's link, or attach the file.".to_owned());
+        if let Some(pick) = &with.pick {
+            if pick.kind == protocol::CatalogKind::Gifs {
+                let url = pick.id.trim();
+                if !url.starts_with("https://") && !url.starts_with("http://") {
+                    return Err("That GIF has no link to share.".to_owned());
+                }
+                let body = if text.trim().is_empty() {
+                    url.to_owned()
+                } else {
+                    format!("{text}\n{url}")
+                };
+                // Keep unfurling enabled so Slack renders and animates the picked GIF.
+                return self.post(conversation, client_id, &body, reply_to, false, &with.spans, with.broadcast);
+            }
+            return Err("Slack has no stickers to pick from. Attach an image or GIF instead.".to_owned());
         }
         if let Some(at) = with.schedule {
             if !up.files().is_empty() {

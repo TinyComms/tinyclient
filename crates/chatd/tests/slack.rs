@@ -1040,6 +1040,44 @@ impl Fake {
                 }
                 Some(json!({"ok": true}))
             }
+            "gifs.trending" => {
+                Some(json!({
+                    "ok": true,
+                    "results": [
+                        {
+                            "title": "Party Parrot",
+                            "url": "https://media.giphy.com/media/partyparrot/giphy.gif",
+                            "preview_url": format!("{}/files-tmb/gif-party.png", self.base),
+                            "width": 320,
+                            "height": 240,
+                        },
+                        {
+                            "title": "Ship It",
+                            "url": "https://media.giphy.com/media/shipit/giphy.gif",
+                            "preview_url": format!("{}/files-tmb/gif-shipit.png", self.base),
+                            "width": 400,
+                            "height": 225,
+                        }
+                    ],
+                    "response_metadata": {"next_cursor": "gif-page-2"}
+                }))
+            }
+            "gifs.search" => {
+                let q = param("q");
+                Some(json!({
+                    "ok": true,
+                    "results": [
+                        {
+                            "title": format!("Found {q}"),
+                            "url": format!("https://media.giphy.com/media/{q}/giphy.gif"),
+                            "preview_url": format!("{}/files-tmb/gif-search-{q}.png", self.base),
+                            "width": 300,
+                            "height": 200,
+                        }
+                    ],
+                    "response_metadata": {"next_cursor": ""}
+                }))
+            }
             method => self.fixture(token, method),
         };
         found.map_or_else(|| refused("unknown_method"), ok)
@@ -2742,7 +2780,7 @@ fn rows_on_screen_get_their_newest_message_paced_and_people_carry_what_slack_say
     // What the account may send, said at connect.
     let can = world.account("T01ALPHA").can;
     assert_eq!((can.max_file_bytes, can.max_files, can.custom_emoji), (1 << 30, 10, protocol::EmojiScope::All));
-    assert!(can.schedule && can.suppress_embeds && !can.gifs && !can.stickers && !can.silent);
+    assert!(can.schedule && can.suppress_embeds && can.gifs && !can.stickers && !can.silent);
     assert!(can.search, "Enter asks Slack itself for a workspace or channel");
 }
 
@@ -5060,4 +5098,105 @@ fn slack_snippets_workspace_files_delete_and_external_files() {
         }
         other => panic!("expected Refused for cant_delete_file, got {other:?}"),
     }
+}
+
+#[test]
+fn slack_gif_picker_catalog_and_send() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let account = general.account();
+    world.general();
+
+    let can = world.account("T01ALPHA").can;
+    assert!(can.gifs && !can.stickers);
+
+    // 1. Trending GIFs catalog (`query: ""`).
+    let Response::Catalog { items: trending, cursor } = world.ask(Request::Catalog {
+        account: account.clone(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected trending GIF catalog");
+    };
+    assert_eq!(trending.len(), 2);
+    assert_eq!(trending[0].id, "https://media.giphy.com/media/partyparrot/giphy.gif");
+    assert_eq!(trending[0].pack, "Trending");
+    assert!(trending[0].animated);
+    assert_eq!(trending[0].file.as_ref().map(|f| (f.kind, f.width, f.height)), Some((MediaKind::Image, 320, 240)));
+    assert_eq!(cursor.as_deref(), Some("gif-page-2"));
+
+    // 2. Search GIFs (`query: "celebrate"`).
+    let Response::Catalog { items: hits, cursor: next } = world.ask(Request::Catalog {
+        account: account.clone(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: "celebrate".into(),
+        cursor: None,
+    }) else {
+        panic!("expected search GIF catalog");
+    };
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "https://media.giphy.com/media/celebrate/giphy.gif");
+    assert_eq!(next, None);
+    let search_call = world.fake.calls(ALPHA, "gifs.search").pop().expect("gifs.search called");
+    assert_eq!(search_call.params.get("q").map(String::as_str), Some("celebrate"));
+
+    // 3. Sending a picked GIF posts its URL with unfurling left enabled (even if suppress_embeds was set).
+    let gif_url = hits[0].id.clone();
+    let with = protocol::Outgoing {
+        pick: Some(protocol::Pick {
+            kind: protocol::CatalogKind::Gifs,
+            id: gif_url.clone(),
+        }),
+        suppress_embeds: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "5691".into(),
+            text: "woohoo".into(),
+            reply_to: None,
+            with,
+        }),
+        Response::Sent { .. }
+    ));
+    let post = world.until("GIF post sent to Slack", || {
+        world
+            .fake
+            .calls(ALPHA, "chat.postMessage")
+            .into_iter()
+            .find(|c| c.params.get("text").is_some_and(|t| t.contains(&gif_url)))
+    });
+    assert_eq!(post.params.get("text").map(String::as_str), Some(format!("woohoo\n{gif_url}").as_str()));
+    assert_eq!(post.params.get("unfurl_links"), None, "picked GIFs must not suppress unfurling");
+
+    // 4. Stickers remain cleanly refused.
+    let sticker = protocol::Outgoing {
+        pick: Some(protocol::Pick {
+            kind: protocol::CatalogKind::Stickers,
+            id: "sticker-1".into(),
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "5692".into(),
+            text: String::new(),
+            reply_to: None,
+            with: sticker,
+        }),
+        Response::Sent { .. }
+    ));
+    let failed = world.until("sticker send failed", || {
+        world.messages(&general).into_iter().find(|m| {
+            m.client_id.as_deref() == Some("5692")
+                && matches!(&m.state, SendState::Failed { reason } if reason.contains("no stickers"))
+        })
+    });
+    assert!(matches!(failed.state, SendState::Failed { .. }));
 }
