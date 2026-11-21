@@ -11,8 +11,8 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer,
-    PersonProfile, Quote, SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
+    Peer, PersonProfile, Quote, SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -641,6 +641,12 @@ impl Wire for Real {
         self.ask(|answer| Ask::PersonProfile { aci: aci.to_owned(), answer })
     }
 
+    /// Fetches link preview metadata and optional thumbnail STRICTLY through Signal's content
+    /// proxy (NEVER directly from chatd, preserving IP privacy parity with Signal Desktop).
+    fn fetch_link_preview(&self, url: &str) -> Result<Option<LinkPreview>, Fault> {
+        Ok(fetch_preview_via_signal_proxy(url))
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -1174,6 +1180,36 @@ impl Session {
         };
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
         let contacts = message.contact.iter().map(shared_contact_of).collect();
+        let mut previews = Vec::new();
+        for p in &message.preview {
+            let url = p.url.clone().unwrap_or_default();
+            if !super::wire::preview_url_in_body(&body, &url) {
+                continue;
+            }
+            let mut image = None;
+            let mut image_width = 0;
+            let mut image_height = 0;
+            if let Some(ptr) = &p.image {
+                if ptr.size.unwrap_or(0) <= 5 * 1024 * 1024 {
+                    if let Ok(bytes) = self.manager.get_attachment(ptr).await {
+                        if !bytes.is_empty() {
+                            image_width = ptr.width.unwrap_or(0);
+                            image_height = ptr.height.unwrap_or(0);
+                            image = Some(bytes);
+                        }
+                    }
+                }
+            }
+            previews.push(LinkPreview {
+                url,
+                title: p.title.clone().unwrap_or_default(),
+                description: p.description.clone().unwrap_or_default(),
+                date: p.date.unwrap_or(0),
+                image,
+                image_width,
+                image_height,
+            });
+        }
         Text {
             author: author.to_owned(),
             name,
@@ -1186,6 +1222,7 @@ impl Session {
             expire_timer: message.expire_timer.unwrap_or(0),
             expire_timer_version: message.expire_timer_version.unwrap_or(0),
             contacts,
+            previews,
         }
     }
 
@@ -1357,6 +1394,7 @@ impl Session {
             self.tell(Event::Settings {
                 read_receipts: configuration.read_receipts.unwrap_or(false),
                 typing: configuration.typing_indicators.unwrap_or(false),
+                link_previews: configuration.link_previews,
             });
         }
         if let Some(verified_sync) = sync.verified {
@@ -2561,15 +2599,42 @@ impl Session {
         let at = now_ms();
         let group_v2 = self.group_context(to)?;
         let content = match body {
-            Body::Text { text, quote, ranges, timer } => ContentBody::DataMessage(DataMessage {
-                body: Some(text),
-                body_ranges: proto_ranges(&ranges),
-                quote: quoted(quote),
-                group_v2,
-                expire_timer: (timer.seconds > 0).then_some(timer.seconds),
-                expire_timer_version: (timer.version > 0).then_some(timer.version),
-                ..Default::default()
-            }),
+            Body::Text { text, quote, ranges, timer, previews } => {
+                let mut proto_previews = Vec::with_capacity(previews.len());
+                for p in previews {
+                    let mut image_ptr = None;
+                    if let Some(bytes) = p.image.filter(|b| !b.is_empty()) {
+                        let spec = AttachmentSpec {
+                            content_type: "image/jpeg".to_owned(),
+                            length: bytes.len(),
+                            file_name: Some("preview.jpg".to_owned()),
+                            width: (p.image_width > 0).then_some(p.image_width),
+                            height: (p.image_height > 0).then_some(p.image_height),
+                            ..AttachmentSpec::default()
+                        };
+                        if let Ok(Ok(ptr)) = self.manager.upload_attachment(spec, bytes).await {
+                            image_ptr = Some(ptr);
+                        }
+                    }
+                    proto_previews.push(presage::proto::Preview {
+                        url: Some(p.url),
+                        title: (!p.title.is_empty()).then_some(p.title),
+                        description: (!p.description.is_empty()).then_some(p.description),
+                        date: (p.date > 0).then_some(p.date),
+                        image: image_ptr,
+                    });
+                }
+                ContentBody::DataMessage(DataMessage {
+                    body: Some(text),
+                    body_ranges: proto_ranges(&ranges),
+                    quote: quoted(quote),
+                    preview: proto_previews,
+                    group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
+                    ..Default::default()
+                })
+            }
             Body::Files { text, quote, files, timer } => {
                 let mut attachments = Vec::with_capacity(files.len());
                 for file in files {
@@ -2853,6 +2918,107 @@ fn quoted(quote: Option<super::wire::Quote>) -> Option<data_message::Quote> {
         text: Some(quote.text),
         r#type: Some(data_message::quote::Type::Normal.into()),
         ..Default::default()
+    })
+}
+
+/// Fetches a link preview strictly through Signal's content proxy (`contentproxy.signal.org`,
+/// overridable via `TINYCLIENT_SIGNAL_CONTENT_PROXY`). NEVER connects directly to target hosts.
+fn fetch_preview_via_signal_proxy(url: &str) -> Option<LinkPreview> {
+    use crate::adapters::tiny::preview as og;
+    use std::io::Read as _;
+    use std::time::Instant;
+
+    const MAX_REDIRECTS: usize = 3;
+    const MAX_HTML_BYTES: u64 = 512 * 1024;
+    const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024;
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    og::validate_https_url(url).ok()?;
+    let proxy_url = std::env::var("TINYCLIENT_SIGNAL_CONTENT_PROXY")
+        .unwrap_or_else(|_| "https://contentproxy.signal.org:443".to_owned());
+    let proxy = ureq::Proxy::new(proxy_url.trim()).ok()?;
+    let deadline = Instant::now() + DEADLINE;
+
+    let fetch = |start: &str, max_bytes: u64| -> Option<(String, String, Vec<u8>)> {
+        let mut current = start.to_owned();
+        for hop in 0..=MAX_REDIRECTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            og::validate_https_url(&current).ok()?;
+            let config = ureq::Agent::config_builder()
+                .proxy(Some(proxy.clone()))
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(remaining))
+                .user_agent("WhatsApp/2")
+                .build();
+            let agent = ureq::Agent::new_with_config(config);
+            let resp = agent
+                .get(&current)
+                .header("Accept", "text/html,application/xhtml+xml,image/*;q=0.8,*/*;q=0.1")
+                .call()
+                .ok()?;
+            let status = resp.status().as_u16();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if hop == MAX_REDIRECTS {
+                    return None;
+                }
+                let loc = resp.headers().get("location").and_then(|v| v.to_str().ok())?;
+                current = og::resolve_redirect(&current, loc)?;
+                continue;
+            }
+            if !(200..300).contains(&status) {
+                return None;
+            }
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mut buf = Vec::new();
+            resp.into_body().into_reader().take(max_bytes).read_to_end(&mut buf).ok()?;
+            return Some((current, content_type, buf));
+        }
+        None
+    };
+
+    let (final_url, content_type, html_bytes) = fetch(url, MAX_HTML_BYTES)?;
+    if !content_type.is_empty()
+        && !content_type.contains("text/html")
+        && !content_type.contains("application/xhtml")
+    {
+        return None;
+    }
+    let html = String::from_utf8_lossy(&html_bytes);
+    let parsed = og::parse_html_metadata(&html, url)?;
+    let mut image = None;
+    let mut image_width = 0;
+    let mut image_height = 0;
+    if let Some(img_ref) = parsed.image_url {
+        if let Some(resolved) = og::resolve_redirect(&final_url, &img_ref) {
+            if let Some((_, _, img_bytes)) = fetch(&resolved, MAX_IMAGE_BYTES) {
+                if let Some(reencoded) = og::reencode_preview_image(&img_bytes) {
+                    image_width = reencoded.width;
+                    image_height = reencoded.height;
+                    image = Some(reencoded.jpeg);
+                }
+            }
+        }
+    }
+    if parsed.title.is_empty() && parsed.description.is_empty() && image.is_none() {
+        return None;
+    }
+    Some(LinkPreview {
+        url: url.to_owned(),
+        title: parsed.title,
+        description: parsed.description,
+        date: 0,
+        image,
+        image_width,
+        image_height,
     })
 }
 

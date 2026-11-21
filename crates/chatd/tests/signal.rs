@@ -2416,3 +2416,87 @@ fn person_profile_returns_about_badges_masked_phone_username_shared_groups_nickn
     };
     assert_eq!(stranger.bio, "Name not shared yet");
 }
+
+#[test]
+fn link_previews_render_on_receive_ignore_mismatched_urls_and_honor_setting_and_suppress_on_send() {
+    let world = World::linked();
+    world.connected();
+
+    // Receive: a preview whose URL appears in the message body populates Message::previews.
+    world.steer("preview grace 1791892810000 https://example.org/bridge | Bridge Rules | Contract bridge guide | Read https://example.org/bridge tonight");
+    let received = world.until("incoming preview message stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text.contains("https://example.org/bridge"))
+    });
+    assert_eq!(received.previews.len(), 1);
+    assert_eq!(received.previews[0].url, "https://example.org/bridge");
+    assert_eq!(received.previews[0].site, "example.org");
+    assert_eq!(received.previews[0].title, "Bridge Rules");
+    assert_eq!(received.previews[0].description, "Contract bridge guide");
+
+    // Receive: a preview whose URL does NOT appear in the body must be ignored.
+    world.steer("preview grace 1791892820000 https://evil.example.net/phish | Spoofed | Fake card | Check out https://example.org/safe");
+    let spoofed = world.until("mismatched preview message stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text.contains("https://example.org/safe"))
+    });
+    assert!(
+        spoofed.previews.is_empty(),
+        "preview whose URL is not in body must be ignored, got {:?}",
+        spoofed.previews
+    );
+
+    // Send with link previews enabled: fetches via Signal content proxy and attaches preview.
+    world.send(GRACE, "lp-send-1", "Look at https://rust-lang.org/news", None);
+    let sent_with_preview = world.until("outgoing preview echoed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text == "Look at https://rust-lang.org/news" && m.id != "lp-send-1")
+    });
+    assert_eq!(sent_with_preview.previews.len(), 1);
+    assert_eq!(sent_with_preview.previews[0].url, "https://rust-lang.org/news");
+    assert_eq!(sent_with_preview.previews[0].title, "Preview for rust-lang.org");
+    assert!(world.calls().contains(&"preview-fetch https://rust-lang.org/news".to_owned()));
+
+    // Send with composer remove chip (`suppress_embeds: true`): skips preview fetch and sends no preview.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "lp-send-2".into(),
+        text: "No card for https://suppressed.example.org/page".into(),
+        reply_to: None,
+        with: Outgoing {
+            suppress_embeds: true,
+            ..Outgoing::default()
+        },
+    });
+    let sent_suppressed = world.until("suppressed send stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text == "No card for https://suppressed.example.org/page" && m.id != "lp-send-2")
+    });
+    assert!(sent_suppressed.previews.is_empty());
+    assert!(!world.calls().iter().any(|c| c.contains("suppressed.example.org") && c.starts_with("preview-fetch")));
+
+    // Configuration sync disables "Generate link previews": subsequent sends fetch no preview.
+    world.steer("link-previews off");
+    world.until("capabilities drop suppress_embeds when link previews disabled", || {
+        let (accounts, _) = world.status();
+        let acct = accounts.iter().find(|a| a.key.network == Network::Signal)?;
+        (!acct.can.suppress_embeds).then_some(())
+    });
+    world.send(GRACE, "lp-send-3", "Setting off https://disabled.example.org/page", None);
+    let sent_disabled = world.until("disabled send stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text == "Setting off https://disabled.example.org/page" && m.id != "lp-send-3")
+    });
+    assert!(sent_disabled.previews.is_empty());
+    assert!(!world.calls().iter().any(|c| c.contains("disabled.example.org") && c.starts_with("preview-fetch")));
+}

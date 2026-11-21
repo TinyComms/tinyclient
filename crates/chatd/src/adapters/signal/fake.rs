@@ -50,8 +50,8 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer,
-    PersonProfile, Quote, SafetyNumber, StorageSnapshot, Text, Wire,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
+    Peer, PersonProfile, Quote, SafetyNumber, StorageSnapshot, Text, Wire,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -227,7 +227,7 @@ impl Fake {
         let _ = events.send(Event::Contacts(vec![grace, alan]));
         let club_state = FakeGroup::initial();
         let _ = events.send(Event::Groups(vec![club_state.info.clone()]));
-        let _ = events.send(Event::Settings { read_receipts: true, typing: true });
+        let _ = events.send(Event::Settings { read_receipts: true, typing: true, link_previews: Some(true) });
         let manifest_path = protocol::support_dir().join("signal.storage.json");
         if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
             if let Ok(snapshot) = serde_json::from_str::<StorageSnapshot>(&raw) {
@@ -578,7 +578,40 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
         }
         "receipts" => {
             let read_receipts = next() != "off";
-            vec![Event::Settings { read_receipts, typing: true }]
+            vec![Event::Settings { read_receipts, typing: true, link_previews: None }]
+        }
+        "link-previews" => {
+            let enabled = next() != "off";
+            vec![Event::Settings { read_receipts: true, typing: true, link_previews: Some(enabled) }]
+        }
+        "preview" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let payload = rest(line, 3);
+            let parts: Vec<&str> = payload.split('|').map(str::trim).collect();
+            let url = parts.first().copied().unwrap_or("").to_owned();
+            let title = parts.get(1).copied().unwrap_or("").to_owned();
+            let description = parts.get(2).copied().unwrap_or("").to_owned();
+            let body = parts.get(3).copied().unwrap_or("").to_owned();
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                text: body,
+                previews: vec![LinkPreview {
+                    url,
+                    title,
+                    description,
+                    date: sent,
+                    image: None,
+                    image_width: 0,
+                    image_height: 0,
+                }],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
         }
         "typing" | "typing-stop" => {
             let Some((by, name)) = who(next()) else {
@@ -974,11 +1007,29 @@ impl Wire for Fake {
         let exp = |timer: super::wire::Timer| {
             if timer.seconds > 0 { format!(" expire={}", timer.seconds) } else { String::new() }
         };
-        let line = match &body {
-            Body::Text { text, quote: Some(quote), ranges, timer } => {
-                format!("send {} text {text}{}{} (answering {}-{})", describe(to), noted(ranges), exp(*timer), quote.sent, quote.author)
+        let prev = |previews: &[LinkPreview]| {
+            if previews.is_empty() {
+                String::new()
+            } else {
+                let urls: Vec<&str> = previews.iter().map(|p| p.url.as_str()).collect();
+                format!(" previews={}", urls.join(","))
             }
-            Body::Text { text, quote: None, ranges, timer } => format!("send {} text {text}{}{}", describe(to), noted(ranges), exp(*timer)),
+        };
+        let line = match &body {
+            Body::Text { text, quote: Some(quote), ranges, timer, previews } => {
+                format!(
+                    "send {} text {text}{}{}{} (answering {}-{})",
+                    describe(to),
+                    noted(ranges),
+                    exp(*timer),
+                    prev(previews),
+                    quote.sent,
+                    quote.author
+                )
+            }
+            Body::Text { text, quote: None, ranges, timer, previews } => {
+                format!("send {} text {text}{}{}{}", describe(to), noted(ranges), exp(*timer), prev(previews))
+            }
             Body::Files { text, quote, files, timer } => {
                 let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
                 format!("{}{}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), exp(*timer))
@@ -1564,6 +1615,26 @@ impl Wire for Fake {
             .cloned()
             .unwrap_or(PersonProfile { key_known: false, ..PersonProfile::default() });
         Ok(found)
+    }
+
+    fn fetch_link_preview(&self, url: &str) -> Result<Option<LinkPreview>, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("preview-fetch {url}"));
+        let host = crate::adapters::tiny::preview::real_host(url);
+        if host.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(LinkPreview {
+            url: url.to_owned(),
+            title: format!("Preview for {host}"),
+            description: "Fetched via Signal content proxy".to_owned(),
+            date: 0,
+            image: None,
+            image_width: 0,
+            image_height: 0,
+        }))
     }
 
     fn close(&self) {

@@ -1097,7 +1097,7 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
     show_self(&account);
     // Nothing is counted until an adapter says so; Signal counts its own body limit.
-    ctx.capabilities(capabilities());
+    ctx.capabilities(capabilities(account.live().link_previews));
     *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
     if ctx.stopped() {
@@ -1226,6 +1226,27 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
         message.kind = MessageKind::Unsupported { link: String::new() };
     }
     message.contacts = text.contacts.clone();
+    for (idx, preview) in text.previews.iter().enumerate() {
+        if !wire::preview_url_in_body(&text.text, &preview.url) {
+            continue;
+        }
+        let image = preview.image.as_ref().filter(|b| !b.is_empty()).and_then(|bytes| {
+            let mut file = MediaFile::new(format!("signal:preview:{}:{}:{idx}", text.sent, author), MediaKind::Image);
+            file.width = preview.image_width;
+            file.height = preview.image_height;
+            file.bytes = bytes.len() as u64;
+            account
+                .ctx
+                .landed(&file, &format!("signal://preview/{}/{}/{idx}", text.sent, author), bytes)
+        });
+        message.previews.push(protocol::Preview {
+            url: preview.url.clone(),
+            site: crate::adapters::tiny::preview::real_host(&preview.url),
+            title: preview.title.clone(),
+            description: preview.description.clone(),
+            image,
+        });
+    }
     if wire::find_group_invite_link(&message.text).is_some() {
         message.card = Some(Box::new(protocol::Card {
             title: "Signal group invite".to_owned(),
@@ -1615,10 +1636,21 @@ fn apply(account: &Account, event: Event) {
                 entry.admin_passkey = admin_passkey;
             }
         }
-        Event::Settings { read_receipts, typing } => {
-            let mut live = account.live();
-            live.read_receipts = read_receipts;
-            live.typing = typing;
+        Event::Settings { read_receipts, typing, link_previews } => {
+            let updated_lp = {
+                let mut live = account.live();
+                live.read_receipts = read_receipts;
+                live.typing = typing;
+                if let Some(lp) = link_previews {
+                    live.link_previews = lp;
+                    Some(lp)
+                } else {
+                    None
+                }
+            };
+            if let Some(lp) = updated_lp {
+                ctx.capabilities(capabilities(lp));
+            }
         }
         Event::TimerChanged { peer, seconds, version } => {
             let conversation = peer.conversation();
@@ -1856,6 +1888,7 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     let mut mark_updates: Vec<(String, Option<Mark>)> = Vec::new();
     let mut people_rows: Vec<PersonRow> = Vec::new();
     let mut seed_rows: Vec<(Peer, String)> = Vec::new();
+    let mut updated_link_previews: Option<bool> = None;
     {
         let mut live = account.live();
         if let Some(acct) = snapshot.account {
@@ -1864,6 +1897,7 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
             }
             if let Some(lp) = acct.link_previews {
                 live.link_previews = lp;
+                updated_link_previews = Some(lp);
             }
             live.default_timer = acct.universal_expire_timer;
             for old in &live.pinned {
@@ -2043,6 +2077,9 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     }
     for conv in to_file {
         sync_filing(account, &conv);
+    }
+    if let Some(lp) = updated_link_previews {
+        ctx.capabilities(capabilities(lp));
     }
 }
 
@@ -2432,7 +2469,7 @@ pub fn reaction_rules() -> protocol::ReactionRules {
 /// What this account may send: text up to the body other clients keep in the message itself,
 /// files up to Signal's limits, and a one-day edit window (how long Signal Desktop still sends an
 /// edit; a late delete is delete-for-me instead, decided in `delete`).
-fn capabilities() -> protocol::Capabilities {
+fn capabilities(link_previews: bool) -> protocol::Capabilities {
     let files = files::capabilities();
     protocol::Capabilities {
         text_limit: TEXT_LIMIT,
@@ -2445,6 +2482,7 @@ fn capabilities() -> protocol::Capabilities {
         delete: true,
         pins: false,
         forward: false,
+        suppress_embeds: link_previews,
         polls: Some(protocol::PollCapabilities {
             max_options: protocol::POLL_OPTIONS as u8,
             max_duration_secs: 0,
@@ -2552,7 +2590,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(outcome);
         }
         Command::Send { conversation_id, client_id, text, reply_to } => {
-            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[]);
+            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[], false);
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -3523,15 +3561,50 @@ fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Re
     })
 }
 
-fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span]) -> Result<Message, Fault> {
+fn send_text(
+    account: &Account,
+    conversation: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    mention_spans: &[Span],
+    suppress_embeds: bool,
+) -> Result<Message, Fault> {
     let to = peer(conversation)?;
     let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
     let shown = style::apply(&wire_body, &ranges, &account.me);
     let quote = quote_of(account, conversation, reply_to)?;
-    let timer = account.live().timer_of(conversation);
-    let sent = account.wire.send(&to, Body::Text { text: wire_body, quote: quote.clone(), ranges, timer })?;
+    let (timer, previews_enabled) = {
+        let live = account.live();
+        (live.timer_of(conversation), live.link_previews)
+    };
+    let mut previews = Vec::new();
+    if previews_enabled && !suppress_embeds {
+        if let Some(url) = crate::adapters::tiny::preview::first_https_url(&wire_body) {
+            if let Ok(Some(fetched)) = account.wire.fetch_link_preview(&url) {
+                if wire::preview_url_in_body(&shown.text, &fetched.url) {
+                    previews.push(fetched);
+                }
+            }
+        }
+    }
+    let sent = account.wire.send(&to, Body::Text {
+        text: wire_body,
+        quote: quote.clone(),
+        ranges,
+        timer,
+        previews: previews.clone(),
+    })?;
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: shown.text, spans: shown.spans, quote, ..Text::default() };
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        text: shown.text,
+        spans: shown.spans,
+        quote,
+        previews,
+        ..Text::default()
+    };
     let mut message = message(account, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
@@ -3569,7 +3642,7 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
             account.ctx.sent(conversation, client_id, outcome);
             return;
         }
-        let outcome = send_text(account, conversation, text, reply_to, &with.spans).map_err(|fault| fault.words());
+        let outcome = send_text(account, conversation, text, reply_to, &with.spans, with.suppress_embeds).map_err(|fault| fault.words());
         account.ctx.sent(conversation, client_id, outcome);
         return;
     }

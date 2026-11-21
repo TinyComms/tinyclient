@@ -493,6 +493,29 @@ pub struct Quote {
     pub spans: Vec<Span>,
 }
 
+/// One link preview carried on a Signal `DataMessage.preview`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub date: u64,
+    /// Decrypted preview thumbnail bytes (JPEG/PNG/WebP), when attached.
+    pub image: Option<Vec<u8>>,
+    pub image_width: u32,
+    pub image_height: u32,
+}
+
+/// Returns true only when `url` is a valid `http://` or `https://` URL that actually appears
+/// in the message `body` (matching Signal Desktop/Android/iOS validation).
+pub fn preview_url_in_body(body: &str, url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+        return false;
+    }
+    body.contains(url)
+}
+
 /// One message's words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Text {
@@ -515,6 +538,8 @@ pub struct Text {
     pub expire_timer_version: u32,
     /// Shared contact cards attached to this message.
     pub contacts: Vec<protocol::SharedContact>,
+    /// Link previews attached to this message (`DataMessage.preview`).
+    pub previews: Vec<LinkPreview>,
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -641,7 +666,7 @@ pub enum Event {
         admin_passkey: Option<Vec<u8>>,
     },
     /// The user's own settings, as the phone shares them.
-    Settings { read_receipts: bool, typing: bool },
+    Settings { read_receipts: bool, typing: bool, link_previews: Option<bool> },
     /// A conversation's disappearing-messages timer changed (0 turns it off).
     TimerChanged { peer: Peer, seconds: u32, version: u32 },
     /// Per-conversation mute, archive, pin, and mark-unread state from the phone / storage service.
@@ -790,7 +815,7 @@ pub struct File {
 /// What is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    Text { text: String, quote: Option<Quote>, ranges: Vec<Range>, timer: Timer },
+    Text { text: String, quote: Option<Quote>, ranges: Vec<Range>, timer: Timer, previews: Vec<LinkPreview> },
     /// Files, with the caption in `text` (empty when there is none).
     Files { text: String, quote: Option<Quote>, files: Vec<File>, timer: Timer },
     React { author: String, target: u64, emoji: String, remove: bool },
@@ -969,6 +994,10 @@ pub trait Wire: Send + Sync {
     fn person_profile(&self, _aci: &str) -> Result<PersonProfile, Fault> {
         Ok(PersonProfile::default())
     }
+    /// Fetches a link preview strictly through Signal's content proxy (NEVER directly).
+    fn fetch_link_preview(&self, _url: &str) -> Result<Option<LinkPreview>, Fault> {
+        Ok(None)
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
@@ -1117,5 +1146,14 @@ mod tests {
         let v2_ba = safety_number_for_acis(b_aci, &bob_key, a_aci, &alice_key).unwrap();
         assert_eq!(v2_ab.len(), 60);
         assert_eq!(v2_ab, v2_ba);
+    }
+
+    #[test]
+    fn preview_url_must_appear_in_message_body() {
+        assert!(preview_url_in_body("See https://example.org/post for details", "https://example.org/post"));
+        assert!(!preview_url_in_body("See https://example.org/post for details", "https://evil.example.net/phish"));
+        assert!(!preview_url_in_body("No links here", "https://example.org/post"));
+        assert!(!preview_url_in_body("javascript:alert(1)", "javascript:alert(1)"));
+        assert!(!preview_url_in_body("anything", ""));
     }
 }
