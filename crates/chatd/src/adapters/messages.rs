@@ -12,7 +12,10 @@ mod fake;
 mod media;
 pub mod signin;
 
-use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, SharedPage, Signed};
+use super::{
+    keep_connected, serve_commands, Command, Context, ConversationAbout, Failure, Members, Refusal,
+    SharedPage, Signed,
+};
 use crate::blobs;
 use crate::blobs::upload;
 use crate::session;
@@ -1646,6 +1649,20 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answer.map_err(Refusal::Refused));
         }
+        Command::Members {
+            conversation_id,
+            offset,
+            limit,
+            reply,
+        } => {
+            let _ = reply.send(members(account, &conversation_id, offset, limit));
+        }
+        Command::ConversationInfo {
+            conversation_id,
+            reply,
+        } => {
+            let _ = reply.send(conversation_info(account, &conversation_id));
+        }
         Command::Handoff { conversation_id, reply } => {
             let url = account
                 .chats
@@ -2541,6 +2558,70 @@ fn ask_fill(account: &Account) {
 
 /// Media, files and links from the messages already read. Only once this chat has been read back
 /// to its start, so the list is the whole chat and not a page that was still loading.
+fn members(
+    account: &Account,
+    conversation: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Members, Refusal> {
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned()
+        .ok_or_else(|| Refusal::Refused("no such conversation".into()))?;
+    let slice = chat
+        .participants
+        .iter()
+        .skip(offset as usize)
+        .take(limit as usize);
+    let members = slice
+        .map(|participant| {
+            let id = if !participant.id.is_empty() {
+                participant.id.clone()
+            } else if !participant.number.is_empty() {
+                participant.number.clone()
+            } else {
+                conversation.to_owned()
+            };
+            let name = if !participant.name.is_empty() {
+                participant.name.clone()
+            } else if participant.is_me && !account.name.is_empty() {
+                account.name.clone()
+            } else if !participant.number.is_empty() {
+                participant.number.clone()
+            } else {
+                "Messages".to_owned()
+            };
+            protocol::Person::new(account.ctx.key(&id), name)
+        })
+        .collect();
+    Ok(Members {
+        pending: false,
+        sections: Vec::new(),
+        members,
+    })
+}
+
+fn conversation_info(
+    account: &Account,
+    conversation: &str,
+) -> Result<ConversationAbout, Refusal> {
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned()
+        .ok_or_else(|| Refusal::Refused("no such conversation".into()))?;
+    let members = (!chat.participants.is_empty()).then_some(chat.participants.len() as u32);
+    Ok(ConversationAbout {
+        members,
+        ..ConversationAbout::default()
+    })
+}
+
 fn shared(
     account: &Account,
     conversation: &str,
