@@ -7,9 +7,10 @@ mod test_mediad;
 
 use base64::Engine;
 use protocol::{
-    read_frame, write_frame, AccountKey, Call, CallState, CallSupport, Change, Conversation, ConversationKind,
-    ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Occupants, Page, Person,
-    Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, SendState, Style, Watching,
+    read_frame, write_frame, AccountKey, AutomodAction, AutomodRule, AutomodTrigger, Call, CallState, CallSupport,
+    Change, Conversation, ConversationKind, ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind,
+    Network, Occupants, Page, Person, Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response,
+    SendState, SpaceSafety, Style, Watching,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -5695,4 +5696,295 @@ fn audit_log_requires_view_audit_log_and_pages_unknown_actions() {
         gets[1].path,
         "/guilds/4000/audit-logs?limit=100&user_id=2001&action_type=22&before=1300000000000000090"
     );
+}
+
+#[test]
+fn automod_lists_and_edits_with_manage_guild_and_refuses_without() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add MANAGE_GUILD (1<<5) to guild 4000's @everyone role. Guild 4888 stays VIEW_CHANNEL only.
+    let current = ready["guilds"][0]["roles"][0]["permissions"].as_str().unwrap().parse::<u64>().unwrap();
+    ready["guilds"][0]["roles"][0]["permissions"] = json!((current | (1u64 << 5)).to_string());
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4888",
+        "properties": {"id": "4888", "name": "ReadOnly", "owner_id": "2001", "icon": null},
+        "roles": [{"id": "4888", "name": "@everyone", "permissions": "1024"}],
+        "channels": [{"id": "4881", "type": 0, "name": "lobby", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let g4000 = spaces.iter().find(|s| s.key.id == "4000").expect("4000");
+            let g4888 = spaces.iter().find(|s| s.key.id == "4888").expect("4888");
+            assert!(g4000.rights.manage_server, "MANAGE_GUILD must show safety setup");
+            assert!(!g4888.rights.manage_server);
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+
+    let refused = |response: Response| match response {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("permission"), "expected a permission refusal, got {detail}");
+        }
+        other => panic!("expected Refused without MANAGE_GUILD, got {other:?}"),
+    };
+    refused(world.ask(Request::AutomodRules { space: world.key("4888") }));
+    refused(world.ask(Request::SaveAutomodRule {
+        space: world.key("4888"),
+        rule: AutomodRule {
+            name: "Should not send".into(),
+            enabled: true,
+            trigger: AutomodTrigger::Spam,
+            actions: vec![AutomodAction::Block { message: String::new() }],
+            ..AutomodRule::default()
+        },
+    }));
+    refused(world.ask(Request::DeleteAutomodRule { space: world.key("4888"), id: "9101".into() }));
+    refused(world.ask(Request::SaveSpaceSafety { space: world.key("4888"), safety: SpaceSafety::default() }));
+    // Onboarding is fetched on connect under this guild. Do not use a prefix that matches it.
+    assert!(world.discord.requests_to("GET", "/guilds/4888/auto-moderation").is_empty());
+    assert!(world.discord.requests_to("POST", "/guilds/4888/auto-moderation").is_empty());
+    assert!(world.discord.requests_to("PATCH", "/guilds/4888/auto-moderation").is_empty());
+    assert!(world.discord.requests_to("DELETE", "/guilds/4888/auto-moderation").is_empty());
+    assert!(world.discord.requests_to("PATCH", "/guilds/4888").iter().all(|seen| seen.path != "/guilds/4888"));
+    assert!(world.discord.requests_to("PUT", "/guilds/4888/incident-actions").is_empty());
+
+    let keyword = json!({
+        "id": "9101",
+        "name": "No finance talk",
+        "enabled": true,
+        "event_type": 1,
+        "trigger_type": 1,
+        "trigger_metadata": {
+            "keyword_filter": ["invoice"],
+            "regex_patterns": [r"\d{4}"],
+            "allow_list": ["invoice number"]
+        },
+        "actions": [
+            {"type": 1, "metadata": {"custom_message": "Keep it in #finance"}},
+            {"type": 2, "metadata": {"channel_id": "4101"}},
+            {"type": 3, "metadata": {"duration_seconds": 60}}
+        ],
+        "exempt_roles": ["4010"],
+        "exempt_channels": ["4102"]
+    });
+    let rules = json!([
+        keyword,
+        {
+            "id": "9103",
+            "name": "Spam",
+            "enabled": true,
+            "event_type": 1,
+            "trigger_type": 3,
+            "trigger_metadata": {},
+            "actions": [{"type": 1, "metadata": {}}],
+            "exempt_roles": [],
+            "exempt_channels": []
+        },
+        {
+            "id": "9104",
+            "name": "Presets",
+            "enabled": true,
+            "event_type": 1,
+            "trigger_type": 4,
+            "trigger_metadata": {"presets": [1, 3], "allow_list": ["ok"]},
+            "actions": [{"type": 1, "metadata": {}}],
+            "exempt_roles": [],
+            "exempt_channels": []
+        },
+        {
+            "id": "9105",
+            "name": "Mentions",
+            "enabled": true,
+            "event_type": 1,
+            "trigger_type": 5,
+            "trigger_metadata": {"mention_total_limit": 5, "mention_raid_protection_enabled": true},
+            "actions": [{"type": 1, "metadata": {}}],
+            "exempt_roles": [],
+            "exempt_channels": []
+        },
+        {
+            "id": "9106",
+            "name": "Profile",
+            "enabled": true,
+            "event_type": 1,
+            "trigger_type": 6,
+            "trigger_metadata": {"keyword_filter": ["bio"], "regex_patterns": [], "allow_list": []},
+            "actions": [{"type": 1, "metadata": {}}],
+            "exempt_roles": [],
+            "exempt_channels": []
+        },
+        {
+            "id": "9107",
+            "guild_id": "4000",
+            "creator_id": "1000",
+            "name": "Mystery",
+            "enabled": true,
+            "event_type": 1,
+            "trigger_type": 7,
+            "trigger_metadata": {"mystery": "leave-me", "script": "rm -rf"},
+            "actions": [{"type": 9, "metadata": {"command": "echo pwned", "custom_message": "nope"}}],
+            "exempt_roles": [],
+            "exempt_channels": []
+        }
+    ]);
+    // GET and PATCH of the guild share one path queue. The list reads the first; the later save reads the second.
+    world.discord.script("/guilds/4000/auto-moderation/rules", 200, rules);
+    world.discord.script(
+        "/guilds/4000",
+        200,
+        json!({
+            "id": "4000",
+            "verification_level": 2,
+            "explicit_content_filter": 1,
+            "incidents_data": {"invites_disabled_until": null, "dms_disabled_until": null}
+        }),
+    );
+    world.discord.script("/guilds/4000", 200, json!({}));
+    world.discord.script("/guilds/4000/incident-actions", 200, json!({}));
+    world.discord.script("/guilds/4000/auto-moderation/rules/9101", 200, Value::Null);
+    world.discord.script("/guilds/4000/auto-moderation/rules/9107", 200, Value::Null);
+
+    let (rules, safety) = match world.ask(Request::AutomodRules { space: world.key("4000") }) {
+        Response::AutomodRules { rules, safety } => (rules, safety),
+        other => panic!("expected AutomodRules, got {other:?}"),
+    };
+    assert_eq!(rules.len(), 6);
+    assert_eq!((safety.verification_level, safety.explicit_filter), (2, 1));
+    assert_eq!((safety.invites_paused_until, safety.dms_paused_until), (0, 0));
+    let by_id = |id: &str| rules.iter().find(|rule| rule.id == id).unwrap_or_else(|| panic!("missing {id}")).clone();
+    let keyword = by_id("9101");
+    assert!(!keyword.read_only);
+    assert!(matches!(&keyword.trigger, AutomodTrigger::Keyword { keywords, regex, allow }
+        if keywords.as_slice() == ["invoice"] && regex.as_slice() == [r"\d{4}"] && allow.as_slice() == ["invoice number"]));
+    assert!(matches!(&keyword.actions[0], AutomodAction::Block { message } if message == "Keep it in #finance"));
+    assert!(matches!(&by_id("9103").trigger, AutomodTrigger::Spam));
+    assert!(matches!(&by_id("9104").trigger, AutomodTrigger::Preset { presets, .. } if presets.as_slice() == [1, 3]));
+    assert!(matches!(&by_id("9105").trigger, AutomodTrigger::Mention { limit: 5, raid_protection: true }));
+    let profile = by_id("9106");
+    assert!(!profile.read_only);
+    assert_eq!(profile.event_type, 2, "a profile rule watches member updates");
+    assert!(matches!(&profile.trigger, AutomodTrigger::Profile { .. }));
+    let mystery = by_id("9107");
+    assert!(mystery.read_only);
+    assert!(matches!(&mystery.trigger, AutomodTrigger::Other { code: 7, .. }));
+    assert!(mystery.raw.contains("mystery") && mystery.raw.contains("command"));
+    let gets = world.discord.requests_to("GET", "/guilds/4000/auto-moderation/rules");
+    assert_eq!(gets.len(), 1);
+    assert_eq!(gets[0].path, "/guilds/4000/auto-moderation/rules");
+    assert_eq!(
+        world.discord.requests_to("GET", "/guilds/4000").iter().filter(|seen| seen.path == "/guilds/4000").count(),
+        1
+    );
+
+    let mut edited = keyword.clone();
+    let AutomodTrigger::Keyword { keywords, .. } = &mut edited.trigger else { panic!("keyword rule") };
+    keywords.push("wire".into());
+    match world.ask(Request::SaveAutomodRule { space: world.key("4000"), rule: edited }) {
+        Response::AutomodRule { rule } => {
+            assert!(matches!(&rule.trigger, AutomodTrigger::Keyword { keywords, .. } if keywords.iter().any(|word| word == "wire")));
+        }
+        other => panic!("expected the edited rule, got {other:?}"),
+    }
+    let patches = world.discord.requests_to("PATCH", "/guilds/4000/auto-moderation/rules/9101");
+    assert_eq!(patches.len(), 1);
+    let body = &patches[0].body;
+    assert_eq!(body["trigger_metadata"]["keyword_filter"], json!(["invoice", "wire"]));
+    assert_eq!(body["trigger_metadata"]["regex_patterns"], json!([r"\d{4}"]));
+    assert_eq!(body["actions"][0]["metadata"]["custom_message"], "Keep it in #finance");
+    let text = body.to_string();
+    assert!(!text.contains("\"command\""), "a block message is display text, not a command");
+    assert!(!text.contains("\"content\""), "a rule action must not carry a content field");
+
+    match world.ask(Request::SaveAutomodRule { space: world.key("4000"), rule: mystery }) {
+        Response::AutomodRule { rule } => assert!(rule.read_only),
+        other => panic!("expected the unknown rule saved untouched, got {other:?}"),
+    }
+    let untouched = world.discord.requests_to("PATCH", "/guilds/4000/auto-moderation/rules/9107");
+    assert_eq!(untouched.len(), 1);
+    let body = &untouched[0].body;
+    assert_eq!(body["trigger_metadata"], json!({"mystery": "leave-me", "script": "rm -rf"}));
+    assert_eq!(body["actions"][0]["type"], 9);
+    assert_eq!(body["actions"][0]["metadata"], json!({"command": "echo pwned", "custom_message": "nope"}));
+    assert!(body.get("id").is_none());
+    assert!(body.get("guild_id").is_none());
+    assert!(body.get("creator_id").is_none());
+    assert!(world.discord.requests_to("POST", "/guilds/4000/auto-moderation").is_empty());
+
+    let mut blocked = keyword;
+    let AutomodAction::Block { message } = &mut blocked.actions[0] else { panic!("block action") };
+    *message = "line\n/bin/sh".into();
+    match world.ask(Request::SaveAutomodRule { space: world.key("4000"), rule: blocked }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("control"), "expected a control-character refusal, got {detail}");
+        }
+        other => panic!("expected a local refusal, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("PATCH", "/guilds/4000/auto-moderation/rules/9101").len(), 1);
+
+    let guild_patches = || {
+        world.discord.requests_to("PATCH", "/guilds/4000").into_iter().filter(|seen| seen.path == "/guilds/4000").count()
+    };
+    match world.ask(Request::SaveSpaceSafety {
+        space: world.key("4000"),
+        safety: SpaceSafety { verification_level: 9, explicit_filter: 1, ..SpaceSafety::default() },
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Verification"), "expected a verification refusal, got {detail}");
+        }
+        other => panic!("expected a local refusal, got {other:?}"),
+    }
+    match world.ask(Request::SaveSpaceSafety {
+        space: world.key("4000"),
+        safety: SpaceSafety { verification_level: 2, explicit_filter: 9, ..SpaceSafety::default() },
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("explicit"), "expected an explicit-filter refusal, got {detail}");
+        }
+        other => panic!("expected a local refusal, got {other:?}"),
+    }
+    assert_eq!(guild_patches(), 0, "an out-of-range level is refused before Discord is asked");
+    assert!(world.discord.requests_to("PUT", "/guilds/4000/incident-actions").is_empty());
+
+    let until = now() + 3600;
+    assert_eq!(
+        world.ask(Request::SaveSpaceSafety {
+            space: world.key("4000"),
+            safety: SpaceSafety {
+                verification_level: 3,
+                explicit_filter: 2,
+                invites_paused_until: until,
+                dms_paused_until: 0,
+            },
+        }),
+        Response::Ok
+    );
+    let guild_patches: Vec<_> = world.discord.requests_to("PATCH", "/guilds/4000").into_iter().filter(|seen| seen.path == "/guilds/4000").collect();
+    assert_eq!(guild_patches.len(), 1);
+    let patch = &guild_patches[0].body;
+    assert_eq!(patch.as_object().unwrap().len(), 2);
+    assert_eq!(patch["verification_level"], 3);
+    assert_eq!(patch["explicit_content_filter"], 2);
+    let incidents = world.discord.requests_to("PUT", "/guilds/4000/incident-actions");
+    assert_eq!(incidents.len(), 1);
+    let invites = incidents[0].body["invites_disabled_until"].as_str().expect("an ISO timestamp");
+    assert_eq!(invites.len(), 24);
+    assert!(invites.ends_with('Z'));
+    assert!(incidents[0].body["dms_disabled_until"].is_null());
+
+    world.discord.script(
+        "/channels/4101/messages",
+        400,
+        json!({"message": "This message was blocked by AutoMod", "code": 200000}),
+    );
+    match world.send("4101", "automod-blocked", "invoice please", None) {
+        Response::Sent { message } => assert_eq!(message.state, SendState::Pending),
+        other => panic!("expected a pending send, got {other:?}"),
+    }
+    assert_eq!(world.failure("4101", "automod-blocked"), "This server's AutoMod blocked that message.");
 }

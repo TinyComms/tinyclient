@@ -1048,6 +1048,11 @@ impl Demo {
             | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteAutomodRule { reply, .. } | Command::SaveSpaceSafety { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

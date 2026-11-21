@@ -927,6 +927,18 @@ impl Shell {
                             }))
                             .into_any_element(),
                     );
+                    if space_row.is_some_and(|row| row.rights.manage_server) {
+                        let safety_space = space.clone();
+                        let safety_name = space_row.as_ref().map(|row| row.name.clone()).unwrap_or_else(|| "Server".to_owned());
+                        items.push(
+                            menu_item("space-safety", Some("icons/settings.svg"), "Safety setup…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_safety(safety_space.clone(), safety_name.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
                     if space_row.is_some_and(|row| row.rights.view_audit_log) {
                         let audit_space = space.clone();
                         let audit_name = space_row.map(|row| row.name.clone()).unwrap_or_else(|| "Server".to_owned());

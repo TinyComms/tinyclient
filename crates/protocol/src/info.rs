@@ -1240,6 +1240,121 @@ impl Keychain {
     }
 }
 
+/// A server's safety setup (`Request::AutomodRules`, `#395`).
+///
+/// `verification_level` is Discord's 0–4 (none through highest). `explicit_filter` is
+/// `explicit_content_filter`, 0–2. The pause fields are unix seconds from incident actions;
+/// `0` means that pause is off.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceSafety {
+    #[serde(default)]
+    pub verification_level: u8,
+    #[serde(default)]
+    pub explicit_filter: u8,
+    #[serde(default)]
+    pub invites_paused_until: i64,
+    #[serde(default)]
+    pub dms_paused_until: i64,
+}
+
+/// What an AutoMod rule watches. Unknown triggers stay `Other` and are saved back untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomodTrigger {
+    #[default]
+    Keyword {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keywords: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        regex: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allow: Vec<String>,
+    },
+    Spam,
+    Preset {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        presets: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allow: Vec<String>,
+    },
+    Mention {
+        #[serde(default)]
+        limit: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        raid_protection: bool,
+    },
+    Profile {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keywords: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        regex: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allow: Vec<String>,
+    },
+    /// A trigger this build does not edit. `metadata` is the original JSON object.
+    Other {
+        #[serde(default)]
+        code: u8,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        metadata: String,
+    },
+}
+
+/// What an AutoMod rule does when it matches. The block message is display text only.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomodAction {
+    #[default]
+    Block {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message: String,
+    },
+    Alert {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        channel_id: String,
+    },
+    Timeout {
+        #[serde(default)]
+        seconds: u32,
+    },
+    /// Discord `BLOCK_MEMBER_INTERACTION`.
+    Quarantine,
+    /// An action this build does not edit. `metadata` is the original JSON object.
+    Other {
+        #[serde(default)]
+        code: u8,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        metadata: String,
+    },
+}
+
+/// One AutoMod rule (`#395`). An empty `id` creates a rule. `read_only` rules are shown and,
+/// if saved, written back from `raw` without tinyclient interpreting their trigger or actions.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AutomodRule {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub event_type: u8,
+    #[serde(default)]
+    pub trigger: AutomodTrigger,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<AutomodAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    /// Original Discord rule object when the trigger or an action is not one this build edits.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raw: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1325,5 +1440,32 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn automod_rules_default_when_a_field_is_missing() {
+        let bare: AutomodRule = serde_json::from_str(r#"{"name":"spam"}"#).unwrap();
+        assert_eq!(bare.name, "spam");
+        assert!(!bare.enabled);
+        assert!(bare.id.is_empty());
+        assert_eq!(bare.trigger, AutomodTrigger::default());
+        assert!(bare.actions.is_empty());
+        assert!(!bare.read_only);
+        let round: AutomodRule = serde_json::from_str(&serde_json::to_string(&AutomodRule::default()).unwrap()).unwrap();
+        assert_eq!(round, AutomodRule::default());
+
+        let safety: SpaceSafety = serde_json::from_str("{}").unwrap();
+        assert_eq!(safety, SpaceSafety::default());
+
+        let space = Key::new(&AccountKey { network: Network::Discord, account: "1".into() }, "4000");
+        let bare_req = Request::SaveAutomodRule { space: space.clone(), rule: AutomodRule::default() };
+        let mut value = serde_json::to_value(&bare_req).unwrap();
+        value.as_object_mut().unwrap().remove("rule");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(back, bare_req);
+
+        let listed = Request::AutomodRules { space };
+        let again: Request = serde_json::from_str(&serde_json::to_string(&listed).unwrap()).unwrap();
+        assert_eq!(again, listed);
     }
 }

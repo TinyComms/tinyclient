@@ -3327,6 +3327,50 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::AutomodRules { space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::AutomodRules { space_id, reply }) {
+                    Ok(page) => Response::AutomodRules { rules: page.rules, safety: page.safety },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SaveAutomodRule { space, rule } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SaveAutomodRule { space_id, rule, reply }) {
+                    Ok(rule) => Response::AutomodRule { rule },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteAutomodRule { space, id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::DeleteAutomodRule { space_id, rule_id: id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SaveSpaceSafety { space, safety } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SaveSpaceSafety { space_id, safety, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CreateGroup { account, members, name } => {
                 let started = self.ask(&account, |reply| Command::CreateGroup {
                     members,

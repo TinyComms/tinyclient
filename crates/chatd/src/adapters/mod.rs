@@ -264,6 +264,13 @@ pub struct AuditPage {
     pub more: bool,
 }
 
+/// A server's AutoMod rules and safety setup (`Command::AutomodRules`).
+#[derive(Debug, Clone, Default)]
+pub struct AutomodPage {
+    pub rules: Vec<protocol::AutomodRule>,
+    pub safety: protocol::SpaceSafety,
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -503,6 +510,29 @@ pub enum Command {
         before: Option<String>,
         limit: u32,
         reply: Reply<AuditPage>,
+    },
+    /// Read a server's AutoMod rules and safety setup.
+    AutomodRules {
+        space_id: String,
+        reply: Reply<AutomodPage>,
+    },
+    /// Create or replace one AutoMod rule.
+    SaveAutomodRule {
+        space_id: String,
+        rule: protocol::AutomodRule,
+        reply: Reply<protocol::AutomodRule>,
+    },
+    /// Delete one AutoMod rule.
+    DeleteAutomodRule {
+        space_id: String,
+        rule_id: String,
+        reply: Reply<()>,
+    },
+    /// Save verification, the explicit-content filter, and raid pauses.
+    SaveSpaceSafety {
+        space_id: String,
+        safety: protocol::SpaceSafety,
+        reply: Reply<()>,
     },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
     CreateGroup {
@@ -926,6 +956,11 @@ impl Command {
             | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteAutomodRule { reply, .. } | Command::SaveSpaceSafety { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }

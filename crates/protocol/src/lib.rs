@@ -1607,6 +1607,30 @@ pub enum Request {
         #[serde(default)]
         limit: u32,
     },
+    /// A server's AutoMod rules and safety setup (`#395`). Answers `Response::AutomodRules`.
+    AutomodRules {
+        space: Key,
+    },
+    /// Create or replace one AutoMod rule. An empty `rule.id` creates it.
+    /// Answers `Response::AutomodRule`.
+    SaveAutomodRule {
+        space: Key,
+        #[serde(default)]
+        rule: AutomodRule,
+    },
+    /// Delete one AutoMod rule. Answers `Response::Ok`.
+    DeleteAutomodRule {
+        space: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+    },
+    /// Save verification, the explicit-content filter, and raid pauses (`#395`).
+    /// Answers `Response::Ok`.
+    SaveSpaceSafety {
+        space: Key,
+        #[serde(default)]
+        safety: SpaceSafety,
+    },
     /// Starts a new group conversation with two or more members (by person id or phone number)
     /// and an optional group name. Answers `Response::Conversation`.
     CreateGroup {
@@ -3222,6 +3246,18 @@ pub enum Response {
         entries: Vec<AuditEntry>,
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
+    },
+    /// A server's AutoMod rules and safety setup (`Request::AutomodRules`).
+    AutomodRules {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rules: Vec<AutomodRule>,
+        #[serde(default)]
+        safety: SpaceSafety,
+    },
+    /// One created or edited AutoMod rule (`Request::SaveAutomodRule`).
+    AutomodRule {
+        #[serde(default)]
+        rule: AutomodRule,
     },
 }
 

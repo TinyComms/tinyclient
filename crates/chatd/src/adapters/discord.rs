@@ -11,6 +11,7 @@
 //! messages go to the store as READY and the events arrive.
 
 mod audit;
+mod automod;
 mod content;
 mod events;
 
@@ -1933,6 +1934,10 @@ impl Discord {
             Command::AuditLog { space_id, person, action, before, limit, reply } => {
                 answer(reply, self.audit_log(&space_id, person.as_deref(), action, before.as_deref(), limit))
             }
+            Command::AutomodRules { space_id, reply } => answer(reply, self.automod_rules(&space_id)),
+            Command::SaveAutomodRule { space_id, rule, reply } => answer(reply, self.save_automod_rule(&space_id, &rule)),
+            Command::DeleteAutomodRule { space_id, rule_id, reply } => answer(reply, self.delete_automod_rule(&space_id, &rule_id)),
+            Command::SaveSpaceSafety { space_id, safety, reply } => answer(reply, self.save_space_safety(&space_id, &safety)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
