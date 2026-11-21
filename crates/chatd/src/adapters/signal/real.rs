@@ -1275,6 +1275,39 @@ impl Session {
             self.tell(Event::Deleted { peer, author: author.to_owned(), target: delete.target_sent_timestamp.unwrap_or(0) });
             return;
         }
+        if let Some(pin) = &message.pin_message {
+            let target_author = pin
+                .target_author_aci_binary
+                .as_deref()
+                .and_then(aci_bytes)
+                .unwrap_or_default();
+            let duration_secs = match pin.pin_duration {
+                Some(data_message::pin_message::PinDuration::PinDurationSeconds(secs)) if secs > 0 => Some(secs),
+                _ => None,
+            };
+            self.tell(Event::Pinned {
+                peer,
+                by: author.to_owned(),
+                author: target_author,
+                target: pin.target_sent_timestamp.unwrap_or(0),
+                duration_secs,
+            });
+            return;
+        }
+        if let Some(unpin) = &message.unpin_message {
+            let target_author = unpin
+                .target_author_aci_binary
+                .as_deref()
+                .and_then(aci_bytes)
+                .unwrap_or_default();
+            self.tell(Event::Unpinned {
+                peer,
+                by: author.to_owned(),
+                author: target_author,
+                target: unpin.target_sent_timestamp.unwrap_or(0),
+            });
+            return;
+        }
         // DataMessage.Flags.EXPIRATION_TIMER_UPDATE == 2.
         if message.flags.unwrap_or(0) & 2 != 0 {
             self.tell(Event::TimerChanged {
@@ -2749,6 +2782,37 @@ impl Session {
                 expire_timer_version: (timer.version > 0).then_some(timer.version),
                 ..Default::default()
             }),
+            Body::Pin { author, target, duration_secs } => {
+                let uuid = Uuid::parse_str(&author)
+                    .map_err(|_| Fault::Refused("That message author isn't one Signal knows.".to_owned()))?;
+                let pin_duration = match duration_secs {
+                    Some(secs) if secs > 0 => data_message::pin_message::PinDuration::PinDurationSeconds(secs),
+                    _ => data_message::pin_message::PinDuration::PinDurationForever(true),
+                };
+                ContentBody::DataMessage(DataMessage {
+                    pin_message: Some(data_message::PinMessage {
+                        target_author_aci_binary: Some(uuid.as_bytes().to_vec()),
+                        target_sent_timestamp: Some(target),
+                        pin_duration: Some(pin_duration),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
+            Body::Unpin { author, target } => {
+                let uuid = Uuid::parse_str(&author)
+                    .map_err(|_| Fault::Refused("That message author isn't one Signal knows.".to_owned()))?;
+                ContentBody::DataMessage(DataMessage {
+                    unpin_message: Some(data_message::UnpinMessage {
+                        target_author_aci_binary: Some(uuid.as_bytes().to_vec()),
+                        target_sent_timestamp: Some(target),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
         };
         self.deliver(to, content, at).await?;
         Ok(at)

@@ -689,6 +689,10 @@ pub enum Event {
     IdentityChanged { peer: Peer },
     /// A contact's verification state changed (locally or synced via `SyncMessage.verified`).
     VerifiedChanged { aci: String, state: IdentityState },
+    /// `by` pinned `author`'s message sent at `target`. `duration_secs == None` means forever.
+    Pinned { peer: Peer, by: String, author: String, target: u64, duration_secs: Option<u32> },
+    /// `by` unpinned `author`'s message sent at `target`.
+    Unpinned { peer: Peer, by: String, author: String, target: u64 },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -832,6 +836,10 @@ pub enum Body {
     PollEnd { target: u64 },
     /// Share a contact card.
     Contact { contact: protocol::SharedContact, timer: Timer },
+    /// Pin a message in a conversation (`duration_secs == None` pins forever).
+    Pin { author: String, target: u64, duration_secs: Option<u32> },
+    /// Unpin a message in a conversation.
+    Unpin { author: String, target: u64 },
 }
 
 /// Why something failed.

@@ -964,6 +964,45 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
             }
             vec![Event::VerifiedChanged { aci, state }]
         }
+        "pin-msg" | "unpin-msg" => {
+            let where_word = next();
+            let peer = if where_word == "club" {
+                club()
+            } else if let Some((id, _)) = who(where_word) {
+                direct(id)
+            } else if super::wire::is_aci(where_word) {
+                direct(where_word)
+            } else {
+                return Vec::new();
+            };
+            let by_word = next();
+            let by = if by_word == "me" {
+                ME.to_owned()
+            } else if let Some((id, _)) = who(by_word) {
+                id.to_owned()
+            } else if super::wire::is_aci(by_word) {
+                by_word.to_owned()
+            } else {
+                return Vec::new();
+            };
+            let author_word = next();
+            let author = if author_word == "me" {
+                ME.to_owned()
+            } else if let Some((id, _)) = who(author_word) {
+                id.to_owned()
+            } else if super::wire::is_aci(author_word) {
+                author_word.to_owned()
+            } else {
+                return Vec::new();
+            };
+            let target = next().parse().unwrap_or(0);
+            if command == "pin-msg" {
+                let duration_secs = next().parse::<u32>().ok().filter(|&s| s > 0);
+                vec![Event::Pinned { peer, by, author, target, duration_secs }]
+            } else {
+                vec![Event::Unpinned { peer, by, author, target }]
+            }
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -1045,6 +1084,11 @@ impl Wire for Fake {
             }
             Body::PollEnd { target } => format!("send {} endpoll {target}", describe(to)),
             Body::Contact { contact, timer } => format!("send {} contact {}{}", describe(to), contact.name, exp(*timer)),
+            Body::Pin { author, target, duration_secs } => {
+                let dur = duration_secs.map_or_else(|| "forever".to_owned(), |s| s.to_string());
+                format!("send {} pin {target}-{author} dur={dur}", describe(to))
+            }
+            Body::Unpin { author, target } => format!("send {} unpin {target}-{author}", describe(to)),
         };
         record(&line);
         if let Peer::Direct(aci) = to {

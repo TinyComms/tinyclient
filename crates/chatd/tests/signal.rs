@@ -2500,3 +2500,97 @@ fn link_previews_render_on_receive_ignore_mismatched_urls_and_honor_setting_and_
     assert!(sent_disabled.previews.is_empty());
     assert!(!world.calls().iter().any(|c| c.contains("disabled.example.org") && c.starts_with("preview-fetch")));
 }
+
+#[test]
+fn pinned_messages_serve_pinned_list_expire_and_respect_group_permissions() {
+    let world = World::linked();
+    world.connected();
+
+    // Grace sends two messages in DM.
+    world.steer("incoming grace 1791892810000 Important bridge schedule");
+    world.steer("incoming grace 1791892811000 Short-lived pin");
+    world.until("both incoming messages stored", || {
+        (world.messages(GRACE).len() >= 2).then_some(())
+    });
+
+    // Incoming pin from Grace (forever) emits system line and appears in Request::Pinned.
+    world.steer("pin-msg grace grace grace 1791892810000");
+    world.until("Grace pinned system line appears", || {
+        world
+            .messages(GRACE)
+            .iter()
+            .any(|m| m.kind == MessageKind::System && m.text == "Grace Ombra pinned a message")
+            .then_some(())
+    });
+    let Response::Pinned { messages, .. } = world.ask(Request::Pinned { conversation: key(GRACE) }) else {
+        panic!("expected Response::Pinned");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "Important bridge schedule");
+    assert!(messages[0].pinned);
+    assert_eq!(messages[0].pinned_by.as_deref(), Some("Grace Ombra"));
+
+    // Incoming expiring pin (1 second) appears and then drops once expired.
+    world.steer("pin-msg grace grace grace 1791892811000 1");
+    world.until("expiring pin recorded then expires", || {
+        let Response::Pinned { messages, .. } = world.ask(Request::Pinned { conversation: key(GRACE) }) else {
+            return None;
+        };
+        (messages.len() == 1
+            && messages[0].text == "Important bridge schedule"
+            && world.messages(GRACE).iter().filter(|m| m.text == "Grace Ombra pinned a message").count() >= 2)
+            .then_some(())
+    });
+
+    // Outgoing unpin removes it and logs unpin call on the wire.
+    let target_id = format!("1791892810000-{GRACE}");
+    assert!(matches!(
+        world.ask(Request::Pin {
+            conversation: key(GRACE),
+            message_id: target_id.clone(),
+            pinned: false,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    ));
+    assert!(world.calls().contains(&format!("send {GRACE} unpin {target_id}")));
+    let Response::Pinned { messages, .. } = world.ask(Request::Pinned { conversation: key(GRACE) }) else {
+        panic!("expected Response::Pinned");
+    };
+    assert!(messages.is_empty());
+
+    // Outgoing pin in DM works and logs pin call on the wire.
+    assert!(matches!(
+        world.ask(Request::Pin {
+            conversation: key(GRACE),
+            message_id: target_id.clone(),
+            pinned: true,
+            notify: true,
+            me_only: false,
+        }),
+        Response::Ok
+    ));
+    assert!(world.calls().contains(&format!("send {GRACE} pin {target_id} dur=forever")));
+
+    // Group permission enforcement: non-admin cannot pin when attributes=admin.
+    world.steer("group grace 1791892812000 Group announcement");
+    world.steer("group-role me member");
+    world.steer("group-access attributes=admin");
+    world.until("club updated with admin-only attributes", || {
+        let c = world.conversation(CLUB)?;
+        (!c.rights.pin && world.messages(CLUB).iter().any(|m| m.text == "Group announcement")).then_some(())
+    });
+    let group_msg_id = format!("1791892812000-{GRACE}");
+    let denied = world.ask(Request::Pin {
+        conversation: key(CLUB),
+        message_id: group_msg_id,
+        pinned: true,
+        notify: true,
+        me_only: false,
+    });
+    assert!(
+        matches!(&denied, Response::Error { detail, .. } if detail.to_lowercase().contains("admin")),
+        "expected admin permission refusal, got {denied:?}"
+    );
+}

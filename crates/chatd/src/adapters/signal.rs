@@ -731,6 +731,11 @@ struct Live {
     call_history: VecDeque<(String, u64)>,
     /// Created or synced call links keyed by their 32-byte root key.
     call_links: HashMap<[u8; 32], wire::CallLink>,
+    /// Pinned messages across conversations, persisted at `pins_path`.
+    pinned_messages: Vec<PinRecord>,
+    /// `{support}/signal/{aci}.pins`. Empty when nothing is kept on disk.
+    pins_path: PathBuf,
+    pins_loaded: bool,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -928,6 +933,123 @@ impl Live {
         }
         before.filter(|before| Some(before.as_str()) != emoji)
     }
+
+    fn load_pins(&mut self) {
+        if self.pins_loaded {
+            return;
+        }
+        self.pins_loaded = true;
+        self.pinned_messages = read_pins(&self.pins_path);
+    }
+
+    fn record_pin(&mut self, conversation: &str, message_id: &str, pinned_by: String, pinned_at: i64, expires_at: Option<i64>) {
+        self.load_pins();
+        self.pinned_messages
+            .retain(|p| !(p.conversation == conversation && p.message_id == message_id));
+        self.pinned_messages.push(PinRecord {
+            conversation: conversation.to_owned(),
+            message_id: message_id.to_owned(),
+            pinned_by,
+            pinned_at,
+            expires_at,
+        });
+        if self.pinned_messages.len() > 512 {
+            let extra = self.pinned_messages.len() - 512;
+            self.pinned_messages.drain(..extra);
+        }
+        write_pins(&self.pins_path, &self.pinned_messages);
+    }
+
+    fn remove_pin(&mut self, conversation: &str, message_id: &str) -> bool {
+        self.load_pins();
+        let before = self.pinned_messages.len();
+        self.pinned_messages
+            .retain(|p| !(p.conversation == conversation && p.message_id == message_id));
+        let changed = self.pinned_messages.len() != before;
+        if changed {
+            write_pins(&self.pins_path, &self.pinned_messages);
+        }
+        changed
+    }
+
+    fn prune_expired_pins(&mut self, now: i64) -> Vec<(String, String)> {
+        self.load_pins();
+        let mut expired = Vec::new();
+        self.pinned_messages.retain(|p| {
+            if p.expires_at.is_some_and(|exp| exp <= now) {
+                expired.push((p.conversation.clone(), p.message_id.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        if !expired.is_empty() {
+            write_pins(&self.pins_path, &self.pinned_messages);
+        }
+        expired
+    }
+
+    fn pins_for(&mut self, conversation: &str) -> Vec<PinRecord> {
+        self.load_pins();
+        let mut out: Vec<PinRecord> = self
+            .pinned_messages
+            .iter()
+            .filter(|p| p.conversation == conversation)
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.pinned_at));
+        out.truncate(protocol::PINNED_LIMIT);
+        out
+    }
+}
+
+/// One pinned message remembered for a Signal conversation (Signal has no server pin index).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PinRecord {
+    conversation: String,
+    message_id: String,
+    pinned_by: String,
+    pinned_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<i64>,
+}
+
+fn pins_path(aci: &str) -> PathBuf {
+    protocol::support_dir().join("signal").join(format!("{aci}.pins"))
+}
+
+fn read_pins(path: &Path) -> Vec<PinRecord> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    if meta.len() > REACTIONS_FILE_LIMIT {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<PinRecord>>(&bytes).unwrap_or_default()
+}
+
+fn write_pins(path: &Path, rows: &[PinRecord]) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(bytes) = serde_json::to_vec(rows) else {
+        return;
+    };
+    let tmp = path.with_extension("pins.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// One kept reaction. The file is a list of these in oldest-to-newest order, owned by this
@@ -1043,7 +1165,11 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     }
     // What is learned (names, settings, unread) outlives one connection. Reactions outlive the
     // process: the file is what a later reaction replaces, once this memory is gone.
-    let live = Arc::new(Mutex::new(Live { reactions_path: reactions_path(&saved.aci), ..Live::default() }));
+    let live = Arc::new(Mutex::new(Live {
+        reactions_path: reactions_path(&saved.aci),
+        pins_path: pins_path(&saved.aci),
+        ..Live::default()
+    }));
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
     let (socket_ctx, held, socket_saved, socket_live) = (ctx.clone(), current.clone(), saved.clone(), live.clone());
     std::thread::Builder::new()
@@ -1188,6 +1314,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
             row.peer = Some(aci.clone());
             row.listed = true;
             row.private = true;
+            row.rights.pin = true;
             row
         }
         Peer::Group(_) => {
@@ -1875,6 +2002,46 @@ fn apply(account: &Account, event: Event) {
             let mark = (state == wire::IdentityState::Verified).then_some(Mark::Verified);
             let _ = ctx.details(&[(aci, PersonDetails { mark, ..PersonDetails::default() })]);
         }
+        Event::Pinned { peer, by, author, target, duration_secs } => {
+            let conv = peer.conversation();
+            if account.live().blocked.contains(&conv) {
+                return;
+            }
+            let msg_id = wire::message_id(target, &author);
+            let now = crate::hub::now();
+            let expires_at = duration_secs.filter(|&s| s > 0).map(|s| now + i64::from(s));
+            let by_name = if by == account.me { "You".to_owned() } else { account.live().name(&by) };
+            account.live().record_pin(&conv, &msg_id, by_name.clone(), now, expires_at);
+            let _ = ctx.pinned(&conv, &msg_id, true);
+            if let Ok(Some(mut stored)) = ctx.stored_message(&conv, &msg_id) {
+                stored.pinned = true;
+                stored.pinned_by = Some(by_name.clone());
+                stored.pinned_at = Some(now);
+                let _ = ctx.message(&conv, &stored);
+            }
+            let sent_ms = now_ms();
+            let mut sys = Message::plain(
+                format!("signal-pin-{sent_ms}-{target}"),
+                String::new(),
+                format!("{by_name} pinned a message"),
+                (sent_ms / 1_000) as i64,
+                by == account.me,
+            );
+            sys.kind = MessageKind::System;
+            let _ = ctx.message(&conv, &sys);
+        }
+        Event::Unpinned { peer, by: _, author, target } => {
+            let conv = peer.conversation();
+            let msg_id = wire::message_id(target, &author);
+            account.live().remove_pin(&conv, &msg_id);
+            let _ = ctx.pinned(&conv, &msg_id, false);
+            if let Ok(Some(mut stored)) = ctx.stored_message(&conv, &msg_id) {
+                stored.pinned = false;
+                stored.pinned_by = None;
+                stored.pinned_at = None;
+                let _ = ctx.message(&conv, &stored);
+            }
+        }
         Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
     }
 }
@@ -2451,6 +2618,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
@@ -2480,7 +2649,7 @@ fn capabilities(link_previews: bool) -> protocol::Capabilities {
         reply: true,
         edit: true,
         delete: true,
-        pins: false,
+        pins: true,
         forward: false,
         suppress_embeds: link_previews,
         polls: Some(protocol::PollCapabilities {
@@ -2730,6 +2899,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ConversationPicture { conversation_id, path, reply } => {
             let _ = reply.send(group_picture(account, &conversation_id, &path));
+        }
+        Command::Pinned { conversation_id, reply } => {
+            let _ = reply.send(pinned_messages(account, &conversation_id));
+        }
+        Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+            let _ = reply.send(pin_message(account, &conversation_id, &message_id, pinned));
         }
         Command::Catalog { kind, query, cursor, reply, .. } => {
             let _ = reply.send(catalog(account, kind, &query, cursor.as_deref()));
@@ -3062,7 +3237,7 @@ fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
     let can_add = is_admin || matches!(group.member_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
     let can_edit = is_admin || matches!(group.attributes_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
     ConversationRights {
-        pin: false,
+        pin: can_edit,
         delete_others: is_admin,
         manage_members: is_admin,
         add_members: can_add,
@@ -3333,6 +3508,87 @@ fn group_picture(account: &Account, conversation_id: &str, path: &str) -> Result
         std::fs::read(path).map_err(|_| Refusal::Refused("The photo file could not be read.".into()))?
     };
     account.wire.group_set_avatar(&group_id, bytes).map_err(refused)
+}
+
+fn prune_expired_pins(account: &Account) {
+    let now = crate::hub::now();
+    let expired = account.live().prune_expired_pins(now);
+    for (conv, msg_id) in expired {
+        let _ = account.ctx.pinned(&conv, &msg_id, false);
+        if let Ok(Some(mut stored)) = account.ctx.stored_message(&conv, &msg_id) {
+            stored.pinned = false;
+            stored.pinned_by = None;
+            stored.pinned_at = None;
+            let _ = account.ctx.message(&conv, &stored);
+        }
+    }
+}
+
+fn pinned_messages(account: &Account, conversation_id: &str) -> Result<Vec<Message>, Refusal> {
+    let _ = peer(conversation_id).map_err(refused)?;
+    prune_expired_pins(account);
+    let records = account.live().pins_for(conversation_id);
+    let mut out = Vec::with_capacity(records.len());
+    for rec in records {
+        if let Ok(Some(mut msg)) = account.ctx.stored_message(conversation_id, &rec.message_id) {
+            msg.pinned = true;
+            if !rec.pinned_by.is_empty() {
+                msg.pinned_by = Some(rec.pinned_by);
+            }
+            if rec.pinned_at > 0 {
+                msg.pinned_at = Some(rec.pinned_at);
+            }
+            out.push(msg);
+        }
+    }
+    Ok(out)
+}
+
+fn pin_message(account: &Account, conversation_id: &str, message_id: &str, pinned: bool) -> Result<(), Refusal> {
+    let to = peer(conversation_id).map_err(refused)?;
+    let (sent, author) = target(message_id).map_err(refused)?;
+    if matches!(to, Peer::Group(_)) {
+        let allowed = account
+            .live()
+            .group_info
+            .get(conversation_id)
+            .is_some_and(|g| group_rights(g, &account.me).pin);
+        if !allowed {
+            return Err(Refusal::Refused("Only group admins can pin or unpin messages.".into()));
+        }
+    }
+    let body = if pinned {
+        Body::Pin { author, target: sent, duration_secs: None }
+    } else {
+        Body::Unpin { author, target: sent }
+    };
+    account.wire.send(&to, body).map_err(refused)?;
+    let now = crate::hub::now();
+    if pinned {
+        account.live().record_pin(conversation_id, message_id, "You".to_owned(), now, None);
+    } else {
+        account.live().remove_pin(conversation_id, message_id);
+    }
+    let _ = account.ctx.pinned(conversation_id, message_id, pinned);
+    if let Ok(Some(mut stored)) = account.ctx.stored_message(conversation_id, message_id) {
+        stored.pinned = pinned;
+        stored.pinned_by = pinned.then(|| "You".to_owned());
+        stored.pinned_at = pinned.then_some(now);
+        let _ = account.ctx.message(conversation_id, &stored);
+    }
+    if pinned {
+        let sent_ms = now_ms();
+        let mut sys = Message::plain(
+            format!("signal-pin-{sent_ms}-{sent}"),
+            String::new(),
+            "You pinned a message".to_owned(),
+            (sent_ms / 1_000) as i64,
+            true,
+        );
+        sys.kind = MessageKind::System;
+        let _ = account.ctx.message(conversation_id, &sys);
+    }
+    Ok(())
 }
 
 fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
