@@ -257,6 +257,13 @@ pub struct ReactorsPage {
     pub more: bool,
 }
 
+/// A page of a server's audit log (`Command::AuditLog`).
+#[derive(Debug, Clone, Default)]
+pub struct AuditPage {
+    pub entries: Vec<protocol::AuditEntry>,
+    pub more: bool,
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -487,6 +494,15 @@ pub enum Command {
     SyncChannelPermissions {
         conversation_id: String,
         reply: Reply<()>,
+    },
+    /// Read one page of a Space's audit log.
+    AuditLog {
+        space_id: String,
+        person: Option<String>,
+        action: Option<u32>,
+        before: Option<String>,
+        limit: u32,
+        reply: Reply<AuditPage>,
     },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
     CreateGroup {
@@ -909,6 +925,7 @@ impl Command {
             | Command::DeleteOverwrite { reply, .. }
             | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }

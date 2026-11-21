@@ -3309,6 +3309,24 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::AuditLog { space, person, action, before, limit } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::AuditLog {
+                    space_id,
+                    person,
+                    action,
+                    before,
+                    limit,
+                    reply,
+                }) {
+                    Ok(page) => Response::AuditLog { entries: page.entries, more: page.more },
+                    Err(refused) => *refused,
+                }
+            }
             Request::CreateGroup { account, members, name } => {
                 let started = self.ask(&account, |reply| Command::CreateGroup {
                     members,

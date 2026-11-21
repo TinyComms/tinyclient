@@ -5567,3 +5567,132 @@ fn channel_permissions_overwrites_sync_unknown_bits_and_lockout_guard() {
         other => panic!("expected category ChannelPermissions, got {other:?}"),
     }
 }
+
+#[test]
+fn audit_log_requires_view_audit_log_and_pages_unknown_actions() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add VIEW_AUDIT_LOG (1<<7) to guild 4000's @everyone role. Guild 4888 stays VIEW_CHANNEL only.
+    let current = ready["guilds"][0]["roles"][0]["permissions"].as_str().unwrap().parse::<u64>().unwrap();
+    ready["guilds"][0]["roles"][0]["permissions"] = json!((current | (1u64 << 7)).to_string());
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4888",
+        "properties": {"id": "4888", "name": "ReadOnly", "owner_id": "2001", "icon": null},
+        "roles": [{"id": "4888", "name": "@everyone", "permissions": "1024"}],
+        "channels": [{"id": "4881", "type": 0, "name": "lobby", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let g4000 = spaces.iter().find(|s| s.key.id == "4000").expect("4000");
+            let g4888 = spaces.iter().find(|s| s.key.id == "4888").expect("4888");
+            assert!(g4000.rights.view_audit_log, "VIEW_AUDIT_LOG must show the audit log menu");
+            assert!(!g4888.rights.view_audit_log);
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+
+    match world.ask(Request::AuditLog {
+        space: world.key("4888"),
+        person: None,
+        action: None,
+        before: None,
+        limit: 50,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("permission"), "expected permission refusal, got {detail}");
+        }
+        other => panic!("expected Refused without VIEW_AUDIT_LOG, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4888/audit-logs").is_empty());
+
+    world.discord.script(
+        "/guilds/4000/audit-logs",
+        200,
+        json!({
+            "users": [
+                {"id": "1000", "username": "justin", "global_name": "Justin"},
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"}
+            ],
+            "audit_log_entries": [
+                {
+                    "id": "1300000000000000100",
+                    "action_type": 22,
+                    "user_id": "1000",
+                    "target_id": "2001",
+                    "reason": "Repeated spam"
+                },
+                {
+                    "id": "1300000000000000090",
+                    "action_type": 999,
+                    "user_id": "1000",
+                    "target_id": "9999"
+                }
+            ]
+        }),
+    );
+    match world.ask(Request::AuditLog {
+        space: world.key("4000"),
+        person: None,
+        action: None,
+        before: None,
+        limit: 2,
+    }) {
+        Response::AuditLog { entries, more } => {
+            assert!(more, "a full page must offer older entries");
+            assert_eq!(entries.len(), 2, "unknown action_type 999 must never be dropped");
+            assert_eq!(entries[0].summary, "Justin banned Mara Okafor.");
+            assert_eq!(entries[0].reason, "Repeated spam");
+            assert_eq!(entries[0].action_type, 22);
+            assert!(entries[0].time > 0);
+            assert_eq!(entries[1].action_type, 999);
+            assert_eq!(entries[1].action_label, "Action #999");
+            assert_eq!(entries[1].summary, "Justin performed an action on 9999.");
+        }
+        other => panic!("expected AuditLog, got {other:?}"),
+    }
+    let gets = world.discord.requests_to("GET", "/guilds/4000/audit-logs");
+    assert_eq!(gets.len(), 1);
+    assert_eq!(gets[0].path, "/guilds/4000/audit-logs?limit=2");
+
+    world.discord.script(
+        "/guilds/4000/audit-logs",
+        200,
+        json!({
+            "users": [{"id": "1000", "username": "justin", "global_name": "Justin"}],
+            "webhooks": [{"id": "7001", "name": "Deploy Hook"}],
+            "audit_log_entries": [{
+                "id": "1300000000000000080",
+                "action_type": 50,
+                "user_id": "1000",
+                "target_id": "7001"
+            }]
+        }),
+    );
+    match world.ask(Request::AuditLog {
+        space: world.key("4000"),
+        person: Some("2001".into()),
+        action: Some(22),
+        before: Some("1300000000000000090".into()),
+        limit: 500,
+    }) {
+        Response::AuditLog { entries, more } => {
+            assert!(!more, "a short page must not offer older entries");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].summary, "Justin created webhook Deploy Hook.");
+            assert_eq!(entries[0].target_name, "Deploy Hook");
+        }
+        other => panic!("expected AuditLog, got {other:?}"),
+    }
+    let gets = world.discord.requests_to("GET", "/guilds/4000/audit-logs");
+    assert_eq!(gets.len(), 2);
+    assert_eq!(
+        gets[1].path,
+        "/guilds/4000/audit-logs?limit=100&user_id=2001&action_type=22&before=1300000000000000090"
+    );
+}

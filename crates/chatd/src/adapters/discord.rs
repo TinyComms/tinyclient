@@ -10,6 +10,7 @@
 //! the user owns, one visible member window, the voice states of the servers. Trees, people and
 //! messages go to the store as READY and the events arrive.
 
+mod audit;
 mod content;
 mod events;
 
@@ -1928,6 +1929,9 @@ impl Discord {
             }
             Command::SyncChannelPermissions { conversation_id, reply } => {
                 answer(reply, self.sync_channel_permissions(&conversation_id))
+            }
+            Command::AuditLog { space_id, person, action, before, limit, reply } => {
+                answer(reply, self.audit_log(&space_id, person.as_deref(), action, before.as_deref(), limit))
             }
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),

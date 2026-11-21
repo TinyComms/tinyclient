@@ -1594,6 +1594,19 @@ pub enum Request {
     SyncChannelPermissions {
         conversation: Key,
     },
+    /// Read a server's audit log (`GET /guilds/{id}/audit-logs`, `#394`).
+    /// Answers `Response::AuditLog`.
+    AuditLog {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
     /// Starts a new group conversation with two or more members (by person id or phone number)
     /// and an optional group name. Answers `Response::Conversation`.
     CreateGroup {
@@ -3203,6 +3216,12 @@ pub enum Response {
     /// Permission overwrites and role list for a channel or category (`Request::ChannelPermissions`).
     ChannelPermissions {
         info: Box<ChannelPermissionsInfo>,
+    },
+    /// One page of a server's audit log (`Request::AuditLog`).
+    AuditLog {
+        entries: Vec<AuditEntry>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
 }
 

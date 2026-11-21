@@ -225,6 +225,11 @@ impl Discord {
             "STREAM_DELETE" => self.stream_deleted(data)?,
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
+            // Live audit log entries arrive when the user has VIEW_AUDIT_LOG; parse leniently
+            // so unknown fields or future action types never disrupt the gateway session.
+            "GUILD_AUDIT_LOG_ENTRY_CREATE" => {
+                let _ = from_str::<super::audit::RawAuditEntry>(data);
+            }
             _ => {}
         }
         Ok(())

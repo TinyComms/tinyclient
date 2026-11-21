@@ -927,6 +927,18 @@ impl Shell {
                             }))
                             .into_any_element(),
                     );
+                    if space_row.is_some_and(|row| row.rights.view_audit_log) {
+                        let audit_space = space.clone();
+                        let audit_name = space_row.map(|row| row.name.clone()).unwrap_or_else(|| "Server".to_owned());
+                        items.push(
+                            menu_item("space-audit-log", Some("icons/shield.svg"), "Audit log…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_audit_log(audit_space.clone(), audit_name.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
                     items.push(
                         menu_item_check("space-show-all", !opt_in_on, "Show all channels", None)
                             .on_click(cx.listener(move |this, _, _, cx| {

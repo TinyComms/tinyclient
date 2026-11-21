@@ -1163,6 +1163,42 @@ impl Outgoing {
     }
 }
 
+/// One changed field inside a server audit log entry (`#394`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuditChange {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new: Option<String>,
+}
+
+/// One entry in a server's audit log (`Request::AuditLog`, `#394`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: String,
+    #[serde(default)]
+    pub action_type: u32,
+    #[serde(default)]
+    pub action_label: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub actor_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub target_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default)]
+    pub time: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<AuditChange>,
+}
+
 /// One custom emoji, sticker or GIF in a picker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogItem {

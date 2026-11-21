@@ -9,13 +9,38 @@ use crate::client::ask;
 use gpui::{div, prelude::*, px, Context, Entity, MouseButton, SharedString, Stateful, Div};
 use protocol::{
     effective_permissions, known_permission_mask, merge_overwrite_bits, would_lock_self_out,
-    ChannelOverwrite, ChannelPermissionsInfo, Key, OverwriteTargetKind, PermissionSection, Request,
-    Response, DISCORD_PERMISSIONS, PERM_VIEW_CHANNEL,
+    AuditEntry, ChannelOverwrite, ChannelPermissionsInfo, Key, OverwriteTargetKind, PermissionSection,
+    Request, Response, DISCORD_PERMISSIONS, PERM_VIEW_CHANNEL,
 };
+
+/// Action-type filters for the audit log page. The adapter still labels every type.
+const AUDIT_FILTERS: &[(u32, &str)] = &[
+    (20, "Kicks"),
+    (22, "Bans"),
+    (24, "Members"),
+    (11, "Channels"),
+    (31, "Roles"),
+    (72, "Messages"),
+    (140, "AutoMod"),
+];
 
 #[derive(Default)]
 pub struct State {
     pub perms: Option<PermsModal>,
+    pub audit: Option<AuditModal>,
+}
+
+struct AuditModal {
+    space: Key,
+    name: String,
+    entries: Vec<AuditEntry>,
+    more: bool,
+    loading: bool,
+    error: Option<String>,
+    person: Entity<TextInput>,
+    action: Option<u32>,
+    expanded: Option<String>,
+    generation: u64,
 }
 
 pub struct PermsModal {
@@ -62,7 +87,9 @@ impl PermsModal {
 
 impl Shell {
     pub(super) fn close_discord_admin(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.discord_admin_state.perms.take().is_some() {
+        let perms = self.discord_admin_state.perms.take().is_some();
+        let audit = self.discord_admin_state.audit.take().is_some();
+        if perms || audit {
             cx.notify();
             return true;
         }
@@ -71,6 +98,7 @@ impl Shell {
 
     /// Opens the Discord channel/category permission overwrites modal (#397).
     pub(in crate::gui) fn open_channel_permissions(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        self.discord_admin_state.audit = None;
         let add_member = cx.new(|cx| TextInput::new("Member user ID…", cx));
         self.discord_admin_state.perms = Some(PermsModal {
             conversation: conversation.clone(),
@@ -348,8 +376,262 @@ impl Shell {
         .detach();
     }
 
+    /// Opens a Discord server's audit log (#394). Shown only when the account may view it.
+    pub(in crate::gui) fn open_audit_log(&mut self, space: Key, name: String, cx: &mut Context<Self>) {
+        self.discord_admin_state.perms = None;
+        let person = cx.new(|cx| TextInput::new("Filter by user ID", cx));
+        self.discord_admin_state.audit = Some(AuditModal {
+            space,
+            name,
+            entries: Vec::new(),
+            more: false,
+            loading: false,
+            error: None,
+            person,
+            action: None,
+            expanded: None,
+            generation: 0,
+        });
+        cx.notify();
+        self.reload_audit_log(false, cx);
+    }
+
+    fn reload_audit_log(&mut self, older: bool, cx: &mut Context<Self>) {
+        let Some(modal) = self.discord_admin_state.audit.as_mut() else {
+            return;
+        };
+        if modal.loading {
+            return;
+        }
+        let person_field = modal.person.clone();
+        let person_text = person_field.read(cx).text().trim().to_owned();
+        let person = if person_text.is_empty() { None } else { Some(person_text) };
+        let action = modal.action;
+        let before = if older { modal.entries.last().map(|entry| entry.id.clone()) } else { None };
+        if older && before.is_none() {
+            return;
+        }
+        let space = modal.space.clone();
+        modal.generation = modal.generation.wrapping_add(1);
+        let generation = modal.generation;
+        if !older {
+            modal.entries.clear();
+            modal.more = false;
+            modal.expanded = None;
+        }
+        modal.loading = true;
+        modal.error = None;
+        cx.notify();
+        let req = Request::AuditLog { space: space.clone(), person, action, before, limit: 50 };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(modal) = this.discord_admin_state.audit.as_mut() else {
+                    return;
+                };
+                if modal.space != space || modal.generation != generation {
+                    return;
+                }
+                modal.loading = false;
+                match answer {
+                    Ok(Response::AuditLog { entries, more }) => {
+                        for entry in entries {
+                            if modal.entries.iter().any(|have| have.id == entry.id) {
+                                continue;
+                            }
+                            modal.entries.push(entry);
+                        }
+                        modal.more = more;
+                    }
+                    Ok(Response::Error { detail, .. }) => modal.error = Some(detail),
+                    Ok(_) => modal.error = Some("Could not read the audit log.".to_owned()),
+                    Err(err) => modal.error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(in crate::gui) fn discord_admin_layer(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        self.channel_permissions_modal(cx)
+        self.channel_permissions_modal(cx).or_else(|| self.audit_log_modal(cx))
+    }
+
+    fn audit_log_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.discord_admin_state.audit.as_ref()?;
+        let title = format!("Audit log · {}", modal.name);
+        let selected = modal.action;
+        let mut filters = vec![button("audit-action-any", if selected.is_none() { ButtonKind::Primary } else { ButtonKind::Ghost }, "Any action")
+            .on_click(cx.listener(|this, _, _, cx| {
+                // A click during a load must not light a chip the in-flight page does not match.
+                let ready = this.discord_admin_state.audit.as_mut().is_some_and(|modal| {
+                    if modal.loading {
+                        false
+                    } else {
+                        modal.action = None;
+                        true
+                    }
+                });
+                if ready {
+                    this.reload_audit_log(false, cx);
+                }
+            }))];
+        for (code, label) in AUDIT_FILTERS {
+            let code = *code;
+            let kind = if selected == Some(code) { ButtonKind::Primary } else { ButtonKind::Ghost };
+            filters.push(
+                button(SharedString::from(format!("audit-action-{code}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
+                    let ready = this.discord_admin_state.audit.as_mut().is_some_and(|modal| {
+                        if modal.loading {
+                            false
+                        } else {
+                            modal.action = Some(code);
+                            true
+                        }
+                    });
+                    if ready {
+                        this.reload_audit_log(false, cx);
+                    }
+                })),
+            );
+        }
+
+        let rows: Vec<_> = modal
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| {
+                let open = modal.expanded.as_deref() == Some(entry.id.as_str());
+                let id = entry.id.clone();
+                let when = if entry.time > 0 {
+                    format!("{} {}", super::time::date(entry.time), super::time::clock(entry.time))
+                } else {
+                    String::new()
+                };
+                let changes: Vec<String> = entry.changes.iter().map(audit_change_line).collect();
+                div()
+                    .id(("audit-row", ix))
+                    .px(px(8.))
+                    .py(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme::hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(m) = this.discord_admin_state.audit.as_mut() {
+                            m.expanded = if m.expanded.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) };
+                            cx.notify();
+                        }
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().type_small().text_color(theme::text()).child(entry.summary.clone()))
+                    .child(
+                        div()
+                            .type_micro()
+                            .text_color(theme::text_faint())
+                            .child(format!("{} · {}{}", entry.action_label, entry.action_type, if when.is_empty() { String::new() } else { format!(" · {when}") })),
+                    )
+                    .when(!entry.reason.is_empty(), |row| {
+                        row.child(div().type_small().text_color(theme::text_soft()).child(format!("Reason: {}", entry.reason)))
+                    })
+                    .when(open, |row| {
+                        row.children(changes.into_iter().map(|line| div().type_micro().text_color(theme::text_soft()).child(line)))
+                            .when(entry.changes.is_empty(), |row| row.child(div().type_micro().text_color(theme::text_faint()).child("No field changes.")))
+                    })
+            })
+            .collect();
+
+        let body = if modal.loading && modal.entries.is_empty() {
+            div().py(px(24.)).type_small().text_color(theme::text_soft()).child("Loading the audit log…")
+        } else if modal.entries.is_empty() {
+            div()
+                .py(px(24.))
+                .type_small()
+                .text_color(theme::text_soft())
+                .child(if modal.action.is_some() || !modal.person.read(cx).text().trim().is_empty() {
+                    "Nothing matches these filters."
+                } else {
+                    "Nothing has been recorded."
+                })
+        } else {
+            div().flex().flex_col().gap(px(4.)).children(rows)
+        };
+
+        let loading = modal.loading;
+        let more = modal.more && !modal.entries.is_empty();
+        let card = div()
+            .id("discord-audit-card")
+            .w(px(640.))
+            .max_w_full()
+            .max_h(px(640.))
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(title))
+                    .child(icon_button("discord-audit-close", "icons/x.svg", false).size(px(24.)).on_click(cx.listener(|this, _, _, cx| {
+                        this.discord_admin_state.audit = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::canvas())
+                            .border_1()
+                            .border_color(theme::border())
+                            .type_small()
+                            .child(modal.person.clone()),
+                    )
+                    .child(button("discord-audit-apply", ButtonKind::Secondary, "Apply").on_click(cx.listener(|this, _, _, cx| this.reload_audit_log(false, cx)))),
+            )
+            .child(div().flex().flex_wrap().gap(px(6.)).children(filters))
+            .children(modal.error.as_ref().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
+            .child(div().max_h(px(360.)).overflow_y_scroll().flex().flex_col().gap(px(4.)).child(body).when(more, |list| {
+                list.child(
+                    div().flex().justify_center().py(px(8.)).child(
+                        button("discord-audit-more", ButtonKind::Secondary, if loading { "Loading…" } else { "Load older entries" }).when(!loading, |button| {
+                            button.on_click(cx.listener(|this, _, _, cx| this.reload_audit_log(true, cx)))
+                        }),
+                    ),
+                )
+            }));
+
+        Some(
+            div()
+                .id("discord-audit-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.discord_admin_state.audit = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
     }
 
     fn channel_permissions_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
@@ -797,5 +1079,14 @@ impl Shell {
                 }))
                 .child(card),
         )
+    }
+}
+
+fn audit_change_line(change: &protocol::AuditChange) -> String {
+    match (&change.old, &change.new) {
+        (Some(old), Some(new)) => format!("{}: {old} → {new}", change.key),
+        (None, Some(new)) => format!("{}: {new}", change.key),
+        (Some(old), None) => format!("{} removed ({old})", change.key),
+        (None, None) => change.key.clone(),
     }
 }

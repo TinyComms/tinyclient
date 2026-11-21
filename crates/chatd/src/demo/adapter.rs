@@ -1047,6 +1047,7 @@ impl Demo {
             | Command::DeleteOverwrite { reply, .. }
             | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }
