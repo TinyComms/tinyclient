@@ -403,9 +403,9 @@ impl Shell {
                     // A direct call keeps the full card. Only a voice room, whose mute lives in
                     // the server's own panel, collapses to the compact bar.
                     _ if self.tiny_room(&call.conversation).is_some() => {
-                        self.call_compact(&call, &subject, cx)
+                        div().child(self.call_compact(&call, &subject, cx))
                     }
-                    _ => self.call_bar(&call, &subject, cx),
+                    _ => div().child(self.call_bar(&call, &subject, cx)),
                 }
             }
             None => self.call_ended(ended?, cx),
@@ -708,7 +708,7 @@ impl Shell {
 
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
     /// deafen and the voice settings are in the user panel right under it.
-    fn call_compact(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
+    fn call_compact(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
         let (state, color) = match call.state {
             CallState::Joined if super::securing(call) => ("Securing…", theme::warning()),
             CallState::Joined if self.call_muted_talking(call) => ("You're muted", theme::danger()),
@@ -735,11 +735,6 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(1.))
-            .cursor_pointer()
-            .tab_index(0)
-            .focus_visible(|style| style.shadow(theme::focus_ring()))
-            .tooltip(tip(format!("Go to {}", subject.title), Some("⌘⇧J")))
-            .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
             .child(
                 div()
                     .flex()
@@ -764,20 +759,31 @@ impl Shell {
             );
         let disconnect = leave()
             .w(px(36.))
-            .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)));
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_leave(cx);
+            }));
         // The name takes the card's width. Signal, lock and Leave sit on the row above it,
         // and wrap under it when the column is the narrowest sidebar.
-        card().children(self.call_waiting_strip().map(|(ring, from)| self.call_strip(&ring, &from, cx))).child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(8.))
-                .children(self.call_signal(call, cx))
-                .children(self.call_security(call, Place::TinyBar, cx))
-                .child(disconnect.ml_auto()),
-        )
-        .child(words)
+        card()
+            .id("call-compact-card")
+            .cursor_pointer()
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .tooltip(tip("Open the call", Some("⌘⇧J")))
+            .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
+            .children(self.call_waiting_strip().map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(self.call_signal(call, cx))
+                    .children(self.call_security(call, Place::TinyBar, cx))
+                    .child(disconnect.ml_auto()),
+            )
+            .child(words)
     }
 
     /// Who or where, then the server or notice on its own line, then signal, lock and who else
@@ -856,8 +862,6 @@ impl Shell {
                     .into_any_element(),
             ),
         };
-        let key = call.conversation.clone();
-        let title = subject.title.clone();
         let signal = self.call_signal(call, cx);
         let security = self.call_security(call, Place::Dock, cx);
         let show_status = signal.is_some() || security.is_some() || right.is_some() || counter.is_some();
@@ -868,8 +872,6 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(4.))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
             .child(
                 div()
                     .w_full()
@@ -908,7 +910,7 @@ impl Shell {
 
     /// Ringing out, connecting, joined and reconnecting. As tall as the name, the server line
     /// and the controls, which wrap when the sidebar is at its narrowest.
-    fn call_bar(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
+    fn call_bar(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
         let place = subject
             .space
             .as_deref()
@@ -942,7 +944,10 @@ impl Shell {
         )
         .when(enabled, |mute| {
             mute.tooltip(tip(if off { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
-                .on_click(cx.listener(|this, _, _, cx| this.call_mute(cx)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_mute(cx);
+                }))
         })
         // While I am heard: a 2 px ring inside the button, the same green as a speaker's.
         .when(call.speaking && !off && joined, |mute| {
@@ -973,7 +978,10 @@ impl Shell {
                     if call.deafened { "Undeafen" } else { "Deafen" },
                     Some("⌘⇧D"),
                 ))
-                .on_click(cx.listener(|this, _, _, cx| this.call_deafen(cx)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_deafen(cx);
+                }))
         });
         let pictures = self.call_pictures(call);
         let share_on = encoding(call, Content::Share);
@@ -996,6 +1004,7 @@ impl Shell {
                         None,
                     ))
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
                         if share_on {
                             this.tiny_stop_share(cx);
                         } else {
@@ -1022,7 +1031,8 @@ impl Shell {
                         None,
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)
+                        cx.stop_propagation();
+                        this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
                     }))
             })
         });
@@ -1039,7 +1049,10 @@ impl Shell {
         .when(enabled, |devices| {
             devices
                 .tooltip(tip("Microphone and speaker", None))
-                .on_click(cx.listener(|this, _, _, cx| this.call_menu_toggle(Menu::Devices, cx)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::Devices, cx);
+                }))
         });
         let end = if in_call(call) {
             leave()
@@ -1075,7 +1088,10 @@ impl Shell {
             .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
             .child(
                 end.when(in_call(call), |button| button.flex_1().min_w_0())
-                    .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_leave(cx);
+                    })),
             );
 
         let popover = match menu {
@@ -1086,7 +1102,13 @@ impl Shell {
             }
             _ => None,
         };
+        let card_key = call.conversation.clone();
+        let card_title = subject.title.clone();
         card()
+            .id("call-bar-card")
+            .cursor_pointer()
+            .tooltip(tip("Open the call", Some("⌘⇧J")))
+            .on_click(cx.listener(move |this, _, _, cx| this.call_go(card_key.clone(), &card_title, cx)))
             .children(
                 self.call_waiting_strip()
                     .map(|(ring, from)| self.call_strip(&ring, &from, cx)),

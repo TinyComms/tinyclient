@@ -391,6 +391,10 @@ impl State {
     pub(super) fn set_members_open(&mut self, open: bool) {
         self.members_open = open;
     }
+
+    pub(in crate::gui) fn channel(&self) -> Option<String> {
+        self.channel.clone()
+    }
 }
 
 type Gains = HashMap<(String, String), (u16, bool)>;

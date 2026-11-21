@@ -551,6 +551,20 @@ pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Op
     shell.call_dock(snapshot, cx).map(IntoElement::into_any_element)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallGoTarget {
+    TinyRoom(protocol::AccountKey, String),
+    Conversation,
+}
+
+fn call_go_target(key: &Key, is_tiny_room: bool) -> CallGoTarget {
+    if key.network == Network::Tiny && is_tiny_room {
+        CallGoTarget::TinyRoom(key.account(), key.id.clone())
+    } else {
+        CallGoTarget::Conversation
+    }
+}
+
 impl Shell {
     /// The speaker chosen (V2), in the call's menu or in Settings, which a voice message plays
     /// through too. `None` is the automatic choice.
@@ -802,24 +816,20 @@ impl Shell {
     }
 
     /// Goes where the call is: its conversation, or for a Tiny room the server's page on it.
-    /// A direct message is not a room, so its title opens the conversation.
+    /// Only a known Tiny room goes to the server page; any direct call (even unlisted) opens its conversation.
     pub(in crate::gui) fn call_go(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
-        let open_direct = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.open.as_ref())
-            .is_some_and(|row| row.key == key && row.kind.is_direct());
-        let listed_direct = self
-            .sidebar_state
-            .find(&self.trees, &key)
-            .is_some_and(|row| row.kind.is_direct());
-        if key.network == Network::Tiny && !open_direct && !listed_direct {
-            self.go(super::sidebar::Mode::Network(Network::Tiny), cx);
-            self.prefer_tiny(key.account(), cx);
-            self.tiny_pick_channel(Some(key.id), cx);
-            return;
+        let is_room = key.network == Network::Tiny && self.tiny_room(&key).is_some();
+        match call_go_target(&key, is_room) {
+            CallGoTarget::TinyRoom(account, room_id) => {
+                self.remember();
+                self.go(super::sidebar::Mode::Network(Network::Tiny), cx);
+                self.prefer_tiny(account, cx);
+                self.tiny_pick_channel(Some(room_id), cx);
+            }
+            CallGoTarget::Conversation => {
+                self.select(key, title, cx);
+            }
         }
-        self.select(key, title, cx);
     }
 
     /// A join was asked for here: a new room that follows is not a moderator's move.
@@ -1138,6 +1148,39 @@ impl Shell {
         .detach();
     }
 
+    /// A small header pill while a call is live elsewhere, taking you back to it in one click.
+    pub(super) fn call_live_hint(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if super::phone::active() {
+            return None;
+        }
+        let open = snapshot.open.as_ref()?;
+        let call = self.call_shown(snapshot).filter(|call| in_call(call) && call.conversation != open.key)?;
+        let subject = Subject::of(self, snapshot, &call);
+        let label = format!("In call · {}", subject.title);
+        Some(
+            div()
+                .id("call-live-hint")
+                .flex_none()
+                .h(px(28.))
+                .px(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::positive_soft())
+                .text_color(theme::positive())
+                .hover(|style| style.bg(theme::hover()))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .tooltip(tip("Open the call", Some("⌘⇧J")))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.call_jump(cx)))
+                .child(glyph("icons/phone.svg", 13., theme::positive()))
+                .child(div().max_w(px(160.)).truncate().child(label)),
+        )
+    }
+
     /// The header pill, by what the open conversation can do (07 §1). Its look is the capability:
     /// a filled pill calls from here, an outlined one with the network's icon opens the official
     /// app, and a conversation that can do neither has none.
@@ -1435,5 +1478,18 @@ mod tests {
         assert_eq!(named(&there(&["Iris Navarro", "Jun Aoki"], 2)), "Iris and Jun are in this call");
         assert_eq!(named(&there(&["Iris Navarro", "Jun Aoki", "Dev Patel"], 3)), "Iris, Jun and 1 more are in this call");
         assert_eq!(named(&there(&[], 4)), "4 people are in this call");
+    }
+
+    #[test]
+    fn call_go_target_opens_only_known_tiny_rooms_on_server_page() {
+        let tiny_room = Key { network: Network::Tiny, account: "srv".into(), id: "room-1".into() };
+        let tiny_direct = Key { network: Network::Tiny, account: "srv".into(), id: "dm-unlisted".into() };
+        let discord_dm = Key { network: Network::Discord, account: "acc".into(), id: "dm-1".into() };
+        assert_eq!(
+            call_go_target(&tiny_room, true),
+            CallGoTarget::TinyRoom(tiny_room.account(), "room-1".into())
+        );
+        assert_eq!(call_go_target(&tiny_direct, false), CallGoTarget::Conversation);
+        assert_eq!(call_go_target(&discord_dm, false), CallGoTarget::Conversation);
     }
 }
