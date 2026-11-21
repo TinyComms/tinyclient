@@ -407,6 +407,17 @@ pub struct Pane {
     fetched_reactors: HashMap<(String, String), (Vec<protocol::Reactor>, bool)>,
     /// Reactor fetch currently in flight, keyed by `(message_id, emoji)`.
     reactors_loading: Option<(String, String)>,
+    /// Loaded Saved Messages sub-dialogs and reaction tags for the open Saved Messages chat.
+    saved_loaded_for: Option<Key>,
+    saved_dialogs: Vec<protocol::SavedDialog>,
+    saved_tags: Vec<protocol::SavedTag>,
+    /// Active Saved Messages filter `(peer_id, tag)` and its fetched messages.
+    saved_filter: Option<(Option<String>, Option<String>)>,
+    saved_filtered: Option<Vec<Rc<Message>>>,
+    /// Queued unread mention / reaction message IDs for jumping through unread items.
+    unread_jumps_for: Option<Key>,
+    unread_mention_ids: Vec<String>,
+    unread_reaction_ids: Vec<String>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -540,6 +551,14 @@ impl Pane {
             app_loading: false,
             app_error: None,
             ephemeral: Vec::new(),
+            saved_loaded_for: None,
+            saved_dialogs: Vec::new(),
+            saved_tags: Vec::new(),
+            saved_filter: None,
+            saved_filtered: None,
+            unread_jumps_for: None,
+            unread_mention_ids: Vec::new(),
+            unread_reaction_ids: Vec::new(),
             #[cfg(feature = "gui-shot")]
             script: if thread { shot::Script::default() } else { shot::Script::from_env() },
         }
@@ -1770,6 +1789,403 @@ impl Pane {
         })
         .detach();
     }
+
+    pub(super) fn press_inline_button(
+        &mut self,
+        conversation: Key,
+        message_id: String,
+        pending_key: String,
+        data: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (message_id.clone(), pending_key);
+        self.pending_actions.insert(key.clone(), Instant::now());
+        cx.notify();
+        let request = Request::PressButton { conversation, message_id, data };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.pending_actions.remove(&key);
+                match answer {
+                    Ok(Response::ButtonAnswer { answer }) => {
+                        if let Some(text) = answer.message.filter(|s| !s.is_empty()) {
+                            this.say(text, cx);
+                        }
+                        if let Some(url) = answer.url.filter(|s| !s.is_empty()) {
+                            cx.open_url(&url);
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("press button", &err), cx),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn jump_next_unread(&mut self, kind: protocol::UnreadItemKind, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        if self.unread_jumps_for.as_ref() != Some(&conversation) {
+            self.unread_jumps_for = Some(conversation.clone());
+            self.unread_mention_ids.clear();
+            self.unread_reaction_ids.clear();
+        }
+        let queue = match kind {
+            protocol::UnreadItemKind::Mentions => &mut self.unread_mention_ids,
+            protocol::UnreadItemKind::Reactions => &mut self.unread_reaction_ids,
+        };
+        if let Some(id) = queue.first().cloned() {
+            queue.remove(0);
+            let done = queue.is_empty();
+            self.jump_to(&id, cx);
+            let conv = conversation.clone();
+            let message_ids = protocol::jump_mark_ids(kind, &id, done);
+            cx.spawn(async move |_, cx| {
+                let _ = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::client::ask(&Request::MarkUnreadItemsRead {
+                            conversation: conv,
+                            kind,
+                            message_ids,
+                        })
+                    })
+                    .await;
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
+        let conv = conversation.clone();
+        cx.spawn(async move |this, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&Request::UnreadItems {
+                        conversation: conv.clone(),
+                        kind,
+                        limit: 20,
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.key() != Some(&conversation) {
+                    return;
+                }
+                if let Ok(Response::UnreadItems { mut message_ids }) = answer {
+                    if let Some(first) = message_ids.first().cloned() {
+                        message_ids.remove(0);
+                        let done = message_ids.is_empty();
+                        match kind {
+                            protocol::UnreadItemKind::Mentions => this.unread_mention_ids = message_ids,
+                            protocol::UnreadItemKind::Reactions => this.unread_reaction_ids = message_ids,
+                        }
+                        this.jump_to(&first, cx);
+                        let conv_mark = conversation.clone();
+                        let mark_ids = protocol::jump_mark_ids(kind, &first, done);
+                        cx.spawn(async move |_, cx| {
+                            let _ = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    crate::client::ask(&Request::MarkUnreadItemsRead {
+                                        conversation: conv_mark,
+                                        kind,
+                                        message_ids: mark_ids,
+                                    })
+                                })
+                                .await;
+                        })
+                        .detach();
+                    } else {
+                        let conv_mark = conversation.clone();
+                        cx.spawn(async move |_, cx| {
+                            let _ = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    crate::client::ask(&Request::MarkUnreadItemsRead {
+                                        conversation: conv_mark,
+                                        kind,
+                                        message_ids: Vec::new(),
+                                    })
+                                })
+                                .await;
+                        })
+                        .detach();
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn unread_jump_buttons(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if self.thread {
+            return None;
+        }
+        let key = self.key()?.clone();
+        let (mentions, reactions) = self.shell.upgrade().and_then(|shell| {
+            let shell = shell.read(cx);
+            let snap = shell.snapshot.as_ref()?;
+            let can = snap.accounts.iter().find(|a| a.key == key.account())?.can.unread_jumps;
+            if !can {
+                return None;
+            }
+            let conv = snap.open.as_ref()?;
+            (conv.key == key).then_some((conv.mentions, conv.unread_reactions))
+        })?;
+        if mentions == 0 && reactions == 0 {
+            return None;
+        }
+        // Sit above the "jump to latest" pill while that pill is on screen.
+        let bottom = if self.away {
+            if self.metrics == Metrics::PHONE { px(68.) } else { px(48.) }
+        } else {
+            px(16.)
+        };
+        let mut stack = div()
+            .absolute()
+            .bottom(bottom)
+            .right(px(16.))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(6.));
+        if reactions > 0 {
+            stack = stack.child(
+                div()
+                    .id("jump-unread-reactions")
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow(theme::shadow_popover())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .type_small()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::text())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(format!("♥ {reactions}"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.jump_next_unread(protocol::UnreadItemKind::Reactions, cx);
+                    })),
+            );
+        }
+        if mentions > 0 {
+            stack = stack.child(
+                div()
+                    .id("jump-unread-mentions")
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .bg(theme::accent())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .shadow(theme::shadow_popover())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .type_small()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::on_accent())
+                    .cursor_pointer()
+                    .child(format!("@ {mentions}"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.jump_next_unread(protocol::UnreadItemKind::Mentions, cx);
+                    })),
+            );
+        }
+        Some(stack)
+    }
+
+    fn load_saved_dialogs(&mut self, key: Key, cx: &mut Context<Self>) {
+        if self.saved_loaded_for.as_ref() == Some(&key) {
+            return;
+        }
+        self.saved_loaded_for = Some(key.clone());
+        self.saved_dialogs.clear();
+        self.saved_tags.clear();
+        self.saved_filter = None;
+        self.saved_filtered = None;
+        let account = key.account();
+        cx.spawn(async move |this, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&Request::SavedDialogs { account }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.saved_loaded_for.as_ref() != Some(&key) {
+                    return;
+                }
+                if let Ok(Response::SavedDialogs { dialogs, tags }) = answer {
+                    this.saved_dialogs = dialogs;
+                    this.saved_tags = tags;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn apply_saved_filter(
+        &mut self,
+        peer_id: Option<String>,
+        tag: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if peer_id.is_none() && tag.is_none() {
+            self.saved_filter = None;
+            self.saved_filtered = None;
+            cx.notify();
+            return;
+        }
+        let Some(key) = self.key().cloned() else {
+            return;
+        };
+        let account = key.account();
+        self.saved_filter = Some((peer_id.clone(), tag.clone()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let req = Request::SavedHistory { account, peer_id, tag, limit: 50 };
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.key() != Some(&key) {
+                    return;
+                }
+                if let Ok(Response::SavedHistory { messages }) = answer {
+                    this.saved_filtered = Some(messages.into_iter().map(Rc::new).collect());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn saved_filter_bar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if self.thread {
+            return None;
+        }
+        let key = self.key()?.clone();
+        let is_saved = self.shell.upgrade().is_some_and(|shell| {
+            let shell = shell.read(cx);
+            let conv_saved = shell
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.open.as_ref())
+                .is_some_and(|c| c.key == key && c.special == protocol::Special::Saved);
+            let can = shell
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.accounts.iter().find(|a| a.key == key.account()))
+                .is_some_and(|a| a.can.saved_subdialogs);
+            conv_saved && can
+        });
+        if !is_saved {
+            return None;
+        }
+        self.load_saved_dialogs(key, cx);
+        if self.saved_dialogs.is_empty() && self.saved_tags.is_empty() {
+            return None;
+        }
+        let mut chips = div().flex().flex_wrap().items_center().gap(px(4.));
+        let all_active = self.saved_filter.is_none();
+        chips = chips.child(
+            div()
+                .id("saved-filter-all")
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(if all_active { theme::accent() } else { theme::hover() })
+                .text_color(if all_active { theme::on_accent() } else { theme::text() })
+                .type_small()
+                .cursor_pointer()
+                .child("All")
+                .on_click(cx.listener(|this, _, _, cx| this.apply_saved_filter(None, None, cx))),
+        );
+        for (ix, dlg) in self.saved_dialogs.iter().take(10).enumerate() {
+            let active = self.saved_filter.as_ref().is_some_and(|(p, t)| p.as_deref() == Some(dlg.peer_id.as_str()) && t.is_none());
+            let pid = dlg.peer_id.clone();
+            let label = if dlg.title.is_empty() { dlg.peer_id.clone() } else { dlg.title.clone() };
+            chips = chips.child(
+                div()
+                    .id(("saved-dlg", ix))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(if active { theme::accent() } else { theme::hover() })
+                    .text_color(if active { theme::on_accent() } else { theme::text() })
+                    .type_small()
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_saved_filter(Some(pid.clone()), None, cx);
+                    })),
+            );
+        }
+        for (ix, tag) in self.saved_tags.iter().take(10).enumerate() {
+            let active = self.saved_filter.as_ref().is_some_and(|(p, t)| p.is_none() && t.as_deref() == Some(tag.emoji.as_str()));
+            let emoji = tag.emoji.clone();
+            let label = if tag.title.is_empty() {
+                format!("{} {}", tag.emoji, tag.count)
+            } else {
+                format!("{} {} ({})", tag.emoji, tag.title, tag.count)
+            };
+            chips = chips.child(
+                div()
+                    .id(("saved-tag", ix))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(if active { theme::accent() } else { theme::hover() })
+                    .text_color(if active { theme::on_accent() } else { theme::text() })
+                    .type_small()
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_saved_filter(None, Some(emoji.clone()), cx);
+                    })),
+            );
+        }
+        let mut bar = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .px(px(12.))
+            .py(px(6.))
+            .bg(theme::raised())
+            .border_b_1()
+            .border_color(theme::hairline())
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(chips);
+        if let Some(filtered) = &self.saved_filtered {
+            let summary = if filtered.is_empty() {
+                "No saved messages match this filter.".to_owned()
+            } else {
+                let first = filtered
+                    .iter()
+                    .take(3)
+                    .map(|m| m.text.chars().take(60).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                format!("{} saved: {first}", filtered.len())
+            };
+            bar = bar.child(div().type_small().text_color(theme::text_soft()).truncate().child(summary));
+        }
+        Some(bar)
+    }
+
     fn live_call_row(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if self.thread {
             return None;
@@ -2288,8 +2704,10 @@ impl Render for Pane {
                     .min_h_0()
                     .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
                     .child(after)
+                    .children(self.saved_filter_bar(cx))
                     .children(self.live_call_row(cx))
                     .children(self.history_banner(cx))
+                    .children(self.unread_jump_buttons(cx))
                     .children(self.away.then(|| self.jump_button(cx)))
                     .children(self.selection_bar(cx))
                     .into_any_element()

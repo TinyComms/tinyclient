@@ -1264,13 +1264,18 @@ impl Shell {
     /// A row's notifications, from its menu: everything, or nothing. The row changes when the
     /// network says so (or immediately in local settings for Tiny).
     pub(in crate::gui) fn set_row_mute(&mut self, conversation: Key, mute: bool, cx: &mut Context<Self>) {
+        self.set_row_mute_until(conversation, mute, None, cx);
+    }
+
+    /// Mute or unmute a conversation, optionally until `until` (Unix seconds; `None` is endless).
+    pub(in crate::gui) fn set_row_mute_until(&mut self, conversation: Key, mute: bool, until: Option<i64>, cx: &mut Context<Self>) {
         let notify = if mute { Notify::Nothing } else { Notify::All };
         if conversation.network == Network::Tiny {
             profile::details::set_local_notify(&conversation, notify, cx);
             cx.notify();
             return;
         }
-        self.conversation_act(Request::SetMute { conversation, notify, until: None }, "Can't change notifications".to_owned(), cx);
+        self.conversation_act(Request::SetMute { conversation, notify, until }, "Can't change notifications".to_owned(), cx);
     }
 
     /// Closes a DM as the network's own ×: it leaves the list until a new message.

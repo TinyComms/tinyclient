@@ -174,6 +174,7 @@ impl Who {
             name: self.name.clone(),
             avatar: self.avatar.clone(),
             bot: self.bot,
+            ..Sender::default()
         }
     }
 }

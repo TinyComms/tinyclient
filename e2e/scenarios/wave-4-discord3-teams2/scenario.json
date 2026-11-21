@@ -1,0 +1,12 @@
+{
+  "id": "wave-4-discord3-teams2",
+  "title": "Wave 4F Discord collapsed categories, mark server read, role colors, moderation & timed mute and Teams activity feed, inline images, live seen/read-by, shared channels & show/hide/pin",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 4F Discord & Teams enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 4F Discord & Teams enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

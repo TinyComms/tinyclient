@@ -454,6 +454,9 @@ pub struct Conversation {
     /// Unread messages that mention me.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub mentions: u32,
+    /// Unread reactions to my messages (Telegram `unread_reactions_count`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread_reactions: u32,
     /// Muted on the network. Drawn dimmed, never a dot, still a quiet mention count.
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
@@ -487,6 +490,9 @@ pub struct Conversation {
     /// Only invited people see it: drawn with a lock.
     #[serde(default, skip_serializing_if = "is_false")]
     pub private: bool,
+    /// Shared channel across teams or organizations (Teams `channelType == 2`): drawn with a link icon.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
     /// End-to-end encrypted or not, where the network says (a Tiny server). A plaintext
     /// conversation can be upgraded once; messages from before that stay readable by the server.
     #[serde(default, skip_serializing_if = "Encryption::is_unknown")]
@@ -612,6 +618,7 @@ impl Conversation {
             peer: None,
             unread: 0,
             mentions: 0,
+            unread_reactions: 0,
             muted: false,
             starred: false,
             preview: String::new(),
@@ -623,6 +630,7 @@ impl Conversation {
             limit: 0,
             read_only: false,
             private: false,
+            shared: false,
             encryption: Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(),
@@ -783,6 +791,15 @@ pub struct Person {
     pub utc_offset: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<Mark>,
+    /// Highest coloured role's RGB (`0xRRGGBB`) in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_color: Option<u32>,
+    /// Highest role icon image in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_icon: Option<MediaFile>,
+    /// Highest role unicode emoji badge in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_emoji: Option<String>,
 }
 
 impl Person {
@@ -803,6 +820,9 @@ impl Person {
             title: String::new(),
             utc_offset: None,
             mark: None,
+            role_color: None,
+            role_icon: None,
+            role_emoji: None,
         }
     }
 }
@@ -940,6 +960,27 @@ pub struct SharedItem {
     pub url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+}
+
+/// Member moderation actions in a Space (`Request::Moderate`, Discord).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModerateAction {
+    Kick,
+    Ban {
+        #[serde(default, skip_serializing_if = "is_zero")]
+        delete_seconds: u32,
+    },
+    Timeout {
+        /// Unix seconds until the timeout expires.
+        until: i64,
+    },
+    Untimeout,
+    Nick {
+        /// New nickname; empty clears it.
+        #[serde(default)]
+        nick: String,
+    },
 }
 
 /// What the user does about a person. Never automated: only on a shell request.
@@ -1663,6 +1704,22 @@ pub enum Request {
         account: AccountKey,
         username: String,
     },
+    /// Moderate a member inside a Space (kick, ban, timeout, untimeout, or change nickname).
+    /// Gated by computed permissions and role hierarchy; never sent without confirmation.
+    Moderate {
+        space: Key,
+        person: Key,
+        action: ModerateAction,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Lift a ban on a person in a Space.
+    Unban {
+        space: Key,
+        person: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
     /// Report a message, person, or conversation to the network. Never sent without a confirm sheet.
     Report {
         target: ReportTarget,
@@ -1782,8 +1839,8 @@ pub enum Request {
         message_id: String,
     },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
-    /// one; `space` to one Space's conversations; both `None` is the whole Inbox. Message
-    /// requests are read here only.
+    /// one; `space` to one Space's conversations; `folder` to one folder's conversations/Spaces;
+    /// all `None` is the whole Inbox. Message requests are read here only.
     MarkAllRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
@@ -1791,6 +1848,9 @@ pub enum Request {
         /// peer that does not know the field ignores it and hears the wider request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<Key>,
+        /// The folder to read out (e.g. a Discord server folder or Telegram chat folder).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<Key>,
     },
     /// Drops this conversation's cached messages and its badge. A direct or group conversation
     /// leaves the Inbox until a newer message arrives. The network is not asked to delete
@@ -2720,6 +2780,79 @@ pub enum Request {
         /// Maximum unread conversations to include (server-clamped; 0 uses default 15).
         #[serde(default)]
         limit: u32,
+    /// Who has read a given message in a chat (`Capabilities::read_by`).
+    ReadBy {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Press an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
+    /// Answers `Response::ButtonAnswer`.
+    PressButton {
+        conversation: Key,
+        message_id: String,
+        /// Hex-encoded callback payload from `InlineButtonKind::Callback::data`.
+        data: String,
+    },
+    /// Read account-wide notification defaults and per-chat exceptions (Telegram).
+    /// Answers `Response::NotifyDefaults`.
+    GetNotifyDefaults {
+        account: AccountKey,
+    },
+    /// Update one account-wide notification default scope (Telegram `account.updateNotifySettings`).
+    /// Answers `Response::NotifyDefaults`.
+    SetNotifyDefault {
+        account: AccountKey,
+        scope: NotifyDefaultScope,
+        muted: bool,
+    },
+    /// Reset all account-wide notification defaults and exceptions (Telegram `account.resetNotifySettings`).
+    /// Answers `Response::NotifyDefaults`.
+    ResetNotifyDefaults {
+        account: AccountKey,
+    },
+    /// List Saved Messages sub-dialogs (by source peer) and reaction tags (Telegram).
+    /// Answers `Response::SavedDialogs`.
+    SavedDialogs {
+        account: AccountKey,
+    },
+    /// Fetch Saved Messages filtered by source peer (`saved_peer_id`) and/or reaction tag (Telegram).
+    /// Answers `Response::SavedHistory`.
+    SavedHistory {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// List active signed-in devices/sessions for an account (Telegram `account.getAuthorizations`).
+    /// Answers `Response::ActiveSessions`.
+    ActiveSessions {
+        account: AccountKey,
+    },
+    /// Terminate another active session (Telegram `account.resetAuthorization`). Never ends the current session.
+    /// Answers `Response::Ok`.
+    EndSession {
+        account: AccountKey,
+        session_id: String,
+    },
+    /// Fetch unread mention or reaction message IDs in a conversation (Telegram `messages.getUnreadMentions` / `getUnreadReactions`).
+    /// Answers `Response::UnreadItems`.
+    UnreadItems {
+        conversation: Key,
+        kind: UnreadItemKind,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Mark unread mentions or reactions read in a conversation (`readMessageContents`, `readMentions`, `readReactions`).
+    /// When `message_ids` is empty, marks all unread items of `kind` read in the conversation.
+    /// Answers `Response::Ok`.
+    MarkUnreadItemsRead {
+        conversation: Key,
+        kind: UnreadItemKind,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
     },
 }
 
@@ -3261,6 +3394,35 @@ pub enum Response {
     /// Unread messages grouped by conversation (`Request::AllUnreads`, #606).
     AllUnreads {
         groups: Vec<UnreadGroup>,
+    /// Members who have read a given message (`Request::ReadBy`).
+    ReadBy {
+        readers: Vec<ReadBy>,
+    },
+    /// Answer to pressing an inline bot callback button (`Request::PressButton`).
+    ButtonAnswer {
+        answer: ButtonAnswer,
+    },
+    /// Account-wide notification defaults and per-chat exceptions.
+    NotifyDefaults {
+        defaults: NotifyDefaults,
+    },
+    /// Saved Messages sub-dialogs and reaction tags (`Request::SavedDialogs`).
+    SavedDialogs {
+        dialogs: Vec<SavedDialog>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<SavedTag>,
+    },
+    /// Saved Messages filtered by source peer or reaction tag (`Request::SavedHistory`).
+    SavedHistory {
+        messages: Vec<Message>,
+    },
+    /// Active signed-in devices/sessions (`Request::ActiveSessions`).
+    ActiveSessions {
+        sessions: Vec<ActiveSession>,
+    },
+    /// Unread mention or reaction message IDs in a conversation (`Request::UnreadItems`).
+    UnreadItems {
+        message_ids: Vec<String>,
     },
 }
 

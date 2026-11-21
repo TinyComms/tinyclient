@@ -474,12 +474,38 @@ impl MemberList {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        // A phone's names are the size the other pages' rows are (Details, a
-                        // profile, the sidebar): 16, not the desktop's interface size scaled.
-                        .map(|name| if phone { name.type_body() } else { name.type_ui() })
-                        .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
-                        .child(person.name.clone()),
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                // A phone's names are the size the other pages' rows are (Details, a
+                                // profile, the sidebar): 16, not the desktop's interface size scaled.
+                                .map(|name| if phone { name.type_body() } else { name.type_ui() })
+                                .text_color(if away {
+                                    theme::text_faint()
+                                } else if let Some(color) = person.role_color {
+                                    theme::role_color(color)
+                                } else if phone {
+                                    theme::text()
+                                } else {
+                                    theme::text_soft()
+                                })
+                                .child(person.name.clone()),
+                        )
+                        .children(person.role_icon.as_ref().and_then(|f| f.path.as_deref()).filter(|p| !p.is_empty()).map(|path| {
+                            gpui::img(std::path::PathBuf::from(path))
+                                .size(px(14.))
+                                .rounded(px(3.))
+                                .flex_none()
+                        }))
+                        .children(person.role_icon.is_none().then(|| {
+                            person.role_emoji.as_deref().filter(|e| !e.is_empty()).map(|emoji| {
+                                div().flex_none().text_size(px(13.)).line_height(px(14.)).child(emoji.to_owned())
+                            })
+                        }).flatten()),
                 )
                 .when(person.title == "Owner", |row| row.child(div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
                 .when(person.bot, |row| row.child(super::list::bot_tag()))

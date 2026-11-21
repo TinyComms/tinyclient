@@ -91,6 +91,59 @@ pub(super) fn pinned_chat_order(listed: &Value, chats: &[Value]) -> Vec<String> 
     order
 }
 
+/// Parses Teams' pinned channel ids in their Teams order from user-level properties
+/// (`pinnedChannels`, `userDetails.pinnedChannels`, `userProperties.pinnedChannels`) and
+/// per-channel `isPinned` / `properties.pinned` flags.
+pub(super) fn pinned_channel_order(listed: &Value, teams: &[Value], shared_channels: &[Value]) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut push = |id: &str| {
+        if !id.is_empty() && !order.iter().any(|existing: &String| existing == id) {
+            order.push(id.to_owned());
+        }
+    };
+    let sources = [
+        &listed["pinnedChannels"],
+        &listed["userDetails"]["pinnedChannels"],
+        &listed["userProperties"]["pinnedChannels"],
+    ];
+    for source in sources {
+        match source {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(id) = item.as_str() {
+                        push(id);
+                    }
+                }
+            }
+            Value::String(raw) => {
+                if let Ok(items) = serde_json::from_str::<Vec<String>>(raw) {
+                    for id in items {
+                        push(&id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let check_channel = |ch: &Value, push: &mut dyn FnMut(&str)| {
+        let pinned = ch["isPinned"] == true
+            || ch["properties"]["pinned"] == true
+            || ch["properties"]["pinned"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if pinned {
+            push(text(ch, "id"));
+        }
+    };
+    for team in teams {
+        for ch in team["channels"].as_array().into_iter().flatten() {
+            check_channel(ch, &mut push);
+        }
+    }
+    for ch in shared_channels {
+        check_channel(ch, &mut push);
+    }
+    order
+}
+
 /// What Teams says of how far a channel or chat was read.
 struct Counted {
     unread: bool,
@@ -135,6 +188,38 @@ fn counted(entry: &Value, me: &str) -> Counted {
     }
 }
 
+/// Classifies a Teams channel by `channelType` (0 = standard, 1 = private, 2 = shared)
+/// and returns `(private, shared, mark)` where cross-tenant shared channels get `Mark::External`.
+pub(super) fn channel_flags(channel: &Value, team_tenant: &str, own_tenant: &str) -> (bool, bool, Option<protocol::Mark>) {
+    channel_flags_with(channel, team_tenant, own_tenant, false)
+}
+
+fn channel_flags_with(channel: &Value, team_tenant: &str, own_tenant: &str, force_shared: bool) -> (bool, bool, Option<protocol::Mark>) {
+    let kind = channel["channelType"].as_u64().unwrap_or(0);
+    let shared = force_shared
+        || kind == 2
+        || channel["isShared"] == true
+        || channel["membershipType"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("shared"));
+    let private = !shared
+        && (kind == 1
+            || channel["membershipType"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("private")));
+    let host_tenant = [&channel["tenantId"], &channel["hostTenantId"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .find(|s| !s.is_empty())
+        .unwrap_or(team_tenant);
+    let mark = (shared
+        && !host_tenant.is_empty()
+        && !own_tenant.is_empty()
+        && !host_tenant.eq_ignore_ascii_case(own_tenant))
+    .then_some(protocol::Mark::External);
+    (private, shared, mark)
+}
+
 impl Teams {
     /// The shell opened a Space, or push has just connected.
     pub(super) fn open_space(&self) -> Result<(), Fault> {
@@ -153,15 +238,64 @@ impl Teams {
     fn list(&self, first: bool) -> Result<(), Fault> {
         let url = format!("{}/api/csa/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true", self.api);
         let mut listed = self.call("GET", &url, Auth::Both(AGGREGATOR), Body::None, true)?.body;
-        let (teams, chats) = (taken(&mut listed, "teams"), taken(&mut listed, "chats"));
+        let (teams, chats, shared_channels) = (
+            taken(&mut listed, "teams"),
+            taken(&mut listed, "chats"),
+            taken(&mut listed, "sharedChannels"),
+        );
         let pinned_order = pinned_chat_order(&listed, &chats);
+        let pinned_channels = pinned_channel_order(&listed, &teams, &shared_channels);
         drop(listed);
+        self.state().pinned_channels = pinned_channels.clone();
         let me = self.me();
+        let own_tenant = self.session.tenant.clone();
         // The chats first: written with no Space, they leave the one an earlier build kept them
         // in before that Space goes.
         self.chats(chats, &pinned_order, &me, first)?;
         let teams: Vec<&Value> = teams.iter().filter(|team| team["isDeleted"] != true && !text(team, "id").is_empty()).collect();
-        let spaces: Vec<SpaceRow> = teams
+        let mut seen_channel_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for team in &teams {
+            for ch in team["channels"].as_array().into_iter().flatten() {
+                let cid = text(ch, "id");
+                if !cid.is_empty() {
+                    seen_channel_ids.insert(cid.to_owned());
+                }
+            }
+        }
+        // Group standalone shared channels (from host teams the user is not a member of) by host team.
+        let mut extra_teams: Vec<(String, String, Vec<&Value>)> = Vec::new();
+        let mut extra_for_existing: HashMap<String, Vec<&Value>> = HashMap::new();
+        for ch in &shared_channels {
+            if ch["isDeleted"] == true {
+                continue;
+            }
+            let cid = text(ch, "id");
+            if cid.is_empty() || seen_channel_ids.contains(cid) {
+                continue;
+            }
+            seen_channel_ids.insert(cid.to_owned());
+            let host_id = [&ch["parentTeamId"], &ch["hostTeamId"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|s| !s.is_empty())
+                .unwrap_or("shared")
+                .to_owned();
+            if teams.iter().any(|t| text(t, "id") == host_id) {
+                extra_for_existing.entry(host_id).or_default().push(ch);
+            } else if let Some((_, _, list)) = extra_teams.iter_mut().find(|(id, _, _)| *id == host_id) {
+                list.push(ch);
+            } else {
+                let host_name = [&ch["parentTeamName"], &ch["hostTeamName"], &ch["teamDisplayName"]]
+                    .into_iter()
+                    .filter_map(Value::as_str)
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("Shared channels")
+                    .to_owned();
+                extra_teams.push((host_id, host_name, vec![ch]));
+            }
+        }
+
+        let mut spaces: Vec<SpaceRow> = teams
             .iter()
             .enumerate()
             .map(|(at, team)| SpaceRow {
@@ -172,27 +306,49 @@ impl Teams {
             })
             .filter(|space| space.id != OLD_CHATS)
             .collect();
+        for (offset, (host_id, host_name, _)) in extra_teams.iter().enumerate() {
+            if host_id != OLD_CHATS {
+                spaces.push(SpaceRow {
+                    id: host_id.clone(),
+                    name: host_name.clone(),
+                    icon: None,
+                    position: (teams.len() + offset) as i32,
+                });
+            }
+        }
         self.ctx.spaces(&spaces)?;
 
         for team in teams {
             let id = text(team, "id");
+            let team_tenant = text(team, "tenantId");
             // General first, then the order Teams lists them in. A channel the user hid is kept
             // apart (`opted_out`), behind the tree's "Show hidden". Unverified: that
             // `isFavorite: false` is what hiding a channel writes.
             let hidden = |channel: &Value| channel["isGeneral"] != true && channel["isFavorite"] == false && channel["isPinned"] != true;
             let mut channels: Vec<&Value> = team["channels"].as_array().into_iter().flatten().filter(|channel| channel["isDeleted"] != true).collect();
+            if let Some(extra) = extra_for_existing.remove(id) {
+                channels.extend(extra);
+            }
             channels.sort_by_key(|channel| channel["isGeneral"] != true);
             let rows: Vec<ConversationRow> = channels
                 .iter()
                 .enumerate()
-                .map(|(position, channel)| ConversationRow {
-                    space: Some(id.to_owned()),
-                    position: position as i32,
-                    call: CallSupport::Handoff,
-                    private: channel["channelType"].as_u64().is_some_and(|kind| kind != 0),
-                    read_only: team["isArchived"] == true || channel["isArchived"] == true,
-                    opted_out: hidden(channel),
-                    ..ConversationRow::new(text(channel, "id"), ConversationKind::Channel, text(channel, "displayName"))
+                .map(|(position, channel)| {
+                    let chan_id = text(channel, "id");
+                    let (private, shared, mark) = channel_flags(channel, team_tenant, &own_tenant);
+                    let pin = pinned_channels.iter().position(|p| p == chan_id).map(|ix| ix as i32);
+                    ConversationRow {
+                        space: Some(id.to_owned()),
+                        position: position as i32,
+                        call: CallSupport::Handoff,
+                        private,
+                        shared,
+                        mark,
+                        read_only: team["isArchived"] == true || channel["isArchived"] == true,
+                        opted_out: hidden(channel),
+                        filing: Some(Filing { pin, ..Filing::default() }),
+                        ..ConversationRow::new(chan_id, ConversationKind::Channel, text(channel, "displayName"))
+                    }
                 })
                 .collect();
             self.ctx.tree(id, &[], &rows)?;
@@ -200,6 +356,39 @@ impl Teams {
             if let Some(group) = team["teamSiteInformation"]["groupId"].as_str() {
                 self.ctx.set_note(&format!("group:{id}"), group);
             }
+            for channel in channels {
+                let chan_id = text(channel, "id");
+                let level = super::info::parse_notify(channel, true)
+                    .or_else(|| super::info::parse_notify(&channel["properties"], true))
+                    .unwrap_or(protocol::Notify::All);
+                self.state().notify.insert(chan_id.to_owned(), level);
+                self.ctx.set_note(&format!("notify:{chan_id}"), super::info::notify_word(level));
+                self.count(chan_id, &counted(channel, &me), level == protocol::Notify::Nothing)?;
+            }
+        }
+        for (host_id, _, channels) in extra_teams {
+            let rows: Vec<ConversationRow> = channels
+                .iter()
+                .enumerate()
+                .map(|(position, channel)| {
+                    let chan_id = text(channel, "id");
+                    let (private, shared, mark) = channel_flags_with(channel, "", &own_tenant, true);
+                    let pin = pinned_channels.iter().position(|p| p == chan_id).map(|ix| ix as i32);
+                    ConversationRow {
+                        space: Some(host_id.clone()),
+                        position: position as i32,
+                        call: CallSupport::Handoff,
+                        private,
+                        shared,
+                        mark,
+                        read_only: channel["isArchived"] == true,
+                        opted_out: channel["isFavorite"] == false && channel["isPinned"] != true,
+                        filing: Some(Filing { pin, ..Filing::default() }),
+                        ..ConversationRow::new(chan_id, ConversationKind::Channel, text(channel, "displayName"))
+                    }
+                })
+                .collect();
+            self.ctx.tree(&host_id, &[], &rows)?;
             for channel in channels {
                 let chan_id = text(channel, "id");
                 let level = super::info::parse_notify(channel, true)
@@ -408,6 +597,210 @@ impl Teams {
         Ok(())
     }
 
+    /// Parses one `48:notifications` message into a [`protocol::ActivityItem`].
+    fn parse_activity_item(
+        &self,
+        item: &Value,
+        read_horizon: i64,
+        read_ids: &std::collections::HashSet<String>,
+    ) -> Option<protocol::ActivityItem> {
+        let id = id_of(&item["id"]);
+        if id.is_empty() {
+            return None;
+        }
+        let activity = match &item["properties"]["activity"] {
+            Value::String(raw) => serde_json::from_str(raw).unwrap_or(Value::Null),
+            other => other.clone(),
+        };
+        let thread = text(&activity, "sourceThreadId");
+        if thread.is_empty() {
+            return None;
+        }
+        let raw_kind = text(&activity, "activityType").to_ascii_lowercase();
+        let kind = if raw_kind.contains("mention") {
+            protocol::ActivityItemKind::Mention
+        } else if raw_kind.contains("reply") || raw_kind.contains("thread") {
+            protocol::ActivityItemKind::ThreadReply
+        } else if raw_kind.contains("react") || raw_kind.contains("like") || raw_kind.contains("emotion") {
+            protocol::ActivityItemKind::Reaction
+        } else if raw_kind.contains("add") || raw_kind.contains("team") || raw_kind.contains("member") || raw_kind.contains("invite") {
+            protocol::ActivityItemKind::Invite
+        } else if raw_kind.contains("app") || raw_kind.contains("bot") || raw_kind.contains("card") {
+            protocol::ActivityItemKind::App
+        } else {
+            protocol::ActivityItemKind::Other
+        };
+        let message_id = {
+            let src = id_of(&activity["sourceMessageId"]);
+            if src.is_empty() { id.clone() } else { src }
+        };
+        let chain = id_of(&activity["sourceReplyChainId"]);
+        let thread_id = (millis(&chain) > 0 && chain != message_id).then(|| chain_id(thread, &chain));
+        let actor_id = {
+            let src = text(&activity, "sourceUserId");
+            if !src.is_empty() {
+                src.to_owned()
+            } else {
+                text(item, "from").rsplit('/').next().unwrap_or("").to_owned()
+            }
+        };
+        let actor = {
+            let from_act = text(&activity, "sourceUserImDisplayName");
+            if !from_act.is_empty() {
+                from_act.to_owned()
+            } else {
+                let from_msg = text(item, "imdisplayname");
+                if !from_msg.is_empty() {
+                    from_msg.to_owned()
+                } else {
+                    self.name_of(&actor_id).unwrap_or_default()
+                }
+            }
+        };
+        let emoji = if kind == protocol::ActivityItemKind::Reaction {
+            let key = [&activity["reactionKey"], &activity["emoji"], &activity["activitySubtype"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|s| !s.is_empty())
+                .unwrap_or("");
+            if key.is_empty() { String::new() } else { super::emoji::emoji_of(key) }
+        } else {
+            String::new()
+        };
+        let snippet = [&activity["messagePreview"], &activity["activityTitle"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                let content = text(item, "content");
+                if content.is_empty() {
+                    None
+                } else {
+                    let parsed = super::html::parse(content, &super::people::Nobody, &self.me()).text;
+                    let cleaned = parsed.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+                    (!cleaned.is_empty()).then_some(cleaned)
+                }
+            })
+            .unwrap_or_else(|| {
+                if raw_kind.contains("call") || raw_kind.contains("voicemail") {
+                    "Missed call".to_owned()
+                } else if kind == protocol::ActivityItemKind::Invite {
+                    "Added you to a team".to_owned()
+                } else {
+                    String::new()
+                }
+            });
+        let item_ms = millis(&id);
+        let time = match item_ms / 1000 {
+            0 => seconds(text(item, "composetime")),
+            ts => ts,
+        };
+        let prop_read = item["properties"]["isRead"] == true
+            || item["properties"]["isRead"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || activity["isRead"] == true
+            || activity["read"] == true;
+        let horizon_read = read_horizon > 0 && item_ms > 0 && item_ms <= read_horizon;
+        let unread = !(prop_read || horizon_read || read_ids.contains(&id));
+        Some(protocol::ActivityItem {
+            id,
+            kind,
+            conversation: self.ctx.key(thread),
+            message_id,
+            thread_id,
+            actor,
+            actor_id,
+            emoji,
+            text: snippet,
+            time,
+            unread,
+        })
+    }
+
+    /// Fetches a page of the Teams `48:notifications` activity feed for `Command::ActivityFeed`.
+    pub(super) fn fetch_activity_feed(
+        &self,
+        kind: Option<protocol::ActivityItemKind>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::adapters::ActivityPage, Fault> {
+        let page_size = limit.clamp(1, ACTIVITY_PAGE);
+        let window = match cursor.filter(|c| !c.is_empty()) {
+            Some(sync) => format!("startTime=1&syncState={sync}"),
+            None => "startTime=1".to_owned(),
+        };
+        let (raw_items, older) = self.page(ACTIVITY, page_size, &window)?;
+        let read_horizon = self.ctx.note("activity_read_horizon").as_deref().map(millis).unwrap_or(0);
+        let read_ids = self.state().activity_read.clone();
+        let items = raw_items
+            .iter()
+            .filter_map(|raw| self.parse_activity_item(raw, read_horizon, &read_ids))
+            .filter(|item| kind.is_none_or(|wanted| item.kind == wanted))
+            .collect();
+        Ok(crate::adapters::ActivityPage {
+            items,
+            cursor: (!older.is_empty()).then_some(older),
+        })
+    }
+
+    /// Marks one activity item (`Some(id)`) or all items (`None`) read on `48:notifications`.
+    pub(super) fn mark_activity_read(&self, item_id: Option<&str>) -> Result<(), Fault> {
+        if let Some(id) = item_id.filter(|id| !id.is_empty()) {
+            let path = format!(
+                "/v1/users/ME/conversations/{}/messages/{}/properties?name=isRead",
+                escaped(ACTIVITY),
+                escaped(id)
+            );
+            self.chat("PUT", &path, Body::Json(&serde_json::json!({"isRead": "true"})), false)?;
+            self.state().activity_read.insert(id.to_owned());
+        } else {
+            let ts = super::now_ms();
+            let path = format!(
+                "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
+                escaped(ACTIVITY)
+            );
+            let horizon = serde_json::json!({"consumptionhorizon": format!("{ts};{ts};{ts}")});
+            self.chat("PUT", &path, Body::Json(&horizon), false)?;
+            self.ctx.set_note("activity_read_horizon", &ts.to_string());
+        }
+        Ok(())
+    }
+
+    /// Handles a live push event arriving on `48:notifications`.
+    pub(super) fn handle_activity_push(&self, raw: &Value) -> Result<(), Fault> {
+        let item_ms = millis(&id_of(&raw["id"]));
+        if item_ms > 0 {
+            let prev = self.ctx.note("activity_cursor").as_deref().map(millis).unwrap_or(0);
+            if item_ms > prev {
+                self.ctx.set_note("activity_cursor", &item_ms.to_string());
+            }
+        }
+        let read_horizon = self.ctx.note("activity_read_horizon").as_deref().map(millis).unwrap_or(0);
+        let read_ids = self.state().activity_read.clone();
+        let Some(item) = self.parse_activity_item(raw, read_horizon, &read_ids) else {
+            return Ok(());
+        };
+        if item.kind == protocol::ActivityItemKind::Mention {
+            let place = item.thread_id.as_deref().unwrap_or(&item.conversation.id);
+            if let Some(row) = self.ctx.known(place)?.or(self.ctx.known(&item.conversation.id)?) {
+                let msg_ms = millis(&item.message_id);
+                let read = row.last_read.as_deref().map(millis).unwrap_or(0);
+                if msg_ms > read {
+                    let next_mentions = row.mentions.saturating_add(1);
+                    self.ctx.counts(
+                        &row.key.id,
+                        row.unread.max(next_mentions),
+                        next_mentions,
+                        row.last_read.as_deref(),
+                        item.time.max(row.updated),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// True once the conversation a message belongs to has a row. A chat never seen (someone
     /// has just started it) is described by Teams and recorded; a channel that is not in the
     /// tree is one the user hid or left, and stays out.
@@ -470,6 +863,8 @@ impl Teams {
         row.root = Some(root.to_owned());
         if let Some(parent) = parent {
             row.private = parent.private;
+            row.shared = parent.shared;
+            row.mark = parent.mark;
             row.read_only = parent.read_only;
         }
         self.ctx.conversation(&row)?;
