@@ -141,6 +141,7 @@ pub fn prove_team_info() -> Result<(), String> {
 }
 mod people;
 mod push;
+mod search;
 mod send;
 mod tree;
 
@@ -175,11 +176,20 @@ const TEAMS: &str = "https://teams.microsoft.com";
 const SPACES: &str = "https://api.spaces.skype.com";
 const AGGREGATOR: &str = "https://chatsvcagg.teams.microsoft.com";
 const PRESENCE: &str = "https://presence.teams.microsoft.com";
+/// Microsoft Search (Substrate) audience for server-side Teams search.
+const SUBSTRATE: &str = "https://substrate.office.com";
 /// The second audience: Microsoft Graph, for the user's OneDrive (files in chats). Unverified
 /// that Teams' client id may mint it.
 const GRAPH: &str = "https://graph.microsoft.com";
 /// Hosts a service address handed out by Teams may be on. A token goes nowhere else.
-const OURS: &[&str] = &["teams.microsoft.com", "skype.com", "teams.cloud.microsoft", "teams.office.com", "graph.microsoft.com"];
+const OURS: &[&str] = &[
+    "teams.microsoft.com",
+    "skype.com",
+    "teams.cloud.microsoft",
+    "teams.office.com",
+    "graph.microsoft.com",
+    "substrate.office.com",
+];
 
 /// Messages per page of history, and per opening of a reply chain.
 const PAGE: u32 = 50;
@@ -290,6 +300,7 @@ struct Place {
     middle: String,
     presence: String,
     urlp: Option<String>,
+    search: Option<String>,
 }
 
 struct Token {
@@ -355,6 +366,8 @@ struct State {
     activity_targets: HashMap<String, (String, String)>,
     /// Newest activity item id seen from `48:notifications`.
     activity_newest_ms: i64,
+    /// When the last server-side search ran, for separate pacing.
+    search_at: Option<Instant>,
 }
 
 /// What a call presents.
@@ -793,6 +806,7 @@ impl Teams {
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
                 urlp: named("urlp"),
+                search: named("search"),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -942,6 +956,8 @@ impl Teams {
             pins: true,
             save_messages: true,
             activity_feed: true,
+            search: true,
+            search_global: true,
             pin_chats: 15,
             close_direct: true,
             clear_history: true,
@@ -1048,6 +1064,9 @@ impl Teams {
             }
             Command::ActivityMarkRead { item_id, reply } => {
                 let _ = reply.send(self.activity_mark_read(item_id.as_deref()).map_err(refuse));
+            }
+            Command::Search { query, scope, filters, cursor, at, reply } => {
+                let _ = reply.send(self.search_messages(&query, &scope, &filters, cursor.as_deref(), at).map_err(refuse));
             }
             Command::CloseDirect { conversation_id, reply } => {
                 let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));

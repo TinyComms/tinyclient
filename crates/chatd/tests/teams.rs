@@ -258,6 +258,7 @@ impl Fake {
             ("https://teams.microsoft.com/api/mt/emea", "/api/mt/emea"),
             ("https://presence.teams.microsoft.com", "/presence"),
             ("https://eu-api.asm.skype.com", "/ams"),
+            ("https://eu-prod.asyncgw.teams.microsoft.com/msgsearch", "/msgsearch"),
         ] {
             text = text.replace(host, &format!("{}{at}", self.base));
         }
@@ -371,6 +372,7 @@ impl Fake {
             "/presence/v1/presence/getpresence/" if bearer("presence") => ok(self.fixture("presence").unwrap()),
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
             "/presence/v1/me/publishnote" if bearer("presence") => ok(json!({})),
+            _ if path.starts_with("/msgsearch") && bearer("substrate") => self.search_endpoint(call),
             // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
             _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
                 status: "200 OK",
@@ -400,6 +402,7 @@ impl Fake {
             scope if scope.starts_with("https://api.spaces.skype.com/.default ") => "spaces",
             scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ") => "csa",
             scope if scope.starts_with("https://presence.teams.microsoft.com/.default ") => "presence",
+            scope if scope.starts_with("https://substrate.office.com/.default ") => "substrate",
             scope if scope.starts_with("https://graph.microsoft.com/.default ") => "graph",
             _ => return answer("400 Bad Request", json!({"error": "invalid_scope", "error_description": "AADSTS70011: The provided value for the input parameter 'scope' is not valid."})),
         };
@@ -462,6 +465,11 @@ impl Fake {
                     "id": thread,
                     "properties": {"threadType": "chat", "uniquerosterthread": "true"},
                     "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
+                })),
+                "19:archive0chat@thread.v2" => Some(json!({
+                    "id": thread,
+                    "properties": {"threadType": "chat", "topic": "Budget Archive"},
+                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
                 })),
                 "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
                 _ => None,
@@ -550,6 +558,13 @@ impl Fake {
                         let mut first = self.fixture("messages.activity").unwrap();
                         first["_metadata"]["backwardLink"] = json!("https://example.invalid/messages?syncState=actpage2");
                         return ok(first);
+                    }
+                    "19:archive0chat@thread.v2" => {
+                        let msgs = vec![
+                            message("19:archive0chat@thread.v2", None, 1_758_000_000_200, ANA, "Ana Ruiz", "<p>Quarterly budget spreadsheet attached</p>"),
+                            message("19:archive0chat@thread.v2", None, 1_758_000_000_100, BEN, "Ben Okafor", "<p>Before budget</p>"),
+                        ];
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
                     }
                     "48:saved" => {
                         let msgs = self.saved.lock().unwrap().clone();
@@ -689,6 +704,83 @@ impl Fake {
             }
         }
         answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
+    }
+
+    /// Microsoft Search / Substrate endpoint for server-side Teams search (#642).
+    fn search_endpoint(&self, call: &Call) -> Reply {
+        let req = call.json();
+        let entity = &req["EntityRequests"][0];
+        let query = entity["Query"]["QueryString"].as_str().unwrap_or("").to_lowercase();
+        let thread_filter = entity["Filter"]["ThreadId"].as_str().unwrap_or("");
+        let team_filter = entity["Filter"]["TeamId"].as_str().unwrap_or("");
+
+        let corpus = vec![
+            json!({
+                "HitHighlightedSummary": "Quarterly <c0>budget</c0> spreadsheet attached",
+                "Source": {
+                    "ThreadId": "19:archive0chat@thread.v2",
+                    "MessageId": "1758000000200",
+                    "ThreadTopic": "Budget Archive",
+                    "From": {"Mri": ANA, "Name": "Ana Ruiz"},
+                    "HasAttachments": true,
+                    "HasLinks": false,
+                    "MentionsMe": false
+                }
+            }),
+            json!({
+                "HitHighlightedSummary": "Reply in chain about <c0>budget</c0> rollout",
+                "Source": {
+                    "ThreadId": GENERAL,
+                    "MessageId": "1760000210210",
+                    "ParentMessageId": ROOT,
+                    "TeamId": GENERAL,
+                    "TeamName": "Platform",
+                    "ChannelName": "General",
+                    "From": {"Mri": BEN, "Name": "Ben Okafor"},
+                    "HasAttachments": false,
+                    "HasLinks": true,
+                    "MentionsMe": true
+                }
+            }),
+            json!({
+                "HitHighlightedSummary": "Check <c0>deploy</c0> logs in Deploys",
+                "Source": {
+                    "ThreadId": DEPLOYS,
+                    "MessageId": "1760000400400",
+                    "TeamId": GENERAL,
+                    "TeamName": "Platform",
+                    "ChannelName": "Deploys",
+                    "From": {"Mri": BEN, "Name": "Ben Okafor"},
+                    "HasAttachments": false,
+                    "HasLinks": false,
+                    "MentionsMe": false
+                }
+            }),
+        ];
+
+        let mut matched = Vec::new();
+        for item in corpus {
+            let src = &item["Source"];
+            let summary = item["HitHighlightedSummary"].as_str().unwrap_or("").to_lowercase();
+            let word = query.split_whitespace().next().unwrap_or("");
+            if !word.is_empty() && !word.contains(':') && !summary.contains(word) {
+                continue;
+            }
+            if !thread_filter.is_empty() && src["ThreadId"].as_str() != Some(thread_filter) {
+                continue;
+            }
+            if !team_filter.is_empty() && src["TeamId"].as_str() != Some(team_filter) {
+                continue;
+            }
+            matched.push(item);
+        }
+        ok(json!({
+            "EntitySets": [{
+                "ResultSets": [{
+                    "Results": matched
+                }]
+            }]
+        }))
     }
 
     // Push.
@@ -2738,5 +2830,110 @@ fn activity_feed_pages_filters_marks_read_and_handles_live_push() {
     world.until("live activity mention updates deploys badge", || {
         world.conversation(&deploys).filter(|row| row.mentions > mentions_before)
     });
+}
+
+#[test]
+fn server_side_search_across_account_team_conversation_filters_and_jump() {
+    let world = World::start();
+    world.ready();
+
+    let caps = world.account(HOME).can;
+    assert!(caps.search && caps.search_global);
+    let account = key(GENERAL).account();
+
+    // 1. Account-wide search finds a hit in a chat not yet in the cache AND a hit inside a reply chain.
+    let hits = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        network: Some(Network::Teams),
+        query: "budget".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    let uncached = hits.iter().find(|h| h.conversation == key("19:archive0chat@thread.v2")).expect("uncached chat hit");
+    assert_eq!(uncached.message_id, "1758000000200");
+    assert!(uncached.snippet.contains("budget") && !uncached.snippet.contains("<c0>"));
+
+    let chain_hit = hits
+        .iter()
+        .find(|h| h.conversation == key(&format!("{GENERAL};messageid={ROOT}")))
+        .expect("reply chain hit mapped to chain conversation");
+    assert_eq!(chain_hit.message_id, "1760000210210");
+
+    // 2. Jumping to the uncached chat hit via Messages::Around loads the page around it.
+    let archive_chat = key("19:archive0chat@thread.v2");
+    assert!(matches!(
+        world.ask(Request::Messages {
+            conversation: archive_chat.clone(),
+            page: Page::Around { id: "1758000000200".to_owned() },
+            limit: 20,
+        }),
+        Response::Messages { .. }
+    ));
+    let jumped = world.until("HistoryAround loads uncached search hit", || {
+        world.message(&archive_chat, "1758000000200")
+    });
+    assert!(jumped.text.contains("Quarterly budget spreadsheet attached"));
+
+    // 3. Team-scoped search (Scope::Space) restricts hits to that team.
+    let team_hits = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(key(GENERAL)),
+        account: None,
+        network: None,
+        query: "budget".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(team_hits.len(), 1);
+    assert_eq!(team_hits[0].message_id, "1760000210210");
+
+    // 4. In-conversation search (Scope::Conversation) restricts hits to that single conversation.
+    let conv_hits = match world.ask(Request::SearchNetwork {
+        conversation: Some(key(DEPLOYS)),
+        space: None,
+        account: None,
+        network: None,
+        query: "deploy".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(conv_hits.len(), 1);
+    assert_eq!(conv_hits[0].conversation, key(DEPLOYS));
+
+    // 5. Structured filters (from + has:Files + mentions_me) filter hits and pass KQL to Teams.
+    let filtered = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        network: Some(Network::Teams),
+        query: "budget".to_owned(),
+        filters: protocol::SearchFilters {
+            from: Some(key(ANA)),
+            has: Some(protocol::SearchHas::Files),
+            ..Default::default()
+        },
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].message_id, "1758000000200");
+    let search_call = world.fake.calls("POST", "/msgsearch/v2/query").pop().expect("search POST");
+    let qs = search_call.json()["EntityRequests"][0]["Query"]["QueryString"].as_str().unwrap_or("").to_owned();
+    assert!(qs.contains("hasAttachment:true"), "{qs}");
+    assert!(qs.contains("from:"), "{qs}");
 }
 
