@@ -4114,6 +4114,12 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     clip(&mut about.time_zone, 64);
     about.mutual_spaces.truncate(MUTUAL_SPACES);
     about.mutual_spaces.iter_mut().for_each(|title| clip(title, 100));
+    about.mutual_space_items.truncate(MUTUAL_SPACES);
+    for item in &mut about.mutual_space_items {
+        clip(&mut item.name, 100);
+        clip(&mut item.nickname, 100);
+    }
+    about.mutual_people.truncate(25);
     about.roles.retain(|role| !role.is_empty());
     about.roles.truncate(protocol::PROFILE_ROLES);
     about.roles.iter_mut().for_each(|role| clip(role, 100));
@@ -4126,6 +4132,8 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     let mut profile = Profile::of(person);
     profile.bio = about.bio;
     profile.mutual_spaces = about.mutual_spaces;
+    profile.mutual_space_items = about.mutual_space_items;
+    profile.mutual_people = about.mutual_people;
     profile.time_zone = about.time_zone;
     profile.utc_offset = about.utc_offset;
     profile.fields = leftovers;

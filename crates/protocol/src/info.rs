@@ -259,6 +259,16 @@ pub struct Folder {
     pub mentions: u32,
 }
 
+/// A Space we share with the person on a profile, with their server nickname there if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutualSpace {
+    pub key: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nickname: String,
+}
+
 /// How a phone number or address on a profile is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

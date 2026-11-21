@@ -80,6 +80,8 @@ pub struct InfoPane {
     /// Show was clicked: the phone numbers read in full until the pane shows someone else.
     phones_shown: bool,
     about_open: bool,
+    /// Mutual friends list expanded in the "In common" section.
+    friends_open: bool,
     /// What the user set here, drawn before the row says so.
     notify_set: Option<(Key, Notify)>,
     /// Inline conversation management input (rename, topic, add people).
@@ -135,6 +137,7 @@ impl InfoPane {
             shared: Shared::default(),
             phones_shown: false,
             about_open: false,
+            friends_open: false,
             notify_set: None,
             manage: None,
             pending_remove: None,
@@ -218,6 +221,7 @@ impl InfoPane {
         if !same {
             self.phones_shown = false;
             self.about_open = false;
+            self.friends_open = false;
         }
         let entity = cx.entity();
         self.shared.show(self.row.as_ref().map(|row| row.key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
@@ -247,6 +251,9 @@ impl InfoPane {
                 this.profile = match answer {
                     Ok(Response::Profile { profile }) => {
                         this.hub.learn(std::slice::from_ref(&profile.person));
+                        if !profile.mutual_people.is_empty() {
+                            this.hub.learn(&profile.mutual_people);
+                        }
                         Answer::Got(*profile)
                     }
                     _ => Answer::Failed,
@@ -618,10 +625,12 @@ impl InfoPane {
                     sections = sections.child(self.contact_row(ix, contact, cx));
                 }
             }
-            if let Some(common) = facts::in_common(network, profile) {
+            let common = facts::in_common(network, profile);
+            let has_mutual_friends = profile.mutual_friends > 0 || !profile.mutual_people.is_empty();
+            if common.is_some() || has_mutual_friends {
                 sections = sections.child(draw::label("In common", !any));
                 any = true;
-                sections = sections.child(self.in_common(person, &common, cx));
+                sections = sections.child(self.in_common(person, profile, common.as_ref(), cx));
             }
             let safety_digits = profile
                 .fields
@@ -886,10 +895,107 @@ impl InfoPane {
             }))
     }
 
-    fn in_common(&self, person: &Person, common: &facts::InCommon, cx: &mut Context<Self>) -> Div {
+    fn in_common(&self, person: &Person, profile: &Profile, common: Option<&facts::InCommon>, cx: &mut Context<Self>) -> Div {
         let spaces = &self.spaces;
         let account = person.key.account();
         let mut rows = div().flex().flex_col();
+        let friend_count = profile.mutual_friends.max(profile.mutual_people.len() as u32);
+        if friend_count > 0 {
+            let expandable = !profile.mutual_people.is_empty();
+            let ring = Ring::on(theme::sidebar());
+            let faces: Vec<Div> = profile
+                .mutual_people
+                .iter()
+                .take(3)
+                .map(|friend| person_avatar(&self.hub, friend, 18., &ring, false, cx))
+                .collect();
+            let toggle = div()
+                .id("info-mutual-friends")
+                .h(px(theme::ROW_ONE))
+                .mx(px(-8.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .when(faces.is_empty(), |row| row.child(glyph("icons/users.svg", 16., theme::text_soft())))
+                .when(!faces.is_empty(), |row| row.child(div().flex().items_center().gap(px(2.)).children(faces)))
+                .child(div().flex_1().min_w_0().truncate().child(facts::mutual_friends_words(friend_count)))
+                .when(expandable, |row| {
+                    let icon = if self.friends_open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
+                    row.cursor_pointer()
+                        .hover(|r| r.bg(theme::hover()))
+                        .child(glyph(icon, 14., theme::text_faint()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.friends_open = !this.friends_open;
+                            cx.notify();
+                        }))
+                });
+            rows = rows.child(toggle);
+            if self.friends_open && expandable {
+                for (ix, friend) in profile.mutual_people.iter().enumerate() {
+                    let key = friend.key.clone();
+                    let ring = Ring::row(theme::sidebar(), false, "mutual-friend");
+                    rows = rows.child(
+                        div()
+                            .id(("info-mutual-friend", ix))
+                            .group("mutual-friend")
+                            .h(px(theme::ROW_ONE))
+                            .mx(px(-8.))
+                            .pl(px(20.))
+                            .pr(px(8.))
+                            .rounded(px(theme::R_CONTROL))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .type_ui()
+                            .cursor_pointer()
+                            .hover(|r| r.bg(theme::hover()))
+                            .child(person_avatar(&self.hub, friend, 20., &ring, false, cx))
+                            .child(div().flex_1().min_w_0().truncate().child(friend.name.clone()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let key = key.clone();
+                                this.with_shell(cx, move |shell, cx| shell.details_person(key, None, cx));
+                            })),
+                    );
+                }
+            }
+        }
+        if !profile.mutual_space_items.is_empty() {
+            for (ix, item) in profile.mutual_space_items.iter().take(facts::SPACES_SHOWN).enumerate() {
+                let known = spaces.iter().find(|space| space.key == item.key);
+                let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
+                let key = item.key.clone();
+                let mut row = draw::place_row(("info-space", ix), &item.key, &item.name, icon.as_ref());
+                if !item.nickname.is_empty() {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(100.))
+                            .truncate()
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child(item.nickname.clone()),
+                    );
+                }
+                rows = rows.child(row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let key = key.clone();
+                        this.with_shell(cx, move |shell, cx| shell.go(crate::gui::sidebar::Mode::Space(key), cx));
+                    },
+                )));
+            }
+            if let Some(common) = common.filter(|c| c.more > 0) {
+                rows = rows.child(
+                    div().h(px(theme::ROW_ONE)).flex().items_center().type_ui().text_color(theme::text_soft()).child(format!("{} more", common.more)),
+                );
+            }
+            return rows;
+        }
+        let Some(common) = common else {
+            return rows;
+        };
         if common.names.is_empty() {
             // CONTRACT: no request names the groups behind `mutual_total`, so the count stays a line.
             return rows.child(draw::fact("info-common", "icons/users.svg", common.words.clone(), ""));

@@ -141,7 +141,7 @@ impl Discord {
         // `profile_queued` has waited the turn; this marks it taken.
         crate::hub::lock(&self.state).profiled = Some(Instant::now());
         let mut path = format!(
-            "/users/{person}/profile?type=popout&with_mutual_guilds=true&with_mutual_friends=false&with_mutual_friends_count=false"
+            "/users/{person}/profile?type=modal&with_mutual_guilds=true&with_mutual_friends=true&with_mutual_friends_count=true"
         );
         if let Some(space) = space {
             path.push_str(&format!("&guild_id={space}"));
@@ -207,8 +207,51 @@ impl Discord {
         } else {
             None
         };
+        let mut friend_files = Vec::new();
+        for friend in profile.mutual_friends.iter().take(25) {
+            friend_files.push(friend.avatar());
+        }
+        if !friend_files.is_empty() {
+            let _ = self.ctx.media(&friend_files);
+        }
         let state = crate::hub::lock(&self.state);
-        let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
+        let mutual_space_items: Vec<protocol::MutualSpace> = profile
+            .mutual_guilds
+            .iter()
+            .filter_map(|mg| {
+                let guild = state.guilds.get(&mg.id)?;
+                Some(protocol::MutualSpace {
+                    key: self.ctx.key(&mg.id),
+                    name: guild.name.clone(),
+                    nickname: mg.nick.clone().unwrap_or_default(),
+                })
+            })
+            .take(protocol::MUTUAL_SPACES)
+            .collect();
+        let mutual_spaces: Vec<String> = mutual_space_items.iter().map(|s| s.name.clone()).collect();
+        let mutual_people: Vec<protocol::Person> = profile
+            .mutual_friends
+            .iter()
+            .take(25)
+            .map(|friend| {
+                let (avatar, _) = friend.avatar();
+                let name = state.users.get(&friend.id).cloned().unwrap_or_else(|| friend.name().to_owned());
+                protocol::Person {
+                    key: self.ctx.key(&friend.id),
+                    name,
+                    handle: friend.username.clone(),
+                    avatar: Some(avatar),
+                    bot: friend.bot,
+                    relation: state.relations.get(&friend.id).copied().unwrap_or(protocol::Relation::Friend),
+                    link: model::user_link(&friend.id),
+                    ..protocol::Person::new(self.ctx.key(&friend.id), "")
+                }
+            })
+            .collect();
+        let mutual_friends = profile
+            .mutual_friends_count
+            .unwrap_or(profile.mutual_friends.len() as u32)
+            .max(mutual_people.len() as u32);
         let text = profile.user_profile.as_ref();
         let bio = match member_profile.map(|p| p.bio.as_str()).filter(|b| !b.is_empty()) {
             Some(server_bio) => {
@@ -237,7 +280,10 @@ impl Discord {
         };
         let mut about = About {
             bio,
-            mutual_spaces: shared.map(|guild| guild.name.clone()).take(protocol::MUTUAL_SPACES).collect(),
+            mutual_spaces,
+            mutual_space_items,
+            mutual_people,
+            mutual_friends,
             mutual_total: profile.mutual_guilds.len() as u32,
             pronouns,
             accent,

@@ -813,6 +813,12 @@ pub struct Profile {
     /// The titles of the Spaces we share, at most [`MUTUAL_SPACES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mutual_spaces: Vec<String>,
+    /// Shared Spaces with their keys and the person's server nickname there, at most [`MUTUAL_SPACES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutual_space_items: Vec<MutualSpace>,
+    /// Mutual friends known to the network (capped at 25).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutual_people: Vec<Person>,
     /// Their time zone as the network names it (`Europe/Lisbon`), and its offset from UTC in
     /// seconds now, so the shell can show their local time without a zone database.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -887,6 +893,8 @@ impl Profile {
             person,
             bio: String::new(),
             mutual_spaces: Vec::new(),
+            mutual_space_items: Vec::new(),
+            mutual_people: Vec::new(),
             time_zone: String::new(),
             utc_offset: None,
             fields: Vec::new(),

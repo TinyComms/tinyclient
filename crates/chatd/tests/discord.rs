@@ -3644,7 +3644,11 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
     assert_eq!(profile.roles.len(), 1, "{:?}", profile.roles);
     let profiles = world.discord.requests_to("GET", "/users/2006/profile");
     assert_eq!(profiles.len(), 1);
-    assert!(profiles[0].path.contains("guild_id=4000") && profiles[0].path.contains("with_mutual_friends=false"));
+    assert!(
+        profiles[0].path.contains("guild_id=4000")
+            && profiles[0].path.contains("with_mutual_friends=true")
+            && profiles[0].path.contains("with_mutual_friends_count=true")
+    );
 
     // A channel's info is what READY said: nothing is asked.
     let before = asked_now();
@@ -5228,4 +5232,51 @@ fn member_list_activities_and_custom_status_emoji() {
         }
         other => panic!("expected Members, got {other:?}"),
     }
+}
+
+#[test]
+fn profile_returns_mutual_friends_and_mutual_spaces_with_nicknames() {
+    let world = World::start();
+    world.discord.script(
+        "/users/2006/profile",
+        200,
+        json!({
+            "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+            "user_profile": {"bio": "hi", "pronouns": ""},
+            "mutual_guilds": [
+                {"id": "4000", "nick": "Sammy"},
+                {"id": "7777", "nick": "UnknownGuildNick"}
+            ],
+            "mutual_friends": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "m1"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel", "discriminator": "0", "avatar": "d2"}
+            ],
+            "mutual_friends_count": 2
+        }),
+    );
+
+    let profile = match world.ask(Request::Profile { person: world.key("2006"), space: Some(world.key("4000")) }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected Profile, got {other:?}"),
+    };
+    let reqs = world.discord.requests_to("GET", "/users/2006/profile");
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].path.contains("type=modal"), "got {}", reqs[0].path);
+    assert!(reqs[0].path.contains("with_mutual_friends=true"), "got {}", reqs[0].path);
+    assert!(reqs[0].path.contains("with_mutual_friends_count=true"), "got {}", reqs[0].path);
+    assert!(reqs[0].path.contains("with_mutual_guilds=true"), "got {}", reqs[0].path);
+
+    assert_eq!(profile.mutual_friends, 2);
+    assert_eq!(profile.mutual_people.len(), 2);
+    assert_eq!(profile.mutual_people[0].key.id, "2001");
+    assert_eq!(profile.mutual_people[0].avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2001:m1"));
+    assert_eq!(profile.mutual_people[1].key.id, "2002");
+
+    // Only known server 4000 appears in mutual_space_items with its nickname; unknown 7777 is omitted.
+    assert_eq!(profile.mutual_spaces, vec!["Rustaceans".to_owned()]);
+    assert_eq!(profile.mutual_total, 2);
+    assert_eq!(profile.mutual_space_items.len(), 1);
+    assert_eq!(profile.mutual_space_items[0].key, world.key("4000"));
+    assert_eq!(profile.mutual_space_items[0].name, "Rustaceans");
+    assert_eq!(profile.mutual_space_items[0].nickname, "Sammy");
 }

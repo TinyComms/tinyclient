@@ -440,6 +440,14 @@ pub fn place_word(network: Network, count: u32) -> &'static str {
     }
 }
 
+pub fn mutual_friends_words(count: u32) -> String {
+    if count == 1 {
+        "1 mutual friend".to_owned()
+    } else {
+        format!("{count} mutual friends")
+    }
+}
+
 pub fn in_common(network: Network, profile: &Profile) -> Option<InCommon> {
     let listed = profile.mutual_spaces.len() as u32;
     let total = profile.mutual_total.max(listed);
@@ -599,7 +607,9 @@ pub fn sections(person: &Person, profile: &Profile, place: Option<&str>, now: i6
         role: role(person, profile, place).is_some(),
         about: !profile.bio.trim().is_empty() || !profile.note.trim().is_empty(),
         contact: !contacts(person, profile).is_empty(),
-        in_common: in_common(person.key.network, profile).is_some(),
+        in_common: in_common(person.key.network, profile).is_some()
+            || profile.mutual_friends > 0
+            || !profile.mutual_people.is_empty(),
         foot: !foot(person, profile, place).is_empty(),
     }
 }

@@ -1211,6 +1211,8 @@ pub struct ProfileMember {
 #[derive(Deserialize)]
 pub struct MutualGuild {
     pub id: String,
+    #[serde(default)]
+    pub nick: Option<String>,
 }
 
 /// `GET /users/{id}/profile`: the parts a person's card shows.
@@ -1222,6 +1224,10 @@ pub struct Profile {
     pub user_profile: Option<ProfileText>,
     #[serde(default, deserialize_with = "nullable")]
     pub mutual_guilds: Vec<MutualGuild>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub mutual_friends: Vec<User>,
+    #[serde(default)]
+    pub mutual_friends_count: Option<u32>,
     #[serde(default)]
     pub guild_member: Option<ProfileMember>,
     #[serde(default)]

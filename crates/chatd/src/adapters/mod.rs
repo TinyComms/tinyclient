@@ -146,6 +146,10 @@ pub struct About {
     pub bio: String,
     /// Titles of the Spaces we share.
     pub mutual_spaces: Vec<String>,
+    /// Structured mutual spaces (key, name, nickname) for clickable navigation.
+    pub mutual_space_items: Vec<protocol::MutualSpace>,
+    /// Mutual friends (capped).
+    pub mutual_people: Vec<Person>,
     /// As the network names it: `Europe/Lisbon`.
     pub time_zone: String,
     /// Seconds east of UTC now.
