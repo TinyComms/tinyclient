@@ -2699,10 +2699,32 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::FollowThread { conversation, on } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::FollowThread {
+                    conversation_id: conversation.id.clone(),
+                    on,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
+            Request::SaveGif { account, id, unsave } => {
+                match self.ask(&account, |reply| Command::SaveGif { id, unsave, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Gifs);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {
@@ -2958,6 +2980,46 @@ impl Chat {
                 match self.hub.store().reminders(&conversation) {
                     Ok(reminders) => Response::Reminders { conversation, reminders },
                     Err(err) => internal(err),
+                }
+            }
+            Request::ScheduledMessages { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::ScheduledList {
+                    conversation_id: conversation.id.clone(),
+                    reply,
+                }) {
+                    Ok(messages) => Response::ScheduledMessages { messages },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CancelScheduled { conversation, scheduled_id } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::CancelScheduled {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RescheduleMessage { conversation, scheduled_id, text, post_at } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::Reschedule {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    text,
+                    post_at,
+                    reply,
+                }) {
+                    Ok(message) => Response::ScheduledMessage { message },
+                    Err(refused) => *refused,
                 }
             }
 
@@ -3816,6 +3878,49 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::AccountFiles { account, query, kind, cursor, limit } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 25 } else { limit.min(100) };
+                match self.ask(&account, |reply| Command::AccountFiles { query, kind, cursor, limit, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.title, 256);
+                            clip(&mut item.url, 2_000);
+                        }
+                        Response::AccountFiles { items: page.items, cursor: page.cursor, more: page.more }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteFile { account, file_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteFile { file_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::MessageAction {
+                conversation,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+            } => self.act(&conversation, |conversation_id, reply| Command::MessageAction {
+                conversation_id,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                reply,
+            }),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

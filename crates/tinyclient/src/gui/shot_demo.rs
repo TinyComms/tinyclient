@@ -1132,6 +1132,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             rules: serde_json::from_value(serde_json::json!({})).expect("the default rules"),
         },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
+        Request::SaveGif { .. } => Response::Ok,
         Request::Watch(watching) => {
             let people = watching
                 .people

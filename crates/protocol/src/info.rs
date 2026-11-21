@@ -663,12 +663,27 @@ pub struct Capabilities {
     /// This account supports setting a status with an emoji and a clear-after expiration (`SetPresence` with `status_emoji` and `clear_at`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub rich_status: bool,
+    /// This account supports workspace-wide file listing and deleting own files (`AccountFiles`, `DeleteFile`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_files: bool,
     /// This account supports previewing and joining a Space from an invite link (`InvitePreview`, `InviteJoin`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub join_space_by_invite: bool,
     /// This account supports leaving a Space (`Request::LeaveSpace`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub leave_space: bool,
+    /// This account supports sharing contact cards (`Outgoing::contact`, Telegram/Signal).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub share_contact: bool,
+    /// This account supports saving and removing GIFs in the saved GIFs collection (`Request::SaveGif`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub save_gif: bool,
+    /// This account supports pausing notifications for a duration (`SetPresence { presence: Dnd, clear_at: Some(..) }` -> `dnd.setSnooze` / `dnd.endSnooze`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dnd_snooze: bool,
+    /// This account supports following and unfollowing threads (`Request::FollowThread`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follow_threads: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
@@ -705,6 +720,19 @@ pub struct BrowsedChannel {
     pub private: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
+}
+
+/// One pending scheduled message returned by [`crate::Request::ScheduledMessages`] or
+/// [`crate::Request::RescheduleMessage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledMessage {
+    pub id: String,
+    pub conversation: Key,
+    #[serde(default)]
+    pub text: String,
+    pub post_at: i64,
+    #[serde(default)]
+    pub created: i64,
 }
 
 /// What kind of event an [`ActivityItem`] represents.
@@ -1027,6 +1055,10 @@ pub struct Outgoing {
     /// dual-SIM phone). `None` keeps the conversation's default line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_as: Option<String>,
+    /// Optional Slack snippet syntax type (e.g. `"rust"`, `"python"`, `"text"`) passed to
+    /// `files.getUploadURLExternal` when uploading a code/text snippet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_type: Option<String>,
     /// Optional one-line subject for a new channel post (Teams).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
@@ -1049,6 +1081,7 @@ impl Default for Outgoing {
             effect: None,
             contact: None,
             send_as: None,
+            snippet_type: None,
             subject: None,
         }
     }

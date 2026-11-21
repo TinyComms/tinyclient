@@ -1299,7 +1299,6 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
             let tl::enums::Poll::Poll(poll) = &media.poll;
             format!("Poll: {}", plain(&poll.question))
         }
-        MessageMedia::Contact(contact) => format!("Contact: {} {}", contact.first_name, contact.last_name).trim_end().to_owned(),
         MessageMedia::Game(media) => {
             let tl::enums::Game::Game(game) = &media.game;
             format!("Game: {}", game.title)
@@ -1442,6 +1441,62 @@ fn location_card(media: &MessageMedia, date: i32) -> Option<Card> {
         _ => return None,
     }
     Some(card)
+}
+
+/// Parses a Telegram `MessageMediaContact` into a structured `SharedContact`, preserving
+/// phone number (normalized with `+` when digits), vCard email/organization, and `user_id`.
+fn shared_contact(contact: &tl::types::MessageMediaContact) -> protocol::SharedContact {
+    let first = contact.first_name.trim();
+    let last = contact.last_name.trim();
+    let name = match (first.is_empty(), last.is_empty()) {
+        (false, false) => format!("{first} {last}"),
+        (false, true) => first.to_owned(),
+        (true, false) => last.to_owned(),
+        (true, true) => String::new(),
+    };
+    let phone = contact.phone_number.trim();
+    let phones = if phone.is_empty() {
+        Vec::new()
+    } else if phone.starts_with('+') {
+        vec![phone.to_owned()]
+    } else if phone.bytes().all(|b| b.is_ascii_digit() || matches!(b, b' ' | b'-' | b'(' | b')')) {
+        vec![format!("+{phone}")]
+    } else {
+        vec![phone.to_owned()]
+    };
+    let mut emails = Vec::new();
+    let mut organization = String::new();
+    for line in contact.vcard.lines() {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let prop = key.split(';').next().unwrap_or("").trim().to_ascii_uppercase();
+        let val = value.trim();
+        if val.is_empty() {
+            continue;
+        }
+        match prop.as_str() {
+            "EMAIL" => {
+                if !emails.iter().any(|e: &String| e.eq_ignore_ascii_case(val)) {
+                    emails.push(val.to_owned());
+                }
+            }
+            "ORG" if organization.is_empty() => {
+                organization = val.trim_end_matches(';').replace(';', " · ").trim().to_owned();
+            }
+            _ => {}
+        }
+    }
+    let person_id = (contact.user_id != 0).then(|| Who::User(contact.user_id).text());
+    protocol::SharedContact {
+        name,
+        phones,
+        emails,
+        organization,
+        avatar: None,
+        person_id,
+    }
 }
 
 /// The card for an invoice or a paid-media preview. The message stays a hand-off: paying and
@@ -2046,6 +2101,9 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     let (text, spans) = checklist(media, &link);
                     message.text = text;
                     message.spans = spans;
+                }
+                Some(MessageMedia::Contact(contact)) => {
+                    message.contacts.push(shared_contact(contact));
                 }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
@@ -4516,5 +4574,64 @@ mod tests {
             }
             other => panic!("expected InputMessageEntityMentionName, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_contact_maps_media_contact_with_and_without_user_id() {
+        let dir = Directory::new(7_001);
+        let make_msg = |id: i32, media: MessageMedia| -> tl::enums::Message {
+            use grammers_tl_types::{Deserializable, Serializable};
+            let mut bytes = Vec::new();
+            0u32.serialize(&mut bytes);
+            0u32.serialize(&mut bytes);
+            id.serialize(&mut bytes);
+            Who::User(7_002).peer().serialize(&mut bytes);
+            1_700_000_000i32.serialize(&mut bytes);
+            String::new().serialize(&mut bytes);
+            let mut msg = tl::types::Message::from_bytes(&bytes).expect("blank message");
+            msg.from_id = Some(Who::User(7_002).peer());
+            msg.media = Some(media);
+            msg.into()
+        };
+
+        let with_user = make_msg(
+            10,
+            tl::types::MessageMediaContact {
+                phone_number: "15550100777".into(),
+                first_name: "Odalys".into(),
+                last_name: "Brandt".into(),
+                vcard: "BEGIN:VCARD\nVERSION:3.0\nORG:Trail Crew\nEMAIL;TYPE=INTERNET:odalys@example.org\nEND:VCARD".into(),
+                user_id: 7_002,
+            }
+            .into(),
+        );
+        let mapped = map(&dir, &with_user).expect("mapped contact");
+        assert_eq!(mapped.message.kind, MessageKind::Normal, "shared contact must not be Unsupported");
+        assert_eq!(mapped.message.contacts.len(), 1);
+        let card = &mapped.message.contacts[0];
+        assert_eq!(card.name, "Odalys Brandt");
+        assert_eq!(card.phones, vec!["+15550100777"]);
+        assert_eq!(card.emails, vec!["odalys@example.org"]);
+        assert_eq!(card.organization, "Trail Crew");
+        assert_eq!(card.person_id.as_deref(), Some("u7002"));
+
+        let without_user = make_msg(
+            11,
+            tl::types::MessageMediaContact {
+                phone_number: "+15550100999".into(),
+                first_name: "External".into(),
+                last_name: String::new(),
+                vcard: String::new(),
+                user_id: 0,
+            }
+            .into(),
+        );
+        let mapped_ext = map(&dir, &without_user).expect("mapped external contact");
+        assert_eq!(mapped_ext.message.kind, MessageKind::Normal);
+        assert_eq!(mapped_ext.message.contacts.len(), 1);
+        let ext = &mapped_ext.message.contacts[0];
+        assert_eq!(ext.name, "External");
+        assert_eq!(ext.phones, vec!["+15550100999"]);
+        assert_eq!(ext.person_id, None);
     }
 }

@@ -20,6 +20,10 @@ pub const POLL_VOTERS: usize = 200;
 pub const PRIOR_LIMIT: usize = 4_000;
 /// Most people a message's info lists. A larger group keeps the first ones named.
 pub const DELIVERIES_LIMIT: usize = 256;
+/// Most interactive controls carried on one message (Slack Block Kit actions/inputs/accessories).
+pub const MESSAGE_CONTROLS_LIMIT: usize = 32;
+/// Most selectable options on a single menu, radio group, or checkbox group.
+pub const CONTROL_OPTIONS_LIMIT: usize = 100;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -465,6 +469,9 @@ pub struct SharedContact {
     pub organization: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<MediaFile>,
+    /// Optional network person id (e.g. `u12345` on Telegram) to open or message this contact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<String>,
 }
 
 /// A poll on a message: the question, the choices and their counts, which I picked, and whether
@@ -576,6 +583,108 @@ impl Poll {
             .unwrap_or_default();
         self.total = None;
     }
+}
+
+/// Visual tone for an interactive message button.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlStyle {
+    #[default]
+    Default,
+    Primary,
+    Danger,
+}
+
+impl ControlStyle {
+    fn is_default(&self) -> bool {
+        *self == ControlStyle::Default
+    }
+}
+
+/// Optional confirmation prompt before an interactive control fires (Slack Block Kit `confirm`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmDialog {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub confirm: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub deny: String,
+}
+
+/// One choice inside a select menu, overflow menu, radio group, or checkbox group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlOption {
+    pub label: String,
+    pub value: String,
+}
+
+/// What kind of interactive widget a [`MessageControl`] draws and submits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ControlKind {
+    Button {
+        /// When set, clicking opens this link directly instead of firing an action callback.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        url: String,
+        #[serde(default, skip_serializing_if = "ControlStyle::is_default")]
+        style: ControlStyle,
+    },
+    Select {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        placeholder: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<ControlOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        external: bool,
+    },
+    DatePicker {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        placeholder: String,
+        /// `YYYY-MM-DD` when prefilled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial: Option<String>,
+    },
+    TimePicker {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        placeholder: String,
+        /// `HH:MM` when prefilled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial: Option<String>,
+    },
+    Checkboxes {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<ControlOption>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        selected: Vec<String>,
+    },
+    RadioButtons {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<ControlOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected: Option<String>,
+    },
+}
+
+/// One interactive Block Kit control attached to a bot/app message (button, menu, picker, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageControl {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub block_id: String,
+    pub action_id: String,
+    /// Network element type (e.g. `"button"`, `"static_select"`, `"datepicker"`, `"overflow"`).
+    pub element_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<ConfirmDialog>,
+    pub kind: ControlKind,
 }
 
 /// One message. Which conversation it is in comes from the answer that carries it.
@@ -718,6 +827,9 @@ pub struct Message {
     /// `https://<workspace>.slack.com/archives/<channel>/p<ts>`). Used by "Copy link".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub permalink: String,
+    /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<MessageControl>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -826,6 +938,7 @@ impl Message {
             contacts: Vec::new(),
             sent_via: None,
             permalink: String::new(),
+            controls: Vec::new(),
         }
     }
 
@@ -866,6 +979,7 @@ impl Message {
         if let Some(card) = &mut self.card {
             card.bound();
         }
+        self.cards.truncate(20);
         for card in &mut self.cards {
             card.bound();
         }
@@ -901,6 +1015,61 @@ impl Message {
         if let Some(via) = &mut self.sent_via {
             clip(via, 64);
         }
+        self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
+        for control in &mut self.controls {
+            clip(&mut control.block_id, 255);
+            clip(&mut control.action_id, 255);
+            clip(&mut control.element_type, 64);
+            clip(&mut control.label, 256);
+            clip(&mut control.value, 2_000);
+            if let Some(confirm) = &mut control.confirm {
+                clip(&mut confirm.title, 200);
+                clip(&mut confirm.text, 1_000);
+                clip(&mut confirm.confirm, 100);
+                clip(&mut confirm.deny, 100);
+            }
+            match &mut control.kind {
+                ControlKind::Button { url, .. } => clip(url, 2_000),
+                ControlKind::Select { placeholder, options, selected, .. } => {
+                    clip(placeholder, 200);
+                    options.truncate(CONTROL_OPTIONS_LIMIT);
+                    for opt in options {
+                        clip(&mut opt.label, 200);
+                        clip(&mut opt.value, 2_000);
+                    }
+                    if let Some(sel) = selected {
+                        clip(sel, 2_000);
+                    }
+                }
+                ControlKind::DatePicker { placeholder, initial } | ControlKind::TimePicker { placeholder, initial } => {
+                    clip(placeholder, 200);
+                    if let Some(val) = initial {
+                        clip(val, 64);
+                    }
+                }
+                ControlKind::Checkboxes { options, selected } => {
+                    options.truncate(CONTROL_OPTIONS_LIMIT);
+                    for opt in options {
+                        clip(&mut opt.label, 200);
+                        clip(&mut opt.value, 2_000);
+                    }
+                    selected.truncate(CONTROL_OPTIONS_LIMIT);
+                    for val in selected {
+                        clip(val, 2_000);
+                    }
+                }
+                ControlKind::RadioButtons { options, selected } => {
+                    options.truncate(CONTROL_OPTIONS_LIMIT);
+                    for opt in options {
+                        clip(&mut opt.label, 200);
+                        clip(&mut opt.value, 2_000);
+                    }
+                    if let Some(sel) = selected {
+                        clip(sel, 2_000);
+                    }
+                }
+            }
+        }
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
@@ -919,6 +1088,7 @@ impl Message {
         self.forwarded = None;
         self.card = None;
         self.cards.clear();
+        self.controls.clear();
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();
@@ -1059,6 +1229,40 @@ mod tests {
         assert!(!rich.is_plain());
         let wire = serde_json::to_string(&rich).unwrap();
         assert_eq!(serde_json::from_str::<crate::Outgoing>(&wire).unwrap(), rich);
+    }
+
+    #[test]
+    fn message_controls_round_trip_and_stay_bounded() {
+        let mut msg = Message::plain("m1", "Bot", "Deploy?", 1_700_000_000, false);
+        let plain_wire = serde_json::to_string(&msg).unwrap();
+        assert!(!plain_wire.contains("controls"), "empty controls stay off the wire");
+
+        for i in 0..(MESSAGE_CONTROLS_LIMIT + 5) {
+            msg.controls.push(MessageControl {
+                block_id: format!("b{i}"),
+                action_id: format!("a{i}"),
+                element_type: "button".into(),
+                label: "X".repeat(300),
+                value: "ok".into(),
+                confirm: Some(ConfirmDialog {
+                    title: "Are you sure?".into(),
+                    text: "This ships to prod.".into(),
+                    confirm: "Ship".into(),
+                    deny: "Cancel".into(),
+                }),
+                kind: ControlKind::Button { url: String::new(), style: ControlStyle::Primary },
+            });
+        }
+        msg.bound();
+        assert_eq!(msg.controls.len(), MESSAGE_CONTROLS_LIMIT);
+        assert_eq!(msg.controls[0].label.len(), 256);
+
+        let wire = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.controls, msg.controls);
+
+        msg.tombstone();
+        assert!(msg.controls.is_empty());
     }
 
     #[test]

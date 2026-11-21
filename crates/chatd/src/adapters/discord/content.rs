@@ -943,6 +943,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         contacts: Vec::new(),
         sent_via: None,
         permalink: String::new(),
+        controls: Vec::new(),
     };
     (message, rich.files)
 }

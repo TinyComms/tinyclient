@@ -1038,6 +1038,7 @@ impl Composer {
             effect: if controls.effects { self.effect.clone() } else { None },
             contact: None,
             send_as: self.send_as.get(&target.key).cloned(),
+            snippet_type: None,
             subject,
         };
         self.importance = protocol::Importance::Normal;
@@ -2101,6 +2102,7 @@ impl Composer {
             known: Vec::new(),
             reacting: false,
             rules: None,
+            save_gif: target.can.save_gif,
         };
         let picker = cx.new(|cx| Picker::open(setup, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {

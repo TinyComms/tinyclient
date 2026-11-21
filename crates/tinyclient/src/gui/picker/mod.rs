@@ -115,6 +115,8 @@ pub struct Setup {
     pub reacting: bool,
     /// For a reaction: what the conversation takes, when chatd said. Only that is offered.
     pub rules: Option<ReactionRules>,
+    /// Account supports saving and removing GIFs on the network (`Request::SaveGif`).
+    pub save_gif: bool,
 }
 
 /// A GIF or sticker grid row: items by index, with their drawn widths.
@@ -197,6 +199,7 @@ impl Picker {
             known,
             reacting: true,
             rules: None,
+            save_gif: false,
         };
         let mut picker = Picker::open(setup, window, cx);
         picker.set_rules(rules, space, cx);
@@ -741,6 +744,27 @@ impl Picker {
         let Some(account) = self.setup.account.clone() else {
             return;
         };
+        if self.tab == Tab::Gifs && self.setup.save_gif {
+            let Some(item) = self.gifs.items.get(ix).cloned() else {
+                return;
+            };
+            let unsave = item.pack == "Saved";
+            let id = item.id.clone();
+            if unsave {
+                self.gifs.items.retain(|one| one.id != id);
+            }
+            let request = Request::SaveGif { account, id, unsave };
+            let this = cx.weak_entity();
+            ask_later(cx, request, move |answer, cx| {
+                if matches!(answer, Ok(Response::Ok)) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.ask(Tab::Gifs, String::new(), None, cx);
+                    });
+                }
+            });
+            self.requery(cx);
+            return;
+        }
         let items = if self.tab == Tab::Gifs { &self.gifs.items } else { &self.stickers.items };
         let Some(id) = items.get(ix).map(|item| item.id.clone()) else {
             return;
@@ -1202,6 +1226,17 @@ impl Picker {
                 }
                 (None, None) => tile(),
             };
+            let saved_on_net = gifs && self.setup.save_gif && item.pack == "Saved";
+            let star_tip = if saved_on_net {
+                "Remove GIF"
+            } else if gifs && self.setup.save_gif {
+                "Save GIF"
+            } else if starred {
+                "Remove from Favorites  F"
+            } else {
+                "Add to Favorites  F"
+            };
+            let star_lit = saved_on_net || starred;
             let star = (hovered || selected).then(|| {
                 div()
                     .id(("star", at))
@@ -1215,8 +1250,8 @@ impl Picker {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .tooltip(crate::gui::components::tip(if starred { "Remove from Favorites  F" } else { "Add to Favorites  F" }, None))
-                    .child(glyph("icons/star.svg", 14., if starred { theme::warning().into_color() } else { gpui::white() }))
+                    .tooltip(crate::gui::components::tip(star_tip, None))
+                    .child(glyph("icons/star.svg", 14., if star_lit { theme::warning().into_color() } else { gpui::white() }))
                     // The star is not the cell: a click here never sends.
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1262,7 +1297,7 @@ fn standin(glyph: &str, size: f32) -> AnyElement {
 }
 
 /// Who the GIF search goes through, named in the footer: from the results' own addresses, and
-/// on Discord, whose search proxies Tenor, Tenor when they do not say.
+/// on Discord (Tenor) or Slack (GIPHY) when they do not say.
 fn gif_provider(items: &[CatalogItem], network: Option<Network>) -> Option<&'static str> {
     let named = items.iter().find_map(|item| {
         let host = item.id.split("://").nth(1)?.split('/').next()?.to_ascii_lowercase();
@@ -1272,7 +1307,11 @@ fn gif_provider(items: &[CatalogItem], network: Option<Network>) -> Option<&'sta
             _ => None,
         }
     });
-    named.or((network == Some(Network::Discord)).then_some("Tenor"))
+    named.or(match network {
+        Some(Network::Discord) => Some("Tenor"),
+        Some(Network::Slack) => Some("GIPHY"),
+        _ => None,
+    })
 }
 
 /// The cell of a row nearest, across, to the one left in the row before: ↑ and ↓ keep the
@@ -1549,6 +1588,7 @@ mod tests {
         assert!(gif_lines(&items, 332., false, &["c".to_owned()]).iter().all(|line| line.label.is_none()));
         assert_eq!(gif_provider(&[CatalogItem { id: "https://media.giphy.com/x".into(), ..gif("x", 1, 1) }], Some(Network::Discord)), Some("GIPHY"));
         assert_eq!(gif_provider(&items, Some(Network::Discord)), Some("Tenor"));
+        assert_eq!(gif_provider(&items, Some(Network::Slack)), Some("GIPHY"));
         assert_eq!(gif_provider(&items, Some(Network::Telegram)), None);
     }
 

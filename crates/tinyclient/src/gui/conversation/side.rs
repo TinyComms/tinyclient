@@ -880,6 +880,23 @@ impl Shell {
         cx.notify();
     }
 
+    fn apply_search_suggestion(&mut self, insert: &str, cx: &mut Context<Self>) {
+        let next = {
+            let Some(page) = self.conversation_state.side.search.as_mut() else {
+                return;
+            };
+            let updated = apply_search_completion(&page.words, insert);
+            page.words = updated.clone();
+            page.reset_network();
+            updated
+        };
+        if let Some(field) = self.conversation_state.side.search_input.as_ref() {
+            field.input.update(cx, |input, cx| input.set_text(&next, cx));
+        }
+        self.reask_search(cx);
+        cx.notify();
+    }
+
     /// Asks the network itself for the page's words: a Space's own search, one conversation's, or
     /// everywhere across connected accounts that support global search.
     fn ask_network(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
@@ -1523,6 +1540,52 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
             .child("Mentions me"),
     );
 
+    let is_slack_search = shell.open_key().is_some_and(|k| k.network == Network::Slack);
+    let slack_suggestions = if is_slack_search {
+        let account = shell.open_key().map(|k| k.account());
+        let channels: Vec<String> = shell
+            .held_rows()
+            .filter(|r| account.as_ref().is_none_or(|a| r.key.account() == *a))
+            .filter(|r| r.title.starts_with('#'))
+            .map(|r| r.title.clone())
+            .take(30)
+            .collect();
+        let people: Vec<(String, String)> = shell
+            .held_rows()
+            .filter(|r| account.as_ref().is_none_or(|a| r.key.account() == *a))
+            .filter(|r| r.kind == ConversationKind::Direct)
+            .map(|r| (r.title.clone(), r.peer.clone().unwrap_or_default()))
+            .take(30)
+            .collect();
+        let items = slack_search_completions(&page.words, &channels, &people);
+        (!items.is_empty()).then(|| {
+            let mut row = div().flex_none().px(px(8.)).pb(px(4.)).flex().flex_wrap().gap(px(4.));
+            for (six, item) in items.into_iter().take(6).enumerate() {
+                let insert = item.insert.clone();
+                row = row.child(
+                    div()
+                        .id(("sf-slack-comp", six))
+                        .px(px(7.))
+                        .h(px(20.))
+                        .rounded(px(theme::R_CHIP))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .type_micro()
+                        .cursor_pointer()
+                        .bg(theme::raised())
+                        .text_color(theme::text_soft())
+                        .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.apply_search_suggestion(&insert, cx)))
+                        .child(item.label),
+                );
+            }
+            row
+        })
+    } else {
+        None
+    };
+
     let load_more = page.network_cursor.clone().map(|cursor| {
         div()
             .flex_none()
@@ -1584,6 +1647,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         .child(head)
         .child(chips)
         .child(filter_chips)
+        .children(slack_suggestions)
         .children(said.map(|line| div().flex_none().px(px(12.)).pb(px(4.)).type_small().text_color(theme::text_soft()).child(line)))
         .child(body)
         .children(load_more)
@@ -1711,6 +1775,131 @@ fn said_at(hit: &MessageHit) -> String {
     }
 }
 
+/// One Slack search modifier completion suggestion shown as a clickable chip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSuggestion {
+    pub label: String,
+    pub insert: String,
+}
+
+/// Computes Slack search modifier completion suggestions (`in:`, `from:`, `to:`, `has:`, `is:`,
+/// `before:`, `after:`, `on:`, `during:`) for the active trailing token of `query`.
+pub fn slack_search_completions(
+    query: &str,
+    channels: &[String],
+    people: &[(String, String)],
+) -> Vec<SearchSuggestion> {
+    let trailing_space = query.ends_with(char::is_whitespace);
+    let active = if trailing_space {
+        ""
+    } else {
+        query.split_whitespace().last().unwrap_or("")
+    };
+    let lower = active.to_ascii_lowercase();
+    let mut out = Vec::new();
+    if let Some(rest) = lower.strip_prefix("in:") {
+        let needle = rest.trim_start_matches('#');
+        for ch in channels {
+            let name = ch.trim_start_matches('#');
+            if needle.is_empty() || name.to_ascii_lowercase().starts_with(needle) {
+                let value = format!("in:#{name}");
+                out.push(SearchSuggestion { label: value.clone(), insert: value });
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = lower.strip_prefix("from:").or_else(|| lower.strip_prefix("to:")) {
+        let prefix = if lower.starts_with("from:") { "from:" } else { "to:" };
+        let needle = rest.trim_start_matches('@');
+        for (name, id) in people {
+            let handle = name.trim().trim_start_matches('@');
+            if needle.is_empty()
+                || handle.to_ascii_lowercase().contains(needle)
+                || id.to_ascii_lowercase().starts_with(needle)
+            {
+                let insert = if !id.is_empty() && (id.starts_with('U') || id.starts_with('W')) {
+                    format!("{prefix}<@{id}>")
+                } else {
+                    format!("{prefix}@{handle}")
+                };
+                out.push(SearchSuggestion {
+                    label: format!("{prefix}@{handle}"),
+                    insert,
+                });
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = lower.strip_prefix("has:") {
+        for kind in ["link", "pin", "reaction", "file", "star"] {
+            if rest.is_empty() || kind.starts_with(rest) {
+                let value = format!("has:{kind}");
+                out.push(SearchSuggestion { label: value.clone(), insert: value });
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = lower.strip_prefix("is:") {
+        for kind in ["thread", "saved", "dm"] {
+            if rest.is_empty() || kind.starts_with(rest) {
+                let value = format!("is:{kind}");
+                out.push(SearchSuggestion { label: value.clone(), insert: value });
+            }
+        }
+        return out;
+    }
+    for date_prefix in ["before:", "after:", "on:", "during:"] {
+        if let Some(rest) = lower.strip_prefix(date_prefix) {
+            for preset in ["today", "yesterday", "this-week", "this-month"] {
+                if rest.is_empty() || preset.starts_with(rest) {
+                    let value = format!("{date_prefix}{preset}");
+                    out.push(SearchSuggestion { label: value.clone(), insert: value });
+                }
+            }
+            return out;
+        }
+    }
+    // Suggest top-level Slack modifiers matching the current prefix (or default quick list when empty).
+    let modifiers = [
+        ("in:", "in:"),
+        ("from:", "from:"),
+        ("to:", "to:"),
+        ("has:link", "has:link"),
+        ("has:pin", "has:pin"),
+        ("has:reaction", "has:reaction"),
+        ("is:thread", "is:thread"),
+        ("before:", "before:"),
+        ("after:", "after:"),
+        ("on:", "on:"),
+        ("during:", "during:"),
+    ];
+    for (label, insert) in modifiers {
+        if lower.is_empty() || label.starts_with(&lower) {
+            out.push(SearchSuggestion {
+                label: label.to_owned(),
+                insert: insert.to_owned(),
+            });
+        }
+    }
+    out
+}
+
+/// Replaces the active trailing token in `query` with `insert`. Complete modifier values
+/// (not ending in `:`) get a trailing space so the user can keep typing.
+pub fn apply_search_completion(query: &str, insert: &str) -> String {
+    let suffix = if insert.ends_with(':') { "" } else { " " };
+    if query.is_empty() {
+        return format!("{insert}{suffix}");
+    }
+    if query.ends_with(char::is_whitespace) {
+        return format!("{query}{insert}{suffix}");
+    }
+    match query.rfind(char::is_whitespace) {
+        Some(pos) => format!("{}{insert}{suffix}", &query[..=pos]),
+        None => format!("{insert}{suffix}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,6 +1948,9 @@ mod tests {
         assert!(network_searches(&searching, Network::Teams, Scope::Conversation));
         assert!(network_searches(&searching, Network::Teams, Scope::Space));
         assert!(!network_searches(&searching, Network::Slack, Scope::Everywhere), "Everywhere requires search_global");
+        let global = Capabilities { search: true, search_global: true, ..Capabilities::default() };
+        assert!(network_searches(&global, Network::Telegram, Scope::Everywhere), "Telegram global search asks at Everywhere scope");
+        assert!(network_searches(&global, Network::Teams, Scope::Everywhere), "Teams global search asks at Everywhere scope");
         // A network that has not said it searches is never asked, whatever the scope.
         let quiet = Capabilities::default();
         assert!(!network_searches(&quiet, Network::Slack, Scope::Conversation));
@@ -1848,5 +2040,36 @@ mod tests {
             [("2", false), ("1", true), ("3", false)]
         );
         assert_eq!(page.picked, Some((key("C_a"), "1".into())));
+    }
+
+    #[test]
+    fn slack_search_modifier_completions_and_formatting() {
+        let channels = vec!["#general".into(), "#deployments".into(), "#design".into()];
+        let people = vec![("Ana".into(), "U0ANA".into()), ("Ben".into(), "U0BEN".into())];
+
+        let in_hits = slack_search_completions("deploy in:de", &channels, &people);
+        assert_eq!(
+            in_hits.iter().map(|s| s.insert.as_str()).collect::<Vec<_>>(),
+            vec!["in:#deployments", "in:#design"]
+        );
+        assert_eq!(apply_search_completion("deploy in:de", "in:#deployments"), "deploy in:#deployments ");
+
+        let from_hits = slack_search_completions("from:an", &channels, &people);
+        assert_eq!(from_hits.len(), 1);
+        assert_eq!(from_hits[0].label, "from:@Ana");
+        assert_eq!(from_hits[0].insert, "from:<@U0ANA>");
+        assert_eq!(apply_search_completion("from:an", "from:<@U0ANA>"), "from:<@U0ANA> ");
+
+        let has_hits = slack_search_completions("has:p", &channels, &people);
+        assert_eq!(has_hits.iter().map(|s| s.insert.as_str()).collect::<Vec<_>>(), vec!["has:pin"]);
+
+        let before_hits = slack_search_completions("before:", &channels, &people);
+        assert!(before_hits.iter().any(|s| s.insert == "before:today"));
+
+        let during_hits = slack_search_completions("during:this", &channels, &people);
+        assert!(during_hits.iter().any(|s| s.insert == "during:this-month"));
+
+        // Prefix-only insertion does not add a trailing space so completion continues immediately.
+        assert_eq!(apply_search_completion("deploy ", "from:"), "deploy from:");
     }
 }

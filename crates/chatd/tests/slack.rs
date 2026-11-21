@@ -130,6 +130,10 @@ struct Fake {
     dnd_info: Mutex<Option<Value>>,
     /// Channel bookmarks keyed by channel_id.
     bookmarks: Mutex<HashMap<String, Vec<Value>>>,
+    /// Optional override for `drafts.list` response.
+    drafts_list: Mutex<Option<Value>>,
+    /// Scheduled messages keyed by scheduled_message_id.
+    scheduled: Mutex<Vec<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -181,6 +185,8 @@ impl Fake {
                     json!({"id": "Bk2", "channel_id": "C0GEN", "title": "Team Canvas", "link": "https://alpha.slack.com/docs/T01ALPHA/F0CANVAS", "emoji": "", "type": "canvas"}),
                 ],
             )])),
+            drafts_list: Mutex::default(),
+            scheduled: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -385,10 +391,49 @@ impl Fake {
                 echo(event);
                 Some(json!({"ok": true, "files": files}))
             }
-            "chat.scheduleMessage" => Some(json!({
-                "ok": true, "channel": channel, "scheduled_message_id": "Q0SCHED", "post_at": param("post_at").parse::<i64>().unwrap(),
-                "message": {"type": "message", "user": me(token), "text": param("text"), "bot_id": null},
-            })),
+            "chat.scheduleMessage" => {
+                let mut list = self.scheduled.lock().unwrap();
+                let id = if list.is_empty() {
+                    "Q0SCHED".to_owned()
+                } else {
+                    format!("Q0SCHED{}", list.len() + 1)
+                };
+                let post_at = param("post_at").parse::<i64>().unwrap();
+                let mut entry = json!({
+                    "id": id,
+                    "channel_id": channel,
+                    "post_at": post_at,
+                    "date_created": 1760000900,
+                    "text": param("text"),
+                });
+                if !param("thread_ts").is_empty() {
+                    entry["thread_ts"] = param("thread_ts").into();
+                }
+                list.push(entry);
+                Some(json!({
+                    "ok": true, "channel": channel, "scheduled_message_id": id, "post_at": post_at,
+                    "message": {"type": "message", "user": me(token), "text": param("text"), "bot_id": null},
+                }))
+            }
+            "chat.scheduledMessages.list" => {
+                let list = self.scheduled.lock().unwrap();
+                let filtered: Vec<Value> = list
+                    .iter()
+                    .filter(|item| channel.is_empty() || item["channel_id"].as_str() == Some(channel))
+                    .cloned()
+                    .collect();
+                Some(json!({"ok": true, "scheduled_messages": filtered}))
+            }
+            "chat.deleteScheduledMessage" => {
+                let target = param("scheduled_message_id");
+                let mut list = self.scheduled.lock().unwrap();
+                let before = list.len();
+                list.retain(|item| item["id"].as_str() != Some(target));
+                if list.len() == before {
+                    return refused("invalid_scheduled_message_id");
+                }
+                Some(json!({"ok": true}))
+            }
             "users.profile.set" => {
                 let asked: Value = serde_json::from_str(param("profile")).unwrap();
                 let mut profile = self.user(token, me(token)).unwrap()["profile"].clone();
@@ -448,11 +493,62 @@ impl Fake {
                 return marked;
             }
             "conversations.mark" | "subscriptions.thread.mark" => Some(json!({"ok": true})),
-            "conversations.open" => Some(json!({
-                "ok": true, "no_op": false, "already_open": false,
-                "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
-                            "user": param("users"), "is_open": true, "priority": 0},
-            })),
+            "conversations.open" => {
+                let users = param("users");
+                if users.contains(',') {
+                    let parts: Vec<&str> = users.split(',').filter(|u| !u.is_empty()).collect();
+                    let handles: Vec<String> = parts
+                        .iter()
+                        .map(|uid| {
+                            self.user(token, uid)
+                                .and_then(|u| u["name"].as_str().map(str::to_owned))
+                                .unwrap_or_else(|| (*uid).to_lowercase())
+                        })
+                        .collect();
+                    let name = format!("mpdm-justin--{}-1", handles.join("--"));
+                    Some(json!({
+                        "ok": true, "no_op": false, "already_open": false,
+                        "channel": {
+                            "id": "G0MPIMNEW", "name": name, "created": 1760000000,
+                            "is_mpim": true, "is_private": true, "is_open": true,
+                        },
+                    }))
+                } else {
+                    Some(json!({
+                        "ok": true, "no_op": false, "already_open": false,
+                        "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
+                                    "user": users, "is_open": true, "priority": 0},
+                    }))
+                }
+            }
+            "conversations.create" => {
+                let name = param("name");
+                if name.is_empty() {
+                    return refused("invalid_name_required");
+                }
+                if name.len() > 80 {
+                    return refused("invalid_name_maxlength");
+                }
+                if name.contains(' ') || name.chars().any(|c| c.is_ascii_uppercase()) {
+                    return refused("invalid_name_punctuation");
+                }
+                let is_private = param("is_private") == "true";
+                let id = if is_private { "C0PRIVNEW" } else { "C0PUBNEW" };
+                Some(json!({
+                    "ok": true,
+                    "channel": {
+                        "id": id,
+                        "name": name,
+                        "is_channel": !is_private,
+                        "is_group": is_private,
+                        "is_private": is_private,
+                        "is_member": true,
+                        "created": 1760000000,
+                        "topic": {"value": ""},
+                        "purpose": {"value": ""}
+                    }
+                }))
+            }
             "conversations.close" => {
                 if channel.is_empty() {
                     return refused("invalid_arguments");
@@ -476,6 +572,27 @@ impl Fake {
                 "snooze_endtime": 0,
             }))),
             "dnd.teamInfo" => Some(json!({"ok": true, "users": {}})),
+            "dnd.setSnooze" => {
+                let mins = param("num_minutes").parse::<i64>().unwrap_or(0);
+                if mins <= 0 {
+                    return refused("missing_duration");
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+                Some(json!({
+                    "ok": true,
+                    "snooze_enabled": true,
+                    "snooze_endtime": now + mins * 60,
+                    "snooze_remaining": mins * 60,
+                }))
+            }
+            "dnd.endSnooze" => Some(json!({
+                "ok": true,
+                "dnd_enabled": false,
+                "next_dnd_start_ts": 0,
+                "next_dnd_end_ts": 0,
+                "snooze_enabled": false,
+                "snooze_endtime": 0,
+            })),
             "stars.add" | "stars.remove" => {
                 if channel.is_empty() {
                     return refused("invalid_arguments");
@@ -511,6 +628,45 @@ impl Fake {
             "reminders.complete" | "reminders.delete" => {
                 if param("reminder").is_empty() {
                     return refused("not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "subscriptions.thread.add" | "subscriptions.thread.remove" => {
+                if channel.is_empty() || param("thread_ts").is_empty() {
+                    return refused("thread_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "drafts.list" => self.drafts_list.lock().unwrap().clone().or_else(|| Some(json!({
+                "ok": true,
+                "drafts": []
+            }))),
+            "drafts.create" => Some(json!({
+                "ok": true,
+                "draft": {
+                    "id": "Dr01LOCAL",
+                    "client_last_updated_ts": "1760000900.000000",
+                    "destinations": serde_json::from_str::<Value>(param("destinations")).unwrap_or(json!([])),
+                    "blocks": serde_json::from_str::<Value>(param("blocks")).unwrap_or(json!([])),
+                }
+            })),
+            "drafts.update" => {
+                if param("draft_id").is_empty() {
+                    return refused("draft_not_found");
+                }
+                Some(json!({
+                    "ok": true,
+                    "draft": {
+                        "id": param("draft_id"),
+                        "client_last_updated_ts": "1760000910.000000",
+                        "destinations": serde_json::from_str::<Value>(param("destinations")).unwrap_or(json!([])),
+                        "blocks": serde_json::from_str::<Value>(param("blocks")).unwrap_or(json!([])),
+                    }
+                }))
+            }
+            "drafts.delete" => {
+                if param("draft_id").is_empty() {
+                    return refused("draft_not_found");
                 }
                 Some(json!({"ok": true}))
             }
@@ -577,6 +733,11 @@ impl Fake {
                     // Our own list of workspaces, which includes us. Not the other organisation.
                     if token == ALPHA && channel == "C0GEN" {
                         known["shared_team_ids"] = json!(["T01ALPHA", "T0SOUTH"]);
+                    }
+                    if token == ALPHA && channel == "C0RND" {
+                        known["properties"] = json!({
+                            "canvas": {"file_id": "F0CHANCANVAS", "is_empty": false}
+                        });
                     }
                     json!({"ok": true, "channel": known})
                 })
@@ -865,6 +1026,125 @@ impl Fake {
                         "purpose": {"value": "Watercooler talk"}
                     }
                 }))
+            }
+            "files.list" if channel.is_empty() => {
+                let page = param("page").parse::<u32>().unwrap_or(1);
+                let types = param("types");
+                if page == 1 {
+                    let mut files = vec![
+                        json!({
+                            "id": "F0SNIP1",
+                            "name": "deploy.rs",
+                            "title": "Deploy helper",
+                            "mimetype": "text/plain",
+                            "filetype": "rust",
+                            "mode": "snippet",
+                            "size": 128,
+                            "created": 1760004000,
+                            "user": me(token),
+                            "url_private": format!("{}/files-pri/{}-F0SNIP1/deploy.rs", self.base, team(token)),
+                            "permalink": "https://acme.slack.com/files/U0ME/F0SNIP1/deploy.rs",
+                        }),
+                        json!({
+                            "id": "F0EXT1",
+                            "name": "Q4 Roadmap",
+                            "title": "Q4 Roadmap",
+                            "filetype": "gdoc",
+                            "pretty_type": "GSuite Document",
+                            "mode": "external",
+                            "is_external": true,
+                            "external_type": "gdrive",
+                            "created": 1760003900,
+                            "user": "U0ANA",
+                            "url_private": "https://docs.google.com/document/d/abc123/edit",
+                            "permalink": "https://acme.slack.com/files/U0ANA/F0EXT1/q4-roadmap",
+                        }),
+                    ];
+                    if types == "snippets" {
+                        files.retain(|f| f["mode"] == "snippet");
+                    }
+                    Some(json!({
+                        "ok": true,
+                        "files": files,
+                        "paging": {"count": 25, "total": 3, "page": 1, "pages": 2}
+                    }))
+                } else {
+                    Some(json!({
+                        "ok": true,
+                        "files": [{
+                            "id": "F0PAGE2",
+                            "name": "spec.pdf",
+                            "title": "Spec PDF",
+                            "mimetype": "application/pdf",
+                            "filetype": "pdf",
+                            "mode": "hosted",
+                            "size": 4096,
+                            "created": 1760003800,
+                            "user": me(token),
+                            "url_private": format!("{}/files-pri/{}-F0PAGE2/spec.pdf", self.base, team(token)),
+                            "permalink": "https://acme.slack.com/files/U0ME/F0PAGE2/spec.pdf",
+                        }],
+                        "paging": {"count": 25, "total": 3, "page": 2, "pages": 2}
+                    }))
+                }
+            }
+            "files.delete" => {
+                let fid = param("file");
+                if fid.is_empty() {
+                    return refused("file_not_found");
+                }
+                if fid == "F0OTHER" {
+                    return refused("cant_delete_file");
+                }
+                Some(json!({"ok": true}))
+            }
+            "gifs.trending" => {
+                Some(json!({
+                    "ok": true,
+                    "results": [
+                        {
+                            "title": "Party Parrot",
+                            "url": "https://media.giphy.com/media/partyparrot/giphy.gif",
+                            "preview_url": format!("{}/files-tmb/gif-party.png", self.base),
+                            "width": 320,
+                            "height": 240,
+                        },
+                        {
+                            "title": "Ship It",
+                            "url": "https://media.giphy.com/media/shipit/giphy.gif",
+                            "preview_url": format!("{}/files-tmb/gif-shipit.png", self.base),
+                            "width": 400,
+                            "height": 225,
+                        }
+                    ],
+                    "response_metadata": {"next_cursor": "gif-page-2"}
+                }))
+            }
+            "gifs.search" => {
+                let q = param("q");
+                Some(json!({
+                    "ok": true,
+                    "results": [
+                        {
+                            "title": format!("Found {q}"),
+                            "url": format!("https://media.giphy.com/media/{q}/giphy.gif"),
+                            "preview_url": format!("{}/files-tmb/gif-search-{q}.png", self.base),
+                            "width": 300,
+                            "height": 200,
+                        }
+                    ],
+                    "response_metadata": {"next_cursor": ""}
+                }))
+            }
+            "blocks.actions" => {
+                let actions = param("actions");
+                if actions.contains("\"fail_action\"") {
+                    return refused("action_not_found");
+                }
+                if actions.is_empty() || param("container").is_empty() {
+                    return refused("invalid_action");
+                }
+                Some(json!({"ok": true}))
             }
             method => self.fixture(token, method),
         };
@@ -1513,11 +1793,14 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     assert_eq!(post.image.as_ref().map(|image| (image.width, image.height)), Some((800, 418)));
     assert_eq!(other.image, None);
 
-    // Buttons are not drawn: one line and the way to the real thing.
+    // Block Kit buttons render as interactive MessageControls instead of Unsupported placeholders.
     let buttons = by_id("1760000090.000090");
-    let link = "https://acme.slack.com/archives/C0GEN/p1760000090000090".to_owned();
-    assert_eq!(buttons.kind, MessageKind::Unsupported { link });
-    assert_eq!(buttons.text, "An interactive message from Deploy Bot");
+    assert_eq!(buttons.kind, MessageKind::Normal);
+    assert_eq!(buttons.controls.len(), 1);
+    assert_eq!(buttons.controls[0].block_id, "a1");
+    assert_eq!(buttons.controls[0].action_id, "approve");
+    assert_eq!(buttons.controls[0].label, "Approve");
+    assert_eq!(buttons.controls[0].value, "42");
 
     // Live: a message with a photo arrives on the socket.
     let before = world.conversation(&general).unwrap().unread;
@@ -2381,6 +2664,7 @@ fn connecting_asks_little_spaces_what_it_warms_and_a_reconnect_asks_less() {
             ("client.counts", connections),
             ("conversations.history", history),
             ("dnd.info", connections),
+            ("drafts.list", connections),
             ("edge:users/info", 1),
             ("team.info", 1),
             ("usergroups.list", connections),
@@ -2568,7 +2852,7 @@ fn rows_on_screen_get_their_newest_message_paced_and_people_carry_what_slack_say
     // What the account may send, said at connect.
     let can = world.account("T01ALPHA").can;
     assert_eq!((can.max_file_bytes, can.max_files, can.custom_emoji), (1 << 30, 10, protocol::EmojiScope::All));
-    assert!(can.schedule && can.suppress_embeds && !can.gifs && !can.stickers && !can.silent);
+    assert!(can.schedule && can.suppress_embeds && can.gifs && !can.stickers && !can.silent);
     assert!(can.search, "Enter asks Slack itself for a workspace or channel");
 }
 
@@ -4381,5 +4665,1079 @@ fn slack_rich_status_emoji_expiration_and_custom_emoji_read() {
         };
         let ana = people.into_iter().find(|p| p.key.id == "U0ANA")?;
         (ana.emoji == ":partyparrot:" && ana.status.contains("Deploying")).then_some(())
+    });
+}
+
+#[test]
+fn slack_canvases_and_lists_render_structured_cards_without_file_chips() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+
+    // 1. Canvas file (`filetype: "quip"`) with HTML preview & sections -> Message::card, no file chip, no raw HTML.
+    let ts_canvas = "1760000901.000901";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "",
+        "ts": ts_canvas,
+        "event_ts": ts_canvas,
+        "files": [{
+            "id": "F0CANVAS1",
+            "name": "Q4 Launch Plan",
+            "title": "Q4 Launch Plan",
+            "filetype": "quip",
+            "mimetype": "application/vnd.slack-docs",
+            "user": "U0ANA",
+            "permalink": "https://acme.slack.com/docs/T01ALPHA/F0CANVAS1",
+            "url_private": "https://files.slack.com/files-pri/T01ALPHA-F0CANVAS1/canvas",
+            "preview": "<h1>Overview</h1><p>Ship &amp; verify all items.</p><ul><li><input type=\"checkbox\" checked>Build</li><li><input type=\"checkbox\">Deploy</li></ul>",
+            "sections": [
+                {"heading": "Goals", "content": "<p>Zero downtime</p>"}
+            ]
+        }]
+    }));
+    let canvas_msg = world.until("canvas message stored", || world.message(&general, ts_canvas));
+    assert!(canvas_msg.attachments.is_empty(), "canvas must not render as a bare file chip");
+    assert_eq!(canvas_msg.kind, MessageKind::Normal);
+    let card = canvas_msg.card.as_deref().expect("canvas card");
+    assert_eq!(card.title, "Q4 Launch Plan");
+    assert_eq!(card.title_link, "https://acme.slack.com/docs/T01ALPHA/F0CANVAS1");
+    assert_eq!(card.footer, "Open in Slack");
+    assert!(card.author.starts_with("Slack Canvas"), "author: {}", card.author);
+    assert!(card.text.contains("Overview") && card.text.contains("Ship & verify"), "text: {}", card.text);
+    assert!(card.text.contains("☑ Build") && card.text.contains("☐ Deploy"), "checklist text: {}", card.text);
+    assert!(!card.text.contains("<h1>") && !card.text.contains("<p>"), "must strip raw HTML: {}", card.text);
+    assert_eq!(card.fields, vec![("Goals".to_owned(), "Zero downtime".to_owned())]);
+
+    // 2. Canvas with no preview falls back cleanly (never blank, never file chip).
+    let ts_empty_canvas = "1760000902.000902";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "",
+        "ts": ts_empty_canvas,
+        "event_ts": ts_empty_canvas,
+        "files": [{
+            "id": "F0CANVAS2",
+            "title": "Huddle Notes",
+            "filetype": "canvas",
+            "permalink": "https://acme.slack.com/docs/T01ALPHA/F0CANVAS2"
+        }]
+    }));
+    let empty_canvas = world.until("minimal canvas stored", || world.message(&general, ts_empty_canvas));
+    assert!(empty_canvas.attachments.is_empty());
+    let fallback_card = empty_canvas.card.as_deref().expect("fallback canvas card");
+    assert_eq!(fallback_card.title, "Huddle Notes");
+    assert!(!fallback_card.text.is_empty(), "fallback canvas card must not be blank");
+    assert_eq!(fallback_card.footer, "Open in Slack");
+
+    // 3. List file (`filetype: "list"`) with schema and items -> structured Card, no file chip.
+    let ts_list = "1760000903.000903";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0BEN",
+        "text": "",
+        "ts": ts_list,
+        "event_ts": ts_list,
+        "files": [{
+            "id": "F0LIST1",
+            "title": "Release Tracker",
+            "filetype": "list",
+            "mimetype": "application/vnd.slack-list",
+            "permalink": "https://acme.slack.com/lists/T01ALPHA/F0LIST1",
+            "list_metadata": {
+                "description": "<b>Wave 6B</b> tasks",
+                "schema": [{"name": "Task"}, {"name": "Status"}, {"name": "Assignee"}],
+                "items": [
+                    {"title": "Canvas reader", "status": "Done", "assignee": "U0ANA", "due_date": "2026-11-22"},
+                    {"title": "GIF picker", "status": "In progress", "assignee": "U0BEN"}
+                ]
+            }
+        }]
+    }));
+    let list_msg = world.until("list message stored", || world.message(&general, ts_list));
+    assert!(list_msg.attachments.is_empty(), "list must not render as a bare file chip");
+    let list_card = list_msg.card.as_deref().expect("list card");
+    assert_eq!(list_card.title, "Release Tracker");
+    assert_eq!(list_card.title_link, "https://acme.slack.com/lists/T01ALPHA/F0LIST1");
+    assert!(list_card.author.starts_with("Slack List"), "author: {}", list_card.author);
+    assert!(list_card.text.contains("Wave 6B tasks") && !list_card.text.contains("<b>"));
+    assert!(list_card.text.contains("Columns: Task, Status, Assignee"));
+    assert_eq!(list_card.fields.len(), 2);
+    assert_eq!(list_card.fields[0].0, "Canvas reader");
+    assert!(list_card.fields[0].1.contains("Done") && list_card.fields[0].1.contains("Due 2026-11-22"));
+    assert_eq!(list_card.footer, "Open in Slack");
+
+    // 4. Channel canvas from conversations.info (`properties.canvas`) appears in ConversationInfo::bookmarks.
+    let random = alpha("C0RND");
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: random }) else {
+        panic!("expected ConversationInfo for C0RND");
+    };
+    let canvas_bm = info
+        .bookmarks
+        .iter()
+        .find(|b| b.kind == protocol::BookmarkKind::Canvas && b.id == "F0CHANCANVAS")
+        .expect("channel canvas surfaced in bookmarks");
+    assert_eq!(canvas_bm.title, "Channel canvas");
+    assert!(canvas_bm.link.contains("F0CHANCANVAS"));
+}
+
+#[test]
+fn slack_create_channel_and_start_group_dm() {
+    let world = World::start();
+    world.ready();
+
+    // Workspace advertises can_create_channels and groups capability (up to 8).
+    let space = Key { network: Network::Slack, account: "T01ALPHA".into(), id: "T01ALPHA".into() };
+    let Response::Spaces { spaces } = world.ask(Request::Spaces { network: Some(Network::Slack) }) else {
+        panic!("expected Spaces");
+    };
+    assert!(
+        spaces.iter().any(|s| s.key == space && s.can_create_channels),
+        "Slack workspace should advertise can_create_channels"
+    );
+    assert_eq!(world.account("T01ALPHA").can.groups, 8);
+
+    // 1. Create a public channel.
+    let Response::Conversation { conversation: pub_chan } = world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "launch-ops".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) else {
+        panic!("expected Conversation for public CreateChannel");
+    };
+    assert_eq!(pub_chan.key.id, "C0PUBNEW");
+    assert_eq!(pub_chan.title, "#launch-ops");
+    assert!(!pub_chan.private);
+    assert!(pub_chan.joined);
+
+    // 2. Create a private channel.
+    let Response::Conversation { conversation: priv_chan } = world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "secret-plan".into(),
+        kind: ConversationKind::Channel,
+        private: true,
+        group: None,
+    }) else {
+        panic!("expected Conversation for private CreateChannel");
+    };
+    assert_eq!(priv_chan.key.id, "C0PRIVNEW");
+    assert_eq!(priv_chan.title, "#secret-plan");
+    assert!(priv_chan.private);
+    let create_calls = world.fake.calls(ALPHA, "conversations.create");
+    assert_eq!(create_calls.len(), 2);
+    assert_eq!(create_calls[0].params.get("is_private").map(String::as_str), Some("false"));
+    assert_eq!(create_calls[1].params.get("is_private").map(String::as_str), Some("true"));
+
+    // 3. Invalid channel name surfaces clear Slack naming rules in words.
+    match world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "Bad Name".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("lowercase"), "got: {detail}");
+        }
+        other => panic!("expected Refused for invalid channel name, got {other:?}"),
+    }
+
+    // 4. Start a multi-person group DM with two other people (3-person DM including me).
+    let Response::Conversation { conversation: mpim } = world.ask(Request::StartGroup {
+        account: space.account(),
+        people: vec![alpha("U0ANA"), alpha("U0BEN")],
+        title: None,
+    }) else {
+        panic!("expected Conversation for StartGroup");
+    };
+    assert_eq!(mpim.key.id, "G0MPIMNEW");
+    assert_eq!(mpim.kind, ConversationKind::Group);
+    assert!(mpim.private);
+    assert!(mpim.title.contains("ana") && mpim.title.contains("ben"), "mpim title: {}", mpim.title);
+    let open_calls = world.fake.calls(ALPHA, "conversations.open");
+    assert!(
+        open_calls.iter().any(|c| c.params.get("users").map(String::as_str) == Some("U0ANA,U0BEN")),
+        "expected comma-separated users in conversations.open: {open_calls:?}"
+    );
+
+    // 5. When workspace restricts channel creation (`restricted_action`), Space hides can_create_channels.
+    world.fake.refusing.lock().unwrap().insert("conversations.create".into(), "restricted_action".into());
+    match world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "blocked-chan".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for restricted_action, got {other:?}"),
+    }
+    let Response::Spaces { spaces: updated_spaces } = world.ask(Request::Spaces { network: Some(Network::Slack) }) else {
+        panic!("expected Spaces");
+    };
+    assert!(
+        !updated_spaces.iter().find(|s| s.key == space).unwrap().can_create_channels,
+        "restricted_action should clear can_create_channels on the Space"
+    );
+}
+
+#[test]
+fn slack_snippets_workspace_files_delete_and_external_files() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let account = general.account();
+    assert!(world.account("T01ALPHA").can.manage_files);
+
+    // 1. Incoming Slack snippet renders inline as a `Style::CodeBlock { language: "rust" }` plus hosted file attachment.
+    let ts_snip = "1760000951.000951";
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "channel": "C0GEN",
+            "user": "U0ANA",
+            "text": "",
+            "ts": ts_snip,
+            "event_ts": ts_snip,
+            "files": [{
+                "id": "F0SNIPIN",
+                "name": "main.rs",
+                "title": "Startup snippet",
+                "mimetype": "text/plain",
+                "filetype": "rust",
+                "mode": "snippet",
+                "size": 240,
+                "lines": 15,
+                "lines_more": 12,
+                "preview": "fn main() {\n    println!(\"hello\");\n}",
+                "url_private": format!("{}/files-pri/T01ALPHA-F0SNIPIN/main.rs", world.fake.base),
+                "permalink": "https://acme.slack.com/files/U0ANA/F0SNIPIN/main.rs"
+            }]
+        }),
+    );
+    let snip_msg = world.until("snippet message stored", || world.message(&general, ts_snip));
+    assert!(snip_msg.text.contains("Startup snippet"));
+    assert!(snip_msg.text.contains("fn main()"));
+    assert!(snip_msg.text.contains("12 more lines"));
+    assert!(
+        snip_msg.spans.iter().any(|s| matches!(&s.style, Style::CodeBlock { language } if language == "rust")),
+        "snippet should carry Style::CodeBlock with language=rust: {:?}",
+        snip_msg.spans
+    );
+    assert_eq!(snip_msg.attachments.len(), 1, "full snippet file stays downloadable");
+
+    // 2. Externally hosted file (`mode == "external"`, Google Drive) renders a structured Card with open link and NO blob fetch.
+    let ts_ext = "1760000952.000952";
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "channel": "C0GEN",
+            "user": "U0BEN",
+            "text": "",
+            "ts": ts_ext,
+            "event_ts": ts_ext,
+            "files": [{
+                "id": "F0DRIVE1",
+                "name": "Architecture Doc",
+                "title": "Architecture Doc",
+                "filetype": "gdoc",
+                "pretty_type": "GSuite Document",
+                "mode": "external",
+                "is_external": true,
+                "external_type": "gdrive",
+                "url_private": "https://docs.google.com/document/d/xyz/edit",
+                "permalink": "https://acme.slack.com/files/U0BEN/F0DRIVE1/arch"
+            }]
+        }),
+    );
+    let ext_msg = world.until("external file message stored", || world.message(&general, ts_ext));
+    assert!(ext_msg.attachments.is_empty(), "external file must not register a Slack blob attachment");
+    let ext_card = ext_msg.card.as_deref().expect("external file card");
+    assert_eq!(ext_card.author, "Google Drive");
+    assert_eq!(ext_card.title, "Architecture Doc");
+    assert_eq!(ext_card.title_link, "https://docs.google.com/document/d/xyz/edit");
+    assert_eq!(ext_card.footer, "Open in Google Drive");
+    assert!(ext_card.text.contains("GSuite Document"));
+
+    // 3. Creating a snippet passes `snippet_type` to `files.getUploadURLExternal`.
+    let files_dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let tmp_snippet = files_dir.join("hello.py");
+    std::fs::write(&tmp_snippet, b"print('hi')\n").unwrap();
+    let with = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: tmp_snippet.to_string_lossy().into_owned(),
+            name: "hello.py".into(),
+            ..Default::default()
+        }],
+        snippet_type: Some("python".into()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "5671".into(),
+            text: "quick script".into(),
+            reply_to: None,
+            with,
+        }),
+        Response::Sent { .. }
+    ));
+    let up_call = world.until("snippet upload requested", || {
+        world.fake.calls(ALPHA, "files.getUploadURLExternal").into_iter().last()
+    });
+    assert_eq!(up_call.params.get("snippet_type").map(String::as_str), Some("python"));
+
+    // 4. Paged workspace-wide `AccountFiles` lists hosted + external files without walking all pages at once.
+    let Response::AccountFiles { items: page1, cursor: next1, more: more1 } = world.ask(Request::AccountFiles {
+        account: account.clone(),
+        query: String::new(),
+        kind: None,
+        cursor: None,
+        limit: 25,
+    }) else {
+        panic!("expected AccountFiles page 1");
+    };
+    assert!(more1);
+    assert_eq!(next1.as_deref(), Some("2"));
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1[0].message_id, "F0SNIP1");
+    assert!(page1[0].attachment.is_some());
+    assert_eq!(page1[1].message_id, "F0EXT1");
+    assert!(page1[1].attachment.is_none());
+    assert_eq!(page1[1].url, "https://docs.google.com/document/d/abc123/edit");
+
+    let Response::AccountFiles { items: page2, cursor: next2, more: more2 } = world.ask(Request::AccountFiles {
+        account: account.clone(),
+        query: String::new(),
+        kind: None,
+        cursor: next1,
+        limit: 25,
+    }) else {
+        panic!("expected AccountFiles page 2");
+    };
+    assert!(!more2 && next2.is_none());
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].message_id, "F0PAGE2");
+
+    // 5. `DeleteFile` deletes own file via `files.delete` and refuses cleanly on `cant_delete_file`.
+    assert_eq!(
+        world.ask(Request::DeleteFile { account: account.clone(), file_id: "F0SNIP1".into() }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.fake.calls(ALPHA, "files.delete").last().and_then(|c| c.params.get("file")).map(String::as_str),
+        Some("F0SNIP1")
+    );
+    match world.ask(Request::DeleteFile { account, file_id: "F0OTHER".into() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("delete this file"), "unexpected refusal: {detail}");
+        }
+        other => panic!("expected Refused for cant_delete_file, got {other:?}"),
+    }
+}
+
+#[test]
+fn slack_gif_picker_catalog_and_send() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let account = general.account();
+    world.general();
+
+    let can = world.account("T01ALPHA").can;
+    assert!(can.gifs && !can.stickers);
+
+    // 1. Trending GIFs catalog (`query: ""`).
+    let Response::Catalog { items: trending, cursor } = world.ask(Request::Catalog {
+        account: account.clone(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected trending GIF catalog");
+    };
+    assert_eq!(trending.len(), 2);
+    assert_eq!(trending[0].id, "https://media.giphy.com/media/partyparrot/giphy.gif");
+    assert_eq!(trending[0].pack, "Trending");
+    assert!(trending[0].animated);
+    assert_eq!(trending[0].file.as_ref().map(|f| (f.kind, f.width, f.height)), Some((MediaKind::Image, 320, 240)));
+    assert_eq!(cursor.as_deref(), Some("gif-page-2"));
+
+    // 2. Search GIFs (`query: "celebrate"`).
+    let Response::Catalog { items: hits, cursor: next } = world.ask(Request::Catalog {
+        account: account.clone(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: "celebrate".into(),
+        cursor: None,
+    }) else {
+        panic!("expected search GIF catalog");
+    };
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "https://media.giphy.com/media/celebrate/giphy.gif");
+    assert_eq!(next, None);
+    let search_call = world.fake.calls(ALPHA, "gifs.search").pop().expect("gifs.search called");
+    assert_eq!(search_call.params.get("q").map(String::as_str), Some("celebrate"));
+
+    // 3. Sending a picked GIF posts its URL with unfurling left enabled (even if suppress_embeds was set).
+    let gif_url = hits[0].id.clone();
+    let with = protocol::Outgoing {
+        pick: Some(protocol::Pick {
+            kind: protocol::CatalogKind::Gifs,
+            id: gif_url.clone(),
+        }),
+        suppress_embeds: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "5691".into(),
+            text: "woohoo".into(),
+            reply_to: None,
+            with,
+        }),
+        Response::Sent { .. }
+    ));
+    let post = world.until("GIF post sent to Slack", || {
+        world
+            .fake
+            .calls(ALPHA, "chat.postMessage")
+            .into_iter()
+            .find(|c| c.params.get("text").is_some_and(|t| t.contains(&gif_url)))
+    });
+    assert_eq!(post.params.get("text").map(String::as_str), Some(format!("woohoo\n{gif_url}").as_str()));
+    assert_eq!(post.params.get("unfurl_links"), None, "picked GIFs must not suppress unfurling");
+
+    // 4. Stickers remain cleanly refused.
+    let sticker = protocol::Outgoing {
+        pick: Some(protocol::Pick {
+            kind: protocol::CatalogKind::Stickers,
+            id: "sticker-1".into(),
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "5692".into(),
+            text: String::new(),
+            reply_to: None,
+            with: sticker,
+        }),
+        Response::Sent { .. }
+    ));
+    let failed = world.until("sticker send failed", || {
+        world.messages(&general).into_iter().find(|m| {
+            m.client_id.as_deref() == Some("5692")
+                && matches!(&m.state, SendState::Failed { reason } if reason.contains("no stickers"))
+        })
+    });
+    assert!(matches!(failed.state, SendState::Failed { .. }));
+}
+
+#[test]
+fn slack_block_kit_interactive_controls_and_actions() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    world.general();
+
+    let ts = "1760000980.000980";
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "subtype": "bot_message",
+            "bot_id": "B0DEP",
+            "app_id": "A0DEPLOY",
+            "username": "Deploy Bot",
+            "channel": "C0GEN",
+            "text": "Release v2.1 ready",
+            "ts": ts,
+            "event_ts": ts,
+            "blocks": [
+                {
+                    "type": "section",
+                    "block_id": "sec1",
+                    "text": {"type": "mrkdwn", "text": "*Release v2.1* ready for approval"},
+                    "accessory": {
+                        "type": "overflow",
+                        "action_id": "more_opts",
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "View logs"}, "value": "logs"},
+                            {"text": {"type": "plain_text", "text": "Rollback"}, "value": "rollback"}
+                        ]
+                    }
+                },
+                {
+                    "type": "actions",
+                    "block_id": "act1",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "approve_btn",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "style": "primary",
+                            "value": "rel-2.1",
+                            "confirm": {
+                                "title": {"type": "plain_text", "text": "Ship release?"},
+                                "text": {"type": "mrkdwn", "text": "Deploy v2.1 to production."},
+                                "confirm": {"type": "plain_text", "text": "Ship it"},
+                                "deny": {"type": "plain_text", "text": "Cancel"}
+                            }
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "open_pr",
+                            "text": {"type": "plain_text", "text": "Open PR"},
+                            "url": "https://example.com/pr/42"
+                        },
+                        {
+                            "type": "static_select",
+                            "action_id": "env_pick",
+                            "placeholder": {"type": "plain_text", "text": "Environment"},
+                            "initial_option": {"text": {"type": "plain_text", "text": "Staging"}, "value": "staging"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Staging"}, "value": "staging"},
+                                {"text": {"type": "plain_text", "text": "Production"}, "value": "prod"}
+                            ]
+                        },
+                        {
+                            "type": "datepicker",
+                            "action_id": "ship_date",
+                            "initial_date": "2026-12-01",
+                            "placeholder": {"type": "plain_text", "text": "Ship date"}
+                        },
+                        {
+                            "type": "timepicker",
+                            "action_id": "ship_time",
+                            "initial_time": "14:30"
+                        },
+                        {
+                            "type": "checkboxes",
+                            "action_id": "checks",
+                            "initial_options": [{"text": {"type": "plain_text", "text": "Notify team"}, "value": "notify"}],
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Notify team"}, "value": "notify"},
+                                {"text": {"type": "plain_text", "text": "Tag release"}, "value": "tag"}
+                            ]
+                        },
+                        {
+                            "type": "radio_buttons",
+                            "action_id": "strategy",
+                            "initial_option": {"text": {"type": "plain_text", "text": "Canary"}, "value": "canary"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Canary"}, "value": "canary"},
+                                {"text": {"type": "plain_text", "text": "Full"}, "value": "full"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }),
+    );
+
+    let msg = world.until("interactive Block Kit message stored", || world.message(&general, ts));
+    assert_eq!(msg.kind, MessageKind::Normal);
+    assert!(!msg.text.contains("Open in Slack"), "parsed controls should not append fallback Open in Slack link");
+    assert_eq!(msg.controls.len(), 8);
+    assert_eq!(msg.controls[0].element_type, "overflow");
+    assert_eq!(msg.controls[1].action_id, "approve_btn");
+    assert_eq!(msg.controls[1].confirm.as_ref().map(|c| c.title.as_str()), Some("Ship release?"));
+    assert_eq!(
+        msg.controls[2].kind,
+        protocol::ControlKind::Button { url: "https://example.com/pr/42".into(), style: protocol::ControlStyle::Default }
+    );
+    assert!(matches!(msg.controls[3].kind, protocol::ControlKind::Select { ref selected, .. } if selected.as_deref() == Some("staging")));
+    assert!(matches!(msg.controls[4].kind, protocol::ControlKind::DatePicker { ref initial, .. } if initial.as_deref() == Some("2026-12-01")));
+    assert!(matches!(msg.controls[5].kind, protocol::ControlKind::TimePicker { ref initial, .. } if initial.as_deref() == Some("14:30")));
+    assert!(matches!(msg.controls[6].kind, protocol::ControlKind::Checkboxes { ref selected, .. } if selected == &["notify"]));
+    assert!(matches!(msg.controls[7].kind, protocol::ControlKind::RadioButtons { ref selected, .. } if selected.as_deref() == Some("canary")));
+
+    // 1. Button action dispatches `blocks.actions` with container, action payload, and remembered service_id.
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: general.clone(),
+            message_id: ts.into(),
+            block_id: "act1".into(),
+            action_id: "approve_btn".into(),
+            element_type: "button".into(),
+            value: "rel-2.1".into(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let call = world.fake.calls(ALPHA, "blocks.actions").pop().expect("blocks.actions called");
+    assert_eq!(call.params.get("channel_id").map(String::as_str), Some("C0GEN"));
+    assert_eq!(call.params.get("service_id").map(String::as_str), Some("A0DEPLOY"));
+    let actions: Value = serde_json::from_str(&call.params["actions"]).unwrap();
+    assert_eq!(actions[0]["action_id"], "approve_btn");
+    assert_eq!(actions[0]["value"], "rel-2.1");
+    let container: Value = serde_json::from_str(&call.params["container"]).unwrap();
+    assert_eq!(container["message_ts"], ts);
+
+    // 2. Select menu & checkboxes format `selected_option` / `selected_options` properly.
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: general.clone(),
+            message_id: ts.into(),
+            block_id: "act1".into(),
+            action_id: "env_pick".into(),
+            element_type: "static_select".into(),
+            value: "prod".into(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let sel_call = world.fake.calls(ALPHA, "blocks.actions").pop().unwrap();
+    let sel_actions: Value = serde_json::from_str(&sel_call.params["actions"]).unwrap();
+    assert_eq!(sel_actions[0]["selected_option"]["value"], "prod");
+
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: general.clone(),
+            message_id: ts.into(),
+            block_id: "act1".into(),
+            action_id: "checks".into(),
+            element_type: "checkboxes".into(),
+            value: String::new(),
+            values: vec!["notify".into(), "tag".into()],
+        }),
+        Response::Ok
+    );
+    let chk_call = world.fake.calls(ALPHA, "blocks.actions").pop().unwrap();
+    let chk_actions: Value = serde_json::from_str(&chk_call.params["actions"]).unwrap();
+    assert_eq!(chk_actions[0]["selected_options"].as_array().map(Vec::len), Some(2));
+
+    // 3. Socket `view_opened` does not disrupt the socket, and `message_changed` updates controls in place.
+    world.fake.push(ALPHA, json!({"type": "view_opened", "view": {"id": "V0MODAL1", "type": "modal"}}));
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": true,
+            "channel": "C0GEN",
+            "ts": "1760000981.000000",
+            "event_ts": "1760000981.000000",
+            "message": {
+                "type": "message",
+                "subtype": "bot_message",
+                "bot_id": "B0DEP",
+                "username": "Deploy Bot",
+                "text": "Release v2.1 approved!",
+                "ts": ts,
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "✅ Release v2.1 approved!"}}]
+            }
+        }),
+    );
+    let updated = world.until("message updated after action", || {
+        world.message(&general, ts).filter(|m| m.controls.is_empty() && m.text.contains("approved"))
+    });
+    assert!(updated.controls.is_empty());
+
+    // 4. Failed action returns a human-readable refusal.
+    match world.ask(Request::MessageAction {
+        conversation: general,
+        message_id: ts.into(),
+        block_id: "act1".into(),
+        action_id: "fail_action".into(),
+        element_type: "button".into(),
+        value: String::new(),
+        values: Vec::new(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("no longer available"), "unexpected refusal: {detail}");
+        }
+        other => panic!("expected Refused for action_not_found, got {other:?}"),
+    }
+}
+
+#[test]
+fn slack_drafts_sync_create_update_delete_and_live_events() {
+    let world = World::start_with(|fake| {
+        *fake.drafts_list.lock().unwrap() = Some(json!({
+            "ok": true,
+            "drafts": [{
+                "id": "Dr01REMOTE",
+                "client_last_updated_ts": "1760000800.000000",
+                "destinations": [{"channel_id": "C0DEP"}],
+                "blocks": [{
+                    "type": "rich_text",
+                    "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "Hydrated from Slack"}]
+                    }]
+                }]
+            }]
+        }));
+    });
+    world.ready();
+
+    let dep = alpha("C0DEP");
+    let general = alpha("C0GEN");
+
+    // 1. drafts.list on connect hydrates C0DEP's draft.
+    world.until("C0DEP draft hydrated from drafts.list", || {
+        let row = world.conversation(&dep)?;
+        (row.draft == "Hydrated from Slack").then_some(())
+    });
+
+    // 2. Writing a draft on C0GEN calls drafts.create, updating calls drafts.update, clearing calls drafts.delete.
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: "First draft".into() }), Response::Ok);
+    world.until("drafts.create called", || (!world.fake.calls(ALPHA, "drafts.create").is_empty()).then_some(()));
+    let created = world.fake.calls(ALPHA, "drafts.create").pop().unwrap();
+    assert!(created.params["destinations"].contains("C0GEN"));
+    assert!(created.params["blocks"].contains("First draft"));
+
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: "Edited draft".into() }), Response::Ok);
+    world.until("drafts.update called", || (!world.fake.calls(ALPHA, "drafts.update").is_empty()).then_some(()));
+    let updated = world.fake.calls(ALPHA, "drafts.update").pop().unwrap();
+    assert_eq!(updated.params["draft_id"], "Dr01LOCAL");
+    assert!(updated.params["blocks"].contains("Edited draft"));
+
+    assert_eq!(world.ask(Request::SetDraft { conversation: general.clone(), text: String::new() }), Response::Ok);
+    world.until("drafts.delete called", || (!world.fake.calls(ALPHA, "drafts.delete").is_empty()).then_some(()));
+    let deleted = world.fake.calls(ALPHA, "drafts.delete").pop().unwrap();
+    assert_eq!(deleted.params["draft_id"], "Dr01LOCAL");
+
+    // 3. Live draft_saved and draft_deleted socket events sync into the store.
+    world.fake.push(ALPHA, json!({
+        "type": "draft_saved",
+        "draft": {
+            "id": "Dr02LIVE",
+            "client_last_updated_ts": "1999999999.000000",
+            "destinations": [{"channel_id": "C0GEN"}],
+            "blocks": [{
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [{"type": "text", "text": "Typed on phone"}]
+                }]
+            }]
+        }
+    }));
+    world.until("live draft_saved synced", || {
+        let row = world.conversation(&general)?;
+        (row.draft == "Typed on phone").then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "draft_deleted",
+        "draft_id": "Dr02LIVE"
+    }));
+    world.until("live draft_deleted cleared", || {
+        let row = world.conversation(&general)?;
+        row.draft.is_empty().then_some(())
+    });
+}
+
+#[test]
+fn slack_dnd_snooze_resume_and_live_dnd_updated() {
+    let world = World::start();
+    world.ready();
+
+    let account = alpha("C0GEN").account();
+    assert!(world.account("T01ALPHA").can.dnd_snooze, "Slack should advertise dnd_snooze capability");
+
+    // 1. Pausing notifications with a clear_at calls dnd.setSnooze and switches presence to Dnd.
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Dnd,
+            status: None,
+            status_emoji: None,
+            clear_at: Some(now + 1800),
+        }),
+        Response::Ok
+    );
+    let snooze = world.fake.calls(ALPHA, "dnd.setSnooze").pop().expect("dnd.setSnooze called");
+    let mins: i64 = snooze.params["num_minutes"].parse().unwrap();
+    assert!((29..=31).contains(&mins), "expected ~30 minutes, got {mins}");
+    world.until("account presence becomes Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Dnd).then_some(())
+    });
+
+    // 2. Resuming notifications (setting Online) calls dnd.endSnooze and clears Dnd.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: None,
+            status_emoji: None,
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "dnd.endSnooze").len(), 1);
+    world.until("account presence returns to Online", || {
+        (world.account("T01ALPHA").presence == Presence::Online).then_some(())
+    });
+
+    // 3. Live dnd_updated socket event sets and clears Dnd.
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated",
+        "user": "U0ME",
+        "dnd_status": {
+            "dnd_enabled": false,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": true,
+            "snooze_endtime": now + 3600,
+        }
+    }));
+    world.until("live dnd_updated sets Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Dnd).then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated",
+        "user": "U0ME",
+        "dnd_status": {
+            "dnd_enabled": false,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": false,
+            "snooze_endtime": 0,
+        }
+    }));
+    world.until("live dnd_updated clears Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Online).then_some(())
+    });
+}
+
+#[test]
+fn slack_scheduled_messages_list_cancel_and_reschedule() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    assert!(world.account("T01ALPHA").can.schedule, "Slack should advertise schedule capability");
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let first_at = now + 3600;
+    let later_at = now + 7200;
+
+    // 1. Schedule a message.
+    let mut with = protocol::Outgoing::default();
+    with.schedule = Some(first_at);
+    let sent = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "sched1".into(),
+        text: "Standup notes".into(),
+        reply_to: None,
+        with,
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    world.until("chat.scheduleMessage called", || {
+        (!world.fake.calls(ALPHA, "chat.scheduleMessage").is_empty()).then_some(())
+    });
+
+    // 2. List scheduled messages via chat.scheduledMessages.list.
+    let Response::ScheduledMessages { messages } = world.ask(Request::ScheduledMessages {
+        conversation: general.clone(),
+    }) else {
+        panic!("expected Response::ScheduledMessages");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "Q0SCHED");
+    assert_eq!(messages[0].text, "Standup notes");
+    assert_eq!(messages[0].post_at, first_at);
+
+    // 3. Edit & reschedule via delete + chat.scheduleMessage.
+    let Response::ScheduledMessage { message: updated } = world.ask(Request::RescheduleMessage {
+        conversation: general.clone(),
+        scheduled_id: "Q0SCHED".into(),
+        text: Some("Updated standup notes".into()),
+        post_at: later_at,
+    }) else {
+        panic!("expected Response::ScheduledMessage");
+    };
+    assert_eq!(updated.text, "Updated standup notes");
+    assert_eq!(updated.post_at, later_at);
+    assert_eq!(world.fake.calls(ALPHA, "chat.deleteScheduledMessage").len(), 1);
+    assert_eq!(world.fake.calls(ALPHA, "chat.scheduleMessage").len(), 2);
+
+    // 4. Cancel the rescheduled message via chat.deleteScheduledMessage.
+    assert_eq!(
+        world.ask(Request::CancelScheduled {
+            conversation: general.clone(),
+            scheduled_id: updated.id.clone(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "chat.deleteScheduledMessage").len(), 2);
+
+    // 5. List is now empty.
+    let Response::ScheduledMessages { messages } = world.ask(Request::ScheduledMessages {
+        conversation: general.clone(),
+    }) else {
+        panic!("expected Response::ScheduledMessages");
+    };
+    assert!(messages.is_empty());
+}
+
+#[test]
+fn slack_search_filters_and_no_duplicate_in_modifier() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let filters = protocol::SearchFilters {
+        from: Some(alpha("U0ANA")),
+        has: Some(protocol::SearchHas::Links),
+        before: Some(1_767_225_600),
+        after: Some(1_735_689_600),
+        mentions_me: false,
+    };
+    let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(general.clone()),
+        space: None,
+        account: None,
+        network: None,
+        query: "deploy".into(),
+        filters: filters.clone(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::MessageHits");
+    };
+    let call = world.fake.calls(ALPHA, "search.messages").pop().expect("search.messages call");
+    let sent = &call.params["query"];
+    assert!(sent.contains("deploy"), "{sent}");
+    assert!(sent.contains("in:#general"), "{sent}");
+    assert!(sent.contains("from:<@U0ANA>"), "{sent}");
+    assert!(sent.contains("has:link"), "{sent}");
+    assert!(sent.contains("before:2026-01-01"), "{sent}");
+    assert!(sent.contains("after:2025-01-01"), "{sent}");
+
+    // When user already typed `in:#deployments`, do not append a duplicate `in:#general`.
+    let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(general.clone()),
+        space: None,
+        account: None,
+        network: None,
+        query: "in:#deployments during:2026-11 release".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::MessageHits");
+    };
+    let call2 = world.fake.calls(ALPHA, "search.messages").pop().expect("second search.messages call");
+    let sent2 = &call2.params["query"];
+    assert!(sent2.contains("in:#deployments"), "{sent2}");
+    assert!(!sent2.contains("in:#general"), "must not duplicate in: modifier: {sent2}");
+    assert!(sent2.contains("during:2026-11"), "{sent2}");
+}
+
+#[test]
+fn slack_follow_unfollow_thread_and_unread_reply_counting() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.follow_threads, "Slack should advertise follow_threads");
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+
+    // 1. Follow the thread -> calls subscriptions.thread.add and marks followed=true.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: thread.clone(), on: true }),
+        Response::Ok
+    );
+    let add = world.fake.calls(ALPHA, "subscriptions.thread.add").pop().expect("subscriptions.thread.add called");
+    assert_eq!(add.params["channel"], "C0GEN");
+    assert_eq!(add.params["thread_ts"], ROOT);
+    world.until("thread marked followed", || {
+        world.conversation(&thread).filter(|c| c.followed).map(|_| ())
+    });
+
+    // 2. A live socket reply from Ana increments unread reply count to 1 without opening the thread.
+    let reply1 = "1760000901.000901";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Following up on this thread",
+        "ts": reply1,
+        "thread_ts": ROOT,
+        "event_ts": reply1,
+    }));
+    world.until("followed thread unread becomes 1", || {
+        world.conversation(&thread).filter(|c| c.unread == 1).map(|_| ())
+    });
+
+    // 3. thread_marked clears unread back to 0.
+    world.fake.push(ALPHA, json!({
+        "type": "thread_marked",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+            "unread_count": 0,
+            "last_read": reply1,
+        }
+    }));
+    world.until("thread_marked clears unread", || {
+        world.conversation(&thread).filter(|c| c.unread == 0).map(|_| ())
+    });
+
+    // 4. Unfollow the thread -> calls subscriptions.thread.remove and marks followed=false.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: thread.clone(), on: false }),
+        Response::Ok
+    );
+    let rem = world.fake.calls(ALPHA, "subscriptions.thread.remove").pop().expect("subscriptions.thread.remove called");
+    assert_eq!(rem.params["channel"], "C0GEN");
+    assert_eq!(rem.params["thread_ts"], ROOT);
+    world.until("thread marked unfollowed", || {
+        world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
+    });
+
+    // 5. A reply in an unfollowed thread does NOT increment unread.
+    let reply2 = "1760000902.000902";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Noise after unfollow",
+        "ts": reply2,
+        "thread_ts": ROOT,
+        "event_ts": reply2,
+    }));
+    world.until("reply2 stored in thread", || world.message(&thread, reply2));
+    assert_eq!(world.conversation(&thread).unwrap().unread, 0);
+
+    // 6. Live thread_subscribed and thread_unsubscribed socket events flip followed state.
+    world.fake.push(ALPHA, json!({
+        "type": "thread_subscribed",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+        }
+    }));
+    world.until("live thread_subscribed sets followed=true", || {
+        world.conversation(&thread).filter(|c| c.followed).map(|_| ())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "thread_unsubscribed",
+        "subscription": {
+            "channel": "C0GEN",
+            "thread_ts": ROOT,
+        }
+    }));
+    world.until("live thread_unsubscribed sets followed=false", || {
+        world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
     });
 }

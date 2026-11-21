@@ -179,7 +179,7 @@ impl Teams {
             let id = text(team, "id");
             let can_create_channels = team["isArchived"] != true
                 && team["memberSettings"]["allowCreateUpdateChannels"] != false;
-            self.ctx.space_can_create_channels(id, can_create_channels)?;
+            self.ctx.set_space_can_create_channels(id, can_create_channels)?;
             // General first, then the order Teams lists them in. A channel the user hid is kept
             // apart (`opted_out`), behind the tree's "Show hidden". Unverified: that
             // `isFavorite: false` is what hiding a channel writes.

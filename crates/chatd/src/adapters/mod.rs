@@ -222,6 +222,14 @@ pub struct SharedPage {
     pub total: Option<u32>,
 }
 
+/// One page of workspace/account-wide files (`Command::AccountFiles`).
+#[derive(Debug, Clone, Default)]
+pub struct AccountFilesPage {
+    pub items: Vec<SharedItem>,
+    pub cursor: Option<String>,
+    pub more: bool,
+}
+
 /// A page of a picker's catalog, and where the next one starts.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogPage {
@@ -503,6 +511,19 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<()>,
     },
+    /// Paged workspace/account-wide file list (Slack `files.list` without a channel).
+    AccountFiles {
+        query: String,
+        kind: Option<String>,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<AccountFilesPage>,
+    },
+    /// Delete a file on the network (Slack `files.delete`).
+    DeleteFile {
+        file_id: String,
+        reply: Reply<()>,
+    },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
     /// Preview a Space invite link or code.
@@ -565,6 +586,31 @@ pub enum Command {
         remind_at: Option<i64>,
         reply: Reply<()>,
     },
+    /// Lists pending scheduled messages for one conversation (Slack `chat.scheduledMessages.list`).
+    ScheduledList {
+        conversation_id: String,
+        reply: Reply<Vec<protocol::ScheduledMessage>>,
+    },
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    CancelScheduled {
+        conversation_id: String,
+        scheduled_id: String,
+        reply: Reply<()>,
+    },
+    /// Edits/reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
+    Reschedule {
+        conversation_id: String,
+        scheduled_id: String,
+        text: Option<String>,
+        post_at: i64,
+        reply: Reply<protocol::ScheduledMessage>,
+    },
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`).
+    FollowThread {
+        conversation_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -586,6 +632,17 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
+    /// Executes an interactive Block Kit control on a message (Slack `blocks.actions`).
+    MessageAction {
+        conversation_id: String,
+        message_id: String,
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        value: String,
+        values: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -594,6 +651,12 @@ pub enum Command {
         to_conversation_ids: Vec<String>,
         note: String,
         reply: Reply<Vec<(String, Result<(), String>)>>,
+    },
+    /// Save or remove a GIF in the user's saved GIFs collection (`messages.saveGif`).
+    SaveGif {
+        id: String,
+        unsave: bool,
+        reply: Reply<()>,
     },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
@@ -794,13 +857,19 @@ impl Command {
             | Command::Star { reply, .. }
             | Command::File { reply, .. }
             | Command::StarMessage { reply, .. }
-            | Command::Remind { reply, .. } => {
+            | Command::Remind { reply, .. }
+            | Command::CancelScheduled { reply, .. }
+            | Command::FollowThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -814,7 +883,9 @@ impl Command {
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
-            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::Join { reply, .. }
+            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
@@ -972,8 +1043,8 @@ impl Context {
         Ok(())
     }
 
-    /// Marks whether the user may create channels inside a Space.
-    pub fn space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
+    /// Sets whether the user can create channels in `space_id`.
+    pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
         let space = self.key(space_id);
         if self.hub.store().set_space_can_create_channels(&space, can)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
