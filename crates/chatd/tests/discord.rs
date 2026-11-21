@@ -1246,7 +1246,7 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
 
     // Our own message, a system line, a poll we cannot draw, a sticker.
     assert!(messages[3].outgoing);
-    assert_eq!((messages[2].kind.clone(), messages[2].text.as_str()), (MessageKind::System, "Mara O started a call."));
+    assert_eq!((messages[2].kind.clone(), messages[2].text.as_str()), (MessageKind::System, "Missed call from Mara O"));
     let poll_link = "https://discord.com/channels/@me/3001/1300000000000000007".to_owned();
     assert_eq!((messages[1].kind.clone(), messages[1].text.as_str()), (MessageKind::Unsupported { link: poll_link }, "Poll: Lunch?"));
     assert_eq!(messages[0].attachments[0].name, "Wave");

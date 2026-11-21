@@ -1071,11 +1071,11 @@ mod tests {
         let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
-            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::Block]
+            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]
         );
         // In their DM: no Mute (the switch has it), Close DM instead, Copy ID only with ⌥. The
         // pane's foot opens them in the app, so its menu does not.
-        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::Block]);
+        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]);
         let nadia = person(Network::Telegram, Relation::Contact);
         let telegram_dm = Seen { in_their_dm: true, direct: Some((CallSupport::Handoff, false)), online: true, ..Seen::default() };
         assert!(!person_menu(&nadia, &telegram_dm, false, true).contains(&Item::CloseDirect), "Telegram does not serve CloseDirect");
@@ -1094,8 +1094,9 @@ mod tests {
         assert!(!can_leave(&row(Network::Teams, ConversationKind::Channel)));
         assert!(conversation_menu(&row(Network::Slack, ConversationKind::Group), Some("l"), false).contains(&Item::Leave));
         let dm_with_close = Seen { close_direct: true, ..DM };
+        let dm_without_close = Seen { close_direct: false, ..DM };
         assert!(person_menu(&tess, &dm_with_close, false, true).contains(&Item::CloseDirect));
-        assert!(!person_menu(&tess, &DM, false, true).contains(&Item::CloseDirect));
+        assert!(!person_menu(&tess, &dm_without_close, false, true).contains(&Item::CloseDirect));
         let tg_caps = protocol::Capabilities { close_direct: false, clear_history: true, ..Default::default() };
         let dc_caps = protocol::Capabilities { close_direct: true, clear_history: false, ..Default::default() };
         assert!(!can_close_direct(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
