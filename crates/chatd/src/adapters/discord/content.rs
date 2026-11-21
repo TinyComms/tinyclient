@@ -134,9 +134,49 @@ fn timestamp(unix: i64, style: &str) -> String {
     }
 }
 
-/// One `<...>` token: a mention, a custom emoji, a time, a link without a preview. Returns how
-/// many bytes of `text` it took.
-fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
+/// Formats a Discord channel or message link (`discord.com/channels/{guild|@me}/{channel}[/{msg}]`,
+/// including `ptb.`, `canary.`, and `discordapp.com`) as a channel/message chip carrying both
+/// `Style::Mention { kind: MentionKind::Channel }` and `Style::Link { url }` so clicking resolves
+/// in-app and falls back to the browser if the server/channel is unknown.
+fn discord_channel_link(
+    rich: &mut Rich,
+    url: &str,
+    masked_label: Option<&str>,
+    names: &dyn Names,
+    guild: Option<&str>,
+) -> bool {
+    if !protocol::link::is_web(url) {
+        return false;
+    }
+    let Some(parsed) = protocol::link::parse_network_link(url) else {
+        return false;
+    };
+    if parsed.network != protocol::Network::Discord {
+        return false;
+    }
+    let start = rich.text.len();
+    match masked_label {
+        Some(label) => inline(rich, label, names, guild),
+        None => {
+            let channel_shown = match names.channel(&parsed.channel) {
+                Some(name) => format!("#{name}"),
+                None => "# No Access".to_owned(),
+            };
+            if parsed.message_id.is_some() {
+                rich.text.push_str(&format!("{channel_shown} › message"));
+            } else {
+                rich.text.push_str(&channel_shown);
+            }
+        }
+    }
+    rich.span(start, Style::Mention { kind: MentionKind::Channel, id: parsed.channel });
+    rich.span(start, Style::Link { url: url.to_owned() });
+    true
+}
+
+/// One `<...>` token: a mention, a custom emoji, a time, a server navigation token, or a link
+/// without a preview. Returns how many bytes of `text` it took.
+fn angle(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) -> Option<usize> {
     let end = text.find('>')?;
     let inner = &text[1..end];
     let start = rich.text.len();
@@ -151,8 +191,22 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         let name = names.user(id).unwrap_or_else(|| "someone".to_owned());
         mention(rich, format!("@{name}"), MentionKind::User, id);
     } else if let Some(id) = inner.strip_prefix('#').filter(|id| digits(id)) {
-        let name = names.channel(id).unwrap_or_else(|| "channel".to_owned());
-        mention(rich, format!("#{name}"), MentionKind::Channel, id);
+        let shown = match names.channel(id) {
+            Some(name) => format!("#{name}"),
+            None => "# No Access".to_owned(),
+        };
+        mention(rich, shown, MentionKind::Channel, id);
+    } else if let Some(special) = inner.strip_prefix("id:") {
+        let (label, suffix) = match special {
+            "browse" => ("Browse Channels", "channel-browser"),
+            "customize" => ("Channels & Roles", "customize-community"),
+            "guide" | "home" => ("Server Guide", "home"),
+            _ => return None,
+        };
+        rich.text.push_str(label);
+        if let Some(guild) = guild.filter(|g| digits(g)) {
+            rich.span(start, Style::Link { url: format!("https://discord.com/channels/{guild}/{suffix}") });
+        }
     } else if let Some(emoji) = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':')) {
         let (name, id) = emoji.split_once(':')?;
         if !digits(id) || name.is_empty() {
@@ -172,8 +226,10 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         }
         rich.text.push_str(&format!("/{name}"));
     } else if inner.starts_with("https://") || inner.starts_with("http://") {
-        rich.text.push_str(inner);
-        rich.span(start, Style::Link { url: inner.to_owned() });
+        if !discord_channel_link(rich, inner, None, names, guild) {
+            rich.text.push_str(inner);
+            rich.span(start, Style::Link { url: inner.to_owned() });
+        }
     } else {
         return None;
     }
@@ -196,7 +252,7 @@ fn bare_link(text: &str) -> usize {
 }
 
 /// Inline markdown of one line.
-fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
+fn inline(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) {
     const PAIRS: [(&str, Option<Style>); 5] = [
         ("**", Some(Style::Bold)),
         ("__", Some(Style::Underline)),
@@ -227,7 +283,7 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                 let inner = &rest[delimiter.len()..close];
                 match style {
                     Some(style) => {
-                        inline(rich, inner, names);
+                        inline(rich, inner, names, guild);
                         rich.span(start, style.clone());
                     }
                     None => {
@@ -258,7 +314,7 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                         && !(first == '_' && word_follows)
                 });
                 if let Some(close) = close {
-                    inline(rich, &rest[1..close], names);
+                    inline(rich, &rest[1..close], names, guild);
                     rich.span(start, Style::Italic);
                     at += close + 1;
                     continue;
@@ -275,14 +331,16 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                         .then(|| (label_end, url.to_owned(), label_end + 2 + target_end + 1))
                 });
                 if let Some((label_end, url, taken)) = masked {
-                    inline(rich, &rest[1..label_end], names);
-                    rich.span(start, Style::Link { url });
+                    if !discord_channel_link(rich, &url, Some(&rest[1..label_end]), names, guild) {
+                        inline(rich, &rest[1..label_end], names, guild);
+                        rich.span(start, Style::Link { url });
+                    }
                     at += taken;
                     continue;
                 }
             }
             '<' => {
-                if let Some(taken) = angle(rich, rest, names) {
+                if let Some(taken) = angle(rich, rest, names, guild) {
                     at += taken;
                     continue;
                 }
@@ -300,8 +358,11 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
             'h' if !after_word && (rest.starts_with("https://") || rest.starts_with("http://")) => {
                 let end = bare_link(rest);
                 if end > "https://".len() {
-                    rich.text.push_str(&rest[..end]);
-                    rich.span(start, Style::Link { url: rest[..end].to_owned() });
+                    let url = &rest[..end];
+                    if !discord_channel_link(rich, url, None, names, guild) {
+                        rich.text.push_str(url);
+                        rich.span(start, Style::Link { url: url.to_owned() });
+                    }
                     at += end;
                     continue;
                 }
@@ -326,7 +387,7 @@ fn list_item(line: &str) -> Option<(u8, bool, usize)> {
 }
 
 /// The lines outside code blocks: quotes, headings, lists, then inline markdown.
-fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
+fn lines(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) {
     let mut quoting = false;
     for (index, line) in text.split('\n').enumerate() {
         if index > 0 {
@@ -347,20 +408,20 @@ fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
             .into_iter()
             .find_map(|(mark, level)| line.strip_prefix(mark).map(|body| (body, level)));
         if let Some((heading, level)) = heading {
-            inline(rich, heading, names);
+            inline(rich, heading, names, guild);
             rich.span(start, Style::Heading { level });
         } else if let Some(small) = line.strip_prefix("-# ") {
-            inline(rich, small, names);
+            inline(rich, small, names, guild);
             rich.span(start, Style::Small);
         } else if let Some((depth, ordered, begins)) = list_item(line) {
             // The marker stays in the text for numbered items, so the numbers are not lost.
             if ordered {
                 rich.text.push_str(line[..begins].trim_start());
             }
-            inline(rich, &line[begins..], names);
+            inline(rich, &line[begins..], names, guild);
             rich.span(start, Style::ListItem { ordered, depth });
         } else {
-            inline(rich, line, names);
+            inline(rich, line, names, guild);
         }
         if quoted {
             rich.span(start, Style::Quote);
@@ -370,6 +431,12 @@ fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
 
 /// Discord markdown into plain text and styled ranges.
 pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
+    markdown_in(rich, text, names, None);
+}
+
+/// Discord markdown into plain text and styled ranges, with optional guild context for
+/// server navigation tokens (`<id:browse>`, `<id:customize>`, `<id:guide>`).
+pub fn markdown_in(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) {
     let mut rest = text;
     while let Some(open) = rest.find("```") {
         let Some(close) = closing(rest, open + 3, "```") else {
@@ -377,7 +444,7 @@ pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
         };
         let before = rest[..open].strip_suffix('\n').unwrap_or(&rest[..open]);
         if !before.is_empty() {
-            lines(rich, before, names);
+            lines(rich, before, names, guild);
         }
         if !rich.text.is_empty() {
             rich.text.push('\n');
@@ -404,7 +471,7 @@ pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
         }
     }
     if !rest.is_empty() {
-        lines(rich, rest, names);
+        lines(rich, rest, names, guild);
     }
 }
 
@@ -793,10 +860,10 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let mentioned = posted.mentions.first().map_or("", |user| user.name());
     match system_line(kind, &who, content, mentioned) {
         None => {
-            markdown(&mut rich, content, place.names);
+            markdown_in(&mut rich, content, place.names, place.guild);
             // What was forwarded is the message's own text; a forward has none of its own.
             if let Some(forwarded) = forwarded {
-                markdown(&mut rich, forwarded.content.as_deref().unwrap_or(""), place.names);
+                markdown_in(&mut rich, forwarded.content.as_deref().unwrap_or(""), place.names, place.guild);
             }
         }
         Some(line) if line.is_empty() => {
@@ -1022,7 +1089,7 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     let mut rich = Rich::default();
     if let Some(content) = &update.content {
         if stored.kind == MessageKind::Normal {
-            markdown(&mut rich, content, place.names);
+            markdown_in(&mut rich, content, place.names, place.guild);
             stored.text = std::mem::take(&mut rich.text);
             stored.spans = std::mem::take(&mut rich.spans);
         }
@@ -1302,5 +1369,52 @@ mod tests {
         let show = Place { blur_explicit: false, ..blur };
         let (shown, _) = message(&posted, &show);
         assert!(!shown.attachments[0].spoiler, "explicit attachment unblurred when filter is set to show");
+    }
+
+    #[test]
+    fn discord_channel_and_message_links_and_special_tokens_parse() {
+        struct Partial;
+        impl Names for Partial {
+            fn user(&self, _: &str) -> Option<String> { None }
+            fn role(&self, _: &str) -> Option<String> { None }
+            fn channel(&self, id: &str) -> Option<String> {
+                (id == "4102").then(|| "announcements".to_owned())
+            }
+            fn space(&self, _: &str) -> Option<String> { None }
+        }
+        let mut rich = Rich::default();
+        markdown_in(
+            &mut rich,
+            "see <#4102> <#9999> https://discord.com/channels/4000/4102/1300001 <https://ptb.discord.com/channels/4000/4102> https://canary.discordapp.com/channels/@me/9999/1300002 [jump](https://discord.com/channels/4000/4102/1300003) <id:browse> <id:customize> <id:guide>",
+            &Partial,
+            Some("4000"),
+        );
+        assert_eq!(
+            rich.text,
+            "see #announcements # No Access #announcements › message #announcements # No Access › message jump Browse Channels Channels & Roles Server Guide"
+        );
+        let ch_mention = Style::Mention { kind: MentionKind::Channel, id: "4102".into() };
+        assert_eq!(
+            styled(&rich, &ch_mention),
+            ["#announcements", "#announcements › message", "#announcements", "jump"]
+        );
+        let no_access = Style::Mention { kind: MentionKind::Channel, id: "9999".into() };
+        assert_eq!(styled(&rich, &no_access), ["# No Access", "# No Access › message"]);
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/4102/1300001".into() }),
+            ["#announcements › message"]
+        );
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/channel-browser".into() }),
+            ["Browse Channels"]
+        );
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/customize-community".into() }),
+            ["Channels & Roles"]
+        );
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/home".into() }),
+            ["Server Guide"]
+        );
     }
 }

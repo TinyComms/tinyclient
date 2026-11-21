@@ -114,6 +114,21 @@ pub(super) fn network_link_chip(url: &str, conversations: &[protocol::Conversati
     Some(if parsed.message_id.is_some() { format!("{label} ↗") } else { label })
 }
 
+/// Web URL fallback when a `#channel` mention is clicked but chatd has no row for it.
+pub(super) fn channel_mention_fallback_url(
+    network: protocol::Network,
+    space: Option<&str>,
+    channel_id: &str,
+) -> Option<String> {
+    if network != protocol::Network::Discord || channel_id.is_empty() || !channel_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let place = space
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("@me");
+    Some(format!("https://discord.com/channels/{place}/{channel_id}"))
+}
+
 impl Pane {
     /// Opens a link externally (in the system browser), asking for confirmation per preferences.
     pub(super) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -169,6 +184,51 @@ impl Pane {
             return;
         }
         self.open_external_link(url, window, cx);
+    }
+
+    /// A click on a `#channel` mention: resolves the channel via `Request::Conversation` and opens
+    /// it in-app. If chatd does not know the row (or Alt is held), falls back to the web link.
+    pub(super) fn open_channel_mention(
+        &mut self,
+        channel_id: &str,
+        external: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let key = protocol::Key::new(&open.key.account(), channel_id);
+        let space = self
+            .shell
+            .upgrade()
+            .and_then(|shell| shell.read(cx).snapshot.as_ref()?.open.as_ref()?.space.clone());
+        let fallback = channel_mention_fallback_url(open.key.network, space.as_deref(), channel_id);
+        if external {
+            if let Some(url) = fallback {
+                self.open_external_link(&url, window, cx);
+            }
+            return;
+        }
+        let request = protocol::Request::Conversation { conversation: key };
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            if let Ok(protocol::Response::Conversation { conversation }) = answer {
+                let _ = this.update(cx, |this, cx| {
+                    let _ = this.shell.update(cx, |shell, cx| {
+                        shell.open_resolved_link(conversation.key, None, &conversation.title, cx);
+                    });
+                });
+                return;
+            }
+            if let Some(url) = fallback {
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.open_external_link(&url, window, cx));
+                });
+            }
+        })
+        .detach();
     }
 
     /// Opens what is asked about, and remembers its domain if that was ticked.
@@ -417,6 +477,26 @@ mod tests {
         );
         assert_eq!(
             network_link_chip("https://discord.com/channels/G7/99999/67890", &[conv]),
+            None
+        );
+    }
+
+    #[test]
+    fn channel_mention_fallback_url_validates_discord_snowflakes() {
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, Some("4000"), "4102").as_deref(),
+            Some("https://discord.com/channels/4000/4102")
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, None, "4102").as_deref(),
+            Some("https://discord.com/channels/@me/4102")
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, Some("4000"), "bad/id"),
+            None
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Slack, Some("T1"), "C1"),
             None
         );
     }

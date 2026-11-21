@@ -5258,3 +5258,53 @@ fn announcement_publish_crosspost_source_and_follow() {
     assert_eq!(follow_reqs.len(), 1);
     assert_eq!(follow_reqs[0].body, json!({"webhook_channel_id": "4101"}));
 }
+
+#[test]
+fn channel_mentions_message_links_and_special_tokens_resolve_in_app() {
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000001200",
+        "channel_id": "4101",
+        "guild_id": "4000",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "check <#4102> and <#999999> plus https://discord.com/channels/4000/4102/1300000010000000005 and <id:browse> <id:customize> <id:guide>",
+        "timestamp": "2026-10-13T09:10:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [],
+        "pinned": false
+    }));
+    let msg = wait("in-app links message", || {
+        world.messages("4101").into_iter().find(|m| m.id == "1300000010000001200")
+    });
+    assert!(msg.text.contains("#announcements"), "got: {}", msg.text);
+    assert!(msg.text.contains("# No Access"), "got: {}", msg.text);
+    assert!(msg.text.contains("#announcements › message"), "got: {}", msg.text);
+    assert!(msg.text.contains("Browse Channels"), "got: {}", msg.text);
+    assert!(msg.text.contains("Channels & Roles"), "got: {}", msg.text);
+    assert!(msg.text.contains("Server Guide"), "got: {}", msg.text);
+
+    // Known message link resolves to the conversation + message id for in-app jump.
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/4000/4102/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, message_id, .. } => {
+            assert_eq!(conversation, Some(world.key("4102")));
+            assert_eq!(message_id.as_deref(), Some("1300000010000000005"));
+        }
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+
+    // Unknown server/channel link returns conversation: None so the shell falls back to browser.
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/8888/8889/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, .. } => assert_eq!(conversation, None),
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+}

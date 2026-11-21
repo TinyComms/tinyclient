@@ -957,7 +957,7 @@ impl Pane {
                         .child(div().type_body().text_color(theme::text()).child(from.text.clone()))
                         .children(attached);
                     sent.children(said)
-                        .child(div().mt(px(4.)).child(forwarded_line(from)))
+                        .child(div().mt(px(4.)).child(self.forwarded_line(&message.id, from, cx)))
                         .child(
                             div()
                                 .flex()
@@ -966,7 +966,7 @@ impl Pane {
                         )
                 }
                 // What was forwarded is the message itself, set behind a bar under where it came from.
-                Some(from) => sent.child(forwarded_line(from)).child(
+                Some(from) => sent.child(self.forwarded_line(&message.id, from, cx)).child(
                     div()
                         .flex()
                         .child(div().w(px(2.)).flex_none().rounded(px(1.)).bg(tokens::border_strong()))
@@ -1575,6 +1575,42 @@ impl Pane {
         Some(div().flex().child(chip).into_any_element())
     }
 
+    /// Where a forwarded message was first said, with an in-app "→ origin" link when present.
+    fn forwarded_line(&self, message_id: &str, from: &Forwarded, cx: &mut Context<Self>) -> Div {
+        let place = match (from.from_title.is_empty(), from.from_space.is_empty()) {
+            (true, true) => "Forwarded".to_owned(),
+            (false, true) => format!("Forwarded from {}", from.from_title),
+            (true, false) => format!("Forwarded from {}", from.from_space),
+            (false, false) => format!("Forwarded from {} in {}", from.from_title, from.from_space),
+        };
+        let origin = (!from.link.is_empty()).then(|| {
+            let url = from.link.clone();
+            div()
+                .id(name_id("fwd-origin", message_id))
+                .flex_none()
+                .cursor_pointer()
+                .text_color(tokens::link())
+                .hover(|s| s.underline())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_link(&url, event.modifiers().alt, window, cx);
+                }))
+                .child("→ origin")
+        });
+        div()
+            .h(px(18.))
+            .mb(px(2.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .type_small()
+            .text_color(theme::text_faint())
+            .child(icon(Icon::Forward, 13., theme::text_faint()))
+            .child(div().min_w_0().truncate().child(place))
+            .children(origin)
+    }
+
     /// "(edited)", with the time it was edited. A network that keeps earlier wordings opens them on a click.
     fn edited_mark(&mut self, message: &Message, cx: &mut Context<Self>) -> AnyElement {
         let words = edited_tip(message.edited_at);
@@ -1771,9 +1807,10 @@ impl Pane {
                         return;
                     };
                     let _ = self.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
+                } else if let Some((MentionKind::Channel, channel_id)) = &run.mention {
+                    let channel_id = channel_id.clone();
+                    self.open_channel_mention(&channel_id, alt, window, cx);
                 }
-                // LATER: a click on a channel mention opens the channel; it needs the channel's
-                // row, which the sidebar holds.
             }
         }
     }
@@ -3688,26 +3725,6 @@ fn megabytes(bytes: u64) -> String {
         0..1_000_000 => format!("{} KB", bytes.div_ceil(1000)),
         _ => format!("{:.1} MB", bytes as f64 / 1_000_000.),
     }
-}
-
-/// Where a forwarded message was first said.
-fn forwarded_line(from: &Forwarded) -> Div {
-    let place = match (from.from_title.is_empty(), from.from_space.is_empty()) {
-        (true, true) => "Forwarded".to_owned(),
-        (false, true) => format!("Forwarded from {}", from.from_title),
-        (true, false) => format!("Forwarded from {}", from.from_space),
-        (false, false) => format!("Forwarded from {} in {}", from.from_title, from.from_space),
-    };
-    div()
-        .h(px(18.))
-        .mb(px(2.))
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .type_small()
-        .text_color(theme::text_faint())
-        .child(icon(Icon::Forward, 13., theme::text_faint()))
-        .child(div().min_w_0().truncate().child(place))
 }
 
 /// The size the network gave for an attachment's picture: the file's, or its still's.

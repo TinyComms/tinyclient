@@ -131,7 +131,9 @@ impl Rich {
                 color = if mine { gpui::white() } else { tokens::link().into_color() };
                 let fill: Hsla = if mine { tokens::mention_me().into_color() } else { theme::accent_soft().into_color() };
                 boxes.push((range.clone(), fill));
-                hot.push((range.clone(), ix));
+                if run.link.is_none() {
+                    hot.push((range.clone(), ix));
+                }
             }
             if let Some(spoiler) = run.spoiler {
                 if (look.revealed)(spoiler) {

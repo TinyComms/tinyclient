@@ -223,6 +223,12 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             Style::Strike => "~~",
             Style::Code => "`",
             Style::Mention { kind, id } => {
+                // Skip message-link chips that also carry a Style::Link on the same range.
+                if spans.iter().any(|other| {
+                    other.start == span.start && other.end == span.end && matches!(other.style, Style::Link { .. })
+                }) {
+                    continue;
+                }
                 let (kind, id) = match kind {
                     MentionKind::User => (Kind::Person, id.clone()),
                     MentionKind::Channel => (Kind::Channel, id.clone()),
@@ -266,6 +272,11 @@ pub fn from_source(raw: &str, message: &Message) -> (String, Vec<Token>) {
     let mut labels: HashMap<(Kind, String), String> = HashMap::new();
     for span in &message.spans {
         if let Style::Mention { kind, id } = &span.style {
+            if message.spans.iter().any(|other| {
+                other.start == span.start && other.end == span.end && matches!(other.style, Style::Link { .. })
+            }) {
+                continue;
+            }
             let kind = match kind {
                 MentionKind::User => Kind::Person,
                 MentionKind::Channel => Kind::Channel,
