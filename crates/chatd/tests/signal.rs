@@ -2594,3 +2594,80 @@ fn pinned_messages_serve_pinned_list_expire_and_respect_group_permissions() {
         "expected admin permission refusal, got {denied:?}"
     );
 }
+
+#[test]
+fn group_at_mentions_send_and_edit_as_ufffc_with_utf16_body_ranges_and_echo_names() {
+    let world = World::linked();
+    world.connected();
+
+    // Send "hi <@GRACE>" in the group: wire gets U+FFFC + Mention(GRACE):3+1, local echo reads "hi @Grace Ombra".
+    world.send(CLUB, "mention-1", &format!("hi <@{GRACE}>"), None);
+    let echoed = world.until("group mention echoed with resolved name", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.text == "hi @Grace Ombra" && m.id != "mention-1")
+    });
+    assert!(
+        echoed.spans.iter().any(|s| {
+            matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == GRACE)
+                && echoed.text.get(s.start as usize..s.end as usize) == Some("@Grace Ombra")
+        }),
+        "expected Style::Mention span on echoed message: {:?}",
+        echoed.spans
+    );
+    assert!(
+        world
+            .calls()
+            .contains(&format!("send {CLUB} text hi \u{FFFC} ranges=Mention({GRACE}):3+1")),
+        "expected wire body with U+FFFC and UTF-16 range, calls: {:?}",
+        world.calls()
+    );
+
+    // Non-ASCII surrogate-pair prefix: 🎉 (2 UTF-16 code units) + " hi " (4) => offset 6.
+    world.send(CLUB, "mention-2", &format!("🎉 hi <@{GRACE}>"), None);
+    world.until("emoji mention echoed", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.text == "🎉 hi @Grace Ombra" && m.id != "mention-2")
+    });
+    assert!(
+        world
+            .calls()
+            .contains(&format!("send {CLUB} text 🎉 hi \u{FFFC} ranges=Mention({GRACE}):6+1")),
+        "expected UTF-16 offset 6 after surrogate pair, calls: {:?}",
+        world.calls()
+    );
+
+    // Editing a message with <@ALAN> also sends U+FFFC + Mention(ALAN):8+1 and updates local echo.
+    let edit_resp = world.ask(Request::Edit {
+        conversation: key(CLUB),
+        message_id: echoed.id.clone(),
+        text: format!("updated <@{ALAN}>"),
+        spans: Vec::new(),
+    });
+    assert!(matches!(edit_resp, Response::Ok), "expected edit Ok, got {edit_resp:?}");
+    let edited = world.until("edited mention updated locally", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.id == echoed.id && m.text == "updated @Alan Ferro")
+    });
+    assert!(edited.edited);
+    assert!(
+        edited.spans.iter().any(|s| {
+            matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == ALAN)
+        }),
+        "expected Style::Mention span on edited message: {:?}",
+        edited.spans
+    );
+    let sent_ts = echoed.id.split('-').next().unwrap();
+    assert!(
+        world
+            .calls()
+            .contains(&format!("send {CLUB} edit {sent_ts} updated \u{FFFC} ranges=Mention({ALAN}):8+1")),
+        "expected edit wire body with U+FFFC and Mention(ALAN):8+1, calls: {:?}",
+        world.calls()
+    );
+}

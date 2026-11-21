@@ -2659,7 +2659,8 @@ fn capabilities(link_previews: bool) -> protocol::Capabilities {
             anonymous: false,
         }),
         reactions: true,
-        mention_spans: true,
+        mention_format: protocol::MentionFormat::Signal,
+        mention_spans: false,
         disappearing: true,
         view_once: false,
         profile_name: true,
@@ -3826,7 +3827,13 @@ fn send_text(
     suppress_embeds: bool,
 ) -> Result<Message, Fault> {
     let to = peer(conversation)?;
-    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
+    let (wire_body, ranges) = style::parse_with_inline_mentions(text, mention_spans, |aci| {
+        if aci == account.me {
+            "you".to_owned()
+        } else {
+            account.live().known_name(aci)
+        }
+    });
     let shown = style::apply(&wire_body, &ranges, &account.me);
     let quote = quote_of(account, conversation, reply_to)?;
     let (timer, previews_enabled) = {
@@ -4023,7 +4030,13 @@ fn edit(account: &Account, conversation: &str, message_id: &str, text: &str, men
     if !can(sent, now_ms(), true, conversation == account.me).edit {
         return Err(Fault::Refused("This message can no longer be edited.".to_owned()));
     }
-    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
+    let (wire_body, ranges) = style::parse_with_inline_mentions(text, mention_spans, |aci| {
+        if aci == account.me {
+            "you".to_owned()
+        } else {
+            account.live().known_name(aci)
+        }
+    });
     let shown = style::apply(&wire_body, &ranges, &account.me);
     let timer = account.live().timer_of(conversation);
     account.wire.send(&to, Body::Edit { target: sent, text: wire_body, ranges, timer })?;
