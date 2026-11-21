@@ -7,7 +7,7 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -64,6 +64,10 @@ enum Ask {
     GroupUpdate { group_id: String, edit: GroupEdit, answer: Sender<Result<(), Fault>> },
     GroupSetAvatar { group_id: String, bytes: Vec<u8>, answer: Sender<Result<(), Fault>> },
     GroupSetTimer { group_id: String, seconds: u32, answer: Sender<Result<(), Fault>> },
+    GroupInviteLink { group_id: String, mode: InviteLinkMode, answer: Sender<Result<String, Fault>> },
+    GroupJoinByLink { url: String, answer: Sender<Result<GroupInfo, Fault>> },
+    GroupReviewRequest { group_id: String, person: String, approve: bool, answer: Sender<Result<(), Fault>> },
+    GroupPendingInvite { group_id: String, accept: bool, answer: Sender<Result<(), Fault>> },
 }
 
 pub struct Real {
@@ -459,6 +463,22 @@ impl Wire for Real {
         self.ask(|answer| Ask::GroupSetTimer { group_id: group_id.to_owned(), seconds, answer })
     }
 
+    fn group_invite_link(&self, group_id: &str, mode: InviteLinkMode) -> Result<String, Fault> {
+        self.ask(|answer| Ask::GroupInviteLink { group_id: group_id.to_owned(), mode, answer })
+    }
+
+    fn group_join_by_link(&self, url: &str) -> Result<GroupInfo, Fault> {
+        self.ask(|answer| Ask::GroupJoinByLink { url: url.to_owned(), answer })
+    }
+
+    fn group_review_request(&self, group_id: &str, person: &str, approve: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::GroupReviewRequest { group_id: group_id.to_owned(), person: person.to_owned(), approve, answer })
+    }
+
+    fn group_pending_invite(&self, group_id: &str, accept: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::GroupPendingInvite { group_id: group_id.to_owned(), accept, answer })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -593,6 +613,11 @@ impl Session {
             let member_access = group.access_control.as_ref().map_or(GroupAccess::Member, |ac| access_of(ac.members));
             let attributes_access = group.access_control.as_ref().map_or(GroupAccess::Member, |ac| access_of(ac.attributes));
             let invite_link_access = group.access_control.as_ref().map_or(GroupAccess::Unsatisfiable, |ac| access_of(ac.add_from_invite_link));
+            let invite_link = if !group.invite_link_password.is_empty() && invite_link_access != GroupAccess::Unsatisfiable {
+                format_group_invite_link(&key, &group.invite_link_password)
+            } else {
+                String::new()
+            };
             self.groups.insert(id.clone(), key);
             self.known.seed(id.clone(), revision, snap);
             told.push(GroupInfo {
@@ -607,7 +632,7 @@ impl Session {
                 attributes_access,
                 invite_link_access,
                 announcements_only: false,
-                invite_link: String::new(),
+                invite_link,
                 timer_secs,
             });
         }
@@ -1039,6 +1064,18 @@ impl Session {
             Ask::GroupSetTimer { group_id, seconds, answer } => {
                 let _ = answer.send(self.group_set_timer(&group_id, seconds).await);
             }
+            Ask::GroupInviteLink { group_id, mode, answer } => {
+                let _ = answer.send(self.group_invite_link(&group_id, mode).await);
+            }
+            Ask::GroupJoinByLink { url, answer } => {
+                let _ = answer.send(self.group_join_by_link(&url).await);
+            }
+            Ask::GroupReviewRequest { group_id, person, approve, answer } => {
+                let _ = answer.send(self.group_review_request(&group_id, &person, approve).await);
+            }
+            Ask::GroupPendingInvite { group_id, accept, answer } => {
+                let _ = answer.send(self.group_pending_invite(&group_id, accept).await);
+            }
         }
     }
 
@@ -1348,6 +1385,148 @@ impl Session {
         actions.modify_disappearing_message_timer = Some(presage::proto::group_change::actions::ModifyDisappearingMessageTimerAction {
             timer: ops.encrypt_disappearing_messages_timer(timer.as_ref(), &mut rng),
         });
+        self.patch_group(group_id, actions).await
+    }
+
+    async fn group_invite_link(&mut self, group_id: &str, mode: InviteLinkMode) -> Result<String, Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let existing = self
+            .vault
+            .group_keys()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|(stored, _)| *stored == key).map(|(_, g)| g));
+        let revision = existing.as_ref().map_or(0, |g| g.revision);
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: Self::encrypt_aci_bytes(&params, Aci::from(me_uuid)),
+            version: revision + 1,
+            ..Default::default()
+        };
+        let mut password = existing.map(|g| g.invite_link_password).unwrap_or_default();
+        let need_new_pass = matches!(mode, InviteLinkMode::Reset) || (password.is_empty() && !matches!(mode, InviteLinkMode::Off));
+        if need_new_pass {
+            let mut buf = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut buf);
+            password = buf.to_vec();
+            actions.modify_invite_link_password = Some(presage::proto::group_change::actions::ModifyInviteLinkPasswordAction {
+                invite_link_password: password.clone(),
+            });
+        }
+        let access = match mode {
+            InviteLinkMode::Off => Some(AccessRequired::Unsatisfiable),
+            InviteLinkMode::Enabled => Some(AccessRequired::Any),
+            InviteLinkMode::ApprovalRequired => Some(AccessRequired::Administrator),
+            InviteLinkMode::Reset => None,
+        };
+        if let Some(access) = access {
+            actions.modify_add_from_invite_link_access = Some(presage::proto::group_change::actions::ModifyAddFromInviteLinkAccessControlAction {
+                add_from_invite_link_access: access.into(),
+            });
+        }
+        self.patch_group(group_id, actions).await?;
+        if matches!(mode, InviteLinkMode::Off) || password.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok(format_group_invite_link(&key, &password))
+        }
+    }
+
+    async fn group_join_by_link(&mut self, url: &str) -> Result<GroupInfo, Fault> {
+        let parsed = parse_group_invite_link(url).ok_or_else(|| Fault::Refused("That is not a valid Signal group link.".into()))?;
+        let key = parsed.master_key;
+        let id = group_id(&key);
+        self.groups.insert(id.clone(), key);
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let ops = presage::libsignal_service::groups_v2::GroupOperations::new(params);
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let aci = Aci::from(me_uuid);
+        let pk = self.manager.registration_data().profile_key();
+        let mut add = ops.build_add_member_action(aci, pk, Role::Default).map_err(|err| Fault::Net(err.to_string()))?;
+        add.join_from_invite_link = true;
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: Self::encrypt_aci_bytes(&params, aci),
+            version: 0,
+            ..Default::default()
+        };
+        actions.add_members.push(add);
+        self.patch_group(&id, actions).await?;
+        Ok(GroupInfo {
+            id,
+            title: "Signal group".into(),
+            member: true,
+            invite_link: url.to_owned(),
+            ..GroupInfo::default()
+        })
+    }
+
+    async fn group_review_request(&mut self, group_id: &str, person: &str, approve: bool) -> Result<(), Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let revision = self
+            .vault
+            .group_keys()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|(stored, _)| *stored == key).map(|(_, g)| g.revision))
+            .unwrap_or(0);
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let target_uuid = Uuid::parse_str(person).map_err(|_| Fault::Refused("That join request can't be reviewed here.".into()))?;
+        let enc_target = Self::encrypt_aci_bytes(&params, Aci::from(target_uuid));
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: Self::encrypt_aci_bytes(&params, Aci::from(me_uuid)),
+            version: revision + 1,
+            ..Default::default()
+        };
+        if approve {
+            actions.promote_members_pending_admin_approval.push(
+                presage::proto::group_change::actions::PromoteMemberPendingAdminApprovalAction {
+                    user_id: enc_target,
+                    role: Role::Default.into(),
+                },
+            );
+        } else {
+            actions.delete_members_pending_admin_approval.push(
+                presage::proto::group_change::actions::DeleteMemberPendingAdminApprovalAction {
+                    deleted_user_id: enc_target,
+                },
+            );
+        }
+        self.patch_group(group_id, actions).await
+    }
+
+    async fn group_pending_invite(&mut self, group_id: &str, accept: bool) -> Result<(), Fault> {
+        let key = *self.groups.get(group_id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let revision = self
+            .vault
+            .group_keys()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|(stored, _)| *stored == key).map(|(_, g)| g.revision))
+            .unwrap_or(0);
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let enc_me = Self::encrypt_aci_bytes(&params, Aci::from(me_uuid));
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: enc_me.clone(),
+            version: revision + 1,
+            ..Default::default()
+        };
+        if accept {
+            let pk = self.manager.registration_data().profile_key();
+            let enc_pk = presage::libsignal_service::zkgroup::serialize(&params.encrypt_profile_key(pk, Aci::from(me_uuid).into()));
+            actions.promote_members_pending_profile_key.push(
+                presage::proto::group_change::actions::PromoteMemberPendingProfileKeyAction {
+                    user_id: enc_me,
+                    profile_key: enc_pk,
+                    presentation: Vec::new(),
+                },
+            );
+        } else {
+            actions.delete_members_pending_profile_key.push(
+                presage::proto::group_change::actions::DeleteMemberPendingProfileKeyAction {
+                    deleted_user_id: enc_me,
+                },
+            );
+        }
         self.patch_group(group_id, actions).await
     }
 

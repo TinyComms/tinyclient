@@ -87,6 +87,130 @@ pub struct GroupMember {
     pub admin: bool,
 }
 
+/// Mode for a Signal group's invite link (`https://signal.group/#...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteLinkMode {
+    Off,
+    Enabled,
+    ApprovalRequired,
+    Reset,
+}
+
+/// Decoded contents of a `https://signal.group/#<base64>` link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupInviteLink {
+    pub master_key: [u8; 32],
+    pub password: Vec<u8>,
+}
+
+/// Encodes a `GroupMasterKey` (32 bytes) and `inviteLinkPassword` into a `https://signal.group/#...` URL
+/// using Signal's `GroupInviteLink` protobuf wire format (`field 1: v1Contents { 1: masterKey, 2: password }`).
+pub fn format_group_invite_link(master_key: &[u8; 32], password: &[u8]) -> String {
+    use base64::Engine as _;
+    fn push_varint(out: &mut Vec<u8>, mut val: usize) {
+        while val >= 0x80 {
+            out.push(((val & 0x7f) as u8) | 0x80);
+            val >>= 7;
+        }
+        out.push(val as u8);
+    }
+    let mut inner = Vec::with_capacity(2 + 32 + 2 + password.len());
+    inner.push((1 << 3) | 2);
+    push_varint(&mut inner, 32);
+    inner.extend_from_slice(master_key);
+    if !password.is_empty() {
+        inner.push((2 << 3) | 2);
+        push_varint(&mut inner, password.len());
+        inner.extend_from_slice(password);
+    }
+    let mut outer = Vec::with_capacity(2 + inner.len());
+    outer.push((1 << 3) | 2);
+    push_varint(&mut outer, inner.len());
+    outer.extend_from_slice(&inner);
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&outer);
+    format!("https://signal.group/#{encoded}")
+}
+
+/// Parses a `https://signal.group/#<base64>` URL into its 32-byte master key and invite link password.
+pub fn parse_group_invite_link(url: &str) -> Option<GroupInviteLink> {
+    use base64::Engine as _;
+    fn read_varint(bytes: &[u8], at: &mut usize) -> Option<usize> {
+        let mut out = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let b = *bytes.get(*at)?;
+            *at += 1;
+            out |= ((b & 0x7f) as usize) << shift;
+            if b & 0x80 == 0 {
+                return Some(out);
+            }
+            shift += 7;
+            if shift > 35 {
+                return None;
+            }
+        }
+    }
+    let trimmed = url.trim();
+    let frag = trimmed
+        .strip_prefix("https://signal.group/#")
+        .or_else(|| trimmed.strip_prefix("http://signal.group/#"))?;
+    if frag.is_empty() {
+        return None;
+    }
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(frag)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(frag))
+        .ok()?;
+    let mut at = 0;
+    let mut inner: Option<&[u8]> = None;
+    while at < raw.len() {
+        let tag = read_varint(&raw, &mut at)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if wire != 2 {
+            return None;
+        }
+        let len = read_varint(&raw, &mut at)?;
+        let slice = raw.get(at..at + len)?;
+        at += len;
+        if field == 1 {
+            inner = Some(slice);
+        }
+    }
+    let inner = inner?;
+    let mut iat = 0;
+    let mut master_key: Option<[u8; 32]> = None;
+    let mut password: Vec<u8> = Vec::new();
+    while iat < inner.len() {
+        let tag = read_varint(inner, &mut iat)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if wire != 2 {
+            return None;
+        }
+        let len = read_varint(inner, &mut iat)?;
+        let slice = inner.get(iat..iat + len)?;
+        iat += len;
+        match field {
+            1 => master_key = slice.try_into().ok(),
+            2 => password = slice.to_vec(),
+            _ => {}
+        }
+    }
+    Some(GroupInviteLink { master_key: master_key?, password })
+}
+
+/// Finds the first valid `https://signal.group/#...` URL in a message's text.
+pub fn find_group_invite_link(text: &str) -> Option<(&str, GroupInviteLink)> {
+    let start = text.find("https://signal.group/#").or_else(|| text.find("http://signal.group/#"))?;
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'')).unwrap_or(rest.len());
+    let candidate = &rest[..end];
+    parse_group_invite_link(candidate).map(|parsed| (candidate, parsed))
+}
+
 /// Group attribute and permission edits sent to Signal Groups v2.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupEdit {
@@ -409,6 +533,23 @@ pub trait Wire: Send + Sync {
     fn group_set_timer(&self, _group_id: &str, _seconds: u32) -> Result<(), Fault> {
         Err(Fault::Refused("Changing the group timer is not available.".to_owned()))
     }
+    /// Enables, disables, requires approval for, or resets a group's invite link.
+    /// Returns the active `https://signal.group/#...` link (or empty string when disabled).
+    fn group_invite_link(&self, _group_id: &str, _mode: InviteLinkMode) -> Result<String, Fault> {
+        Err(Fault::Refused("Group invite links are not available.".to_owned()))
+    }
+    /// Joins (or requests to join) a group from its `https://signal.group/#...` invite link.
+    fn group_join_by_link(&self, _url: &str) -> Result<GroupInfo, Fault> {
+        Err(Fault::Refused("Joining a group by link is not available.".to_owned()))
+    }
+    /// Approves or denies a member's request to join a group.
+    fn group_review_request(&self, _group_id: &str, _person: &str, _approve: bool) -> Result<(), Fault> {
+        Err(Fault::Refused("Reviewing join requests is not available.".to_owned()))
+    }
+    /// Accepts or declines a pending invite to a group for our own account.
+    fn group_pending_invite(&self, _group_id: &str, _accept: bool) -> Result<(), Fault> {
+        Err(Fault::Refused("Answering group invites is not available.".to_owned()))
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
@@ -476,5 +617,24 @@ mod tests {
         assert_eq!(view_once_label(Some("video/mp4")), "View-once video · open it on your phone");
         assert_eq!(view_once_label(Some("application/pdf")), "View-once media · open it on your phone");
         assert_eq!(view_once_label(None), "View-once media · open it on your phone");
+    }
+
+    #[test]
+    fn group_invite_link_round_trips_and_extracts_from_text() {
+        let key = [0x5au8; 32];
+        let pass = b"secret-pass-1234";
+        let url = format_group_invite_link(&key, pass);
+        assert!(url.starts_with("https://signal.group/#"));
+        let parsed = parse_group_invite_link(&url).expect("valid invite link");
+        assert_eq!(parsed.master_key, key);
+        assert_eq!(parsed.password, pass);
+
+        let msg = format!("Come join us: {url}!");
+        let (found_url, found) = find_group_invite_link(&msg).expect("found in text");
+        assert_eq!(found_url, url);
+        assert_eq!(found, parsed);
+
+        assert!(parse_group_invite_link("https://signal.group/#not-valid-base64!!!").is_none());
+        assert!(parse_group_invite_link("https://example.com/#abc").is_none());
     }
 }

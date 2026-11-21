@@ -94,6 +94,34 @@ const GROUP_ADMIN_REVOKE: &str = "\u{1}signal-admin-revoke\u{1}";
 /// Group permissions edit packed into `ConversationUpdate.description`:
 /// `\u{1}signal-group-perms\u{1}members=admin|member;attributes=admin|member;announcements=on|off`.
 const GROUP_PERMS_PREFIX: &str = "\u{1}signal-group-perms\u{1}";
+/// Group invite link control packed into `ConversationUpdate.description`:
+/// `\u{1}signal-group-link\u{1}off|on|approval|reset`.
+const GROUP_LINK_PREFIX: &str = "\u{1}signal-group-link\u{1}";
+/// Join request approval/denial packed into `MembersRemove.person`:
+/// `\u{1}signal-join-approve\u{1}<aci>` or `\u{1}signal-join-deny\u{1}<aci>`.
+const GROUP_JOIN_APPROVE: &str = "\u{1}signal-join-approve\u{1}";
+const GROUP_JOIN_DENY: &str = "\u{1}signal-join-deny\u{1}";
+/// Join a group from its `https://signal.group/#...` link packed into `StartDirect.person_id`.
+const GROUP_JOIN_LINK: &str = "\u{1}signal-join-link\u{1}";
+
+/// Packs a Signal group invite link mode change (`off`, `on`, `approval`, `reset`).
+pub fn group_link_command(mode: &str) -> String {
+    format!("{GROUP_LINK_PREFIX}{mode}")
+}
+
+/// Packs a join-request approval or denial for `MembersRemove`.
+pub fn group_join_request_command(person: &str, approve: bool) -> String {
+    if approve {
+        format!("{GROUP_JOIN_APPROVE}{person}")
+    } else {
+        format!("{GROUP_JOIN_DENY}{person}")
+    }
+}
+
+/// Packs a `https://signal.group/#...` join request for `StartDirect`.
+pub fn group_join_link_command(url: &str) -> String {
+    format!("{GROUP_JOIN_LINK}{url}")
+}
 
 /// Packs a Signal group permissions edit so `Request::ConversationUpdate` carries it.
 pub fn group_permissions_command(
@@ -1007,6 +1035,14 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
     if text.unsupported.is_some() {
         message.kind = MessageKind::Unsupported { link: String::new() };
     }
+    if wire::find_group_invite_link(&message.text).is_some() {
+        message.card = Some(Box::new(protocol::Card {
+            title: "Signal group invite".to_owned(),
+            text: "Joining by link shares your profile key with the group.".to_owned(),
+            footer: "Join group".to_owned(),
+            ..protocol::Card::default()
+        }));
+    }
     message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, quote));
     message
 }
@@ -1584,6 +1620,15 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Typing { conversation_id, activity: _ } => typing(account, &conversation_id),
         Command::StartDirect { person_id, reply } => {
+            if let Some(url) = person_id.strip_prefix(GROUP_JOIN_LINK) {
+                let res = account
+                    .wire
+                    .group_join_by_link(url.trim())
+                    .map(|g| Peer::Group(g.id).conversation())
+                    .map_err(refused);
+                let _ = reply.send(res);
+                return;
+            }
             // Nothing reaches the other person: the chat exists on Signal once a message does.
             let started = wire::is_aci(&person_id).then(|| {
                 let name = account.live().names.get(&person_id).cloned().unwrap_or_default();
@@ -1591,6 +1636,13 @@ fn serve(account: &Arc<Account>, command: Command) {
                 person_id
             });
             let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
+        }
+        Command::AnswerMessageRequest { conversation_id, accept, reply } => {
+            let Some(Peer::Group(group_id)) = Peer::parse(&conversation_id) else {
+                let _ = reply.send(Err(Refusal::Unsupported));
+                return;
+            };
+            let _ = reply.send(account.wire.group_pending_invite(&group_id, accept).map_err(refused));
         }
         Command::SearchPeople(query) => search_people(account, &query),
         Command::Members { conversation_id, offset, limit, reply } => {
@@ -1884,6 +1936,22 @@ fn members_remove(account: &Account, conversation_id: &str, person: &str) -> Res
         }
         return account.wire.group_set_admin(&group_id, target_aci, admin).map_err(refused);
     }
+    if let Some(target_aci) = person.strip_prefix(GROUP_JOIN_APPROVE).or_else(|| person.strip_prefix(GROUP_JOIN_DENY)) {
+        let approve = person.starts_with(GROUP_JOIN_APPROVE);
+        let target_aci = target_aci.trim();
+        if !wire::is_aci(target_aci) {
+            return Err(Refusal::Refused("That join request can't be reviewed here.".into()));
+        }
+        let allowed = account
+            .live()
+            .group_info
+            .get(conversation_id)
+            .is_some_and(|g| group_rights(g, &account.me).manage_members);
+        if !allowed {
+            return Err(Refusal::Refused("Only group admins can approve or deny join requests.".into()));
+        }
+        return account.wire.group_review_request(&group_id, target_aci, approve).map_err(refused);
+    }
     let person = person.trim();
     if !wire::is_aci(person) {
         return Err(Refusal::Refused("That person can't be removed from here.".into()));
@@ -1907,6 +1975,25 @@ fn group_update(account: &Account, conversation_id: &str, title: Option<String>,
         return Err(Refusal::Unsupported);
     };
     if let Some(desc) = description.as_deref() {
+        if let Some(mode_str) = desc.strip_prefix(GROUP_LINK_PREFIX) {
+            let is_admin = account
+                .live()
+                .group_info
+                .get(conversation_id)
+                .is_some_and(|g| group_rights(g, &account.me).manage_members);
+            if !is_admin {
+                return Err(Refusal::Refused("Only group admins can change the group invite link.".into()));
+            }
+            let mode = match mode_str.trim() {
+                "off" => wire::InviteLinkMode::Off,
+                "on" => wire::InviteLinkMode::Enabled,
+                "approval" => wire::InviteLinkMode::ApprovalRequired,
+                "reset" => wire::InviteLinkMode::Reset,
+                _ => return Err(Refusal::Refused("Unknown invite link setting.".into())),
+            };
+            account.wire.group_invite_link(&group_id, mode).map_err(refused)?;
+            return Ok(());
+        }
         if let Some(edit) = parse_group_permissions(desc) {
             let is_admin = account
                 .live()

@@ -750,9 +750,8 @@ pub fn conversation_link(conversation: &Conversation, info: Option<&Conversation
             Some(format!("https://discord.com/channels/{place}/{id}"))
         }
         Network::Slack => conversation.space.as_ref().map(|team| format!("slack://channel?team={team}&id={id}")),
-        Network::Telegram | Network::Teams => told,
-        // Signal opens a chat only by a phone number or username, which a row does not carry.
-        Network::Signal | Network::Messages | Network::Tiny => None,
+        Network::Telegram | Network::Teams | Network::Signal => told,
+        Network::Messages | Network::Tiny => None,
     }
 }
 

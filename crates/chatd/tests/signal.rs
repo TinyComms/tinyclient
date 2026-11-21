@@ -1579,3 +1579,116 @@ fn editing_group_name_description_avatar_and_permissions() {
     let pic_err = world.ask(Request::ConversationPicture { conversation: key(CLUB), path: String::new() });
     assert!(matches!(pic_err, Response::Error { code: ErrorCode::Refused, .. }));
 }
+
+#[test]
+fn a_group_invite_link_renders_a_join_card_and_can_be_managed_and_joined() {
+    let world = World::linked();
+    world.connected();
+
+    // Enable the group invite link as admin and verify ConversationInfo.link exposes it.
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: None,
+            topic: None,
+            description: Some("\u{1}signal-group-link\u{1}on".into()),
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("group-link {CLUB} Enabled"));
+    let link = world.until("invite link populated", || {
+        match world.ask(Request::ConversationInfo { conversation: key(CLUB) }) {
+            Response::ConversationInfo { info } if info.link.starts_with("https://signal.group/#") => Some(info.link),
+            _ => None,
+        }
+    });
+    assert_eq!(protocol::redact(&link), "https://signal.group/#[redacted]");
+
+    // An incoming message containing the invite link gets a join card with profile-key notice.
+    world.steer(&format!("incoming grace {} Join here {link}", T0 + 25_000));
+    let msg = world.arrived(GRACE, &id(T0 + 25_000, GRACE));
+    let card = msg.card.expect("group invite link must render a card");
+    assert_eq!(card.title, "Signal group invite");
+    assert!(card.text.contains("profile key"));
+    assert_eq!(card.footer, "Join group");
+
+    // Join a group from its link.
+    let Response::Conversation { conversation: joined } = world.ask(Request::StartDirect {
+        person: key(&format!("\u{1}signal-join-link\u{1}{link}")),
+    }) else {
+        panic!("expected joined group conversation");
+    };
+    assert!(joined.key.id.starts_with("g."));
+    world.heard("group-join-link");
+
+    // Reset and turn off the invite link.
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: None,
+            topic: None,
+            description: Some("\u{1}signal-group-link\u{1}reset".into()),
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("group-link {CLUB} Reset"));
+    let reset_link = world.until("reset link differs", || {
+        match world.ask(Request::ConversationInfo { conversation: key(CLUB) }) {
+            Response::ConversationInfo { info } if !info.link.is_empty() && info.link != link => Some(info.link),
+            _ => None,
+        }
+    });
+    assert!(reset_link.starts_with("https://signal.group/#"));
+}
+
+#[test]
+fn group_join_requests_and_pending_invites_can_be_approved_or_declined() {
+    let world = World::linked();
+    world.connected();
+
+    let eve = "e5e5e5e5-0000-4000-8000-000000000005";
+    let frank = "f6f6f6f6-0000-4000-8000-000000000006";
+    world.steer(&format!("group-requesting {eve} Eve"));
+    world.steer(&format!("group-requesting {frank} Frank"));
+    world.until("two join requests listed", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().filter(|m| m.status == "Requested to join").count() == 2 => Some(()),
+            _ => None,
+        }
+    });
+
+    // Approve Eve -> becomes a full member; deny Frank -> removed from requests.
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-join-approve\u{1}{eve}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-request {CLUB} {eve} approve"));
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-join-deny\u{1}{frank}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-request {CLUB} {frank} deny"));
+    world.until("Eve approved and Frank denied", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. }
+                if members.iter().any(|m| m.key.id == eve && m.status.is_empty())
+                    && !members.iter().any(|m| m.key.id == frank) =>
+            {
+                Some(())
+            }
+            _ => None,
+        }
+    });
+
+    // Accept / decline a pending group invite to me.
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: key(CLUB), accept: true }),
+        Response::Ok
+    );
+    world.heard(&format!("group-invite {CLUB} accept"));
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: key(CLUB), accept: false }),
+        Response::Ok
+    );
+    world.heard(&format!("group-invite {CLUB} decline"));
+}

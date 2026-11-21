@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -797,6 +797,114 @@ impl Wire for Fake {
         record(&format!("group-timer {conv} {seconds}"));
         let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
         g.info.timer_secs = seconds;
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(())
+    }
+
+    fn group_invite_link(&self, group_id: &str, mode: InviteLinkMode) -> Result<String, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        let conv = Peer::Group(group_id.to_owned()).conversation();
+        record(&format!("group-link {conv} {mode:?}"));
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        let key = [0x5au8; 32];
+        match mode {
+            InviteLinkMode::Off => {
+                g.info.invite_link_access = GroupAccess::Unsatisfiable;
+                g.info.invite_link.clear();
+            }
+            InviteLinkMode::Enabled => {
+                g.info.invite_link_access = GroupAccess::Any;
+                g.info.invite_link = format_group_invite_link(&key, b"club-pass-v1");
+            }
+            InviteLinkMode::ApprovalRequired => {
+                g.info.invite_link_access = GroupAccess::Administrator;
+                g.info.invite_link = format_group_invite_link(&key, b"club-pass-v1");
+            }
+            InviteLinkMode::Reset => {
+                if g.info.invite_link_access == GroupAccess::Unsatisfiable {
+                    g.info.invite_link_access = GroupAccess::Any;
+                }
+                g.info.invite_link = format_group_invite_link(&key, b"club-pass-v2");
+            }
+        }
+        let link = g.info.invite_link.clone();
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(link)
+    }
+
+    fn group_join_by_link(&self, url: &str) -> Result<GroupInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let Some(_parsed) = parse_group_invite_link(url) else {
+            return Err(Fault::Refused("That is not a valid Signal group link.".into()));
+        };
+        record("group-join-link");
+        let joined = GroupInfo {
+            id: "6b286b286b286b286b286b286b286b286b286b286b286b286b286b286b286b28".into(),
+            title: "Chess club".into(),
+            description: "Joined via invite link".into(),
+            members: 2,
+            member: true,
+            member_ids: vec![ME.into(), GRACE.into()],
+            admins: vec![GRACE.into()],
+            member_access: GroupAccess::Member,
+            attributes_access: GroupAccess::Administrator,
+            invite_link_access: GroupAccess::Any,
+            announcements_only: false,
+            invite_link: url.to_owned(),
+            timer_secs: 0,
+        };
+        let _ = self.events.send(Event::Groups(vec![joined.clone()]));
+        Ok(joined)
+    }
+
+    fn group_review_request(&self, group_id: &str, person: &str, approve: bool) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        let conv = Peer::Group(group_id.to_owned()).conversation();
+        record(&format!("group-request {conv} {person} {}", if approve { "approve" } else { "deny" }));
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        let req = g.requesting.iter().position(|m| m.id == person).map(|idx| g.requesting.remove(idx));
+        if approve {
+            let member = req.unwrap_or(GroupMember { id: person.to_owned(), name: String::new(), admin: false });
+            if !g.members.iter().any(|m| m.id == person) {
+                g.members.push(member);
+            }
+        }
+        g.sync_info();
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(())
+    }
+
+    fn group_pending_invite(&self, group_id: &str, accept: bool) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        let conv = Peer::Group(group_id.to_owned()).conversation();
+        record(&format!("group-invite {conv} {}", if accept { "accept" } else { "decline" }));
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        g.pending.retain(|m| m.id != ME);
+        if accept {
+            if !g.members.iter().any(|m| m.id == ME) {
+                g.members.push(GroupMember { id: ME.into(), name: "Ada Quill".into(), admin: false });
+            }
+        } else {
+            g.members.retain(|m| m.id != ME);
+        }
+        g.sync_info();
         let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
         Ok(())
     }
