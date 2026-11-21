@@ -1171,6 +1171,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     pinned: Some(1),
                     external: String::new(),
                     link: String::new(),
+                    disappearing: row.disappearing,
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },

@@ -187,6 +187,7 @@ pub struct ConversationAbout {
     pub pinned: Option<u32>,
     pub external: String,
     pub link: String,
+    pub disappearing: Option<u32>,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -361,6 +362,13 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Set or clear a conversation's disappearing-messages timer (`seconds == 0` turns it off).
+    /// Report the new timer through [`Context::disappearing`] before answering.
+    SetDisappearing {
+        conversation_id: String,
+        seconds: u32,
+        reply: Reply<()>,
+    },
     /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
@@ -484,6 +492,7 @@ impl Command {
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
@@ -779,6 +788,15 @@ impl Context {
     pub fn rights(&self, conversation_id: &str, rights: protocol::ConversationRights) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_rights(&conversation, rights)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    /// The network's disappearing-messages timer for a conversation (seconds; `None` or `Some(0)` means off).
+    pub fn disappearing(&self, conversation_id: &str, seconds: Option<u32>) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_disappearing(&conversation, seconds)? {
             self.hub.changed(Change::Conversation { conversation });
         }
         Ok(())

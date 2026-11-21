@@ -1067,6 +1067,7 @@ fn apply(account: &Account, event: Event) {
             let mut message = message(account, &text, outgoing);
             if text.expire_timer > 0 || text.expire_timer_version > 0 {
                 account.live().note_timer(&conversation, text.expire_timer, text.expire_timer_version);
+                let _ = ctx.disappearing(&conversation, (text.expire_timer > 0).then_some(text.expire_timer));
             }
             if text.expire_timer > 0 {
                 if outgoing {
@@ -1194,6 +1195,7 @@ fn apply(account: &Account, event: Event) {
         Event::TimerChanged { peer, seconds, version } => {
             let conversation = peer.conversation();
             account.live().note_timer(&conversation, seconds, version);
+            let _ = ctx.disappearing(&conversation, (seconds > 0).then_some(seconds));
             if let Peer::Direct(aci) = &peer {
                 let title = account.live().names.get(aci).cloned().unwrap_or_default();
                 ensure_row(account, &peer, &title);
@@ -1430,6 +1432,7 @@ fn capabilities() -> protocol::Capabilities {
         edit_window: (SEND_WINDOW_MS / 1_000) as u32,
         max_file_bytes: files.max_file_bytes,
         max_files: files.max_files,
+        disappearing: true,
         ..protocol::Capabilities::default()
     }
 }
@@ -1503,6 +1506,27 @@ fn serve(account: &Arc<Account>, command: Command) {
                 return;
             };
             let _ = reply.send(set_own(account, name, about, emoji));
+        }
+        Command::SetDisappearing { conversation_id, seconds, reply } => {
+            let next_version = {
+                let mut live = account.live();
+                let current = live.timer_of(&conversation_id);
+                let version = current.version.saturating_add(1);
+                live.note_timer(&conversation_id, seconds, version);
+                version
+            };
+            let _ = next_version;
+            let _ = ctx.disappearing(&conversation_id, (seconds > 0).then_some(seconds));
+            let line = if seconds == 0 {
+                "Disappearing messages are off".to_owned()
+            } else {
+                format!("Disappearing messages are set to {}", duration(seconds))
+            };
+            let sent_ms = now_ms();
+            let mut msg = Message::plain(format!("signal-timer-{sent_ms}"), String::new(), line, (sent_ms / 1_000) as i64, false);
+            msg.kind = MessageKind::System;
+            let _ = ctx.message(&conversation_id, &msg);
+            let _ = reply.send(Ok(()));
         }
         other => other.unsupported(ctx),
     }

@@ -50,6 +50,51 @@ fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
     div().flex().flex_col().gap(px(6.)).child(div().type_ui().child("Sound")).child(chips).children(muted)
 }
 
+/// Disappearing-messages timer control in the info pane (separate from local `keep_days`).
+fn disappearing_row(
+    pane: &InfoPane,
+    row: &Conversation,
+    info: Option<&protocol::ConversationInfo>,
+    cx: &mut Context<InfoPane>,
+) -> Option<Div> {
+    let (_, scene, ..) = pane.parts();
+    let can = scene
+        .accounts
+        .iter()
+        .find(|a| a.key == row.key.account())
+        .map(|a| a.can)
+        .unwrap_or_default();
+    let active = info.and_then(|i| i.disappearing).or(row.disappearing).unwrap_or(0);
+    if !can.disappearing && active == 0 {
+        return None;
+    }
+    let presets = protocol::disappearing_presets(row.key.network);
+    let mut choices = segmented();
+    for (ix, &secs) in presets.iter().enumerate() {
+        let key = row.key.clone();
+        let label = protocol::format_disappearing(secs);
+        let seg = segment(("details-disappearing", ix), label, active == secs).px(px(8.));
+        let seg = if can.disappearing {
+            seg.on_click(cx.listener(move |_, _, _, cx| {
+                let req = Request::SetDisappearing { conversation: key.clone(), seconds: secs };
+                crate::gui::people::ask_later(cx, req, |_, _| {});
+            }))
+        } else {
+            seg
+        };
+        choices = choices.child(seg);
+    }
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().type_ui().child("Disappearing messages"))
+            .child(div().flex().flex_wrap().gap(px(4.)).child(choices))
+            .child(div().type_small().text_color(theme::text_faint()).child("Auto-deletes on the network (separate from local retention).")),
+    )
+}
+
 /// Notifications' segmented choice for a channel.
 fn notify_segments(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
     let shown = pane.notify_shown(row);
@@ -163,6 +208,9 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         .mt(px(12.)),
     );
     top = top.child(sound_row(row, cx).mt(px(8.)));
+    if let Some(timer_row) = disappearing_row(pane, row, info, cx) {
+        top = top.child(timer_row.mt(px(8.)));
+    }
     if !online {
         let words = facts::heads_up_words(&facts::HeadsUp::Offline, &row.title, network, crate::view::now());
         top = top.child(draw::heads_up_banner(&words, None).mt(px(12.)));

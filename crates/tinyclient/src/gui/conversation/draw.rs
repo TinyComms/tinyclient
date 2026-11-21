@@ -1170,6 +1170,24 @@ impl Pane {
         if edited_alone {
             out.push(self.edited_mark(message, cx));
         }
+        if let Some(expires_at) = message.expires_at {
+            if let Some(label) = expiry_label(expires_at, crate::view::now()) {
+                out.push(
+                    div()
+                        .id(name_id("expires", &message.id))
+                        .h(px(16.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .tooltip(tip(format!("Disappears in {label}"), None))
+                        .child(glyph("icons/clock.svg", 11., theme::text_faint()))
+                        .child(label)
+                        .into_any_element(),
+                );
+            }
+        }
         out
     }
 
@@ -2729,5 +2747,31 @@ mod tests {
         assert_eq!(ended_dur.label, "Call with Bea · 12 min");
         let ended_plain = call_line_spec(&make(protocol::CallOutcome::Ended, true, None), "Bea");
         assert_eq!(ended_plain.label, "Call with Bea");
+    }
+
+    #[test]
+    fn expiry_label_formats_countdown_cleanly() {
+        assert_eq!(expiry_label(100, 100), Some("expiring".into()));
+        assert_eq!(expiry_label(125, 100), Some("25s".into()));
+        assert_eq!(expiry_label(400, 100), Some("5m".into()));
+        assert_eq!(expiry_label(7_300, 100), Some("2h".into()));
+        assert_eq!(expiry_label(172_900, 100), Some("2d".into()));
+    }
+}
+
+/// Short remaining-time label for a disappearing message's `expires_at` timestamp.
+pub(crate) fn expiry_label(expires_at: i64, now: i64) -> Option<String> {
+    let left = expires_at - now;
+    if left <= 0 {
+        return Some("expiring".to_owned());
+    }
+    if left >= 86_400 {
+        Some(format!("{}d", left / 86_400))
+    } else if left >= 3_600 {
+        Some(format!("{}h", left / 3_600))
+    } else if left >= 60 {
+        Some(format!("{}m", left / 60))
+    } else {
+        Some(format!("{left}s"))
     }
 }

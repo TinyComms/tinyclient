@@ -814,6 +814,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetMute { conversation_id, notify, until, reply } => {
             let _ = reply.send(info::set_mute(account, &conversation_id, notify, until).map_err(refused));
         }
+        Command::SetDisappearing { conversation_id, seconds, reply } => {
+            let _ = reply.send(info::set_disappearing(account, &conversation_id, seconds).map_err(refused));
+        }
         Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
         }

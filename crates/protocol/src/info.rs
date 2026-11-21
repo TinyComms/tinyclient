@@ -240,6 +240,9 @@ pub struct ConversationInfo {
     /// The public link (`t.me/name`), where there is one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub link: String,
+    /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disappearing: Option<u32>,
 }
 
 /// A Space's info: opened from its name, never from a conversation.
@@ -361,6 +364,36 @@ pub struct Capabilities {
     /// This account supports adding and removing conversations from folders (`Request::File`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub folders_edit: bool,
+    /// This account supports setting a conversation's disappearing-messages timer (`Request::SetDisappearing`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disappearing: bool,
+}
+
+/// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.
+pub fn disappearing_presets(network: Network) -> &'static [u32] {
+    match network {
+        Network::Signal => &[0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200],
+        Network::Telegram => &[0, 86_400, 604_800, 2_678_400],
+        _ => &[0, 30, 300, 3_600, 86_400, 604_800],
+    }
+}
+
+/// Short human-readable label for a disappearing-messages timer in seconds.
+pub fn format_disappearing(seconds: u32) -> String {
+    if seconds == 0 {
+        return "Off".to_owned();
+    }
+    if seconds % 604_800 == 0 {
+        format!("{}w", seconds / 604_800)
+    } else if seconds % 86_400 == 0 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds % 3_600 == 0 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 impl Capabilities {

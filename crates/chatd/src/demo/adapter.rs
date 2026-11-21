@@ -356,6 +356,7 @@ impl Demo {
             pinned: Some((pick % 4) as u32),
             external: if self.ctx.account.network == Network::Slack && row.title == "customer-voice" { "Northwind Traders".to_owned() } else { String::new() },
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
+            disappearing: row.disappearing,
         })
     }
 
@@ -740,6 +741,24 @@ impl Demo {
             }
             Command::Source { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::SetDisappearing { conversation_id, seconds, reply } => {
+                let outcome = demo
+                    .ctx
+                    .disappearing(&conversation_id, (seconds > 0).then_some(seconds))
+                    .map_err(|err| Refusal::Refused(err.to_string()));
+                if outcome.is_ok() {
+                    let line = if seconds == 0 {
+                        "Disappearing messages are off".to_owned()
+                    } else {
+                        format!("Disappearing messages are set to {}", protocol::format_disappearing(seconds))
+                    };
+                    let now = crate::hub::now();
+                    let mut msg = Message::plain(format!("demo-ttl-{now}"), String::new(), line, now, false);
+                    msg.kind = protocol::MessageKind::System;
+                    let _ = demo.ctx.message(&conversation_id, &msg);
+                }
+                let _ = reply.send(outcome);
             }
             Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
                 let outcome = match demo.ctx.known(&conversation_id) {

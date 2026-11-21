@@ -188,12 +188,16 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
             let tl::enums::UserFull::Full(user) = full.full_user;
             about.description = user.about.unwrap_or_default();
             about.members = Some(2);
+            about.disappearing = user.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
+            let _ = account.ctx.disappearing(conversation, about.disappearing);
         }
         Who::Group(chat_id) => {
             let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::Full(chat) = full.full_chat {
                 about.description = chat.about;
+                about.disappearing = chat.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
+                let _ = account.ctx.disappearing(conversation, about.disappearing);
                 if let tl::enums::ChatParticipants::Participants(list) = chat.participants {
                     about.members = Some(list.participants.len() as u32);
                     about.creator = list
@@ -215,10 +219,31 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
                 about.description = channel.about;
                 about.members = channel.participants_count.map(|count| count.max(0) as u32);
                 about.online = channel.online_count.map(|count| count.max(0) as u32);
+                about.disappearing = channel.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
+                let _ = account.ctx.disappearing(conversation, about.disappearing);
             }
         }
     }
     Ok(about)
+}
+
+/// Sets or clears Telegram's auto-delete timer (`messages.setHistoryTTL`).
+pub(super) fn set_disappearing(account: &Account, conversation: &str, seconds: u32) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    account.ask(&tl::functions::messages::SetHistoryTtl { peer, period: seconds as i32 })?;
+    let timer = (seconds > 0).then_some(seconds);
+    let _ = account.ctx.disappearing(conversation, timer);
+    let line = if seconds == 0 {
+        "Disappearing messages are off".to_owned()
+    } else {
+        format!("Disappearing messages are set to {}", protocol::format_disappearing(seconds))
+    };
+    let now = crate::hub::now();
+    let mut msg = Message::plain(format!("tg-ttl-{now}"), String::new(), line, now, false);
+    msg.kind = protocol::MessageKind::System;
+    let _ = account.ctx.message(conversation, &msg);
+    Ok(())
 }
 
 /// The network's own mute. Telegram has no "mentions only" for a chat: a muted chat still

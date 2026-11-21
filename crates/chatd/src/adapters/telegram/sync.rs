@@ -339,6 +339,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         pin_chats: if premium { 10 } else { 5 },
         archive: true,
         folders_edit: true,
+        disappearing: true,
     }
 }
 

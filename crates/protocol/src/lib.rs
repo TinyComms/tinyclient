@@ -528,6 +528,9 @@ pub struct Conversation {
     /// Per-conversation moderation and management rights for this account.
     #[serde(default, skip_serializing_if = "ConversationRights::is_empty")]
     pub rights: ConversationRights,
+    /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disappearing: Option<u32>,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -592,6 +595,7 @@ impl Conversation {
             read_only_reason: String::new(),
             spam: false,
             rights: ConversationRights::default(),
+            disappearing: None,
         }
     }
 
@@ -1319,6 +1323,12 @@ pub enum Request {
         notify: Notify,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<i64>,
+    },
+    /// Sets or clears a conversation's disappearing-messages timer (`seconds == 0` turns it off).
+    /// Separate from local cache retention (`keep_days`).
+    SetDisappearing {
+        conversation: Key,
+        seconds: u32,
     },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
     Leave {
@@ -2821,6 +2831,23 @@ mod tests {
         assert_eq!(ConversationRights::from_bits(rights.to_bits()), rights);
         assert!(ConversationRights::default().is_empty());
         assert!(!rights.is_empty());
+    }
+
+    #[test]
+    fn disappearing_timer_request_and_presets_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Signal, account: "sig".into() }, "u:1");
+        let req = Request::SetDisappearing { conversation: key.clone(), seconds: 30 };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+
+        assert_eq!(format_disappearing(0), "Off");
+        assert_eq!(format_disappearing(30), "30s");
+        assert_eq!(format_disappearing(300), "5m");
+        assert_eq!(format_disappearing(3_600), "1h");
+        assert_eq!(format_disappearing(86_400), "1d");
+        assert_eq!(format_disappearing(604_800), "1w");
+        assert!(disappearing_presets(Network::Signal).contains(&30));
+        assert!(disappearing_presets(Network::Telegram).contains(&86_400));
     }
 }
 

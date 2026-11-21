@@ -1732,6 +1732,7 @@ impl Chat {
             Err(refused) => return *refused,
         };
         let mut info = ConversationInfo {
+            disappearing: about.disappearing.or(row.disappearing),
             conversation: row,
             description: about.description,
             members: about.members,
@@ -2560,6 +2561,13 @@ impl Chat {
             Request::SpaceInfo { space } => self.space_info(space),
             Request::SetMute { conversation, notify, until } => {
                 self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, until, reply })
+            }
+            Request::SetDisappearing { conversation, seconds } => {
+                let res = self.act(&conversation, |conversation_id, reply| Command::SetDisappearing { conversation_id, seconds, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
             }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
             Request::CloseDirect { conversation } => {
@@ -4239,6 +4247,62 @@ mod tests {
             *seen.lock().unwrap(),
             vec![("m1".to_owned(), DeleteScope::Everyone), ("m2".to_owned(), DeleteScope::Me)]
         );
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn disappearing_timer_updates_row_and_info() {
+        use crate::adapters::{self, Command, ConversationAbout};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Store};
+        use protocol::{AccountKey, ConversationKind, Key, Link, Network, Request, Response};
+        use std::sync::Arc;
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Signal, account: "sig".into() };
+        let conv = Key::new(&account, "u:9");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        ctx.conversation(&ConversationRow::new("u:9", ConversationKind::Direct, "Nora")).unwrap();
+
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::SetDisappearing { conversation_id, seconds, reply } => {
+                        worker_ctx.disappearing(&conversation_id, (seconds > 0).then_some(seconds)).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::ConversationInfo { reply, .. } => {
+                        let _ = reply.send(Ok(ConversationAbout::default()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        assert_eq!(chat.handle(Request::SetDisappearing { conversation: conv.clone(), seconds: 30 }), Response::Ok);
+        let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conv.clone() }) else {
+            panic!("expected Conversation");
+        };
+        assert_eq!(row.disappearing, Some(30));
+
+        let Response::ConversationInfo { info } = chat.handle(Request::ConversationInfo { conversation: conv.clone() }) else {
+            panic!("expected ConversationInfo");
+        };
+        assert_eq!(info.disappearing, Some(30));
+
+        assert_eq!(chat.handle(Request::SetDisappearing { conversation: conv.clone(), seconds: 0 }), Response::Ok);
+        let Response::Conversation { conversation: cleared } = chat.handle(Request::Conversation { conversation: conv }) else {
+            panic!("expected Conversation");
+        };
+        assert_eq!(cleared.disappearing, None);
 
         lock(&chat.adapters).remove(&account);
         drop(ctx);
