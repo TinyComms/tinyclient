@@ -332,9 +332,11 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
 #[derive(Default)]
 struct State {
     me: String,
-    /// Verified email from READY's own user. Missing is unknown.
+    /// Verified email. READY writes it, and so does a later event once Discord says it is verified.
+    /// Missing is unknown.
     verified: Option<bool>,
-    /// Whether READY's own user has a phone. The number is never stored.
+    /// Whether this account has a phone. The number is never stored. Written the same way.
+    /// Missing is unknown.
     phone: Option<bool>,
     session: Option<Resumable>,
     guilds: HashMap<String, GuildInfo>,

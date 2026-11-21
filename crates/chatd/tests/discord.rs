@@ -4516,6 +4516,59 @@ fn rules_and_onboarding_lock_until_discord_says_so_and_do_not_grant_a_channel() 
 }
 
 #[test]
+fn verifying_phone_or_email_unlocks_the_composer_without_a_new_ready() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["verified"] = json!(false);
+    ready["user"]["phone"] = Value::Null;
+    // Level 4 asks for a phone. Level 1 asks for an email. The phone check runs first, so only
+    // the level-4 server says phone while the email is still unverified.
+    ready["guilds"][0]["properties"]["verification_level"] = json!(4);
+    ready["guilds"][1]["verification_level"] = json!(1);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
+    assert_eq!(world.conversation("5001").read_only_reason, "This server needs a verified email");
+
+    // Clearing the challenge, with no user on it, does not refresh the snapshot READY stored.
+    world.discord.push("USER_REQUIRED_ACTION_UPDATE", json!({"required_action": null}));
+    world.incoming("3002", None, "still locked", json!({}));
+    wait("the challenge clear to be handled", || {
+        world.messages("3002").into_iter().rev().find(|message| message.text == "still locked").map(|_| ())
+    });
+    assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
+    assert_eq!(world.conversation("5001").read_only_reason, "This server needs a verified email");
+
+    world.discord.push("USER_UPDATE", json!({
+        "id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "verified": true
+    }));
+    wait("the email lock to lift", || world.conversation("5001").read_only_reason.is_empty().then_some(()));
+    assert!(!world.conversation("5001").read_only);
+    assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
+
+    world.discord.push("USER_REQUIRED_ACTION_UPDATE", json!({
+        "required_action": null,
+        "user": {"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "phone": "+15555550100"}
+    }));
+    wait("the phone lock to lift", || world.conversation("4101").read_only_reason.is_empty().then_some(()));
+    assert!(!world.conversation("4101").read_only);
+
+    // A server joined after that copies the new snapshot, not the one from READY.
+    world.discord.push("GUILD_CREATE", json!({
+        "id": "6000", "name": "New Place", "icon": null, "owner_id": "2001", "joined_at": "2026-10-13T08:00:00+00:00",
+        "verification_level": 4,
+        "roles": [{"id": "6000", "name": "@everyone", "permissions": "1024", "position": 0}],
+        "channels": [{"id": "6001", "type": 0, "name": "lobby", "position": 0, "permission_overwrites": []}],
+        "threads": [],
+        "members": [{"user": {"id": "1000", "username": "justin"}, "roles": [], "joined_at": "2026-10-13T08:00:00+00:00"}]
+    }));
+    wait("the new server", || world.tree("6000").1.iter().any(|row| row.key.id == "6001").then_some(()));
+    let joined = world.conversation("6001");
+    assert!(!joined.read_only, "a server joined after verification stays locked: {}", joined.read_only_reason);
+}
+
+#[test]
 fn voice_channel_respects_connect_permission_and_user_limit() {
     let mut ready: Value = serde_json::from_str(READY).unwrap();
     ready["guilds"][0]["roles"][0]["permissions"] = json!("36769344");

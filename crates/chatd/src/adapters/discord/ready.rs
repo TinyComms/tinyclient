@@ -848,6 +848,47 @@ impl Discord {
         self.ctx.describe(user.name(), &user.id)
     }
 
+    /// A phone or email Discord has just said is verified. The account snapshot is what a server
+    /// joined later copies. Every server already joined keeps its own copy, which is what the
+    /// composer lock reads, and one that was blocking is replanted so the lock lifts without a
+    /// reconnect.
+    pub(super) fn note_verified(&self, user: &User) -> Result<(), Failure> {
+        let email = user.verified == Some(true);
+        let phone = user.phone == Some(true);
+        if !email && !phone {
+            return Ok(());
+        }
+        let guilds = {
+            let mut state = self.state.lock().unwrap();
+            if email {
+                state.verified = Some(true);
+            }
+            if phone {
+                state.phone = Some(true);
+            }
+            let mut lift = Vec::new();
+            for (id, info) in state.guilds.iter_mut() {
+                let mut blocking = false;
+                if email && info.verified != Some(true) {
+                    blocking |= info.verified == Some(false);
+                    info.verified = Some(true);
+                }
+                if phone && info.phone != Some(true) {
+                    blocking |= info.phone == Some(false);
+                    info.phone = Some(true);
+                }
+                if blocking {
+                    lift.push(id.clone());
+                }
+            }
+            lift
+        };
+        for guild in guilds {
+            self.replant(&guild)?;
+        }
+        Ok(())
+    }
+
     /// The user's server folders as JSON settings or protobuf ones carry them. Only a folder with
     /// an id is one; a server alone in a nameless one is simply not in a folder.
     fn folders(ready: &Ready) -> Option<Vec<proto::GuildFolder>> {

@@ -132,6 +132,9 @@ struct MemberChange {
 struct RequiredAction {
     #[serde(default)]
     required_action: Option<String>,
+    /// Set when this event names the account. A bare challenge leaves it out.
+    #[serde(default)]
+    user: Option<User>,
 }
 
 impl Discord {
@@ -180,16 +183,23 @@ impl Discord {
             "CHANNEL_UNREAD_UPDATE" | "PASSIVE_UPDATE_V2" => self.passive(from_str(data)?)?,
             "USER_UPDATE" => {
                 let user: User = from_str(data)?;
-                // Ours: a new name or picture.
+                // Ours: a new name or picture, and a phone or email that just became verified.
                 if user.id == self.me() {
                     self.myself(&user)?;
+                    self.note_verified(&user)?;
                 }
             }
             "USER_SETTINGS_PROTO_UPDATE" => self.settings_proto(from_str(data)?)?,
             // Discord wants a phone number, an email check or a captcha: nothing more is asked of
-            // it until the user has dealt with that in Discord's own app.
+            // it until the user has dealt with that in Discord's own app. Clearing that flag does
+            // not say the phone or email is verified. A user on this payload does.
             "USER_REQUIRED_ACTION_UPDATE" => {
                 let action: RequiredAction = from_str(data)?;
+                if let Some(user) = action.user.as_ref().filter(|user| user.id == self.me()) {
+                    self.note_verified(user)?;
+                } else if let Some(user) = from_str::<User>(data).ok().filter(|user| user.id == self.me()) {
+                    self.note_verified(&user)?;
+                }
                 match action.required_action.as_deref() {
                     Some(action) => {
                         let what = match action {
