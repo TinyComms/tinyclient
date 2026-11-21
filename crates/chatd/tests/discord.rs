@@ -5045,3 +5045,72 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
 }
+
+#[test]
+fn system_messages_render_boosts_pins_thread_starter_and_all_types() {
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    // Open channel 4101 so live messages are stored.
+    wait("channel 4101 history", || (!world.messages("4101").is_empty()).then_some(()));
+
+    // Boost tier 2 with count 2.
+    let boost_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": boost_id, "channel_id": "4101", "guild_id": "4000", "type": 10, "content": "2",
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara O"},
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let boost = wait("boost tier 2 message", || {
+        world.messages("4101").into_iter().find(|m| m.id == boost_id)
+    });
+    assert_eq!(boost.kind, MessageKind::System);
+    assert_eq!(boost.text, "Mara O boosted the server 2 times! Rustaceans has reached Level 2.");
+
+    // Pinned message system line carries jump target.
+    let pin_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": pin_id, "channel_id": "4101", "guild_id": "4000", "type": 6, "content": "",
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara O"},
+        "message_reference": {"message_id": "1300000000000000201", "channel_id": "4101", "guild_id": "4000", "type": 0},
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let pin = wait("pin system message", || {
+        world.messages("4101").into_iter().find(|m| m.id == pin_id)
+    });
+    assert_eq!(pin.kind, MessageKind::System);
+    assert_eq!(pin.text, "Mara O pinned a message.");
+    assert_eq!(pin.jump.as_deref(), Some("1300000000000000201"));
+
+    // Thread starter (type 21) in thread 4500 renders as System with quoted original and jump.
+    let starter_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": starter_id, "channel_id": "4500", "guild_id": "4000", "type": 21, "content": "",
+        "author": {"id": "2002", "username": "sam", "global_name": "Sam"},
+        "message_reference": {"message_id": "1300000000000000201", "channel_id": "4101", "guild_id": "4000", "type": 0},
+        "referenced_message": {
+            "id": "1300000000000000201", "channel_id": "4101", "type": 0, "content": "Ship it Friday",
+            "author": {"id": "2002", "username": "sam", "global_name": "Sam"}
+        },
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let starter = wait("thread starter message", || {
+        world.messages("4500").into_iter().find(|m| m.id == starter_id)
+    });
+    assert_eq!(starter.kind, MessageKind::System);
+    assert_eq!(starter.jump.as_deref(), Some("1300000000000000201"));
+    let quote = starter.reply_to.as_ref().expect("type 21 carries reply_to quote");
+    assert_eq!(quote.snippet, "Ship it Friday");
+
+    // Newly added discovery/incident/purchase types are System, not Unsupported.
+    let incident_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": incident_id, "channel_id": "4101", "guild_id": "4000", "type": 36, "content": "",
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara O"},
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let incident = wait("incident alert message", || {
+        world.messages("4101").into_iter().find(|m| m.id == incident_id)
+    });
+    assert_eq!(incident.kind, MessageKind::System);
+    assert_eq!(incident.text, "Mara O enabled security actions for this server.");
+}

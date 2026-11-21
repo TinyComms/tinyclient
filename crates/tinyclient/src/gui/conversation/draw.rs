@@ -266,16 +266,61 @@ fn replies_line(count: u32, metrics: Metrics) -> Div {
         .child(div().flex_1().h(px(1.)).bg(theme::hairline()))
 }
 
-fn system_line(message: &Message) -> Div {
+fn system_line_div(pane: &Pane, message: &Message, cx: &mut Context<Pane>) -> Div {
+    let _ = pane;
+    let text_el = if let Some(target) = message.jump.clone().filter(|id| !id.is_empty()) {
+        div()
+            .id(SharedString::from(format!("sys-jump-{}", message.id)))
+            .max_w(px(MEASURE))
+            .cursor_pointer()
+            .hover(|style| style.text_color(theme::text()).underline())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| this.jump_to(&target, cx)))
+            .child(message.text.clone())
+            .into_any_element()
+    } else {
+        div().max_w(px(MEASURE)).child(message.text.clone()).into_any_element()
+    };
+    let quote_el = message.reply_to.as_ref().map(|reply| {
+        let target = reply.id.clone();
+        let snippet = if reply.deleted {
+            "Original message was deleted".to_owned()
+        } else if reply.sender.is_empty() {
+            reply.snippet.clone()
+        } else {
+            format!("{}: {}", reply.sender, reply.snippet)
+        };
+        let row = div()
+            .id(SharedString::from(format!("sys-quote-{}", message.id)))
+            .mt(px(3.))
+            .max_w(px(MEASURE))
+            .pl(px(8.))
+            .border_l_2()
+            .border_color(theme::hairline())
+            .type_small()
+            .text_color(theme::text_soft())
+            .truncate()
+            .child(snippet);
+        if target.is_empty() {
+            row
+        } else {
+            row.cursor_pointer()
+                .hover(|style| style.text_color(theme::text()))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.jump_to(&target, cx)))
+        }
+    });
     div()
         .min_h(px(28.))
         .px(px(20.))
         .py(px(5.))
         .flex()
-        .justify_center()
+        .flex_col()
+        .items_center()
         .type_small()
         .text_color(theme::text_faint())
-        .child(div().max_w(px(MEASURE)).child(message.text.clone()))
+        .child(text_el)
+        .children(quote_el)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,7 +526,7 @@ impl Pane {
             Item::New => new_line(metrics).into_any_element(),
             Item::Message { message, head } => self.message_row(message, *head, false, window, cx),
             Item::System(message) if message.call.is_some() => self.call_line(message, cx).into_any_element(),
-            Item::System(message) => system_line(message).into_any_element(),
+            Item::System(message) => system_line_div(self, message, cx).into_any_element(),
         };
         let seen = self.seen.clone();
         let mark = canvas(move |bounds, _, _| seen.borrow_mut().push((ix, bounds)), |_, (), _, _| {});

@@ -1019,6 +1019,34 @@ pub struct Posted {
     pub nonce: Option<String>,
     #[serde(default)]
     pub call: Option<CallPayload>,
+    #[serde(default)]
+    pub role_subscription_data: Option<RoleSubscriptionData>,
+    #[serde(default)]
+    pub purchase_notification: Option<PurchaseNotification>,
+}
+
+/// Discord's `role_subscription_data` on a type-25 role subscription purchase message.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct RoleSubscriptionData {
+    #[serde(default, deserialize_with = "nullable")]
+    pub tier_name: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub total_months_subscribed: u32,
+    #[serde(default, deserialize_with = "nullable")]
+    pub is_renewal: bool,
+}
+
+/// Discord's `purchase_notification.guild_product_purchase` on a type-44 purchase message.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct GuildProductPurchase {
+    #[serde(default, deserialize_with = "nullable")]
+    pub product_name: String,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct PurchaseNotification {
+    #[serde(default)]
+    pub guild_product_purchase: Option<GuildProductPurchase>,
 }
 
 /// Discord's `call` object on a type-3 call system message.

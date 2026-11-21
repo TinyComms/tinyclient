@@ -678,10 +678,31 @@ pub fn sender_name(posted: &Posted) -> String {
     nick.unwrap_or(own).to_owned()
 }
 
+/// Formats a server boost line (types 8–11), preserving the boost count in `content` and any
+/// tier level reached.
+fn boost_line(kind: u8, who: &str, content: &str, server: &str) -> String {
+    let count = content.trim().parse::<u32>().ok().filter(|&n| n > 1);
+    let tier = match kind {
+        9 => Some(1),
+        10 => Some(2),
+        11 => Some(3),
+        _ => None,
+    };
+    let head = match (count, tier) {
+        (Some(n), _) => format!("{who} boosted the server {n} times!"),
+        (None, Some(_)) => format!("{who} boosted the server!"),
+        (None, None) => format!("{who} boosted the server."),
+    };
+    match tier {
+        Some(level) => format!("{head} {server} has reached Level {level}."),
+        None => head,
+    }
+}
+
 /// The one grey line a system message is. `None` for types that are ordinary messages.
-fn system_line(kind: u8, who: &str, content: &str, mentioned: &str) -> Option<String> {
+fn system_line(posted: &Posted, kind: u8, who: &str, content: &str, mentioned: &str, server: &str) -> Option<String> {
     Some(match kind {
-        0 | 19 | 20 | 21 | 23 => return None,
+        0 | 19 | 20 | 23 => return None,
         1 => format!("{who} added {mentioned} to the group."),
         2 if mentioned == who || mentioned.is_empty() => format!("{who} left the group."),
         2 => format!("{who} removed {mentioned} from the group."),
@@ -690,17 +711,70 @@ fn system_line(kind: u8, who: &str, content: &str, mentioned: &str) -> Option<St
         5 => format!("{who} changed the group icon."),
         6 => format!("{who} pinned a message."),
         7 => format!("{who} joined the server."),
-        8..=11 => format!("{who} boosted the server."),
+        8..=11 => boost_line(kind, who, content, server),
         12 => format!("{who} added {content} to this channel."),
+        14 => "This server has been removed from Server Discovery because it no longer passes all the requirements.".to_owned(),
+        15 => "This server is eligible for Server Discovery again and has been automatically relisted!".to_owned(),
+        16 => "This server has failed Discovery activity requirements for 1 week. If this server fails for 4 weeks in a row, it will be automatically removed from Discovery.".to_owned(),
+        17 => "This server has failed Discovery activity requirements for 3 weeks in a row. If this server fails for 1 more week, it will be automatically removed from Discovery.".to_owned(),
         18 => format!("{who} started a thread: {content}"),
+        21 => format!("{who} started a thread."),
+        22 => "Sending invites to your server is the best way to grow your community.".to_owned(),
         24 => "AutoMod flagged a message.".to_owned(),
+        25 => match posted.role_subscription_data.as_ref() {
+            Some(sub) if !sub.tier_name.is_empty() && sub.is_renewal && sub.total_months_subscribed > 1 => {
+                format!(
+                    "{who} renewed {} and has been a subscriber of {server} for {} months!",
+                    sub.tier_name, sub.total_months_subscribed
+                )
+            }
+            Some(sub) if !sub.tier_name.is_empty() => {
+                format!("{who} joined {} and became a subscriber of {server}!", sub.tier_name)
+            }
+            _ => format!("{who} subscribed to {server}."),
+        },
+        26 => {
+            if content.is_empty() {
+                "Upgrade to unlock more features for this app.".to_owned()
+            } else {
+                content.to_owned()
+            }
+        }
         27 => format!("{who} started {content}"),
         28 => format!("{who} ended {content}"),
         29 => format!("{who} is now a speaker."),
+        30 => format!("{who} requested to speak."),
         31 => format!("{who} changed the Stage topic: {content}"),
+        32 => {
+            if content.is_empty() {
+                format!("{who} subscribed to an app for {server}.")
+            } else {
+                format!("{who} subscribed to {content} for {server}.")
+            }
+        }
+        36 => format!("{who} enabled security actions for this server."),
+        37 => format!("{who} disabled security actions for this server."),
+        38 => format!("{who} reported a raid in this server."),
+        39 => format!("{who} marked the raid alert as a false alarm."),
+        44 => {
+            let product = posted
+                .purchase_notification
+                .as_ref()
+                .and_then(|p| p.guild_product_purchase.as_ref())
+                .map(|p| p.product_name.as_str())
+                .filter(|name| !name.is_empty())
+                .or_else(|| (!content.is_empty()).then_some(content));
+            match product {
+                Some(name) => format!("{who} has purchased {name}!"),
+                None => format!("{who} made a purchase."),
+            }
+        }
         46 => "A poll has closed.".to_owned(),
         67 => format!("{who} accepted your friend request."),
-        _ => return Some(String::new()),
+        _ => {
+            tracing::debug!(message_type = kind, "chatd: Discord: unsupported system message type");
+            return Some(String::new());
+        }
     })
 }
 
@@ -784,7 +858,12 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let forwarded = posted.message_snapshots.first().map(|snapshot| &*snapshot.message);
     let mut message_kind = MessageKind::Normal;
     let mentioned = posted.mentions.first().map_or("", |user| user.name());
-    match system_line(kind, &who, content, mentioned) {
+    let server = place
+        .guild
+        .and_then(|guild| place.names.space(guild))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "This server".to_owned());
+    match system_line(posted, kind, &who, content, mentioned, &server) {
         None => {
             markdown(&mut rich, content, place.names);
             // What was forwarded is the message's own text; a forward has none of its own.
@@ -855,8 +934,15 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             sender: sender_name(original),
             snippet: snippet(original, place.names),
         }),
+        (None, Some(original)) if kind == 21 => Some(ReplyTo {
+            deleted: false,
+            person: original.author.as_ref().filter(|_| original.webhook_id.is_none()).map(|author| Key::new(place.account, &author.id)),
+            id: original.id.clone(),
+            sender: sender_name(original),
+            snippet: snippet(original, place.names),
+        }),
         // The original was deleted, or Discord did not include it.
-        (Some(reference), None) if reference.kind == 0 && kind == 19 => reference.message_id.as_ref().map(|id| ReplyTo {
+        (Some(reference), None) if reference.kind == 0 && matches!(kind, 19 | 21) => reference.message_id.as_ref().map(|id| ReplyTo {
             deleted: true,
             person: None,
             id: id.clone(),
@@ -864,6 +950,15 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             snippet: String::new(),
         }),
         _ => None,
+    };
+    let jump = if matches!(kind, 6 | 18 | 21 | 46) {
+        posted
+            .message_reference
+            .as_ref()
+            .and_then(|r| r.message_id.clone())
+            .or_else(|| (kind == 21).then(|| posted.referenced_message.as_ref().map(|m| m.id.clone())).flatten())
+    } else {
+        None
     };
     // The thread object names the count and the newest id. Faces and unread are filled
     // as replies arrive, and a thread update can raise the count.
@@ -944,6 +1039,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_via: None,
         permalink: String::new(),
         controls: Vec::new(),
+        jump,
     };
     (message, rich.files)
 }
@@ -1236,5 +1332,112 @@ mod tests {
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
         assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
+    }
+
+    #[test]
+    fn every_system_message_type_has_wording_boost_tiers_and_jump_targets() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "test".into() };
+        let place = Place { account: &account, me: "400", guild: Some("4000"), names: &Nobody, author: None };
+        let make = |kind: u8, content: &str| -> Posted {
+            serde_json::from_value(serde_json::json!({
+                "id": "100", "channel_id": "200", "type": kind, "content": content,
+                "author": {"id": "300", "username": "ana", "global_name": "Ana"},
+                "mentions": [{"id": "301", "username": "ben", "global_name": "Ben"}]
+            }))
+            .unwrap()
+        };
+
+        let table: &[(u8, &str, &str)] = &[
+            (1, "", "Ana added Ben to the group."),
+            (2, "", "Ana removed Ben from the group."),
+            (3, "", "Ana started a call."),
+            (4, "Trail crew", "Ana changed the group name: Trail crew"),
+            (5, "", "Ana changed the group icon."),
+            (6, "", "Ana pinned a message."),
+            (7, "", "Ana joined the server."),
+            (8, "", "Ana boosted the server."),
+            (8, "3", "Ana boosted the server 3 times!"),
+            (9, "", "Ana boosted the server! Moss has reached Level 1."),
+            (10, "2", "Ana boosted the server 2 times! Moss has reached Level 2."),
+            (11, "4", "Ana boosted the server 4 times! Moss has reached Level 3."),
+            (12, "#news", "Ana added #news to this channel."),
+            (14, "", "This server has been removed from Server Discovery because it no longer passes all the requirements."),
+            (15, "", "This server is eligible for Server Discovery again and has been automatically relisted!"),
+            (16, "", "This server has failed Discovery activity requirements for 1 week. If this server fails for 4 weeks in a row, it will be automatically removed from Discovery."),
+            (17, "", "This server has failed Discovery activity requirements for 3 weeks in a row. If this server fails for 1 more week, it will be automatically removed from Discovery."),
+            (18, "Release plan", "Ana started a thread: Release plan"),
+            (21, "", "Ana started a thread."),
+            (22, "", "Sending invites to your server is the best way to grow your community."),
+            (24, "", "AutoMod flagged a message."),
+            (25, "", "Ana subscribed to Moss."),
+            (26, "", "Upgrade to unlock more features for this app."),
+            (27, "Town Hall", "Ana started Town Hall"),
+            (28, "Town Hall", "Ana ended Town Hall"),
+            (29, "", "Ana is now a speaker."),
+            (30, "", "Ana requested to speak."),
+            (31, "Q&A", "Ana changed the Stage topic: Q&A"),
+            (32, "", "Ana subscribed to an app for Moss."),
+            (36, "", "Ana enabled security actions for this server."),
+            (37, "", "Ana disabled security actions for this server."),
+            (38, "", "Ana reported a raid in this server."),
+            (39, "", "Ana marked the raid alert as a false alarm."),
+            (44, "", "Ana made a purchase."),
+            (46, "", "A poll has closed."),
+            (67, "", "Ana accepted your friend request."),
+        ];
+        for &(kind, content, expected) in table {
+            let posted = make(kind, content);
+            let (decoded, _) = message(&posted, &place);
+            assert_eq!(decoded.kind, MessageKind::System, "type {kind} must be System");
+            assert_eq!(decoded.text, expected, "type {kind} wording mismatch");
+        }
+
+        // Pin (type 6) and poll result (type 46) carry their jump target.
+        let mut pin = make(6, "");
+        pin.message_reference = Some(model::Reference { message_id: Some("9001".into()), channel_id: Some("200".into()), guild_id: Some("4000".into()), kind: 0 });
+        let (pin_msg, _) = message(&pin, &place);
+        assert_eq!(pin_msg.jump.as_deref(), Some("9001"));
+
+        let mut poll_res = make(46, "");
+        poll_res.message_reference = Some(model::Reference { message_id: Some("9002".into()), channel_id: Some("200".into()), guild_id: Some("4000".into()), kind: 0 });
+        let (poll_msg, _) = message(&poll_res, &place);
+        assert_eq!(poll_msg.jump.as_deref(), Some("9002"));
+
+        // Thread starter (type 21) quotes referenced_message and carries jump.
+        let starter: Posted = serde_json::from_value(serde_json::json!({
+            "id": "500", "channel_id": "4500", "type": 21, "content": "",
+            "author": {"id": "300", "username": "ana", "global_name": "Ana"},
+            "message_reference": {"message_id": "499", "channel_id": "4101", "guild_id": "4000", "type": 0},
+            "referenced_message": {
+                "id": "499", "channel_id": "4101", "type": 0, "content": "Let's plan the release",
+                "author": {"id": "301", "username": "ben", "global_name": "Ben"}
+            }
+        }))
+        .unwrap();
+        let (starter_msg, _) = message(&starter, &place);
+        assert_eq!(starter_msg.kind, MessageKind::System);
+        assert_eq!(starter_msg.jump.as_deref(), Some("499"));
+        let quote = starter_msg.reply_to.as_ref().expect("thread starter carries quoted original");
+        assert_eq!((quote.id.as_str(), quote.sender.as_str(), quote.snippet.as_str()), ("499", "Ben", "Let's plan the release"));
+
+        // Role subscription purchase (type 25) and purchase notification (type 44) use structured metadata.
+        let mut sub = make(25, "");
+        sub.role_subscription_data = Some(model::RoleSubscriptionData {
+            tier_name: "Supporter".into(),
+            total_months_subscribed: 6,
+            is_renewal: true,
+        });
+        assert_eq!(message(&sub, &place).0.text, "Ana renewed Supporter and has been a subscriber of Moss for 6 months!");
+
+        let mut purchase = make(44, "");
+        purchase.purchase_notification = Some(model::PurchaseNotification {
+            guild_product_purchase: Some(model::GuildProductPurchase { product_name: "Field Guide".into() }),
+        });
+        assert_eq!(message(&purchase, &place).0.text, "Ana has purchased Field Guide!");
+
+        // Unknown future type still falls back to Unsupported.
+        let unknown = make(250, "");
+        let (unsupported, _) = message(&unknown, &place);
+        assert!(matches!(unsupported.kind, MessageKind::Unsupported { .. }));
     }
 }
