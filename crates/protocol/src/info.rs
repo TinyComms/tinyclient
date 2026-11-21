@@ -646,6 +646,9 @@ pub struct Capabilities {
     /// This account supports setting a status with an emoji and a clear-after expiration (`SetPresence` with `status_emoji` and `clear_at`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub rich_status: bool,
+    /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_mute: bool,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].

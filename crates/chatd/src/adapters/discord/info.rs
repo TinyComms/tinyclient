@@ -247,16 +247,10 @@ impl Discord {
     /// Sets a conversation's notifications as Discord's own menu does: one settings change for
     /// its server (`@me` for direct and group conversations). Discord answers with the server's
     /// settings whole, which are applied as if they came from the gateway.
-    pub(super) fn set_mute(&self, channel: &str, notify: Notify) -> Result<(), Refusal> {
+    pub(super) fn set_mute(&self, channel: &str, notify: Notify, until: Option<i64>) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
         let guild = self.guild_of(&known);
-        let mut setting = match notify {
-            Notify::All => json!({"muted": false, "message_notifications": 0}),
-            Notify::Mentions => json!({"muted": false, "message_notifications": 1}),
-            Notify::Nothing => json!({"muted": true}),
-        };
-        setting["mute_config"] = json!({"end_time": null, "selected_time_window": -1});
-        let body = json!({"channel_overrides": {channel: setting}});
+        let body = mute_override_body(channel, notify, until, now());
         let path = format!("/users/@me/guilds/{}/settings", guild.as_deref().unwrap_or("@me"));
         let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
         match serde_json::from_str::<GuildSettings>(&answer) {
@@ -526,6 +520,28 @@ impl Discord {
     }
 }
 
+/// Builds the `PATCH /users/@me/guilds/{guild}/settings` body for a timed or endless channel mute.
+pub(super) fn mute_override_body(
+    channel: &str,
+    notify: Notify,
+    until: Option<i64>,
+    now_secs: i64,
+) -> serde_json::Value {
+    let mut setting = match notify {
+        Notify::All => json!({"muted": false, "message_notifications": 0}),
+        Notify::Mentions => json!({"muted": false, "message_notifications": 1}),
+        Notify::Nothing => json!({"muted": true}),
+    };
+    setting["mute_config"] = match (notify, until) {
+        (Notify::Nothing, Some(end)) if end > now_secs => {
+            let window = (end - now_secs).max(1);
+            json!({"end_time": model::iso_timestamp(end), "selected_time_window": window})
+        }
+        _ => json!({"end_time": null, "selected_time_window": -1}),
+    };
+    json!({"channel_overrides": {channel: setting}})
+}
+
 /// Builds the `(method, path, body)` for a Discord member moderation REST request.
 pub(super) fn moderate_request(
     guild: &str,
@@ -651,5 +667,42 @@ mod moderation_tests {
         assert!(guild.can_moderate("4000", "me", "999", &ModerateAction::Kick).is_err());
         // Denied: self
         assert!(guild.can_moderate("4000", "me", "me", &ModerateAction::Kick).is_err());
+    }
+
+    #[test]
+    fn timed_mute_builds_mute_config_and_expires_on_read() {
+        let now_secs = 1_700_000_000_i64;
+        let one_hour = now_secs + 3_600;
+        let body = mute_override_body("4101", Notify::Nothing, Some(one_hour), now_secs);
+        let entry = &body["channel_overrides"]["4101"];
+        assert_eq!(entry["muted"], true);
+        assert_eq!(entry["mute_config"]["selected_time_window"], 3_600);
+        assert_eq!(entry["mute_config"]["end_time"], "2023-11-14T23:13:20Z");
+
+        let endless = mute_override_body("4101", Notify::Nothing, None, now_secs);
+        assert_eq!(endless["channel_overrides"]["4101"]["mute_config"]["selected_time_window"], -1);
+        assert!(endless["channel_overrides"]["4101"]["mute_config"]["end_time"].is_null());
+
+        let unmute = mute_override_body("4101", Notify::All, Some(one_hour), now_secs);
+        assert_eq!(unmute["channel_overrides"]["4101"]["muted"], false);
+        assert_eq!(unmute["channel_overrides"]["4101"]["mute_config"]["selected_time_window"], -1);
+
+        // Reading back a timed mute from GuildSettings unmutes once `end_time` passes.
+        let settings: GuildSettings = serde_json::from_value(json!({
+            "guild_id": "4000",
+            "channel_overrides": [{
+                "channel_id": "4101",
+                "muted": true,
+                "mute_config": {
+                    "end_time": "2023-11-14T23:13:20Z",
+                    "selected_time_window": 3600
+                }
+            }]
+        }))
+        .unwrap();
+        let parsed = super::super::ready::quiet(&settings);
+        assert!(parsed.mutes("4101", None, one_hour - 1), "still muted before end_time");
+        assert!(!parsed.mutes("4101", None, one_hour), "unmuted at end_time");
+        assert!(!parsed.mutes("4101", None, one_hour + 60), "unmuted after end_time");
     }
 }
