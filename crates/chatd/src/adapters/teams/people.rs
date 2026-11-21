@@ -1,7 +1,7 @@
 //! People in a tenant: who wrote a message, who a chat is with, who is online. The directory is
 //! searched and looked up by id, never listed.
 
-use super::{escaped, Auth, Body, Fault, Teams, PRESENCE, REMEMBERED, SPACES};
+use super::{escaped, Audience, Auth, Body, Fault, Teams, REMEMBERED};
 use crate::adapters::{About, Members};
 use crate::store::{PersonDetails, PersonRow};
 use protocol::{Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation};
@@ -268,7 +268,7 @@ impl Teams {
 
     fn middle(&self, path: &str, body: Body) -> Result<Value, Fault> {
         let url = format!("{}{path}", self.place()?.middle);
-        Ok(self.call("POST", &url, Auth::Both(SPACES), body, true)?.body)
+        Ok(self.call("POST", &url, Auth::Both(Audience::Spaces), body, true)?.body)
     }
 
     /// The people an answer of the middle tier lists, under whichever name it used.
@@ -473,7 +473,7 @@ impl Teams {
         }
         let asked: Vec<Value> = ids.iter().map(|id| json!({"mri": id})).collect();
         let url = format!("{}/v1/presence/getpresence/", self.place()?.presence);
-        let found = self.call("POST", &url, Auth::Bearer(PRESENCE), Body::Json(&json!(asked)), true)?.body;
+        let found = self.call("POST", &url, Auth::Bearer(Audience::Presence), Body::Json(&json!(asked)), true)?.body;
         self.presences(&found);
         Ok(())
     }
@@ -498,12 +498,12 @@ impl Teams {
                 Presence::Unknown => unreachable!(),
             };
             let url = format!("{}/v1/me/forceavailability/", place.presence);
-            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&json!({"availability": availability})), false)?;
+            self.call("PUT", &url, Auth::Bearer(Audience::Presence), Body::Json(&json!({"availability": availability})), false)?;
         }
         if let Some(note) = status {
             let url = format!("{}/v1/me/publishnote", place.presence);
             let body = json!({"message": note, "expiry": "9999-12-30T23:00:00.000Z"});
-            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
+            self.call("PUT", &url, Auth::Bearer(Audience::Presence), Body::Json(&body), false)?;
         }
         Ok(())
     }

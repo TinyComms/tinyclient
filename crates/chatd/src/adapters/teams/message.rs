@@ -2,7 +2,7 @@
 //! everything done to messages: pages, sending, editing, deleting, reacting.
 
 use super::html::{self, Lookup};
-use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
+use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Audience, Body, Fault, Teams, CHAIN, PAGE, TYPING_SHOWN};
 use protocol::{
     Attachment, ConversationKind, Forwarded, MediaFile, MediaKind, MentionKind, Message,
     MessageKind, Preview, Reaction, ReplyTo, Span, Style, ThreadSummary,
@@ -611,7 +611,7 @@ impl Teams {
         let thread = placed.as_ref().map(|(channel, _)| channel.as_str()).unwrap_or_else(|| thread_of(conversation));
         let parent = placed.as_ref().and_then(|(_, root)| root.as_deref()).filter(|root| *root != id);
         let parent = parent.or_else(|| chain_of(conversation).map(|(_, root)| root).filter(|root| *root != id));
-        super::links::message_share(thread, id, &self.session.tenant, parent)
+        super::links::message_share_on(self.cloud.endpoints().teams, thread, id, &self.session.tenant, parent)
     }
 
     /// `ThreadActivity/…`: who joined, left or renamed the conversation, in words. Names come
@@ -894,7 +894,7 @@ impl Teams {
                 })
                 .or_else(|| {
                     (!orig_conv_id.is_empty() && !orig_msg_id.is_empty())
-                        .then(|| super::links::message_share(&orig_conv_id, &orig_msg_id, &self.session.tenant, None))
+                        .then(|| super::links::message_share_on(self.cloud.endpoints().teams, &orig_conv_id, &orig_msg_id, &self.session.tenant, None))
                 })
                 .unwrap_or_default();
             let fwd_body = html_fwd
@@ -938,7 +938,7 @@ impl Teams {
             message.text = title.map_or_else(|| "Meeting".to_owned(), |title| format!("Meeting: {title}"));
             message.spans.clear();
             message.kind = MessageKind::Unsupported {
-                link: format!("{TEAMS}/l/meetup-join/{}/0", escaped(conversation)),
+                link: super::links::meeting_share_on(self.cloud.endpoints().teams, conversation),
             };
         } else if let Some(component) = loop_card(&cards) {
             // A Loop component names itself and opens its file. Live editing is not drawn.
@@ -1427,7 +1427,7 @@ impl Teams {
         let place = self.place().ok()?;
         let endpoint = format!("{}/v1/urlpreview", place.middle);
         let body = json!({"url": url});
-        let answer = self.call("POST", &endpoint, super::Auth::Both(super::SPACES), Body::Json(&body), false).ok()?;
+        let answer = self.call("POST", &endpoint, super::Auth::Both(Audience::Spaces), Body::Json(&body), false).ok()?;
         let info = &answer.body;
         let title = [&info["title"], &info["previewTitle"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
         let description = [&info["description"], &info["previewDescription"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");

@@ -11,7 +11,7 @@
 //! - Sharing: Teams grants the chat's members access one by one; an organization link is
 //!   asked for here instead, which a tenant may forbid.
 
-use super::{escaped, Auth, Body, Fault, Teams, GRAPH};
+use super::{escaped, Audience, Auth, Body, Fault, Teams};
 use crate::blobs::upload::{self, Target, Upload};
 use protocol::{Attachment, MediaFile, MediaKind, Message, Outgoing};
 use serde_json::{json, Value};
@@ -99,7 +99,7 @@ impl Teams {
             return Err(format!("{name} is empty."));
         }
         let path = format!("{}/v1.0/me/drive/root:/{}/{}:/createUploadSession", self.graph, escaped(FOLDER), escaped(&name));
-        let session = self.call("POST", &path, Auth::Bearer(GRAPH), Body::Json(&json!({"item": {"@microsoft.graph.conflictBehavior": "rename"}})), true).map_err(failed)?;
+        let session = self.call("POST", &path, Auth::Bearer(Audience::Graph), Body::Json(&json!({"item": {"@microsoft.graph.conflictBehavior": "rename"}})), true).map_err(failed)?;
         let Some(url) = session.body["uploadUrl"].as_str().map(str::to_owned) else {
             return Err(format!("{name} could not be sent: OneDrive gave no place to put it."));
         };
@@ -119,7 +119,7 @@ impl Teams {
             return Err(format!("{name} could not be sent: OneDrive did not say where it put it."));
         };
         let shared = format!("{}/v1.0/me/drive/items/{}/createLink", self.graph, escaped(id));
-        let link = self.call("POST", &shared, Auth::Bearer(GRAPH), Body::Json(&json!({"type": "view", "scope": "organization"})), true).map_err(failed)?;
+        let link = self.call("POST", &shared, Auth::Bearer(Audience::Graph), Body::Json(&json!({"type": "view", "scope": "organization"})), true).map_err(failed)?;
         let share = link.body["link"]["webUrl"].as_str().unwrap_or(web).to_owned();
         let kind = name.rsplit_once('.').map_or("", |(_, ext)| ext).to_ascii_lowercase();
         let site = web.split("/Documents/").next().unwrap_or(web);

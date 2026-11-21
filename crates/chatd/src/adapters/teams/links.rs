@@ -38,15 +38,21 @@ impl ShareTarget {
     }
 }
 
-/// `https://teams.microsoft.com/l/chat/<chatId>/conversations`
-pub(crate) fn chat_share(thread: &str) -> String {
-    format!("{TEAMS}/l/chat/{}/conversations", escaped(thread))
+/// `https://<teams-host>/l/chat/<chatId>/conversations`
+pub(crate) fn chat_share_on(teams_host: &str, thread: &str) -> String {
+    format!("{}/l/chat/{}/conversations", teams_host.trim_end_matches('/'), escaped(thread))
 }
 
-/// `https://teams.microsoft.com/l/channel/<channelId>/<channelName>?groupId=&tenantId=`
-pub(crate) fn channel_share(thread: &str, title: &str, group: &str, tenant: &str) -> String {
+/// `https://teams.microsoft.com/l/chat/<chatId>/conversations`
+pub(crate) fn chat_share(thread: &str) -> String {
+    chat_share_on(TEAMS, thread)
+}
+
+/// `https://<teams-host>/l/channel/<channelId>/<channelName>?groupId=&tenantId=`
+pub(crate) fn channel_share_on(teams_host: &str, thread: &str, title: &str, group: &str, tenant: &str) -> String {
     format!(
-        "{TEAMS}/l/channel/{}/{}?groupId={}&tenantId={}",
+        "{}/l/channel/{}/{}?groupId={}&tenantId={}",
+        teams_host.trim_end_matches('/'),
         escaped(thread),
         escaped(title),
         escaped(group),
@@ -54,9 +60,15 @@ pub(crate) fn channel_share(thread: &str, title: &str, group: &str, tenant: &str
     )
 }
 
+/// `https://teams.microsoft.com/l/channel/<channelId>/<channelName>?groupId=&tenantId=`
+pub(crate) fn channel_share(thread: &str, title: &str, group: &str, tenant: &str) -> String {
+    channel_share_on(TEAMS, thread, title, group, tenant)
+}
+
 /// A message in a channel, or in a chat (which adds the documented `context` query).
 /// `parent` is the post a channel reply hangs off. The post's own id is not a parent.
-pub(crate) fn message_share(
+pub(crate) fn message_share_on(
+    teams_host: &str,
     conversation: &str,
     id: &str,
     tenant: &str,
@@ -65,7 +77,8 @@ pub(crate) fn message_share(
     let thread = super::thread_of(conversation);
     let channel = thread.contains("@thread.tacv2") || thread.contains("@thread.skype");
     let mut url = format!(
-        "{TEAMS}/l/message/{}/{}?tenantId={}",
+        "{}/l/message/{}/{}?tenantId={}",
+        teams_host.trim_end_matches('/'),
         escaped(thread),
         escaped(id),
         escaped(tenant)
@@ -80,6 +93,16 @@ pub(crate) fn message_share(
     url
 }
 
+/// A message in a channel, or in a chat, on the worldwide Teams host.
+pub(crate) fn message_share(
+    conversation: &str,
+    id: &str,
+    tenant: &str,
+    parent: Option<&str>,
+) -> String {
+    message_share_on(TEAMS, conversation, id, tenant, parent)
+}
+
 /// `https://teams.microsoft.com/l/team/<channelId>/conversations?groupId=&tenantId=`
 pub(crate) fn team_share(channel: &str, group: &str, tenant: &str) -> String {
     format!(
@@ -90,9 +113,14 @@ pub(crate) fn team_share(channel: &str, group: &str, tenant: &str) -> String {
     )
 }
 
+/// `https://<teams-host>/l/meetup-join/<thread>/0`
+pub(crate) fn meeting_share_on(teams_host: &str, thread: &str) -> String {
+    format!("{}/l/meetup-join/{}/0", teams_host.trim_end_matches('/'), escaped(thread))
+}
+
 /// `https://teams.microsoft.com/l/meetup-join/<thread>/0`
 pub(crate) fn meeting_share(thread: &str) -> String {
-    format!("{TEAMS}/l/meetup-join/{}/0", escaped(thread))
+    meeting_share_on(TEAMS, thread)
 }
 
 /// The conversation, message and team a Teams link names. `None` when it is not one, or when
@@ -197,6 +225,9 @@ fn after_scheme(url: &str) -> Option<&str> {
     let heads = [
         "https://teams.microsoft.com/l/",
         "http://teams.microsoft.com/l/",
+        "https://gov.teams.microsoft.us/l/",
+        "https://dod.teams.microsoft.us/l/",
+        "https://teams.microsoft.cn/l/",
         "msteams://l/",
         "msteams:/l/",
     ];

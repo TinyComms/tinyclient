@@ -374,10 +374,22 @@ impl Fake {
         let presented = asked.get("refresh_token").cloned().unwrap_or_default();
         let scope = asked.get("scope").cloned().unwrap_or_default();
         let audience = match scope.as_str() {
-            scope if scope.starts_with("https://api.spaces.skype.com/.default ") => "spaces",
-            scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ") => "csa",
-            scope if scope.starts_with("https://presence.teams.microsoft.com/.default ") => "presence",
-            scope if scope.starts_with("https://graph.microsoft.com/.default ") => "graph",
+            scope if scope.starts_with("https://api.spaces.skype.com/.default ")
+                || scope.starts_with("https://api.fl.spaces.skype.us/.default ")
+                || scope.starts_with("https://api.dod.spaces.skype.us/.default ")
+                || scope.starts_with("https://api.spaces.skype.cn/.default ") => "spaces",
+            scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ")
+                || scope.starts_with("https://chatsvcagg.gov.teams.microsoft.us/.default ")
+                || scope.starts_with("https://chatsvcagg.dod.teams.microsoft.us/.default ")
+                || scope.starts_with("https://chatsvcagg.teams.microsoft.cn/.default ") => "csa",
+            scope if scope.starts_with("https://presence.teams.microsoft.com/.default ")
+                || scope.starts_with("https://presence.gov.teams.microsoft.us/.default ")
+                || scope.starts_with("https://presence.dod.teams.microsoft.us/.default ")
+                || scope.starts_with("https://presence.teams.microsoft.cn/.default ") => "presence",
+            scope if scope.starts_with("https://graph.microsoft.com/.default ")
+                || scope.starts_with("https://graph.microsoft.us/.default ")
+                || scope.starts_with("https://dod-graph.microsoft.us/.default ")
+                || scope.starts_with("https://microsoftgraph.chinacloudapi.cn/.default ") => "graph",
             _ => return answer("400 Bad Request", json!({"error": "invalid_scope", "error_description": "AADSTS70011: The provided value for the input parameter 'scope' is not valid."})),
         };
         let shaped = asked.get("grant_type").map(String::as_str) == Some("refresh_token")
@@ -645,13 +657,17 @@ fn chain() -> Key {
 
 impl World {
     fn start() -> World {
+        World::start_with_cloud(None)
+    }
+
+    fn start_with_cloud(cloud: Option<&str>) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let fake = Fake::start();
         // Short path: a unix socket address holds about 100 bytes. On Windows "/tmp" has no drive; chatd takes only absolute paths.
         let dir = std::path::absolute(format!("/tmp/tinyclient-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         // What the sign-in helper prints for someone who is also a guest in a second tenant.
-        let session = json!({
+        let mut session = json!({
             "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "user_agent": agent(),
             "oid": "00000000-0000-4000-8000-0000000000aa", "name": "Me Myself", "upn": "me@contoso.com",
             "tenants": [
@@ -659,6 +675,9 @@ impl World {
                 {"id": GUEST, "name": "Fabrikam", "refresh_token": "rt-guest"},
             ],
         });
+        if let Some(cloud) = cloud {
+            session["cloud"] = json!(cloud);
+        }
         let log = if std::env::var_os("TINYCLIENT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
             .env("TINYCLIENT_DIR", &dir)
@@ -2340,4 +2359,31 @@ fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance(
         .expect("urgent POST");
     assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
 }
+
+#[test]
+fn gcc_high_session_mints_sovereign_audiences_and_uses_sovereign_origin() {
+    let world = World::start_with_cloud(Some("gcc_high"));
+    world.ready();
+
+    let calls = world.fake.calls.lock().unwrap().clone();
+    let token_calls: Vec<&Call> = calls.iter().filter(|c| c.path.ends_with("/oauth2/v2.0/token")).collect();
+    assert!(!token_calls.is_empty());
+    let scopes: Vec<String> = token_calls
+        .iter()
+        .filter_map(|c| form(&c.body).remove("scope"))
+        .collect();
+    assert!(scopes.iter().any(|s| s.starts_with("https://api.fl.spaces.skype.us/.default")));
+    assert!(scopes.iter().any(|s| s.starts_with("https://chatsvcagg.gov.teams.microsoft.us/.default")));
+    assert!(!scopes.iter().any(|s| s.contains(".com")), "GCC High session must never mint worldwide audiences: {scopes:?}");
+
+    let list_call = world.fake.calls("GET", "/api/csa/api/v1/teams/users/me").pop().unwrap();
+    assert_eq!(list_call.headers.get("origin").map(String::as_str), Some("https://gov.teams.microsoft.us"));
+    assert_eq!(list_call.headers.get("referer").map(String::as_str), Some("https://gov.teams.microsoft.us/"));
+
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(GENERAL) }) else {
+        panic!("no info");
+    };
+    assert!(info.link.starts_with("https://gov.teams.microsoft.us/l/channel/"), "{}", info.link);
+}
+
 

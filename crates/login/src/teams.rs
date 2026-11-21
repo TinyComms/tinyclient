@@ -33,20 +33,133 @@ use std::time::{Duration, Instant};
 
 /// Teams' own desktop client, the registration third-party clients sign in as.
 const CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
-const LOGIN: &str = "https://login.microsoftonline.com";
 /// Work and school accounts of any organization.
 const TENANT: &str = "organizations";
-const REDIRECT: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
-const SCOPE: &str = "https://api.spaces.skype.com/.default openid profile offline_access";
-const AUTHZ: &str = "https://teams.microsoft.com/api/authsvc/v1.0/authz";
 /// Guest tenants tried at one sign-in.
 const GUESTS: usize = 8;
 const REFUSED: i32 = 6;
 /// How long Microsoft's page stays up once it has shown a refusal `main.rs` does not know.
 const READ_IT: Duration = Duration::from_secs(20);
 
+/// Which Microsoft 365 cloud a Teams sign-in targets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Cloud {
+    #[default]
+    Worldwide,
+    GccHigh,
+    Dod,
+    China,
+}
+
+impl Cloud {
+    pub fn parse(raw: &str) -> Cloud {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "gcc_high" | "gcchigh" | "gcc-high" | "usgov" | "usgov_high" | "usgovhigh" => Cloud::GccHigh,
+            "dod" | "usgov_dod" | "usgovdod" | "usdod" => Cloud::Dod,
+            "china" | "21vianet" | "cn" | "gallatin" => Cloud::China,
+            _ => Cloud::Worldwide,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cloud::Worldwide => "worldwide",
+            Cloud::GccHigh => "gcc_high",
+            Cloud::Dod => "dod",
+            Cloud::China => "china",
+        }
+    }
+
+    pub fn login(self) -> &'static str {
+        match self {
+            Cloud::Worldwide => "https://login.microsoftonline.com",
+            Cloud::GccHigh | Cloud::Dod => "https://login.microsoftonline.us",
+            Cloud::China => "https://login.chinacloudapi.cn",
+        }
+    }
+
+    pub fn teams(self) -> &'static str {
+        match self {
+            Cloud::Worldwide => "https://teams.microsoft.com",
+            Cloud::GccHigh => "https://gov.teams.microsoft.us",
+            Cloud::Dod => "https://dod.teams.microsoft.us",
+            Cloud::China => "https://teams.microsoft.cn",
+        }
+    }
+
+    pub fn redirect(self) -> &'static str {
+        match self {
+            Cloud::Worldwide => "https://login.microsoftonline.com/common/oauth2/nativeclient",
+            Cloud::GccHigh | Cloud::Dod => "https://login.microsoftonline.us/common/oauth2/nativeclient",
+            Cloud::China => "https://login.chinacloudapi.cn/common/oauth2/nativeclient",
+        }
+    }
+
+    pub fn scope(self) -> &'static str {
+        match self {
+            Cloud::Worldwide => "https://api.spaces.skype.com/.default openid profile offline_access",
+            Cloud::GccHigh => "https://api.fl.spaces.skype.us/.default openid profile offline_access",
+            Cloud::Dod => "https://api.dod.spaces.skype.us/.default openid profile offline_access",
+            Cloud::China => "https://api.spaces.skype.cn/.default openid profile offline_access",
+        }
+    }
+
+    pub fn authz(self) -> String {
+        format!("{}/api/authsvc/v1.0/authz", self.teams())
+    }
+
+    /// Detects the Microsoft 365 cloud from a user-realm (`getuserrealm.srf` / `/common/userrealm/`)
+    /// or OpenID discovery JSON payload, with an optional email/domain hint for DoD disambiguation.
+    pub fn from_discovery(doc: &serde_json::Value, hint: Option<&str>) -> Cloud {
+        let candidates = [
+            doc["cloud_instance_name"].as_str(),
+            doc["CloudInstanceName"].as_str(),
+            doc["tenant_region_scope"].as_str(),
+            doc["issuer"].as_str(),
+            doc["authorization_endpoint"].as_str(),
+            doc["AuthURL"].as_str(),
+            doc["FederationBrandName"].as_str(),
+        ];
+        let hint_lower = hint.unwrap_or("").to_ascii_lowercase();
+        let is_dod_hint = hint_lower.ends_with(".mil") || hint_lower.contains("dod.teams.microsoft.us");
+        for raw in candidates.into_iter().flatten() {
+            let lower = raw.to_ascii_lowercase();
+            if lower.contains("chinacloudapi.cn") || lower.contains("microsoftonline.cn") || lower.contains("teams.microsoft.cn") || lower == "china" {
+                return Cloud::China;
+            }
+            if lower.contains("dod.teams.microsoft.us") || lower.contains("dod-graph.microsoft.us") || lower.contains("usdod") {
+                return Cloud::Dod;
+            }
+            if lower.contains("microsoftonline.us") || lower.contains("gov.teams.microsoft.us") || lower.contains("usgov") {
+                return if is_dod_hint { Cloud::Dod } else { Cloud::GccHigh };
+            }
+        }
+        if is_dod_hint {
+            return Cloud::Dod;
+        }
+        Cloud::Worldwide
+    }
+
+    /// Infers the cloud from an ID token's `iss` claim, falling back to `fallback`.
+    pub fn from_claims(claims: &serde_json::Value, fallback: Cloud) -> Cloud {
+        let detected = Self::from_discovery(claims, claims["preferred_username"].as_str());
+        if detected != Cloud::Worldwide {
+            detected
+        } else {
+            fallback
+        }
+    }
+}
+
+const REDIRECTS: &[&str] = &[
+    "https://login.microsoftonline.com/common/oauth2/nativeclient",
+    "https://login.microsoftonline.us/common/oauth2/nativeclient",
+    "https://login.chinacloudapi.cn/common/oauth2/nativeclient",
+];
+
 /// The secrets one sign-in made up for its one authorize request, and what it has seen.
 pub struct Flow {
+    cloud: Cloud,
     verifier: String,
     state: String,
     /// When Microsoft's own page first showed a refusal `blocked` does not know.
@@ -60,17 +173,30 @@ pub type Ending = Result<serde_json::Value, i32>;
 /// own address or shown an error with its code; otherwise null.
 pub const PROBE: &str = "(()=>{try{const u=location.href;\
     const t=document.body?document.body.innerText.slice(0,4000):'';\
-    if(u.startsWith('https://login.microsoftonline.com/common/oauth2/nativeclient')||t.includes('AADSTS'))\
+    if(u.startsWith('https://login.microsoftonline.com/common/oauth2/nativeclient')\
+    ||u.startsWith('https://login.microsoftonline.us/common/oauth2/nativeclient')\
+    ||u.startsWith('https://login.chinacloudapi.cn/common/oauth2/nativeclient')\
+    ||t.includes('AADSTS'))\
     return JSON.stringify({url:u,text:t});return null}catch(e){return null}})()";
 
 pub const TITLE: &str = "Sign in to Teams";
 
 impl Flow {
-    /// A fresh verifier and state. `Err` with the exit code when the system has no randomness.
+    /// A fresh verifier and state. Uses `TINYCLIENT_TEAMS_CLOUD` when set, otherwise Worldwide.
+    /// `Err` with the exit code when the system has no randomness.
     pub fn new() -> Result<Flow, i32> {
+        let cloud = std::env::var("TINYCLIENT_TEAMS_CLOUD")
+            .ok()
+            .map(|raw| Cloud::parse(&raw))
+            .unwrap_or(Cloud::Worldwide);
+        Self::for_cloud(cloud)
+    }
+
+    /// A fresh sign-in flow targeting a specific Microsoft 365 cloud.
+    pub fn for_cloud(cloud: Cloud) -> Result<Flow, i32> {
         let made = random(48).and_then(|verifier| Ok((verifier, random(16)?)));
         match made {
-            Ok((verifier, state)) => Ok(Flow { verifier, state, shown: Mutex::new(None) }),
+            Ok((verifier, state)) => Ok(Flow { cloud, verifier, state, shown: Mutex::new(None) }),
             Err(err) => {
                 tracing::warn!("tinyclient-login: no randomness to sign in with: {err}");
                 Err(super::LOAD_FAILED)
@@ -80,19 +206,19 @@ impl Flow {
 
     /// Microsoft's authorize page for this sign-in.
     pub fn start(&self) -> String {
-        authorize_url(&challenge(&self.verifier), &self.state)
+        authorize_url_for(self.cloud, &challenge(&self.verifier), &self.state)
     }
 
     /// True for a navigation to the redirect, which the page cannot show and need not load.
     pub fn is_redirect(url: &str) -> bool {
-        url.starts_with(REDIRECT)
+        REDIRECTS.iter().any(|prefix| url.starts_with(prefix))
     }
 
     /// A navigation the page made. `Some` once it is Microsoft's redirect for this sign-in: the
     /// code redeemed for the session (blocking, over the network), or why not.
     pub fn navigated(&self, url: &str) -> Option<Ending> {
-        match landed(url, &self.state)? {
-            Landed::Code(code) => Some(signed_in(&code, &self.verifier)),
+        match landed_for(self.cloud, url, &self.state)? {
+            Landed::Code(code) => Some(signed_in_for(self.cloud, &code, &self.verifier)),
             Landed::Refused { error, description } => Some(Err(refusal(&error, &description))),
         }
     }
@@ -267,12 +393,18 @@ fn unescaped(text: &str) -> String {
 
 // The sign-in.
 
+#[cfg(test)]
 fn authorize_url(challenge: &str, state: &str) -> String {
+    authorize_url_for(Cloud::Worldwide, challenge, state)
+}
+
+fn authorize_url_for(cloud: Cloud, challenge: &str, state: &str) -> String {
     format!(
-        "{LOGIN}/{TENANT}/oauth2/v2.0/authorize?client_id={CLIENT}&response_type=code&redirect_uri={}&scope={}\
+        "{}/{TENANT}/oauth2/v2.0/authorize?client_id={CLIENT}&response_type=code&redirect_uri={}&scope={}\
          &code_challenge={challenge}&code_challenge_method=S256&state={state}&prompt=select_account",
-        escaped(REDIRECT),
-        escaped(SCOPE),
+        cloud.login(),
+        escaped(cloud.redirect()),
+        escaped(cloud.scope()),
     )
 }
 
@@ -287,8 +419,13 @@ enum Landed {
 
 /// Reads the address Microsoft redirected to. `None` for any other address, and for a redirect
 /// that does not answer this run's request (another window's, or a forged one).
+#[cfg(test)]
 fn landed(url: &str, state: &str) -> Option<Landed> {
-    let rest = url.strip_prefix(REDIRECT)?;
+    landed_for(Cloud::Worldwide, url, state)
+}
+
+fn landed_for(cloud: Cloud, url: &str, state: &str) -> Option<Landed> {
+    let rest = url.strip_prefix(cloud.redirect())?;
     let query = rest.strip_prefix('?').or_else(|| rest.strip_prefix('#'))?;
     let query = query.split('#').next().unwrap_or(query);
     let value = |name: &str| {
@@ -390,10 +527,10 @@ fn asked(sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<
     })
 }
 
-fn token(agent: &ureq::Agent, tenant: &str, grant: &[(&str, &str)]) -> Result<Asked, String> {
-    let mut form = vec![("client_id", CLIENT), ("scope", SCOPE)];
+fn token(agent: &ureq::Agent, cloud: Cloud, tenant: &str, grant: &[(&str, &str)]) -> Result<Asked, String> {
+    let mut form = vec![("client_id", CLIENT), ("scope", cloud.scope())];
     form.extend_from_slice(grant);
-    asked(agent.post(format!("{LOGIN}/{}/oauth2/v2.0/token", escaped(tenant))).send_form(form))
+    asked(agent.post(format!("{}/{}/oauth2/v2.0/token", cloud.login(), escaped(tenant))).send_form(form))
 }
 
 /// The claims of an id token. Nothing is verified: it came straight from Microsoft over TLS,
@@ -413,18 +550,27 @@ fn guests(listed: &serde_json::Value, home: &str) -> Vec<(String, String)> {
 }
 
 /// The session as chatd stores it.
-fn session(claims: &serde_json::Value, tenants: &[(String, String, String)]) -> serde_json::Value {
+fn session_for(cloud: Cloud, claims: &serde_json::Value, tenants: &[(String, String, String)]) -> serde_json::Value {
     let tenants: Vec<serde_json::Value> = tenants
         .iter()
         .map(|(id, name, refresh)| serde_json::json!({"id": id, "name": name, "refresh_token": refresh}))
         .collect();
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "client_id": CLIENT,
         "oid": claims["oid"].as_str().unwrap_or(""),
         "name": claims["name"].as_str().unwrap_or(""),
         "upn": claims["preferred_username"].as_str().unwrap_or(""),
         "tenants": tenants,
-    })
+    });
+    if cloud != Cloud::Worldwide {
+        out["cloud"] = serde_json::Value::String(cloud.as_str().to_owned());
+    }
+    out
+}
+
+#[cfg(test)]
+fn session(claims: &serde_json::Value, tenants: &[(String, String, String)]) -> serde_json::Value {
+    session_for(Cloud::Worldwide, claims, tenants)
 }
 
 /// A tenant's name when Teams did not give one: the organization's part of the sign-in name.
@@ -438,12 +584,27 @@ fn fallback_name(upn: &str) -> String {
     letters.next().map(|first| first.to_uppercase().chain(letters).collect()).unwrap_or_default()
 }
 
+/// Queries Microsoft's user-realm discovery endpoint for an email or domain to identify whether
+/// the organization lives in Worldwide, GCC High, DoD, or China (21Vianet).
+pub fn discover_cloud(hint: &str) -> Cloud {
+    let hint = hint.trim();
+    if hint.is_empty() {
+        return Cloud::Worldwide;
+    }
+    let url = format!("https://login.microsoftonline.com/common/userrealm/{}?api-version=2.0", escaped(hint));
+    let agent = agent();
+    match asked(agent.get(&url).call()) {
+        Ok(ans) if ans.status == 200 => Cloud::from_discovery(&ans.body, Some(hint)),
+        _ => Cloud::from_discovery(&serde_json::Value::Null, Some(hint)),
+    }
+}
+
 /// Redeems the code and finds the tenants the sign-in reaches. `Err` with the exit code if Microsoft
 /// refuses the code; anything that fails after that only leaves the guest tenants out.
-fn signed_in(code: &str, verifier: &str) -> Ending {
+fn signed_in_for(cloud: Cloud, code: &str, verifier: &str) -> Ending {
     let agent = agent();
-    let grant = [("grant_type", "authorization_code"), ("code", code), ("redirect_uri", REDIRECT), ("code_verifier", verifier)];
-    let redeemed = match token(&agent, TENANT, &grant) {
+    let grant = [("grant_type", "authorization_code"), ("code", code), ("redirect_uri", cloud.redirect()), ("code_verifier", verifier)];
+    let redeemed = match token(&agent, cloud, TENANT, &grant) {
         Ok(redeemed) => redeemed,
         Err(why) => {
             tracing::warn!("tinyclient-login: Microsoft could not be reached to finish the sign-in: {why}");
@@ -462,11 +623,13 @@ fn signed_in(code: &str, verifier: &str) -> Ending {
     if home.is_empty() {
         return Err(refusal("no_tenant", "Microsoft did not say which organization signed in"));
     }
+    let cloud = Cloud::from_claims(&claims, cloud);
     // Where this user's Teams is, then which tenants they are in.
-    let authz = asked(agent.post(AUTHZ).header("Authorization", &format!("Bearer {access}")).header("Accept", "application/json; ver=1.0").send_empty());
+    let authz = asked(agent.post(cloud.authz()).header("Authorization", &format!("Bearer {access}")).header("Accept", "application/json; ver=1.0").send_empty());
     let middle = authz.ok().and_then(|authz| Some(authz.body["regionGtms"]["middleTier"].as_str()?.trim_end_matches('/').to_owned()));
-    // The token goes to Teams' own front door and nowhere else, whatever the answer names.
-    let middle = middle.filter(|middle| middle.starts_with("https://teams.microsoft.com/"));
+    // The token goes to this cloud's Teams front door and nowhere else, whatever the answer names.
+    let teams_prefix = format!("{}/", cloud.teams());
+    let middle = middle.filter(|middle| middle.starts_with(&teams_prefix));
     let listed = middle.and_then(|middle| {
         let sent = agent.get(format!("{middle}/beta/users/tenants")).header("Authorization", &format!("Bearer {access}")).call();
         asked(sent).ok().filter(|listed| listed.status == 200).map(|listed| listed.body)
@@ -479,13 +642,13 @@ fn signed_in(code: &str, verifier: &str) -> Ending {
     for (id, name) in guests(&listed, &home) {
         // A guest tenant with rules of its own (its own MFA, its own device policy) refuses
         // here; it is left out rather than shown as an account that never connects.
-        let reached = token(&agent, &id, &[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())]);
+        let reached = token(&agent, cloud, &id, &[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())]);
         match reached.ok().filter(|reached| reached.status == 200).map(|reached| text(&reached.body["refresh_token"])) {
             Some(own) if !own.is_empty() => tenants.push((id, name, own)),
             _ => tracing::warn!("tinyclient-login: guest tenant {name:?} did not accept this sign-in and is left out"),
         }
     }
-    Ok(session(&claims, &tenants))
+    Ok(session_for(cloud, &claims, &tenants))
 }
 
 #[cfg(test)]
@@ -610,5 +773,47 @@ mod tests {
         // `main` adds the browser that signed in, as it does for every site.
         assert_eq!(crate::session(made, None, "Safari/26.0")["user_agent"], "Safari/26.0");
         assert_eq!((fallback_name("ana@contoso.com"), fallback_name("ana"), fallback_name("")), ("Contoso".to_owned(), "Teams".to_owned(), "Teams".to_owned()));
+    }
+
+    #[test]
+    fn sovereign_clouds_are_discovered_and_isolated() {
+        assert_eq!(
+            Cloud::from_discovery(&json!({"cloud_instance_name": "microsoftonline.us"}), Some("user@agency.gov")),
+            Cloud::GccHigh
+        );
+        assert_eq!(
+            Cloud::from_discovery(&json!({"cloud_instance_name": "microsoftonline.us"}), Some("user@unit.mil")),
+            Cloud::Dod
+        );
+        assert_eq!(
+            Cloud::from_discovery(&json!({"CloudInstanceName": "partner.microsoftonline.cn", "AuthURL": "https://login.chinacloudapi.cn/"}), None),
+            Cloud::China
+        );
+        assert_eq!(
+            Cloud::from_discovery(&json!({"cloud_instance_name": "microsoftonline.com"}), Some("ana@contoso.com")),
+            Cloud::Worldwide
+        );
+
+        let gcc_url = authorize_url_for(Cloud::GccHigh, "CHALLENGE", "STATE");
+        assert!(gcc_url.starts_with("https://login.microsoftonline.us/organizations/oauth2/v2.0/authorize?"));
+        assert!(gcc_url.contains("https%3A%2F%2Flogin.microsoftonline.us%2Fcommon%2Foauth2%2Fnativeclient"));
+        assert!(gcc_url.contains("https%3A%2F%2Fapi.fl.spaces.skype.us%2F.default"));
+        assert!(!gcc_url.contains("microsoftonline.com") && !gcc_url.contains("skype.com"));
+
+        let cn_url = authorize_url_for(Cloud::China, "CHALLENGE", "STATE");
+        assert!(cn_url.starts_with("https://login.chinacloudapi.cn/organizations/oauth2/v2.0/authorize?"));
+        assert!(cn_url.contains("https%3A%2F%2Fapi.spaces.skype.cn%2F.default"));
+
+        // Redirects match only their own cloud.
+        let gcc_redirect = "https://login.microsoftonline.us/common/oauth2/nativeclient?code=gov-code&state=STATE";
+        assert!(Flow::is_redirect(gcc_redirect));
+        assert_eq!(landed_for(Cloud::GccHigh, gcc_redirect, "STATE"), Some(Landed::Code("gov-code".to_owned())));
+        assert_eq!(landed_for(Cloud::Worldwide, gcc_redirect, "STATE"), None);
+
+        let claims = json!({"tid": "1111-gov", "oid": "2222-gov", "name": "Sam Gov", "preferred_username": "sam@agency.gov"});
+        let tenants = [("1111-gov".to_owned(), "Agency".to_owned(), "rt-gov".to_owned())];
+        let saved = session_for(Cloud::GccHigh, &claims, &tenants);
+        assert_eq!(saved["cloud"], "gcc_high");
+        assert!(session_for(Cloud::Worldwide, &claims, &tenants).get("cloud").is_none());
     }
 }

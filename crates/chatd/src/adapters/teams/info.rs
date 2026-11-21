@@ -151,13 +151,14 @@ impl Teams {
     /// The https link the info pane copies. A channel and a chat use Microsoft's documented
     /// forms. A meeting chat uses the join link. A reply chain links its post.
     fn share_link(&self, thread: &str, row: Option<&protocol::Conversation>, shared: bool) -> String {
+        let host = self.cloud.endpoints().teams;
         if thread.starts_with("19:meeting_") {
-            return links::meeting_share(thread);
+            return links::meeting_share_on(host, thread);
         }
         match row {
             Some(row) if row.kind == ConversationKind::Channel => {
                 let group = row.space.as_ref().and_then(|team| self.ctx.note(&format!("group:{team}"))).unwrap_or_default();
-                let mut link = links::channel_share(thread, &row.title, &group, &self.session.tenant);
+                let mut link = links::channel_share_on(host, thread, &row.title, &group, &self.session.tenant);
                 if shared {
                     link.push_str("&ngc=true&allowXTenantAccess=true");
                 } else if row.private {
@@ -166,10 +167,10 @@ impl Teams {
                 link
             }
             Some(row) if row.kind == ConversationKind::Thread => match (row.parent.as_deref(), row.root.as_deref()) {
-                (Some(parent), Some(root)) => links::message_share(parent, root, &self.session.tenant, None),
+                (Some(parent), Some(root)) => links::message_share_on(host, parent, root, &self.session.tenant, None),
                 _ => String::new(),
             },
-            _ => links::chat_share(thread),
+            _ => links::chat_share_on(host, thread),
         }
     }
 

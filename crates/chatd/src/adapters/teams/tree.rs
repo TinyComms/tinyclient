@@ -3,7 +3,7 @@
 //! state Teams keeps for all of it. Everything comes from one call, and the Activity stream is
 //! read once at connect for the mentions that came while tinyclient was closed.
 
-use super::{chain_id, escaped, id_of, millis, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, TREE_FRESH};
+use super::{chain_id, escaped, id_of, millis, seconds, thread_of, Audience, Auth, Body, Fault, Teams, TREE_FRESH};
 use crate::adapters::Command;
 use crate::store::{ConversationRow, Filing, PreviewLine, SpaceRow};
 use protocol::{CallSupport, ConversationKind, Relation, Special};
@@ -152,7 +152,7 @@ impl Teams {
     /// for its sidebar. Rows go to the store team by team and nothing is kept.
     fn list(&self, first: bool) -> Result<(), Fault> {
         let url = format!("{}/api/csa/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true", self.api);
-        let mut listed = self.call("GET", &url, Auth::Both(AGGREGATOR), Body::None, true)?.body;
+        let mut listed = self.call("GET", &url, Auth::Both(Audience::Aggregator), Body::None, true)?.body;
         let (teams, chats) = (taken(&mut listed, "teams"), taken(&mut listed, "chats"));
         let pinned_order = pinned_chat_order(&listed, &chats);
         drop(listed);

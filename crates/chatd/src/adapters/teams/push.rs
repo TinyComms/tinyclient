@@ -2,14 +2,13 @@
 //! to it (the registration), and from then on each event arrives as a small request that has to
 //! be answered. See the notes at the top of `teams.rs` for where each step was read.
 
-use super::{bare, escaped, now_ms, uuid, Auth, Body, Fault, Teams, SPACES};
-use crate::adapters::net::{address, gunzip, Socket};
+use super::{bare, escaped, now_ms, uuid, Audience, Auth, Body, Fault, Teams};
+use crate::adapters::net::{gunzip, Socket};
 use crate::adapters::{Command, Failure};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-const TROUTER: &str = "https://go.trouter.teams.microsoft.com";
 /// The client version trouter and the registrar are told, as purple-teams sends it now.
 const VERSION: &str = "49/25113001312";
 const TRACE: &str = "2024.23.01.2";
@@ -69,8 +68,7 @@ impl Teams {
             self.ctx.set_note("endpoint", &made);
             made
         });
-        let base = address("TINYCLIENT_TEAMS_TROUTER", TROUTER);
-        let base = base.trim_end_matches('/');
+        let base = self.trouter.as_str();
         let named = self.call("POST", &format!("{base}/v4/a?epid={}", escaped(&endpoint)), Auth::Push, Body::None, true)?.body;
         let socketio = named["socketio"].as_str().unwrap_or(base).trim_end_matches('/').to_owned();
         let surl = named["surl"].as_str().unwrap_or("").to_owned();
@@ -139,7 +137,7 @@ impl Teams {
         match frame.as_bytes().first() {
             // The session is up: say who we are, then have the chat service deliver here.
             Some(b'1') => {
-                let bearer = self.token(SPACES)?;
+                let bearer = self.token(Audience::Spaces)?;
                 let hello = json!({"name": "user.authenticate", "args": [{
                     "headers": {"X-Ms-Test-User": "False", "Authorization": format!("Bearer {bearer}"), "X-MS-Migration": "True"},
                     "connectparams": push.params,
@@ -189,7 +187,7 @@ impl Teams {
             "transports": {"TROUTER": [{"context": "", "path": push.surl, "ttl": REGISTERED}]},
         });
         let url = format!("{}/registrar/prod/V2/registrations", self.api);
-        self.call("POST", &url, Auth::Both(SPACES), Body::Json(&body), true)?;
+        self.call("POST", &url, Auth::Both(Audience::Spaces), Body::Json(&body), true)?;
         push.registered = Some(Instant::now());
         Ok(())
     }
