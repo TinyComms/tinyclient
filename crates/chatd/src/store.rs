@@ -1106,6 +1106,12 @@ impl Store {
         if !column(&store.db, "conversation", "disappearing")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN disappearing INTEGER")?;
         }
+        if !column(&store.db, "conversation", "moderate")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN moderate INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "can_pin")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN can_pin INTEGER NOT NULL DEFAULT 0")?;
+        }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
         }

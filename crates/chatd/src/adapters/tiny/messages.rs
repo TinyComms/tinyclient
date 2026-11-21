@@ -2070,8 +2070,9 @@ fn search(
                 let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
                 return;
             }
-            // Encrypted conversations cannot be searched on the server; answer from local cache only.
-            if sealed_here(ctx, saved, conv_id) == Ok(true) {
+            // Encrypted conversations (or ones whose encryption state cannot be verified locally)
+            // must never send search queries to the server; answer from local cache only.
+            if sealed_here(ctx, saved, conv_id) != Ok(false) {
                 let key = ctx.key(conv_id);
                 let hits = ctx
                     .hub
