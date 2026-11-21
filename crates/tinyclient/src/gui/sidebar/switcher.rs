@@ -83,6 +83,10 @@ pub struct Switcher {
     pub input: Entity<TextInput>,
     conversations: Vec<Rc<Conversation>>,
     people: Vec<Person>,
+    /// People staged for a new group conversation (`Request::StartGroup`).
+    group_people: Vec<Person>,
+    /// Optional title for the staged group conversation.
+    group_title: Entity<TextInput>,
     /// Recent places, newest first, as rows.
     recent: Vec<Rc<Conversation>>,
     pub hits: Vec<Hit>,
@@ -365,10 +369,13 @@ impl Shell {
         let held: Vec<Rc<Conversation>> =
             self.sidebar_state.held().cloned().chain(self.trees.values().flat_map(|tree| tree.conversations.iter().cloned())).collect();
         let recent = self.recent_places(&held);
+        let group_title = cx.new(|cx| TextInput::new("Group name (optional)", cx));
         self.sidebar_state.switcher = Some(Switcher {
             input,
             conversations: held,
             people: Vec::new(),
+            group_people: Vec::new(),
+            group_title,
             recent,
             hits: Vec::new(),
             selected: 0,
@@ -710,6 +717,33 @@ impl Shell {
         let shown_title = if channel { format!("#{title}") } else { title.to_owned() };
         let highlights = if channel { highlights.into_iter().map(|(r, s)| (r.start + 1..r.end + 1, s)).collect() } else { highlights };
         let word = if hit.matched.is_empty() { theme::text() } else { theme::text_soft() };
+        let add_to_group = match &hit.target {
+            Target::Person(person) => {
+                let account = person.key.account();
+                let cap = self.snapshot.as_ref().and_then(|s| s.account(&account)).map(|a| a.can.groups).unwrap_or(0);
+                let switcher = self.sidebar_state.switcher.as_ref();
+                let same_account = switcher
+                    .and_then(|sw| sw.group_people.first())
+                    .is_none_or(|first| first.key.account() == account);
+                let picked = switcher.is_some_and(|sw| sw.group_people.iter().any(|p| p.key == person.key));
+                (cap > 0 && same_account).then(|| {
+                    let who = (**person).clone();
+                    div()
+                        .id(("add-grp", ix))
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(if picked { theme::accent() } else { theme::raised() })
+                        .type_small()
+                        .text_color(if picked { theme::on_accent() } else { theme::text_soft() })
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group_person(who.clone(), cx)))
+                        .child(if picked { "✓ Group" } else { "+ Group" })
+                })
+            }
+            _ => None,
+        };
         div()
             .id(("hit", ix))
             .h(px(ROW))
@@ -752,7 +786,54 @@ impl Shell {
                     .children(network.filter(|_| marks && !hit.context.is_empty()).map(|network| super::chat::mark(network, 12., theme::text_soft())))
                     .child(div().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(hit.context.clone())),
             )
+            .children(add_to_group)
             .children(trailing)
+    }
+
+    fn toggle_group_person(&mut self, person: Person, cx: &mut Context<Self>) {
+        let Some(switcher) = self.sidebar_state.switcher.as_mut() else { return };
+        if let Some(pos) = switcher.group_people.iter().position(|p| p.key == person.key) {
+            switcher.group_people.remove(pos);
+        } else {
+            let cap = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.account(&person.key.account()))
+                .map(|a| a.can.groups)
+                .unwrap_or(0) as usize;
+            let same_account = switcher
+                .group_people
+                .first()
+                .is_none_or(|first| first.key.account() == person.key.account());
+            if same_account && cap > 0 && switcher.group_people.len() < cap {
+                switcher.group_people.push(person);
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_group_from_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(switcher) = self.sidebar_state.switcher.as_ref() else { return };
+        if switcher.group_people.is_empty() {
+            return;
+        }
+        let account = switcher.group_people[0].key.account();
+        let people: Vec<Key> = switcher.group_people.iter().map(|p| p.key.clone()).collect();
+        let title = {
+            let t = switcher.group_title.read(cx).text().trim().to_owned();
+            (!t.is_empty()).then_some(t)
+        };
+        self.close_switcher(window, cx);
+        let req = Request::StartGroup { account, people, title };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Conversation { conversation }) => this.open_now(conversation.key, &conversation.title, cx),
+                Ok(Response::Error { detail, .. }) => this.toast(None, detail, cx),
+                _ => {}
+            });
+        })
+        .detach();
     }
 
     /// The switcher's sheet, over the window, or nothing when it is closed.
@@ -837,6 +918,67 @@ impl Shell {
                         )
                     }),
             )
+            .when(!switcher.group_people.is_empty(), |sheet| {
+                let mut chips = div().flex().flex_wrap().items_center().gap(px(4.));
+                for (i, person) in switcher.group_people.iter().enumerate() {
+                    let who = person.clone();
+                    chips = chips.child(
+                        div()
+                            .id(("grp-chip", i))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::selected())
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .type_small()
+                            .text_color(theme::text())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_group_person(who.clone(), cx)))
+                            .child(person.name.clone())
+                            .child(div().text_color(theme::text_faint()).child("×")),
+                    );
+                }
+                sheet.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .border_b_1()
+                        .border_color(theme::hairline())
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(chips)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(theme::R_CONTROL))
+                                        .bg(theme::canvas())
+                                        .border_1()
+                                        .border_color(theme::hairline())
+                                        .type_small()
+                                        .child(switcher.group_title.clone()),
+                                )
+                                .child(
+                                    crate::gui::components::button(
+                                        "start-group",
+                                        crate::gui::components::ButtonKind::Primary,
+                                        format!("Start group ({})", switcher.group_people.len()),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| this.start_group_from_switcher(window, cx))),
+                                ),
+                        ),
+                )
+            })
             .children(said.map(|words| div().h(px(ROW)).flex_none().px(px(16.)).flex().items_center().type_ui().text_color(theme::text_soft()).child(words)))
             .child(crate::gui::components::scroll_frame("switcher-scroll-frame", switcher.scroll.clone(), rows).fit_content().keyboard(false))
             // The keys it names are a keyboard's; a phone has none.
@@ -1070,7 +1212,7 @@ mod tests {
         let mut desmond = (*row("Desmond", Direct, 10)).clone();
         desmond.peer = Some("desmond".into());
         let rows = vec![row("design", Channel, 10), row("redesign", Channel, 10), Rc::new(desmond), row("general", Channel, 99)];
-        let space = Space { key: key("s"), name: "Design Guild".into(), icon: None, position: 0, attention: 0, unread: false, folder: None, muted: false, hide_muted: false };
+        let space = Space { key: key("s"), name: "Design Guild".into(), icon: None, position: 0, attention: 0, unread: false, folder: None, muted: false, hide_muted: false, can_create_channels: false };
         let people = vec![person("desmond"), person("Desiree")];
         // Long after anything was said, so recency lifts nothing.
         let found = hits("des", &rows, std::slice::from_ref(&space), &people, &[], true, 10_000_000);

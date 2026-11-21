@@ -266,6 +266,7 @@ impl Shell {
             .children(bar)
             .child(div().flex_1().min_h_0().pl(px(left)).pr(px(right)).bg(theme::sidebar()).child(screen))
             .children(self.switcher(window, cx))
+            .children(self.create_channel_modal(cx))
             .children(self.phone_slack_sheet(window, cx))
             .children(self.phone_menu(snapshot, window, cx))
     }

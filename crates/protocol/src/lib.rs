@@ -244,6 +244,9 @@ pub struct Space {
     /// not drawn in its tree.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_muted: bool,
+    /// The user has permission to create channels in this Space (`Request::CreateChannel`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_create_channels: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1252,6 +1255,25 @@ pub enum Request {
     /// conversation keeps the server's text encryption policy and sending text stays guarded.
     StartDirectCall {
         person: Key,
+    },
+    /// Start a group conversation with several people on one account. Answers with the new
+    /// conversation.
+    StartGroup {
+        account: AccountKey,
+        people: Vec<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Create a channel inside a Space where the user has permission to do so. Answers with the
+    /// new conversation.
+    CreateChannel {
+        space: Key,
+        name: String,
+        kind: ConversationKind,
+        #[serde(default, skip_serializing_if = "is_false")]
+        private: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// The thread a channel message starts. Discord only: its thread is a new channel, so this
     /// creates it and answers with that conversation. Slack and Teams name a thread from the

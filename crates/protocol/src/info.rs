@@ -354,6 +354,9 @@ pub struct Capabilities {
     /// This account supports creating and voting in polls, with its limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polls: Option<PollCapabilities>,
+    /// Maximum members in a group chat this account can create (`Request::StartGroup`). 0: unsupported.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub groups: u32,
 }
 
 /// What a network allows when creating a poll.

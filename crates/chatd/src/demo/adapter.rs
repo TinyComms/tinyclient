@@ -742,6 +742,43 @@ impl Demo {
             Command::Previews(ids) => demo.previews(&ids),
             Command::Members { conversation_id, offset, limit, reply } => drop(reply.send(demo.members(&conversation_id, offset, limit))),
             Command::StartDirect { person_id, reply } | Command::StartDirectCall { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
+            Command::StartGroup { people, title, reply } => {
+                let outcome = (|| -> Result<String, Refusal> {
+                    let id = format!("group-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
+                    let names: Vec<String> = people
+                        .iter()
+                        .map(|pid| {
+                            demo.hub
+                                .store()
+                                .person(&demo.key(pid))
+                                .ok()
+                                .flatten()
+                                .map(|p| p.name)
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or_else(|| pid.clone())
+                        })
+                        .collect();
+                    let label = title.unwrap_or_else(|| names.join(", "));
+                    let row = ConversationRow::new(id.clone(), ConversationKind::Group, label);
+                    demo.ctx.conversation(&row).map_err(|err| Refusal::Refused(err.to_string()))?;
+                    Ok(id)
+                })();
+                let _ = reply.send(outcome);
+            }
+            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+                let outcome = (|| -> Result<String, Refusal> {
+                    let id = format!("chan-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
+                    let row = ConversationRow {
+                        space: Some(space_id),
+                        group,
+                        private,
+                        ..ConversationRow::new(id.clone(), kind, name)
+                    };
+                    demo.ctx.conversation(&row).map_err(|err| Refusal::Refused(err.to_string()))?;
+                    Ok(id)
+                })();
+                let _ = reply.send(outcome);
+            }
             Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new(), sealed: None }))),

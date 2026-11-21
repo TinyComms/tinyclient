@@ -815,9 +815,21 @@ impl Shell {
             // link to open it in the network's app, so those items are left out.
             Menu::Space(space) => {
                 let pinned = self.sidebar_state.pins.contains(space);
+                let can_create = self.spaces.iter().any(|s| &s.key == space && s.can_create_channels);
                 let key = space.clone();
                 let shown = space.clone();
                 let read = space.clone();
+                if can_create {
+                    let create_space = space.clone();
+                    items.push(
+                        menu_item("create-channel", Some("icons/plus.svg"), "Create channel…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_create_channel(create_space.clone(), None, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 items.push(
                     menu_item("details", Some("icons/info.svg"), "Details", None)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1449,6 +1461,7 @@ impl Render for Shell {
                 )
             })
             .children(self.switcher(window, cx))
+            .children(self.create_channel_modal(cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))

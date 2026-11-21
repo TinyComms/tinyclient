@@ -2535,6 +2535,64 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::StartGroup { account, people, title } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let cap = self.hub.capabilities(&account).groups;
+                if cap == 0 {
+                    return error(ErrorCode::Unsupported, "Creating group chats is not supported on this account.");
+                }
+                let mut ids: Vec<String> = Vec::new();
+                for p in people {
+                    if p.account() != account {
+                        return error(ErrorCode::Refused, "Everyone in a group must be on the same account.");
+                    }
+                    if !ids.contains(&p.id) {
+                        ids.push(p.id);
+                    }
+                }
+                if ids.is_empty() {
+                    return error(ErrorCode::Refused, "Pick at least one person for the group.");
+                }
+                if ids.len() > cap as usize {
+                    return error(ErrorCode::Refused, format!("This account allows at most {cap} people in a group."));
+                }
+                let title = title.map(|mut t| {
+                    protocol::clip(&mut t, 100);
+                    t.trim().to_owned()
+                }).filter(|t| !t.is_empty());
+                let id = match self.ask(&account, |reply| Command::StartGroup { people: ids, title, reply }) {
+                    Ok(id) => id,
+                    Err(refused) => return *refused,
+                };
+                match self.hub.store().conversation(&Key::new(&account, id)) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                    Ok(None) => error(ErrorCode::Internal, "group created, but not recorded"),
+                    Err(err) => internal(err),
+                }
+            }
+            Request::CreateChannel { space, name, kind, private, group } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let mut name = name.trim().to_owned();
+                protocol::clip(&mut name, 100);
+                if name.is_empty() {
+                    return error(ErrorCode::Refused, "Channel name cannot be empty.");
+                }
+                let space_id = space.id.clone();
+                let id = match self.ask(&account, |reply| Command::CreateChannel { space_id, name, kind, private, group, reply }) {
+                    Ok(id) => id,
+                    Err(refused) => return *refused,
+                };
+                match self.hub.store().conversation(&Key::new(&account, id)) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                    Ok(None) => error(ErrorCode::Internal, "channel created, but not recorded"),
+                    Err(err) => internal(err),
+                }
+            }
             Request::StartThread { conversation, message } => self.start_thread(conversation, message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),

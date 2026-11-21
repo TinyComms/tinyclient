@@ -81,6 +81,7 @@ const TABLES: &str = "
         position INTEGER NOT NULL DEFAULT 0,
         muted    INTEGER NOT NULL DEFAULT 0,
         hide_muted INTEGER NOT NULL DEFAULT 0,
+        can_create_channels INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     -- A folder: of chats (Telegram, membership on the conversation) or of Spaces (Discord,
@@ -1057,6 +1058,9 @@ impl Store {
         store.migrate_reminders()?;
         // The revision table is new and must not wipe a cache that is already at this schema.
         store.ensure_revisions()?;
+        if !column(&store.db, "space", "can_create_channels")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(store)
     }
 
@@ -1267,7 +1271,7 @@ impl Store {
                     (SELECT f.id FROM folder f
                       WHERE f.network = s.network AND f.account = s.account
                         AND instr(f.spaces, ',' || s.id || ',') > 0 LIMIT 1),
-                    s.muted, s.hide_muted
+                    s.muted, s.hide_muted, s.can_create_channels
              FROM space s
              LEFT JOIN media m ON m.network = s.network AND m.account = s.account AND m.id = s.icon
              WHERE ?1 IS NULL OR s.network = ?1
@@ -1284,6 +1288,7 @@ impl Store {
                 folder: row.get(14)?,
                 muted: row.get(15)?,
                 hide_muted: row.get(16)?,
+                can_create_channels: row.get(17)?,
             })
         })?;
         rows.collect()
@@ -1925,6 +1930,15 @@ impl Store {
             "UPDATE space SET muted = ?4, hide_muted = ?5
               WHERE network = ?1 AND account = ?2 AND id = ?3 AND (muted != ?4 OR hide_muted != ?5)",
             params![word(&space.network), space.account, space.id, muted, hide_muted],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_space_can_create_channels(&mut self, space: &Key, can: bool) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE space SET can_create_channels = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND can_create_channels != ?4",
+            params![word(&space.network), space.account, space.id, can],
         )?;
         Ok(changed == 1)
     }

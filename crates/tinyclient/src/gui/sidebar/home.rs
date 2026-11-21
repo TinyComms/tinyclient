@@ -381,7 +381,7 @@ mod tests {
     }
 
     fn space(id: &str, folder: Option<&str>, attention: u32, unread: bool) -> Space {
-        Space { key: key(id), name: id.into(), icon: None, position: 0, attention, unread, folder: folder.map(Into::into), muted: false, hide_muted: false }
+        Space { key: key(id), name: id.into(), icon: None, position: 0, attention, unread, folder: folder.map(Into::into), muted: false, hide_muted: false, can_create_channels: false }
     }
 
     fn folder(id: &str, spaces: &[&str]) -> Folder {
