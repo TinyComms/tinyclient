@@ -3124,6 +3124,20 @@ impl Store {
     /// True if it was there. A message with a thread hanging off it stays as a tombstone, and
     /// every stored reply to the message says its original is gone. The preview is left to the
     /// next message.
+    /// Updates a stored message's `pinned` flag in place. Returns true if the message existed
+    /// and its flag changed.
+    pub fn set_pinned(&mut self, conversation: &Key, id: &str, pinned: bool) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        if message.pinned == pinned {
+            return Ok(false);
+        }
+        message.pinned = pinned;
+        self.ingest(conversation, &message, false)?;
+        Ok(true)
+    }
+
     pub fn delete_message(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
         let Some(mut message) = self.message(conversation, id)? else {
             return Ok(false);

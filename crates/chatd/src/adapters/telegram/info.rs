@@ -382,6 +382,28 @@ pub(super) fn pinned(account: &Account, conversation: &str) -> Result<Vec<Messag
     Ok(search(account, conversation, "", tl::enums::MessagesFilter::InputMessagesFilterPinned, 0, protocol::PINNED_LIMIT as i32)?.0)
 }
 
+pub(super) fn pin(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    pinned: bool,
+    notify: bool,
+    me_only: bool,
+) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let id = message_id.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    account.ask(&tl::functions::messages::UpdatePinnedMessage {
+        silent: !notify,
+        unpin: !pinned,
+        pm_oneside: me_only,
+        peer,
+        id,
+    })?;
+    let _ = account.ctx.pinned(conversation, message_id, pinned);
+    Ok(())
+}
+
 /// What was shared, from Telegram's own search, with Telegram's count of it as the total.
 pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, before: Option<&str>, limit: u32) -> Result<SharedPage, Fault> {
     let filter = match kind {

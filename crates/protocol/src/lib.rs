@@ -1322,6 +1322,17 @@ pub enum Request {
     Pinned {
         conversation: Key,
     },
+    /// Pins or unpins a message on the network, waiting for the network's answer.
+    /// `notify` and `me_only` are used on networks that support them (Telegram).
+    Pin {
+        conversation: Key,
+        message_id: String,
+        pinned: bool,
+        #[serde(default)]
+        notify: bool,
+        #[serde(default)]
+        me_only: bool,
+    },
     /// The pictures, files or links said in a conversation, newest first, from what is cached:
     /// what the info pane lists under a person or a channel. `before` continues below a
     /// message already listed. With `search`, the network is asked instead, because the user

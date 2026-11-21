@@ -2573,6 +2573,16 @@ impl Chat {
                 self.act(&conversation, |conversation_id, reply| Command::AnswerMessageRequest { conversation_id, accept, reply })
             }
             Request::Pinned { conversation } => self.pinned(conversation),
+            Request::Pin { conversation, message_id, pinned, notify, me_only } => {
+                self.act(&conversation, |conversation_id, reply| Command::Pin {
+                    conversation_id,
+                    message_id,
+                    pinned,
+                    notify,
+                    me_only,
+                    reply,
+                })
+            }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
             Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),

@@ -686,6 +686,10 @@ impl Demo {
                 let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
             }
             Command::Pinned { conversation_id, reply } => drop(reply.send(Ok(demo.pinned(&conversation_id)))),
+            Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+                let done = demo.ctx.pinned(&conversation_id, &message_id, pinned);
+                let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
+            }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));
             }

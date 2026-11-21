@@ -245,6 +245,8 @@ enum MenuAct {
     Thread,
     React,
     Edit,
+    /// Pin or unpin a message when `can.pin` is true.
+    Pin,
     Link,
     Open,
     /// A file attachment that is already on disk.
@@ -290,6 +292,9 @@ fn menu_acts(
     }
     if can.edit {
         acts.push(MenuAct::Edit);
+    }
+    if can.pin {
+        acts.push(MenuAct::Pin);
     }
     if has_text {
         acts.push(MenuAct::Copy);
@@ -592,7 +597,7 @@ impl Pane {
 
     // Requests.
 
-    fn say(&self, words: String, cx: &mut Context<Self>) {
+    pub(super) fn say(&self, words: String, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx));
     }
 
@@ -728,6 +733,41 @@ impl Pane {
         cx.notify();
     }
 
+    /// Pins or unpins a message on the network. Never mutates `message.pinned` optimistically:
+    /// chatd emits `Change::Messages` and the pins pane reloads once the network confirms.
+    fn toggle_pin(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let pinned = !message.pinned;
+        let request = Request::Pin {
+            conversation: conversation.clone(),
+            message_id: message.id.clone(),
+            pinned,
+            notify: true,
+            me_only: false,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(Response::Ok) => {
+                        let _ = this.shell.update(cx, |shell, cx| shell.refresh_pins(&conversation, cx));
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.say(detail, cx);
+                    }
+                    Err(err) => {
+                        let why = crate::client::trouble_words(if pinned { "pin" } else { "unpin" }, &err);
+                        this.say(why, cx);
+                    }
+                    _ => {}
+                }
+            });
+        })
+        .detach();
+    }
+
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
@@ -815,6 +855,7 @@ impl Pane {
             MenuAct::Thread => cx.emit(PaneEvent::OpenThread(message)),
             MenuAct::React => self.open_picker(&message.id, at, window, cx),
             MenuAct::Edit => self.edit(&message, window, cx),
+            MenuAct::Pin => self.toggle_pin(&message, cx),
             MenuAct::Link => {
                 if let Some(link) = link {
                     cx.write_to_clipboard(ClipboardItem::new_string(link));
@@ -980,6 +1021,14 @@ impl Pane {
                             this.close_menu(cx);
                             this.save_attachment_as(path.clone(), name.clone(), cx);
                         }))
+                        .into_any_element(),
+                );
+            }
+            if can.pin {
+                let label = if message.pinned { "Unpin" } else { "Pin" };
+                rows.push(
+                    row("sheet-pin", "icons/pin.svg", label.into(), false)
+                        .on_click(then(|this, message, _, cx| this.toggle_pin(message, cx)))
                         .into_any_element(),
                 );
             }
@@ -1150,6 +1199,14 @@ impl Pane {
             if can.edit {
                 items = items.child(menu_item("edit", Some("icons/pencil.svg"), "Edit", None).when(lit(MenuAct::Edit), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Edit)));
+            }
+            if can.pin {
+                let label = if message.pinned { "Unpin" } else { "Pin" };
+                items = items.child(
+                    menu_item("pin", Some("icons/pin.svg"), label, None)
+                        .when(lit(MenuAct::Pin), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Pin)),
+                );
             }
             let selected = self.selection.as_ref().is_some_and(|selection| {
                 selection.message == message.id && selection.head.is_some()

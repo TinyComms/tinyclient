@@ -1090,6 +1090,12 @@ impl Discord {
         self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
+    fn pin(&self, channel: &str, message: &str, pinned: bool) -> Result<(), Refusal> {
+        let method = if pinned { "PUT" } else { "DELETE" };
+        self.call(method, &format!("/channels/{channel}/pins/{message}"), None).map_err(refusal)?;
+        self.ctx.pinned(channel, message, pinned).map_err(|err| Refusal::Refused(err.to_string()))
+    }
+
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
     /// managing friends is what Discord's anti-abuse system watches most closely.
     ///
@@ -1630,6 +1636,9 @@ impl Discord {
                 answer(reply, self.answer_message_request(&conversation_id, accept))
             }
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
+            Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+                answer(reply, self.pin(&conversation_id, &message_id, pinned))
+            }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
             }

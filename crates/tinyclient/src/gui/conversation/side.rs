@@ -1158,6 +1158,43 @@ impl Shell {
     }
 
     /// A pin was clicked: the conversation shows it, as a reply quote would.
+    /// Reloads the pins pane if it is currently showing `conversation`.
+    pub(in crate::gui) fn refresh_pins(&mut self, conversation: &Key, cx: &mut Context<Self>) {
+        if self.conversation_state.side.pins.as_ref().is_some_and(|pins| pins.conversation == *conversation) {
+            self.open_pins(cx);
+        }
+    }
+
+    /// Unpins a message from the pins pane, reloading the list once the network confirms.
+    fn unpin_message(&mut self, conversation: Key, message_id: String, cx: &mut Context<Self>) {
+        let request = Request::Pin {
+            conversation: conversation.clone(),
+            message_id,
+            pinned: false,
+            notify: false,
+            me_only: false,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => this.refresh_pins(&conversation, cx),
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(pane) = this.conversation_state.pane.get().cloned() {
+                        pane.update(cx, |pane, cx| pane.say(detail, cx));
+                    }
+                }
+                Err(err) => {
+                    let why = crate::client::trouble_words("unpin", &err);
+                    if let Some(pane) = this.conversation_state.pane.get().cloned() {
+                        pane.update(cx, |pane, cx| pane.say(why, cx));
+                    }
+                }
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
     fn jump_to_pin(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(pane) = self.conversation_state.pane.get().cloned() {
             let id = id.to_owned();
@@ -1425,9 +1462,16 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
         }
         Some(Ok(messages)) => messages,
     };
+    let can_unpin = shell.snapshot.as_ref().is_some_and(|snapshot| {
+        let caps = snapshot.account(&conversation.account()).map(|a| a.can).unwrap_or_default();
+        let rights = snapshot.open.as_ref().filter(|o| o.key == *conversation).map(|o| o.rights).unwrap_or_default();
+        caps.pins && rights.pin
+    });
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
     let rows = messages.iter().map(|message| {
         let id = message.id.clone();
+        let unpin_id = message.id.clone();
+        let unpin_conv = conversation.clone();
         let said = if message.text.is_empty() { "Attachment".to_owned() } else { message.text.clone() };
         div()
             .id(gpui::ElementId::Name(format!("pin-{}", message.id).into()))
@@ -1444,7 +1488,25 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
                     .items_baseline()
                     .gap(px(8.))
                     .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).child(message.sender.name.clone()))
-                    .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(time::stamp(now, message.sent))),
+                    .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(time::stamp(now, message.sent)))
+                    .children(can_unpin.then(|| {
+                        div()
+                            .id(gpui::ElementId::Name(format!("unpin-{}", message.id).into()))
+                            .ml_auto()
+                            .flex_none()
+                            .px(px(6.))
+                            .py(px(1.))
+                            .rounded(px(theme::R_CONTROL))
+                            .type_micro()
+                            .text_color(theme::text_soft())
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::pressed()).text_color(theme::text()))
+                            .child("Unpin")
+                            .on_click(cx.listener(move |shell, _, _, cx| {
+                                cx.stop_propagation();
+                                shell.unpin_message(unpin_conv.clone(), unpin_id.clone(), cx);
+                            }))
+                    })),
             )
             .child(div().type_ui().text_color(theme::text_soft()).line_clamp(3).child(said))
             .on_click(cx.listener(move |shell, _, _, cx| shell.jump_to_pin(&id, cx)))

@@ -1362,6 +1362,9 @@ impl Slack {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
+            Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+                answer(reply, self.pin(&conversation_id, &message_id, pinned))
+            }
             Command::Search { query, scope, at, reply } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
@@ -1676,6 +1679,13 @@ impl Slack {
         self.api("chat.delete", &[("channel", channel), ("ts", ts)])?;
         let gone = self.ctx.deleted(channel, ts).and_then(|()| self.ctx.deleted(&thread_id(channel, root), ts));
         gone.map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    fn pin(&self, conversation: &str, ts: &str, pinned: bool) -> Result<(), Fault> {
+        let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
+        let method = if pinned { "pins.add" } else { "pins.remove" };
+        self.api(method, &[("channel", channel), ("timestamp", ts)])?;
+        self.ctx.pinned(channel, ts, pinned).map_err(|err| Fault::Net(err.to_string()))
     }
 
     /// Our own presence, and the status text when one is given (empty clears it).
