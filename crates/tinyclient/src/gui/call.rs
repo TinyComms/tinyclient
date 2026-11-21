@@ -103,6 +103,8 @@ fn now() -> i64 {
 pub(super) enum Menu {
     Devices,
     People,
+    /// Add friends to a Discord 1:1 or group DM call.
+    AddPeople,
     /// How the call is protected (`security`).
     Security,
     /// Per-person volume and local mute for someone in any call.
@@ -1258,6 +1260,9 @@ impl Shell {
             );
         }
         let can_ring_group = call.conversation.network == Network::Discord && subject.kind == ConversationKind::Group;
+        let can_add_people = call.conversation.network == Network::Discord
+            && subject.kind.is_direct()
+            && (call.participants.len() + 1) < 10;
         div()
             .flex()
             .flex_col()
@@ -1269,30 +1274,61 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(4.))
                     .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text_faint())
                     .child(format!("{} · {joined_count} {noun}", subject.title.to_uppercase()))
-                    .when(can_ring_group, |header| {
+                    .when(can_ring_group || can_add_people, |header| {
                         header.child(
                             div()
-                                .id("call-ring-group")
-                                .px(px(6.))
-                                .h(px(20.))
-                                .rounded(px(6.))
-                                .bg(theme::hover())
-                                .hover(|s| s.bg(theme::selected()).text_color(theme::text()))
                                 .flex()
                                 .items_center()
-                                .cursor_pointer()
-                                .type_micro()
-                                .text_color(theme::text_soft())
-                                .tooltip(tip("Ring everyone in the group", None))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.call_ask(Request::CallRing { people: None }, cx);
-                                }))
-                                .child("Ring"),
+                                .gap(px(4.))
+                                .when(can_add_people, |actions| {
+                                    actions.child(
+                                        div()
+                                            .id("call-add-people-open")
+                                            .px(px(6.))
+                                            .h(px(20.))
+                                            .rounded(px(6.))
+                                            .bg(theme::hover())
+                                            .hover(|s| s.bg(theme::selected()).text_color(theme::text()))
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .type_micro()
+                                            .text_color(theme::text_soft())
+                                            .tooltip(tip("Add friends to call", None))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.call_menu_set(Some(Menu::AddPeople), cx);
+                                            }))
+                                            .child("Add people"),
+                                    )
+                                })
+                                .when(can_ring_group, |actions| {
+                                    actions.child(
+                                        div()
+                                            .id("call-ring-group")
+                                            .px(px(6.))
+                                            .h(px(20.))
+                                            .rounded(px(6.))
+                                            .bg(theme::hover())
+                                            .hover(|s| s.bg(theme::selected()).text_color(theme::text()))
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .type_micro()
+                                            .text_color(theme::text_soft())
+                                            .tooltip(tip("Ring everyone in the group", None))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.call_ask(Request::CallRing { people: None }, cx);
+                                            }))
+                                            .child("Ring"),
+                                    )
+                                }),
                         )
                     }),
             )
@@ -1603,6 +1639,103 @@ impl Shell {
     /// A join was asked for here: a new room that follows is not a moderator's move.
     pub(in crate::gui) fn call_asked(&mut self) {
         self.call_state.asked = Some(Instant::now());
+    }
+
+    /// Friend picker popover for adding friends to a Discord 1:1 or group DM call.
+    /// Filtered to `Relation::Friend` on the call's account, excluding people already in the call,
+    /// and respecting Discord's 10-person group DM ceiling.
+    pub(super) fn call_add_people_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        const LIMIT: usize = 10;
+        let account = call.conversation.account();
+        let me = self
+            .snapshot
+            .as_ref()
+            .and_then(|snap| snap.accounts.iter().find(|a| a.key == account))
+            .map(|a| a.me.clone())
+            .unwrap_or_default();
+        let in_call_ids: std::collections::HashSet<&str> = call.participants.iter().map(|p| p.id.as_str()).collect();
+        let seats_left = LIMIT.saturating_sub(call.participants.len() + 1);
+        let candidates: Vec<protocol::Person> = self
+            .people_state
+            .hub()
+            .friends(&account)
+            .into_iter()
+            .filter(|p| p.key.id != me && !in_call_ids.contains(p.key.id.as_str()))
+            .collect();
+        let rows: Vec<AnyElement> = if seats_left == 0 {
+            vec![div()
+                .px(px(12.))
+                .py(px(8.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("This group call is full (10 people).")
+                .into_any_element()]
+        } else if candidates.is_empty() {
+            vec![div()
+                .px(px(12.))
+                .py(px(8.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("No other friends available to add.")
+                .into_any_element()]
+        } else {
+            candidates
+                .into_iter()
+                .map(|friend| {
+                    let person_id = friend.key.id.clone();
+                    let face = self.person_picture(&friend.key, cx);
+                    let avatar = super::components::Avatar::new(&friend.key, &friend.name, 22.).image_at(face).build();
+                    div()
+                        .id(SharedString::from(format!("call-add-friend-{person_id}")))
+                        .w_full()
+                        .h(px(32.))
+                        .flex_none()
+                        .px(px(10.))
+                        .rounded(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .text_size(px(13.))
+                        .text_color(theme::text())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_menu_close(cx);
+                            this.call_ask(Request::CallAddPeople { people: vec![person_id.clone()] }, cx);
+                        }))
+                        .child(avatar)
+                        .child(div().flex_1().min_w_0().truncate().child(friend.name))
+                        .into_any_element()
+                })
+                .collect()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(26.))
+                    .flex_none()
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_faint())
+                    .child("ADD FRIENDS TO CALL")
+                    .child(format!("{seats_left} left")),
+            )
+            .child(
+                div()
+                    .id("call-add-people-rows")
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
     }
 
     /// The name of whoever was in this call with me and is not any more.

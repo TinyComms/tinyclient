@@ -27,6 +27,9 @@ const RING_DECLINE_WINDOW: Duration = Duration::from_secs(50);
 /// unconfirmed against a real account.
 const FLAGS: u8 = 2;
 
+/// A Discord group DM holds at most ten people, including us.
+const GROUP_DM_LIMIT: usize = 10;
+
 /// The words of each way a call ends here. No status code or Discord error text is among them.
 const NO_ANSWER: &str = "Nobody picked up.";
 /// The dock tells a decline from no answer by this sentence.
@@ -897,6 +900,168 @@ impl Discord {
         self.call("POST", &format!("/channels/{conversation_id}/call/stop-ringing"), Some(body))
             .map(drop)
             .map_err(super::refusal)
+    }
+
+    /// Adds friends to an active DM or group DM call.
+    ///
+    /// - In a group DM: `PUT /channels/{group}/recipients/{user}`, then rings just them.
+    /// - In a 1:1 DM: creates a group DM (`POST /users/@me/channels` with `[peer, ...added]`),
+    ///   joins its voice state and rings everyone, moving the call there; if ringing fails after
+    ///   the group was created, restores the 1:1 voice state and leaves the call where it was.
+    pub(super) fn call_add_people(&self, conversation_id: &str, people: Vec<String>) -> Result<String, super::Refusal> {
+        let Ok(Some(conversation)) = self.ctx.known(conversation_id) else {
+            return Err(super::Refusal::Refused("This conversation is gone.".to_owned()));
+        };
+        if !conversation.kind.is_direct() {
+            return Err(super::Refusal::Unsupported);
+        }
+        let (me, added, peer_for_direct, current_group_count, audio_state) = {
+            let state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_ref().filter(|call| call.conversation == conversation_id) else {
+                return Err(super::Refusal::Refused("You are not in this call.".to_owned()));
+            };
+            if call.guild.is_some() {
+                return Err(super::Refusal::Unsupported);
+            }
+            let mut added: Vec<String> = Vec::new();
+            for id in people {
+                if id.is_empty() || id == state.me || added.contains(&id) {
+                    continue;
+                }
+                if state.relations.get(&id) != Some(&Relation::Friend) {
+                    return Err(super::Refusal::Refused("Only friends can be added to a Discord call.".to_owned()));
+                }
+                added.push(id);
+            }
+            if added.is_empty() {
+                return Err(super::Refusal::Refused("Choose at least one friend to add.".to_owned()));
+            }
+            let peer = state
+                .directs
+                .iter()
+                .find(|(_, ch)| ch.as_str() == conversation_id)
+                .map(|(user, _)| user.clone())
+                .or_else(|| {
+                    state
+                        .voice
+                        .states
+                        .iter()
+                        .find(|(id, h)| h.channel == conversation_id && **id != state.me)
+                        .map(|(id, _)| id.clone())
+                });
+            let group_members = state
+                .groups
+                .get(conversation_id)
+                .map(|g| g.recipients.len() + 1)
+                .unwrap_or(2);
+            (state.me.clone(), added, peer, group_members, (call.muted, call.deafened, call.video))
+        };
+
+        if conversation.kind == ConversationKind::Group {
+            let existing: HashSet<String> = {
+                let state = self.state.lock().unwrap();
+                state
+                    .groups
+                    .get(conversation_id)
+                    .map(|g| g.recipients.iter().cloned().collect())
+                    .unwrap_or_default()
+            };
+            let to_add: Vec<String> = added.into_iter().filter(|id| !existing.contains(id)).collect();
+            if to_add.is_empty() {
+                return Ok(conversation_id.to_owned());
+            }
+            if current_group_count + to_add.len() > GROUP_DM_LIMIT {
+                return Err(super::Refusal::Refused(format!(
+                    "A Discord group call can hold at most {GROUP_DM_LIMIT} people."
+                )));
+            }
+            for user in &to_add {
+                self.call("PUT", &format!("/channels/{conversation_id}/recipients/{user}"), None)
+                    .map_err(super::refusal)?;
+                if let Some(group) = self.state.lock().unwrap().groups.get_mut(conversation_id) {
+                    if !group.recipients.contains(user) {
+                        group.recipients.push(user.clone());
+                    }
+                }
+                self.call("POST", &format!("/channels/{conversation_id}/call/ring"), Some(json!({ "recipients": [user] })))
+                    .map_err(|refused| super::Refusal::Refused(ring_refused(&refused)))?;
+            }
+            return Ok(conversation_id.to_owned());
+        }
+
+        // 1:1 DM -> escalate to a new group DM, join its call, ring everyone, and move the call.
+        let mut recipients: Vec<String> = Vec::new();
+        if let Some(peer) = peer_for_direct {
+            if peer != me {
+                recipients.push(peer);
+            }
+        }
+        for id in added {
+            if !recipients.contains(&id) {
+                recipients.push(id);
+            }
+        }
+        if recipients.len() + 1 > GROUP_DM_LIMIT {
+            return Err(super::Refusal::Refused(format!(
+                "A Discord group call can hold at most {GROUP_DM_LIMIT} people."
+            )));
+        }
+
+        // Step 1: create the group DM. If this fails (including Captcha -> Refused::Challenge),
+        // the 1:1 call is untouched.
+        let created = self
+            .call("POST", "/users/@me/channels", Some(json!({ "recipients": recipients })))
+            .map_err(super::refusal)?;
+        let channel: model::Channel = serde_json::from_str(&created)
+            .map_err(|err| super::Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let new_id = channel.id.clone();
+        self.direct(&channel, &HashMap::new())
+            .map_err(|err| super::Refusal::Refused(err.to_string()))?;
+
+        // Step 2: move our voice state to the new group channel.
+        let (muted, deafened, video) = audio_state;
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_mut().filter(|call| call.conversation == conversation_id) else {
+                return Err(super::Refusal::Refused("The call ended while adding people.".to_owned()));
+            };
+            call.conversation = new_id.clone();
+            call.session = None;
+            call.server = None;
+            call.reported = false;
+            call.again = true;
+            call.ring = true;
+            call.saw_ringing = false;
+            call.ring_started = Some(Instant::now());
+            call.stopped_by_us = false;
+            call.answered = false;
+        }
+        self.tell(4, voice_state(None, Some(&new_id), muted, deafened, video));
+
+        // Step 3: ring everyone in the new group DM. If ringing fails, undo Step 2 and return
+        // our voice state to the original 1:1 call.
+        if let Err(refused) = self.call("POST", &format!("/channels/{new_id}/call/ring"), Some(json!({ "recipients": null }))) {
+            self.log("ring", &refused);
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(call) = state.voice.call.as_mut().filter(|call| call.conversation == new_id) {
+                    call.conversation = conversation_id.to_owned();
+                    call.session = None;
+                    call.server = None;
+                    call.reported = false;
+                    call.again = true;
+                    call.ring = false;
+                }
+            }
+            self.tell(4, voice_state(None, Some(conversation_id), muted, deafened, video));
+            return Err(super::Refusal::Refused(ring_refused(&refused)));
+        }
+
+        // Tell the shell the call moved to the new group DM.
+        self.ctx.tiny_moved(conversation_id, &new_id);
+        self.roster();
+        self.occupancy(BTreeSet::from([conversation_id.to_owned(), new_id.clone()]));
+        Ok(new_id)
     }
 
     /// A direct call began or its ringing changed.

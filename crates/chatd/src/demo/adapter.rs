@@ -999,6 +999,9 @@ impl Demo {
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
+            Command::CallAddPeople { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)));
+            }
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

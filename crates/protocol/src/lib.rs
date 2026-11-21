@@ -1880,6 +1880,12 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         people: Option<Vec<String>>,
     },
+    /// Adds friends to the current direct or group call. In a 1:1 DM call, creates a group DM
+    /// with the peer and added friends and moves the call there; in a group DM call, adds them
+    /// and rings them.
+    CallAddPeople {
+        people: Vec<String>,
+    },
     /// Where the official app takes this conversation's call.
     Handoff {
         conversation: Key,

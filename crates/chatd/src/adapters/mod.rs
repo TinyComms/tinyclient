@@ -590,6 +590,8 @@ pub enum Command {
     CallRing { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Stops ringing everyone (`None`) or specific people (`Some`) in the current direct/group call.
     CallStopRinging { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
+    /// Adds friends to the current direct or group call, returning the resulting conversation id.
+    CallAddPeople { conversation_id: String, people: Vec<String>, reply: Reply<String> },
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),
@@ -615,7 +617,8 @@ impl Command {
             | Command::CreateChannel { reply, .. }
             | Command::CreateGroup { reply, .. }
             | Command::StartThread { reply, .. }
-            | Command::Handoff { reply, .. } => {
+            | Command::Handoff { reply, .. }
+            | Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {

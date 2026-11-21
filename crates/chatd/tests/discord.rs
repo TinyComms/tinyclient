@@ -4598,3 +4598,122 @@ fn discord_call_ring_stop_ringing_and_ringing_roster() {
         rung.iter().map(|r| &r.body).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn discord_call_add_people_group_dm_and_1to1_escalation_with_rollback() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+
+    // --- Flow 1: 1:1 DM (3001 with friend 2001) -> add non-friend 2006 is refused ---
+    world.discord.script("/channels/3001/call/ring", 204, json!(null));
+    world.ask(Request::CallStart { conversation: world.key("3001") });
+    wait("join 3001", || world.discord.frames_of(4).pop());
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": null, "channel_id": "3001", "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false
+        }),
+    );
+
+    match world.ask(Request::CallAddPeople { people: vec!["2006".into()] }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("friends"), "expected friend check, got {detail}");
+        }
+        other => panic!("expected Refused for non-friend, got {other:?}"),
+    }
+
+    // --- Flow 2: 1:1 DM -> failure after group creation rolls back voice state to 3001 ---
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3098",
+            "type": 3,
+            "name": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara O"},
+                {"id": "2002", "username": "dev", "global_name": "Dev"}
+            ]
+        }),
+    );
+    world.discord.script("/channels/3098/call/ring", 403, json!({"code": 50013, "message": "Forbidden"}));
+    match world.ask(Request::CallAddPeople { people: vec!["2002".into()] }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused when ring fails, got {other:?}"),
+    }
+    // Call must still be on 3001, and last op 4 frame restored channel 3001.
+    assert_eq!(call().unwrap().conversation.id, "3001");
+    let last_op4 = world.discord.frames_of(4).pop().unwrap();
+    assert_eq!(last_op4["d"]["channel_id"], json!("3001"));
+
+    // --- Flow 3: 1:1 DM -> add friend 2002 succeeds, moves call to new group 3099 ---
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3099",
+            "type": 3,
+            "name": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara O"},
+                {"id": "2002", "username": "dev", "global_name": "Dev"}
+            ]
+        }),
+    );
+    world.discord.script("/channels/3099/call/ring", 204, json!(null));
+    match world.ask(Request::CallAddPeople { people: vec!["2002".into()] }) {
+        Response::Conversation { conversation } => assert_eq!(conversation.key.id, "3099"),
+        other => panic!("expected Response::Conversation for new group, got {other:?}"),
+    }
+    assert_eq!(call().unwrap().conversation.id, "3099", "call must retarget to new group DM");
+    let created_reqs = world.discord.requests_to("POST", "/users/@me/channels");
+    assert!(
+        created_reqs.iter().any(|r| r.body == json!({"recipients": ["2001", "2002"]})),
+        "expected group creation with [peer, added], got {:?}",
+        created_reqs.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+    let ring_new = world.discord.requests_to("POST", "/channels/3099/call/ring");
+    assert_eq!(ring_new.len(), 1);
+    assert_eq!(ring_new[0].body, json!({"recipients": null}));
+
+    // --- Flow 4: Group DM (3099) -> add friend 2003 PUTs recipient and rings only [2003] ---
+    // Make 2003 a friend via RELATIONSHIP_ADD first.
+    world.discord.push(
+        "RELATIONSHIP_ADD",
+        json!({
+            "id": "2003",
+            "type": 1,
+            "user": {"id": "2003", "username": "lin", "global_name": "Lin"}
+        }),
+    );
+    wait("2003 friend recorded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Discord),
+            relation: Some(Relation::Friend),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. } => people.iter().any(|p| p.key.id == "2003").then_some(()),
+            _ => None,
+        }
+    });
+    world.discord.script("/channels/3099/recipients/2003", 204, json!(null));
+    world.discord.script("/channels/3099/call/ring", 204, json!(null));
+    match world.ask(Request::CallAddPeople { people: vec!["2003".into()] }) {
+        Response::Conversation { conversation } => assert_eq!(conversation.key.id, "3099"),
+        other => panic!("expected Response::Conversation for group add, got {other:?}"),
+    }
+    let put_rec = world.discord.requests_to("PUT", "/channels/3099/recipients/2003");
+    assert_eq!(put_rec.len(), 1);
+    let ring_3099 = world.discord.requests_to("POST", "/channels/3099/call/ring");
+    assert!(
+        ring_3099.iter().any(|r| r.body == json!({"recipients": ["2003"]})),
+        "expected targeted ring for newly added friend, got {:?}",
+        ring_3099.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+}

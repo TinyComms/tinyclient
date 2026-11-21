@@ -513,6 +513,20 @@ impl Hub {
         self.0.borrow().people.get(person).cloned()
     }
 
+    /// Friends known on `account`, sorted by name.
+    pub fn friends(&self, account: &AccountKey) -> Vec<Person> {
+        let mut out: Vec<Person> = self
+            .0
+            .borrow()
+            .people
+            .values()
+            .filter(|p| p.key.account() == *account && p.relation == Relation::Friend)
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| p.name.to_lowercase());
+        out
+    }
+
     /// `Unknown` for anyone not watched: it draws as no dot at all.
     pub fn presence_of(&self, person: &Key) -> Presence {
         self.0.borrow().presence.get(person).map_or(Presence::Unknown, |seen| seen.presence)

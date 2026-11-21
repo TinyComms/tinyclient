@@ -1726,6 +1726,9 @@ impl Discord {
             Command::CallStopRinging { conversation_id, people, reply } => {
                 answer(reply, self.call_stop_ringing(&conversation_id, people))
             }
+            Command::CallAddPeople { conversation_id, people, reply } => {
+                answer(reply, self.call_add_people(&conversation_id, people))
+            }
             // The user asked to sign out, so the token should stop working, not just be
             // forgotten: the answer goes once Discord has ended the session, or refused to.
             Command::SignOut(done) => {

@@ -3356,6 +3356,25 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::CallAddPeople { people } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let account = call.conversation.account();
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&account, |reply| Command::CallAddPeople {
+                    conversation_id,
+                    people,
+                    reply,
+                }) {
+                    Ok(id) => match self.hub.store().conversation(&Key::new(&account, id)) {
+                        Ok(Some(conversation)) => Response::Conversation { conversation },
+                        Ok(None) => Response::Ok,
+                        Err(err) => error(ErrorCode::Internal, err.to_string()),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
             Request::Handoff { conversation } => {
                 let conversation_id = conversation.id.clone();
                 match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {
