@@ -1838,3 +1838,48 @@ fn link_previews_received_sent_and_opted_out() {
     let posted2 = world.fake.calls("POST", &format!("{CHAT_ANA}/messages")).pop().unwrap();
     assert!(posted2.json()["properties"]["links"].is_null());
 }
+
+#[test]
+fn notification_levels_read_write_and_live_update() {
+    let world = World::start();
+    world.ready();
+
+    let general = key(GENERAL);
+    let grp1 = key("19:grp1@thread.v2");
+
+    // Channel defaults to Mentions when unmuted and not followed.
+    let info = match world.ask(Request::ConversationInfo { conversation: general.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(info.notify, protocol::Notify::Mentions);
+
+    // Update channel to All: writes alerts=true and channelNotificationSettings.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::All, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update chat to Mentions: writes alerts=false + mentions=true and does NOT mark row muted.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let grp_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((grp_call.query.as_str(), grp_call.json()), ("name=alerts", json!({"alerts": "false", "mentions": "true"})));
+    assert!(!world.conversation(&grp1).unwrap().muted);
+
+    // Live ConversationUpdate push muting grp1 reflects in row.muted.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"alerts": "false"}}),
+        false,
+    );
+    world.until("grp1 muted by ConversationUpdate", || {
+        world.conversation(&grp1).filter(|row| row.muted)
+    });
+}

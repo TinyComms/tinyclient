@@ -16,6 +16,83 @@ use serde_json::{json, Value};
 /// "Seen" is told in one-to-one and small chats only, never in channels, as Teams does.
 const SMALL: usize = 20;
 
+pub(super) fn notify_word(notify: Notify) -> &'static str {
+    match notify {
+        Notify::All => "all",
+        Notify::Mentions => "mentions",
+        Notify::Nothing => "nothing",
+    }
+}
+
+pub(super) fn parse_notify_word(word: &str) -> Option<Notify> {
+    match word {
+        "all" => Some(Notify::All),
+        "mentions" => Some(Notify::Mentions),
+        "nothing" => Some(Notify::Nothing),
+        _ => None,
+    }
+}
+
+/// Reads Teams per-conversation notification level from `channelNotificationSettings`,
+/// `alerts` + `mentions`, `isMuted`, or `isFollowed`.
+pub(super) fn parse_notify(source: &Value, is_channel: bool) -> Option<Notify> {
+    let settings = match &source["channelNotificationSettings"] {
+        Value::String(raw) => serde_json::from_str::<Value>(raw).unwrap_or(Value::Null),
+        other => other.clone(),
+    };
+    if settings.is_object() {
+        if let Some(level) = settings["level"].as_str().or_else(|| settings["mode"].as_str()) {
+            match level.to_ascii_lowercase().as_str() {
+                "all" | "allposts" | "bannerandfeed" => return Some(Notify::All),
+                "mentions" | "mentionsonly" => return Some(Notify::Mentions),
+                "off" | "none" | "nothing" => return Some(Notify::Nothing),
+                _ => {}
+            }
+        }
+        let all_posts = &settings["allPosts"];
+        let new_posts = if all_posts.is_null() { &settings["newPosts"] } else { all_posts };
+        let mentions = &settings["mentions"];
+        let is_on = |v: &Value| {
+            *v == Value::Bool(true)
+                || v.as_str().is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "bannerandfeed" | "feed" | "on" | "true" | "all"))
+        };
+        let is_off = |v: &Value| {
+            *v == Value::Bool(false)
+                || v.as_str().is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "off" | "none" | "false"))
+        };
+        if is_on(new_posts) {
+            return Some(Notify::All);
+        }
+        if is_off(new_posts) {
+            return Some(if is_off(mentions) { Notify::Nothing } else { Notify::Mentions });
+        }
+    }
+
+    let alerts = &source["alerts"];
+    let mentions = &source["mentions"];
+    let mentions_on = *mentions == Value::Bool(true)
+        || mentions.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on"));
+    match alerts {
+        Value::Bool(true) => return Some(Notify::All),
+        Value::Bool(false) => return Some(if mentions_on { Notify::Mentions } else { Notify::Nothing }),
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" | "all" => return Some(Notify::All),
+            "mentions" | "mentionsonly" => return Some(Notify::Mentions),
+            "false" | "off" | "none" => return Some(if mentions_on { Notify::Mentions } else { Notify::Nothing }),
+            _ => {}
+        },
+        _ => {}
+    }
+
+    if source["isMuted"] == true {
+        return Some(Notify::Nothing);
+    }
+    if is_channel && source["isFollowed"] == true {
+        return Some(Notify::All);
+    }
+    None
+}
+
 impl Teams {
     fn described(&self, thread: &str) -> Result<Value, Fault> {
         Ok(self.chat("GET", &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)), Body::None, true)?.body)
@@ -24,12 +101,30 @@ impl Teams {
     pub(super) fn conversation_info(&self, conversation: &str) -> Result<ConversationAbout, Fault> {
         let thread = thread_of(conversation);
         let row = self.ctx.known(thread)?;
-        let notify = if row.as_ref().is_some_and(|row| row.muted) { Notify::Nothing } else { Notify::All };
+        let channel = super::tree::is_channel(thread);
+        let remembered = self
+            .state()
+            .notify
+            .get(thread)
+            .copied()
+            .or_else(|| self.ctx.note(&format!("notify:{thread}")).as_deref().and_then(parse_notify_word));
+        let default_notify = if row.as_ref().is_some_and(|row| row.muted) {
+            Notify::Nothing
+        } else if let Some(level) = remembered {
+            level
+        } else if channel {
+            Notify::Mentions
+        } else {
+            Notify::All
+        };
         if thread.starts_with("48:") {
-            return Ok(ConversationAbout { notify, ..ConversationAbout::default() });
+            return Ok(ConversationAbout { notify: default_notify, ..ConversationAbout::default() });
         }
         let described = self.described(thread)?;
         let properties = &described["properties"];
+        let notify = parse_notify(properties, channel).unwrap_or(default_notify);
+        self.state().notify.insert(thread.to_owned(), notify);
+        self.ctx.set_note(&format!("notify:{thread}"), notify_word(notify));
         let members = described["members"].as_array().map(|members| members.len() as u32);
         let text = |name: &str| properties[name].as_str().unwrap_or("").trim().to_owned();
         let creator = text("creator");
@@ -97,14 +192,32 @@ impl Teams {
         })
     }
 
-    /// Teams has on and off for a chat: `Mentions` keeps the mention alerts, which a muted
-    /// chat still raises in Teams, so it is off too.
+    /// Updates Teams per-conversation notification level (`All`, `Mentions`, `Nothing`).
     pub(super) fn set_mute(&self, conversation: &str, notify: Notify) -> Result<(), Fault> {
         let thread = thread_of(conversation);
-        let muted = notify != Notify::All;
+        let channel = super::tree::is_channel(thread);
         let path = format!("/v1/users/ME/conversations/{}/properties?name=alerts", escaped(thread));
-        self.chat("PUT", &path, Body::Json(&json!({"alerts": if muted { "false" } else { "true" }})), false)?;
-        self.ctx.muted(thread, muted)?;
+        let alerts_body = match notify {
+            Notify::All => json!({"alerts": "true"}),
+            Notify::Mentions => json!({"alerts": "false", "mentions": "true"}),
+            Notify::Nothing => json!({"alerts": "false"}),
+        };
+        self.chat("PUT", &path, Body::Json(&alerts_body), false)?;
+        if channel {
+            let settings_path = format!(
+                "/v1/users/ME/conversations/{}/properties?name=channelNotificationSettings",
+                escaped(thread)
+            );
+            let settings_body = match notify {
+                Notify::All => json!({"channelNotificationSettings": {"allPosts": "bannerAndFeed", "mentions": "bannerAndFeed"}}),
+                Notify::Mentions => json!({"channelNotificationSettings": {"allPosts": "off", "mentions": "bannerAndFeed"}}),
+                Notify::Nothing => json!({"channelNotificationSettings": {"allPosts": "off", "mentions": "off"}}),
+            };
+            let _ = self.chat("PUT", &settings_path, Body::Json(&settings_body), false);
+        }
+        self.state().notify.insert(thread.to_owned(), notify);
+        self.ctx.set_note(&format!("notify:{thread}"), notify_word(notify));
+        self.ctx.muted(thread, notify == Notify::Nothing)?;
         Ok(())
     }
 
@@ -236,5 +349,34 @@ impl Teams {
             self.ctx.seen(conversation, &least.to_string())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_notify_reads_channel_settings_and_alerts_properties() {
+        assert_eq!(
+            parse_notify(&json!({"channelNotificationSettings": {"allPosts": "bannerAndFeed", "mentions": "bannerAndFeed"}}), true),
+            Some(Notify::All)
+        );
+        assert_eq!(
+            parse_notify(&json!({"channelNotificationSettings": {"allPosts": "off", "mentions": "bannerAndFeed"}}), true),
+            Some(Notify::Mentions)
+        );
+        assert_eq!(
+            parse_notify(&json!({"channelNotificationSettings": {"allPosts": "off", "mentions": "off"}}), true),
+            Some(Notify::Nothing)
+        );
+        assert_eq!(
+            parse_notify(&json!({"alerts": "false", "mentions": "true"}), false),
+            Some(Notify::Mentions)
+        );
+        assert_eq!(parse_notify(&json!({"alerts": "false"}), false), Some(Notify::Nothing));
+        assert_eq!(parse_notify(&json!({"alerts": "true"}), false), Some(Notify::All));
+        assert_eq!(parse_notify(&json!({"isFollowed": true}), true), Some(Notify::All));
+        assert_eq!(parse_notify(&json!({"isMuted": true}), true), Some(Notify::Nothing));
     }
 }

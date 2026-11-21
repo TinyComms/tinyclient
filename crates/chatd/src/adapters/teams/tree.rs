@@ -188,7 +188,13 @@ impl Teams {
                 self.ctx.set_note(&format!("group:{id}"), group);
             }
             for channel in channels {
-                self.count(text(channel, "id"), &counted(channel, &me), channel["isMuted"] == true)?;
+                let chan_id = text(channel, "id");
+                let level = super::info::parse_notify(channel, true)
+                    .or_else(|| super::info::parse_notify(&channel["properties"], true))
+                    .unwrap_or(protocol::Notify::Mentions);
+                self.state().notify.insert(chan_id.to_owned(), level);
+                self.ctx.set_note(&format!("notify:{chan_id}"), super::info::notify_word(level));
+                self.count(chan_id, &counted(channel, &me), level == protocol::Notify::Nothing)?;
             }
         }
         self.state().listed = Some(Instant::now());

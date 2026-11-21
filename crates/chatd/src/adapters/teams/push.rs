@@ -260,6 +260,11 @@ impl Teams {
             };
             self.ctx.filing(id, &filing)?;
         }
+        if let Some(level) = super::info::parse_notify(props, super::tree::is_channel(id)) {
+            self.state().notify.insert(id.to_owned(), level);
+            self.ctx.set_note(&format!("notify:{id}"), super::info::notify_word(level));
+            self.ctx.muted(id, level == protocol::Notify::Nothing)?;
+        }
         let horizon = props["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
         let Some(read) = horizon.filter(|read| super::millis(read) > 0) else {
             return Ok(());

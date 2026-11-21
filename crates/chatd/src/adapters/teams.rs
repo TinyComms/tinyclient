@@ -325,6 +325,8 @@ struct State {
     own_meta: HashMap<(String, String), message::OwnMeta>,
     /// Chat ids pinned in Teams, in Teams' own order.
     pinned_chats: Vec<String>,
+    /// Per-conversation notification level as reported by Teams.
+    notify: HashMap<String, protocol::Notify>,
 }
 
 /// What a call presents.
