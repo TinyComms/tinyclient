@@ -924,6 +924,15 @@ impl Context {
         Ok(())
     }
 
+    /// Sets whether the user can create channels in `space_id`.
+    pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
     /// One Space's whole tree: only what the user may see, in the network's order. Rows go
     /// straight to the store; keep none of them.
     pub fn tree(&self, space_id: &str, groups: &[Group], conversations: &[ConversationRow]) -> Stores {

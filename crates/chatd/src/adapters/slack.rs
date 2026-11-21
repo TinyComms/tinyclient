@@ -184,12 +184,13 @@ fn reason(fault: Fault) -> String {
             "already_in_channel" => "That person is already in this channel.",
             "user_not_in_channel" => "That person is not in this channel.",
             "name_taken" => "A channel with that name already exists.",
-            "invalid_name_required"
-            | "invalid_name_punctuation"
-            | "invalid_name_maxlength"
+            "invalid_name_required" => "Channel name cannot be empty.",
+            "invalid_name_maxlength" => "Slack channel names can be at most 80 characters.",
+            "invalid_name_reserved" => "That channel name is reserved by Slack.",
+            "invalid_name_punctuation"
             | "invalid_name_specials"
-            | "invalid_name_reserved"
-            | "invalid_name_nonmatching" => "That channel name is not valid for Slack.",
+            | "invalid_name_nonmatching" => "Slack channel names must be lowercase letters, numbers, hyphens, or underscores, with no spaces.",
+            "too_many_users" => "Slack group DMs can include at most 8 other people.",
             "not_authorized" => "You do not have permission to do that in this workspace.",
             "permission_denied" => "This workspace does not let you pin messages here.",
             "already_pinned" => "This message is already pinned.",
@@ -1523,6 +1524,10 @@ impl Slack {
                 answer(reply, self.members_remove(&conversation_id, &person));
             }
             Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
+            Command::StartGroup { people, reply, .. } => answer(reply, self.start_group(&people)),
+            Command::CreateChannel { name, private, group, reply, .. } => {
+                answer(reply, self.create_channel(&name, private, group.as_deref()))
+            }
             Command::CloseDirect { conversation_id, reply } => {
                 answer(reply, self.close_direct(&conversation_id));
             }
@@ -2404,6 +2409,7 @@ fn capabilities() -> protocol::Capabilities {
         bookmarks: true,
         browse_channels: true,
         archive: true,
+        groups: 8,
         save_messages: true,
         rich_status: true,
         ..protocol::Capabilities::default()

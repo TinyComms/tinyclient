@@ -448,11 +448,62 @@ impl Fake {
                 return marked;
             }
             "conversations.mark" | "subscriptions.thread.mark" => Some(json!({"ok": true})),
-            "conversations.open" => Some(json!({
-                "ok": true, "no_op": false, "already_open": false,
-                "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
-                            "user": param("users"), "is_open": true, "priority": 0},
-            })),
+            "conversations.open" => {
+                let users = param("users");
+                if users.contains(',') {
+                    let parts: Vec<&str> = users.split(',').filter(|u| !u.is_empty()).collect();
+                    let handles: Vec<String> = parts
+                        .iter()
+                        .map(|uid| {
+                            self.user(token, uid)
+                                .and_then(|u| u["name"].as_str().map(str::to_owned))
+                                .unwrap_or_else(|| (*uid).to_lowercase())
+                        })
+                        .collect();
+                    let name = format!("mpdm-justin--{}-1", handles.join("--"));
+                    Some(json!({
+                        "ok": true, "no_op": false, "already_open": false,
+                        "channel": {
+                            "id": "G0MPIMNEW", "name": name, "created": 1760000000,
+                            "is_mpim": true, "is_private": true, "is_open": true,
+                        },
+                    }))
+                } else {
+                    Some(json!({
+                        "ok": true, "no_op": false, "already_open": false,
+                        "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
+                                    "user": users, "is_open": true, "priority": 0},
+                    }))
+                }
+            }
+            "conversations.create" => {
+                let name = param("name");
+                if name.is_empty() {
+                    return refused("invalid_name_required");
+                }
+                if name.len() > 80 {
+                    return refused("invalid_name_maxlength");
+                }
+                if name.contains(' ') || name.chars().any(|c| c.is_ascii_uppercase()) {
+                    return refused("invalid_name_punctuation");
+                }
+                let is_private = param("is_private") == "true";
+                let id = if is_private { "C0PRIVNEW" } else { "C0PUBNEW" };
+                Some(json!({
+                    "ok": true,
+                    "channel": {
+                        "id": id,
+                        "name": name,
+                        "is_channel": !is_private,
+                        "is_group": is_private,
+                        "is_private": is_private,
+                        "is_member": true,
+                        "created": 1760000000,
+                        "topic": {"value": ""},
+                        "purpose": {"value": ""}
+                    }
+                }))
+            }
             "conversations.close" => {
                 if channel.is_empty() {
                     return refused("invalid_arguments");
@@ -4506,4 +4557,106 @@ fn slack_canvases_and_lists_render_structured_cards_without_file_chips() {
         .expect("channel canvas surfaced in bookmarks");
     assert_eq!(canvas_bm.title, "Channel canvas");
     assert!(canvas_bm.link.contains("F0CHANCANVAS"));
+}
+
+#[test]
+fn slack_create_channel_and_start_group_dm() {
+    let world = World::start();
+    world.ready();
+
+    // Workspace advertises can_create_channels and groups capability (up to 8).
+    let space = Key { network: Network::Slack, account: "T01ALPHA".into(), id: "T01ALPHA".into() };
+    let Response::Spaces { spaces } = world.ask(Request::Spaces { network: Some(Network::Slack) }) else {
+        panic!("expected Spaces");
+    };
+    assert!(
+        spaces.iter().any(|s| s.key == space && s.can_create_channels),
+        "Slack workspace should advertise can_create_channels"
+    );
+    assert_eq!(world.account("T01ALPHA").can.groups, 8);
+
+    // 1. Create a public channel.
+    let Response::Conversation { conversation: pub_chan } = world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "launch-ops".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) else {
+        panic!("expected Conversation for public CreateChannel");
+    };
+    assert_eq!(pub_chan.key.id, "C0PUBNEW");
+    assert_eq!(pub_chan.title, "#launch-ops");
+    assert!(!pub_chan.private);
+    assert!(pub_chan.joined);
+
+    // 2. Create a private channel.
+    let Response::Conversation { conversation: priv_chan } = world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "secret-plan".into(),
+        kind: ConversationKind::Channel,
+        private: true,
+        group: None,
+    }) else {
+        panic!("expected Conversation for private CreateChannel");
+    };
+    assert_eq!(priv_chan.key.id, "C0PRIVNEW");
+    assert_eq!(priv_chan.title, "#secret-plan");
+    assert!(priv_chan.private);
+    let create_calls = world.fake.calls(ALPHA, "conversations.create");
+    assert_eq!(create_calls.len(), 2);
+    assert_eq!(create_calls[0].params.get("is_private").map(String::as_str), Some("false"));
+    assert_eq!(create_calls[1].params.get("is_private").map(String::as_str), Some("true"));
+
+    // 3. Invalid channel name surfaces clear Slack naming rules in words.
+    match world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "Bad Name".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("lowercase"), "got: {detail}");
+        }
+        other => panic!("expected Refused for invalid channel name, got {other:?}"),
+    }
+
+    // 4. Start a multi-person group DM with two other people (3-person DM including me).
+    let Response::Conversation { conversation: mpim } = world.ask(Request::StartGroup {
+        account: space.account(),
+        people: vec![alpha("U0ANA"), alpha("U0BEN")],
+        title: None,
+    }) else {
+        panic!("expected Conversation for StartGroup");
+    };
+    assert_eq!(mpim.key.id, "G0MPIMNEW");
+    assert_eq!(mpim.kind, ConversationKind::Group);
+    assert!(mpim.private);
+    assert!(mpim.title.contains("ana") && mpim.title.contains("ben"), "mpim title: {}", mpim.title);
+    let open_calls = world.fake.calls(ALPHA, "conversations.open");
+    assert!(
+        open_calls.iter().any(|c| c.params.get("users").map(String::as_str) == Some("U0ANA,U0BEN")),
+        "expected comma-separated users in conversations.open: {open_calls:?}"
+    );
+
+    // 5. When workspace restricts channel creation (`restricted_action`), Space hides can_create_channels.
+    world.fake.refusing.lock().unwrap().insert("conversations.create".into(), "restricted_action".into());
+    match world.ask(Request::CreateChannel {
+        space: space.clone(),
+        name: "blocked-chan".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for restricted_action, got {other:?}"),
+    }
+    let Response::Spaces { spaces: updated_spaces } = world.ask(Request::Spaces { network: Some(Network::Slack) }) else {
+        panic!("expected Spaces");
+    };
+    assert!(
+        !updated_spaces.iter().find(|s| s.key == space).unwrap().can_create_channels,
+        "restricted_action should clear can_create_channels on the Space"
+    );
 }

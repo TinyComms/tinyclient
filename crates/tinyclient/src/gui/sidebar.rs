@@ -2150,25 +2150,27 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .id("create-chan-kind")
-                            .type_small()
-                            .text_color(theme::accent_text())
-                            .cursor_pointer()
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(m) = this.sidebar_state.create_channel.as_mut() {
-                                    m.kind = if m.kind == ConversationKind::Voice {
-                                        ConversationKind::Channel
-                                    } else {
-                                        ConversationKind::Voice
-                                    };
-                                    cx.notify();
-                                }
-                            }))
-                            .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
-                    )
+                    .when(modal.space.network != Network::Slack, |row| {
+                        row.child(
+                            div()
+                                .id("create-chan-kind")
+                                .type_small()
+                                .text_color(theme::accent_text())
+                                .cursor_pointer()
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(m) = this.sidebar_state.create_channel.as_mut() {
+                                        m.kind = if m.kind == ConversationKind::Voice {
+                                            ConversationKind::Channel
+                                        } else {
+                                            ConversationKind::Voice
+                                        };
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
+                        )
+                    })
                     .child(
                         div()
                             .id("create-chan-private")
