@@ -4430,3 +4430,373 @@ fn delete_modes_admin_batch_participant_history_and_report_spam() {
     );
     assert!(world.calls().iter().any(|c| c == "channels.DeleteParticipantHistory c9002 u7003"));
 }
+
+#[test]
+fn bot_inline_buttons_render_and_fire_callback() {
+    let world = World::signed_in();
+    world.connected();
+    let bot_chat = key("u7004");
+    world.steer("bot-buttons");
+
+    let msg = world.until("bot message with inline buttons", || {
+        match world.ask(Request::Messages { conversation: bot_chat.clone(), page: Page::Newest, limit: 20 }) {
+            Response::Messages { messages, .. } => messages.into_iter().find(|m| m.id == "90"),
+            _ => None,
+        }
+    });
+    assert_eq!(msg.buttons.len(), 2, "expected 2 rows of inline buttons: {:?}", msg.buttons);
+    assert_eq!(msg.buttons[0].len(), 2);
+    assert_eq!(msg.buttons[0][0].label, "Approve");
+    let callback_data = match &msg.buttons[0][0].kind {
+        protocol::InlineButtonKind::Callback { data, requires_password } => {
+            assert!(!requires_password);
+            data.clone()
+        }
+        other => panic!("expected Callback button, got {other:?}"),
+    };
+    assert_eq!(
+        msg.buttons[0][1],
+        protocol::InlineButton {
+            label: "Docs".into(),
+            kind: protocol::InlineButtonKind::Url { url: "https://example.com/docs".into() },
+        }
+    );
+    assert_eq!(
+        msg.buttons[1][0],
+        protocol::InlineButton {
+            label: "Copy code".into(),
+            kind: protocol::InlineButtonKind::Copy { text: "ABC-123".into() },
+        }
+    );
+    assert_eq!(
+        msg.buttons[1][1],
+        protocol::InlineButton {
+            label: "Search".into(),
+            kind: protocol::InlineButtonKind::SwitchInline { query: "trails ".into(), same_peer: true },
+        }
+    );
+
+    let resp = world.ask(Request::PressButton {
+        conversation: bot_chat,
+        message_id: "90".into(),
+        data: callback_data,
+    });
+    match resp {
+        Response::ButtonAnswer { answer } => {
+            assert_eq!(answer.message.as_deref(), Some("Approved!"));
+            assert!(!answer.alert);
+        }
+        other => panic!("expected ButtonAnswer, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c == "GetBotCallbackAnswer u7004 90 approve:42"),
+        "expected GetBotCallbackAnswer on wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn notify_defaults_read_update_exceptions_and_reset() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.notify_defaults, "Telegram must advertise notify_defaults capability");
+
+    // Initial defaults: none muted, with Field Notes channel as an exception.
+    let initial = match world.ask(Request::GetNotifyDefaults { account: account() }) {
+        Response::NotifyDefaults { defaults } => defaults,
+        other => panic!("expected NotifyDefaults, got {other:?}"),
+    };
+    assert!(!initial.users_muted);
+    assert!(!initial.groups_muted);
+    assert!(!initial.channels_muted);
+    assert!(
+        initial.exceptions.iter().any(|e| e.conversation == key("c9001") && e.muted),
+        "expected c9001 muted exception, got {:?}",
+        initial.exceptions
+    );
+
+    // Mute all groups via SetNotifyDefault.
+    let after_groups = match world.ask(Request::SetNotifyDefault {
+        account: account(),
+        scope: protocol::NotifyDefaultScope::Groups,
+        muted: true,
+    }) {
+        Response::NotifyDefaults { defaults } => defaults,
+        other => panic!("expected NotifyDefaults, got {other:?}"),
+    };
+    assert!(after_groups.groups_muted);
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("UpdateNotifySettings chats ")),
+        "expected UpdateNotifySettings chats on wire, got: {:#?}",
+        world.calls()
+    );
+    // Unset group row g8001 should now inherit muted = true.
+    let crew = world.until("g8001 muted after group default changed", || {
+        match world.ask(Request::Conversation { conversation: key("g8001") }) {
+            Response::Conversation { conversation } if conversation.muted => Some(conversation),
+            _ => None,
+        }
+    });
+    assert!(crew.muted);
+
+    // Reset all defaults and exceptions.
+    let after_reset = match world.ask(Request::ResetNotifyDefaults { account: account() }) {
+        Response::NotifyDefaults { defaults } => defaults,
+        other => panic!("expected NotifyDefaults, got {other:?}"),
+    };
+    assert!(!after_reset.users_muted && !after_reset.groups_muted && !after_reset.channels_muted);
+    assert!(after_reset.exceptions.is_empty());
+    assert!(
+        world.calls().iter().any(|c| c == "ResetNotifySettings"),
+        "expected ResetNotifySettings on wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn saved_messages_dialogs_history_and_reaction_tags() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.saved_subdialogs, "Telegram must advertise saved_subdialogs capability");
+
+    // Fetch Saved Messages sub-dialogs (by source peer) and reaction tags.
+    let (dialogs, tags) = match world.ask(Request::SavedDialogs { account: account() }) {
+        Response::SavedDialogs { dialogs, tags } => (dialogs, tags),
+        other => panic!("expected SavedDialogs, got {other:?}"),
+    };
+    assert!(
+        dialogs.iter().any(|d| d.peer_id == "u7002" && d.title.contains("Odalys")),
+        "expected Odalys saved dialog, got {dialogs:?}"
+    );
+    assert!(
+        dialogs.iter().any(|d| d.peer_id == "c9001" && d.title.contains("Field Notes")),
+        "expected Field Notes saved dialog, got {dialogs:?}"
+    );
+    assert!(
+        tags.iter().any(|t| t.emoji == "⭐" && t.title == "Gear" && t.count == 2),
+        "expected ⭐ Gear tag, got {tags:?}"
+    );
+
+    // Fetch Saved Messages history for a specific source peer (`messages.getSavedHistory`).
+    let peer_msgs = match world.ask(Request::SavedHistory {
+        account: account(),
+        peer_id: Some("u7002".into()),
+        tag: None,
+        limit: 20,
+    }) {
+        Response::SavedHistory { messages } => messages,
+        other => panic!("expected SavedHistory, got {other:?}"),
+    };
+    assert_eq!(peer_msgs.len(), 1);
+    assert!(peer_msgs[0].text.contains("Trailhead"), "got: {:?}", peer_msgs[0].text);
+    assert!(
+        world.calls().iter().any(|c| c == "GetSavedHistory u7002"),
+        "expected GetSavedHistory u7002 on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Fetch Saved Messages filtered by reaction tag (`messages.search` with `saved_reaction`).
+    let tag_msgs = match world.ask(Request::SavedHistory {
+        account: account(),
+        peer_id: None,
+        tag: Some("⭐".into()),
+        limit: 20,
+    }) {
+        Response::SavedHistory { messages } => messages,
+        other => panic!("expected SavedHistory, got {other:?}"),
+    };
+    assert_eq!(tag_msgs.len(), 1);
+    assert!(tag_msgs[0].text.contains("Packing list"), "got: {:?}", tag_msgs[0].text);
+    assert!(
+        world.calls().iter().any(|c| c == "SearchSavedTag ⭐"),
+        "expected SearchSavedTag ⭐ on wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn active_sessions_list_and_end_non_current() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.active_sessions, "Telegram must advertise active_sessions capability");
+
+    // List all active sessions (3 seeded: 1 current + 2 other devices).
+    let sessions = match world.ask(Request::ActiveSessions { account: account() }) {
+        Response::ActiveSessions { sessions } => sessions,
+        other => panic!("expected ActiveSessions, got {other:?}"),
+    };
+    assert_eq!(sessions.len(), 3, "expected 3 active sessions, got {sessions:?}");
+    assert!(sessions.iter().any(|s| s.current && s.id == "0"));
+    assert!(sessions.iter().any(|s| !s.current && s.id == "91001" && s.device.contains("iPhone")));
+
+    // Refuses ending the current session (hash 0).
+    let refuse = world.ask(Request::EndSession {
+        account: account(),
+        session_id: "0".into(),
+    });
+    assert!(matches!(refuse, Response::Error { .. }), "ending current session must be refused, got {refuse:?}");
+
+    // End a non-current session (91001).
+    let ok = world.ask(Request::EndSession {
+        account: account(),
+        session_id: "91001".into(),
+    });
+    assert!(matches!(ok, Response::Ok), "expected Ok ending session 91001, got {ok:?}");
+    assert!(
+        world.calls().iter().any(|c| c == "ResetAuthorization 91001"),
+        "expected ResetAuthorization 91001 on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Re-listing sessions should no longer contain 91001.
+    let after = match world.ask(Request::ActiveSessions { account: account() }) {
+        Response::ActiveSessions { sessions } => sessions,
+        other => panic!("expected ActiveSessions, got {other:?}"),
+    };
+    assert_eq!(after.len(), 2);
+    assert!(!after.iter().any(|s| s.id == "91001"));
+}
+
+#[test]
+fn unread_mentions_jump_three_times_and_the_count_reaches_zero() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.unread_jumps, "Telegram must advertise unread_jumps capability");
+
+    let crew = key("g8001");
+    // Three unread mentions (21, 22, 23) and two unread reactions (24, 25) on Trail crew.
+    // A topic mention and a channel mention ride the same tell, for top_msg_id and channels.readMessageContents.
+    world.steer("unread-jumps");
+    let row = world.until("the mention and reaction counts on the row", || {
+        let conversation = world.conversation("g8001")?;
+        (conversation.mentions == 3 && conversation.unread_reactions == 2).then_some(conversation)
+    });
+    assert_eq!(row.mentions, 3);
+    assert_eq!(row.unread_reactions, 2);
+
+    // Each press: the next unread mention, a HistoryAround landing, then that mention's contents read.
+    for (step, id) in ["21", "22", "23"].into_iter().enumerate() {
+        let left = 3 - step as u32;
+        let mention_ids = match world.ask(Request::UnreadItems {
+            conversation: crew.clone(),
+            kind: protocol::UnreadItemKind::Mentions,
+            limit: 1,
+        }) {
+            Response::UnreadItems { message_ids } => message_ids,
+            other => panic!("expected UnreadItems, got {other:?}"),
+        };
+        assert_eq!(mention_ids, vec![id.to_owned()], "press {} should land on the next mention", step + 1);
+        assert!(
+            world.calls().iter().any(|call| call == "GetUnreadMentions g8001"),
+            "expected GetUnreadMentions g8001 on wire, got: {:#?}",
+            world.calls()
+        );
+
+        let _ = world.ask(Request::Messages {
+            conversation: crew.clone(),
+            page: Page::Around { id: id.to_owned() },
+            limit: 50,
+        });
+        let landing = format!("GetHistory g8001 {id} -25");
+        world.until(&format!("the landing on {id}"), || {
+            world.calls().iter().any(|call| call == &landing).then_some(())
+        });
+        world.until(&format!("message {id} in the landing"), || world.message("g8001", id));
+
+        let ok = world.ask(Request::MarkUnreadItemsRead {
+            conversation: crew.clone(),
+            kind: protocol::UnreadItemKind::Mentions,
+            message_ids: vec![id.into()],
+        });
+        assert!(matches!(ok, Response::Ok), "expected Ok marking mention {id} read, got {ok:?}");
+        let contents = format!("ReadMessageContents {id}");
+        assert!(
+            world.calls().iter().any(|call| call == &contents),
+            "expected {contents} on wire, got: {:#?}",
+            world.calls()
+        );
+        let now = world.until(&format!("the mention count to fall to {}", left - 1), || {
+            world.conversation("g8001").filter(|conversation| conversation.mentions == left - 1)
+        });
+        assert_eq!(now.mentions, left - 1);
+    }
+    assert_eq!(world.conversation("g8001").unwrap().mentions, 0);
+
+    // Mark all is a separate call from seeing one mention.
+    let ok = world.ask(Request::MarkUnreadItemsRead {
+        conversation: crew.clone(),
+        kind: protocol::UnreadItemKind::Mentions,
+        message_ids: Vec::new(),
+    });
+    assert!(matches!(ok, Response::Ok), "expected Ok marking all mentions read, got {ok:?}");
+    assert!(
+        world.calls().iter().any(|call| call == "ReadMentions g8001"),
+        "expected ReadMentions g8001 on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // A forum topic sends top_msg_id (the conversation key carries it on the wire log).
+    let topic_ids = match world.ask(Request::UnreadItems {
+        conversation: key("c9002_31"),
+        kind: protocol::UnreadItemKind::Mentions,
+        limit: 1,
+    }) {
+        Response::UnreadItems { message_ids } => message_ids,
+        other => panic!("expected UnreadItems, got {other:?}"),
+    };
+    assert_eq!(topic_ids, vec!["42".to_owned()]);
+    assert!(
+        world.calls().iter().any(|call| call == "GetUnreadMentions c9002_31"),
+        "expected GetUnreadMentions c9002_31 (top_msg_id) on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // A channel mention on screen uses channels.readMessageContents.
+    let ok = world.ask(Request::MarkUnreadItemsRead {
+        conversation: key("c9001"),
+        kind: protocol::UnreadItemKind::Mentions,
+        message_ids: vec!["5".into()],
+    });
+    assert!(matches!(ok, Response::Ok), "expected Ok marking the channel mention read, got {ok:?}");
+    assert!(
+        world.calls().iter().any(|call| call == "channels.ReadMessageContents 5"),
+        "expected channels.ReadMessageContents 5 on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Reactions: the row's count, then mark-all (`messages.readReactions`) clears it.
+    let reaction_ids = match world.ask(Request::UnreadItems {
+        conversation: crew.clone(),
+        kind: protocol::UnreadItemKind::Reactions,
+        limit: 20,
+    }) {
+        Response::UnreadItems { message_ids } => message_ids,
+        other => panic!("expected UnreadItems, got {other:?}"),
+    };
+    assert_eq!(reaction_ids, vec!["24".to_owned(), "25".to_owned()]);
+    assert!(
+        world.calls().iter().any(|call| call == "GetUnreadReactions g8001"),
+        "expected GetUnreadReactions g8001 on wire, got: {:#?}",
+        world.calls()
+    );
+    let ok = world.ask(Request::MarkUnreadItemsRead {
+        conversation: crew.clone(),
+        kind: protocol::UnreadItemKind::Reactions,
+        message_ids: Vec::new(),
+    });
+    assert!(matches!(ok, Response::Ok), "expected Ok marking reactions read, got {ok:?}");
+    assert!(
+        world.calls().iter().any(|call| call == "ReadReactions g8001"),
+        "expected ReadReactions g8001 on wire, got: {:#?}",
+        world.calls()
+    );
+    let cleared = world.until("the reaction count to reach zero", || {
+        world.conversation("g8001").filter(|conversation| conversation.unread_reactions == 0 && conversation.mentions == 0)
+    });
+    assert_eq!(cleared.unread_reactions, 0);
+    assert_eq!(cleared.mentions, 0);
+}

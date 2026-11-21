@@ -866,7 +866,7 @@ impl Emoji {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct Attachment {
     pub id: String,
     #[serde(default)]

@@ -745,6 +745,16 @@ fn offline(ctx: &Context, command: Command) {
         Command::SearchCalendar { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
+        Command::PressButton { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetNotifyDefaults { reply }
+        | Command::SetNotifyDefault { reply, .. }
+        | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(down()))),
+        Command::SavedDialogs { reply } => drop(reply.send(Err(down()))),
+        Command::SavedHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ActiveSessions { reply } => drop(reply.send(Err(down()))),
+        Command::EndSession { reply, .. } => drop(reply.send(Err(down()))),
+        Command::UnreadItems { reply, .. } => drop(reply.send(Err(down()))),
+        Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -975,6 +985,45 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
+        }
+        Command::PressButton { conversation_id, message_id, data, reply } => {
+            let _ = reply.send(info::press_button(account, &conversation_id, &message_id, &data).map_err(refused));
+        }
+        Command::GetNotifyDefaults { reply } => {
+            let _ = reply.send(info::get_notify_defaults(account).map_err(refused));
+        }
+        Command::SetNotifyDefault { scope, muted, reply } => {
+            let _ = reply.send(info::set_notify_default(account, scope, muted).map_err(refused));
+        }
+        Command::ResetNotifyDefaults { reply } => {
+            let _ = reply.send(info::reset_notify_defaults(account).map_err(refused));
+        }
+        Command::SavedDialogs { reply } => {
+            let _ = reply.send(info::saved_dialogs(account).map_err(refused));
+        }
+        Command::SavedHistory { peer_id, tag, limit, reply } => {
+            let _ = reply.send(info::saved_history(account, peer_id.as_deref(), tag.as_deref(), limit).map_err(refused));
+        }
+        Command::ActiveSessions { reply } => {
+            let _ = reply.send(info::active_sessions(account).map_err(refused));
+        }
+        Command::EndSession { session_id, reply } => {
+            let res = info::end_session(account, &session_id).map_err(|fault| match &fault {
+                Fault::Rpc { name, .. } if name == "CURRENT_SESSION_FORBIDDEN" => {
+                    Refusal::Refused("Use Sign out to end this device's session.".to_owned())
+                }
+                Fault::Rpc { name, .. } if name == "FRESH_RESET_AUTHORISATION_FORBIDDEN" => {
+                    Refusal::Refused("Telegram requires a session to be at least 24 hours old before ending other devices.".to_owned())
+                }
+                _ => refused(fault),
+            });
+            let _ = reply.send(res);
+        }
+        Command::UnreadItems { conversation_id, kind, limit, reply } => {
+            let _ = reply.send(info::unread_items(account, &conversation_id, kind, limit).map_err(refused));
+        }
+        Command::MarkUnreadItemsRead { conversation_id, kind, message_ids, reply } => {
+            let _ = reply.send(info::mark_unread_items_read(account, &conversation_id, kind, &message_ids).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
@@ -1693,6 +1742,24 @@ pub fn prove_telegram_mark_unread() -> Result<(), String> {
     }
     if sync::unread_of(0, false) != 0 || sync::unread_of(3, false) != 3 {
         return Err("clearing the mark did not keep the dialog's own unread count".into());
+    }
+    Ok(())
+}
+
+/// `TINYCLIENT_PROVE=telegram-unread-jumps`. A mention jump marks that message. A reaction
+/// jump names the one just opened until the last, which clears the chat.
+pub fn prove_telegram_unread_jumps() -> Result<(), String> {
+    if protocol::jump_mark_ids(protocol::UnreadItemKind::Mentions, "21", true) != ["21"] {
+        return Err("a mention jump marks that message".into());
+    }
+    if protocol::jump_mark_ids(protocol::UnreadItemKind::Reactions, "24", false) != ["24"] {
+        return Err("a reaction jump names the one just opened".into());
+    }
+    if !protocol::jump_mark_ids(protocol::UnreadItemKind::Reactions, "25", true).is_empty() {
+        return Err("the last reaction jump clears the chat".into());
+    }
+    if protocol::badge_after_jump(3, 1) != 2 || protocol::badge_after_jump(3, 0) != 0 {
+        return Err("the badge drops by what was just read, and a clear ends it".into());
     }
     Ok(())
 }

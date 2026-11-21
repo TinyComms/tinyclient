@@ -708,8 +708,10 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 } else if let Some(fresh) = sync::peer_dialog(account, who) {
                     let unread = sync::unread_of(fresh.unread_count, fresh.unread_mark);
                     let mentions = fresh.unread_mentions_count.max(0) as u32;
+                    let unread_reactions = fresh.unread_reactions_count.max(0) as u32;
                     let read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
                     let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), 0);
+                    let _ = account.ctx.unread_reactions(&id, unread_reactions);
                     filing::facts_changed(account, who, |facts| facts.read = unread == 0);
                 }
             }

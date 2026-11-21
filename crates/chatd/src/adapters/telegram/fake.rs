@@ -597,6 +597,16 @@ struct World {
     forum_topics: HashMap<Who, Vec<FakeTopic>>,
     /// Pending scheduled messages by conversation key (`messages.getScheduledHistory`).
     scheduled: BTreeMap<String, BTreeMap<i32, tl::enums::Message>>,
+    /// Account-wide notification defaults: `[users_muted, groups_muted, channels_muted]`.
+    notify_defaults: [bool; 3],
+    /// Per-peer notification exceptions (`account.getNotifyExceptions`).
+    notify_exceptions: Vec<(Who, bool)>,
+    /// Active sessions (`hash`, `app`, `device`, `region`, `country`, `current`).
+    sessions: Vec<(i64, &'static str, &'static str, &'static str, &'static str, bool)>,
+    /// Unread mention message IDs per conversation (`messages.getUnreadMentions`).
+    unread_mentions: HashMap<String, Vec<i32>>,
+    /// Unread reaction message IDs per conversation (`messages.getUnreadReactions`).
+    unread_reactions: HashMap<String, Vec<i32>>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -671,6 +681,15 @@ impl World {
             custom_folders: None,
             forum_topics: HashMap::new(),
             scheduled: BTreeMap::new(),
+            notify_defaults: [false, false, false],
+            notify_exceptions: vec![(Who::Channel(NOTES), true)],
+            sessions: vec![
+                (0, "TinyClient", "Desktop", "Seattle", "US", true),
+                (91_001, "Telegram iOS", "iPhone 15", "Seattle", "US", false),
+                (91_002, "Telegram Desktop", "MacBook Pro", "Portland", "US", false),
+            ],
+            unread_mentions: HashMap::new(),
+            unread_reactions: HashMap::new(),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -729,9 +748,23 @@ impl World {
 
     /// A manual unread mark rides the dialog the next time it is read.
     fn flag_unread(&self, dialog: &mut tl::enums::Dialog) {
+        self.stamp_jump_counts(dialog);
         let tl::enums::Dialog::Dialog(row) = dialog else { return };
         let Some(on) = self.unread_marks.get(&Who::of(&row.peer)) else { return };
         row.unread_mark = *on;
+    }
+
+    /// Unread mention and reaction totals, from the lists `getUnreadMentions` and
+    /// `getUnreadReactions` answer. A chat with no list keeps the count the dialog already had.
+    fn stamp_jump_counts(&self, dialog: &mut tl::enums::Dialog) {
+        let tl::enums::Dialog::Dialog(row) = dialog else { return };
+        let place = Who::of(&row.peer).text();
+        if let Some(ids) = self.unread_mentions.get(&place) {
+            row.unread_mentions_count = ids.len() as i32;
+        }
+        if let Some(ids) = self.unread_reactions.get(&place) {
+            row.unread_reactions_count = ids.len() as i32;
+        }
     }
 
     fn folder(&self, id: i32) -> tl::enums::DialogFilter {
@@ -889,13 +922,24 @@ impl World {
 
     /// One page of a conversation, as `getHistory` and `getReplies` count it: newest first,
     /// from `offset_id` back, shifted by `add_offset`.
+    ///
+    /// A mention or reaction still on the unread list stays out of the page. The next jump
+    /// has to land on it; once it is read it comes back with the rest of the chat.
     fn page(&self, place: &str, offset_id: i32, add_offset: i32, limit: i32) -> tl::enums::messages::Messages {
-        let all: Vec<&tl::enums::Message> = self.messages.get(place).map(|held| held.values().rev().collect()).unwrap_or_default();
         let id = |message: &tl::enums::Message| match message {
             tl::enums::Message::Message(message) => message.id,
             tl::enums::Message::Service(message) => message.id,
             tl::enums::Message::Empty(message) => message.id,
         };
+        let still_unread = |message_id: i32| {
+            self.unread_mentions.get(place).is_some_and(|ids| ids.contains(&message_id))
+                || self.unread_reactions.get(place).is_some_and(|ids| ids.contains(&message_id))
+        };
+        let all: Vec<&tl::enums::Message> = self
+            .messages
+            .get(place)
+            .map(|held| held.values().rev().filter(|message| !still_unread(id(message))).collect())
+            .unwrap_or_default();
         let start = match offset_id {
             0 => 0,
             offset => all.iter().position(|message| id(message) < offset).unwrap_or(all.len()) as i32,
@@ -929,6 +973,12 @@ fn app_config() -> tl::enums::help::AppConfig {
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
     Fault::Rpc { code, name: name.to_owned(), value }
+}
+
+/// The first `limit` ids, or none when Telegram asked for nothing.
+fn limited(ids: &[i32], limit: i32) -> Vec<i32> {
+    let n = usize::try_from(limit).unwrap_or(0);
+    ids.iter().copied().take(n).collect()
 }
 
 /// The request, if `body` is one of these.
@@ -1957,6 +2007,87 @@ impl World {
                 self.store(None, message.clone());
                 vec![new(message)]
             }
+            // A bot message with two rows of inline keyboard buttons (callback, URL, copy, switch_inline).
+            "bot-buttons" => {
+                let bot = Who::User(BOT);
+                let mut msg = message(bot, 90, BOT, t0() + 80, "Choose an action:");
+                let row1 = tl::types::KeyboardButtonRow {
+                    buttons: vec![
+                        tl::types::KeyboardButtonCallback {
+                            requires_password: false,
+                            style: None,
+                            text: "Approve".to_owned(),
+                            data: b"approve:42".to_vec(),
+                        }
+                        .into(),
+                        tl::types::KeyboardButtonUrl {
+                            style: None,
+                            text: "Docs".to_owned(),
+                            url: "https://example.com/docs".to_owned(),
+                        }
+                        .into(),
+                    ],
+                }
+                .into();
+                let row2 = tl::types::KeyboardButtonRow {
+                    buttons: vec![
+                        tl::types::KeyboardButtonCopy {
+                            style: None,
+                            text: "Copy code".to_owned(),
+                            copy_text: "ABC-123".to_owned(),
+                        }
+                        .into(),
+                        tl::types::KeyboardButtonSwitchInline {
+                            same_peer: true,
+                            style: None,
+                            text: "Search".to_owned(),
+                            query: "trails ".to_owned(),
+                            peer_types: None,
+                        }
+                        .into(),
+                    ],
+                }
+                .into();
+                msg.reply_markup = Some(tl::types::ReplyInlineMarkup { rows: vec![row1, row2] }.into());
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            // Three unread mentions and two unread reactions in Trail crew, one mention in the
+            // Tools topic, and the channel post that already names the user. The messages stay
+            // on the wire until a jump asks for them. The dialog mark is what puts the counts
+            // on the row.
+            "unread-jumps" => {
+                let crew = Who::Group(CREW);
+                let mut m21 = message(crew, 21, TOBIN, t0() + 10, "@mira_k bring the stove!");
+                m21.mentioned = true;
+                let mut m22 = message(crew, 22, ODALYS, t0() + 20, "@mira_k check the map!");
+                m22.mentioned = true;
+                let mut m23 = message(crew, 23, TOBIN, t0() + 30, "@mira_k the gate code!");
+                m23.mentioned = true;
+                let m24 = message(crew, 24, ME, t0() + 40, "Stove packed.");
+                let m25 = message(crew, 25, ME, t0() + 50, "Map packed.");
+                for m in [&m21, &m22, &m23, &m24, &m25] {
+                    self.store(None, m.clone());
+                }
+                self.unread_mentions.insert(crew.text(), vec![21, 22, 23]);
+                self.unread_reactions.insert(crew.text(), vec![24, 25]);
+                let mut topic = in_topic(
+                    message(Who::Channel(WORKSHOP), 42, TOBIN, t0() + 60, "@mira_k the wrench is back."),
+                    TOOLS,
+                );
+                topic.mentioned = true;
+                self.store(Some(TOOLS), topic);
+                self.unread_mentions.insert(key(Who::Channel(WORKSHOP), Some(TOOLS)), vec![42]);
+                self.unread_mentions.insert(Who::Channel(NOTES).text(), vec![5]);
+                vec![update(
+                    tl::types::UpdateDialogUnreadMark {
+                        unread: false,
+                        peer: tl::types::DialogPeer { peer: crew.peer() }.into(),
+                        saved_peer_id: None,
+                    }
+                    .into(),
+                )]
+            }
             // The channel's post gains a section of comments: the post says its count and the
             // linked group it is answered in, and two comments stand in the thread. A number
             // after the word says how many of them the user has not read.
@@ -2235,13 +2366,218 @@ impl World {
             self.log("GetUsers");
             return answer(vec![tl::enums::User::from(self.self_user())]);
         }
-        if asked::<f::account::GetNotifySettings>(body).is_some() {
+        if let Some(request) = asked::<f::account::GetNotifySettings>(body) {
             self.log("GetNotifySettings");
-            return answer(settings(None));
+            let mute = match request.peer {
+                tl::enums::InputNotifyPeer::InputNotifyUsers => self.notify_defaults[0].then_some(i32::MAX),
+                tl::enums::InputNotifyPeer::InputNotifyChats => self.notify_defaults[1].then_some(i32::MAX),
+                tl::enums::InputNotifyPeer::InputNotifyBroadcasts => self.notify_defaults[2].then_some(i32::MAX),
+                _ => None,
+            };
+            return answer(settings(mute));
+        }
+        if asked::<f::account::GetNotifyExceptions>(body).is_some() {
+            self.log("GetNotifyExceptions");
+            let list: Vec<tl::enums::Update> = self
+                .notify_exceptions
+                .iter()
+                .map(|(who, muted)| {
+                    tl::types::UpdateNotifySettings {
+                        peer: tl::types::NotifyPeer { peer: who.peer() }.into(),
+                        notify_settings: settings(muted.then_some(i32::MAX)),
+                    }
+                    .into()
+                })
+                .collect();
+            return answer(updates(list));
+        }
+        if asked::<f::account::ResetNotifySettings>(body).is_some() {
+            self.log("ResetNotifySettings");
+            self.notify_defaults = [false; 3];
+            self.notify_exceptions.clear();
+            return answer(true);
+        }
+        if asked::<f::account::GetAuthorizations>(body).is_some() {
+            self.log("GetAuthorizations");
+            let authorizations: Vec<tl::enums::Authorization> = self
+                .sessions
+                .iter()
+                .map(|&(hash, app, device, region, country, current)| {
+                    tl::types::Authorization {
+                        current,
+                        official_app: !current,
+                        password_pending: false,
+                        encrypted_requests_disabled: false,
+                        call_requests_disabled: false,
+                        unconfirmed: false,
+                        hash,
+                        device_model: device.to_owned(),
+                        platform: "Desktop".to_owned(),
+                        system_version: "1.0".to_owned(),
+                        api_id: 1,
+                        app_name: app.to_owned(),
+                        app_version: "1.0".to_owned(),
+                        date_created: t0() - 86_400 * 10,
+                        date_active: t0() - 60,
+                        ip: "127.0.0.1".to_owned(),
+                        country: country.to_owned(),
+                        region: region.to_owned(),
+                    }
+                    .into()
+                })
+                .collect();
+            return answer(tl::enums::account::Authorizations::Authorizations(
+                tl::types::account::Authorizations {
+                    authorization_ttl_days: 180,
+                    authorizations,
+                },
+            ));
+        }
+        if let Some(request) = asked::<f::account::ResetAuthorization>(body) {
+            self.log(&format!("ResetAuthorization {}", request.hash));
+            self.sessions.retain(|s| s.0 != request.hash || s.5);
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::GetUnreadMentions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("GetUnreadMentions {k}"));
+            let ids = limited(self.unread_mentions.get(&k).map(Vec::as_slice).unwrap_or(&[]), request.limit);
+            let msgs: Vec<tl::enums::Message> = ids
+                .into_iter()
+                .filter_map(|id| self.messages.get(&k).and_then(|m| m.get(&id)).cloned())
+                .collect();
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages: msgs,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
+        }
+        if let Some(request) = asked::<f::messages::ReadMessageContents>(body) {
+            let joined = request.id.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            self.log(&format!("ReadMessageContents {joined}"));
+            for list in self.unread_mentions.values_mut() {
+                list.retain(|id| !request.id.contains(id));
+            }
+            return answer(tl::enums::messages::AffectedMessages::Messages(
+                tl::types::messages::AffectedMessages { pts: 1, pts_count: 0 },
+            ));
+        }
+        if let Some(request) = asked::<f::channels::ReadMessageContents>(body) {
+            let joined = request.id.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            self.log(&format!("channels.ReadMessageContents {joined}"));
+            for list in self.unread_mentions.values_mut() {
+                list.retain(|id| !request.id.contains(id));
+            }
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::ReadMentions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("ReadMentions {k}"));
+            self.unread_mentions.remove(&k);
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 1, pts_count: 0, offset: 0 },
+            ));
+        }
+        if let Some(request) = asked::<f::messages::GetUnreadReactions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("GetUnreadReactions {k}"));
+            let ids = limited(self.unread_reactions.get(&k).map(Vec::as_slice).unwrap_or(&[]), request.limit);
+            let msgs: Vec<tl::enums::Message> = ids
+                .into_iter()
+                .filter_map(|id| self.messages.get(&k).and_then(|m| m.get(&id)).cloned())
+                .collect();
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages: msgs,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
+        }
+        if let Some(request) = asked::<f::messages::ReadReactions>(body) {
+            let who = input_who(&request.peer);
+            let k = key(who, request.top_msg_id);
+            self.log(&format!("ReadReactions {k}"));
+            self.unread_reactions.remove(&k);
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 1, pts_count: 0, offset: 0 },
+            ));
+        }
+        if asked::<f::messages::GetSavedDialogs>(body).is_some() {
+            self.log("GetSavedDialogs");
+            let m_odalys = message(Who::User(ME), 201, ME, t0() - 50, "Trailhead at seven.");
+            let m_notes = message(Who::User(ME), 202, ME, t0() - 90, "Snow line is at 1,900 m this week.");
+            let d1 = tl::types::SavedDialog {
+                pinned: true,
+                peer: Who::User(ODALYS).peer(),
+                top_message: 201,
+            }
+            .into();
+            let d2 = tl::types::SavedDialog {
+                pinned: false,
+                peer: Who::Channel(NOTES).peer(),
+                top_message: 202,
+            }
+            .into();
+            let found = tl::types::messages::SavedDialogs {
+                dialogs: vec![d1, d2],
+                messages: vec![m_odalys.into(), m_notes.into()],
+                chats: chats(),
+                users: users(),
+            };
+            return answer(tl::enums::messages::SavedDialogs::Dialogs(found));
+        }
+        if asked::<f::messages::GetSavedReactionTags>(body).is_some() {
+            self.log("GetSavedReactionTags");
+            let tag = tl::types::SavedReactionTag {
+                reaction: tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: "⭐".to_owned() }),
+                title: Some("Gear".to_owned()),
+                count: 2,
+            }
+            .into();
+            return answer(tl::enums::messages::SavedReactionTags::Tags(tl::types::messages::SavedReactionTags {
+                tags: vec![tag],
+                hash: 1,
+            }));
+        }
+        if let Some(request) = asked::<f::messages::GetSavedHistory>(body) {
+            let who = input_who(&request.peer);
+            self.log(&format!("GetSavedHistory {}", who.text()));
+            let msgs = match who {
+                Who::User(ODALYS) => vec![message(Who::User(ME), 201, ME, t0() - 50, "Trailhead at seven.").into()],
+                Who::Channel(NOTES) => vec![message(Who::User(ME), 202, ME, t0() - 90, "Snow line is at 1,900 m this week.").into()],
+                _ => vec![message(Who::User(ME), 2, ME, t0() - 100_000, "Packing list: stove, map, headlamp.").into()],
+            };
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages: msgs,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
         }
         if asked::<f::account::UpdateStatus>(body).is_some() {
             self.log("UpdateStatus");
             return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::GetBotCallbackAnswer>(body) {
+            let who = input_who(&request.peer);
+            let data_str = request
+                .data
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            self.log(&format!("GetBotCallbackAnswer {} {} {}", who.text(), request.msg_id, data_str));
+            return answer(tl::enums::messages::BotCallbackAnswer::Answer(tl::types::messages::BotCallbackAnswer {
+                alert: false,
+                has_url: false,
+                native_ui: false,
+                message: Some("Approved!".to_owned()),
+                url: None,
+                cache_time: 0,
+            }));
         }
         if let Some(request) = asked::<f::messages::GetDialogs>(body) {
             let after = match &request.offset_peer {
@@ -3434,6 +3770,21 @@ impl World {
     fn panes(&mut self, body: &[u8], events: &Sender<Event>) -> Option<Result<Vec<u8>, Fault>> {
         use tl::functions as f;
         if let Some(request) = asked::<f::messages::Search>(body) {
+            if let Some(reactions) = request.saved_reaction.as_ref().filter(|r| !r.is_empty()) {
+                let emoji = match &reactions[0] {
+                    tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
+                    tl::enums::Reaction::CustomEmoji(c) => format!("custom:{}", c.document_id),
+                    _ => String::new(),
+                };
+                self.log(&format!("SearchSavedTag {emoji}"));
+                let msgs = vec![message(Who::User(ME), 2, ME, t0() - 100_000, "Packing list: stove, map, headlamp.").into()];
+                return Some(answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                    messages: msgs,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                })));
+            }
             if let tl::enums::MessagesFilter::InputMessagesFilterPhoneCalls(filter) = &request.filter {
                 self.log(&format!("Search calls missed={} offset={}", filter.missed, request.offset_id));
                 let mut calls: Vec<tl::enums::Message> = self
@@ -3743,12 +4094,24 @@ impl World {
             return Some(answer(tl::enums::channels::ChannelParticipant::Participant(found)));
         }
         if let Some(request) = asked::<f::account::UpdateNotifySettings>(body) {
+            let tl::enums::InputPeerNotifySettings::Settings(settings) = &request.settings;
+            let is_muted = settings.mute_until.is_some_and(|v| v > 0);
             let peer = match &request.peer {
                 tl::enums::InputNotifyPeer::Peer(peer) => input_who(&peer.peer).text(),
                 tl::enums::InputNotifyPeer::InputNotifyForumTopic(topic) => key(input_who(&topic.peer), Some(topic.top_msg_id)),
-                _ => "default".to_owned(),
+                tl::enums::InputNotifyPeer::InputNotifyUsers => {
+                    self.notify_defaults[0] = is_muted;
+                    "users".to_owned()
+                }
+                tl::enums::InputNotifyPeer::InputNotifyChats => {
+                    self.notify_defaults[1] = is_muted;
+                    "chats".to_owned()
+                }
+                tl::enums::InputNotifyPeer::InputNotifyBroadcasts => {
+                    self.notify_defaults[2] = is_muted;
+                    "broadcasts".to_owned()
+                }
             };
-            let tl::enums::InputPeerNotifySettings::Settings(settings) = &request.settings;
             self.log(&format!("UpdateNotifySettings {peer} {}", settings.mute_until.unwrap_or(-1)));
             return Some(answer(true));
         }

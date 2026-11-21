@@ -744,6 +744,118 @@ pub struct Capabilities {
     /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_mute: bool,
+    /// This account supports reading/updating account-wide notification defaults and exceptions (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub notify_defaults: bool,
+    /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub saved_subdialogs: bool,
+    /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active_sessions: bool,
+    /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread_jumps: bool,
+}
+
+/// Scope of an account-wide notification default (Telegram `InputNotifyUsers` / `Chats` / `Broadcasts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyDefaultScope {
+    Users,
+    Groups,
+    Channels,
+}
+
+/// One conversation whose notification setting overrides its account-wide scope default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyException {
+    pub conversation: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
+}
+
+/// Account-wide notification defaults and per-chat exceptions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyDefaults {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub users_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channels_muted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<NotifyException>,
+}
+
+/// One sub-view of Saved Messages grouped by source peer (`messages.getSavedDialogs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedDialog {
+    /// Peer id (e.g. `"u7002"`, `"c9001"`, or `"u7001"` for My Notes).
+    pub peer_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
+    #[serde(default)]
+    pub updated: i64,
+}
+
+/// One reaction tag applied to Saved Messages (`messages.getSavedReactionTags`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTag {
+    pub emoji: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub count: u32,
+}
+
+/// One active signed-in device/session on an account (`account.getAuthorizations`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSession {
+    /// Opaque session identifier (`"0"` for the current session on Telegram).
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub location: String,
+    #[serde(default)]
+    pub last_active: i64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub current: bool,
+}
+
+/// Which unread markers to list or clear in a conversation (`UnreadItems` / `MarkUnreadItemsRead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadItemKind {
+    Mentions,
+    Reactions,
+}
+
+/// What a jump tells the network it just opened.
+/// A mention is that message. A reaction names the one just opened until the last,
+/// which clears the chat (`readReactions` takes no ids).
+pub fn jump_mark_ids(kind: UnreadItemKind, id: &str, last: bool) -> Vec<String> {
+    match kind {
+        UnreadItemKind::Mentions => vec![id.to_owned()],
+        UnreadItemKind::Reactions if last => Vec::new(),
+        UnreadItemKind::Reactions => vec![id.to_owned()],
+    }
+}
+
+/// The badge left after that mark. An empty mark clears the count.
+pub fn badge_after_jump(count: u32, marked: u32) -> u32 {
+    if marked == 0 { 0 } else { count.saturating_sub(marked) }
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
@@ -1214,6 +1326,15 @@ impl Keychain {
 mod tests {
     use super::*;
     use crate::{AccountKey, Key, Network, Request};
+
+    #[test]
+    fn jump_mark_ids_mentions_one_message_and_reactions_clear_on_the_last() {
+        assert_eq!(jump_mark_ids(UnreadItemKind::Mentions, "21", true), vec!["21".to_owned()]);
+        assert_eq!(jump_mark_ids(UnreadItemKind::Reactions, "24", false), vec!["24".to_owned()]);
+        assert!(jump_mark_ids(UnreadItemKind::Reactions, "25", true).is_empty());
+        assert_eq!(badge_after_jump(3, 1), 2);
+        assert_eq!(badge_after_jump(3, 0), 0);
+    }
 
     #[test]
     fn profile_edit_capabilities_and_requests_round_trip() {

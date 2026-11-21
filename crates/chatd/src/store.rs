@@ -185,6 +185,7 @@ const TABLES: &str = "
         joined INTEGER NOT NULL DEFAULT 1,
         call_video INTEGER NOT NULL DEFAULT 0,
         shared INTEGER NOT NULL DEFAULT 0,
+        unread_reactions INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -304,7 +305,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared, c.unread_reactions
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -759,6 +760,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         joined: row.get(58)?,
         call_video: row.get(59)?,
         shared: row.get(60)?,
+        unread_reactions: row.get(61)?,
     })
 }
 
@@ -1086,6 +1088,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "shared")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !column(db, "conversation", "unread_reactions")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN unread_reactions INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(true)
 }
 
@@ -1162,6 +1167,9 @@ impl Store {
         }
         if !column(&store.db, "conversation", "shared")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "unread_reactions")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN unread_reactions INTEGER NOT NULL DEFAULT 0")?;
         }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
@@ -2626,6 +2634,24 @@ impl Store {
     /// not clear a badge a live message already raised: Tiny channels have no cursor, and their
     /// ids are UUIDs, so text order cannot say the preview was already read. A newer `updated`
     /// with no cursor is real activity (Discord's unread push) and may raise the badge again.
+    pub fn set_unread_reactions(&mut self, conversation: &Key, unread_reactions: u32) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET unread_reactions = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND unread_reactions != ?4",
+            params![word(&conversation.network), conversation.account, conversation.id, unread_reactions],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn set_mentions_count(&mut self, conversation: &Key, mentions: u32) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET mentions = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND mentions != ?4",
+            params![word(&conversation.network), conversation.account, conversation.id, mentions],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn set_counts(
         &mut self,
         conversation: &Key,
