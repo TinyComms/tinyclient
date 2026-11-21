@@ -458,6 +458,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         from_title: "#announcements".to_owned(),
         from_space: String::new(),
         link: format!("https://discord.com/channels/{}/400000000000000002", discord::MOSS),
+        ..Forwarded::default()
     }));
     feed.push(forward);
     let mut afar = s.message(account, who(TOMASZ), step(5), "Someone got the same sensor working with a 3.3 V regulator. Schematic in their post.");
@@ -465,6 +466,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         from_title: "#show-and-tell".to_owned(),
         from_space: "Rustaceans Anonymous".to_owned(),
         link: "https://discord.com/channels/300000000000000002/410000000000000002".to_owned(),
+        ..Forwarded::default()
     }));
     afar.attachments.push(photo(s, account, "schematic.png", "schematic.webp", Art::Bands, 480, 320)?);
     feed.push(afar);

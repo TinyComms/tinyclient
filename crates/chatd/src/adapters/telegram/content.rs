@@ -1595,6 +1595,7 @@ fn forwarded(dir: &Directory, header: &tl::enums::MessageFwdHeader) -> Forwarded
         from_title: title,
         from_space: String::new(),
         link,
+        ..Forwarded::default()
     }
 }
 

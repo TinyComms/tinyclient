@@ -800,6 +800,7 @@ impl Demo {
                             from_title: from_title.clone(),
                             from_space: from_space.clone(),
                             link: String::new(),
+                            ..protocol::Forwarded::default()
                         }));
                         if let Err(e) = demo.ctx.message(&target, &fwd) {
                             err = Some(e.to_string());

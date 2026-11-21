@@ -622,7 +622,7 @@ impl Slack {
     }
 
     /// Where the official app shows this message.
-    fn permalink(&self, channel: &str, ts: &str, thread: Option<&str>) -> String {
+    pub(super) fn permalink(&self, channel: &str, ts: &str, thread: Option<&str>) -> String {
         let link = format!("{}archives/{channel}/p{}", self.session.url, ts.replace('.', ""));
         match thread {
             Some(thread) => format!("{link}?thread_ts={thread}&cid={channel}"),
@@ -914,15 +914,20 @@ impl Slack {
         }
     }
 
-    /// A message shared from elsewhere ("Share message"): where it came from, and what it said
-    /// as the message's own text and files.
-    // CONTRACT: `Forwarded` keeps no place for what the forwarder wrote themselves, apart from
-    // what was forwarded: both are the message's text, the forwarder's words first.
+    /// A message shared from elsewhere ("Share message"): where it came from, and what it said.
+    /// When the forwarder also wrote a note (`rich.text` is non-empty), the note stays in
+    /// `Message::text` and the forwarded message's body sits in `Forwarded::text` so both stay distinct.
     fn forwarded(&self, card: &Value, rich: &mut Rich, media: &mut Registered, variants: &mut Sizes, attachments: &mut Vec<Attachment>) -> Forwarded {
-        rich.line();
+        let mut quoted = Rich::new(self);
         let blocks = card["message_blocks"][0]["message"]["blocks"].as_array();
-        if !blocks.is_some_and(|blocks| rich.blocks(blocks)) {
-            rich.mrkdwn(first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
+        if !blocks.is_some_and(|blocks| quoted.blocks(blocks)) {
+            quoted.mrkdwn(first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
+        }
+        quoted.finish();
+        let has_note = !rich.text.trim().is_empty();
+        if !has_note && !quoted.text.is_empty() {
+            rich.text = quoted.text.clone();
+            rich.spans = quoted.spans;
         }
         for file in card["files"].as_array().into_iter().flatten() {
             attachments.extend(self.file(file, media, variants));
@@ -941,6 +946,8 @@ impl Slack {
             // worth a lookup, and Slack does not send the workspace's name.
             from_space: first(&[&card["from_url"]]).and_then(|url| self.workspace_named(url)).unwrap_or_default(),
             link: first(&[&card["from_url"]]).unwrap_or("").to_owned(),
+            author: first(&[&card["author_name"]]).unwrap_or("").to_owned(),
+            text: quoted.text,
         }
     }
 

@@ -264,8 +264,9 @@ pub struct ThreadSummary {
     pub unread: u32,
 }
 
-/// Where a forwarded message came from. What was forwarded is the message's own text and
-/// attachments.
+/// Where a forwarded message came from. When the forwarder also wrote a note of their own,
+/// the note stays in `Message::text` and the forwarded message's body sits in `text` (with
+/// `author` naming who originally said it).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Forwarded {
     /// The conversation it was first said in: `#announcements`, a person's name.
@@ -277,6 +278,12 @@ pub struct Forwarded {
     /// Opens the original in the network's own app. Empty when it cannot be linked to.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub link: String,
+    /// Who originally wrote the forwarded message, when distinct from the forwarder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author: String,
+    /// The forwarded message's own text when kept distinct from a forwarder's note.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
 }
 
 /// What a bot or app posts instead of plain text: an embed, a block of fields. Drawn as one
@@ -797,6 +804,8 @@ impl Message {
             clip(&mut forwarded.from_title, 200);
             clip(&mut forwarded.from_space, 200);
             clip(&mut forwarded.link, 2_000);
+            clip(&mut forwarded.author, 200);
+            clip(&mut forwarded.text, 4_000);
         }
         if let Some(prior) = &mut self.prior_text {
             clip(prior, PRIOR_LIMIT);

@@ -1863,16 +1863,21 @@ impl Slack {
         targets: &[String],
         note: &str,
     ) -> Result<Vec<(String, Result<(), String>)>, Fault> {
-        let from_channel = thread_of(from).map_or(from, |(channel, _)| channel);
+        let (from_channel, from_thread) = match thread_of(from) {
+            Some((channel, root)) => (channel, Some(root)),
+            None => (from, None),
+        };
         let from_key = self.ctx.key(from);
         let mut snippets = Vec::new();
         for mid in message_ids {
             let permalink = self
                 .api("chat.getPermalink", &[("channel", from_channel), ("message_ts", mid)])
                 .ok()
-                .and_then(|v| v["permalink"].as_str().map(str::to_owned));
+                .and_then(|v| v["permalink"].as_str().filter(|s| !s.is_empty()).map(str::to_owned));
             if let Some(link) = permalink {
                 snippets.push(link);
+            } else if !self.session.url.is_empty() {
+                snippets.push(self.permalink(from_channel, mid, from_thread.filter(|root| *root != mid.as_str())));
             } else if let Ok(Some(msg)) = self.ctx.hub.store().message(&from_key, mid) {
                 snippets.push(format!("> {}", msg.text));
             }
@@ -1888,8 +1893,15 @@ impl Slack {
         text.push_str(&snippets.join("\n"));
         let mut results = Vec::with_capacity(targets.len());
         for target in targets {
-            let channel = thread_of(target).map_or(target.as_str(), |(c, _)| c);
-            let res = self.api("chat.postMessage", &[("channel", channel), ("text", text.as_str())]);
+            let (channel, thread_ts) = match thread_of(target) {
+                Some((c, root)) => (c, Some(root)),
+                None => (target.as_str(), None),
+            };
+            let mut params = vec![("channel", channel), ("text", text.as_str()), ("unfurl_links", "true")];
+            if let Some(root) = thread_ts {
+                params.push(("thread_ts", root));
+            }
+            let res = self.api("chat.postMessage", &params);
             results.push((target.clone(), res.map(|_| ()).map_err(|e| reason(e))));
         }
         Ok(results)

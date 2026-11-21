@@ -3971,3 +3971,63 @@ fn slack_pin_unpin_socket_events_and_pinned_files() {
         (!world.message(&general, &target)?.pinned).then_some(())
     });
 }
+
+#[test]
+fn slack_share_forward_with_note_and_distinct_received_share() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let dm = alpha("D0ANA");
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+
+    // Ensure history is loaded so the message exists locally.
+    let _ = world.ask(Request::Messages { conversation: general.clone(), page: Page::Newest, limit: 20 });
+
+    // Forward a message from #general to a DM and a thread with a note.
+    let reply = world.ask(Request::Forward {
+        from: general.clone(),
+        message_ids: vec![ROOT.to_owned()],
+        to: vec![dm.clone(), thread.clone()],
+        note: "Please take a look".into(),
+    });
+    let Response::Forwarded { results } = reply else {
+        panic!("expected Forwarded, got {reply:?}");
+    };
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.ok), "results: {results:?}");
+
+    let posts = world.fake.calls(ALPHA, "chat.postMessage");
+    let dm_post = posts.iter().find(|c| c.params.get("channel").map(String::as_str) == Some("D0ANA")).expect("DM post");
+    assert!(dm_post.params["text"].starts_with("Please take a look\n"), "got: {}", dm_post.params["text"]);
+    assert!(dm_post.params["text"].contains("archives/C0GEN/p1760000200000200"), "got: {}", dm_post.params["text"]);
+    assert_eq!(dm_post.params.get("unfurl_links").map(String::as_str), Some("true"));
+
+    let thread_post = posts.iter().find(|c| c.params.get("channel").map(String::as_str) == Some("C0GEN")).expect("thread post");
+    assert_eq!(thread_post.params.get("thread_ts").map(String::as_str), Some(ROOT));
+
+    // Received `is_share` with BOTH forwarder note and forwarded text keeps them distinct.
+    let ts = "1760000700.000700";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Check this out",
+        "ts": ts,
+        "event_ts": ts,
+        "attachments": [{
+            "is_share": true,
+            "channel_name": "buying",
+            "author_name": "Nia",
+            "text": "The order shipped",
+            "fallback": "The order shipped",
+            "from_url": "https://alpha.slack.com/archives/C0BUY/p1760000100000100",
+        }],
+    }));
+    let arrived = world.until("shared message with note", || world.message(&general, ts));
+    assert_eq!(arrived.text, "Check this out");
+    let shared = arrived.forwarded.as_ref().expect("forwarded metadata");
+    assert_eq!(shared.from_title, "#buying");
+    assert_eq!(shared.author, "Nia");
+    assert_eq!(shared.text, "The order shipped");
+    assert_eq!(shared.link, "https://alpha.slack.com/archives/C0BUY/p1760000100000100");
+}
