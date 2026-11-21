@@ -1657,6 +1657,10 @@ pub enum Request {
     GetAutoDownload { account: AccountKey },
     /// Writes the presets (`account.saveAutoDownloadSettings`) and the local chat-kind gates.
     SetAutoDownload { account: AccountKey, settings: AutoDownload },
+    /// A channel's boost level (`premium.getBoostsStatus`).
+    GetBoosts { conversation: Key },
+    /// Gives this Premium account's free boost to the channel (`premium.applyBoost`).
+    ApplyBoost { conversation: Key },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2931,6 +2935,11 @@ pub enum Response {
     },
     AutoDownload {
         settings: AutoDownload,
+    },
+    /// A channel's boost level, and the free slots this account can still give.
+    Boosts {
+        conversation: Key,
+        status: ChannelBoosts,
     },
     Folders {
         folders: Vec<Folder>,

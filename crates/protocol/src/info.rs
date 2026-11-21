@@ -150,6 +150,29 @@ impl Default for AutoDownload {
     }
 }
 
+/// A channel's boost level, from `premium.getBoostsStatus`.
+/// `slots` are the free boosts this Premium account can still give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelBoosts {
+    #[serde(default)]
+    pub level: i32,
+    #[serde(default)]
+    pub boosts: i32,
+    #[serde(default)]
+    pub current_level_boosts: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_level_boosts: Option<i32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub my_boost: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<i32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boost_url: String,
+    /// The signed-in account is Telegram Premium, so it may give a boost.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_boost: bool,
+}
+
 /// Cached files one conversation is using, when those files can be attributed to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatCache {

@@ -711,6 +711,16 @@ pub enum Command {
         settings: protocol::AutoDownload,
         reply: Reply<protocol::AutoDownload>,
     },
+    /// A channel's boost level.
+    GetBoosts {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelBoosts>,
+    },
+    /// Gives a free Premium boost to that channel.
+    ApplyBoost {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelBoosts>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -899,6 +909,8 @@ impl Command {
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

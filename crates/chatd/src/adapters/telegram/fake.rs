@@ -554,6 +554,12 @@ struct World {
     download: [tl::types::AutoDownloadSettings; 3],
     /// The next `account.saveAutoDownloadSettings` returns `PREMIUM_ACCOUNT_REQUIRED`.
     download_refuse: bool,
+    /// Channel id this account's one boost slot is applied to.
+    boost_peer: Option<i64>,
+    boost_level: i32,
+    boost_count: i32,
+    /// The next `premium.applyBoost` returns `PREMIUM_ACCOUNT_REQUIRED`.
+    boost_refuse: bool,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -648,6 +654,10 @@ impl World {
                 download_preset(false, 1_048_576, 10_485_760, 1_048_576),
             ],
             download_refuse: false,
+            boost_peer: None,
+            boost_level: 3,
+            boost_count: 12,
+            boost_refuse: false,
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -898,6 +908,32 @@ fn app_config() -> tl::enums::help::AppConfig {
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
     Fault::Rpc { code, name: name.to_owned(), value }
+}
+
+fn boost_status(level: i32, boosts: i32, mine: bool, url: &str) -> tl::types::premium::BoostsStatus {
+    tl::types::premium::BoostsStatus {
+        my_boost: mine,
+        level,
+        current_level_boosts: 10,
+        boosts,
+        gift_boosts: None,
+        next_level_boosts: Some(20),
+        premium_audience: None,
+        boost_url: url.to_owned(),
+        prepaid_giveaways: None,
+        my_boost_slots: mine.then_some(vec![1]),
+    }
+}
+
+fn one_boost(slot: i32, channel: Option<i64>) -> tl::enums::MyBoost {
+    tl::types::MyBoost {
+        slot,
+        peer: channel.map(|id| Who::Channel(id).peer()),
+        date: t0(),
+        expires: t0() + 30 * 86_400,
+        cooldown_until_date: None,
+    }
+    .into()
 }
 
 fn download_preset(disabled: bool, photo: i32, video: i64, file: i64) -> tl::types::AutoDownloadSettings {
@@ -1579,6 +1615,10 @@ impl World {
             }
             "autodownload-refuse" => {
                 self.download_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "boost-refuse" => {
+                self.boost_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
                 Vec::new()
             }
             "transcribe-update" => {
@@ -2920,6 +2960,45 @@ impl World {
             ));
             self.download[slot] = settings.clone();
             return answer(true);
+        }
+        if let Some(request) = asked::<f::premium::GetBoostsStatus>(body) {
+            let Who::Channel(id) = input_who(&request.peer) else {
+                self.log("premium.getBoostsStatus refused");
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            };
+            self.log(&format!("premium.getBoostsStatus c{id}"));
+            let url = if id == NOTES { "https://t.me/boost/fieldnotes".to_owned() } else { format!("https://t.me/boost/c{id}") };
+            let status = boost_status(self.boost_level, self.boost_count, self.boost_peer == Some(id), &url);
+            return answer(tl::enums::premium::BoostsStatus::Status(status));
+        }
+        if asked::<f::premium::GetMyBoosts>(body).is_some() {
+            let free = self.boost_peer.is_none();
+            self.log(if free { "premium.getMyBoosts free" } else { "premium.getMyBoosts used" });
+            let mine = tl::types::premium::MyBoosts { my_boosts: vec![one_boost(1, self.boost_peer)], chats: Vec::new(), users: Vec::new() };
+            return answer(tl::enums::premium::MyBoosts::Boosts(mine));
+        }
+        if let Some(request) = asked::<f::premium::ApplyBoost>(body) {
+            if self.boost_refuse {
+                self.log("premium.applyBoost refused");
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
+            let Who::Channel(id) = input_who(&request.peer) else {
+                self.log("premium.applyBoost refused");
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            };
+            let slot = request.slots.as_ref().and_then(|slots| slots.first().copied()).unwrap_or(1);
+            if self.boost_peer.is_some_and(|held| held != id) {
+                self.log(&format!("premium.applyBoost c{id} slot={slot} empty"));
+                return Err(rpc(400, "BOOSTS_EMPTY", None));
+            }
+            self.log(&format!("premium.applyBoost c{id} slot={slot}"));
+            self.boost_peer = Some(id);
+            self.boost_count += 1;
+            if self.boost_count >= 20 {
+                self.boost_level += 1;
+            }
+            let mine = tl::types::premium::MyBoosts { my_boosts: vec![one_boost(slot, Some(id))], chats: Vec::new(), users: Vec::new() };
+            return answer(tl::enums::premium::MyBoosts::Boosts(mine));
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;

@@ -683,11 +683,25 @@ pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
     }
     if matches!(scheme, "http" | "https") && matches!(host.as_str(), "t.me" | "telegram.me" | "telegram.dog") {
         let first = *segments.first()?;
+        // t.me/boost/{username} opens that channel. `space` marks it as a boost link; no new field.
+        if first.eq_ignore_ascii_case("boost") {
+            let name = *segments.get(1)?;
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return None;
+            }
+            return Some(NetworkLink {
+                network: crate::Network::Telegram,
+                space: Some("boost".to_owned()),
+                channel: name.to_owned(),
+                message_id: None,
+                thread_id: None,
+            });
+        }
         // Invite links and Telegram utility routes stay external.
         if first.starts_with('+')
             || matches!(
                 first.to_ascii_lowercase().as_str(),
-                "joinchat" | "addstickers" | "addemoji" | "addlist" | "addtheme" | "proxy" | "socks" | "share" | "login" | "iv" | "bg" | "setlanguage" | "boost" | "giftcode"
+                "joinchat" | "addstickers" | "addemoji" | "addlist" | "addtheme" | "proxy" | "socks" | "share" | "login" | "iv" | "bg" | "setlanguage" | "giftcode"
             )
         {
             return None;
@@ -1129,6 +1143,17 @@ mod tests {
                 thread_id: None,
             })
         );
+        assert_eq!(
+            parse_network_link("https://t.me/boost/fieldnotes"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: Some("boost".into()),
+                channel: "fieldnotes".into(),
+                message_id: None,
+                thread_id: None,
+            })
+        );
+        assert_eq!(parse_network_link("https://t.me/boost"), None);
         assert_eq!(parse_network_link("https://t.me/+secretInviteHash"), None);
         assert_eq!(parse_network_link("https://t.me/joinchat/abc"), None);
 

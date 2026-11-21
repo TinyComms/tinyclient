@@ -979,6 +979,63 @@ pub(super) fn set_auto_download(account: &Account, settings: &protocol::AutoDown
     Ok(settings.clone())
 }
 
+fn free_slots(boosts: &[tl::enums::MyBoost]) -> Vec<i32> {
+    boosts
+        .iter()
+        .filter_map(|one| {
+            let tl::enums::MyBoost::Boost(one) = one;
+            (one.peer.is_none() && one.cooldown_until_date.is_none()).then_some(one.slot)
+        })
+        .collect()
+}
+
+fn boosts_of(account: &Account, who: Who) -> Result<protocol::ChannelBoosts, Fault> {
+    let peer = account.input(who)?;
+    let tl::enums::premium::BoostsStatus::Status(status) = account.ask(&tl::functions::premium::GetBoostsStatus { peer })?;
+    let can_boost = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
+    let slots = if can_boost {
+        let tl::enums::premium::MyBoosts::Boosts(mine) = account.ask(&tl::functions::premium::GetMyBoosts {})?;
+        account.learn(&mine.users, &mine.chats);
+        free_slots(&mine.my_boosts)
+    } else {
+        Vec::new()
+    };
+    Ok(protocol::ChannelBoosts {
+        level: status.level,
+        boosts: status.boosts,
+        current_level_boosts: status.current_level_boosts,
+        next_level_boosts: status.next_level_boosts,
+        my_boost: status.my_boost,
+        slots,
+        boost_url: status.boost_url,
+        can_boost,
+    })
+}
+
+/// A channel's boost level. Anything that is not a channel is refused.
+pub(super) fn get_boosts(account: &Account, conversation: &str) -> Result<protocol::ChannelBoosts, Fault> {
+    let (who @ Who::Channel(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    boosts_of(account, who)
+}
+
+/// Gives one free Premium slot to the channel, after the shell has confirmed.
+pub(super) fn apply_boost(account: &Account, conversation: &str) -> Result<protocol::ChannelBoosts, Fault> {
+    let (who @ Who::Channel(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let peer = account.input(who)?;
+    let tl::enums::premium::MyBoosts::Boosts(mine) = account.ask(&tl::functions::premium::GetMyBoosts {})?;
+    account.learn(&mine.users, &mine.chats);
+    let Some(&slot) = free_slots(&mine.my_boosts).first() else {
+        return Err(invalid("BOOSTS_EMPTY"));
+    };
+    let tl::enums::premium::MyBoosts::Boosts(applied) = account.ask(&tl::functions::premium::ApplyBoost { slots: Some(vec![slot]), peer })?;
+    account.learn(&applied.users, &applied.chats);
+    boosts_of(account, who)
+}
+
 fn tl_report_reason(reason: protocol::ReportReason) -> tl::enums::ReportReason {
     match reason {
         protocol::ReportReason::Spam => tl::enums::ReportReason::InputReportReasonSpam,

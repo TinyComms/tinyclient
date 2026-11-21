@@ -3670,6 +3670,52 @@ fn auto_download_reads_wifi_limits_and_refuses_a_save() {
 }
 
 #[test]
+fn channel_boosts_read_the_level_and_applying_one_can_be_refused() {
+    use protocol::ErrorCode;
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::Boosts { status, .. } = world.ask(Request::GetBoosts { conversation: key("c9001") }) else {
+        panic!("expected Boosts");
+    };
+    assert_eq!(status.level, 3);
+    assert_eq!(status.boosts, 12);
+    assert_eq!(status.next_level_boosts, Some(20));
+    assert!(!status.my_boost);
+    assert!(
+        world.calls().iter().any(|c| c == "premium.getBoostsStatus c9001"),
+        "expected getBoostsStatus on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("boost-refuse");
+    match world.ask(Request::ApplyBoost { conversation: key("c9001") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a premium refusal, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("premium.applyBoost refused")),
+        "expected the refused apply on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("boost-refuse 0");
+    let Response::Boosts { status, .. } = world.ask(Request::ApplyBoost { conversation: key("c9001") }) else {
+        panic!("expected Boosts after apply");
+    };
+    assert!(status.my_boost);
+    assert_eq!(status.level, 3);
+    assert_eq!(status.boosts, 13);
+    assert!(
+        world.calls().iter().any(|c| c.contains("premium.applyBoost c9001 slot=1")),
+        "expected applyBoost on the wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
 fn shared_contact_send_and_receive() {
     let world = World::signed_in();
     world.connected();

@@ -86,6 +86,10 @@ pub struct InfoPane {
     manage: Option<(Key, ManageKind, Entity<crate::gui::input::TextInput>)>,
     /// Pending confirmation to remove a member: (conversation, person_id, person_name).
     pending_remove: Option<(Key, String, String)>,
+    /// A Telegram channel's boost level, loaded when its Details open.
+    boosts: Option<(Key, Answer<protocol::ChannelBoosts>)>,
+    /// The Boost button is waiting for a yes.
+    boost_confirm: bool,
     /// The content width, from the pane's.
     width: f32,
     /// The shell's Spaces, for In common and Details' icons.
@@ -138,6 +142,8 @@ impl InfoPane {
             notify_set: None,
             manage: None,
             pending_remove: None,
+            boosts: None,
+            boost_confirm: false,
             width: 268.,
             spaces: Vec::new(),
         }
@@ -284,6 +290,10 @@ impl InfoPane {
         self.hub.watch("info", [], cx);
         let same = self.subject.as_ref() == Some(&Subject::Conversation(key.clone()));
         self.subject = Some(Subject::Conversation(key.clone()));
+        if !same {
+            self.boosts = None;
+            self.boost_confirm = false;
+        }
         self.row = row.or_else(|| self.row.clone().filter(|_| same));
         let entity = cx.entity();
         self.shared.show(Some(key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
@@ -307,6 +317,7 @@ impl InfoPane {
                         if small {
                             this.ask_members(key.clone(), asked, cx);
                         }
+                        this.load_boosts(key.clone(), cx);
                         Answer::Got(*info)
                     }
                     _ => Answer::Failed,
@@ -1067,6 +1078,76 @@ impl InfoPane {
 
     pub(in crate::gui) fn managing(&self) -> Option<&(Key, ManageKind, Entity<crate::gui::input::TextInput>)> {
         self.manage.as_ref()
+    }
+
+    pub(in crate::gui) fn channel_boosts(&self, key: &Key) -> Option<&protocol::ChannelBoosts> {
+        match self.boosts.as_ref() {
+            Some((held, Answer::Got(status))) if held == key => Some(status),
+            _ => None,
+        }
+    }
+
+    pub(in crate::gui) fn boosts_waiting(&self, key: &Key) -> bool {
+        matches!(&self.boosts, Some((held, Answer::Waiting)) if held == key)
+    }
+
+    pub(in crate::gui) fn boost_confirming(&self, key: &Key) -> bool {
+        self.boost_confirm && self.boosts.as_ref().is_some_and(|(held, _)| held == key)
+    }
+
+    pub(in crate::gui) fn ask_boost_confirm(&mut self, cx: &mut Context<Self>) {
+        self.boost_confirm = true;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_boost(&mut self, cx: &mut Context<Self>) {
+        self.boost_confirm = false;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn confirm_boost(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.boosts.as_ref().map(|(key, _)| key.clone()) else {
+            return;
+        };
+        self.boost_confirm = false;
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::ApplyBoost { conversation: key.clone() }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(Response::Boosts { status, conversation }) = answer {
+                    if this.boosts.as_ref().is_some_and(|(held, _)| held == &conversation) {
+                        this.boosts = Some((key, Answer::Got(status)));
+                    }
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    fn load_boosts(&mut self, key: Key, cx: &mut Context<Self>) {
+        let channel = self.row.as_ref().is_some_and(|row| row.key == key && row.key.network == Network::Telegram && row.kind == protocol::ConversationKind::Channel);
+        if !channel {
+            return;
+        }
+        if self.boosts.as_ref().is_some_and(|(held, answer)| held == &key && !matches!(answer, Answer::Failed)) {
+            return;
+        }
+        self.boosts = Some((key.clone(), Answer::Waiting));
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::GetBoosts { conversation: key.clone() }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let Some((held, slot)) = this.boosts.as_mut() else {
+                    return;
+                };
+                if held != &key {
+                    return;
+                }
+                *slot = match answer {
+                    Ok(Response::Boosts { status, .. }) => Answer::Got(status),
+                    _ => Answer::Failed,
+                };
+                cx.notify();
+            });
+        });
     }
 
     pub(in crate::gui) fn pending_remove(&self) -> Option<&(Key, String, String)> {

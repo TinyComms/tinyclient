@@ -156,8 +156,14 @@ impl Pane {
             cx.spawn(async move |this, cx| {
                 let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
                 if let Ok(protocol::Response::Resolved { conversation: Some(key), message_id, title }) = answer {
+                    let boost = protocol::link::parse_network_link(&owned).is_some_and(|link| link.space.as_deref() == Some("boost"));
                     let _ = this.update(cx, |this, cx| {
-                        let _ = this.shell.update(cx, |shell, cx| shell.open_resolved_link(key, message_id, &title, cx));
+                        let _ = this.shell.update(cx, |shell, cx| {
+                            shell.open_resolved_link(key.clone(), message_id, &title, cx);
+                            if boost {
+                                shell.details_conversation(key, cx);
+                            }
+                        });
                     });
                     return;
                 }

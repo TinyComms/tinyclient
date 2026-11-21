@@ -2308,6 +2308,28 @@ impl Chat {
         }
     }
 
+    fn get_boosts(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::GetBoosts { conversation_id, reply }) {
+            Ok(status) => Response::Boosts { conversation, status },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn apply_boost(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::ApplyBoost { conversation_id, reply }) {
+            Ok(status) => Response::Boosts { conversation, status },
+            Err(refused) => *refused,
+        }
+    }
+
     fn set_auto_download(&self, account: AccountKey, settings: protocol::AutoDownload) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -3316,6 +3338,8 @@ impl Chat {
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::GetAutoDownload { account } => self.get_auto_download(account),
             Request::SetAutoDownload { account, settings } => self.set_auto_download(account, settings),
+            Request::GetBoosts { conversation } => self.get_boosts(conversation),
+            Request::ApplyBoost { conversation } => self.apply_boost(conversation),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
