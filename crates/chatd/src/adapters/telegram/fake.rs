@@ -542,6 +542,10 @@ struct World {
     blocked: HashSet<i64>,
     /// Per-user `(phone_calls_available, phone_calls_private, video_calls_available)` for `GetFullUser`.
     call_flags: HashMap<i64, (bool, bool, bool)>,
+    /// Users whose `UserFull::voice_messages_forbidden` is true and whose `SendMedia` refuses voice notes.
+    voice_forbidden: HashSet<i64>,
+    /// Groups/supergroups where `send_voices` is forbidden (`CHAT_SEND_VOICES_FORBIDDEN`).
+    voice_banned: HashSet<Who>,
     /// Stored privacy rules by key name (`phone_call`, `phone_p2p`, `voice_messages`).
     privacy: HashMap<&'static str, Vec<tl::enums::PrivacyRule>>,
     calls: PathBuf,
@@ -616,6 +620,8 @@ impl World {
             topic_reads: HashMap::new(),
             blocked: HashSet::new(),
             call_flags: HashMap::new(),
+            voice_forbidden: HashSet::new(),
+            voice_banned: HashSet::new(),
             privacy: HashMap::from([
                 ("phone_call", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
                 ("phone_p2p", vec![tl::enums::PrivacyRule::PrivacyValueAllowContacts]),
@@ -1484,6 +1490,27 @@ impl World {
                 let priv_ = words.next().is_some_and(|v| v == "1" || v == "true");
                 let video = words.next().is_some_and(|v| v == "1" || v == "true");
                 self.call_flags.insert(id, (avail, priv_, video));
+                Vec::new()
+            }
+            "voice-forbidden" => {
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
+                let on = words.next().map_or(true, |v| v == "1" || v == "true");
+                if on {
+                    self.voice_forbidden.insert(id);
+                } else {
+                    self.voice_forbidden.remove(&id);
+                }
+                Vec::new()
+            }
+            "voice-ban" => {
+                if let Some((who, None)) = words.next().and_then(Who::parse) {
+                    let on = words.next().map_or(true, |v| v == "1" || v == "true");
+                    if on {
+                        self.voice_banned.insert(who);
+                    } else {
+                        self.voice_banned.remove(&who);
+                    }
+                }
                 Vec::new()
             }
             "call-event" => {
@@ -2692,6 +2719,7 @@ impl World {
             full.phone_calls_available = phone_avail;
             full.phone_calls_private = phone_priv;
             full.video_calls_available = video_avail;
+            full.voice_messages_forbidden = self.voice_forbidden.contains(&id);
             let mut people = users();
             if id == TOBIN {
                 full.birthday = Some(tl::types::Birthday { day: 14, month: 3, year: None }.into());
@@ -3362,6 +3390,23 @@ impl World {
             let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("SendMedia {} {kind} {}{noted}{options}", peer.text(), request.message));
+            if kind.starts_with("voice-note") {
+                if let Who::User(id) = peer {
+                    if self.voice_forbidden.contains(&id) {
+                        return Some(Err(Fault::Rpc {
+                            code: 403,
+                            name: "VOICE_MESSAGES_FORBIDDEN".to_owned(),
+                            value: None,
+                        }));
+                    }
+                } else if self.voice_banned.contains(&peer) {
+                    return Some(Err(Fault::Rpc {
+                        code: 403,
+                        name: "CHAT_SEND_VOICES_FORBIDDEN".to_owned(),
+                        value: None,
+                    }));
+                }
+            }
             return Some(self.deliver(events, peer, None, None, vec![(request.random_id, request.message, Some(media), request.entities)], request.schedule_date));
         }
         if let Some(request) = asked::<f::messages::SendMultiMedia>(body) {

@@ -70,6 +70,10 @@ impl Fault {
                 }
                 "PARTICIPANTS_HIDDEN" => "This group hides its member list.".to_owned(),
                 "USER_PRIVACY_RESTRICTED" => "This person's privacy settings don't allow calls.".to_owned(),
+                "VOICE_MESSAGES_FORBIDDEN" => "This person doesn't accept voice and video messages.".to_owned(),
+                "CHAT_SEND_VOICES_FORBIDDEN" | "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN" => {
+                    "Voice and video messages aren't allowed in this group.".to_owned()
+                }
                 "CALL_PROTOCOL_COMPAT_LAYER_INVALID" => "This call protocol version isn't supported.".to_owned(),
                 "PARTICIPANT_VERSION_OUTDATED" => "The other person's Telegram app needs an update for this call.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
@@ -212,5 +216,15 @@ mod tests {
         assert!(compat.words().contains("protocol"), "{}", compat.words());
         let outdated = Fault::Rpc { code: 400, name: "PARTICIPANT_VERSION_OUTDATED".into(), value: None };
         assert!(outdated.words().contains("update"), "{}", outdated.words());
+    }
+
+    #[test]
+    fn voice_message_refusal_rpc_errors_map_to_plain_words() {
+        let user = Fault::Rpc { code: 403, name: "VOICE_MESSAGES_FORBIDDEN".into(), value: None };
+        assert!(user.words().contains("voice and video messages"), "{}", user.words());
+        let group = Fault::Rpc { code: 403, name: "CHAT_SEND_VOICES_FORBIDDEN".into(), value: None };
+        assert!(group.words().contains("aren't allowed in this group"), "{}", group.words());
+        let round = Fault::Rpc { code: 403, name: "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN".into(), value: None };
+        assert!(round.words().contains("aren't allowed in this group"), "{}", round.words());
     }
 }

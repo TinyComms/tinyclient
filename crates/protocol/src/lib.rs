@@ -573,6 +573,10 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
+    /// Why voice and round video messages are not allowed in this conversation (e.g. the recipient's
+    /// Telegram setting or group banned rights). Empty when allowed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub voice_notes_forbidden: String,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -642,12 +646,18 @@ impl Conversation {
             moderate: false,
             can_pin: false,
             joined: true,
+            voice_notes_forbidden: String::new(),
         }
     }
 
     /// Whether this account may post messages in this conversation.
     pub fn can_post(&self) -> bool {
         !self.read_only
+    }
+
+    /// Whether voice and round video messages may be sent in this conversation.
+    pub fn allows_voice_notes(&self) -> bool {
+        self.voice_notes_forbidden.is_empty()
     }
 
     /// The mark on my newest message. `None` when the newest is not mine.

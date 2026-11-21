@@ -184,6 +184,7 @@ const TABLES: &str = "
         can_pin INTEGER NOT NULL DEFAULT 0,
         joined INTEGER NOT NULL DEFAULT 1,
         call_video INTEGER NOT NULL DEFAULT 0,
+        voice_notes_forbidden TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -303,7 +304,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.voice_notes_forbidden
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -410,6 +411,8 @@ pub struct ConversationRow {
     pub can_pin: bool,
     /// Whether this account has joined the conversation (`false` for an unjoined channel preview).
     pub joined: bool,
+    /// Why voice and round video messages are not allowed here (empty when allowed).
+    pub voice_notes_forbidden: String,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -512,6 +515,7 @@ impl ConversationRow {
             moderate: false,
             can_pin: false,
             joined: true,
+            voice_notes_forbidden: String::new(),
         }
     }
 }
@@ -754,6 +758,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         can_pin: row.get(57)?,
         joined: row.get(58)?,
         call_video: row.get(59)?,
+        voice_notes_forbidden: row.get(60)?,
     })
 }
 
@@ -918,9 +923,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, voice_notes_forbidden)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -940,6 +945,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              can_pin = excluded.can_pin,
              joined = excluded.joined,
              call_video = excluded.call_video,
+             voice_notes_forbidden = excluded.voice_notes_forbidden,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -986,6 +992,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.can_pin,
             row.joined,
             row.call_video,
+            row.voice_notes_forbidden,
         ],
     )?;
     Ok(())
@@ -1073,6 +1080,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "call_video")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !column(db, "conversation", "voice_notes_forbidden")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(true)
 }
 
@@ -1146,6 +1156,9 @@ impl Store {
         }
         if !column(&store.db, "conversation", "call_video")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "voice_notes_forbidden")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
         }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;

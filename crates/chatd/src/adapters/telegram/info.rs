@@ -50,14 +50,18 @@ pub(super) fn birthday_line(day: i32, month: i32, year: Option<i32>) -> Option<S
     })
 }
 
-/// Records call capability flags from `users.getFullUser` and refreshes the DM row when changed.
+/// Records call and voice-message capability flags from `users.getFullUser` and refreshes the DM row when changed.
 fn record_call_flags(account: &Account, who: Who, user: &tl::types::UserFull) {
     let flags = peers::CallFlags {
         phone_available: user.phone_calls_available,
         phone_private: user.phone_calls_private,
         video_available: user.video_calls_available,
     };
-    if account.dir().set_call_flags(who, flags) {
+    let mut dir = account.dir();
+    let call_changed = dir.set_call_flags(who, flags);
+    let voice_changed = dir.set_voice_forbidden(who, user.voice_messages_forbidden);
+    drop(dir);
+    if call_changed || voice_changed {
         sync::refresh_row(account, who);
     }
 }

@@ -12,6 +12,18 @@ pub(in crate::gui) fn available(can: &Capabilities) -> bool {
     can.voice_notes && can.max_file_bytes > 0
 }
 
+/// Whether voice and round video messages are allowed in a conversation given account capabilities
+/// and any per-conversation restriction reason (`Conversation::voice_notes_forbidden`).
+#[allow(dead_code)]
+pub(in crate::gui) fn allowed_in(can: &Capabilities, voice_notes_forbidden: &str) -> bool {
+    available(can) && voice_notes_forbidden.is_empty()
+}
+
+/// Returns the per-conversation reason voice and round video messages are disabled, if any.
+pub(in crate::gui) fn blocked_reason(voice_notes_forbidden: &str) -> Option<&str> {
+    (!voice_notes_forbidden.is_empty()).then_some(voice_notes_forbidden)
+}
+
 /// What a press on the mic is: the first on a conversation records, the next stops. A press
 /// while another recording holds starts over instead: one recording at a time, and the pushed
 /// one goes (chatd ends it and says so).
@@ -346,5 +358,17 @@ mod tests {
         // Two files are not one voice note (`Outgoing::voice` names the last of `files`).
         let two = vec![file("voice-1.opus"), file("trail.jpg")];
         assert!(sent_as(&Some(kept("voice-1.opus")), &two).is_none());
+    }
+
+    #[test]
+    fn voice_and_round_video_gate_honours_per_conversation_restriction() {
+        let can = Capabilities { voice_notes: true, max_file_bytes: 1_000_000, ..Capabilities::default() };
+        assert!(allowed_in(&can, ""));
+        assert_eq!(blocked_reason(""), None);
+        let why = "Odalys Brandt doesn't accept voice and video messages.";
+        assert!(!allowed_in(&can, why));
+        assert_eq!(blocked_reason(why), Some(why));
+        let no_voice = Capabilities { voice_notes: false, max_file_bytes: 1_000_000, ..Capabilities::default() };
+        assert!(!allowed_in(&no_voice, ""));
     }
 }

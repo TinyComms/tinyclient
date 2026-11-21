@@ -3817,3 +3817,109 @@ fn save_and_unsave_gif() {
     };
     assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
 }
+
+#[test]
+fn voice_messages_forbidden_disables_mic_and_refused_send_returns_plain_words() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+
+    // 1. Before full profile is known, Odalys forbids voice messages on the server: sending fails
+    //    with plain words and updates the conversation's `voice_notes_forbidden` field.
+    world.steer("voice-forbidden 7002 1");
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-voice-forbid-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("voice-refused.opus");
+    std::fs::write(&path, vec![7u8; 1024]).unwrap();
+    let file = || protocol::OutgoingFile {
+        path: path.to_string_lossy().into_owned(),
+        name: String::new(),
+        spoiler: false,
+        as_file: false,
+        original: false,
+        view_once: false,
+        media: None,
+    };
+    let voice = || protocol::VoiceNote { duration: 4_000, waveform: vec![120, 60, 200, 30] };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "vf-1".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let failed = world.until("voice send refused", || {
+        world.messages("u7002").into_iter().find(|m| m.client_id.as_deref() == Some("vf-1") && m.state != SendState::Pending)
+    });
+    match &failed.state {
+        SendState::Failed { reason } => {
+            assert!(
+                reason.contains("doesn't accept voice and video messages"),
+                "expected plain-words refusal, got: {reason}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let updated = world.until("conversation marks voice_notes_forbidden", || {
+        world.conversation("u7002").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(updated.voice_notes_forbidden.contains("Odalys Brandt"), "{}", updated.voice_notes_forbidden);
+
+    // 2. Fetching full profile for Tobin (u7003) with voice_messages_forbidden sets the flag proactively,
+    //    so chatd refuses a subsequent voice send before it reaches the wire.
+    world.steer("voice-forbidden 7003 1");
+    assert!(matches!(
+        world.ask(Request::ConversationInfo { conversation: key("u7003") }),
+        Response::ConversationInfo { .. }
+    ));
+    let tobin = world.until("tobin voice_notes_forbidden", || {
+        world.conversation("u7003").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(tobin.voice_notes_forbidden.contains("Tobin Reyes"), "{}", tobin.voice_notes_forbidden);
+    let calls_before = world.called("SendMedia u7003");
+    let refused = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "vf-2".into(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("doesn't accept voice and video messages"), "{detail}");
+        }
+        other => panic!("expected immediate Refused, got {other:?}"),
+    }
+    assert_eq!(world.called("SendMedia u7003"), calls_before, "proactively blocked send must not hit Telegram");
+
+    // 3. Group with send_voices banned fails with plain group wording and records the restriction.
+    world.steer("voice-ban g8001 1");
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("g8001"),
+            client_id: "vf-3".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let group_failed = world.until("group voice send refused", || {
+        world.messages("g8001").into_iter().find(|m| m.client_id.as_deref() == Some("vf-3") && m.state != SendState::Pending)
+    });
+    match &group_failed.state {
+        SendState::Failed { reason } => {
+            assert!(reason.contains("aren't allowed in this group"), "{reason}");
+        }
+        other => panic!("expected Failed for group, got {other:?}"),
+    }
+    let group_row = world.until("group marks voice_notes_forbidden", || {
+        world.conversation("g8001").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(group_row.voice_notes_forbidden.contains("aren't allowed in this group"), "{}", group_row.voice_notes_forbidden);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

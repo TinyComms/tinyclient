@@ -130,6 +130,18 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
                     }
                 }
             }
+            if known.voice_forbidden == Some(true) {
+                row.voice_notes_forbidden = if known.name.is_empty() {
+                    "This person doesn't accept voice and video messages.".to_owned()
+                } else {
+                    format!("{} doesn't accept voice and video messages.", known.name)
+                };
+            }
+        }
+        Who::Group(_) | Who::Channel(_) if !known.broadcast => {
+            if known.voice_banned {
+                row.voice_notes_forbidden = "Voice and video messages aren't allowed in this group.".to_owned();
+            }
         }
         _ => {}
     }

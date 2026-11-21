@@ -1236,6 +1236,9 @@ impl Chat {
                     };
                     return error(ErrorCode::Refused, why);
                 }
+                Ok(Some(row)) if with.voice.is_some() && !row.voice_notes_forbidden.is_empty() => {
+                    return error(ErrorCode::Refused, row.voice_notes_forbidden);
+                }
                 Ok(Some(_)) => store.ingest(&conversation, &message, true),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),

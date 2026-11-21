@@ -274,6 +274,8 @@ struct Target {
     space: Option<String>,
     read_only: bool,
     read_only_reason: String,
+    /// Why voice and round video messages are not allowed in this conversation. Empty when allowed.
+    voice_notes_forbidden: String,
     joined: bool,
     /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
     blocked_peer: Option<protocol::Person>,
@@ -477,6 +479,8 @@ struct Outgoing {
     made: Vec<PathBuf>,
     /// The send carried a voice note, so its facts and file can leave with it.
     note: bool,
+    /// Recorded voice note & chip kept until chatd confirms the send succeeded (so a refusal keeps the note in the tray).
+    voice_chip: Option<(Rec, Staged)>,
 }
 
 /// A drag of files over the window, while it is over this composer's conversation.
@@ -585,6 +589,8 @@ pub struct Composer {
     /// The facts of the note that arrived (`Recorded`): a send is sent with them, and this
     /// composer answers a removed chip with them.
     note: Option<Rec>,
+    /// Voice note send waiting on network settlement: restored to the tray if Telegram refuses it.
+    held_voice: Option<(Key, String, Rec, Staged)>,
     /// Tiny file sends whose chips stay until the upload and the message have both settled.
     /// One hold per client id, so a second channel does not discard the first.
     held_files: crate::tiny_attach::Holds<Outgoing>,
@@ -697,6 +703,7 @@ impl Composer {
             release: None,
             owed_stop: None,
             note: None,
+            held_voice: None,
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
             poll_composer: None,
@@ -1009,6 +1016,11 @@ impl Composer {
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
         let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
         let voice = rec::sent_as(&self.note, &files);
+        let voice_chip = voice.as_ref().and_then(|_| {
+            let rec = self.note.clone()?;
+            let chip = self.tray.iter().find(|chip| rec::holds_the_note(&self.note, chip)).cloned()?;
+            Some((rec, chip))
+        });
         let chosen = self.schedule_at.take();
         let schedule = match schedule::for_send(controls.schedule, chosen, now()) {
             Ok(at) => at,
@@ -1064,6 +1076,7 @@ impl Composer {
             chips: self.tray.iter().map(|chip| chip.id).collect(),
             made: self.tray.iter().flat_map(Staged::made).collect(),
             note: voice.is_some(),
+            voice_chip,
         };
         self.dispatch(out, with, cx);
     }
@@ -1118,6 +1131,7 @@ impl Composer {
             chips: Vec::new(),
             made: Vec::new(),
             note: false,
+            voice_chip: None,
         };
         self.dispatch(out, protocol::Outgoing { pick: Some(pick), ping, ..protocol::Outgoing::default() }, cx);
     }
@@ -1217,8 +1231,12 @@ impl Composer {
         let refused = match answer {
             Ok(Response::Sent { .. }) => {
                 let (key, client_id, made) = (out.key.clone(), out.client_id.clone(), out.made.clone());
-                // The note went out with the send: chatd's facts and file go with it.
-                if out.note {
+                // Hold the recorded note until the network accepts it so a refusal (e.g. Telegram's
+                // VOICE_MESSAGES_FORBIDDEN) can restore it to the tray without losing the audio.
+                if let Some((rec, chip)) = out.voice_chip.clone() {
+                    self.held_voice = Some((out.key.clone(), out.client_id.clone(), rec, chip));
+                    self.note = None;
+                } else if out.note {
                     self.note = None;
                     ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
                 }
@@ -1256,6 +1274,54 @@ impl Composer {
             Some(words) => self.tell(&out.key, (words, Tone::Refused), cx),
             None if scan => self.hold_tiny_files(out, cx),
             None => self.went(&out, cx),
+        }
+        cx.notify();
+    }
+
+    /// A voice note send settled on the network. When refused (e.g. `VOICE_MESSAGES_FORBIDDEN`),
+    /// restore the recorded note to the tray with the refusal words so it is not lost.
+    fn voice_settled(&mut self, key: &Key, client_id: &str, outcome: Result<(), String>, cx: &mut Context<Self>) {
+        let matches = self
+            .held_voice
+            .as_ref()
+            .is_some_and(|(held_key, held_id, _, _)| held_key == key && held_id == client_id);
+        if !matches {
+            return;
+        }
+        let Some((held_key, held_id, rec, chip)) = self.held_voice.take() else {
+            return;
+        };
+        match outcome {
+            Ok(()) => {
+                ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
+            }
+            Err(reason) => {
+                self.note = Some(rec);
+                let here = self.target.as_ref().is_some_and(|now| now.key == held_key);
+                if here {
+                    if !self.tray.iter().any(|existing| existing.path == chip.path) {
+                        self.tray.push(chip);
+                    }
+                } else if let Some(draft) = self.drafts.get_mut(&held_key) {
+                    if !draft.files.iter().any(|existing| existing.path == chip.path) {
+                        draft.files.push(chip);
+                    }
+                } else {
+                    self.remember(
+                        held_key.clone(),
+                        Draft {
+                            files: vec![chip],
+                            ..Draft::default()
+                        },
+                    );
+                }
+                self.tell(&held_key, (reason, Tone::Refused), cx);
+                ask_later(
+                    cx,
+                    Request::Discard { conversation: held_key, client_id: held_id },
+                    |_, _| {},
+                );
+            }
         }
         cx.notify();
     }
@@ -2936,6 +3002,27 @@ impl Composer {
         if !on {
             return None;
         }
+        if let Some(reason) = self
+            .target
+            .as_ref()
+            .and_then(|target| rec::blocked_reason(&target.voice_notes_forbidden))
+        {
+            let size = if crate::gui::phone::active() { 18. } else { 16. };
+            return Some(
+                div()
+                    .id("mic")
+                    .relative()
+                    .flex_none()
+                    .size(px(card_control()))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.4)
+                    .tooltip(tip(reason.to_owned(), None))
+                    .child(glyph("icons/mic.svg", size, theme::text_soft())),
+            );
+        }
         let hot = self
             .recording
             .as_ref()
@@ -2978,7 +3065,7 @@ impl Composer {
     fn record_target(&self) -> Option<Key> {
         self.target
             .as_ref()
-            .filter(|target| target.locked().is_none())
+            .filter(|target| target.locked().is_none() && target.voice_notes_forbidden.is_empty())
             .filter(|_| live())
             .map(|target| target.key.clone())
     }
@@ -3743,6 +3830,7 @@ impl Composer {
                     chips: Vec::new(),
                     made: Vec::new(),
                     note: false,
+                    voice_chip: None,
                 };
                 self.dispatch(out, with, cx);
             }
@@ -3987,6 +4075,7 @@ impl Shell {
             space: open.space.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
+            voice_notes_forbidden: open.voice_notes_forbidden.clone(),
             joined: open.joined,
             blocked_peer,
             special: open.special,
@@ -4018,6 +4107,7 @@ impl Shell {
             space: None,
             read_only: false,
             read_only_reason: String::new(),
+            voice_notes_forbidden: String::new(),
             joined: true,
             blocked_peer: None,
             special: protocol::Special::None,
@@ -4391,6 +4481,19 @@ impl Shell {
                 if changed {
                     cx.notify();
                 }
+                for id in &inflight {
+                    let voice_outcome = match found_state(id) {
+                        Some(SendState::Sent) => Some(Ok(())),
+                        Some(SendState::Failed { reason }) => Some(Err(reason)),
+                        _ => None,
+                    };
+                    if let Some(outcome) = voice_outcome {
+                        for composer in [shell.composer_state.main.get(), shell.composer_state.thread.get()].into_iter().flatten() {
+                            let (composer, key, id, outcome) = (composer.clone(), key.clone(), id.clone(), outcome.clone());
+                            cx.defer(move |cx| composer.update(cx, |composer, cx| composer.voice_settled(&key, &id, outcome, cx)));
+                        }
+                    }
+                }
                 if key.network != Network::Tiny {
                     return;
                 }
@@ -4629,6 +4732,7 @@ mod tests {
             space: None,
             read_only,
             read_only_reason: String::new(),
+            voice_notes_forbidden: String::new(),
             blocked_peer: None,
             special: protocol::Special::None,
             joined: true,
