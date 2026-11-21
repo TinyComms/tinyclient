@@ -1757,6 +1757,19 @@ pub enum Request {
     Reactions {
         conversation: Key,
     },
+    /// Who reacted to a message with `emoji`, paged. Fetched only on demand (clicking or
+    /// opening the reactors list), never prefetched.
+    Reactors {
+        conversation: Key,
+        message_id: String,
+        emoji: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        burst: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
     /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
     /// empty keeps the edit as plain text. An older client omits them.
@@ -2748,6 +2761,15 @@ pub enum Response {
     Reactions {
         conversation: Key,
         rules: ReactionRules,
+    },
+    /// Answers `Reactors`: one page of people who reacted with `emoji`.
+    Reactors {
+        conversation: Key,
+        message_id: String,
+        emoji: String,
+        reactors: Vec<Reactor>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
     Catalog {
         items: Vec<CatalogItem>,

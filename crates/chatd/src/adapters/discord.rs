@@ -1021,16 +1021,11 @@ impl Discord {
         }
     }
 
-    /// Adds or takes back our reaction. `emoji` is the emoji itself, or a custom one: as the
-    /// message spells it (`:name:`) when it is already there, or as the id of its registered
-    /// file (`emoji:<id>`). Discord wants a custom one as `name:id`.
-    ///
-    /// The query is what the web client adds; it is from the community documentation and
-    /// unconfirmed against a real account. So is sending a placeholder name with an id whose
-    /// name is not known here (Discord is said to go by the id).
-    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool) -> Result<(), Refusal> {
+    /// Resolves `emoji` to the path segment Discord expects (either the unicode emoji,
+    /// `name:id` for a custom emoji already in that form, or looked up from `:name:` / `emoji:<id>`).
+    fn reaction_emoji(&self, channel: &str, message: &str, emoji: &str) -> Result<String, Refusal> {
         let spelled = emoji.len() > 2 && emoji.starts_with(':') && emoji.ends_with(':');
-        let named = if spelled || emoji.starts_with("emoji:") {
+        if spelled || emoji.starts_with("emoji:") {
             let stored = self.ctx.stored_message(channel, message).ok().flatten();
             let reactions = stored.map(|stored| stored.reactions).unwrap_or_default();
             let known = reactions.into_iter().find(|reaction| match &reaction.file {
@@ -1045,16 +1040,79 @@ impl Discord {
                 return Err(Refusal::Refused("That emoji is not on the message, so tinyclient cannot tell Discord which one it is.".to_owned()));
             };
             let name = known.map_or_else(|| "emoji".to_owned(), |reaction| reaction.emoji.trim_matches(':').to_owned());
-            format!("{name}:{id}")
+            Ok(format!("{name}:{id}"))
         } else {
-            emoji.to_owned()
-        };
+            Ok(emoji.to_owned())
+        }
+    }
+
+    /// Adds or takes back our reaction. `emoji` is the emoji itself, or a custom one: as the
+    /// message spells it (`:name:`) when it is already there, or as the id of its registered
+    /// file (`emoji:<id>`). Discord wants a custom one as `name:id`.
+    ///
+    /// The query is what the web client adds; it is from the community documentation and
+    /// unconfirmed against a real account. So is sending a placeholder name with an id whose
+    /// name is not known here (Discord is said to go by the id).
+    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool) -> Result<(), Refusal> {
+        let named = self.reaction_emoji(channel, message, emoji)?;
         let reaction = format!("/channels/{channel}/messages/{message}/reactions/{}", escaped(&named));
         let asked = match on {
             true => self.call("PUT", &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type=0"), None),
             false => self.call("DELETE", &format!("{reaction}/0/%40me?location=Message%20Inline%20Button&burst=false"), None),
         };
         asked.map(drop).map_err(refusal)
+    }
+
+    /// Fetches one page of users who reacted to `message` with `emoji`.
+    fn reactors(
+        &self,
+        channel: &str,
+        message: &str,
+        emoji: &str,
+        burst: bool,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<super::ReactorsPage, Refusal> {
+        let named = self.reaction_emoji(channel, message, emoji)?;
+        let limit = if limit == 0 { 100 } else { limit.clamp(1, 100) };
+        let rtype = if burst { 1 } else { 0 };
+        let mut path = format!(
+            "/channels/{channel}/messages/{message}/reactions/{}?limit={limit}&type={rtype}",
+            escaped(&named)
+        );
+        if let Some(after) = after.filter(|a| !a.is_empty()) {
+            path.push_str(&format!("&after={}", escaped(after)));
+        }
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let users: Vec<User> = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let more = users.len() as u32 >= limit;
+        let mut files = Vec::with_capacity(users.len());
+        let mut reactors = Vec::with_capacity(users.len());
+        let known_names = {
+            let state = crate::hub::lock(&self.state);
+            users
+                .iter()
+                .map(|u| (u.id.clone(), state.users.get(&u.id).cloned()))
+                .collect::<HashMap<_, _>>()
+        };
+        for user in users {
+            let (avatar, url) = user.avatar();
+            let name = known_names
+                .get(&user.id)
+                .and_then(|n| n.as_deref())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| user.name())
+                .to_owned();
+            files.push((avatar.clone(), url));
+            reactors.push(protocol::Reactor {
+                key: self.ctx.key(&user.id),
+                name,
+                avatar: Some(avatar),
+            });
+        }
+        let _ = self.ctx.media(&files);
+        Ok(super::ReactorsPage { reactors, more })
     }
 
     /// Replaces the text of one of our messages. The store changes with Discord's answer.
@@ -1656,6 +1714,9 @@ impl Discord {
             }
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
+            }
+            Command::Reactors { conversation_id, message_id, emoji, burst, after, limit, reply } => {
+                answer(reply, self.reactors(&conversation_id, &message_id, &emoji, burst, after.as_deref(), limit))
             }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text))

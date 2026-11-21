@@ -358,6 +358,10 @@ pub struct Pane {
     link_ask: Option<links::LinkAsk>,
     /// Earlier wordings of one message, opened from its edited mark.
     revisions: Option<Earlier>,
+    /// On-demand reactors fetched for messages in the open conversation, keyed by `(message_id, emoji)`.
+    fetched_reactors: HashMap<(String, String), (Vec<protocol::Reactor>, bool)>,
+    /// Reactor fetch currently in flight, keyed by `(message_id, emoji)`.
+    reactors_loading: Option<(String, String)>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -458,6 +462,8 @@ impl Pane {
             multi_select: actions::MultiSelect::default(),
             link_ask: None,
             revisions: None,
+            fetched_reactors: HashMap::new(),
+            reactors_loading: None,
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -601,6 +607,8 @@ impl Pane {
         let landing = self.landing.take();
         let around = self.around.take();
         self.revisions = None;
+        self.fetched_reactors.clear();
+        self.reactors_loading = None;
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);

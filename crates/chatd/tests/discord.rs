@@ -4316,3 +4316,101 @@ fn source_fetches_raw_markdown_for_editing() {
         asked.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn reactors_fetches_unicode_and_custom_emoji_with_paging() {
+    let world = World::start();
+    // Open channel 4101 so message 1300000000000000501 (with custom emoji reaction) is cached.
+    let _ = world.messages("4101");
+    wait("messages in 4101 to backfill", || {
+        (!world.messages("4101").is_empty()).then_some(())
+    });
+    let message_id = world.messages("4101")[0].id.clone();
+
+    // 1. Standard unicode emoji (👍 -> %F0%9F%91%8D), with paging (limit=2 -> more=true, then after=9002 -> more=false).
+    let unicode_path = format!("/channels/4101/messages/{message_id}/reactions/%F0%9F%91%8D");
+    world.discord.script(
+        &unicode_path,
+        200,
+        json!([
+            {"id": "9001", "username": "alice", "global_name": "Alice", "discriminator": "0", "avatar": "a1"},
+            {"id": "9002", "username": "bob", "global_name": "Bob", "discriminator": "0", "avatar": null}
+        ]),
+    );
+    world.discord.script(
+        &unicode_path,
+        200,
+        json!([
+            {"id": "9003", "username": "carol", "global_name": null, "discriminator": "0", "avatar": null}
+        ]),
+    );
+
+    match world.ask(Request::Reactors {
+        conversation: world.key("4101"),
+        message_id: message_id.clone(),
+        emoji: "👍".into(),
+        burst: false,
+        after: None,
+        limit: 2,
+    }) {
+        Response::Reactors { reactors, more, .. } => {
+            assert_eq!(reactors.len(), 2);
+            assert_eq!(reactors[0].key.id, "9001");
+            assert_eq!(reactors[0].name, "Alice");
+            assert_eq!(reactors[1].key.id, "9002");
+            assert_eq!(reactors[1].name, "Bob");
+            assert!(more, "full page should report more=true");
+        }
+        other => panic!("expected Response::Reactors, got {other:?}"),
+    }
+
+    match world.ask(Request::Reactors {
+        conversation: world.key("4101"),
+        message_id: message_id.clone(),
+        emoji: "👍".into(),
+        burst: false,
+        after: Some("9002".into()),
+        limit: 2,
+    }) {
+        Response::Reactors { reactors, more, .. } => {
+            assert_eq!(reactors.len(), 1);
+            assert_eq!(reactors[0].key.id, "9003");
+            assert_eq!(reactors[0].name, "carol");
+            assert!(!more, "partial page should report more=false");
+        }
+        other => panic!("expected Response::Reactors, got {other:?}"),
+    }
+
+    let reqs = world.discord.requests_to("GET", &unicode_path);
+    assert_eq!(reqs.len(), 2);
+    assert!(reqs[0].path.contains("limit=2") && reqs[0].path.contains("type=0"));
+    assert!(reqs[1].path.contains("after=9002") && reqs[1].path.contains("limit=2"));
+
+    // 2. Custom emoji passed as name:id (encoded as ferris%3A7001).
+    let custom_path = format!("/channels/4101/messages/{message_id}/reactions/ferris%3A7001");
+    world.discord.script(
+        &custom_path,
+        200,
+        json!([
+            {"id": "2001", "username": "alice", "global_name": "Alice", "discriminator": "0", "avatar": null}
+        ]),
+    );
+    match world.ask(Request::Reactors {
+        conversation: world.key("4101"),
+        message_id: message_id.clone(),
+        emoji: "ferris:7001".into(),
+        burst: true,
+        after: None,
+        limit: 100,
+    }) {
+        Response::Reactors { reactors, more, .. } => {
+            assert_eq!(reactors.len(), 1);
+            assert_eq!(reactors[0].key.id, "2001");
+            assert!(!more);
+        }
+        other => panic!("expected Response::Reactors, got {other:?}"),
+    }
+    let custom_reqs = world.discord.requests_to("GET", &custom_path);
+    assert_eq!(custom_reqs.len(), 1);
+    assert!(custom_reqs[0].path.contains("type=1"), "burst=true must pass type=1, got {}", custom_reqs[0].path);
+}

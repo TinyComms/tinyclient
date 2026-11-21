@@ -2689,16 +2689,23 @@ impl Pane {
             // Joining one the conversation no longer takes, or past a limit, is not offered:
             // the chip says why instead.
             let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
-            // Who reacted, where the network said; a chip that is only a count keeps its
-            // own words.
+            // Who reacted, where the network said or after an on-demand fetch; a chip that is
+            // only a count keeps its own words.
             let named = !reaction.who.is_empty();
-            let names = named.then(|| {
+            let names = if named {
                 let said = |id: &str| match self.person(id) {
                     Some(person) => self.who(&person, cx).0,
                     None => String::new(),
                 };
-                reactor_words(&reaction.who, said).unwrap_or_default()
-            });
+                reactor_words(&reaction.who, said)
+            } else {
+                self.fetched_reactors
+                    .get(&(message.id.clone(), toggled.clone()))
+                    .and_then(|(reactors, _)| {
+                        let ids: Vec<String> = reactors.iter().map(|r| r.name.clone()).collect();
+                        reactor_words(&ids, |name| name.to_owned())
+                    })
+            };
             let words = match (&refused, &names) {
                 (Some(why), _) => why.clone(),
                 (None, Some(names)) => names.clone(),
@@ -2706,9 +2713,9 @@ impl Pane {
                 (None, None) => "React with this too".to_owned(),
             };
             let joins = acts && refused.is_none();
-            // Right-click names them in a list, where one was sent. Left-click keeps its
-            // work: joining or taking the reaction back.
-            let list = (!phone && named).then(|| {
+            // Right-click names them in a list, where one was sent or the account can fetch them.
+            // Left-click keeps its work: joining or taking the reaction back.
+            let list = (!phone && (named || self.caps.reactors)).then(|| {
                 let open = message.clone();
                 cx.listener(move |this: &mut Pane, event: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();

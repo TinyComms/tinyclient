@@ -1475,6 +1475,40 @@ impl Chat {
         }
     }
 
+    fn reactors(
+        &self,
+        conversation: Key,
+        message_id: String,
+        emoji: String,
+        burst: bool,
+        after: Option<String>,
+        limit: u32,
+    ) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let asked = self.ask(&account, |reply| Command::Reactors {
+            conversation_id: conversation.id.clone(),
+            message_id: message_id.clone(),
+            emoji: emoji.clone(),
+            burst,
+            after,
+            limit,
+            reply,
+        });
+        match asked {
+            Ok(page) => Response::Reactors {
+                conversation,
+                message_id,
+                emoji,
+                reactors: page.reactors,
+                more: page.more,
+            },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Our reaction, shown at once and taken back if the network refuses it. One the
     /// conversation's rules refuse is refused here and never sent; one that replaces mine (a
     /// network with one reaction a person) takes mine off at once too. A custom emoji that is
@@ -3094,6 +3128,9 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
+            Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
+                self.reactors(conversation, message_id, emoji, burst, after, limit)
+            }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),

@@ -534,6 +534,9 @@ pub struct Capabilities {
     /// This account supports message reactions.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reactions: bool,
+    /// This account supports fetching who reacted to a message (`Request::Reactors`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reactors: bool,
     /// How inline mentions are formatted on the wire for this account.
     #[serde(default, skip_serializing_if = "MentionFormat::is_plain")]
     pub mention_format: MentionFormat,

@@ -234,6 +234,13 @@ pub struct BrowsedPage {
     pub cursor: Option<String>,
 }
 
+/// A page of people who reacted to a message (`Command::Reactors`).
+#[derive(Debug, Clone, Default)]
+pub struct ReactorsPage {
+    pub reactors: Vec<protocol::Reactor>,
+    pub more: bool,
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -305,6 +312,16 @@ pub enum Command {
     /// opened it; chatd keeps the answer five minutes. `Unsupported` leaves every reaction to the
     /// network to judge.
     ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
+    /// Who reacted to a message with `emoji`, paged.
+    Reactors {
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        burst: bool,
+        after: Option<String>,
+        limit: u32,
+        reply: Reply<ReactorsPage>,
+    },
     /// Replace the text of one of our messages. Report the edited message through
     /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
     /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
@@ -709,6 +726,7 @@ impl Command {
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
                 ctx.sent(&conversation_id, &client_id, Err(why));

@@ -234,6 +234,15 @@ pub struct Reaction {
     pub who: Vec<String>,
 }
 
+/// One person who reacted to a message (`Request::Reactors`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reactor {
+    pub key: Key,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+}
+
 /// The earlier message this one answers, as one line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyTo {
