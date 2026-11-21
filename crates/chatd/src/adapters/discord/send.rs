@@ -39,6 +39,30 @@ fn shown_name(name: &str, spoiler: bool) -> String {
     }
 }
 
+/// Upload size limits (checked 2026-11):
+/// - Free plan: 10 MiB; Nitro Basic / Classic (1, 3): 50 MiB; Nitro (2): 500 MiB.
+/// - Server boost tiers: tier 0/1 = 10 MiB, tier 2 = 50 MiB, tier 3 = 100 MiB.
+/// Effective limit is max(plan, server tier).
+pub(super) fn plan_upload_limit(premium: u8) -> u64 {
+    match premium {
+        2 => 500 << 20,
+        1 | 3 => 50 << 20,
+        _ => 10 << 20,
+    }
+}
+
+pub(super) fn tier_upload_limit(tier: u8) -> u64 {
+    match tier {
+        3 => 100 << 20,
+        2 => 50 << 20,
+        _ => 10 << 20,
+    }
+}
+
+pub(super) fn upload_limit(premium: u8, tier: u8) -> u64 {
+    plan_upload_limit(premium).max(tier_upload_limit(tier))
+}
+
 impl Discord {
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
     /// the files and ends the send through `Context::sent`.
@@ -53,11 +77,11 @@ impl Discord {
         let conversation = self.ctx.known(channel).map_err(|err| err.to_string())?;
         let conversation = conversation.ok_or_else(|| "This conversation is gone.".to_owned())?;
         let guild = self.guild_of(&conversation);
-        let most: u64 = match premium {
-            2 => 500 << 20,
-            1 | 3 => 50 << 20,
-            _ => 10 << 20,
-        };
+        let tier = guild
+            .as_deref()
+            .and_then(|guild| self.state.lock().unwrap().guilds.get(guild).map(|info| info.premium_tier))
+            .unwrap_or(0);
+        let most = upload_limit(premium, tier);
         if up.files().len() > FILES {
             return Err(format!("Discord takes {FILES} files in one message."));
         }
@@ -147,5 +171,22 @@ impl Discord {
             attachments.push(json!({"id": at.to_string(), "filename": name, "uploaded_filename": slot.upload_filename}));
         }
         Ok(attachments)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_limit_takes_max_of_plan_and_server_boost_tier() {
+        assert_eq!(upload_limit(0, 0), 10 << 20);
+        assert_eq!(upload_limit(0, 1), 10 << 20);
+        assert_eq!(upload_limit(0, 2), 50 << 20);
+        assert_eq!(upload_limit(0, 3), 100 << 20);
+        assert_eq!(upload_limit(1, 0), 50 << 20);
+        assert_eq!(upload_limit(3, 3), 100 << 20);
+        assert_eq!(upload_limit(2, 0), 500 << 20);
+        assert_eq!(upload_limit(2, 3), 500 << 20);
     }
 }

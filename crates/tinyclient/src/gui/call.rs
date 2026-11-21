@@ -1418,6 +1418,7 @@ mod tests {
             muted: false,
             deafened: false,
             streaming: false,
+            camera: false,
             speaking: false,
         };
         Occupants { people: names.iter().map(person).collect(), total }

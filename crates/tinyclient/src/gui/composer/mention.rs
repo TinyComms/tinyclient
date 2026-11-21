@@ -8,7 +8,7 @@ use std::ops::Range;
 /// The longest run after `@` or `#` that is still looked up.
 const QUERY: usize = 40;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Person,
     Channel,
@@ -241,6 +241,80 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
     (out, tokens)
 }
 
+/// Converts a Discord raw markdown source string into composer field text and tokens.
+/// Preserves code blocks, quotes, lists, masked links, and inline formatting verbatim while
+/// turning `<@id>`, `<#id>`, `<@&id>`, `<:name:id>`, and `<a:name:id>` back into editable tokens.
+pub fn from_source(raw: &str, message: &Message) -> (String, Vec<Token>) {
+    use std::collections::HashMap;
+    let mut labels: HashMap<(Kind, String), String> = HashMap::new();
+    for span in &message.spans {
+        if let Style::Mention { kind, id } = &span.style {
+            let kind = match kind {
+                MentionKind::User => Kind::Person,
+                MentionKind::Channel => Kind::Channel,
+                MentionKind::Role => Kind::Role,
+                MentionKind::Everyone => continue,
+            };
+            let (start, end) = (span.start as usize, span.end as usize);
+            if let Some(label) = message.text.get(start..end) {
+                labels.entry((kind, id.clone())).or_insert_with(|| label.to_owned());
+            }
+        }
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut tokens = Vec::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(rel_end) = raw[i + 1..].find('>') {
+                let inner = &raw[i + 1..i + 1 + rel_end];
+                let end = i + 2 + rel_end;
+                if let Some((kind, id, label)) = parse_discord_tag(inner, &labels) {
+                    let start = out.len();
+                    out.push_str(&label);
+                    tokens.push(Token { range: start..out.len(), label, kind, id });
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, tokens)
+}
+
+fn parse_discord_tag(inner: &str, labels: &std::collections::HashMap<(Kind, String), String>) -> Option<(Kind, String, String)> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = inner.strip_prefix("@&") {
+        if digits(rest) {
+            let label = labels.get(&(Kind::Role, rest.to_owned()))?.clone();
+            return Some((Kind::Role, rest.to_owned(), label));
+        }
+    } else if let Some(rest) = inner.strip_prefix("@!").or_else(|| inner.strip_prefix('@')) {
+        if digits(rest) {
+            let label = labels.get(&(Kind::Person, rest.to_owned()))?.clone();
+            return Some((Kind::Person, rest.to_owned(), label));
+        }
+    } else if let Some(rest) = inner.strip_prefix('#') {
+        if digits(rest) {
+            let label = labels.get(&(Kind::Channel, rest.to_owned()))?.clone();
+            return Some((Kind::Channel, rest.to_owned(), label));
+        }
+    } else if let Some(rest) = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':')) {
+        let animated = inner.starts_with("a:");
+        if let Some((name, id)) = rest.split_once(':') {
+            if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && digits(id) {
+                let token_id = if animated { format!("a:{id}") } else { id.to_owned() };
+                return Some((Kind::Emoji, token_id, format!(":{name}:")));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +465,28 @@ mod tests {
         let (text, tokens) = source(&bold);
         assert_eq!(text, "cc **@Dev**");
         assert_eq!(wire(&text, &tokens, Network::Discord), "cc **<@8>**");
+    }
+
+    #[test]
+    fn from_source_preserves_markdown_and_round_trips_mentions_and_emoji() {
+        let raw = "> quoted line\n- item one\n```rust\nlet x = 1;\n```\nsee [docs](https://example.com) with <@8> in <#5> cc <@&3> <:ferris:7001> <a:party:7002>";
+        let mut msg = Message::plain("1", "me", "quoted line\nitem one\nlet x = 1;\nsee docs with @Dev in #ops cc @core :ferris: :party:", 0, true);
+        let span = |part: &str, style: Style| {
+            let start = msg.text.find(part).expect("part") as u32;
+            Span { start, end: start + part.len() as u32, style }
+        };
+        msg.spans = vec![
+            span("@Dev", Style::Mention { kind: MentionKind::User, id: "8".into() }),
+            span("#ops", Style::Mention { kind: MentionKind::Channel, id: "5".into() }),
+            span("@core", Style::Mention { kind: MentionKind::Role, id: "3".into() }),
+        ];
+        let (field, tokens) = from_source(raw, &msg);
+        assert!(field.contains("```rust\nlet x = 1;\n```"));
+        assert!(field.contains("> quoted line"));
+        assert!(field.contains("- item one"));
+        assert!(field.contains("[docs](https://example.com)"));
+        assert!(field.contains("@Dev") && field.contains("#ops") && field.contains("@core"));
+        assert!(field.contains(":ferris:") && field.contains(":party:"));
+        assert_eq!(wire(&field, &tokens, Network::Discord), raw);
     }
 }

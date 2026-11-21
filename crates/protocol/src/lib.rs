@@ -343,9 +343,12 @@ pub struct Occupant {
     pub muted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub deafened: bool,
-    /// Sharing a screen or a camera.
+    /// Sharing a screen.
     #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,
+    /// Camera is on.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub camera: bool,
     /// Heard right now, where the network says so to someone in the call (a Tiny server's
     /// `call.speaking`), or on stage: a stage channel's platform holds whoever Discord does
     /// not suppress.
@@ -513,6 +516,15 @@ pub struct Conversation {
     /// My newest message is still going.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sending: bool,
+    /// Per-conversation upload limit override, in bytes (e.g. a boosted Discord server). 0: use account's `Capabilities::max_file_bytes`.
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub max_file_bytes: u64,
+    /// Why this conversation is read-only, in words (e.g. a Discord server timeout). Empty uses the default sentence.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub read_only_reason: String,
+    /// Flagged as spam by the network (e.g. Discord spam message request).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub spam: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -573,6 +585,9 @@ impl Conversation {
             seen: false,
             delivered: false,
             sending: false,
+            max_file_bytes: 0,
+            read_only_reason: String::new(),
+            spam: false,
         }
     }
 
@@ -642,6 +657,8 @@ pub enum Relation {
     /// I asked.
     Outgoing,
     Blocked,
+    /// Ignored without blocking (Discord): messages and notifications are suppressed without telling them.
+    Ignored,
 }
 
 /// Never stored. Known only for people the shell is watching and for lists the user owns.
@@ -876,6 +893,12 @@ pub enum RelateAction {
     /// End the friendship.
     Remove,
     Block,
+    /// Lift a block.
+    Unblock,
+    /// Ignore someone without blocking them (Discord).
+    IgnoreUser,
+    /// Stop ignoring someone (Discord).
+    UnignoreUser,
 }
 
 /// What someone is doing in a composer. Networks that only have typing leave this as [`Typing`].
@@ -1280,6 +1303,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         revoke: bool,
     },
+    /// Accept (`accept == true`) or decline/ignore (`accept == false`) a message request (Discord).
+    AnswerMessageRequest {
+        conversation: Key,
+        accept: bool,
+    },
     /// The messages pinned in a conversation, asked of the network, newest first, at most
     /// [`PINNED_LIMIT`].
     Pinned {
@@ -1341,6 +1369,12 @@ pub enum Request {
     /// them (`Capabilities::revisions`) or when nothing earlier was stored. A live edit does
     /// not fill this by itself.
     Revisions {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Raw source text of a message as the network stores it (for lossless editing of markdown,
+    /// code blocks, quotes, lists, masked links, and custom emoji).
+    Source {
         conversation: Key,
         message_id: String,
     },
@@ -2164,6 +2198,10 @@ pub enum Response {
         conversation: Key,
         message_id: String,
         revisions: Vec<Revision>,
+    },
+    /// Answers `Source`: the raw source text of the message as the network holds it.
+    Source {
+        text: String,
     },
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {

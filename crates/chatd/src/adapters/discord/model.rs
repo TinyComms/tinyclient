@@ -40,7 +40,14 @@ pub const VIEW_CHANNEL: u64 = 1 << 10;
 pub const SEND_MESSAGES: u64 = 1 << 11;
 pub const ADMINISTRATOR: u64 = 1 << 3;
 pub const ADD_REACTIONS: u64 = 1 << 6;
+#[allow(dead_code)]
+pub const STREAM: u64 = 1 << 9;
 pub const READ_MESSAGE_HISTORY: u64 = 1 << 16;
+pub const CONNECT: u64 = 1 << 20;
+pub const SPEAK: u64 = 1 << 21;
+pub const MOVE_MEMBERS: u64 = 1 << 24;
+#[allow(dead_code)]
+pub const USE_VAD: u64 = 1 << 25;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
 pub fn user_link(id: &str) -> String {
@@ -229,6 +236,8 @@ pub struct Member {
     pub roles: Vec<String>,
     #[serde(default)]
     pub presence: Option<PresenceUpdate>,
+    #[serde(default)]
+    pub communication_disabled_until: Option<String>,
 }
 
 impl Member {
@@ -409,6 +418,8 @@ pub struct GuildProperties {
     pub icon: Option<String>,
     #[serde(default)]
     pub owner_id: Option<String>,
+    #[serde(default)]
+    pub premium_tier: Option<u8>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -422,6 +433,8 @@ pub struct Guild {
     pub icon: Option<String>,
     #[serde(default)]
     pub owner_id: Option<String>,
+    #[serde(default)]
+    pub premium_tier: Option<u8>,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -514,6 +527,11 @@ impl Guild {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.owner_id.as_deref());
         wrapped.or(self.owner_id.as_deref()).unwrap_or("")
     }
+
+    pub fn premium_tier(&self) -> Option<u8> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.premium_tier);
+        wrapped.or(self.premium_tier)
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -528,6 +546,8 @@ pub struct Relationship {
     pub user: Option<User>,
     #[serde(default)]
     pub user_id: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub user_ignored: bool,
 }
 
 impl Relationship {
@@ -545,6 +565,7 @@ impl Relationship {
             2 => protocol::Relation::Blocked,
             3 => protocol::Relation::Incoming,
             4 => protocol::Relation::Outgoing,
+            _ if self.user_ignored => protocol::Relation::Ignored,
             _ => protocol::Relation::None,
         }
     }

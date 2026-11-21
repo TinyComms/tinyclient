@@ -239,6 +239,15 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             shared.push("RELATIONSHIP_REMOVE", json!({"id": person, "type": 1, "nickname": null}));
             (204, Value::Null)
         }
+        ("PUT", ["users", "@me", "relationships", person, "ignore"]) => {
+            let user = json!({"id": person, "username": format!("user{person}"), "global_name": format!("User {person}")});
+            shared.push("RELATIONSHIP_ADD", json!({"id": person, "type": 0, "user_ignored": true, "nickname": null, "user": user}));
+            (204, Value::Null)
+        }
+        ("DELETE", ["users", "@me", "relationships", person, "ignore"]) => {
+            shared.push("RELATIONSHIP_REMOVE", json!({"id": person, "type": 0, "user_ignored": false, "nickname": null}));
+            (204, Value::Null)
+        }
         ("PATCH", ["users", "@me", "settings-proto", "1"]) => (200, json!({"settings": seen.body["settings"]})),
         ("GET", ["users", person, "profile"]) => {
             let mut profile = json!({
@@ -268,6 +277,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (200, json!({"guild_id": guild_id, "muted": false, "suppress_everyone": false, "suppress_roles": false, "message_notifications": 0, "flags": 0, "channel_overrides": overrides}))
         }
         ("DELETE", ["channels", channel]) => (200, json!({"id": channel, "type": 1})),
+        ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
         ("GET", ["channels", channel, "messages", "pins"]) => {
             let pinned = json!({
                 "id": "1300000000000000700", "channel_id": channel, "type": 0, "author": me(), "content": "Read the rules first",
@@ -3955,4 +3965,353 @@ fn a_voice_message_and_a_gif_from_tenor_are_attachments_fetched_only_from_discor
     let fetched = world.discord.requests_to("GET", "/media/attachments/1/9201/");
     let paths: Vec<&str> = fetched.iter().map(|seen| seen.path.as_str()).collect();
     assert_eq!(paths, ["/media/attachments/1/9201/voice-message.ogg?ex=7fffffff&is=1&hm=abc"]);
+}
+
+#[test]
+fn call_roster_reports_camera_and_screen_share_separately() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "self_stream": true, "self_video": false
+        }),
+    );
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "self_stream": false, "self_video": true,
+            "member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock"}, "nick": null, "roles": []}
+        }),
+    );
+
+    let active = wait("the roster with camera and share", || {
+        call().filter(|call| {
+            let dev = call.participants.iter().find(|p| p.id == "2002");
+            let sam = call.participants.iter().find(|p| p.id == "2006");
+            dev.is_some_and(|p| p.sharing && !p.camera) && sam.is_some_and(|p| p.camera && !p.sharing)
+        })
+    });
+    let dev = active.participants.iter().find(|p| p.id == "2002").unwrap();
+    let sam = active.participants.iter().find(|p| p.id == "2006").unwrap();
+    assert_eq!((dev.camera, dev.sharing), (false, true));
+    assert_eq!((sam.camera, sam.sharing), (true, false));
+
+    // Occupants on the tree row also keep screen share (streaming) and camera apart.
+    let occupants = wait("the channel occupants with camera and share", || {
+        match world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) {
+            Response::Tree { conversations, .. } => {
+                let row = conversations.iter().find(|r| r.key.id == "4201")?;
+                let occ = row.occupants.as_ref()?;
+                let dev = occ.people.iter().find(|p| p.person.id == "2002")?;
+                let sam = occ.people.iter().find(|p| p.person.id == "2006")?;
+                (dev.streaming && !dev.camera && sam.camera && !sam.streaming).then(|| (dev.clone(), sam.clone()))
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!((occupants.0.streaming, occupants.0.camera), (true, false));
+    assert_eq!((occupants.1.streaming, occupants.1.camera), (false, true));
+}
+
+#[test]
+fn upload_limit_honors_server_boost_tier() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["properties"]["premium_tier"] = json!(3);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let files_dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let big = files_dir.join("boosted.bin");
+    std::fs::File::create(&big).unwrap().set_len(40 << 20).unwrap();
+    let outgoing = || protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: big.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+        }],
+        ..Default::default()
+    };
+
+    // Tier-0 server (5000 / channel 5001): 40 MB is refused locally at the 10 MB free limit.
+    let refused = world.ask(Request::Send {
+        conversation: world.key("5001"),
+        client_id: "390001".into(),
+        text: String::new(),
+        reply_to: None,
+        with: outgoing(),
+    });
+    match refused {
+        Response::Error { detail, .. } => assert_eq!(detail, "boosted.bin is too big for Discord (limit 10 MB)."),
+        other => panic!("tier-0 server should refuse 40 MB, got {other:?}"),
+    }
+
+    // Tier-3 server (4000 / channel 4101): 40 MB passes the local check (100 MB limit).
+    let accepted = world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "390002".into(),
+        text: String::new(),
+        reply_to: None,
+        with: outgoing(),
+    });
+    match accepted {
+        Response::Sent { .. } => {}
+        other => panic!("tier-3 server should accept 40 MB, got {other:?}"),
+    }
+    wait("attachment slot request on tier-3 server", || {
+        let asked = world.discord.requests_to("POST", "/channels/4101/attachments");
+        (!asked.is_empty()).then_some(asked)
+    });
+}
+
+#[test]
+fn server_timeout_marks_rows_read_only_and_lifts_when_cleared() {
+    let world = World::start();
+    assert!(!world.conversation("4101").read_only);
+
+    // Timeout on our own member (with a role change so we can synchronize immediately):
+    world.discord.push(
+        "GUILD_MEMBER_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "user": {"id": "1000", "username": "justin"},
+            "roles": ["4010", "4011"],
+            "nick": null,
+            "communication_disabled_until": "2099-01-01T00:00:00.000000+00:00"
+        }),
+    );
+    wait("the member update to settle", || {
+        world.tree("4000").1.iter().any(|r| r.key.id == "4103").then_some(())
+    });
+    let row = world.conversation("4101");
+    assert!(row.read_only, "a timed-out member's channels must be read-only");
+    assert!(
+        row.read_only_reason.contains("timed out"),
+        "timeout reason should mention being timed out, got {:?}",
+        row.read_only_reason
+    );
+    assert_eq!(world.conversation("4201").call, CallSupport::None, "voice join is disabled while timed out");
+    match world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "c-timed-out".into(),
+        text: "hello?".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    }) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert!(detail.contains("timed out"), "refusal should mention timeout, got {detail}");
+        }
+        other => panic!("expected refused send while timed out, got {other:?}"),
+    }
+
+    // Clearing the timeout (past timestamp / null) lifts read_only.
+    world.discord.push(
+        "GUILD_MEMBER_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "user": {"id": "1000", "username": "justin"},
+            "roles": ["4010"],
+            "nick": null,
+            "communication_disabled_until": null
+        }),
+    );
+    wait("the timeout lift to settle", || {
+        (!world.tree("4000").1.iter().any(|r| r.key.id == "4103")).then_some(())
+    });
+    let lifted = world.conversation("4101");
+    assert!(!lifted.read_only, "clearing timeout must lift read-only");
+    assert!(lifted.read_only_reason.is_empty(), "clearing timeout must clear read_only_reason");
+    assert_eq!(world.conversation("4201").call, CallSupport::Native, "voice join returns when timeout lifts");
+}
+
+#[test]
+fn voice_channel_respects_connect_permission_and_user_limit() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["roles"][0]["permissions"] = json!("36769344");
+    let channels = ready["guilds"][0]["channels"].as_array_mut().unwrap();
+    for ch in channels.iter_mut() {
+        if ch["id"] == "4201" {
+            ch["user_limit"] = json!(2);
+        }
+    }
+    channels.push(json!({
+        "id": "4203",
+        "type": 2,
+        "name": "VIP",
+        "position": 2,
+        "parent_id": "4200",
+        "bitrate": 64000,
+        "user_limit": 0,
+        "permission_overwrites": [
+            {"id": "4000", "type": 0, "allow": "0", "deny": "1048576"}
+        ]
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    assert_eq!(world.conversation("4203").call, CallSupport::None, "voice channel without CONNECT must not offer Join");
+    assert_eq!(world.conversation("4201").call, CallSupport::Native, "voice channel with CONNECT offers Join");
+
+    // Fill Lounge (limit 2): 2002 is already there from READY; add 2006.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false
+        }),
+    );
+    world.ask(Request::Watch(Watching { space: Some(world.key("4000")), ..Watching::default() }));
+    wait("Lounge to have 2 occupants", || {
+        let Response::Tree { conversations, .. } = world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) else {
+            return None;
+        };
+        conversations.into_iter().find(|r| r.key.id == "4201")?.occupants.filter(|o| o.total == 2)
+    });
+
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    let failed = wait("full voice channel refusal", || {
+        let Response::Status { call, .. } = world.ask(Request::Status) else { return None };
+        let call = call?;
+        matches!(call.state, CallState::Failed { .. }).then_some(call)
+    });
+    match failed.state {
+        CallState::Failed { detail, .. } => {
+            assert!(detail.contains("full"), "expected full channel refusal, got {detail:?}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(world.discord.frames_of(4).is_empty(), "must not send op 4 when channel is full");
+}
+
+#[test]
+fn unblock_and_ignore_user_relationships() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["users"].as_array_mut().unwrap().push(json!({
+        "id": "2007", "username": "nora", "global_name": "Nora", "discriminator": "0", "avatar": null
+    }));
+    ready["relationships"].as_array_mut().unwrap().push(json!({
+        "id": "2007", "user_id": "2007", "type": 0, "user_ignored": true, "nickname": null
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Ignored user from READY is parsed as Relation::Ignored.
+    assert!(
+        world.people(Some(Relation::Ignored), None).iter().any(|p| p.key.id == "2007"),
+        "user_ignored in READY should map to Relation::Ignored"
+    );
+
+    // Unblock blocked user 2005: DELETE /users/@me/relationships/2005.
+    assert!(world.people(Some(Relation::Blocked), None).iter().any(|p| p.key.id == "2005"));
+    assert_eq!(world.ask(Request::Relate { person: world.key("2005"), action: RelateAction::Unblock }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", "/users/@me/relationships/2005").len(), 1);
+    assert!(world.people(Some(Relation::Blocked), None).iter().all(|p| p.key.id != "2005"));
+
+    // Ignore user 2006 without blocking: PUT /users/@me/relationships/2006/ignore.
+    assert_eq!(world.ask(Request::Relate { person: world.key("2006"), action: RelateAction::IgnoreUser }), Response::Ok);
+    assert_eq!(world.discord.requests_to("PUT", "/users/@me/relationships/2006/ignore").len(), 1);
+    assert!(world.people(Some(Relation::Ignored), None).iter().any(|p| p.key.id == "2006"));
+    assert!(world.people(Some(Relation::Blocked), None).iter().all(|p| p.key.id != "2006"));
+
+    // Unignore user 2006: DELETE /users/@me/relationships/2006/ignore.
+    assert_eq!(world.ask(Request::Relate { person: world.key("2006"), action: RelateAction::UnignoreUser }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", "/users/@me/relationships/2006/ignore").len(), 1);
+    assert!(world.people(Some(Relation::Ignored), None).iter().all(|p| p.key.id != "2006"));
+}
+
+#[test]
+fn message_request_accept_decline_and_spam_flag() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    let privates = ready["private_channels"].as_array_mut().unwrap();
+    privates.push(json!({
+        "id": "3010", "type": 1, "last_message_id": "1300000000000009010",
+        "recipient_ids": ["2006"], "is_message_request": true, "is_spam": false
+    }));
+    privates.push(json!({
+        "id": "3011", "type": 1, "last_message_id": "1300000000000009011",
+        "recipient_ids": ["2005"], "is_message_request": true, "is_spam": true
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let normal = world.conversation("3010");
+    assert_eq!(normal.special, protocol::Special::Request);
+    assert!(!normal.spam);
+    let spam = world.conversation("3011");
+    assert_eq!(spam.special, protocol::Special::Request);
+    assert!(spam.spam, "is_spam must set Conversation::spam");
+
+    // Accept 3010: PUT /channels/3010/recipients/@me with consent_status 2 -> leaves Requests.
+    assert_eq!(world.ask(Request::AnswerMessageRequest { conversation: world.key("3010"), accept: true }), Response::Ok);
+    let accepts = world.discord.requests_to("PUT", "/channels/3010/recipients/@me");
+    assert_eq!(accepts.len(), 1);
+    assert_eq!(accepts[0].body, json!({"consent_status": 2}));
+    assert_eq!(world.conversation("3010").special, protocol::Special::None);
+
+    // Decline 3011: DELETE /channels/3011 -> conversation removed.
+    assert_eq!(world.ask(Request::AnswerMessageRequest { conversation: world.key("3011"), accept: false }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/3011").len(), 1);
+    assert!(matches!(
+        world.ask(Request::Conversation { conversation: world.key("3011") }),
+        Response::Error { code: ErrorCode::NotFound, .. }
+    ));
+}
+
+#[test]
+fn source_fetches_raw_markdown_for_editing() {
+    let world = World::start();
+    let raw = "> quote\n- item\n```rust\nfn main() {}\n```\nsee [docs](https://example.com) <:ferris:7001>";
+    let posted = json!({
+        "id": "1300000000000000777",
+        "channel_id": "4101",
+        "type": 0,
+        "author": me(),
+        "content": raw,
+        "timestamp": "2026-10-13T08:15:00.000000+00:00",
+        "edited_timestamp": null,
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "attachments": [],
+        "embeds": [],
+        "pinned": false,
+        "tts": false,
+        "flags": 0
+    });
+    world.discord.script("/channels/4101/messages", 200, json!([posted]));
+    match world.ask(Request::Source {
+        conversation: world.key("4101"),
+        message_id: "1300000000000000777".into(),
+    }) {
+        Response::Source { text } => assert_eq!(text, raw),
+        other => panic!("expected Response::Source, got {other:?}"),
+    }
+    let asked = world.discord.requests_to("GET", "/channels/4101/messages");
+    assert!(
+        asked.iter().any(|r| r.path.contains("around=1300000000000000777")),
+        "Source must query around the target message id, got {:?}",
+        asked.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
 }
