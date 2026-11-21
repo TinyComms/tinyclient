@@ -633,7 +633,7 @@ impl Demo {
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
+            Command::Delete { conversation_id, message_id, scope: _, reply } => {
                 let deleted = demo.ctx.deleted(&conversation_id, &message_id);
                 let _ = reply.send(deleted.map_err(|err| Refusal::Refused(err.to_string())));
             }

@@ -369,6 +369,36 @@ impl Capabilities {
     }
 }
 
+/// Per-conversation moderation and management rights reported by the adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRights {
+    /// This account may delete other people's messages in this conversation (Discord
+    /// `MANAGE_MESSAGES`, Slack admin, Telegram `delete_messages`, Signal group admin,
+    /// Teams owner).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_others: bool,
+}
+
+impl ConversationRights {
+    pub fn is_empty(&self) -> bool {
+        *self == ConversationRights::default()
+    }
+
+    pub fn to_bits(self) -> i64 {
+        let mut bits = 0i64;
+        if self.delete_others {
+            bits |= 1 << 0;
+        }
+        bits
+    }
+
+    pub fn from_bits(bits: i64) -> Self {
+        Self {
+            delete_others: (bits & (1 << 0)) != 0,
+        }
+    }
+}
+
 /// Optional media facts staged by the shell for video or audio uploads.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutgoingMedia {

@@ -1542,7 +1542,7 @@ impl Chat {
 
     /// Edit and delete change nothing here: the answer is the network's, and the message
     /// changes when the adapter reports it.
-    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>) -> Response {
+    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>, scope: protocol::DeleteScope) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -1569,6 +1569,7 @@ impl Chat {
             None => self.ask(&account, |reply| Command::Delete {
                 conversation_id,
                 message_id,
+                scope,
                 reply,
             }),
         };
@@ -2645,8 +2646,8 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
             Request::Reactions { conversation } => self.reactions(conversation),
-            Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans),
-            Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None, Vec::new()),
+            Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
+            Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 
@@ -3461,7 +3462,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
         emoji: "👍".into(),
         on: true,
     });
-    let delete = chat.handle(Request::Delete { conversation: conversation.clone(), message_id: "1".into() });
+    let delete = chat.handle(Request::Delete { conversation: conversation.clone(), message_id: "1".into(), scope: protocol::DeleteScope::Everyone });
     if !matches!(edit, Response::Error { code: ErrorCode::Offline, .. })
         || !matches!(react, Response::Error { code: ErrorCode::Offline, .. })
         || !matches!(delete, Response::Error { code: ErrorCode::Offline, .. })
@@ -4175,6 +4176,69 @@ mod tests {
         assert!(!row.archived);
         assert_eq!(row.pin, Some(0));
         assert_eq!(row.folders, vec!["work".to_owned()]);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn delete_passes_scope_and_persists_conversation_rights() {
+        use crate::adapters::{self, Command};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Store};
+        use protocol::{AccountKey, ConversationKind, ConversationRights, DeleteScope, Key, Link, Message, Network, Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Telegram, account: "tg".into() };
+        let conv = Key::new(&account, "g:1");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        let mut row = ConversationRow::new("g:1", ConversationKind::Group, "Mods");
+        row.rights = ConversationRights { delete_others: true };
+        ctx.conversation(&row).unwrap();
+        let other_msg = Message::plain("m1", "other", "remove me", 1_700_000_000, false);
+        let other_msg2 = Message::plain("m2", "other", "remove locally", 1_700_000_001, false);
+        ctx.message("g:1", &other_msg).unwrap();
+        ctx.message("g:1", &other_msg2).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, DeleteScope)>::new()));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::Delete { conversation_id, message_id, scope, reply } => {
+                        seen_worker.lock().unwrap().push((message_id.clone(), scope));
+                        worker_ctx.deleted(&conversation_id, &message_id).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        let Response::Conversation { conversation: stored } = chat.handle(Request::Conversation { conversation: conv.clone() }) else {
+            panic!("expected Conversation");
+        };
+        assert!(stored.rights.delete_others);
+
+        assert_eq!(
+            chat.handle(Request::Delete { conversation: conv.clone(), message_id: "m1".into(), scope: DeleteScope::Everyone }),
+            Response::Ok
+        );
+        assert_eq!(
+            chat.handle(Request::Delete { conversation: conv, message_id: "m2".into(), scope: DeleteScope::Me }),
+            Response::Ok
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("m1".to_owned(), DeleteScope::Everyone), ("m2".to_owned(), DeleteScope::Me)]
+        );
 
         lock(&chat.adapters).remove(&account);
         drop(ctx);

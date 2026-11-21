@@ -765,8 +765,8 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
         }
-        Command::Delete { conversation_id, message_id, reply } => {
-            let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
+        Command::Delete { conversation_id, message_id, scope, reply } => {
+            let _ = reply.send(delete(account, &conversation_id, &message_id, scope).map_err(refused));
         }
         Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
@@ -1054,17 +1054,24 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans:
     Ok(())
 }
 
-fn delete(account: &Account, conversation: &str, message: &str) -> Result<(), Fault> {
+fn delete(account: &Account, conversation: &str, message: &str, scope: protocol::DeleteScope) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
     match who {
         Who::Channel(_) => {
+            if scope == protocol::DeleteScope::Me {
+                return Err(Fault::Rpc {
+                    code: 400,
+                    name: "CHANNEL_DELETE_FOR_EVERYONE_ONLY".to_owned(),
+                    value: None,
+                });
+            }
             let channel = account.input_channel(who)?;
             account.ask(&tl::functions::channels::DeleteMessages { channel, id: vec![id] })?;
         }
-        // For everyone, which is what `Delete` means.
         _ => {
-            account.ask(&tl::functions::messages::DeleteMessages { revoke: true, id: vec![id] })?;
+            let revoke = scope == protocol::DeleteScope::Everyone;
+            account.ask(&tl::functions::messages::DeleteMessages { revoke, id: vec![id] })?;
         }
     }
     let _ = account.ctx.deleted(conversation, message);

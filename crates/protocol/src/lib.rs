@@ -525,6 +525,9 @@ pub struct Conversation {
     /// Flagged as spam by the network (e.g. Discord spam message request).
     #[serde(default, skip_serializing_if = "is_false")]
     pub spam: bool,
+    /// Per-conversation moderation and management rights for this account.
+    #[serde(default, skip_serializing_if = "ConversationRights::is_empty")]
+    pub rights: ConversationRights,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -588,6 +591,7 @@ impl Conversation {
             max_file_bytes: 0,
             read_only_reason: String::new(),
             spam: false,
+            rights: ConversationRights::default(),
         }
     }
 
@@ -1067,6 +1071,23 @@ pub struct MessageReminder {
     pub due: i64,
 }
 
+/// Who a `Request::Delete` removes the message for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteScope {
+    /// Remove the message for everyone in the conversation (the default).
+    #[default]
+    Everyone,
+    /// Remove the message on this user's side only (Telegram, Signal, Google Messages).
+    Me,
+}
+
+impl DeleteScope {
+    pub fn is_everyone(&self) -> bool {
+        *self == DeleteScope::Everyone
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1494,10 +1515,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spans: Vec<Span>,
     },
-    /// Deletes a message for everyone. Waits for the network, like `Edit`.
+    /// Deletes a message. `scope` defaults to `Everyone` (so older shells keep working);
+    /// `Me` removes it on this user's side only (Telegram, Signal, Google Messages).
     Delete {
         conversation: Key,
         message_id: String,
+        #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
+        scope: DeleteScope,
     },
     /// Vote on a poll, take a vote back, or end one. `votes` of `None` ends it (only the person
     /// who started it), `Some` replaces our vote, and an empty list takes it back. Signal only.
@@ -2767,6 +2791,36 @@ mod tests {
         // Older capabilities JSON without these fields defaults to 0 / false.
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert_eq!((old.pin_chats, old.archive, old.folders_edit), (0, false, false));
+    }
+
+    #[test]
+    fn delete_scope_and_conversation_rights_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u:1");
+        // Default scope stays off the wire for backward compatibility.
+        let everyone = Request::Delete { conversation: key.clone(), message_id: "9".into(), scope: DeleteScope::Everyone };
+        let json = serde_json::to_string(&everyone).unwrap();
+        assert!(!json.contains("scope"), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), everyone);
+
+        // Explicit `Me` scope round-trips.
+        let mine = Request::Delete { conversation: key.clone(), message_id: "9".into(), scope: DeleteScope::Me };
+        let me_json = serde_json::to_string(&mine).unwrap();
+        assert!(me_json.contains(r#""scope":"me""#), "{me_json}");
+        assert_eq!(serde_json::from_str::<Request>(&me_json).unwrap(), mine);
+
+        // Older shell request without `scope` decodes as `Everyone`.
+        let legacy: Request = serde_json::from_str(&format!(
+            r#"{{"op":"delete","conversation":{},"message_id":"9"}}"#,
+            serde_json::to_string(&key).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(legacy, everyone);
+
+        // ConversationRights bitmask + serde round-trip.
+        let rights = ConversationRights { delete_others: true };
+        assert_eq!(ConversationRights::from_bits(rights.to_bits()), rights);
+        assert!(ConversationRights::default().is_empty());
+        assert!(!rights.is_empty());
     }
 }
 

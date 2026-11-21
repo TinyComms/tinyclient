@@ -1845,7 +1845,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     assert_eq!(world.fake.calls(ALPHA, "chat.update").len(), 1);
 
     // A delete, likewise.
-    assert_eq!(world.ask(Request::Delete { conversation: general.clone(), message_id: mine.to_owned() }), Response::Ok);
+    assert_eq!(world.ask(Request::Delete { conversation: general.clone(), message_id: mine.to_owned(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     assert!(world.message(&general, mine).is_none());
     let deleted = world.fake.calls(ALPHA, "chat.delete").pop().unwrap();
     assert_eq!((said(&deleted, "channel"), said(&deleted, "ts")), ("C0GEN".to_owned(), mine.to_owned()));
@@ -1855,7 +1855,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
 
     // Slack says no to an edit: nothing changed, and the answer is its reason.
     world.fake.refusing.lock().unwrap().insert("chat.delete".to_owned(), "cant_delete_message".to_owned());
-    let refused = world.ask(Request::Delete { conversation: general.clone(), message_id: shipping.to_owned() });
+    let refused = world.ask(Request::Delete { conversation: general.clone(), message_id: shipping.to_owned(), scope: protocol::DeleteScope::Everyone });
     assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "Slack does not let you delete this message.".to_owned() });
     assert!(world.message(&general, shipping).is_some());
 

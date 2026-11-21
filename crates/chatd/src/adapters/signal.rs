@@ -1466,8 +1466,15 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answered.map_err(refused));
         }
-        Command::Delete { conversation_id, message_id, reply } => {
-            let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
+        Command::Delete { conversation_id, message_id, scope, reply } => {
+            let answer = match scope {
+                protocol::DeleteScope::Everyone => delete(account, &conversation_id, &message_id).map_err(refused),
+                protocol::DeleteScope::Me => {
+                    let _ = account.ctx.deleted(&conversation_id, &message_id);
+                    Ok(())
+                }
+            };
+            let _ = reply.send(answer);
         }
         Command::Typing { conversation_id, activity: _ } => typing(account, &conversation_id),
         Command::StartDirect { person_id, reply } => {

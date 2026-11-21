@@ -1400,6 +1400,7 @@ fn a_text_deleted_on_the_phone_leaves_and_delete_reaches_the_phone() {
     match world.ask(Request::Delete {
         conversation: key(GRACE),
         message_id: mine.id.clone(),
+        scope: protocol::DeleteScope::Me,
     }) {
         Response::Ok => {}
         other => panic!("{other:?}"),

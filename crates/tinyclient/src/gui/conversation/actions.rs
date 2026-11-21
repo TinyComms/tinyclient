@@ -114,7 +114,12 @@ pub struct Can {
     pub reply: bool,
     pub thread: bool,
     pub edit: bool,
+    /// Either delete-for-everyone, delete-for-me, or discarding an unsent message is offered.
     pub delete: bool,
+    /// May delete this message for everyone (own message or moderator with `rights.delete_others`).
+    pub delete_everyone: bool,
+    /// May delete this message on this user's side only (Telegram DM/group, Signal, Google Messages).
+    pub delete_me: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
 }
@@ -150,21 +155,41 @@ pub(super) fn starts_thread(message: &Message, network: Network, kind: Conversat
 
 /// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
 pub fn can(message: &Message, network: Network, kind: ConversationKind, in_thread: bool) -> Can {
+    can_with_rights(message, network, kind, in_thread, protocol::ConversationRights::default())
+}
+
+/// Like [`can`], taking the conversation's moderation rights into account.
+pub fn can_with_rights(
+    message: &Message,
+    network: Network,
+    kind: ConversationKind,
+    in_thread: bool,
+    rights: protocol::ConversationRights,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
     let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
+    let delete_everyone = act && (own || rights.delete_others) && network != Network::Messages;
+    let delete_me = act
+        && match network {
+            Network::Signal | Network::Messages => true,
+            Network::Telegram => !matches!(kind, ConversationKind::Channel | ConversationKind::Announcement),
+            _ => false,
+        };
+    let unsent = !sent && message.outgoing;
     Can {
         act,
         // Slack has no inline reply: its reply is the thread.
         reply: act && network != Network::Slack,
         thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, network, kind)),
         // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
-        // on every message of mine and a refusal is the network's answer. Messages never edits
-        // or deletes, so those items stay off.
+        // on every message of mine and a refusal is the network's answer. Messages never edits.
         edit: sent && own && !message.saved_history && network != Network::Messages,
-        delete: own && network != Network::Messages,
-        unsent: !sent && message.outgoing,
+        delete: delete_everyone || delete_me || (unsent && own && network != Network::Messages),
+        delete_everyone,
+        delete_me,
+        unsent,
     }
 }
 
@@ -307,7 +332,8 @@ impl Pane {
     pub(super) fn can(&self, message: &Message) -> Can {
         // No open conversation is not a place a thread can be started from.
         let kind = self.open.as_ref().map(|open| open.kind).unwrap_or(ConversationKind::Thread);
-        can(message, self.network(), kind, self.is_thread())
+        let rights = self.open.as_ref().map(|open| open.rights).unwrap_or_default();
+        can_with_rights(message, self.network(), kind, self.is_thread(), rights)
     }
 
     // Reactions.
@@ -657,7 +683,7 @@ impl Pane {
         });
     }
 
-    /// Deletes for everyone. `at_once` is a Shift-click, which does not ask. A message that
+    /// Deletes a message. `at_once` is a Shift-click, which does not ask. A message that
     /// never left is only ever here, so removing it asks nothing either.
     pub(super) fn delete(&mut self, message: &Rc<Message>, at_once: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(conversation) = self.key().cloned() else {
@@ -668,14 +694,27 @@ impl Pane {
             let _ = self.shell.update(cx, |shell, cx| shell.discard_send(conversation, client_id, cx));
             return;
         }
-        if !at_once {
+        let allowed = self.can(message);
+        if !at_once || (allowed.delete_everyone && allowed.delete_me) {
             self.confirm = Some(message.clone());
             window.focus(&self.focus, cx);
             cx.notify();
             return;
         }
+        let scope = if allowed.delete_everyone {
+            protocol::DeleteScope::Everyone
+        } else {
+            protocol::DeleteScope::Me
+        };
+        self.delete_scoped(message, scope, cx);
+    }
+
+    pub(super) fn delete_scoped(&mut self, message: &Rc<Message>, scope: protocol::DeleteScope, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
         self.confirm = None;
-        self.act(Request::Delete { conversation, message_id: message.id.clone() }, "Couldn't delete", cx);
+        self.act(Request::Delete { conversation, message_id: message.id.clone(), scope }, "Couldn't delete", cx);
         cx.notify();
     }
 
@@ -1364,8 +1403,19 @@ impl Pane {
     fn confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let message = self.confirm.as_ref()?;
         let open = self.open.as_ref()?;
+        let allowed = self.can(message);
         let network = open.key.network.label();
-        let consequence = if open.kind.is_direct() {
+        let sender = message.shown_sender();
+        let heading = if !message.outgoing {
+            format!("Delete {sender}'s message?")
+        } else {
+            "Delete this message?".to_owned()
+        };
+        let consequence = if allowed.delete_me && !allowed.delete_everyone {
+            format!("It is removed on your side only. Other people on {network} still see it.")
+        } else if !message.outgoing {
+            format!("This removes {sender}'s message for everyone in {}. {network} cannot bring it back.", open.title)
+        } else if open.kind.is_direct() {
             format!("It is removed for both of you. {network} cannot bring it back.")
         } else {
             format!("It is removed for everyone in {}. {network} cannot bring it back.", open.title)
@@ -1384,27 +1434,35 @@ impl Pane {
                     .flex()
                     .items_baseline()
                     .gap(px(8.))
-                    .child(div().type_ui().font_weight(theme::SEMIBOLD).child(message.shown_sender().to_owned()))
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).child(sender.to_owned()))
                     .child(div().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
             )
             .child(div().line_clamp(2).type_ui().text_color(theme::text_soft()).child(words));
-        let target = message.clone();
+        let mut buttons = modal_buttons().child(button("cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+            this.confirm = None;
+            cx.notify();
+        })));
+        if allowed.delete_me {
+            let target_me = message.clone();
+            let kind = if allowed.delete_everyone { ButtonKind::Secondary } else { ButtonKind::Danger };
+            buttons = buttons.child(button("delete-me", kind, "Delete for me").on_click(cx.listener(move |this, _, _, cx| {
+                this.delete_scoped(&target_me, protocol::DeleteScope::Me, cx);
+            })));
+        }
+        if allowed.delete_everyone {
+            let target_all = message.clone();
+            let label = if allowed.delete_me { "Delete for everyone" } else { "Delete" };
+            buttons = buttons.child(button("delete", ButtonKind::Danger, label).on_click(cx.listener(move |this, _, _, cx| {
+                this.delete_scoped(&target_all, protocol::DeleteScope::Everyone, cx);
+            })));
+        }
         // A phone's dialog keeps 16 pt of the window either side.
         let room = f32::from(window.viewport_size().width) - 32.;
-        let panel = modal("Delete this message?")
+        let panel = modal(heading)
             .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
             .child(modal_body(consequence))
             .child(quoted)
-            .child(
-                modal_buttons()
-                    .child(button("cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
-                        this.confirm = None;
-                        cx.notify();
-                    })))
-                    .child(button("delete", ButtonKind::Danger, "Delete").on_click(cx.listener(move |this, _, window, cx| {
-                        this.delete(&target, true, window, cx);
-                    }))),
-            )
+            .child(buttons)
             // A press on the panel is not a press on the scrim behind it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         let size = window.viewport_size();
@@ -1714,5 +1772,37 @@ mod tests {
         saved.outgoing = false;
         let neutral = can(&saved, Network::Tiny, ConversationKind::Direct, false);
         assert!(!neutral.edit && !neutral.delete);
+    }
+
+    #[test]
+    fn moderator_can_delete_others_and_delete_for_me_follows_network() {
+        let theirs = Message::plain("10", "Wren", "hello", 1, false);
+        let mine = Message::plain("11", "Robin", "hi", 2, true);
+        let mod_rights = protocol::ConversationRights { delete_others: true };
+        let plain = protocol::ConversationRights::default();
+
+        // Discord moderator sees Delete (for everyone) on another person's row; non-mod does not.
+        let dc_mod = can_with_rights(&theirs, Network::Discord, ConversationKind::Channel, false, mod_rights);
+        assert!(dc_mod.delete && dc_mod.delete_everyone && !dc_mod.delete_me);
+        let dc_plain = can_with_rights(&theirs, Network::Discord, ConversationKind::Channel, false, plain);
+        assert!(!dc_plain.delete && !dc_plain.delete_everyone && !dc_plain.delete_me);
+
+        // Google Messages offers only delete-for-me (both on own and others' messages).
+        let msg_own = can_with_rights(&mine, Network::Messages, ConversationKind::Direct, false, plain);
+        assert!(msg_own.delete && msg_own.delete_me && !msg_own.delete_everyone && !msg_own.edit);
+        let msg_theirs = can_with_rights(&theirs, Network::Messages, ConversationKind::Direct, false, plain);
+        assert!(msg_theirs.delete && msg_theirs.delete_me && !msg_theirs.delete_everyone);
+
+        // Telegram DM & Signal offer both delete-for-everyone and delete-for-me on own messages,
+        // and only delete-for-me on others' messages unless moderator right is granted.
+        let tg_own = can_with_rights(&mine, Network::Telegram, ConversationKind::Direct, false, plain);
+        assert!(tg_own.delete && tg_own.delete_everyone && tg_own.delete_me);
+        let tg_theirs = can_with_rights(&theirs, Network::Telegram, ConversationKind::Group, false, plain);
+        assert!(tg_theirs.delete && !tg_theirs.delete_everyone && tg_theirs.delete_me);
+        let tg_mod = can_with_rights(&theirs, Network::Telegram, ConversationKind::Group, false, mod_rights);
+        assert!(tg_mod.delete && tg_mod.delete_everyone && tg_mod.delete_me);
+        // Telegram broadcast channel: delete-for-everyone only.
+        let tg_chan = can_with_rights(&theirs, Network::Telegram, ConversationKind::Channel, false, mod_rights);
+        assert!(tg_chan.delete && tg_chan.delete_everyone && !tg_chan.delete_me);
     }
 }

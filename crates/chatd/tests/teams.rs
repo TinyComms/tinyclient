@@ -1219,7 +1219,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(typed[0].json(), json!({"content": "", "contenttype": "Application/Message", "messagetype": "Control/Typing"}));
 
     // Delete: gone here once Teams agreed.
-    assert_eq!(world.ask(Request::Delete { conversation: ana.clone(), message_id: sent.id.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Delete { conversation: ana.clone(), message_id: sent.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     let deleted = world.fake.calls("DELETE", &path("/messages/1760001000000")).pop().expect("the delete reached Teams");
     assert_eq!(deleted.query, "behavior=softDelete");
     assert!(world.message(&ana, &sent.id).is_none());

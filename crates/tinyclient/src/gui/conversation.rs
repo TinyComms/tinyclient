@@ -147,6 +147,8 @@ struct Open {
     reactions: Option<protocol::ReactionRules>,
     /// What became of my newest message, from the conversation's row.
     receipt: Option<protocol::Receipt>,
+    /// Per-conversation moderation and management rights for this account.
+    rights: protocol::ConversationRights,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -462,10 +464,11 @@ impl Pane {
     fn show(&mut self, conversation: &Conversation, me: &str, picture: Option<MediaFile>, typing: bool, cx: &mut Context<Self>) {
         let receipt = conversation.receipt();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
-            if open.title != conversation.title || open.picture != picture || open.receipt != receipt {
+            if open.title != conversation.title || open.picture != picture || open.receipt != receipt || open.rights != conversation.rights {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
                 open.receipt = receipt;
+                open.rights = conversation.rights;
                 cx.notify();
             }
             return;
@@ -481,6 +484,7 @@ impl Pane {
         if let Some(open) = self.open.as_mut() {
             open.picture = picture;
             open.receipt = receipt;
+            open.rights = conversation.rights;
         }
     }
 
@@ -517,6 +521,7 @@ impl Pane {
             root,
             reactions: None,
             receipt: None,
+            rights: protocol::ConversationRights::default(),
             started: Instant::now(),
         });
         self.window = pages::Window::default();

@@ -303,10 +303,11 @@ pub enum Command {
         message_id: String,
         reply: Reply<String>,
     },
-    /// Delete a message for everyone. Report it through [`Context::deleted`] before answering.
+    /// Delete a message (`Everyone` or `Me`). Report it through [`Context::deleted`] before answering.
     Delete {
         conversation_id: String,
         message_id: String,
+        scope: protocol::DeleteScope,
         reply: Reply<()>,
     },
     /// The user's draft is changing. Pace it: at most one typing signal per 8 s per
@@ -769,6 +770,15 @@ impl Context {
     pub fn starred(&self, conversation_id: &str, starred: bool) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_starred(&conversation, starred)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    /// Per-conversation moderation and management rights for this account.
+    pub fn rights(&self, conversation_id: &str, rights: protocol::ConversationRights) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_rights(&conversation, rights)? {
             self.hub.changed(Change::Conversation { conversation });
         }
         Ok(())

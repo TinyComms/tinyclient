@@ -507,7 +507,7 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     world.until("delivered", || world.conversation(GRACE)?.delivered.then_some(()));
     world.steer(&format!("seen grace {ours_at}"));
     world.until("seen", || world.conversation(GRACE)?.seen.then_some(()));
-    assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: ours.id.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: ours.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     world.heard(&format!("send {GRACE} delete {ours_at}"));
 }
 
@@ -1069,7 +1069,7 @@ fn deleting_an_old_message_is_delete_for_me() {
     let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into(), spans: Vec::new() });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("no longer")), "{refused:?}");
     assert!(!world.calls().iter().any(|call| call.contains(&format!("edit {T0}"))));
-    assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: old.id.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: old.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
     world.heard(&format!("send {GRACE} delete-for-me {T0}"));
     assert!(!world.calls().iter().any(|call| call == &format!("send {GRACE} delete {T0}")));
     world.until("the local delete", || (!world.messages(GRACE).iter().any(|m| m.id == old.id)).then_some(()));

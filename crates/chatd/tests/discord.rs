@@ -2594,7 +2594,7 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
     assert_eq!(world.messages(dm).into_iter().find(|stored| stored.id == mine).unwrap().text, "is the deploy done yet?");
 
     // A delete is Discord's to accept too.
-    let delete = || world.ask(Request::Delete { conversation: world.key(dm), message_id: "1300000000000000007".to_owned() });
+    let delete = || world.ask(Request::Delete { conversation: world.key(dm), message_id: "1300000000000000007".to_owned(), scope: protocol::DeleteScope::Everyone });
     world.discord.script(&format!("{reactions}/1300000000000000007"), 403, json!({"message": "Missing Permissions", "code": 50013}));
     assert!(matches!(delete(), Response::Error { code: ErrorCode::Refused, .. }));
     assert_eq!(world.messages(dm).len(), 5);

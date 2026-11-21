@@ -429,8 +429,15 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         Command::Delete {
             conversation_id,
             message_id,
+            scope,
             reply,
-        } => delete(ctx, saved, &conversation_id, &message_id, reply),
+        } => {
+            if scope == protocol::DeleteScope::Me {
+                let _ = reply.send(Err(Refusal::Refused("Tiny only supports deleting for everyone.".to_owned())));
+            } else {
+                delete(ctx, saved, &conversation_id, &message_id, reply);
+            }
+        }
         Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
