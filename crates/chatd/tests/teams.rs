@@ -430,6 +430,11 @@ impl Fake {
                 return ok(json!({}));
             }
             let described = match thread {
+                CHAT_ANA => Some(json!({
+                    "id": thread,
+                    "properties": {"threadType": "chat"},
+                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
+                })),
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
                 "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
@@ -507,10 +512,33 @@ impl Fake {
         answer("201 Created", json!({"OriginalArrivalTime": arrived}))
     }
 
-    /// Microsoft Graph's OneDrive: an upload session for a file, and a link to share it.
+    /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, and channel SharePoint `filesFolder`.
     fn graph(&self, call: &Call, path: &str) -> Reply {
         if call.method == "POST" && path.starts_with("/v1.0/me/drive/root:/Microsoft Teams Chat Files/") && path.ends_with(":/createUploadSession") {
             return ok(json!({"uploadUrl": format!("{}/upload/session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
+        }
+        if call.method == "POST" && path.starts_with("/v1.0/me/drive/items/") && path.ends_with("/invite") {
+            let body = call.json();
+            let has_guest = body["recipients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|r| r["email"].as_str() == Some("dee@contoso.com"));
+            if has_guest {
+                return answer("403 Forbidden", json!({"error": {"code": "accessDenied", "message": "External sharing is disabled by tenant policy."}}));
+            }
+            return ok(json!({"value": [{"id": "perm-1", "roles": ["read"]}]}));
+        }
+        if call.method == "GET" && path.starts_with("/v1.0/teams/") && path.ends_with("/filesFolder") {
+            return ok(json!({
+                "id": "FOLDER_CH1",
+                "name": "General",
+                "parentReference": {"driveId": "DRIVE_TEAM1"},
+                "webUrl": "https://contoso.sharepoint.com/sites/Platform/Shared Documents/General",
+            }));
+        }
+        if call.method == "POST" && path.starts_with("/v1.0/drives/DRIVE_TEAM1/items/FOLDER_CH1:/") && path.ends_with(":/createUploadSession") {
+            return ok(json!({"uploadUrl": format!("{}/upload/channel-session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
         }
         if call.method == "POST" && path.starts_with("/v1.0/me/drive/items/") && path.ends_with("/createLink") {
             return ok(json!({"link": {"type": "view", "scope": "organization", "webUrl": "https://contoso-my.sharepoint.com/:t:/g/personal/me/share-1"}}));
@@ -525,6 +553,12 @@ impl Fake {
         let end: u64 = span.split_once('-').and_then(|(_, end)| end.parse().ok()).unwrap_or(0);
         if end + 1 < total.parse::<u64>().unwrap_or(0) {
             return answer("202 Accepted", json!({"nextExpectedRanges": [format!("{}-", end + 1)]}));
+        }
+        if call.path.contains("channel-session") {
+            return answer("201 Created", json!({
+                "id": "01CHANITEM", "name": "report.txt", "size": total.parse::<u64>().unwrap_or(0),
+                "webUrl": "https://contoso.sharepoint.com/sites/Platform/Shared Documents/General/report.txt",
+            }));
         }
         answer("201 Created", json!({
             "id": "01ITEM", "name": "notes.txt", "size": total.parse::<u64>().unwrap_or(0),
@@ -1460,8 +1494,8 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     assert_eq!((profile.away.as_str(), profile.away_until), ("Back Monday, ask Ben", Some(1_792_396_800)));
     assert_eq!((profile.title.as_str(), profile.department.as_str()), ("Product Manager", "Product"));
 
-    // A file is refused until it can be shared with the chat's members alone: an
-    // organization-wide link is not what the Teams app makes. Nothing reaches OneDrive.
+    // A file in a 1:1 chat uploads to OneDrive and shares ONLY with the chat's members via
+    // Graph `/invite` — never an organization-wide `/createLink`.
     // On Windows "/tmp" has no drive; chatd takes only absolute paths.
     let staged = std::path::absolute(format!("/tmp/tinyclient-teams-file-{}", std::process::id())).unwrap();
     std::fs::create_dir_all(&staged).unwrap();
@@ -1473,10 +1507,18 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     };
     let asked = Request::Send { conversation: key(CHAT_ANA), client_id: "88001".into(), text: "notes attached".into(), reply_to: None, with };
     let answer = world.ask(asked);
-    assert!(!matches!(answer, Response::Sent { .. }), "a file went to Teams: {answer:?}");
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(world.fake.calls("POST", ":/createUploadSession").is_empty());
-    assert!(world.fake.calls("POST", "/createLink").is_empty());
+    assert!(matches!(answer, Response::Sent { .. }), "chat file send failed: {answer:?}");
+    world.until("chat file message sent", || {
+        world.messages(&key(CHAT_ANA)).into_iter().find(|m| m.client_id.as_deref() == Some("88001") && m.state == SendState::Sent)
+    });
+    assert!(!world.fake.calls("POST", ":/createUploadSession").is_empty());
+    let invites = world.fake.calls("POST", "/v1.0/me/drive/items/01ITEM/invite");
+    assert_eq!(invites.len(), 1, "expected per-member invite");
+    let invite_body = invites[0].json();
+    assert_eq!(invite_body["recipients"][0]["email"].as_str(), Some("ana@contoso.com"));
+    assert_eq!(invite_body["requireSignIn"], true);
+    assert_eq!(invite_body["sendInvitation"], false);
+    assert!(world.fake.calls("POST", "/createLink").is_empty(), "must never create an organization-wide link");
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -2387,5 +2429,114 @@ fn signing_out_removes_push_registration_for_signed_out_tenant() {
         "DELETE carries X-Skypetoken: {:?}",
         deleted.headers
     );
+}
+
+#[test]
+fn sending_files_in_channels_uses_sharepoint_folder_and_refused_external_invite_fails_clearly() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 2);
+
+    // Account advertises file upload capabilities.
+    assert!(world.account(HOME).can.max_file_bytes > 0);
+    assert!(world.account(HOME).can.max_files > 0);
+
+    let staged = std::path::absolute(format!("/tmp/tinyclient-teams-chfile-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&staged).unwrap();
+    let report = staged.join("report.txt");
+    std::fs::write(&report, b"quarterly report").unwrap();
+
+    // 1. Channel upload goes to the channel's SharePoint filesFolder (no /invite, no /createLink).
+    let with = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: report.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            view_once: false,
+            media: None,
+        }],
+        ..Default::default()
+    };
+    let sent = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "88002".into(),
+        text: "Channel report".into(),
+        reply_to: None,
+        with,
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    world.until("channel file message sent", || {
+        world
+            .messages(&general)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("88002") && m.state == SendState::Sent)
+    });
+    assert!(!world.fake.calls("GET", "/filesFolder").is_empty(), "queried channel filesFolder");
+    assert!(
+        !world.fake.calls("POST", "/v1.0/drives/DRIVE_TEAM1/items/FOLDER_CH1:/report.txt:/createUploadSession").is_empty(),
+        "uploaded to channel SharePoint drive"
+    );
+    assert!(world.fake.calls("POST", "/invite").is_empty(), "channels do not call /invite");
+    assert!(world.fake.calls("POST", "/createLink").is_empty(), "must never call /createLink");
+    let ch_post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "88002")
+        .expect("channel message POST");
+    let files_prop: Vec<Value> = serde_json::from_str(ch_post.json()["properties"]["files"].as_str().unwrap()).unwrap();
+    assert_eq!(files_prop[0]["permissionScope"].as_str(), Some("channel"));
+    assert_eq!(files_prop[0]["fileChicletState"]["serviceName"].as_str(), Some("sharepoint"));
+
+    // 2. Chat with a guest whose /invite returns 403 surfaces a clear policy refusal and does not post.
+    let Response::Conversation { conversation: dee_row } = world.ask(Request::StartDirect { person: key(DEE) }) else {
+        panic!("expected Response::Conversation for Dee");
+    };
+    let dee_chat = dee_row.key;
+    let with_guest = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: report.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            view_once: false,
+            media: None,
+        }],
+        ..Default::default()
+    };
+    let guest_sent = world.ask(Request::Send {
+        conversation: dee_chat.clone(),
+        client_id: "88003".into(),
+        text: "For Dee".into(),
+        reply_to: None,
+        with: with_guest,
+    });
+    assert!(matches!(guest_sent, Response::Sent { .. }), "{guest_sent:?}");
+    let failed = world.until("guest file send failed", || {
+        world
+            .messages(&dee_chat)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("88003") && matches!(m.state, SendState::Failed { .. }))
+    });
+    let SendState::Failed { reason: err_msg } = failed.state else {
+        panic!("expected SendState::Failed");
+    };
+    assert!(
+        err_msg.contains("external") || err_msg.contains("guest"),
+        "expected clear guest/external policy error, got: {err_msg:?}"
+    );
+    assert!(
+        world
+            .fake
+            .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_DEE}/messages"))
+            .into_iter()
+            .all(|c| c.json()["clientmessageid"] != "88003"),
+        "failed invite must not post message"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
 }
 

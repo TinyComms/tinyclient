@@ -919,12 +919,9 @@ impl Teams {
         self.ctx.describe(&self.session.name, &self.me())?;
         let mut push = self.open()?;
         self.ctx.link(Link::Connected);
-        // Files are off until they can be shared with the chat's members only. The OneDrive path
-        // below made an organization-wide link, which is not what the Teams app does and shows
-        // up in a company's audit logs.
         self.ctx.capabilities(protocol::Capabilities {
-            max_file_bytes: 0,
-            max_files: 0,
+            max_file_bytes: 250 * 1024 * 1024,
+            max_files: protocol::ATTACHMENTS_LIMIT as u32,
             reply: true,
             edit: true,
             delete: true,
