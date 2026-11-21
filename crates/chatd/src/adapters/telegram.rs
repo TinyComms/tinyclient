@@ -1532,6 +1532,10 @@ pub fn prove_telegram_round() -> Result<(), String> {
     protocol::prove_round_video()
 }
 
+pub fn prove_telegram_round_record() -> Result<(), String> {
+    protocol::prove_round_record()
+}
+
 /// The lab's telegram-location driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_location() -> Result<(), String> {
     content::prove_location()?;

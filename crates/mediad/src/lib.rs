@@ -52,6 +52,7 @@ pub mod play;
 pub mod process;
 pub mod probe;
 pub mod rec;
+pub mod rec_video;
 pub mod reel;
 pub mod ring;
 pub mod rt;

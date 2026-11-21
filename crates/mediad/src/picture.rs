@@ -28,6 +28,8 @@ pub const CODEC_LATER: &str = "OpenH264 is still downloading.";
 mod desktop;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use desktop::*;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) use desktop::{RoundCam, RoundEncoder};
 /// What a share sends: the picker's list and the one chosen.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod screens;

@@ -1914,7 +1914,7 @@ fn a_voice_recording_is_told_as_a_recording_and_heard_as_one() {
 
     // Starting the recorder sends record-audio for the Telegram chat, and discarding sends cancel.
     assert_eq!(
-        world.ask(Request::Record(protocol::RecordRequest::Start { conversation: key("u7002"), input: None })),
+        world.ask(Request::Record(protocol::RecordRequest::Start { conversation: key("u7002"), input: None, video: false })),
         Response::Ok
     );
     world.until("recorder start to send record-audio", || (world.called("SetTyping u7002 record-audio") >= 1).then_some(()));

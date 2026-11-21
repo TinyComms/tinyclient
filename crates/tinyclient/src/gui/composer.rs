@@ -573,6 +573,8 @@ pub struct Composer {
     anchors: Rc<Anchors>,
     /// The recording of this conversation, as chatd said it (`Change::Recording`).
     recording: Option<Rec>,
+    /// The mic records a round video message instead of a voice note. Telegram only.
+    video_note: bool,
     /// The mic held down (push-to-talk), and the conversation the hold began in: the next
     /// release stops that one's recording after the grace, wherever the composer has gone since.
     holding: Option<Key>,
@@ -693,6 +695,7 @@ impl Composer {
             schedule_at: None,
             anchors: Rc::new(Anchors::default()),
             recording: None,
+            video_note: false,
             holding: None,
             release: None,
             owed_stop: None,
@@ -1007,8 +1010,21 @@ impl Composer {
         let controls = self.controls();
         let hosts = niceties::link_hosts(&field);
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
-        let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
+        let mut files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
         let voice = rec::sent_as(&self.note, &files);
+        let video = rec::sent_video(&self.note, &files);
+        if let Some(note) = &video {
+            if let Some(file) = files.first_mut() {
+                file.as_file = false;
+                file.media = Some(protocol::OutgoingMedia {
+                    duration_ms: Some(note.duration),
+                    width: Some(note.side),
+                    height: Some(note.side),
+                    thumb: self.note.as_ref().and_then(|recording| recording.frame.clone()),
+                    ..protocol::OutgoingMedia::default()
+                });
+            }
+        }
         let chosen = self.schedule_at.take();
         let schedule = match schedule::for_send(controls.schedule, chosen, now()) {
             Ok(at) => at,
@@ -1026,6 +1042,7 @@ impl Composer {
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
+            video: video.clone(),
             silent: silent && controls.silent,
             suppress_embeds: tiny_previews_off || (self.no_preview && controls.link_chip && !hosts.is_empty()),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
@@ -1063,7 +1080,7 @@ impl Composer {
             reply: self.reply.clone(),
             chips: self.tray.iter().map(|chip| chip.id).collect(),
             made: self.tray.iter().flat_map(Staged::made).collect(),
-            note: voice.is_some(),
+            note: voice.is_some() || video.is_some(),
         };
         self.dispatch(out, with, cx);
     }
@@ -2941,11 +2958,14 @@ impl Composer {
             .as_ref()
             .is_some_and(|recording| Some(&recording.conversation) == self.target.as_ref().map(|target| &target.key) && matches!(recording.state, RecordState::Active));
         let push = crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK);
-        let (icon, words) = match (hot, push) {
-            (true, true) => ("icons/square.svg", "Release to stop recording"),
-            (true, false) => ("icons/square.svg", "Stop recording"),
-            (false, true) => ("icons/mic.svg", "Hold to record"),
-            (false, false) => ("icons/mic.svg", "Record a voice message"),
+        let video = self.video_note && self.target.as_ref().is_some_and(|target| target.can.video_notes);
+        let (icon, words) = match (hot, push, video) {
+            (true, true, _) => ("icons/square.svg", "Release to stop recording"),
+            (true, false, _) => ("icons/square.svg", "Stop recording"),
+            (false, true, true) => ("icons/video.svg", "Hold to record a video message"),
+            (false, false, true) => ("icons/video.svg", "Record a video message"),
+            (false, true, false) => ("icons/mic.svg", "Hold to record"),
+            (false, false, false) => ("icons/mic.svg", "Record a voice message"),
         };
         let button = self
             .card_button("mic", Some(icon), false, None)
@@ -2974,6 +2994,58 @@ impl Composer {
         })
     }
 
+    /// The mic records a round video when the account offers one and the switch is on.
+    fn wants_video(&self) -> bool {
+        self.video_note && self.target.as_ref().is_some_and(|target| target.can.video_notes && rec::available(&target.can))
+    }
+
+    fn record_input(&self, video: bool) -> Option<String> {
+        let key = if video { protocol::settings::CAMERA } else { protocol::settings::INPUT };
+        crate::gui::app::prefs::values().device(key)
+    }
+
+    /// Switches the mic between a voice note and a round video message.
+    fn video_switch(&self, on: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if !on {
+            return None;
+        }
+        let chosen = self.video_note;
+        let hot = self.recording.as_ref().is_some_and(|recording| matches!(recording.state, RecordState::Active));
+        Some(
+            self.card_button("video-note", Some(if chosen { "icons/mic.svg" } else { "icons/video.svg" }), chosen, None)
+                .tooltip(tip(if chosen { "Switch to a voice message" } else { "Switch to a video message" }, None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if hot {
+                        return;
+                    }
+                    this.video_note = !this.video_note;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// A circular live preview while a round video message records.
+    fn round_live(&self) -> Option<Div> {
+        let recording = self.recording.as_ref()?;
+        if !recording.video || !matches!(recording.state, RecordState::Active) {
+            return None;
+        }
+        let target = self.target.as_ref()?;
+        if recording.conversation != target.key {
+            return None;
+        }
+        let path = recording.frame.clone()?;
+        Some(
+            div().flex().justify_center().py(px(8.)).child(
+                div()
+                    .size(px(96.))
+                    .rounded(px(48.))
+                    .overflow_hidden()
+                    .child(gpui::img(PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover)),
+            ),
+        )
+    }
+
     /// The conversation a recording may start for now, if there is one.
     fn record_target(&self) -> Option<Key> {
         self.target
@@ -2990,8 +3062,9 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
-        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input)), |_, _| {});
+        let video = self.wants_video();
+        let input = self.record_input(video);
+        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input, video)), |_, _| {});
     }
 
     /// Push-to-talk, the press: record now. A press inside the previous release's grace drops
@@ -3002,8 +3075,9 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
-        ask_later(cx, Request::Record(rec::on_hold_down(&target, input)), |_, _| {});
+        let video = self.wants_video();
+        let input = self.record_input(video);
+        ask_later(cx, Request::Record(rec::on_hold_down(&target, input, video)), |_, _| {});
         self.holding = Some(target);
     }
 
@@ -3144,6 +3218,7 @@ impl Composer {
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
         let mic = self.mic_button(controls.voice, cx);
+        let video_mode = self.video_switch(controls.voice && self.target.as_ref().is_some_and(|target| target.can.video_notes), cx);
         let sim_btn = self
             .target
             .as_ref()
@@ -3252,9 +3327,9 @@ impl Composer {
             .text_color(theme::text())
             .child(self.input.clone());
         let row = if phone {
-            // A real flex row: 44 | field | 44 | 44. Every button keeps its size; only the field
-            // gives way, so nothing can overlap at 100% or at 200%. GIFs and stickers are inside
-            // the emoji picker's own tabs, so the row has no fifth button.
+            // A real flex row. Every button keeps its size; only the field gives way, so nothing
+            // can overlap at 100% or at 200%. GIFs and stickers stay in the emoji picker. A
+            // video-note account adds one switch before the mic.
             div()
                 .min_h(px(52.))
                 // Without the attach button (an edit), the words keep the desktop's 12 from the edge.
@@ -3267,6 +3342,7 @@ impl Composer {
                 .children(attach)
                 .child(field)
                 .children(sim_btn)
+                .children(video_mode)
                 .children(mic)
                 .children(smile)
                 .child(send)
@@ -3283,6 +3359,7 @@ impl Composer {
                 .child(field)
                 .children(sim_btn.map(|btn| btn.mr(px(4.))))
                 .children(gif.map(|gif| gif.mr(px(2.))))
+                .children(video_mode.map(|mode| mode.mr(px(2.))))
                 .children(mic.map(|mic| mic.mr(px(2.))))
                 .children(smile.map(|smile| smile.mr(px(4.))))
                 .child(send)
@@ -3306,6 +3383,7 @@ impl Composer {
             .children(self.mode_bar(cx))
             .children(self.subject_bar(cx))
             .children(self.tray(window, cx))
+            .children(self.round_live())
             .children(self.format_bar(cx))
             .child(row)
     }

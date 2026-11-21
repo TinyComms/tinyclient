@@ -9,7 +9,7 @@ use super::wire::Fault;
 use super::{live, random_id, remember_random, reply_header, Account, Options};
 use crate::blobs::upload::{self, Upload};
 use grammers_tl_types as tl;
-use protocol::{Message, Outgoing, VoiceNote};
+use protocol::{Message, Outgoing, VideoNote, VoiceNote};
 use std::sync::Arc;
 
 /// Telegram's part size, which every part but the last must be exactly.
@@ -60,8 +60,9 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
     let (account, conversation_id, client, text, reply) =
         (account.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned));
     let voice: Option<VoiceNote> = (with.files.len() == 1).then_some(()).and_then(|_| with.voice.clone());
+    let video: Option<VideoNote> = (with.files.len() == 1 && voice.is_none()).then_some(()).and_then(|_| with.video.clone());
     upload::spawn(&ctx, conversation, client_id, &with.files, move |up| {
-        files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, voice.as_ref(), up)
+        files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, voice.as_ref(), video.as_ref(), up)
     });
 }
 
@@ -298,7 +299,17 @@ struct Uploaded {
     visual: bool,
 }
 
-fn files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Message, String> {
+fn files(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    opts: Options,
+    voice: Option<&VoiceNote>,
+    video: Option<&VideoNote>,
+    up: &mut Upload,
+) -> Result<Message, String> {
     let words = |fault: Fault| fault.words();
     let target = target(account, conversation, reply_to).map_err(words)?;
     let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
@@ -315,7 +326,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     let mut uploaded = Vec::with_capacity(up.files().len());
     for at in 0..up.files().len() {
         // `voice` is only set for a send of one file: a voice message is one file.
-        uploaded.push(file(account, conversation, client_id, at, voice, up)?);
+        uploaded.push(file(account, conversation, client_id, at, voice, video, up)?);
     }
     up.check()?;
     let random = random_id(client_id);
@@ -395,7 +406,15 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
 
 /// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
 /// `voice` and is sent as a voice note, as Telegram's apps send one.
-fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {
+fn file(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    at: usize,
+    voice: Option<&VoiceNote>,
+    video: Option<&VideoNote>,
+    up: &mut Upload,
+) -> Result<Uploaded, String> {
     let (name, bytes, mime, spoiler, as_file, path, staged_media, thumb_path) = {
         let source = &up.files()[at];
         (
@@ -409,9 +428,9 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
             source.thumb.clone(),
         )
     };
-    let photo = !as_file && PHOTOS.contains(&mime) && bytes <= BIG;
-    let is_video = !as_file && voice.is_none() && mime.starts_with("video/");
-    let is_audio = !as_file && voice.is_none() && mime.starts_with("audio/");
+    let photo = !as_file && video.is_none() && PHOTOS.contains(&mime) && bytes <= BIG;
+    let is_video = video.is_some() || (!as_file && voice.is_none() && mime.starts_with("video/"));
+    let is_audio = !as_file && voice.is_none() && video.is_none() && mime.starts_with("audio/");
     let activity = if voice.is_some() {
         protocol::Compose::UploadingAudio
     } else if photo {
@@ -459,16 +478,30 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
     // A voice note is one Ogg Opus file and its own attribute: no file name, which Telegram's
     // own voice notes carry none of (their rows read "Voice message"). The loudness bars go
     // from the contract's byte a bar to Telegram's five bits a bar.
-    let attributes: Vec<tl::enums::DocumentAttribute> = match voice {
-        Some(voice) => vec![tl::types::DocumentAttributeAudio {
+    let round = video.map(protocol::round_wire);
+    let attributes: Vec<tl::enums::DocumentAttribute> = if let Some(voice) = voice {
+        vec![tl::types::DocumentAttributeAudio {
             voice: true,
             duration: (voice.duration / 1000) as i32,
             title: None,
             performer: None,
             waveform: Some(packed(&voice.waveform)),
         }
-        .into()],
-        None => {
+        .into()]
+    } else if let Some(wire) = round {
+        vec![tl::types::DocumentAttributeVideo {
+            round_message: wire.round_message,
+            supports_streaming: false,
+            nosound: wire.nosound,
+            duration: wire.duration_secs,
+            w: wire.side,
+            h: wire.side,
+            preload_prefix_size: None,
+            video_start_ts: None,
+            video_codec: None,
+        }
+        .into()]
+    } else {
             let mut attrs: Vec<tl::enums::DocumentAttribute> = vec![tl::types::DocumentAttributeFilename { file_name: name }.into()];
             if is_video {
                 let probed = probe_mp4(&path);
@@ -522,17 +555,16 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
                 }
             }
             attrs
-        }
     };
     let media: tl::enums::InputMedia = match photo {
         true => tl::types::InputMediaUploadedPhoto { spoiler, live_photo: false, file: input, stickers: None, ttl_seconds: None, video: None }.into(),
         false => tl::types::InputMediaUploadedDocument {
-            nosound_video: false,
-            force_file: as_file,
-            spoiler: spoiler && !as_file,
+            nosound_video: round.is_some_and(|wire| wire.nosound),
+            force_file: as_file && video.is_none(),
+            spoiler: spoiler && !as_file && video.is_none(),
             file: input,
             thumb,
-            mime_type: mime.to_owned(),
+            mime_type: if video.is_some() { "video/mp4".to_owned() } else { mime.to_owned() },
             attributes,
             stickers: None,
             video_cover: None,

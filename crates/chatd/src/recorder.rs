@@ -65,6 +65,19 @@ fn heard(shown: &mut Recording, active: &Active, event: &RecEvent) -> bool {
             since: active.recording.since,
             device: (!device.is_empty()).then(|| device.clone()),
             notice: notice.clone(),
+            video: active.recording.video,
+            side: active.recording.side,
+            frame: shown.frame.clone(),
+            state: RecordState::Active,
+        },
+        RecEvent::Frame { path } => Recording {
+            conversation: active.recording.conversation.clone(),
+            since: active.recording.since,
+            device: shown.device.clone(),
+            notice: shown.notice.clone(),
+            video: active.recording.video,
+            side: active.recording.side,
+            frame: Some(path.clone()),
             state: RecordState::Active,
         },
         RecEvent::Done { duration, waveform } => Recording {
@@ -72,6 +85,9 @@ fn heard(shown: &mut Recording, active: &Active, event: &RecEvent) -> bool {
             since: active.recording.since,
             device: shown.device.clone(),
             notice: shown.notice.clone(),
+            video: active.recording.video,
+            side: active.recording.side,
+            frame: shown.frame.clone(),
             state: RecordState::Recorded {
                 path: active.path.display().to_string(),
                 duration: *duration,
@@ -83,6 +99,9 @@ fn heard(shown: &mut Recording, active: &Active, event: &RecEvent) -> bool {
             since: active.recording.since,
             device: shown.device.clone(),
             notice: shown.notice.clone(),
+            video: active.recording.video,
+            side: active.recording.side,
+            frame: shown.frame.clone(),
             state: RecordState::Failed { detail: detail.clone() },
         },
     };
@@ -124,20 +143,33 @@ impl Recorder {
     /// The shell's request. Every answer is `Ok`: what happened is a `Change::Recording`.
     pub fn request(&self, hub: &Arc<Hub>, request: RecordRequest) {
         match request {
-            RecordRequest::Start { conversation, input } => self.start(hub, conversation, input),
+            RecordRequest::Start { conversation, input, video } => self.start(hub, conversation, input, video),
             RecordRequest::Stop => self.stop(hub),
             RecordRequest::Forget => self.forget(hub),
         }
     }
 
     /// Starts a mediad. Whatever was recording ends first: its facts never arrive any more.
-    fn start(&self, hub: &Arc<Hub>, conversation: Key, input: Option<String>) {
+    fn start(&self, hub: &Arc<Hub>, conversation: Key, input: Option<String>, video: bool) {
         let since = now_ms();
-        let path = crate::blobs::upload::outbox().join(format!("voice-{since}.opus"));
+        let path = crate::blobs::upload::outbox().join(if video {
+            format!("video-{since}.mp4")
+        } else {
+            format!("voice-{since}.opus")
+        });
         let cancel_old = self.shown().is_some_and(|old| old.conversation != conversation);
         self.replace(hub, None, cancel_old);
-        self.emit_activity(&conversation, Compose::RecordingVoice);
-        let recording = Recording { conversation, since, device: None, notice: None, state: RecordState::Active };
+        self.emit_activity(&conversation, if video { Compose::RecordingVideo } else { Compose::RecordingVoice });
+        let recording = Recording {
+            conversation,
+            since,
+            device: None,
+            notice: None,
+            video,
+            side: if video { protocol::ROUND_SIDE } else { 0 },
+            frame: None,
+            state: RecordState::Active,
+        };
         let _ = std::fs::create_dir_all(path.parent().expect("the outbox has a parent"));
         self.spawn_recording(hub, &recording, &path, input.as_deref());
         self.tell(hub);
@@ -148,7 +180,7 @@ impl Recorder {
         let error = match mediad_path() {
             Err(err) => Some(err),
             Ok(mediad) => {
-                let mut command = recorder_command(&mediad, path, input);
+                let mut command = recorder_command(&mediad, path, input, recording.video);
                 protocol::launch::no_console(&mut command);
                 match protocol::media_host::spawn(&mut command) {
                     Ok(spawned) => {
@@ -163,11 +195,8 @@ impl Recorder {
             tracing::warn!("chatd: the recorder did not start: {err}");
             *lock(&self.active) = None;
             *lock(&self.shown) = Some(Recording {
-                conversation: recording.conversation.clone(),
-                since: recording.since,
-                device: None,
-                notice: None,
                 state: RecordState::Failed { detail: NO_RECORDER.to_owned() },
+                ..recording.clone()
             });
         }
     }
@@ -195,6 +224,8 @@ impl Recorder {
             let hub = hub.clone();
             let conv = recording.conversation.clone();
             let renew_stop = stop_renew.clone();
+            let video = recording.video;
+            let started = std::time::Instant::now();
             let _ = std::thread::Builder::new().name("recorder-activity".into()).stack_size(64 * 1024).spawn(move || {
                 let mut done = lock(&renew_stop.0);
                 while !*done {
@@ -208,7 +239,12 @@ impl Recorder {
                     }
                     if timeout.timed_out() {
                         drop(done);
-                        hub.recorder.emit_activity(&conv, Compose::RecordingVoice);
+                        if video && started.elapsed() >= std::time::Duration::from_secs(60) {
+                            hub.recorder.stop(&hub);
+                            break;
+                        }
+                        let activity = if video { Compose::RecordingVideo } else { Compose::RecordingVoice };
+                        hub.recorder.emit_activity(&conv, activity);
                         done = lock(&renew_stop.0);
                     }
                 }
@@ -275,7 +311,7 @@ impl Recorder {
             let active = lock(&self.active);
             match (active.as_ref(), shown.as_mut()) {
                 (Some(active), Some(shown)) if active.recording == *recording => {
-                    if !matches!(event, RecEvent::Started { .. }) {
+                    if !matches!(event, RecEvent::Started { .. } | RecEvent::Frame { .. }) {
                         active.said.store(true, Ordering::Relaxed);
                         finish_renew(&active.stop_renew);
                     }
@@ -293,9 +329,9 @@ impl Recorder {
     }
 }
 
-fn recorder_command(mediad: &Path, path: &Path, input: Option<&str>) -> Command {
+fn recorder_command(mediad: &Path, path: &Path, input: Option<&str>, video: bool) -> Command {
     let mut command = Command::new(mediad);
-    command.arg("--rec").arg(path);
+    command.arg(if video { "--rec-video" } else { "--rec" }).arg(path);
     if let Some(input) = input.filter(|s| !s.is_empty()) {
         command.arg("--input").arg(input);
     }
@@ -355,7 +391,16 @@ mod tests {
     }
 
     fn recording(since: u64) -> Recording {
-        Recording { conversation: Key { network: Network::Telegram, account: "10".into(), id: "7002".into() }, since, device: None, notice: None, state: RecordState::Active }
+        Recording {
+            conversation: Key { network: Network::Telegram, account: "10".into(), id: "7002".into() },
+            since,
+            device: None,
+            notice: None,
+            video: false,
+            side: 0,
+            frame: None,
+            state: RecordState::Active,
+        }
     }
 
     fn active(recording: Recording, path: &str) -> Active {
@@ -437,11 +482,15 @@ mod tests {
 
     #[test]
     fn recorder_command_passes_chosen_input_and_started_updates_device_and_notice() {
-        let cmd = recorder_command(Path::new("mediad"), Path::new("voice.opus"), Some("Blue Yeti\tusb-mic"));
+        let cmd = recorder_command(Path::new("mediad"), Path::new("voice.opus"), Some("Blue Yeti\tusb-mic"), false);
         let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(args, ["--rec", "voice.opus", "--input", "Blue Yeti\tusb-mic"]);
 
-        let auto = recorder_command(Path::new("mediad"), Path::new("voice.opus"), None);
+        let round = recorder_command(Path::new("mediad"), Path::new("video.mp4"), None, true);
+        let round_args: Vec<&str> = round.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(round_args, ["--rec-video", "video.mp4"]);
+
+        let auto = recorder_command(Path::new("mediad"), Path::new("voice.opus"), None, false);
         let auto_args: Vec<&str> = auto.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(auto_args, ["--rec", "voice.opus"]);
 

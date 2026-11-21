@@ -529,6 +529,9 @@ pub struct Capabilities {
     /// This network takes a file sent as a recorded voice note (`Outgoing::voice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub voice_notes: bool,
+    /// This network takes a round video message (`Outgoing::video`). Telegram only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video_notes: bool,
     /// Seconds after sending that an edit is still allowed. 0: no limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub edit_window: u32,
@@ -959,6 +962,20 @@ pub struct VoiceNote {
     pub waveform: Vec<u8>,
 }
 
+/// A round video message: a square picture, at most a minute. `sound` is set only when the
+/// file has an AAC track. This build's recorder writes video only, so `sound` stays off and
+/// the upload says `nosound`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoNote {
+    /// Milliseconds of picture, as the recorder finished the file.
+    pub duration: u32,
+    /// Square side in pixels.
+    pub side: u32,
+    /// The file has an AAC sound track. False: picture only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sound: bool,
+}
+
 /// A poll the user is starting. Signal: a question of 1 to 100 characters and 2 to 10 choices,
 /// each at most 100 characters. `multiple` lets a person pick more than one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1013,6 +1030,9 @@ pub struct Outgoing {
     /// `files` of one). The facts name it what it is without a second look at the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<VoiceNote>,
+    /// The last file is a round video message (`files` of one). Not a voice note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoNote>,
     /// Unix seconds: the network sends it then (Slack, Telegram). tinyclient never runs a timer
     /// that sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1060,6 +1080,7 @@ impl Default for Outgoing {
             pick: None,
             schedule: None,
             voice: None,
+            video: None,
             spans: Vec::new(),
             poll: None,
             importance: Importance::Normal,

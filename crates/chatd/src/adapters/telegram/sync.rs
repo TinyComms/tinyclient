@@ -354,6 +354,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         allow_archives: false,
         abuse_reports: true,
         voice_notes: true,
+        video_notes: true,
         direct_calls: false,
         revisions: false,
         close_direct: false,
