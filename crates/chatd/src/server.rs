@@ -1679,7 +1679,7 @@ impl Chat {
         }
     }
 
-    fn invite_preview(&self, account: AccountKey, code: String) -> Response {
+    fn invite_preview(&self, account: AccountKey, code: String, event_id: Option<String>) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
@@ -1687,8 +1687,38 @@ impl Chat {
         if code.is_empty() {
             return error(ErrorCode::Refused, "Enter an invite link or code.");
         }
-        match self.ask(&account, |reply| Command::InvitePreview { code, reply }) {
+        match self.ask(&account, |reply| Command::InvitePreview { code, event_id, reply }) {
             Ok(preview) => Response::InvitePreview { preview },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn event_preview(&self, space: Key, event_id: String) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let event_id = event_id.trim().to_owned();
+        if event_id.is_empty() {
+            return error(ErrorCode::Refused, "Missing event id.");
+        }
+        match self.ask(&account, |reply| Command::EventPreview { space_id: space.id, event_id, reply }) {
+            Ok(event) => Response::EventPreview { event },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn event_interest(&self, space: Key, event_id: String, interested: bool) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let event_id = event_id.trim().to_owned();
+        if event_id.is_empty() {
+            return error(ErrorCode::Refused, "Missing event id.");
+        }
+        match self.ask(&account, |reply| Command::EventInterest { space_id: space.id, event_id, interested, reply }) {
+            Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
     }
@@ -3281,8 +3311,10 @@ impl Chat {
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
-            Request::InvitePreview { account, code } => self.invite_preview(account, code),
+            Request::InvitePreview { account, code, event_id } => self.invite_preview(account, code, event_id),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
+            Request::EventPreview { space, event_id } => self.event_preview(space, event_id),
+            Request::EventInterest { space, event_id, interested } => self.event_interest(space, event_id, interested),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

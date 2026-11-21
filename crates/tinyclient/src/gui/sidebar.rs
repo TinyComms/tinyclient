@@ -2212,7 +2212,7 @@ impl Shell {
         modal.error = None;
         let account = modal.account.clone();
         cx.notify();
-        let req = Request::InvitePreview { account, code };
+        let req = Request::InvitePreview { account, code, event_id: None };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
             let _ = shell.update(cx, |this, cx| {

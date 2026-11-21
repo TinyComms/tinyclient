@@ -38,7 +38,7 @@ use protocol::{Conversation, ConversationKind, Key, Message, MessageKind, Presen
 use rest::{Refused, Rest};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -338,6 +338,12 @@ struct State {
     warming: HashSet<String>,
     /// What the last acknowledgement answered with; the web client sends it back on the next.
     ack_token: Option<String>,
+    /// Session cache of resolved invites (keyed by `"code"` or `"code:event_id"`).
+    invite_cache: HashMap<String, Result<protocol::InvitePreview, String>>,
+    /// Session cache of resolved scheduled events (keyed by `(guild_id, event_id)`).
+    event_cache: HashMap<(String, String), Result<protocol::ScheduledEvent, String>>,
+    /// Recent invite/event resolve timestamps, paced to avoid scraping bursts.
+    invite_recent: VecDeque<Instant>,
     /// Our own presence and status line as the settings have them, and those settings as
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
@@ -1306,11 +1312,59 @@ impl Discord {
         Ok(())
     }
 
-    /// Previews a Discord server invite (`GET /invites/{code}?with_counts=true&with_expiration=true`).
-    fn invite_preview(&self, raw: &str) -> Result<protocol::InvitePreview, Refusal> {
+    /// Previews a Discord server invite (`GET /invites/{code}?with_counts=true&with_expiration=true`),
+    /// optionally including a scheduled event (`&guild_scheduled_event_id=...`). Session-cached
+    /// per code and paced so scrolling never bursts Discord.
+    fn invite_preview(&self, raw: &str, event_id: Option<&str>) -> Result<protocol::InvitePreview, Refusal> {
         let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
-        let path = format!("/invites/{}?with_counts=true&with_expiration=true", escaped(&code));
-        let body = self.call("GET", &path, None).map_err(invite_refusal)?;
+        let query_event = raw
+            .split_once('?')
+            .and_then(|(_, q)| q.split('#').next())
+            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("event=")))
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        let event_id = event_id.filter(|id| !id.is_empty()).or(query_event);
+        let cache_key = match event_id {
+            Some(ev) => format!("{code}:{ev}"),
+            None => code.clone(),
+        };
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(cached) = state.invite_cache.get(&cache_key).cloned() {
+                return match cached {
+                    Ok(mut preview) => {
+                        if let Some(gid) = preview.space_id.as_deref() {
+                            preview.joined = state.guilds.contains_key(gid);
+                        }
+                        Ok(preview)
+                    }
+                    Err(msg) => Err(Refusal::Refused(msg)),
+                };
+            }
+            let now = Instant::now();
+            while state.invite_recent.front().is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60)) {
+                state.invite_recent.pop_front();
+            }
+            if state.invite_recent.len() >= 12 {
+                return Err(Refusal::Refused("Too many invite previews right now. Try again in a moment.".to_owned()));
+            }
+            state.invite_recent.push_back(now);
+        }
+        let mut path = format!("/invites/{}?with_counts=true&with_expiration=true", escaped(&code));
+        if let Some(ev) = event_id {
+            path.push_str(&format!("&guild_scheduled_event_id={}", escaped(ev)));
+        }
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(err) => {
+                let refused = invite_refusal(err);
+                if let Refusal::Refused(ref msg) = refused {
+                    if msg.contains("invalid or has expired") {
+                        crate::hub::lock(&self.state).invite_cache.insert(cache_key, Err(msg.clone()));
+                    }
+                }
+                return Err(refused);
+            }
+        };
         let parsed: Value = serde_json::from_str(&body)
             .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
         let guild = parsed.get("guild").filter(|v| v.is_object());
@@ -1342,7 +1396,15 @@ impl Discord {
             .and_then(|c| c.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        Ok(protocol::InvitePreview {
+        let event = parsed
+            .get("guild_scheduled_event")
+            .filter(|v| v.is_object())
+            .and_then(|ev| parse_scheduled_event(ev, space_id.as_deref()));
+        let joined = {
+            let state = crate::hub::lock(&self.state);
+            space_id.as_deref().is_some_and(|gid| state.guilds.contains_key(gid))
+        };
+        let preview = protocol::InvitePreview {
             code: parsed.get("code").and_then(Value::as_str).unwrap_or(&code).to_owned(),
             name,
             description,
@@ -1351,7 +1413,11 @@ impl Discord {
             online: parsed.get("approximate_presence_count").and_then(Value::as_u64).map(|n| n as u32),
             space_id,
             channel_id,
-        })
+            joined,
+            event,
+        };
+        crate::hub::lock(&self.state).invite_cache.insert(cache_key, Ok(preview.clone()));
+        Ok(preview)
     }
 
     /// Joins a Discord server from an invite code (`POST /invites/{code}`). Never retries on
@@ -1375,7 +1441,93 @@ impl Discord {
             .and_then(|c| c.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        {
+            let mut state = crate::hub::lock(&self.state);
+            for (k, v) in &mut state.invite_cache {
+                if k == &code || k.starts_with(&format!("{code}:")) {
+                    if let Ok(preview) = v {
+                        preview.joined = true;
+                    }
+                }
+            }
+        }
         Ok((space_id, channel_id))
+    }
+
+    /// Resolves a Discord scheduled event (`GET /guilds/{guild}/scheduled-events/{event}?with_user_count=true`).
+    fn event_preview(&self, guild_id: &str, event_id: &str) -> Result<protocol::ScheduledEvent, Refusal> {
+        let key = (guild_id.to_owned(), event_id.to_owned());
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(cached) = state.event_cache.get(&key).cloned() {
+                return cached.map_err(Refusal::Refused);
+            }
+            let now = Instant::now();
+            while state.invite_recent.front().is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60)) {
+                state.invite_recent.pop_front();
+            }
+            if state.invite_recent.len() >= 12 {
+                return Err(Refusal::Refused("Too many event lookups right now. Try again in a moment.".to_owned()));
+            }
+            state.invite_recent.push_back(now);
+        }
+        let path = format!(
+            "/guilds/{}/scheduled-events/{}?with_user_count=true",
+            escaped(guild_id),
+            escaped(event_id)
+        );
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(err) => {
+                let refused = invite_refusal(err);
+                if let Refusal::Refused(ref msg) = refused {
+                    if msg.contains("invalid or has expired") {
+                        crate::hub::lock(&self.state).event_cache.insert(key, Err(msg.clone()));
+                    }
+                }
+                return Err(refused);
+            }
+        };
+        let parsed: Value = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let event = parse_scheduled_event(&parsed, Some(guild_id))
+            .ok_or_else(|| Refusal::Refused("Discord's event response was incomplete.".to_owned()))?;
+        crate::hub::lock(&self.state).event_cache.insert(key, Ok(event.clone()));
+        Ok(event)
+    }
+
+    /// Marks or unmarks ourselves as interested in a Discord scheduled event
+    /// (`PUT` / `DELETE /guilds/{guild}/scheduled-events/{event}/users/@me`).
+    fn event_interest(&self, guild_id: &str, event_id: &str, interested: bool) -> Result<(), Refusal> {
+        let method = if interested { "PUT" } else { "DELETE" };
+        let path = format!(
+            "/guilds/{}/scheduled-events/{}/users/@me",
+            escaped(guild_id),
+            escaped(event_id)
+        );
+        self.call(method, &path, None).map_err(refusal)?;
+        let mut state = crate::hub::lock(&self.state);
+        if let Some(Ok(ev)) = state.event_cache.get_mut(&(guild_id.to_owned(), event_id.to_owned())) {
+            if ev.interested != interested {
+                ev.interested = interested;
+                if let Some(count) = ev.interested_count.as_mut() {
+                    *count = if interested { count.saturating_add(1) } else { count.saturating_sub(1) };
+                }
+            }
+        }
+        for cached in state.invite_cache.values_mut() {
+            if let Ok(preview) = cached {
+                if let Some(ev) = preview.event.as_mut().filter(|e| e.id == event_id) {
+                    if ev.interested != interested {
+                        ev.interested = interested;
+                        if let Some(count) = ev.interested_count.as_mut() {
+                            *count = if interested { count.saturating_add(1) } else { count.saturating_sub(1) };
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
@@ -1861,8 +2013,16 @@ impl Discord {
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
-            Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
+            Command::InvitePreview { code, event_id, reply } => {
+                answer(reply, self.invite_preview(&code, event_id.as_deref()))
+            }
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
+            Command::EventPreview { space_id, event_id, reply } => {
+                answer(reply, self.event_preview(&space_id, &event_id))
+            }
+            Command::EventInterest { space_id, event_id, interested, reply } => {
+                answer(reply, self.event_interest(&space_id, &event_id, interested))
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
@@ -2066,6 +2226,38 @@ fn invite_refusal(err: Refused) -> Refusal {
         }
         other => refusal(other),
     }
+}
+
+/// Parses a Discord `guild_scheduled_event` JSON object into [`protocol::ScheduledEvent`].
+fn parse_scheduled_event(ev: &Value, fallback_guild: Option<&str>) -> Option<protocol::ScheduledEvent> {
+    let id = ev.get("id").and_then(Value::as_str)?.to_owned();
+    let guild_id = ev
+        .get("guild_id")
+        .and_then(Value::as_str)
+        .or(fallback_guild)
+        .unwrap_or_default()
+        .to_owned();
+    let name = ev.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let start = ev
+        .get("scheduled_start_time")
+        .and_then(Value::as_str)
+        .and_then(model::iso_seconds);
+    let place = ev
+        .get("entity_metadata")
+        .and_then(|m| m.get("location"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let interested_count = ev.get("user_count").and_then(Value::as_u64).map(|n| n as u32);
+    Some(protocol::ScheduledEvent {
+        id,
+        guild_id,
+        name,
+        start,
+        place,
+        interested_count,
+        interested: false,
+    })
 }
 
 /// Sends the answer to a command the shell is waiting on.

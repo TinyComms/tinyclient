@@ -700,6 +700,12 @@ pub struct InvitePreview {
     pub space_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    /// True when this account is already a member of `space_id`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub joined: bool,
+    /// Optional scheduled event attached to this invite (`?event=<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<crate::ScheduledEvent>,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].

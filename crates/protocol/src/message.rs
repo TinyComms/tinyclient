@@ -24,6 +24,8 @@ pub const DELIVERIES_LIMIT: usize = 256;
 pub const MESSAGE_CONTROLS_LIMIT: usize = 32;
 /// Most selectable options on a single menu, radio group, or checkbox group.
 pub const CONTROL_OPTIONS_LIMIT: usize = 100;
+/// Most invite or event cards attached to one message.
+pub const MESSAGE_INVITES_LIMIT: usize = 3;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -709,6 +711,61 @@ pub struct MessageControl {
     pub kind: ControlKind,
 }
 
+/// Resolution state of a Space invite or scheduled-event card on a message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteState {
+    #[default]
+    Unresolved,
+    Valid,
+    Joined,
+    Invalid,
+}
+
+/// Metadata for a scheduled event (e.g. Discord `guild_scheduled_event`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledEvent {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guild_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Unix seconds when the event starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub place: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interested_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interested: bool,
+}
+
+/// A Space invite or scheduled-event link detected inside a message, resolved lazily when on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageInvite {
+    /// Invite code (e.g. `rustlang`), empty for a standalone event link.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// Canonical HTTPS link to open in the official app / browser when handing off.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub space_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<u32>,
+    #[serde(default)]
+    pub state: InviteState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<ScheduledEvent>,
+}
+
 /// One message. Which conversation it is in comes from the answer that carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -852,6 +909,9 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Server invite or scheduled-event cards detected in the message text (resolved lazily on screen).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invites: Vec<MessageInvite>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -961,6 +1021,7 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            invites: Vec::new(),
         }
     }
 
@@ -1096,6 +1157,18 @@ impl Message {
                 }
             }
         }
+        self.invites.truncate(MESSAGE_INVITES_LIMIT);
+        for invite in &mut self.invites {
+            clip(&mut invite.code, 128);
+            clip(&mut invite.url, 512);
+            clip(&mut invite.space_name, 200);
+            if let Some(ev) = &mut invite.event {
+                clip(&mut ev.id, 64);
+                clip(&mut ev.guild_id, 64);
+                clip(&mut ev.name, 200);
+                clip(&mut ev.place, 200);
+            }
+        }
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
@@ -1115,6 +1188,7 @@ impl Message {
         self.card = None;
         self.cards.clear();
         self.controls.clear();
+        self.invites.clear();
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();
@@ -1139,6 +1213,7 @@ impl Message {
         attached
             .chain(self.previews.iter().filter_map(|preview| preview.image.as_ref()))
             .chain(cards)
+            .chain(self.invites.iter().filter_map(|invite| invite.icon.as_ref()))
             .chain(self.reactions.iter().filter_map(|reaction| reaction.file.as_ref()))
             .chain(emoji)
             .chain(&self.sender.avatar)
@@ -1163,6 +1238,7 @@ impl Message {
         attached
             .chain(self.previews.iter_mut().filter_map(|preview| preview.image.as_mut()))
             .chain(cards)
+            .chain(self.invites.iter_mut().filter_map(|invite| invite.icon.as_mut()))
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
             .chain(&mut self.sender.avatar)
@@ -1353,5 +1429,38 @@ mod tests {
             serde_json::from_str::<Span>(omitted).unwrap().style,
             Style::Time { unix: 1_618_953_630, form: 'f' }
         );
+    }
+
+    #[test]
+    fn message_invites_round_trip_bound_and_tombstone() {
+        let mut msg = Message::plain("m4", "Ana", "https://discord.gg/moss", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("invites"));
+        for i in 0..(MESSAGE_INVITES_LIMIT + 2) {
+            msg.invites.push(MessageInvite {
+                code: format!("code{i}"),
+                url: format!("https://discord.gg/code{i}"),
+                space_name: "X".repeat(300),
+                space_id: Some("4000".into()),
+                state: InviteState::Valid,
+                event: Some(ScheduledEvent {
+                    id: "888".into(),
+                    guild_id: "4000".into(),
+                    name: "E".repeat(300),
+                    start: Some(1_791_931_020),
+                    place: "North Ridge".into(),
+                    interested_count: Some(12),
+                    interested: true,
+                }),
+                ..MessageInvite::default()
+            });
+        }
+        msg.bound();
+        assert_eq!(msg.invites.len(), MESSAGE_INVITES_LIMIT);
+        assert_eq!(msg.invites[0].space_name.len(), 200);
+        assert_eq!(msg.invites[0].event.as_ref().unwrap().name.len(), 200);
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap().invites, msg.invites);
+        msg.tombstone();
+        assert!(msg.invites.is_empty());
     }
 }

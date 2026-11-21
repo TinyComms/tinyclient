@@ -27,7 +27,7 @@ use gpui::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, Response, SendState};
+use protocol::{Attachment, Card, Forwarded, InviteState, Key, MediaFile, MentionKind, Message, MessageInvite, MessageKind, Preview, Receipt, Request, Response, ScheduledEvent, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1049,6 +1049,7 @@ impl Pane {
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
+                .children(message.invites.iter().enumerate().map(|(ix, invite)| self.invite_card(message, ix, invite, window, cx)))
                 .children(self.message_controls(message, cx))
                 .children(self.cards(message, window, cx));
         }
@@ -3189,6 +3190,278 @@ impl Pane {
             Picture::Failed => self.failed_box(holder("preview", 72., 72., 6.), &image, false, cx),
         };
         card.flex().gap(px(12.)).child(words).child(picture).into_any_element()
+    }
+
+    /// Renders a Discord server invite card and/or scheduled event card under a message.
+    fn invite_card(
+        &mut self,
+        message: &Message,
+        ix: usize,
+        invite: &MessageInvite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut space_name = invite.space_name.clone();
+        let mut space_id = invite.space_id.clone();
+        let mut icon_file = invite.icon.clone();
+        let mut members = invite.members;
+        let mut online = invite.online;
+        let mut state = invite.state;
+        let mut event: Option<ScheduledEvent> = invite.event.clone();
+        let mut error_note: Option<String> = None;
+
+        if !invite.code.is_empty() {
+            let ev_id = invite.event.as_ref().map(|e| e.id.as_str()).filter(|id| !id.is_empty());
+            let cache_key = match ev_id {
+                Some(ev) => format!("{}:{ev}", invite.code),
+                None => invite.code.clone(),
+            };
+            if let Some(cached) = self.invite_previews.get(&cache_key).cloned() {
+                match cached {
+                    Ok(preview) => {
+                        space_name = preview.name;
+                        space_id = preview.space_id;
+                        icon_file = preview.icon;
+                        members = preview.members;
+                        online = preview.online;
+                        state = if preview.joined { InviteState::Joined } else { InviteState::Valid };
+                        if preview.event.is_some() {
+                            event = preview.event;
+                        }
+                    }
+                    Err(err) => {
+                        state = InviteState::Invalid;
+                        error_note = Some(err);
+                    }
+                }
+            }
+        } else if let Some(ev) = invite.event.as_ref().filter(|e| !e.guild_id.is_empty() && !e.id.is_empty()) {
+            if let Some(cached) = self.event_previews.get(&(ev.guild_id.clone(), ev.id.clone())).cloned() {
+                match cached {
+                    Ok(resolved) => {
+                        state = InviteState::Valid;
+                        event = Some(resolved);
+                    }
+                    Err(err) => {
+                        state = InviteState::Invalid;
+                        error_note = Some(err);
+                    }
+                }
+            }
+        }
+
+        let mut card = div()
+            .id(name_id(&format!("invite-{ix}"), &message.id))
+            .mt(px(6.))
+            .max_w(px(432.))
+            .p(px(12.))
+            .rounded(px(theme::R_CARD))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .flex_col()
+            .gap(px(10.));
+
+        if !invite.code.is_empty() {
+            let heading = match state {
+                InviteState::Invalid => "INVITE INVALID",
+                InviteState::Joined => "YOU'RE ALREADY IN THIS SERVER",
+                _ => "YOU'VE BEEN INVITED TO JOIN A SERVER",
+            };
+            let title = if !space_name.is_empty() {
+                space_name.clone()
+            } else if state == InviteState::Invalid {
+                "Invite invalid or expired".to_owned()
+            } else {
+                format!("discord.gg/{}", invite.code)
+            };
+            let counts = match (online, members) {
+                (Some(on), Some(all)) => Some(format!("{on} online · {all} members")),
+                (None, Some(all)) => Some(format!("{all} members")),
+                (Some(on), None) => Some(format!("{on} online")),
+                (None, None) => error_note.clone().or_else(|| (state == InviteState::Unresolved).then(|| "Loading invite…".to_owned())),
+            };
+            let avatar = self.face(
+                Avatar::new(space_id.as_deref().unwrap_or(&invite.code), &title, 40.).shape(Shape::Place),
+                icon_file.as_ref(),
+                40.,
+                Shape::Place,
+                window,
+                cx,
+            );
+            let code = invite.code.clone();
+            let url = invite.url.clone();
+            let valid_url = url.starts_with("https://") || url.starts_with("http://");
+            let handoff = self.invite_handoff.contains(&code);
+            let joining = self.invite_joining.contains(&code);
+
+            let action: Option<AnyElement> = match state {
+                InviteState::Joined => {
+                    let target_space = space_id.clone();
+                    Some(
+                        div()
+                            .id(name_id(&format!("invite-open-{ix}"), &message.id))
+                            .flex_none()
+                            .h(px(30.))
+                            .px(px(12.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::raised())
+                            .border_1()
+                            .border_color(theme::border())
+                            .hover(|s| s.bg(theme::selected()))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(theme::text())
+                            .when_some(target_space, |btn, gid| {
+                                btn.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_invite_space(gid.clone(), cx);
+                                }))
+                            })
+                            .child("Joined")
+                            .into_any_element(),
+                    )
+                }
+                InviteState::Valid => {
+                    let label = if handoff {
+                        "Open in Discord"
+                    } else if joining {
+                        "Joining…"
+                    } else {
+                        "Join"
+                    };
+                    Some(
+                        div()
+                            .id(name_id(&format!("invite-join-{ix}"), &message.id))
+                            .flex_none()
+                            .h(px(30.))
+                            .px(px(14.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::accent())
+                            .text_color(theme::on_accent())
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::SEMIBOLD)
+                            .when(handoff && valid_url, |btn| {
+                                let url = url.clone();
+                                btn.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_external_link(&url, window, cx);
+                                }))
+                            })
+                            .when(!handoff && !joining, |btn| {
+                                let code = code.clone();
+                                btn.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.join_invite(code.clone(), cx);
+                                }))
+                            })
+                            .child(label)
+                            .into_any_element(),
+                    )
+                }
+                InviteState::Invalid | InviteState::Unresolved => None,
+            };
+
+            card = card
+                .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text_faint()).child(heading))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(avatar)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .type_ui()
+                                        .font_weight(theme::SEMIBOLD)
+                                        .text_color(if state == InviteState::Invalid { theme::text_faint() } else { theme::text() })
+                                        .child(title),
+                                )
+                                .children(counts.map(|c| div().truncate().type_micro().text_color(theme::text_soft()).child(c))),
+                        )
+                        .children(action),
+                );
+        }
+
+        if let Some(ev) = event {
+            let ev_title = if !ev.name.is_empty() {
+                ev.name.clone()
+            } else if state == InviteState::Invalid {
+                "Event unavailable".to_owned()
+            } else {
+                "Scheduled Event".to_owned()
+            };
+            let when_text = ev.start.map(time::tooltip);
+            let mut meta_parts: Vec<String> = Vec::new();
+            if !ev.place.is_empty() {
+                meta_parts.push(ev.place.clone());
+            }
+            if let Some(count) = ev.interested_count {
+                meta_parts.push(format!("{count} interested"));
+            }
+            let meta_line = (!meta_parts.is_empty()).then(|| meta_parts.join(" · "));
+            let can_interest = state != InviteState::Invalid && !ev.guild_id.is_empty() && !ev.id.is_empty();
+            let toggling = self.event_toggling.contains(&(ev.guild_id.clone(), ev.id.clone()));
+            let ev_guild = ev.guild_id.clone();
+            let ev_id = ev.id.clone();
+            let next_interested = !ev.interested;
+
+            let mut ev_box = div()
+                .when(!invite.code.is_empty(), |d| d.pt(px(8.)).border_t_1().border_color(theme::border()))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(when_text.map(|w| div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::accent_text()).child(w)))
+                        .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(ev_title))
+                        .children(meta_line.map(|m| div().truncate().type_micro().text_color(theme::text_soft()).child(m))),
+                );
+            if can_interest {
+                ev_box = ev_box.child(
+                    div()
+                        .id(name_id(&format!("event-interest-{ix}"), &message.id))
+                        .flex_none()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .border_1()
+                        .when(ev.interested, |b| b.bg(theme::accent_soft()).border_color(theme::accent()).text_color(theme::accent_text()))
+                        .when(!ev.interested, |b| b.bg(theme::raised()).border_color(theme::border()).text_color(theme::text()))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_small()
+                        .font_weight(theme::MEDIUM)
+                        .when(!toggling, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_event_interest(ev_guild.clone(), ev_id.clone(), next_interested, cx);
+                            }))
+                        })
+                        .child(if ev.interested { "✓ Interested" } else { "Interested" }),
+                );
+            }
+            card = card.child(ev_box);
+        }
+
+        card.into_any_element()
     }
 
     // Around the message.

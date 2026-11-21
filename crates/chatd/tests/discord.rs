@@ -4955,6 +4955,7 @@ fn invite_preview_join_and_error_translation() {
     match world.ask(Request::InvitePreview {
         account: account.clone(),
         code: "https://discord.gg/rustlang?foo=1".into(),
+        event_id: None,
     }) {
         Response::InvitePreview { preview } => {
             assert_eq!(preview.code, "rustlang");
@@ -5129,4 +5130,128 @@ fn super_reactions_split_counts_follow_burst_events_and_send_with_nitro() {
     let put_reqs = world.discord.requests_to("PUT", &format!("/channels/{dm}/messages/{msg_id}/reactions/"));
     assert_eq!(put_reqs.len(), 1);
     assert!(put_reqs[0].path.contains("type=1"), "{}", put_reqs[0].path);
+}
+
+#[test]
+fn invite_and_event_cards_detect_resolve_cache_and_toggle_interest() {
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let account = world.key("5001").account();
+
+    // 1. Incoming message with an invite+event link and a standalone event link attaches MessageInvite cards lazily.
+    let dm = "5001";
+    let msg_id = world.incoming(
+        dm,
+        None,
+        "Come hang out https://discord.gg/moss?event=777 and https://discord.com/events/4000/888",
+        json!({}),
+    );
+    let loaded = wait("message with invites", || {
+        world.messages(dm).into_iter().find(|m| m.id == msg_id)
+    });
+    assert_eq!(loaded.invites.len(), 2);
+    assert_eq!(loaded.invites[0].code, "moss");
+    assert_eq!(loaded.invites[0].event.as_ref().map(|e| e.id.as_str()), Some("777"));
+    assert_eq!(loaded.invites[1].space_id.as_deref(), Some("4000"));
+    assert_eq!(loaded.invites[1].event.as_ref().map(|e| e.id.as_str()), Some("888"));
+    // No HTTP requests happened during message translation.
+    assert!(world.discord.requests_to("GET", "/invites/").is_empty());
+
+    // 2. Resolving the invite with event_id fetches with guild_scheduled_event_id and caches per session.
+    world.discord.script(
+        "/invites/moss",
+        200,
+        json!({
+            "code": "moss",
+            "guild": {"id": "4000", "name": "Moss", "icon": null, "description": "Trail talk"},
+            "channel": {"id": "4101", "name": "general"},
+            "approximate_member_count": 420,
+            "approximate_presence_count": 88,
+            "guild_scheduled_event": {
+                "id": "777",
+                "guild_id": "4000",
+                "name": "Trail Cleanup",
+                "scheduled_start_time": "2026-11-22T18:00:00+00:00",
+                "entity_metadata": {"location": "North Ridge"},
+                "user_count": 14
+            }
+        }),
+    );
+    match world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "moss".into(),
+        event_id: Some("777".into()),
+    }) {
+        Response::InvitePreview { preview } => {
+            assert_eq!(preview.name, "Moss");
+            assert!(preview.joined, "guild 4000 is already joined in READY");
+            let ev = preview.event.expect("attached scheduled event");
+            assert_eq!(ev.name, "Trail Cleanup");
+            assert_eq!(ev.place, "North Ridge");
+            assert_eq!(ev.interested_count, Some(14));
+            assert!(ev.start.is_some());
+        }
+        other => panic!("expected Response::InvitePreview, got {other:?}"),
+    }
+    let reqs = world.discord.requests_to("GET", "/invites/moss");
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].path.contains("guild_scheduled_event_id=777"), "{}", reqs[0].path);
+
+    // Second request hits the session cache with zero additional HTTP calls.
+    assert!(matches!(
+        world.ask(Request::InvitePreview {
+            account: account.clone(),
+            code: "moss".into(),
+            event_id: Some("777".into()),
+        }),
+        Response::InvitePreview { .. }
+    ));
+    assert_eq!(world.discord.requests_to("GET", "/invites/moss").len(), 1);
+
+    // 3. Standalone EventPreview + EventInterest PUT and DELETE.
+    world.discord.script(
+        "/guilds/4000/scheduled-events/888",
+        200,
+        json!({
+            "id": "888",
+            "guild_id": "4000",
+            "name": "Night Hike",
+            "scheduled_start_time": "2026-11-23T02:00:00+00:00",
+            "entity_metadata": {"location": "Pine Trail"},
+            "user_count": 7
+        }),
+    );
+    match world.ask(Request::EventPreview {
+        space: world.key("4000"),
+        event_id: "888".into(),
+    }) {
+        Response::EventPreview { event } => {
+            assert_eq!(event.name, "Night Hike");
+            assert_eq!(event.place, "Pine Trail");
+            assert_eq!(event.interested_count, Some(7));
+        }
+        other => panic!("expected Response::EventPreview, got {other:?}"),
+    }
+
+    world.discord.script("/guilds/4000/scheduled-events/888/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventInterest {
+            space: world.key("4000"),
+            event_id: "888".into(),
+            interested: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PUT", "/guilds/4000/scheduled-events/888/users/@me").len(), 1);
+
+    world.discord.script("/guilds/4000/scheduled-events/888/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventInterest {
+            space: world.key("4000"),
+            event_id: "888".into(),
+            interested: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/4000/scheduled-events/888/users/@me").len(), 1);
 }

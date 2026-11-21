@@ -527,12 +527,26 @@ pub enum Command {
     /// Preview a Space invite link or code.
     InvitePreview {
         code: String,
+        event_id: Option<String>,
         reply: Reply<protocol::InvitePreview>,
     },
     /// Join a Space from an invite link or code; returns `(space_id, channel_id)`.
     InviteJoin {
         code: String,
         reply: Reply<(Option<String>, Option<String>)>,
+    },
+    /// Preview a scheduled event by guild/space id and event id.
+    EventPreview {
+        space_id: String,
+        event_id: String,
+        reply: Reply<protocol::ScheduledEvent>,
+    },
+    /// Mark or unmark ourselves as interested in a scheduled event.
+    EventInterest {
+        space_id: String,
+        event_id: String,
+        interested: bool,
+        reply: Reply<()>,
     },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
@@ -846,6 +860,8 @@ impl Command {
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }

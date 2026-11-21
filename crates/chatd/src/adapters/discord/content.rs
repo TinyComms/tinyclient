@@ -5,8 +5,8 @@ use super::model::{self, seconds, Attachment as Attached, Embed, EmbedImage, Pos
 use crate::adapters::Context;
 use base64::Engine;
 use protocol::{
-    AccountKey, Attachment, Card, Forwarded, Key, MediaFile, MediaKind, MentionKind, Message,
-    MessageKind, Preview, Reaction, ReplyTo, Sender, Span, Style, ThreadSummary,
+    AccountKey, Attachment, Card, Forwarded, InviteState, Key, MediaFile, MediaKind, MentionKind, Message,
+    MessageInvite, MessageKind, Preview, Reaction, ReplyTo, ScheduledEvent, Sender, Span, Style, ThreadSummary,
 };
 
 /// Names for what a message only gives ids for.
@@ -730,6 +730,117 @@ fn system_line(kind: u8, who: &str, content: &str, mentioned: &str) -> Option<St
     })
 }
 
+/// Extracts Discord server invite links (`discord.gg/{code}`, `discord.com/invite/{code}`,
+/// `discordapp.com/invite/{code}`, with optional `?event={id}`) and scheduled event links
+/// (`discord.com/events/{guild}/{event}`) from translated link spans. No network calls are made.
+pub fn extract_invites(spans: &[Span]) -> Vec<MessageInvite> {
+    let mut found: Vec<MessageInvite> = Vec::new();
+    for span in spans {
+        if found.len() >= protocol::MESSAGE_INVITES_LIMIT {
+            break;
+        }
+        let Style::Link { url } = &span.style else {
+            continue;
+        };
+        let Some(invite) = parse_invite_or_event_url(url) else {
+            continue;
+        };
+        let dup = found.iter().any(|have| {
+            have.code == invite.code
+                && have.event.as_ref().map(|e| (&e.guild_id, &e.id))
+                    == invite.event.as_ref().map(|e| (&e.guild_id, &e.id))
+        });
+        if !dup {
+            found.push(invite);
+        }
+    }
+    found
+}
+
+fn parse_invite_or_event_url(raw: &str) -> Option<MessageInvite> {
+    let stripped = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))?;
+    let (without_frag, _) = stripped.split_once('#').unwrap_or((stripped, ""));
+    let (host_and_path, query) = without_frag.split_once('?').unwrap_or((without_frag, ""));
+    let (host, path) = host_and_path.split_once('/')?;
+    let host_lower = host.to_ascii_lowercase();
+    let path = path.trim_matches('/');
+    let event_param = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("event="))
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_owned);
+
+    let valid_code = |code: &str| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    };
+
+    if host_lower == "discord.gg" || host_lower == "www.discord.gg" {
+        let code = path.split('/').next().unwrap_or("");
+        if !valid_code(code) {
+            return None;
+        }
+        let canonical = match &event_param {
+            Some(ev) => format!("https://discord.gg/{code}?event={ev}"),
+            None => format!("https://discord.gg/{code}"),
+        };
+        return Some(MessageInvite {
+            code: code.to_owned(),
+            url: canonical,
+            state: InviteState::Unresolved,
+            event: event_param.map(|id| ScheduledEvent { id, ..ScheduledEvent::default() }),
+            ..MessageInvite::default()
+        });
+    }
+
+    if matches!(
+        host_lower.as_str(),
+        "discord.com" | "www.discord.com" | "discordapp.com" | "www.discordapp.com" | "ptb.discord.com" | "canary.discord.com"
+    ) {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.first() == Some(&"invite") {
+            let code = *segments.get(1)?;
+            if !valid_code(code) {
+                return None;
+            }
+            let canonical = match &event_param {
+                Some(ev) => format!("https://discord.gg/{code}?event={ev}"),
+                None => format!("https://discord.gg/{code}"),
+            };
+            return Some(MessageInvite {
+                code: code.to_owned(),
+                url: canonical,
+                state: InviteState::Unresolved,
+                event: event_param.map(|id| ScheduledEvent { id, ..ScheduledEvent::default() }),
+                ..MessageInvite::default()
+            });
+        }
+        if segments.first() == Some(&"events") {
+            let guild_id = *segments.get(1)?;
+            let event_id = *segments.get(2)?;
+            if !digits(guild_id) || !digits(event_id) {
+                return None;
+            }
+            return Some(MessageInvite {
+                code: String::new(),
+                url: format!("https://discord.com/events/{guild_id}/{event_id}"),
+                space_id: Some(guild_id.to_owned()),
+                state: InviteState::Unresolved,
+                event: Some(ScheduledEvent {
+                    id: event_id.to_owned(),
+                    guild_id: guild_id.to_owned(),
+                    ..ScheduledEvent::default()
+                }),
+                ..MessageInvite::default()
+            });
+        }
+    }
+    None
+}
+
 /// Where the official app shows this message.
 pub fn jump_link(guild: Option<&str>, channel: &str, message: &str) -> String {
     format!("https://discord.com/channels/{}/{channel}/{message}", guild.unwrap_or("@me"))
@@ -916,6 +1027,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     };
     // Our own client's nonce is the shell's client id: digits, at most 25.
     let client_id = posted.nonce.clone().filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
+    let invites = extract_invites(&rich.spans);
     let message = Message {
         saved_history: false,
         sent_subsec_millis: 0,
@@ -970,6 +1082,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_via: None,
         permalink: String::new(),
         controls: Vec::new(),
+        invites,
     };
     (message, rich.files)
 }
@@ -1025,6 +1138,7 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
             markdown(&mut rich, content, place.names);
             stored.text = std::mem::take(&mut rich.text);
             stored.spans = std::mem::take(&mut rich.spans);
+            stored.invites = extract_invites(&stored.spans);
         }
     }
     if let Some(attached) = &update.attachments {
@@ -1224,6 +1338,23 @@ mod tests {
         let bad = parsed("<t:notanumber:R>");
         assert_eq!(bad.text, "<t:notanumber:R>");
         assert!(bad.spans.is_empty());
+    }
+
+    #[test]
+    fn invite_and_event_links_are_detected_and_deduplicated() {
+        let rich = parsed(
+            "Join https://discord.gg/rustlang?event=9001 or https://discord.com/invite/rustlang?event=9001 \
+             and event https://discord.com/events/4000/8002 (ignore https://example.com/invite/fake)",
+        );
+        let invites = extract_invites(&rich.spans);
+        assert_eq!(invites.len(), 2);
+        assert_eq!(invites[0].code, "rustlang");
+        assert_eq!(invites[0].event.as_ref().map(|e| e.id.as_str()), Some("9001"));
+        assert_eq!(invites[0].url, "https://discord.gg/rustlang?event=9001");
+        assert!(invites[1].code.is_empty());
+        assert_eq!(invites[1].space_id.as_deref(), Some("4000"));
+        assert_eq!(invites[1].event.as_ref().map(|e| e.id.as_str()), Some("8002"));
+        assert_eq!(invites[1].url, "https://discord.com/events/4000/8002");
     }
 
     #[test]

@@ -49,7 +49,7 @@ use protocol::{
 };
 use rows::Item;
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -397,6 +397,20 @@ pub struct Pane {
     fetched_reactors: HashMap<(String, String, bool), (Vec<protocol::Reactor>, bool)>,
     /// Reactor fetch currently in flight, keyed by `(message_id, emoji, burst)`.
     reactors_loading: Option<(String, String, bool)>,
+    /// Session cache of lazily resolved invite previews (keyed by `"code"` or `"code:event_id"`).
+    invite_previews: HashMap<String, Result<protocol::InvitePreview, String>>,
+    /// Session cache of lazily resolved standalone scheduled events (keyed by `(guild_id, event_id)`).
+    event_previews: HashMap<(String, String), Result<protocol::ScheduledEvent, String>>,
+    /// Invite or event cache keys currently resolving.
+    invite_loading: HashSet<String>,
+    /// Invite codes currently joining.
+    invite_joining: HashSet<String>,
+    /// Invite codes that required captcha/verification and should hand off to the official app.
+    invite_handoff: HashSet<String>,
+    /// Scheduled events whose Interested state is currently toggling.
+    event_toggling: HashSet<(String, String)>,
+    /// Recent lazy on-screen invite/event resolve timestamps, paced to at most 4 per minute.
+    invite_resolve_times: VecDeque<Instant>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -505,6 +519,13 @@ impl Pane {
             open_select: None,
             fetched_reactors: HashMap::new(),
             reactors_loading: None,
+            invite_previews: HashMap::new(),
+            event_previews: HashMap::new(),
+            invite_loading: HashSet::new(),
+            invite_joining: HashSet::new(),
+            invite_handoff: HashSet::new(),
+            event_toggling: HashSet::new(),
+            invite_resolve_times: VecDeque::new(),
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -1392,6 +1413,7 @@ impl Pane {
             .filter_map(|(ix, _)| self.items.get(*ix).and_then(Item::message))
             .any(|message| message.spans.iter().any(|span| matches!(span.style, protocol::Style::Time { form: 'R', .. })));
         self.sync_relative_timer(has_relative_time, cx);
+        self.resolve_visible_invites(&seen, viewport, cx);
         let newest = seen
             .iter()
             .filter(|(_, bounds)| on_screen(bounds))
@@ -1422,6 +1444,236 @@ impl Pane {
                 cx.notify();
             });
         }));
+    }
+
+    /// Resolves server invites and scheduled-event links on messages currently visible on screen,
+    /// paced to at most 4 lookups per minute and cached for the session.
+    fn resolve_visible_invites(&mut self, seen: &[(usize, Bounds<Pixels>)], viewport: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if SCREENSHOTS {
+            return;
+        }
+        let Some(account) = self.open.as_ref().map(|open| open.key.account()) else {
+            return;
+        };
+        let on_screen = |bounds: &Bounds<Pixels>| bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom();
+        let mut to_resolve: Vec<protocol::MessageInvite> = Vec::new();
+        for (ix, bounds) in seen {
+            if !on_screen(bounds) {
+                continue;
+            }
+            if let Some(message) = self.items.get(*ix).and_then(Item::message) {
+                for invite in &message.invites {
+                    if invite.state == protocol::InviteState::Unresolved {
+                        to_resolve.push(invite.clone());
+                    }
+                }
+            }
+        }
+        if to_resolve.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        while self
+            .invite_resolve_times
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
+        {
+            self.invite_resolve_times.pop_front();
+        }
+        for invite in to_resolve {
+            if self.invite_resolve_times.len() >= 4 {
+                break;
+            }
+            if !invite.code.is_empty() {
+                let event_id = invite.event.as_ref().map(|e| e.id.clone()).filter(|id| !id.is_empty());
+                let cache_key = match &event_id {
+                    Some(ev) => format!("{}:{ev}", invite.code),
+                    None => invite.code.clone(),
+                };
+                if self.invite_previews.contains_key(&cache_key) || !self.invite_loading.insert(cache_key.clone()) {
+                    continue;
+                }
+                self.invite_resolve_times.push_back(now);
+                let req = Request::InvitePreview {
+                    account: account.clone(),
+                    code: invite.code.clone(),
+                    event_id,
+                };
+                let key_for_cb = cache_key.clone();
+                cx.spawn(async move |this, cx| {
+                    let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.invite_loading.remove(&key_for_cb);
+                        let outcome = match answer {
+                            Ok(Response::InvitePreview { preview }) => Ok(preview),
+                            Ok(Response::Error { detail, .. }) => Err(detail),
+                            _ => Err("Invite invalid or expired.".to_owned()),
+                        };
+                        if this.invite_previews.len() >= 200 {
+                            this.invite_previews.clear();
+                        }
+                        this.invite_previews.insert(key_for_cb, outcome);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            } else if let Some(ev) = invite.event.as_ref().filter(|e| !e.guild_id.is_empty() && !e.id.is_empty()) {
+                let ev_key = (ev.guild_id.clone(), ev.id.clone());
+                let load_key = format!("ev:{}:{}", ev.guild_id, ev.id);
+                if self.event_previews.contains_key(&ev_key) || !self.invite_loading.insert(load_key.clone()) {
+                    continue;
+                }
+                self.invite_resolve_times.push_back(now);
+                let req = Request::EventPreview {
+                    space: Key::new(&account, ev.guild_id.clone()),
+                    event_id: ev.id.clone(),
+                };
+                cx.spawn(async move |this, cx| {
+                    let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.invite_loading.remove(&load_key);
+                        let outcome = match answer {
+                            Ok(Response::EventPreview { event }) => Ok(event),
+                            Ok(Response::Error { detail, .. }) => Err(detail),
+                            _ => Err("Event unavailable.".to_owned()),
+                        };
+                        if this.event_previews.len() >= 200 {
+                            this.event_previews.clear();
+                        }
+                        this.event_previews.insert(ev_key, outcome);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    pub(super) fn open_invite_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.open.as_ref().map(|open| open.key.account()) else {
+            return;
+        };
+        let key = Key::new(&account, space_id);
+        let shell = self.shell.clone();
+        cx.defer(move |cx| {
+            let _ = shell.update(cx, |shell, cx| {
+                shell.go(crate::gui::sidebar::Mode::Space(key), cx);
+            });
+        });
+    }
+
+    pub(super) fn join_invite(&mut self, code: String, cx: &mut Context<Self>) {
+        if SCREENSHOTS || !self.invite_joining.insert(code.clone()) {
+            return;
+        }
+        let Some(account) = self.open.as_ref().map(|open| open.key.account()) else {
+            self.invite_joining.remove(&code);
+            return;
+        };
+        cx.notify();
+        let req = Request::InviteJoin { account, code: code.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.invite_joining.remove(&code);
+                match answer {
+                    Ok(Response::InviteJoined { space, .. }) => {
+                        for (k, v) in &mut this.invite_previews {
+                            if k == &code || k.starts_with(&format!("{code}:")) {
+                                if let Ok(preview) = v {
+                                    preview.joined = true;
+                                }
+                            }
+                        }
+                        if let Some(space) = space {
+                            let shell = this.shell.clone();
+                            cx.defer(move |cx| {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.go(crate::gui::sidebar::Mode::Space(space), cx);
+                                    shell.toast(Some(("icons/check.svg", theme::text_soft())), "Joined server", cx);
+                                });
+                            });
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        let lower = detail.to_ascii_lowercase();
+                        if lower.contains("captcha") || lower.contains("verify") {
+                            this.invite_handoff.insert(code.clone());
+                        }
+                        let shell = this.shell.clone();
+                        cx.defer(move |cx| {
+                            let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                        });
+                    }
+                    _ => {
+                        let shell = this.shell.clone();
+                        cx.defer(move |cx| {
+                            let _ = shell.update(cx, |shell, cx| shell.toast(None, "Could not join server.".to_owned(), cx));
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn toggle_event_interest(&mut self, guild_id: String, event_id: String, interested: bool, cx: &mut Context<Self>) {
+        if SCREENSHOTS {
+            return;
+        }
+        let Some(account) = self.open.as_ref().map(|open| open.key.account()) else {
+            return;
+        };
+        let key = (guild_id.clone(), event_id.clone());
+        if !self.event_toggling.insert(key.clone()) {
+            return;
+        }
+        cx.notify();
+        let req = Request::EventInterest {
+            space: Key::new(&account, guild_id),
+            event_id: event_id.clone(),
+            interested,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.event_toggling.remove(&key);
+                match answer {
+                    Ok(Response::Ok) => {
+                        if let Some(Ok(ev)) = this.event_previews.get_mut(&key) {
+                            if ev.interested != interested {
+                                ev.interested = interested;
+                                if let Some(c) = ev.interested_count.as_mut() {
+                                    *c = if interested { c.saturating_add(1) } else { c.saturating_sub(1) };
+                                }
+                            }
+                        }
+                        for cached in this.invite_previews.values_mut() {
+                            if let Ok(preview) = cached {
+                                if let Some(ev) = preview.event.as_mut().filter(|e| e.id == event_id) {
+                                    if ev.interested != interested {
+                                        ev.interested = interested;
+                                        if let Some(c) = ev.interested_count.as_mut() {
+                                            *c = if interested { c.saturating_add(1) } else { c.saturating_sub(1) };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        let shell = this.shell.clone();
+                        cx.defer(move |cx| {
+                            let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                        });
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// A mark-unread holds until the list moves. The frame that sets it only records the place.

@@ -1726,11 +1726,24 @@ pub enum Request {
     InvitePreview {
         account: AccountKey,
         code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<String>,
     },
     /// Join a Space from an invite link or code (e.g. Discord `POST /invites/{code}`).
     InviteJoin {
         account: AccountKey,
         code: String,
+    },
+    /// Preview a scheduled event link (`GET /guilds/{id}/scheduled-events/{event}`).
+    EventPreview {
+        space: Key,
+        event_id: String,
+    },
+    /// Toggle "Interested" on a scheduled event (`PUT` / `DELETE /guilds/{id}/scheduled-events/{event}/users/@me`).
+    EventInterest {
+        space: Key,
+        event_id: String,
+        interested: bool,
     },
     Watch(Watching),
 
@@ -2929,6 +2942,10 @@ pub enum Response {
         space: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
+    },
+    /// Answers `EventPreview`: metadata for a scheduled event.
+    EventPreview {
+        event: ScheduledEvent,
     },
     Pinned {
         conversation: Key,
