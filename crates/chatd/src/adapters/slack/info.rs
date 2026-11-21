@@ -9,7 +9,7 @@ use crate::store::Filing;
 use protocol::{
     ActivityItem, ActivityItemKind, AppHome, AppLink, AppProfile, AppSlashCommand, AppView,
     Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify,
-    SharedItem, SharedKind, UserGroup,
+    SharedItem, SharedKind, SlashCommand, UserGroup,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -1503,4 +1503,86 @@ impl Slack {
             home,
         })
     }
+
+    /// Built-in Slack slash commands plus workspace app commands from `commands.list` (cached 24 h
+    /// in store notes, same policy as `emoji.list`).
+    pub(super) fn slash_commands(&self) -> Result<Vec<SlashCommand>, Fault> {
+        let mut out = builtin_slash_commands();
+        let now = crate::hub::now();
+        let cached_at = self.ctx.note("commands:at").and_then(|s| s.parse::<i64>().ok());
+        let workspace: Vec<SlashCommand> = if cached_at.is_some_and(|at| now.saturating_sub(at) < 86_400) {
+            self.ctx
+                .note("commands:json")
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default()
+        } else {
+            self.ctx.set_note("commands:at", &now.to_string());
+            let mut fetched = Vec::new();
+            if let Ok(resp) = self.api("commands.list", &[]) {
+                for raw in resp["commands"].as_array().into_iter().flatten().take(200) {
+                    let Some(cmd) = raw["command"]
+                        .as_str()
+                        .or_else(|| raw["name"].as_str())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let command = if cmd.starts_with('/') { cmd.to_owned() } else { format!("/{cmd}") };
+                    if out.iter().any(|b| b.command.eq_ignore_ascii_case(&command)) {
+                        continue;
+                    }
+                    fetched.push(SlashCommand {
+                        command,
+                        description: raw["description"]
+                            .as_str()
+                            .or_else(|| raw["desc"].as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned(),
+                        usage: raw["usage"]
+                            .as_str()
+                            .or_else(|| raw["usage_hint"].as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned(),
+                        builtin: false,
+                    });
+                }
+            }
+            if let Ok(json) = serde_json::to_string(&fetched) {
+                self.ctx.set_note("commands:json", &json);
+            }
+            fetched
+        };
+        out.extend(workspace);
+        Ok(out)
+    }
+}
+
+pub(super) fn builtin_slash_commands() -> Vec<SlashCommand> {
+    [
+        ("/me", "Display action text", "[text]"),
+        ("/shrug", "Append ¯\\_(ツ)_/¯ to your message", "[text]"),
+        ("/topic", "Set the channel topic", "[text]"),
+        ("/invite", "Invite someone to this channel", "@user"),
+        ("/kick", "Remove someone from this channel", "@user"),
+        ("/remove", "Remove someone from this channel", "@user"),
+        ("/leave", "Leave this channel", ""),
+        ("/join", "Join a channel", "#channel"),
+        ("/archive", "Archive this channel", ""),
+        ("/mute", "Mute this channel", ""),
+        ("/status", "Set your status", "[:emoji:] [text]"),
+        ("/dnd", "Pause notifications", "[minutes | off]"),
+        ("/away", "Set yourself away", ""),
+        ("/active", "Set yourself active", ""),
+        ("/remind", "Set a reminder", "[text] [in N minutes]"),
+    ]
+    .into_iter()
+    .map(|(command, description, usage)| SlashCommand {
+        command: command.to_owned(),
+        description: description.to_owned(),
+        usage: usage.to_owned(),
+        builtin: true,
+    })
+    .collect()
 }

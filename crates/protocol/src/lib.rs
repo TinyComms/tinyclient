@@ -2703,6 +2703,11 @@ pub enum Request {
         from_section: Option<String>,
         to_section: String,
     },
+    /// List available slash commands for an account (built-ins + cached `commands.list`).
+    /// Answers `Response::SlashCommands`.
+    SlashCommands {
+        account: AccountKey,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -2733,6 +2738,9 @@ pub enum Change {
     Searched { account: AccountKey, query: String },
     /// Ephemeral. Everyone typing in the conversation now; empty when they stopped.
     Typing { conversation: Key, typists: Vec<Typist> },
+    /// Ephemeral. A message visible only to the current user (e.g. Slack ephemeral reply).
+    /// Never stored in persistent channel history.
+    Ephemeral { conversation: Key, message: Box<Message> },
     /// A network's folders, or their counts: ask `Folders`.
     Folders { account: AccountKey },
     /// Ephemeral. Presence, status and what they are doing, all of it.
@@ -2815,6 +2823,7 @@ impl Change {
         matches!(
             self,
             Change::Typing { .. }
+                | Change::Ephemeral { .. }
                 | Change::Presence { .. }
                 | Change::Call { .. }
                 | Change::Occupants { .. }
@@ -3231,6 +3240,10 @@ pub enum Response {
     /// A newly created custom sidebar section (`Request::SectionCreate`).
     Section {
         group: Group,
+    },
+    /// Built-in and workspace slash commands (`Request::SlashCommands`).
+    SlashCommands {
+        commands: Vec<SlashCommand>,
     },
 }
 

@@ -830,6 +830,10 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Ephemeral message only visible to the current user (e.g. Slack slash-command replies).
+    /// Never stored in persistent channel history.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ephemeral: bool,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -939,6 +943,7 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            ephemeral: false,
         }
     }
 

@@ -911,6 +911,10 @@ pub enum Command {
         to_section: String,
         reply: Reply<()>,
     },
+    /// List available slash commands for the account (`commands.list` + built-ins).
+    SlashCommands {
+        reply: Reply<Vec<protocol::SlashCommand>>,
+    },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }
@@ -1016,6 +1020,7 @@ impl Command {
             | Command::SectionDelete { reply, .. }
             | Command::SectionReorder { reply, .. }
             | Command::SectionMoveChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1647,6 +1652,27 @@ impl Context {
             self.hub.changed(Change::Status);
         }
         Ok(())
+    }
+
+    /// Delivers an ephemeral message (only visible to this user) without ever writing it to SQLite.
+    pub fn ephemeral(&self, conversation_id: &str, mut message: Message) {
+        message.ephemeral = true;
+        message.bound();
+        self.hub.changed(Change::Ephemeral {
+            conversation: self.key(conversation_id),
+            message: Box::new(message),
+        });
+    }
+
+    /// Completes a local slash command that produced no persistent channel message: removes the
+    /// temporary pending send row from SQLite and optionally emits an ephemeral notice.
+    pub fn command_done(&self, conversation_id: &str, client_id: &str, notice: Option<Message>) {
+        let conversation = self.key(conversation_id);
+        let _ = self.hub.store().delete_message(&conversation, client_id);
+        self.hub.changed(Change::Messages { conversation });
+        if let Some(msg) = notice {
+            self.ephemeral(conversation_id, msg);
+        }
     }
 
     /// Drops the cached messages and hides a direct or group conversation. The network is not

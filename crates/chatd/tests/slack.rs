@@ -400,6 +400,26 @@ impl Fake {
         };
         let found = match call.method.as_str() {
             "chat.postMessage" => return self.post(call),
+            "chat.meMessage" => {
+                let text = param("text");
+                if channel.is_empty() || text.is_empty() {
+                    return refused("no_text");
+                }
+                let n = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
+                let ts = format!("17600025{n:02}.000100");
+                Some(json!({
+                    "ok": true,
+                    "channel": channel,
+                    "ts": ts,
+                }))
+            }
+            "commands.list" => Some(json!({
+                "ok": true,
+                "commands": [
+                    {"command": "/deploy", "description": "Deploy a service", "usage": "[service] [env]"},
+                    {"command": "/standup", "description": "Start standup check-in", "usage": ""}
+                ]
+            })),
             method @ ("reactions.add" | "reactions.remove") => {
                 if param("name") == "no_entry_sign" {
                     return refused("too_many_reactions");
@@ -6628,4 +6648,140 @@ fn slack_sidebar_sections_mixed_types_paging_crud_live_events_and_paid_gating() 
     world.until("sidebar_sections capability disabled after paid_only", || {
         (!world.account("T01ALPHA").can.sidebar_sections).then_some(())
     });
+}
+
+#[test]
+fn slack_slash_commands_builtins_unknown_handoff_completion_and_ephemeral() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    world.general();
+
+    // 1. `/me waves` sends `chat.meMessage` (never `chat.postMessage`).
+    let post_before = world.fake.calls(ALPHA, "chat.postMessage").len();
+    let me_sent = world.send(&general, "slash-me-1", "/me waves");
+    assert_eq!(me_sent.state, SendState::Sent);
+    assert_eq!(me_sent.text, "waves");
+    assert_eq!(world.fake.calls(ALPHA, "chat.postMessage").len(), post_before);
+    let me_call = world.fake.calls(ALPHA, "chat.meMessage").pop().expect("chat.meMessage called");
+    assert_eq!((me_call.params["channel"].as_str(), me_call.params["text"].as_str()), ("C0GEN", "waves"));
+
+    // 2. `/unknown x` is NOT sent as plain text and returns the hand-off wording.
+    let post_before = world.fake.calls(ALPHA, "chat.postMessage").len();
+    let unknown = world.send(&general, "slash-unk-1", "/unknown x");
+    assert_eq!(world.fake.calls(ALPHA, "chat.postMessage").len(), post_before, "unknown command must not post as channel text");
+    match &unknown.state {
+        SendState::Failed { reason } => assert!(reason.contains("Commands run in the official app"), "{reason}"),
+        other => panic!("expected Failed handoff, got {other:?}"),
+    }
+
+    // 3. `/shrug hello` posts `hello ¯\_(ツ)_/¯` via chat.postMessage.
+    let shrug = world.send(&general, "slash-shrug-1", "/shrug hello");
+    assert_eq!(shrug.state, SendState::Sent);
+    assert_eq!(shrug.text, "hello ¯\\_(ツ)_/¯");
+
+    // 4. `/topic Ship v2` calls conversations.setTopic, removes temporary pending send, and emits Change::Ephemeral.
+    let wait_handle = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "slash-topic-1".into(),
+        text: "/topic Ship v2".into(),
+        reply_to: None,
+        with: Default::default(),
+    });
+    assert!(matches!(wait_handle, Response::Sent { .. }));
+    world.until("conversations.setTopic called by /topic", || {
+        world.fake.calls(ALPHA, "conversations.setTopic").into_iter().find(|c| c.params["topic"] == "Ship v2")
+    });
+    world.until("pending /topic row cleaned from persistent history", || {
+        world.messages(&general).iter().all(|m| m.client_id.as_deref() != Some("slash-topic-1")).then_some(())
+    });
+
+    // 5. `/mute` and `/away` map to their documented Slack calls.
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "slash-mute-1".into(),
+            text: "/mute".into(),
+            reply_to: None,
+            with: Default::default(),
+        }),
+        Response::Sent { .. }
+    ));
+    world.until("/mute calls setNotifications", || {
+        world.fake.calls(ALPHA, "users.prefs.setNotifications").into_iter().find(|c| c.params["name"] == "muted")
+    });
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "slash-away-1".into(),
+            text: "/away".into(),
+            reply_to: None,
+            with: Default::default(),
+        }),
+        Response::Sent { .. }
+    ));
+    world.until("/away calls users.setPresence", || {
+        world.fake.calls(ALPHA, "users.setPresence").into_iter().find(|c| c.params["presence"] == "away")
+    });
+
+    // 6. Workspace slash commands: built-ins + cached `commands.list` (fetched once per 24h).
+    let acct = alpha("T01ALPHA").account();
+    let Response::SlashCommands { commands } = world.ask(Request::SlashCommands { account: acct.clone() }) else {
+        panic!("expected SlashCommands");
+    };
+    assert!(commands.iter().any(|c| c.command == "/me" && c.builtin));
+    assert!(commands.iter().any(|c| c.command == "/deploy" && !c.builtin));
+    let Response::SlashCommands { commands: cached } = world.ask(Request::SlashCommands { account: acct }) else {
+        panic!("expected cached SlashCommands");
+    };
+    assert_eq!(commands.len(), cached.len());
+    assert_eq!(world.fake.calls(ALPHA, "commands.list").len(), 1, "commands.list should be cached 24h");
+
+    // 7. Live ephemeral socket event arrives with ephemeral=true via Change::Ephemeral and is NEVER stored in SQLite.
+    let eph_ts = "1760009999.000100";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock = world.dir.join("chat.sock");
+    let general_wait = general.clone();
+    std::thread::spawn(move || {
+        let ask_sock = |req: Request| -> Response {
+            let mut stream = ChatStream::connect(&sock).unwrap();
+            write_frame(&mut stream, &req).unwrap();
+            read_frame(&mut stream).unwrap()
+        };
+        let mut since = match ask_sock(Request::Status) {
+            Response::Status { seq, .. } => seq,
+            _ => 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Response::Changes { seq, changes, .. } = ask_sock(Request::Wait { since }) {
+                since = seq;
+                for ch in changes {
+                    if let Change::Ephemeral { conversation, message } = ch {
+                        if conversation == general_wait && message.id == eph_ts {
+                            let _ = tx.send(*message);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    sleep(Duration::from_millis(100));
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "subtype": "ephemeral",
+        "is_ephemeral": true,
+        "channel": "C0GEN",
+        "user": "U0BOT",
+        "ts": eph_ts,
+        "text": "Deploy dry-run succeeded (only visible to you)"
+    }));
+    let got = rx.recv_timeout(Duration::from_secs(5)).expect("ephemeral message delivered via Change::Ephemeral");
+    assert!(got.ephemeral);
+    assert!(got.text.contains("Deploy dry-run succeeded"));
+    assert!(
+        world.message(&general, eph_ts).is_none(),
+        "ephemeral message must never be persisted in channel history"
+    );
 }

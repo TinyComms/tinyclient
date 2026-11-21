@@ -1024,6 +1024,7 @@ impl Demo {
             | Command::SectionDelete { reply, .. }
             | Command::SectionReorder { reply, .. }
             | Command::SectionMoveChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));

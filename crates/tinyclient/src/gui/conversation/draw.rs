@@ -975,6 +975,25 @@ impl Pane {
                 None => sent.children(said).children(attached),
             };
             sent = sent
+                .children(message.ephemeral.then(|| {
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(theme::hairline())
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child("Only visible to you"),
+                        )
+                }))
                 .children(message.announcement.then(|| {
                     div()
                         .pb(px(3.))

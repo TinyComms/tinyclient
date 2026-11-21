@@ -1831,8 +1831,12 @@ impl Slack {
     pub(super) fn message(&self, channel: &str, event: &Value) -> Option<Message> {
         let ts = event["ts"].as_str()?;
         let subtype = event["subtype"].as_str();
+        let ephemeral = event["is_ephemeral"] == true
+            || subtype == Some("ephemeral")
+            || event["message_type"].as_str() == Some("ephemeral")
+            || event["ephemeral_type"].is_string();
         let handled_apart = matches!(subtype, Some("message_changed" | "message_deleted" | "message_replied"));
-        if handled_apart || event["hidden"] == true {
+        if handled_apart || (event["hidden"] == true && !ephemeral) {
             return None;
         }
         let thread = event["thread_ts"].as_str();
@@ -2028,6 +2032,7 @@ impl Slack {
         message.card = framed;
         message.cards = extra_cards;
         message.controls = controls;
+        message.ephemeral = ephemeral;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
         message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);

@@ -448,6 +448,9 @@ pub struct Pane {
     app_view: Option<(Key, protocol::AppView)>,
     app_loading: bool,
     app_error: Option<String>,
+    /// Ephemeral messages ("Only visible to you") for the currently open conversation; kept in
+    /// memory only and cleared on conversation switch or dismissal.
+    ephemeral: Vec<Rc<Message>>,
     #[cfg(feature = "gui-shot")]
     script: shot::Script,
 }
@@ -536,6 +539,7 @@ impl Pane {
             app_view: None,
             app_loading: false,
             app_error: None,
+            ephemeral: Vec::new(),
             #[cfg(feature = "gui-shot")]
             script: if thread { shot::Script::default() } else { shot::Script::from_env() },
         }
@@ -702,6 +706,7 @@ impl Pane {
         self.app_view = None;
         self.app_loading = false;
         self.app_error = None;
+        self.ephemeral.clear();
         self.window = pages::Window::default();
         self.items = Vec::new();
         self.list.reset(0);
@@ -1156,6 +1161,13 @@ impl Pane {
         };
         match change {
             Change::Messages { conversation } if conversation == key => self.refresh(cx),
+            Change::Ephemeral { conversation, message } if conversation == key => {
+                if self.ephemeral.len() >= 10 {
+                    self.ephemeral.remove(0);
+                }
+                self.ephemeral.push(Rc::new((**message).clone()));
+                cx.notify();
+            }
             Change::Upload { conversation, client_id, sent, total } if conversation == key => {
                 self.uploads.insert(client_id.clone(), (*sent, *total));
                 cx.notify();
@@ -2167,6 +2179,61 @@ impl Render for Pane {
         .size_0();
         let app_bar = self.app_tabs_bar(cx);
         let showing_app_tab = self.is_slack_app() && self.app_tab != AppTab::Messages;
+        let ephemeral_strip = (!self.ephemeral.is_empty() && !showing_app_tab).then(|| {
+            let mut list = div()
+                .flex_none()
+                .px(px(theme::PANE_PAD))
+                .py(px(6.))
+                .border_t_1()
+                .border_color(theme::hairline())
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.));
+            for (ix, msg) in self.ephemeral.iter().enumerate() {
+                let id = msg.id.clone();
+                let who = if msg.sender.name.is_empty() { "Slackbot".to_owned() } else { msg.sender.name.clone() };
+                list = list.child(
+                    div()
+                        .id(("ephemeral-msg", ix))
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(who))
+                                        .child(div().type_micro().text_color(theme::text_faint()).child("Only visible to you")),
+                                )
+                                .child(div().type_ui().text_color(theme::text_soft()).child(msg.text.clone())),
+                        )
+                        .child(
+                            div()
+                                .id(("ephemeral-dismiss", ix))
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme::text()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.ephemeral.retain(|m| m.id != id);
+                                    cx.notify();
+                                }))
+                                .child("Dismiss"),
+                        ),
+                );
+            }
+            list
+        });
         div()
             .id("messages")
             .size_full()
@@ -2227,6 +2294,7 @@ impl Render for Pane {
                     .into_any_element()
             })
             .children(self.action_layers(window, cx))
+            .children(ephemeral_strip)
             .children(self.viewer_layer(window, cx))
     }
 }

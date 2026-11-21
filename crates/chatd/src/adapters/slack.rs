@@ -368,6 +368,8 @@ fn per_minute(method: &str) -> f64 {
         | "users.channelSections.order"
         | "users.channelSections.channels.list"
         | "users.channelSections.channels.bulkUpdate"
+        | "commands.list"
+        | "chat.meMessage"
         | "dnd.setSnooze"
         | "dnd.endSnooze"
         | "stars.add"
@@ -631,11 +633,15 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         // paced: the commands behind either (a cancel among them) are not held up.
         let other = |command| match command {
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
-                let sending = slack.clone();
-                let (conversation, client) = (conversation_id.clone(), client_id.clone());
-                crate::blobs::upload::spawn(&slack.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
-                    sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
-                });
+                if with.files.is_empty() && with.pick.is_none() && with.schedule.is_none() && parse_slash_command(&text).is_some() {
+                    slack.send(&conversation_id, &client_id, &text, reply_to.as_deref(), with.suppress_embeds);
+                } else {
+                    let sending = slack.clone();
+                    let (conversation, client) = (conversation_id.clone(), client_id.clone());
+                    crate::blobs::upload::spawn(&slack.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
+                        sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
+                    });
+                }
             }
             Command::Previews(ids) => slack.previews(ids),
             command => slack.serve(command),
@@ -1232,6 +1238,12 @@ impl Slack {
             return Ok(());
         };
         let root = event["thread_ts"].as_str().filter(|root| *root != message.id);
+        // Ephemeral messages ("Only visible to you") are never written to persistent channel history.
+        if message.ephemeral {
+            let place = root.map_or_else(|| channel.to_owned(), |root| thread_id(channel, root));
+            self.ctx.ephemeral(&place, message);
+            return Ok(());
+        }
         // The files of a send of ours, shared: that send records it as its own.
         if event["files"].is_array() && self.shared_here(event, &message) {
             return Ok(());
@@ -1677,6 +1689,7 @@ impl Slack {
             Command::SectionMoveChannel { conversation_id, from_section, to_section, reply, .. } => {
                 answer(reply, self.section_move_channel(&conversation_id, from_section.as_deref(), &to_section))
             }
+            Command::SlashCommands { reply } => answer(reply, self.slash_commands()),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::StarMessage { conversation_id, message_id, starred, reply } => {
@@ -1993,9 +2006,206 @@ impl Slack {
     /// Posts a message and ends the send. In a thread's conversation it is a reply to that
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
+    ///
+    /// Built-in slash commands (`/me`, `/shrug`, `/topic`, `/invite`, `/kick`, `/remove`,
+    /// `/leave`, `/join`, `/archive`, `/mute`, `/status`, `/dnd`, `/away`, `/active`, `/remind`)
+    /// are intercepted before `chat.postMessage`. Unknown `/commands` are refused with the
+    /// hand-off message and never posted as raw channel text.
     fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
+        if let Some((cmd, arg)) = parse_slash_command(text) {
+            match self.run_slash_command(conversation, client_id, cmd, arg, reply_to, suppress) {
+                SlashOutcome::Message(outcome) => self.ctx.sent(conversation, client_id, outcome),
+                SlashOutcome::Done(notice) => {
+                    let msg = notice.map(|body| {
+                        let mut m = Message::plain(
+                            format!("ephemeral:{client_id}"),
+                            "Slackbot",
+                            body,
+                            crate::hub::now(),
+                            false,
+                        );
+                        m.ephemeral = true;
+                        m
+                    });
+                    self.ctx.command_done(conversation, client_id, msg);
+                }
+            }
+            return;
+        }
         let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[], false);
         self.ctx.sent(conversation, client_id, outcome);
+    }
+
+    fn resolve_user_arg(&self, raw: &str) -> String {
+        let token = raw.split_whitespace().next().unwrap_or("").trim();
+        if let Some(inner) = token.strip_prefix("<@").and_then(|s| s.strip_suffix('>')) {
+            return inner.split('|').next().unwrap_or("").to_owned();
+        }
+        let clean = token.trim_start_matches('@');
+        if (clean.starts_with('U') || clean.starts_with('W'))
+            && clean.len() >= 4
+            && clean.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return clean.to_owned();
+        }
+        // Look up cached user by handle or display name.
+        self.state()
+            .users
+            .iter()
+            .find(|(_, u)| u.handle.eq_ignore_ascii_case(clean) || u.name.eq_ignore_ascii_case(clean))
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| clean.to_owned())
+    }
+
+    fn resolve_channel_arg(&self, raw: &str) -> String {
+        let token = raw.split_whitespace().next().unwrap_or("").trim();
+        if let Some(inner) = token.strip_prefix("<#").and_then(|s| s.strip_suffix('>')) {
+            return inner.split('|').next().unwrap_or("").to_owned();
+        }
+        token.trim_start_matches('#').to_owned()
+    }
+
+    fn run_slash_command(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        cmd: &str,
+        arg: &str,
+        reply_to: Option<&str>,
+        suppress: bool,
+    ) -> SlashOutcome {
+        let channel = thread_of(conversation).map_or(conversation, |(c, _)| c);
+        match cmd {
+            "me" => {
+                if arg.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /me <text>".to_owned()));
+                }
+                let escaped = escape(arg);
+                let posted = self.api("chat.meMessage", &[("channel", channel), ("text", escaped.as_str())]).map_err(reason);
+                let outcome = posted.and_then(|resp| {
+                    let ts = resp["ts"].as_str().unwrap_or("").to_owned();
+                    let me = self.me.get().cloned().unwrap_or_default();
+                    let event = json!({
+                        "type": "message",
+                        "subtype": "me_message",
+                        "ts": ts,
+                        "user": me,
+                        "text": escaped,
+                    });
+                    self.message(channel, &event)
+                        .ok_or_else(|| "Slack accepted /me but returned no message.".to_owned())
+                });
+                SlashOutcome::Message(outcome)
+            }
+            "shrug" => {
+                let body = if arg.is_empty() {
+                    "¯\\_(ツ)_/¯".to_owned()
+                } else {
+                    format!("{arg} ¯\\_(ツ)_/¯")
+                };
+                SlashOutcome::Message(self.post(conversation, client_id, &body, reply_to, suppress, &[], false))
+            }
+            "topic" => match self.update_conversation(channel, None, Some(arg), None) {
+                Ok(()) => SlashOutcome::Done(Some("Channel topic updated.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "invite" => {
+                let uid = self.resolve_user_arg(arg);
+                if uid.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /invite @user".to_owned()));
+                }
+                match self.members_add(channel, &[uid]) {
+                    Ok(()) => SlashOutcome::Done(Some("Invited to this channel.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "kick" | "remove" => {
+                let uid = self.resolve_user_arg(arg);
+                if uid.is_empty() {
+                    return SlashOutcome::Message(Err(format!("Usage: /{cmd} @user")));
+                }
+                match self.members_remove(channel, &uid) {
+                    Ok(()) => SlashOutcome::Done(Some("Removed from this channel.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "leave" => match self.leave(channel) {
+                Ok(()) => SlashOutcome::Done(None),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "join" => {
+                let cid = self.resolve_channel_arg(arg);
+                if cid.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /join #channel".to_owned()));
+                }
+                match self.join_channel(&cid) {
+                    Ok(()) => SlashOutcome::Done(Some(format!("Joined #{cid}."))),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "archive" => match self.archive_channel(channel, true) {
+                Ok(()) => SlashOutcome::Done(Some("Channel archived.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "mute" => match self.set_mute(channel, protocol::Notify::Nothing) {
+                Ok(()) => SlashOutcome::Done(Some("Channel muted.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "away" => match self.set_presence(Presence::Idle, None, None, None) {
+                Ok(()) => SlashOutcome::Done(Some("You are now set to away.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "active" => match self.set_presence(Presence::Online, None, None, None) {
+                Ok(()) => SlashOutcome::Done(Some("You are now set to active.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "status" => {
+                let (emoji, text) = if arg.is_empty() {
+                    (Some(String::new()), Some(String::new()))
+                } else if arg.starts_with(':') {
+                    if let Some(end) = arg[1..].find(':') {
+                        let em = arg[..end + 2].to_owned();
+                        let rest = arg[end + 2..].trim().to_owned();
+                        (Some(em), Some(rest))
+                    } else {
+                        (None, Some(arg.to_owned()))
+                    }
+                } else {
+                    (None, Some(arg.to_owned()))
+                };
+                match self.set_presence(Presence::Unknown, text, emoji, None) {
+                    Ok(()) => SlashOutcome::Done(Some("Status updated.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "dnd" => {
+                if arg.eq_ignore_ascii_case("off") || arg.eq_ignore_ascii_case("end") {
+                    match self.set_presence(Presence::Online, None, None, None) {
+                        Ok(()) => SlashOutcome::Done(Some("Notifications resumed.".to_owned())),
+                        Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                    }
+                } else {
+                    let mins = parse_duration_minutes(arg).unwrap_or(30);
+                    let until = crate::hub::now() + mins * 60;
+                    match self.set_presence(Presence::Dnd, None, None, Some(until)) {
+                        Ok(()) => SlashOutcome::Done(Some(format!("Notifications paused for {mins} minutes."))),
+                        Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                    }
+                }
+            }
+            "remind" => {
+                if arg.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /remind <text>".to_owned()));
+                }
+                let when = crate::hub::now() + parse_duration_minutes(arg).unwrap_or(30) * 60;
+                let when_str = when.to_string();
+                match self.api("reminders.add", &[("text", arg), ("time", when_str.as_str())]) {
+                    Ok(_) => SlashOutcome::Done(Some("Reminder set.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            _ => SlashOutcome::Message(Err("Commands run in the official app.".to_owned())),
+        }
     }
 
     /// The post itself, answering what Slack accepted.
@@ -3132,6 +3342,49 @@ fn capabilities() -> protocol::Capabilities {
         sidebar_sections: true,
         ..protocol::Capabilities::default()
     }
+}
+
+enum SlashOutcome {
+    Message(Result<Message, String>),
+    Done(Option<String>),
+}
+
+/// Parses a leading Slack slash command (`/cmd [args]`). Returns `(lowercase_cmd, trimmed_args)`.
+/// Ignores paths like `/usr/bin/env` (contains `/` in first token) and non-ASCII names.
+fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let (head, tail) = match rest.find(char::is_whitespace) {
+        Some(at) => (&rest[..at], rest[at..].trim()),
+        None => (rest, ""),
+    };
+    if head.is_empty()
+        || head.len() > 64
+        || !head.as_bytes()[0].is_ascii_alphabetic()
+        || !head.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some((head, tail))
+}
+
+/// Parses a simple duration in minutes from `/dnd 30`, `/dnd 2h`, or `/remind ... in 15 minutes`.
+fn parse_duration_minutes(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    for token in lower.split_whitespace() {
+        if let Some(h) = token.strip_suffix('h').and_then(|n| n.parse::<i64>().ok()).filter(|&n| n > 0) {
+            return Some((h * 60).min(24 * 60));
+        }
+        if let Some(m) = token.strip_suffix('m').and_then(|n| n.parse::<i64>().ok()).filter(|&n| n > 0) {
+            return Some(m.min(24 * 60));
+        }
+        if let Ok(n) = token.parse::<i64>() {
+            if n > 0 {
+                return Some(n.min(24 * 60));
+            }
+        }
+    }
+    None
 }
 
 /// A store error on the way out of a command, as a fault. Slack had already said yes.

@@ -423,6 +423,18 @@ pub struct AppView {
     pub home: Option<AppHome>,
 }
 
+/// One slash command available in a workspace (`Request::SlashCommands`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub builtin: bool,
+}
+
 /// Which of a custom emoji set this account may send.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

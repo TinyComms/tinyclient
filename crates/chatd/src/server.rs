@@ -4076,6 +4076,15 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::SlashCommands { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SlashCommands { reply }) {
+                    Ok(commands) => Response::SlashCommands { commands },
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
