@@ -342,6 +342,8 @@ pub struct Pane {
     /// Files the user asked to open, and the name each is opened under.
     then: HashMap<String, (Then, String)>,
 
+    /// On-demand translations, by message id. The message's own text stays the original.
+    translations: HashMap<String, String>,
     /// Spoilers opened, by message and span.
     revealed: HashSet<(String, u32)>,
     /// Spoilered pictures opened, by file.
@@ -473,6 +475,7 @@ impl Pane {
             let_go: Vec::new(),
             scale: 0.,
             then: HashMap::new(),
+            translations: HashMap::new(),
             revealed: HashSet::new(),
             shown: HashSet::new(),
             poll_results: HashSet::new(),
@@ -648,6 +651,7 @@ impl Pane {
         let landing = self.landing.take();
         let around = self.around.take();
         self.revisions = None;
+        self.translations.clear();
         self.fetched_reactors.clear();
         self.reactors_loading = None;
         // Where the one being left was, for coming back to it.

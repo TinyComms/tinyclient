@@ -921,6 +921,7 @@ impl Demo {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
             Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarMessage { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }

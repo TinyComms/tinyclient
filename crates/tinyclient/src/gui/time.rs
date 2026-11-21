@@ -165,8 +165,23 @@ fn windows_clock() -> Style {
         }
         Some(String::from_utf16_lossy(&buf[..count as usize - 1]))
     }
-    // 0x5c LOCALE_SNAME, 0x23 LOCALE_ITIME, 0x21 LOCALE_IDATE.
-    style_from_locale(&info(0x5c).unwrap_or_default(), info(0x23).as_deref(), info(0x21).as_deref())
+    // 0x23 LOCALE_ITIME, 0x21 LOCALE_IDATE. The name is `user_locale_name` (0x5c LOCALE_SNAME).
+    style_from_locale(&user_locale_name(), info(0x23).as_deref(), info(0x21).as_deref())
+}
+
+#[cfg(windows)]
+fn user_locale_name() -> String {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocaleInfoW(locale: u32, kind: u32, buf: *mut u16, size: i32) -> i32;
+    }
+    let mut buf = [0u16; 85];
+    // SAFETY: the buffer is writable and its length is passed. 0x400 is LOCALE_USER_DEFAULT, 0x5c is LOCALE_SNAME.
+    let count = unsafe { GetLocaleInfoW(0x400, 0x5c, buf.as_mut_ptr(), buf.len() as i32) };
+    if count <= 1 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..count as usize - 1])
 }
 
 fn clock_in(t: Local, style: Style) -> String {
@@ -180,6 +195,34 @@ fn clock_in(t: Local, style: Style) -> String {
         _ => (t.hour - 12, "PM"),
     };
     format!("{hour}:{:02} {half}", t.minute)
+}
+
+/// The language a translation asks for: the system locale's primary tag, or `en`.
+pub fn system_language() -> String {
+    language_tag(&system_locale())
+}
+
+fn system_locale() -> String {
+    #[cfg(windows)]
+    {
+        return user_locale_name();
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES")).or_else(|_| std::env::var("LANG")).unwrap_or_default()
+    }
+}
+
+/// `en-US`, `pt_BR.UTF-8`, and `C` become `en`, `pt`, and `en`.
+fn language_tag(raw: &str) -> String {
+    let primary = raw.trim().split(['-', '_', '.']).next().unwrap_or("");
+    let tag: String = primary.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let tag = tag.to_ascii_lowercase();
+    if (2..=3).contains(&tag.len()) {
+        tag
+    } else {
+        "en".to_owned()
+    }
 }
 
 /// `10:37 PM` or `22:37`: a message's time, whatever its age.
@@ -319,6 +362,15 @@ mod tests {
         assert_eq!(style_from_locale("en-US", Some("0"), Some("0")), US);
         assert_eq!(style_from_locale("en-US", Some("1"), Some("0")), Style { hour24: true, month_first: true });
         assert_eq!(style_from_locale("en-GB", None, None), UK);
+    }
+
+    #[test]
+    fn a_language_tag_is_the_primary_subtag() {
+        assert_eq!(language_tag("en-US"), "en");
+        assert_eq!(language_tag("pt_BR.UTF-8"), "pt");
+        assert_eq!(language_tag("EN"), "en");
+        assert_eq!(language_tag("C"), "en");
+        assert_eq!(language_tag(""), "en");
     }
 
     #[test]

@@ -1226,6 +1226,17 @@ fn default_starred_limit() -> u32 {
     50
 }
 
+/// One message as a network translated it. The stored message is left as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Translation {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<Span>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -2644,6 +2655,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         values: Vec<String>,
     },
+    /// Translate these messages into `to` (a language tag such as `en`). On demand: nothing is
+    /// stored over the original, and a sealed or secret chat is refused before the network is asked.
+    Translate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        to: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -2878,6 +2898,11 @@ pub enum Response {
     /// Answers `Source`: the raw source text of the message as the network holds it.
     Source {
         text: String,
+    },
+    /// Answers `Translate`. One item per message the network translated, in the order asked.
+    Translated {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<Translation>,
     },
     /// Answers `Resolve`: the matching cached conversation and optional message id on a signed-in account.
     Resolved {
@@ -3681,6 +3706,29 @@ mod tests {
             anonymous: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
+    }
+
+    #[test]
+    fn a_translate_frame_missing_its_new_fields_still_reads() {
+        let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u1");
+        let bare: Request = serde_json::from_str(&format!(
+            r#"{{"op":"translate","conversation":{}}}"#,
+            serde_json::to_string(&key).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(bare, Request::Translate { conversation: key.clone(), message_ids: vec![], to: String::new() });
+
+        let full = Request::Translate { conversation: key, message_ids: vec!["9".into()], to: "en".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
+
+        let empty: Response = serde_json::from_str(r#"{"op":"translated"}"#).unwrap();
+        assert_eq!(empty, Response::Translated { items: vec![] });
+        let item: Translation = serde_json::from_str("{}").unwrap();
+        assert_eq!(item, Translation { message_id: String::new(), text: String::new(), spans: vec![] });
+        let said = Translation { message_id: "9".into(), text: "hi".into(), spans: vec![] };
+        let wire = serde_json::to_string(&Response::Translated { items: vec![said.clone()] }).unwrap();
+        assert!(!wire.contains("spans"), "{wire}");
+        assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), Response::Translated { items: vec![said] });
     }
 }
 

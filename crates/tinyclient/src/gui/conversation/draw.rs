@@ -1426,6 +1426,38 @@ impl Pane {
         if edited_alone {
             out.push(self.edited_mark(message, cx));
         }
+        if let Some(said) = self.translations.get(&message.id).cloned() {
+            let id = message.id.clone();
+            out.push(
+                div()
+                    .max_w(px(MEASURE))
+                    .mt(px(6.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().type_micro().text_color(theme::text_faint()).child("Translated by Telegram"))
+                    .child(
+                        div()
+                            .type_body()
+                            .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                            .text_color(theme::text_soft())
+                            .child(said),
+                    )
+                    .child(
+                        div()
+                            .id(name_id("show-original", &message.id))
+                            .cursor_pointer()
+                            .type_micro()
+                            .text_color(theme::accent())
+                            .child("Show original")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.translations.remove(&id);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
         if let Some(expires_at) = message.expires_at {
             if let Some(label) = expiry_label(expires_at, crate::view::now()) {
                 out.push(

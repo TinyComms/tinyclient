@@ -54,6 +54,7 @@
 mod catalog;
 mod content;
 mod open_link;
+mod translate;
 mod fake;
 mod files;
 mod filing;
@@ -731,6 +732,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenLink { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
@@ -931,6 +933,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::OpenLink { url, reply } => {
             let _ = reply.send(open_link::open(account, &url).map_err(refused));
+        }
+        Command::Translate { conversation_id, message_ids, to, reply } => {
+            let _ = reply.send(translate::translate(account, &conversation_id, &message_ids, &to).map_err(refused));
         }
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));

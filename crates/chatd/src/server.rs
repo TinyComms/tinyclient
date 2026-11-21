@@ -161,6 +161,20 @@ fn offline_words(account: &AccountKey, with: &Outgoing) -> String {
     }
 }
 
+/// A language tag Telegram can be asked for: `en`, `pt-BR`. Empty and anything else is refused.
+fn translate_language(raw: &str) -> Option<String> {
+    let to = raw.trim();
+    let bytes = to.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 16
+        || !bytes[0].is_ascii_alphabetic()
+        || !bytes.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
+    {
+        return None;
+    }
+    Some(to.to_owned())
+}
+
 fn error(code: ErrorCode, detail: impl ToString) -> Response {
     Response::Error {
         code,
@@ -1499,6 +1513,46 @@ impl Chat {
             message.poll = Some(Box::new(protocol::Poll::open(question, draft.options.iter().take(10).cloned(), draft.multiple)));
         }
         message
+    }
+
+    /// On-demand translation. A sealed or secret chat is refused before any command is sent,
+    /// so the adapter never sees it and the stored text stays as it was.
+    fn translate(&self, conversation: Key, message_ids: Vec<String>, to: String) -> Response {
+        match self.sealed_or_secret(&conversation) {
+            Ok(true) => return error(ErrorCode::Refused, "A sealed or secret chat is not translated."),
+            Ok(false) => {}
+            Err(err) => return internal(err),
+        }
+        let Some(to) = translate_language(&to) else {
+            return error(ErrorCode::Refused, "Choose a language to translate into.");
+        };
+        if message_ids.is_empty() || message_ids.len() > 100 {
+            return error(ErrorCode::Refused, "Choose a message to translate.");
+        }
+        if conversation.network != Network::Telegram {
+            return error(ErrorCode::Unsupported, format!("{} cannot do this yet", conversation.network.label()));
+        }
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::Translate { conversation_id, message_ids, to, reply }) {
+            Ok(items) => Response::Translated { items },
+            Err(refused) => *refused,
+        }
+    }
+
+    /// A Telegram secret chat (`e` plus digits) or a conversation whose row is end-to-end sealed.
+    fn sealed_or_secret(&self, conversation: &Key) -> Result<bool, rusqlite::Error> {
+        if conversation.network == Network::Telegram {
+            if let Some(rest) = conversation.id.strip_prefix('e') {
+                if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(self.hub.store().conversation(conversation)?.is_some_and(|row| row.encryption.is_sealed()))
     }
 
     /// Refuses what needs the network when the account is not connected to it.
@@ -4143,6 +4197,7 @@ impl Chat {
                 values,
                 reply,
             }),
+            Request::Translate { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
@@ -5738,6 +5793,81 @@ mod tests {
             assert_eq!(conversation, None, "{url}");
         }
         assert_eq!(*seen.lock().unwrap(), 0, "no open command for a foreign host or a bad path");
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn a_translation_keeps_the_original_and_a_sealed_chat_is_not_asked() {
+        use crate::adapters::Command;
+        use crate::hub::lock;
+        use crate::store::ConversationRow;
+        use protocol::{ConversationKind, Encryption, ErrorCode, Key, Message, Request, Response, Translation};
+        use std::sync::{Arc, Mutex};
+
+        let (chat, account, ctx, rx) = telegram_link_account();
+        ctx.conversation(&ConversationRow::new("u7", ConversationKind::Direct, "Ada")).unwrap();
+        ctx.message("u7", &Message::plain("42", "Ada", "hola", 1, false)).unwrap();
+        let mut sealed = ConversationRow::new("u8", ConversationKind::Direct, "Bea");
+        sealed.encryption = Encryption::EndToEnd;
+        ctx.conversation(&sealed).unwrap();
+        ctx.conversation(&ConversationRow::new("e9", ConversationKind::Direct, "Secret")).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, Vec<String>, String)>::new()));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::Translate { conversation_id, message_ids, to, reply } => {
+                        seen_worker.lock().unwrap().push((conversation_id, message_ids, to));
+                        let _ = reply.send(Ok(vec![Translation {
+                            message_id: "42".into(),
+                            text: "hello".into(),
+                            spans: Vec::new(),
+                        }]));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        let Response::Translated { items } = chat.handle(Request::Translate {
+            conversation: Key::new(&account, "u7"),
+            message_ids: vec!["42".into()],
+            to: "en".into(),
+        }) else {
+            panic!("expected Translated");
+        };
+        assert_eq!(items, vec![Translation { message_id: "42".into(), text: "hello".into(), spans: Vec::new() }]);
+        assert_eq!(ctx.stored_message("u7", "42").unwrap().unwrap().text, "hola");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![("u7".to_owned(), vec!["42".to_owned()], "en".to_owned())]
+        );
+
+        for id in ["u8", "e9"] {
+            let Response::Error { code, .. } = chat.handle(Request::Translate {
+                conversation: Key::new(&account, id),
+                message_ids: vec!["42".into()],
+                to: "en".into(),
+            }) else {
+                panic!("expected a refusal for {id}");
+            };
+            assert_eq!(code, ErrorCode::Refused, "{id}");
+        }
+        let Response::Error { code, .. } = chat.handle(Request::Translate {
+            conversation: Key::new(&account, "u7"),
+            message_ids: vec!["42".into()],
+            to: "  ".into(),
+        }) else {
+            panic!("expected a refusal for an empty language");
+        };
+        assert_eq!(code, ErrorCode::Refused);
+        assert_eq!(seen.lock().unwrap().len(), 1, "sealed, secret, and an empty language send no command");
 
         lock(&chat.adapters).remove(&account);
         drop(ctx);
