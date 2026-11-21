@@ -712,6 +712,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-mute-until:0");
         return Ok(());
     }
+    // The lab's telegram-unread-jumps driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-unread-jumps") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_unread_jumps() {
+            eprintln!("telegram-unread-jumps: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-unread-jumps:0");
+        return Ok(());
+    }
     // The lab's telegram-mark-unread driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-mark-unread") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_mark_unread() {

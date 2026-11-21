@@ -238,6 +238,7 @@ mod tests {
             peer: None,
             unread: 0,
             mentions: 0,
+            unread_reactions: 0,
             muted: false,
             starred: false,
             preview: String::new(),

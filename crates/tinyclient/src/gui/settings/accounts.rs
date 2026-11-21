@@ -164,6 +164,12 @@ impl SettingsWindow {
                 if network == Network::Telegram && account.link == Link::Connected {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
                 }
+                if account.can.notify_defaults && account.link == Link::Connected {
+                    group = group.child(self.notify_defaults_rows(account, ix, cx));
+                }
+                if account.can.active_sessions && account.link == Link::Connected {
+                    group = group.child(self.active_sessions_rows(account, ix, cx));
+                }
             }
             if network == Network::Tiny {
                 tiny_line = self.tiny_line();
@@ -186,6 +192,346 @@ impl SettingsWindow {
     fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
         cx.notify();
+    }
+
+    fn load_active_sessions(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_sessions_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::ActiveSessions { account: acc }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::ActiveSessions { sessions }) = answer {
+                    this.tg_sessions.insert(account, sessions);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn end_active_session(&mut self, account: protocol::AccountKey, session_id: String, cx: &mut Context<Self>) {
+        self.tg_session_confirm = None;
+        self.tg_session_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let sid = session_id.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&protocol::Request::EndSession { account: acc, session_id: sid })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(protocol::Response::Ok) => {
+                        if let Some(list) = this.tg_sessions.get_mut(&account) {
+                            list.retain(|s| s.id != session_id);
+                        }
+                    }
+                    Ok(protocol::Response::Error { detail, .. }) => {
+                        this.tg_session_error = Some(detail);
+                    }
+                    Err(err) => {
+                        this.tg_session_error = Some(crate::client::trouble_words("end session", &err));
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn active_sessions_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_active_sessions(account.key.clone(), cx);
+        let sessions = self.tg_sessions.get(&account.key).cloned();
+        let mut box_div = div().flex().flex_col();
+        box_div = box_div.child(rule()).child(
+            div()
+                .px(px(12.))
+                .py(px(6.))
+                .type_small()
+                .font_weight(theme::MEDIUM)
+                .text_color(theme::text_soft())
+                .child("Devices"),
+        );
+        if let Some(ref err) = self.tg_session_error {
+            box_div = box_div.child(
+                div().px(px(12.)).pb(px(6.)).type_small().text_color(theme::danger()).child(err.clone()),
+            );
+        }
+        match sessions {
+            None => {
+                box_div = box_div.child(
+                    div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::text_faint()).child("Loading devices…"),
+                );
+            }
+            Some(list) if list.is_empty() => {
+                box_div = box_div.child(
+                    div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::text_faint()).child("No active sessions."),
+                );
+            }
+            Some(list) => {
+                for (s_ix, sess) in list.iter().enumerate() {
+                    let title = if sess.device.is_empty() {
+                        sess.app.clone()
+                    } else if sess.app.is_empty() {
+                        sess.device.clone()
+                    } else {
+                        format!("{} · {}", sess.device, sess.app)
+                    };
+                    let detail = if sess.location.is_empty() {
+                        sess.platform.clone()
+                    } else if sess.platform.is_empty() {
+                        sess.location.clone()
+                    } else {
+                        format!("{} · {}", sess.location, sess.platform)
+                    };
+                    let confirming = self.tg_session_confirm.as_ref() == Some(&(account.key.clone(), sess.id.clone()));
+                    let control = if sess.current {
+                        div().type_small().text_color(theme::accent_text()).child("This device").into_any_element()
+                    } else if confirming {
+                        let acc_ok = account.key.clone();
+                        let sid_ok = sess.id.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                button(("tg-sess-go", ix * 100 + s_ix), ButtonKind::Primary, "End session").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.end_active_session(acc_ok.clone(), sid_ok.clone(), cx);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                button(("tg-sess-no", ix * 100 + s_ix), ButtonKind::Ghost, "Cancel").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.tg_session_confirm = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .into_any_element()
+                    } else {
+                        let acc_ask = account.key.clone();
+                        let sid_ask = sess.id.clone();
+                        button(("tg-sess-end", ix * 100 + s_ix), ButtonKind::Ghost, "End").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.tg_session_confirm = Some((acc_ask.clone(), sid_ask.clone()));
+                                cx.notify();
+                            },
+                        ))
+                        .into_any_element()
+                    };
+                    box_div = box_div.child(
+                        div()
+                            .px(px(12.))
+                            .py(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(div().type_ui().text_color(theme::text()).truncate().child(title))
+                                    .when(!detail.is_empty(), |d| {
+                                        d.child(div().type_small().text_color(theme::text_soft()).truncate().child(detail))
+                                    }),
+                            )
+                            .child(control),
+                    );
+                }
+            }
+        }
+        box_div
+    }
+
+    fn load_notify_defaults(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_notify_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::GetNotifyDefaults { account: acc }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::NotifyDefaults { defaults }) = answer {
+                    this.tg_notify_defaults.insert(account, defaults);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_notify_default(
+        &mut self,
+        account: protocol::AccountKey,
+        scope: protocol::NotifyDefaultScope,
+        muted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(cur) = self.tg_notify_defaults.get_mut(&account) {
+            match scope {
+                protocol::NotifyDefaultScope::Users => cur.users_muted = muted,
+                protocol::NotifyDefaultScope::Groups => cur.groups_muted = muted,
+                protocol::NotifyDefaultScope::Channels => cur.channels_muted = muted,
+            }
+            cx.notify();
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&protocol::Request::SetNotifyDefault { account: acc, scope, muted })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::NotifyDefaults { defaults }) = answer {
+                    this.tg_notify_defaults.insert(account, defaults);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn reset_notify_defaults(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::ResetNotifyDefaults { account: acc }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::NotifyDefaults { defaults }) = answer {
+                    this.tg_notify_defaults.insert(account, defaults);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn notify_defaults_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_notify_defaults(account.key.clone(), cx);
+        let loaded = self.tg_notify_defaults.get(&account.key).cloned();
+        let mut box_div = div().flex().flex_col();
+        let scopes: [(&str, protocol::NotifyDefaultScope); 3] = [
+            ("Private chats", protocol::NotifyDefaultScope::Users),
+            ("Groups", protocol::NotifyDefaultScope::Groups),
+            ("Channels", protocol::NotifyDefaultScope::Channels),
+        ];
+        for (s_ix, (label, scope)) in scopes.into_iter().enumerate() {
+            let control = if let Some(ref defs) = loaded {
+                let muted = match scope {
+                    protocol::NotifyDefaultScope::Users => defs.users_muted,
+                    protocol::NotifyDefaultScope::Groups => defs.groups_muted,
+                    protocol::NotifyDefaultScope::Channels => defs.channels_muted,
+                };
+                let acc_on = account.key.clone();
+                let acc_off = account.key.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        button(
+                            ("tg-ndef-on", ix * 100 + s_ix * 2),
+                            if !muted { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            "On",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_notify_default(acc_on.clone(), scope, false, cx);
+                        })),
+                    )
+                    .child(
+                        button(
+                            ("tg-ndef-off", ix * 100 + s_ix * 2 + 1),
+                            if muted { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            "Muted",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_notify_default(acc_off.clone(), scope, true, cx);
+                        })),
+                    )
+                    .into_any_element()
+            } else {
+                div().type_small().text_color(theme::text_faint()).child("Loading…").into_any_element()
+            };
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().type_ui().text_color(theme::text()).child(format!("{label} notifications")))
+                            .child(
+                                div()
+                                    .type_small()
+                                    .text_color(theme::text_soft())
+                                    .child("Account-wide default across all your devices."),
+                            ),
+                    )
+                    .child(control),
+            );
+        }
+        if let Some(ref defs) = loaded {
+            let exc_summary = if defs.exceptions.is_empty() {
+                "No per-chat notification exceptions.".to_owned()
+            } else {
+                let names: Vec<String> = defs
+                    .exceptions
+                    .iter()
+                    .take(5)
+                    .map(|e| format!("{} ({})", e.title, if e.muted { "muted" } else { "unmuted" }))
+                    .collect();
+                format!("Exceptions ({}): {}", defs.exceptions.len(), names.join(", "))
+            };
+            let acc_reset = account.key.clone();
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(div().flex_1().min_w_0().type_small().text_color(theme::text_soft()).child(exc_summary))
+                    .child(
+                        button(("tg-ndef-reset", ix), ButtonKind::Ghost, "Reset all").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.reset_notify_defaults(acc_reset.clone(), cx);
+                            },
+                        )),
+                    ),
+            );
+        }
+        box_div
     }
 
     fn load_telegram_privacy(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {

@@ -1040,6 +1040,16 @@ impl Demo {
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNotifyDefaults { reply }
+            | Command::SetNotifyDefault { reply, .. }
+            | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }
