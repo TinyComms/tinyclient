@@ -418,6 +418,9 @@ impl Fake {
             return ok(json!({"id": thread, "consumptionhorizons": horizons}));
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/") {
+            if call.method == "DELETE" && thread.contains("/members/") {
+                return ok(json!({}));
+            }
             let described = match thread {
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
@@ -1507,4 +1510,17 @@ fn presence_is_asked_only_for_who_is_watched_and_a_rate_limit_is_waited_out_once
     world.until("the second try", || (world.fake.calls("POST", "/presence/v1/presence/getpresence/").len() >= 2).then_some(()));
     sleep(Duration::from_millis(1600));
     assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), 2);
+}
+
+#[test]
+fn leaving_a_group_chat_removes_myself_and_drops_the_row() {
+    let world = World::start();
+    world.ready();
+    let grp1 = key("19:grp1@thread.v2");
+    assert!(world.conversation(&grp1).is_some());
+
+    assert_eq!(world.ask(Request::Leave { conversation: grp1.clone() }), Response::Ok);
+    let left = world.fake.calls("DELETE", &format!("/v1/threads/19:grp1@thread.v2/members/{ME}"));
+    assert_eq!(left.len(), 1);
+    assert!(world.conversation(&grp1).is_none());
 }

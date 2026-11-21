@@ -1058,6 +1058,8 @@ mod tests {
         assert_eq!(conversation_menu(&channel, None, false), Vec::<Item>::new());
         assert!(can_leave(&row(Network::Telegram, ConversationKind::Announcement)));
         assert!(!can_leave(&row(Network::Discord, ConversationKind::Channel)));
+        assert!(can_leave(&row(Network::Teams, ConversationKind::Group)));
+        assert!(!can_leave(&row(Network::Teams, ConversationKind::Channel)));
     }
 
     #[test]

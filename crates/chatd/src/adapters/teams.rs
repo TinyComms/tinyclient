@@ -942,6 +942,9 @@ impl Teams {
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
             }
+            Command::Leave { conversation_id, reply } => {
+                let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
+            }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
             }

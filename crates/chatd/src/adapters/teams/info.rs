@@ -108,6 +108,15 @@ impl Teams {
         Ok(())
     }
 
+    /// Leaves a group chat by removing myself from its member list, then drops the row.
+    pub(super) fn leave(&self, conversation: &str) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(&self.me()));
+        self.chat("DELETE", &path, Body::None, false)?;
+        self.ctx.conversation_gone(conversation)?;
+        Ok(())
+    }
+
     /// After a chat's newest page: when my message is the newest, whether everyone else has
     /// read up to it, from their read markers. Not for channels, nor for large chats.
     pub(super) fn seen_by(&self, conversation: &str) -> Result<(), Fault> {
