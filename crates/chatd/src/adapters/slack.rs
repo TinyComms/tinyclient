@@ -1401,7 +1401,7 @@ impl Slack {
                     answer(reply, self.delete(&conversation_id, &message_id));
                 }
             }
-            Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetPresence { presence, status, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
             Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.watch(),

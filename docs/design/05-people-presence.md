@@ -146,11 +146,11 @@ card):
 
 - Head: avatar 40, name, one line of truth ("Do not disturb on 3 networks").
 - Status text field 36 px: emoji button, text, "clears in 1 h" (never, 30 min, 1 h, 4 h, today), clear `x`. Sent to Discord,
-  Slack and Teams. Telegram, Signal, Messages, and a Tiny server have no status text.
+  Slack, Teams, and a Tiny server that supports `presence_status`. Telegram, Signal, Messages, and an older Tiny server have no status text.
 - "All networks": one 32 px row per signed-in network, with the presence glyph (12 px), label, a faint note where a network differs ("Away on Slack
   and Teams", "Discord and Teams only"), check on the current one.
 - "Per network": one 32 px row per signed-in network: icon 16, name, current glyph and word, chevron. Each opens a 208 px submenu listing only
-  that network's states. Telegram reads "Online while open" and has no submenu. Signal, Messages, and a Tiny server have no submenu. A disconnected network reads "Offline" in
+  that network's states. Telegram reads "Online while open" and has no submenu. Signal, Messages, and an older Tiny server have no submenu; a Tiny server with `presence_status` offers Online, Idle, Do not disturb and Invisible. A disconnected network reads "Offline" in
   `warning` and is not settable.
 
 ## New tokens

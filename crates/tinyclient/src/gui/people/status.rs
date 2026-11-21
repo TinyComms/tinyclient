@@ -52,25 +52,30 @@ fn own_keys(scene: &Scene) -> Vec<Key> {
 }
 
 /// The states a network lets us choose. Telegram is online while a client is open and has no
-/// other; Slack has two.
-pub fn states(network: Network) -> &'static [Presence] {
+/// other; Slack has two. A Tiny server offers states only when it advertises `presence_status`.
+pub fn states(network: Network, can: &protocol::Capabilities) -> &'static [Presence] {
     match network {
         Network::Discord => &[Presence::Online, Presence::Idle, Presence::Dnd, Presence::Offline],
         Network::Teams => &[Presence::Online, Presence::Idle, Presence::Busy, Presence::Dnd, Presence::Offline],
         Network::Slack => &[Presence::Online, Presence::Idle],
+        Network::Tiny if can.presence_status => &[Presence::Online, Presence::Idle, Presence::Dnd, Presence::Offline],
         // Signal shows no presence at all.
         Network::Telegram | Network::Signal | Network::Messages | Network::Tiny => &[],
     }
 }
 
-fn has_status_text(network: Network) -> bool {
-    !matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny)
+fn has_status_text(network: Network, can: &protocol::Capabilities) -> bool {
+    match network {
+        Network::Tiny => can.presence_status,
+        Network::Telegram | Network::Signal | Network::Messages => false,
+        _ => true,
+    }
 }
 
 /// The word for a state of our own: choosing to look offline has the network's name for it.
 pub fn state_word(presence: Presence, network: Network) -> &'static str {
     match (presence, network) {
-        (Presence::Offline, Network::Discord) => "Invisible",
+        (Presence::Offline, Network::Discord | Network::Tiny) => "Invisible",
         (Presence::Offline, Network::Teams) => "Appear offline",
         _ => presence::word(presence, network),
     }
@@ -280,7 +285,7 @@ impl StatusMenu {
         }
         let this = cx.weak_entity();
         // chatd reports the new state as a `Status` change, which is what redraws the rows.
-        super::ask_later(cx, Request::SetPresence { account, presence, status }, move |answer, cx| {
+        super::ask_later(cx, Request::SetPresence { account, presence, status, clear_at: None }, move |answer, cx| {
             let refused = match answer {
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => None,
@@ -312,7 +317,7 @@ impl StatusMenu {
 
     fn account_row(&self, ix: usize, own: &Own, cx: &mut Context<Self>) -> Stateful<Div> {
         let network = own.key.network;
-        let settable = own.link == Link::Connected && !states(network).is_empty();
+        let settable = own.link == Link::Connected && !states(network, &own.can).is_empty();
         let open = self.open.as_ref() == Some(&own.key);
         let (word, color) = link_word(own);
         let shape = Shape::of(own.presence).filter(|_| own.link == Link::Connected);
@@ -342,7 +347,7 @@ impl StatusMenu {
     fn choices(&self, ix: usize, own: &Own, window: &Window, cx: &mut Context<Self>) -> Div {
         let network = own.key.network;
         let mut choices = div().pl(px(24.)).pb(px(4.)).flex().flex_col();
-        for (at, state) in states(network).iter().copied().enumerate() {
+        for (at, state) in states(network, &own.can).iter().copied().enumerate() {
             let account = own.key.clone();
             choices = choices.child(
                 div()
@@ -361,7 +366,7 @@ impl StatusMenu {
                     .on_click(cx.listener(move |this, _, _, cx| this.send(account.clone(), state, None, cx))),
             );
         }
-        if !has_status_text(network) {
+        if !has_status_text(network, &own.can) {
             return choices;
         }
         let focused = self.field.focus_handle(cx).is_focused(window);
@@ -578,7 +583,7 @@ impl Render for StatusMenu {
 impl StatusMenu {
     /// The first settable account opened, with words in its field.
     pub fn stage(&mut self, text: &str, cx: &mut Context<Self>) {
-        let first = connected(&self.scene).find(|own| has_status_text(own.key.network) && !states(own.key.network).is_empty());
+        let first = connected(&self.scene).find(|own| has_status_text(own.key.network, &own.can) && !states(own.key.network, &own.can).is_empty());
         self.open = first.map(|own| own.key.clone());
         self.field.update(cx, |field, cx| field.set_text(text, cx));
         cx.notify();
@@ -648,11 +653,18 @@ mod tests {
 
     #[test]
     fn a_network_lists_only_the_states_it_has() {
-        assert_eq!(states(Network::Slack), [Presence::Online, Presence::Idle]);
-        assert_eq!(states(Network::Discord).len(), 4);
-        assert!(states(Network::Telegram).is_empty());
+        let bare = protocol::Capabilities::default();
+        let tiny_presence = protocol::Capabilities { presence_status: true, ..protocol::Capabilities::default() };
+        assert_eq!(states(Network::Slack, &bare), [Presence::Online, Presence::Idle]);
+        assert_eq!(states(Network::Discord, &bare).len(), 4);
+        assert!(states(Network::Telegram, &bare).is_empty());
+        assert!(states(Network::Tiny, &bare).is_empty());
+        assert!(!has_status_text(Network::Tiny, &bare));
+        assert_eq!(states(Network::Tiny, &tiny_presence), [Presence::Online, Presence::Idle, Presence::Dnd, Presence::Offline]);
+        assert!(has_status_text(Network::Tiny, &tiny_presence));
         assert_eq!(state_word(Presence::Idle, Network::Slack), "Away");
         assert_eq!(state_word(Presence::Offline, Network::Discord), "Invisible");
+        assert_eq!(state_word(Presence::Offline, Network::Tiny), "Invisible");
         assert_eq!(state_word(Presence::Offline, Network::Slack), "Offline");
     }
 

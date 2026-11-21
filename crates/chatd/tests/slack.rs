@@ -1877,7 +1877,7 @@ fn presence_a_profile_and_signing_out() {
     let account = AccountKey { network: Network::Slack, account: "T01ALPHA".to_owned() };
 
     // Away with a status: both reach Slack, and the account shows what Slack now shows others.
-    let away = Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: Some("Lunch".to_owned()) };
+    let away = Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: Some("Lunch".to_owned()), clear_at: None };
     assert_eq!(world.ask(away), Response::Ok);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").pop().unwrap().params["presence"], "away");
     let set = world.fake.calls(ALPHA, "users.profile.set").pop().unwrap();
@@ -1886,18 +1886,18 @@ fn presence_a_profile_and_signing_out() {
     let shown = world.account("T01ALPHA");
     assert_eq!((shown.presence, shown.status.as_str()), (Presence::Idle, "💬 Lunch"));
     // Back, with the status left alone: one call, and the text stays.
-    let back = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: None };
+    let back = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: None, clear_at: None };
     assert_eq!(world.ask(back), Response::Ok);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").pop().unwrap().params["presence"], "auto");
     assert_eq!(world.fake.calls(ALPHA, "users.profile.set").len(), 1);
     let shown = world.account("T01ALPHA");
     assert_eq!((shown.presence, shown.status.as_str()), (Presence::Online, "💬 Lunch"));
     // Clearing the status.
-    let clear = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: Some(String::new()) };
+    let clear = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: Some(String::new()), clear_at: None };
     assert_eq!(world.ask(clear), Response::Ok);
     assert_eq!(world.account("T01ALPHA").status, "");
     // Do Not Disturb is not built: it is refused in words and nothing is shown as set.
-    let quiet = world.ask(Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: None });
+    let quiet = world.ask(Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: None, clear_at: None });
     assert!(matches!(&quiet, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("Do Not Disturb")), "{quiet:?}");
     assert_eq!(world.account("T01ALPHA").presence, Presence::Online);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").len(), 3);

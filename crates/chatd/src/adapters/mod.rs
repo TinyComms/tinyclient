@@ -532,6 +532,7 @@ pub enum Command {
     SetPresence {
         presence: Presence,
         status: Option<String>,
+        clear_at: Option<i64>,
         reply: Reply<()>,
     },
     /// Edit our own profile fields on the network. `None` leaves a field unchanged.

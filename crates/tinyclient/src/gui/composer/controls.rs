@@ -110,6 +110,10 @@ mod tests {
         let y = controls(&tiny, false);
         assert!(y.attach && y.gif && y.emoji && !y.custom_emoji);
         assert_eq!(y.tabs, [Tab::Emoji]);
+        let tiny_catalog = Capabilities { max_file_bytes: 8 << 20, max_files: 10, gifs: true, gif_file: true, ..Capabilities::default() };
+        let yc = controls(&tiny_catalog, false);
+        assert!(yc.gif);
+        assert_eq!(yc.tabs, [Tab::Emoji, Tab::Gifs]);
         let bare = controls(&Capabilities { gif_file: true, ..Capabilities::default() }, false);
         assert!(!bare.attach && !bare.gif && bare.emoji);
         assert_eq!(bare.tabs, [Tab::Emoji]);

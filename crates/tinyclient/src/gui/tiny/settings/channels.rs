@@ -562,7 +562,7 @@ fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
                 }
                 tree = tree.child(row);
             }
-            Line::Seat { .. } => {}
+            Line::Seat { .. } | Line::MoreSeats { .. } => {}
         }
     }
     if community.rooms.is_empty() && community.channels.is_empty() {

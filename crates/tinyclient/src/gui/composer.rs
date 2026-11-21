@@ -1916,16 +1916,17 @@ impl Composer {
         .detach();
     }
 
-    /// Tiny has no GIF catalog. The button asks for a .gif and stages it like any other file.
+    /// When a network has no GIF catalog (`!can.gifs`), the button asks for a `.gif` file and stages it like any other attachment.
     fn attach_gif(&mut self, cx: &mut Context<Self>) {
-        if !self.controls().gif || self.target.as_ref().is_none_or(|target| target.key.network != Network::Tiny || target.locked().is_some()) {
+        let controls = self.controls();
+        if !controls.gif || controls.tabs.contains(&Tab::Gifs) || self.target.as_ref().is_none_or(|target| target.locked().is_some()) {
             return;
         }
         let Some(target) = self.target.clone() else {
             return;
         };
         let key = target.key.clone();
-        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Send a GIF".into()) });
+        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach a GIF file".into()) });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = asked.await {
                 let _ = this.update(cx, |this, cx| {
@@ -2975,13 +2976,13 @@ impl Composer {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_poll_composer(cx)))
         });
         let gif = controls.gif.then(|| {
-            let tiny = self.target.as_ref().is_some_and(|target| target.key.network == Network::Tiny);
-            let slot = if tiny { None } else { Some(Trigger::Gif) };
-            let button = self.card_button("gif", None, !tiny && open_tab == Some(Tab::Gifs), slot);
-            if tiny {
-                button.tooltip(tip("Send a GIF", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
-            } else {
+            let catalog = controls.tabs.contains(&Tab::Gifs);
+            let slot = if catalog { Some(Trigger::Gif) } else { None };
+            let button = self.card_button("gif", None, catalog && open_tab == Some(Tab::Gifs), slot);
+            if catalog {
                 button.tooltip(tip("GIFs", Some("⇧⌘G"))).on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Gifs, window, cx)))
+            } else {
+                button.tooltip(tip("Attach a GIF file", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
             }
         });
         let smile = controls.emoji.then(|| {
@@ -3682,10 +3683,10 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &crate::gui::AttachFile, _, cx| this.attach_files(cx)))
             .on_action(cx.listener(|this, _: &PickEmoji, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
             .on_action(cx.listener(|this, _: &PickGifs, window, cx| {
-                if this.target.as_ref().is_some_and(|target| target.key.network == Network::Tiny) {
-                    this.attach_gif(cx);
-                } else {
+                if this.controls().tabs.contains(&Tab::Gifs) {
                     this.toggle_picker(Tab::Gifs, window, cx);
+                } else {
+                    this.attach_gif(cx);
                 }
             }))
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {

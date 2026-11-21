@@ -428,6 +428,9 @@ pub struct Capabilities {
     /// The GIF button picks a `.gif` file through the attachment path when `max_file_bytes > 0` (Tiny).
     #[serde(default, skip_serializing_if = "is_false")]
     pub gif_file: bool,
+    /// This Tiny server supports setting presence state (online, idle, dnd, invisible) and status text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub presence_status: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stickers: bool,
     /// The network searches its own messages (`SearchNetwork`), which the search pane's Enter
