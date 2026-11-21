@@ -41,13 +41,23 @@ fn later() -> i64 {
 }
 
 fn code(via: CodeVia, next: Option<CodeVia>, resend_at: i64, problem: Option<SignInProblem>) -> SignInStep {
-    SignInStep::Code { via, length: 5, phone: PHONE.to_owned(), next, resend_at, problem }
+    SignInStep::Code {
+        via,
+        length: 5,
+        phone: PHONE.to_owned(),
+        email_pattern: String::new(),
+        reset_available_at: 0,
+        reset_pending_date: 0,
+        next,
+        resend_at,
+        problem,
+    }
 }
 
 pub(super) fn canned() -> Option<Canned> {
     let name = std::env::var("TINYCLIENT_SIGNIN_SHOT").ok().filter(|name| !name.is_empty())?;
     let qr = |link: &str, problem| SignInStep::Qr { link: link.to_owned(), expires: 0, problem };
-    let password = |problem| SignInStep::Password { hint: "the old street".to_owned(), problem };
+    let password = |problem| SignInStep::Password { hint: "the old street".to_owned(), has_recovery: true, problem };
     let sms = Some(CodeVia::Sms);
     let mut canned = Canned { network: Network::Telegram, face: Face::Step(qr("", None)), number: "", digits: "", password: "", local: None, invite: String::new() };
     let web = |network, started| Some(Canned { network, face: Face::Web { started }, number: "", digits: "", password: "", local: None, invite: String::new() });
@@ -92,11 +102,25 @@ pub(super) fn canned() -> Option<Canned> {
         "code-wrong" => code(CodeVia::App, sms, 0, Some(SignInProblem::CodeInvalid)),
         "code-expired" => code(CodeVia::App, sms, 0, Some(SignInProblem::CodeExpired)),
         "code-toomany" => code(CodeVia::App, sms, 0, Some(SignInProblem::TooMany { until: later() })),
+        "email-setup" => SignInStep::EmailSetup { phone: PHONE.to_owned(), problem: None },
+        "email-verify" => SignInStep::EmailVerify { email_pattern: "m***@example.com".to_owned(), length: 6, problem: None },
         "password" => {
             canned.password = "hunter2!";
             password(None)
         }
         "password-wrong" => password(Some(SignInProblem::PasswordInvalid)),
+        "password-recovery" => SignInStep::PasswordRecovery { email_pattern: "m***@example.com".to_owned(), problem: None },
+        "passkey" => SignInStep::Passkey {
+            options: String::new(),
+            problem: Some(SignInProblem::Other {
+                reason: "Passkey sign-in isn't available in tinyclient. A third-party app cannot use Telegram's passkey domain. Use a QR code or a phone number.".to_owned(),
+            }),
+        },
+        "signup" => SignInStep::SignUp {
+            phone: PHONE.to_owned(),
+            terms: "By signing up for Telegram, you agree not to send spam or scam users.".to_owned(),
+            problem: None,
+        },
         "tiny-invite" => {
             canned.network = Network::Tiny;
             canned.invite = protocol::pack_join(TINY, "Nf3kQ8xLw2pZ7rT1").unwrap_or_default();

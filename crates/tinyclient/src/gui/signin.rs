@@ -282,6 +282,22 @@ fn resend_words(next: Option<CodeVia>) -> Option<&'static str> {
 
 /// The number as chatd wants it: `+` and digits only. `None` when there are fewer than seven,
 /// which no country's numbers are.
+fn looks_like_email(email: &str) -> bool {
+    let Some((name, host)) = email.split_once('@') else {
+        return false;
+    };
+    !name.is_empty() && host.contains('.') && !email.contains(char::is_whitespace)
+}
+
+/// The first word is the given name. The rest, if any, is the family name.
+fn split_name(typed: &str) -> (String, String) {
+    let typed = typed.trim();
+    match typed.split_once(char::is_whitespace) {
+        Some((first, rest)) => (first.trim().to_owned(), rest.trim().to_owned()),
+        None => (typed.to_owned(), String::new()),
+    }
+}
+
 fn phone_number(country: &str, number: &str) -> Option<String> {
     let digits: String = country.chars().chain(number.chars()).filter(char::is_ascii_digit).collect();
     (digits.len() >= 7).then(|| format!("+{digits}"))
@@ -311,7 +327,12 @@ fn step_problem(step: &SignInStep) -> Option<&SignInProblem> {
         SignInStep::Qr { problem, .. }
         | SignInStep::Phone { problem }
         | SignInStep::Code { problem, .. }
+        | SignInStep::EmailSetup { problem, .. }
+        | SignInStep::EmailVerify { problem, .. }
         | SignInStep::Password { problem, .. }
+        | SignInStep::PasswordRecovery { problem, .. }
+        | SignInStep::Passkey { problem, .. }
+        | SignInStep::SignUp { problem, .. }
         | SignInStep::Server { problem }
         | SignInStep::Invite { problem, .. }
         | SignInStep::Browser { problem, .. } => problem.as_ref(),
@@ -380,7 +401,7 @@ impl Sheet {
         })
         .detach();
         cx.subscribe(&url, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Submit => this.send_url(cx),
+            InputEvent::Submit => this.send_free_text(cx),
             InputEvent::Changed => {
                 this.dismiss();
                 cx.notify();
@@ -560,6 +581,8 @@ impl Sheet {
             SignInStep::Phone { problem }
             | SignInStep::Server { problem }
             | SignInStep::Invite { problem, .. }
+            | SignInStep::EmailSetup { problem, .. }
+            | SignInStep::SignUp { problem, .. }
             | SignInStep::Password { problem, .. } => *problem = None,
             _ => {}
         }
@@ -754,6 +777,15 @@ impl Sheet {
             }
             _ => None,
         };
+        match &step {
+            SignInStep::EmailSetup { .. } => self.url.update(cx, |input, _| input.set_placeholder("name@example.com")),
+            SignInStep::SignUp { .. } => self.url.update(cx, |input, _| input.set_placeholder("First and last name")),
+            SignInStep::Server { .. } => self.url.update(cx, |input, _| input.set_placeholder("tiny.example.com")),
+            _ => {}
+        }
+        if moved && matches!(step, SignInStep::EmailSetup { .. } | SignInStep::SignUp { .. }) {
+            self.url.update(cx, |input, cx| input.set_text("", cx));
+        }
         self.face = Some(Face::Step(step));
         cx.notify();
     }
@@ -797,10 +829,14 @@ impl Sheet {
 
     /// The field behind the boxes changed. It keeps digits only; the last one sends the code.
     fn code_typed(&mut self, cx: &mut Context<Sheet>) {
-        let Some(Face::Step(SignInStep::Code { length, .. })) = &self.face else {
-            return;
+        // 0 phone code, 1 login-email code, 2 password-recovery code. Recovery codes are six digits.
+        let (length, which) = match &self.face {
+            Some(Face::Step(SignInStep::Code { length, .. })) => (*length, 0),
+            Some(Face::Step(SignInStep::EmailVerify { length, .. })) => (*length, 1),
+            Some(Face::Step(SignInStep::PasswordRecovery { .. })) => (6, 2),
+            _ => return,
         };
-        let length = usize::from(*length).max(1);
+        let length = usize::from(length).max(1);
         let typed = self.digits.read(cx).text().to_owned();
         let code = code_digits(&typed, length);
         if self.busy {
@@ -808,7 +844,12 @@ impl Sheet {
             self.digits.update(cx, |input, cx| input.set_text("", cx));
         } else if code.len() == length {
             self.digits.update(cx, |input, cx| input.set_text("", cx));
-            self.answer(SignInInput::Code { code }, cx);
+            let input = match which {
+                1 => SignInInput::EmailCode { code },
+                2 => SignInInput::RecoveryCode { code },
+                _ => SignInInput::Code { code },
+            };
+            self.answer(input, cx);
         } else if code != typed {
             self.digits.update(cx, |input, cx| input.set_text(&code, cx));
         }
@@ -826,6 +867,43 @@ impl Sheet {
         // Left in the field. A miss would make a long password be typed again.
         self.dismiss();
         self.answer(SignInInput::Password { password }, cx);
+    }
+
+    /// The free-text field: a Tiny server address, a login email, or a new account's name.
+    fn send_free_text(&mut self, cx: &mut Context<Sheet>) {
+        match &self.face {
+            Some(Face::Step(SignInStep::EmailSetup { .. })) => self.send_email(cx),
+            Some(Face::Step(SignInStep::SignUp { .. })) => self.send_name(cx),
+            _ => self.send_url(cx),
+        }
+    }
+
+    fn send_email(&mut self, cx: &mut Context<Sheet>) {
+        if self.busy {
+            return;
+        }
+        let email = self.url.read(cx).text().trim().to_owned();
+        if !looks_like_email(&email) {
+            self.local = Some(SignInProblem::Other { reason: "That doesn't look like an email address.".to_owned() });
+            cx.notify();
+            return;
+        }
+        self.dismiss();
+        self.answer(SignInInput::Email { email }, cx);
+    }
+
+    fn send_name(&mut self, cx: &mut Context<Sheet>) {
+        if self.busy {
+            return;
+        }
+        let (first_name, last_name) = split_name(&self.url.read(cx).text());
+        if first_name.is_empty() {
+            self.local = Some(SignInProblem::Other { reason: "Enter a valid first name.".to_owned() });
+            cx.notify();
+            return;
+        }
+        self.dismiss();
+        self.answer(SignInInput::SignUp { first_name, last_name }, cx);
     }
 
     fn send_url(&mut self, cx: &mut Context<Sheet>) {
@@ -892,8 +970,9 @@ impl Sheet {
     fn target(&self, cx: &App) -> FocusHandle {
         match &self.face {
             Some(Face::Step(SignInStep::Phone { .. })) => self.number.focus_handle(cx),
-            Some(Face::Step(SignInStep::Code { .. })) => self.digits.focus_handle(cx),
+            Some(Face::Step(SignInStep::Code { .. } | SignInStep::EmailVerify { .. } | SignInStep::PasswordRecovery { .. })) => self.digits.focus_handle(cx),
             Some(Face::Step(SignInStep::Password { .. })) => self.password.focus_handle(cx),
+            Some(Face::Step(SignInStep::EmailSetup { .. } | SignInStep::SignUp { .. })) => self.url.focus_handle(cx),
             Some(Face::Step(SignInStep::Server { .. })) => self.url.focus_handle(cx),
             Some(Face::Step(SignInStep::Invite { .. })) => self.invite.focus_handle(cx),
             _ => self.focus.clone(),
@@ -1029,13 +1108,17 @@ impl Sheet {
         via: CodeVia,
         length: u8,
         phone: &str,
+        email_pattern: &str,
         next: Option<CodeVia>,
         resend_at: i64,
         problem: Option<&SignInProblem>,
         window: &mut Window,
         cx: &Context<Sheet>,
     ) -> Div {
-        let sent = sent_words(via, length, phone);
+        let mut sent = sent_words(via, length, phone);
+        if via == CodeVia::Email && !email_pattern.is_empty() {
+            sent = format!("Telegram sent a {length}-digit code to {email_pattern}.");
+        }
         let length = usize::from(length).max(1);
         let handle = self.digits.focus_handle(cx);
         let focused = handle.is_focused(window);
@@ -1119,7 +1202,7 @@ impl Sheet {
             .child(footer(26.).child(resend).child(self.cancel("Cancel", cx)))
     }
 
-    fn password_step(&self, hint: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+    fn password_step(&self, hint: &str, has_recovery: bool, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
         let handle = self.password.focus_handle(cx);
         let focused = handle.is_focused(window);
         let count = self.password.read(cx).text().chars().count();
@@ -1155,8 +1238,12 @@ impl Sheet {
             )
             .child(hidden(&self.password, 12., 10., 64.))
             .child(bullets);
-        // Words in a link's color, not a link: the reset happens in Telegram's own app.
-        let aside = div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.");
+        // Without a recovery email the reset happens in Telegram's own app, so the words are not a link.
+        let aside = if has_recovery {
+            self.answer_link("signin-recover", "Email me a recovery code", || SignInInput::RecoverPassword, cx).into_any_element()
+        } else {
+            div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.").into_any_element()
+        };
         div()
             .flex()
             .flex_col()
@@ -1166,6 +1253,142 @@ impl Sheet {
             // `text_faint` does not sit on `overlay` (`01-system.md`, rule 7): one level up.
             .children((!hint.is_empty()).then(|| div().mt(px(6.)).type_small().text_color(theme::text_soft()).child(format!("Hint from Telegram: {hint}"))))
             .child(footer(22.).child(aside).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_password, cx))))
+    }
+
+    fn email_setup_step(&self, phone: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+        let focused = self.url.focus_handle(cx).is_focused(window);
+        let input = tall_field(focused, problem.is_some()).child(self.url.clone());
+        let sentence = if phone.is_empty() {
+            "Telegram needs an email address before it sends a sign-in code.".to_owned()
+        } else {
+            format!("Telegram needs an email address before it sends a sign-in code for {phone}.")
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header("Login email", true, cx))
+            .child(div().mt(px(6.)).mb(px(16.)).whitespace_normal().text_color(theme::text_soft()).child(sentence))
+            .child(input)
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
+            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Send code", Sheet::send_email, cx))))
+    }
+
+    fn email_verify_step(&self, pattern: &str, length: u8, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+        let where_to = if pattern.is_empty() { "your email".to_owned() } else { pattern.to_owned() };
+        self.digit_step(
+            "Check your email",
+            &format!("Telegram sent a {length}-digit code to {where_to}."),
+            length,
+            problem,
+            window,
+            cx,
+        )
+    }
+
+    fn recovery_step(&self, pattern: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+        let where_to = if pattern.is_empty() { "your recovery email".to_owned() } else { pattern.to_owned() };
+        self.digit_step("Recovery code", &format!("Telegram sent a 6-digit code to {where_to}."), 6, problem, window, cx)
+    }
+
+    /// The same boxes as a phone code, with a sentence of our own. The last digit sends it.
+    fn digit_step(&self, title: &str, sentence: &str, length: u8, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+        let length = usize::from(length).max(1);
+        let handle = self.digits.focus_handle(cx);
+        let focused = handle.is_focused(window);
+        let typed: Vec<char> = self.digits.read(cx).text().chars().collect();
+        let bad = problem.is_some();
+        let surface = theme::over(theme::field(), theme::overlay());
+        let boxes = (0..length).map(|at| {
+            let caret = focused && !self.busy && at == typed.len().min(length - 1);
+            let edge = if caret {
+                theme::focus()
+            } else if bad {
+                theme::danger()
+            } else {
+                theme::border()
+            };
+            div()
+                .flex_none()
+                .w(px(BOX.0))
+                .h(px(BOX.1))
+                .rounded(px(theme::R_CONTROL))
+                .bg(surface)
+                .border_1()
+                .border_color(edge)
+                .when(caret, |cell| cell.shadow(theme::field_halo()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(24.))
+                .line_height(px(30.))
+                .font_weight(theme::SEMIBOLD)
+                .children(typed.get(at).map(|digit| digit.to_string()))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header(title.to_owned(), true, cx))
+            .child(div().mt(px(6.)).mb(px(22.)).whitespace_normal().text_color(theme::text_soft()).child(sentence.to_owned()))
+            .child(
+                div().flex().justify_center().child(
+                    div()
+                        .relative()
+                        .flex()
+                        .gap(px(8.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |_, _, window, cx| {
+                            window.focus(&handle, cx);
+                            window.prevent_default();
+                        }))
+                        .child(hidden(&self.digits, 4., 18., 40.))
+                        .children(boxes),
+                ),
+            )
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(12.)).text_center()))
+            .child(footer(26.).child(div()).child(self.cancel("Cancel", cx)))
+    }
+
+    fn signup_step(&self, phone: &str, terms: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+        let focused = self.url.focus_handle(cx).is_focused(window);
+        let input = tall_field(focused, problem.is_some()).child(self.url.clone());
+        let sentence = if phone.is_empty() {
+            "This number is new to Telegram. What should people call you?".to_owned()
+        } else {
+            format!("This number, {phone}, is new to Telegram. What should people call you?")
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header("Create an account", true, cx))
+            .child(div().mt(px(6.)).mb(px(16.)).whitespace_normal().text_color(theme::text_soft()).child(sentence))
+            .child(input)
+            .children((!terms.is_empty()).then(|| div().mt(px(8.)).type_small().whitespace_normal().text_color(theme::text_soft()).child(terms.to_owned())))
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
+            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Create account", Sheet::send_name, cx))))
+    }
+
+    fn passkey_step(&self, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header("Passkey", true, cx))
+            .child(
+                div()
+                    .mt(px(6.))
+                    .mb(px(16.))
+                    .whitespace_normal()
+                    .text_color(theme::text_soft())
+                    .child("Passkey sign-in isn't available in tinyclient. A third-party app cannot use Telegram's passkey domain."),
+            )
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
+            .child(
+                footer(22.)
+                    .child(self.answer_link("signin-use-phone", "Use a phone number", || SignInInput::UsePhone, cx))
+                    .child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Scan a code", Sheet::use_qr, cx))),
+            )
+    }
+
+    fn use_qr(&mut self, cx: &mut Context<Sheet>) {
+        self.answer(SignInInput::UseQr, cx);
     }
 
     fn server_step(&self, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
@@ -1558,10 +1781,15 @@ impl Render for Sheet {
                 match step {
                     SignInStep::Qr { .. } => self.qr_step(problem, cx),
                     SignInStep::Phone { .. } => self.phone_step(problem, window, cx),
-                    SignInStep::Code { via, length, phone, next, resend_at, .. } => {
-                        self.code_step(*via, *length, phone, *next, *resend_at, problem, window, cx)
+                    SignInStep::Code { via, length, phone, email_pattern, next, resend_at, .. } => {
+                        self.code_step(*via, *length, phone, email_pattern, *next, *resend_at, problem, window, cx)
                     }
-                    SignInStep::Password { hint, .. } => self.password_step(hint, problem, window, cx),
+                    SignInStep::EmailSetup { phone, .. } => self.email_setup_step(phone, problem, window, cx),
+                    SignInStep::EmailVerify { email_pattern, length, .. } => self.email_verify_step(email_pattern, *length, problem, window, cx),
+                    SignInStep::Password { hint, has_recovery, .. } => self.password_step(hint, *has_recovery, problem, window, cx),
+                    SignInStep::PasswordRecovery { email_pattern, .. } => self.recovery_step(email_pattern, problem, window, cx),
+                    SignInStep::Passkey { .. } => self.passkey_step(problem, cx),
+                    SignInStep::SignUp { phone, terms, .. } => self.signup_step(phone, terms, problem, window, cx),
                     SignInStep::Server { .. } => self.server_step(problem, window, cx),
                     SignInStep::Invite { server, .. } => self.invite_step(server, problem, window, cx),
                     SignInStep::Browser { server, provider, waiting, .. } => self.browser_step(server, provider, *waiting, problem, cx),
@@ -1624,6 +1852,11 @@ mod tests {
         assert_eq!(phone_number("+1", "call me"), None);
         assert_eq!(phone_shown("+1", " 555 010 0142 "), "+1 555 010 0142");
         assert_eq!(phone_shown("", "+49 30 901820"), "+49 30 901820");
+        assert!(looks_like_email("mira@example.com"));
+        assert!(!looks_like_email("not-an-email") && !looks_like_email("a@b") && !looks_like_email("mira @example.com"));
+        assert_eq!(split_name("  Ada Lovelace  "), ("Ada".to_owned(), "Lovelace".to_owned()));
+        assert_eq!(split_name("Ada"), ("Ada".to_owned(), String::new()));
+        assert_eq!(split_name("   "), (String::new(), String::new()));
     }
 
     #[test]
@@ -1700,7 +1933,17 @@ mod tests {
     #[test]
     fn a_step_knows_its_problem() {
         let problem = Some(SignInProblem::CodeInvalid);
-        let code = SignInStep::Code { via: CodeVia::App, length: 5, phone: String::new(), next: None, resend_at: 0, problem: problem.clone() };
+        let code = SignInStep::Code {
+            via: CodeVia::App,
+            length: 5,
+            phone: String::new(),
+            email_pattern: String::new(),
+            reset_available_at: 0,
+            reset_pending_date: 0,
+            next: None,
+            resend_at: 0,
+            problem: problem.clone(),
+        };
         assert_eq!(step_problem(&code), problem.as_ref());
         assert_eq!(step_problem(&waiting()), None);
         assert_eq!(step_problem(&SignInStep::Failed { reason: "no".into() }), None);

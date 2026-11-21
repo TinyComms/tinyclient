@@ -91,6 +91,15 @@ fn unhex(text: &str) -> Vec<u8> {
     (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap_or(0)).collect()
 }
 
+/// `m***@example.com`. The local part's first letter only; the rest stays hidden.
+fn mask_email(email: &str) -> String {
+    let Some((name, host)) = email.split_once('@') else {
+        return "email".to_owned();
+    };
+    let first = name.chars().next().unwrap_or('*');
+    format!("{first}***@{host}")
+}
+
 /// One field of a value, written out.
 type Field<'a> = &'a dyn Fn(&mut Vec<u8>);
 
@@ -568,6 +577,12 @@ struct World {
     default_reaction: String,
     /// Paid reaction count accumulated per `(peer, msg_id)` in this session.
     paid_counts: HashMap<(Who, i32), i32>,
+    /// Whether `account.getPassword` reports a recovery email (`has_recovery`).
+    has_recovery: bool,
+    /// Login email set during `SetUpEmailRequired` flow.
+    pending_login_email: Option<String>,
+    /// Whether the phone code flow is testing `authorizationSignUpRequired`.
+    signup_required: bool,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -640,6 +655,9 @@ impl World {
             stars_balance: 250,
             default_reaction: "❤".to_owned(),
             paid_counts: HashMap::new(),
+            has_recovery: false,
+            pending_login_email: None,
+            signup_required: false,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -801,6 +819,17 @@ impl World {
         person
     }
 
+    fn signup_required_auth(&self) -> tl::enums::auth::Authorization {
+        let terms = tl::types::help::TermsOfService {
+            popup: false,
+            id: tl::types::DataJson { data: "{}".to_owned() }.into(),
+            text: "By signing up for Telegram, you agree not to send spam or scam users.".to_owned(),
+            entities: Vec::new(),
+            min_age_confirm: None,
+        };
+        tl::types::auth::AuthorizationSignUpRequired { terms_of_service: Some(terms.into()) }.into()
+    }
+
     fn me(&self) -> tl::enums::auth::Authorization {
         tl::types::auth::Authorization {
             setup_password_required: false,
@@ -820,7 +849,7 @@ impl World {
             p: unhex(PRIME),
         };
         tl::types::account::Password {
-            has_recovery: false,
+            has_recovery: self.has_recovery,
             has_secure_values: false,
             has_password: true,
             current_algo: Some(algo.clone().into()),
@@ -2082,8 +2111,21 @@ impl World {
                 })
             };
             return match request.phone_number.as_str() {
-                "+15550100142" | "+15550100199" => {
+                "+15550100177" => {
                     self.phone = Some(request.phone_number);
+                    self.has_recovery = false;
+                    self.signup_required = false;
+                    answer(tl::enums::auth::SentCode::Code(tl::types::auth::SentCode {
+                        r#type: tl::types::auth::SentCodeTypeSetUpEmailRequired { apple_signin_allowed: false, google_signin_allowed: false }.into(),
+                        phone_code_hash: "hash-mail".to_owned(),
+                        next_type: None,
+                        timeout: None,
+                    }))
+                }
+                "+15550100142" | "+15550100199" | "+15550100166" | "+15550100188" => {
+                    self.phone = Some(request.phone_number.clone());
+                    self.has_recovery = request.phone_number == "+15550100166";
+                    self.signup_required = request.phone_number == "+15550100188";
                     answer(sms(Some(60)))
                 }
                 "+15550100666" => Err(rpc(400, "PHONE_NUMBER_BANNED", None)),
@@ -2104,10 +2146,11 @@ impl World {
             // What was typed is not written to the log, here as anywhere.
             self.log("SignIn");
             return match (request.phone_code.as_deref(), self.phone.as_deref()) {
-                (Some(CODE), Some("+15550100199")) => {
+                (Some(CODE), Some("+15550100199" | "+15550100166")) => {
                     self.password_owed = true;
                     Err(rpc(401, "SESSION_PASSWORD_NEEDED", None))
                 }
+                (Some(CODE), Some("+15550100188")) if self.signup_required => answer(self.signup_required_auth()),
                 (Some(CODE), Some(_)) => {
                     self.signed_in = true;
                     answer(self.me())
@@ -2115,6 +2158,60 @@ impl World {
                 (Some("00000"), _) => Err(rpc(400, "PHONE_CODE_EXPIRED", None)),
                 _ => Err(rpc(400, "PHONE_CODE_INVALID", None)),
             };
+        }
+        if let Some(request) = asked::<f::account::SendVerifyEmailCode>(body) {
+            self.log("SendVerifyEmailCode");
+            if !request.email.contains('@') || request.email.contains(char::is_whitespace) {
+                return Err(rpc(400, "EMAIL_INVALID", None));
+            }
+            self.pending_login_email = Some(request.email.clone());
+            let pattern = mask_email(&request.email);
+            return answer(tl::enums::account::SentEmailCode::Code(tl::types::account::SentEmailCode { email_pattern: pattern, length: 6 }));
+        }
+        if let Some(request) = asked::<f::account::VerifyEmail>(body) {
+            self.log("VerifyEmail");
+            let tl::enums::EmailVerification::Code(proof) = request.verification else {
+                return Err(rpc(400, "CODE_INVALID", None));
+            };
+            if proof.code != "654321" {
+                return Err(rpc(400, "CODE_INVALID", None));
+            }
+            let email = self.pending_login_email.clone().unwrap_or_default();
+            return answer(tl::enums::account::EmailVerified::Login(tl::types::account::EmailVerifiedLogin {
+                email,
+                sent_code: tl::types::auth::SentCode {
+                    r#type: tl::types::auth::SentCodeTypeApp { length: 5 }.into(),
+                    phone_code_hash: "hash-1".to_owned(),
+                    next_type: Some(tl::enums::auth::CodeType::Sms),
+                    timeout: Some(60),
+                }
+                .into(),
+            }));
+        }
+        if let Some(request) = asked::<f::auth::SignUp>(body) {
+            self.log("SignUp");
+            if request.first_name.trim().is_empty() {
+                return Err(rpc(400, "FIRSTNAME_INVALID", None));
+            }
+            self.signed_in = true;
+            self.signup_required = false;
+            return answer(self.me());
+        }
+        if asked::<f::auth::RequestPasswordRecovery>(body).is_some() {
+            self.log("RequestPasswordRecovery");
+            if !self.has_recovery {
+                return Err(rpc(400, "PASSWORD_RECOVERY_NA", None));
+            }
+            return answer(tl::enums::auth::PasswordRecovery::Recovery(tl::types::auth::PasswordRecovery { email_pattern: "m***@example.com".to_owned() }));
+        }
+        if let Some(request) = asked::<f::auth::RecoverPassword>(body) {
+            self.log("RecoverPassword");
+            if request.code != "135790" {
+                return Err(rpc(400, "CODE_INVALID", None));
+            }
+            self.signed_in = true;
+            self.password_owed = false;
+            return answer(self.me());
         }
         if asked::<f::account::GetPassword>(body).is_some() {
             self.log("GetPassword");

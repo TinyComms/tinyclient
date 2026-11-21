@@ -2625,12 +2625,12 @@ fn a_scanned_code_on_an_account_with_a_second_password_asks_for_it() {
     let (_, seq) = world.status();
     world.steer_sign_in("scan-password");
     let hint = world.changed(seq, "the password step", |change| match change {
-        Change::SignIn { step: SignInStep::Password { hint, problem: None }, .. } => Some(hint.clone()),
+        Change::SignIn { step: SignInStep::Password { hint, problem: None, .. }, .. } => Some(hint.clone()),
         _ => None,
     });
     assert_eq!(hint, "the old street");
     let wrong = world.sign_in(Some(SignInInput::Password { password: "hunter2".into() }));
-    assert_eq!(wrong, SignInStep::Password { hint: "the old street".into(), problem: Some(SignInProblem::PasswordInvalid) });
+    assert_eq!(wrong, SignInStep::Password { hint: "the old street".into(), has_recovery: false, problem: Some(SignInProblem::PasswordInvalid) });
     let done = world.sign_in(Some(SignInInput::Password { password: "correct horse".into() }));
     assert_eq!(done, SignInStep::Done { account: Some(account()) });
     world.connected();
@@ -2654,7 +2654,7 @@ fn a_phone_number_a_code_and_a_password_sign_in_and_each_mistake_says_what_it_wa
     assert!(until > 0);
 
     let sent = world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0199".into() }));
-    let SignInStep::Code { via: CodeVia::App, length: 5, phone, next: Some(CodeVia::Sms), resend_at, problem: None } = sent else {
+    let SignInStep::Code { via: CodeVia::App, length: 5, phone, next: Some(CodeVia::Sms), resend_at, problem: None, .. } = sent else {
         panic!("{sent:?}");
     };
     assert_eq!(phone, "+1 555 010 0199");
@@ -2672,7 +2672,7 @@ fn a_phone_number_a_code_and_a_password_sign_in_and_each_mistake_says_what_it_wa
     assert!(matches!(world.sign_in(None), SignInStep::Code { .. }));
 
     let password = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
-    assert_eq!(password, SignInStep::Password { hint: "the old street".into(), problem: None });
+    assert_eq!(password, SignInStep::Password { hint: "the old street".into(), has_recovery: false, problem: None });
     assert_eq!(world.sign_in(Some(SignInInput::Password { password: "correct horse".into() })), SignInStep::Done { account: Some(account()) });
     world.connected();
     let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
@@ -2716,6 +2716,73 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
 }
 
 #[test]
+fn a_login_email_a_new_account_and_a_recovery_code_sign_in_and_a_passkey_is_refused() {
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    assert_eq!(world.sign_in(Some(SignInInput::UsePhone)), SignInStep::Phone { problem: None });
+    let setup = world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0177".into() }));
+    assert!(matches!(setup, SignInStep::EmailSetup { ref phone, problem: None } if phone == "+1 555 010 0177"), "{setup:?}");
+    let bad = world.sign_in(Some(SignInInput::Email { email: "not-an-email".into() }));
+    assert!(matches!(bad, SignInStep::EmailSetup { problem: Some(SignInProblem::Other { .. }), .. }), "{bad:?}");
+    let verify = world.sign_in(Some(SignInInput::Email { email: "mira@example.com".into() }));
+    assert!(
+        matches!(verify, SignInStep::EmailVerify { ref email_pattern, length: 6, problem: None } if email_pattern == "m***@example.com"),
+        "{verify:?}"
+    );
+    let sent = world.sign_in(Some(SignInInput::EmailCode { code: "654321".into() }));
+    assert!(matches!(sent, SignInStep::Code { via: CodeVia::App, length: 5, .. }), "{sent:?}");
+    assert_eq!(world.sign_in(Some(SignInInput::Code { code: "24680".into() })), SignInStep::Done { account: Some(account()) });
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("mira@example.com") && !said.contains("654321"), "{said}");
+
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    world.sign_in(Some(SignInInput::UsePhone));
+    world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0188".into() }));
+    let signup = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
+    assert!(matches!(signup, SignInStep::SignUp { ref terms, problem: None } if terms.contains("spam")), "{signup:?}");
+    let nameless = world.sign_in(Some(SignInInput::SignUp { first_name: "  ".into(), last_name: String::new() }));
+    assert!(matches!(nameless, SignInStep::SignUp { problem: Some(_), .. }), "{nameless:?}");
+    assert_eq!(
+        world.sign_in(Some(SignInInput::SignUp { first_name: "Ada".into(), last_name: "Lovelace".into() })),
+        SignInStep::Done { account: Some(account()) }
+    );
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("Lovelace") && !said.contains("Ada"), "{said}");
+
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    world.sign_in(Some(SignInInput::UsePhone));
+    world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0166".into() }));
+    let password = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
+    assert!(matches!(password, SignInStep::Password { has_recovery: true, problem: None, .. }), "{password:?}");
+    let recovery = world.sign_in(Some(SignInInput::RecoverPassword));
+    assert!(matches!(recovery, SignInStep::PasswordRecovery { ref email_pattern, problem: None } if email_pattern == "m***@example.com"), "{recovery:?}");
+    let wrong = world.sign_in(Some(SignInInput::RecoveryCode { code: "000000".into() }));
+    assert!(matches!(wrong, SignInStep::PasswordRecovery { problem: Some(SignInProblem::CodeInvalid), .. }), "{wrong:?}");
+    assert_eq!(world.sign_in(Some(SignInInput::RecoveryCode { code: "135790".into() })), SignInStep::Done { account: Some(account()) });
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("135790"), "{said}");
+
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    let refused = world.sign_in(Some(SignInInput::UsePasskey));
+    assert!(matches!(refused, SignInStep::Passkey { ref options, problem: Some(SignInProblem::Other { ref reason }) } if options.is_empty() && reason.contains("passkey domain")), "{refused:?}");
+    let again = world.sign_in(Some(SignInInput::Passkey {
+        id: "cred".into(),
+        raw_id: "raw".into(),
+        client_data: "secret-client-data".into(),
+        authenticator_data: vec![1],
+        signature: vec![2],
+        user_handle: "handle".into(),
+    }));
+    assert!(matches!(again, SignInStep::Passkey { problem: Some(_), .. }), "{again:?}");
+    assert_eq!(world.called("InitPasskeyLogin"), 0);
+    assert_eq!(world.called("FinishPasskeyLogin"), 0);
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("secret-client-data"), "{said}");
+}
+
 fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
     let world = World::signed_in();
     world.connected();

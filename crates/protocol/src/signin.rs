@@ -29,7 +29,7 @@ pub enum SignInProblem {
     /// The network could not be reached.
     Unreachable,
     PhoneInvalid,
-    /// No account uses this number, and tinyclient does not create accounts.
+    /// No account uses this number, and Telegram did not offer to create one.
     PhoneUnknown,
     PhoneBanned,
     CodeInvalid,
@@ -43,6 +43,14 @@ pub enum SignInProblem {
     TooMany { until: i64 },
     /// Anything else, in words the user can read.
     Other { reason: String },
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Where a sign-in stands: what the shell draws now.
@@ -70,6 +78,15 @@ pub enum SignInStep {
         length: u8,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         phone: String,
+        /// Masked email address when `via` is `CodeVia::Email` (`m***@example.com`).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        email_pattern: String,
+        /// Unix seconds when an email login reset becomes available, if Telegram gave one.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        reset_available_at: i64,
+        /// Unix seconds when a pending email login reset completes, if one is in flight.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        reset_pending_date: i64,
         /// How `Resend` would send it, when the network offers another way.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next: Option<CodeVia>,
@@ -79,10 +96,52 @@ pub enum SignInStep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
+    /// Telegram requires a login email before sending a sign-in code.
+    EmailSetup {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        phone: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<SignInProblem>,
+    },
+    /// Verify the login email with the code Telegram just sent to `email_pattern`.
+    EmailVerify {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        email_pattern: String,
+        #[serde(default)]
+        length: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<SignInProblem>,
+    },
     /// The account has a second password. `hint` is the user's own, as the network keeps it.
     Password {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         hint: String,
+        /// True when a recovery email is set on the account (`auth.requestPasswordRecovery`).
+        #[serde(default, skip_serializing_if = "is_false")]
+        has_recovery: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<SignInProblem>,
+    },
+    /// Recover a forgotten two-step verification password using the code sent to `email_pattern`.
+    PasswordRecovery {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        email_pattern: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<SignInProblem>,
+    },
+    /// Sign in with a passkey. `options` is the WebAuthn request options JSON from Telegram.
+    Passkey {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        options: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<SignInProblem>,
+    },
+    /// Telegram says this phone number has no account yet and may be registered with a name.
+    SignUp {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        phone: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        terms: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
@@ -128,9 +187,34 @@ pub enum SignInInput {
     UseQr,
     /// Type a number instead of scanning.
     UsePhone,
+    /// Start passkey sign-in (`auth.initPasskeyLogin`).
+    UsePasskey,
     Phone { number: String },
     Code { code: String },
+    /// Submit an email address for login email setup (`account.sendVerifyEmailCode`).
+    Email { email: String },
+    /// Submit the verification code emailed to the login email (`account.verifyEmail`).
+    EmailCode { code: String },
     Password { password: String },
+    /// Ask Telegram to email a password recovery code (`auth.requestPasswordRecovery`).
+    RecoverPassword,
+    /// Submit the emailed password recovery code (`auth.recoverPassword`).
+    RecoveryCode { code: String },
+    /// Finish passkey sign-in with a WebAuthn assertion (`auth.finishPasskeyLogin`).
+    Passkey {
+        id: String,
+        raw_id: String,
+        client_data: String,
+        authenticator_data: Vec<u8>,
+        signature: Vec<u8>,
+        user_handle: String,
+    },
+    /// Create a new Telegram account after `authorizationSignUpRequired` (`auth.signUp`).
+    SignUp {
+        first_name: String,
+        #[serde(default)]
+        last_name: String,
+    },
     /// A Tiny server's address, as typed.
     Server { url: String },
     /// A Tiny server's address, to join it with a code.
@@ -151,9 +235,16 @@ impl fmt::Debug for SignInInput {
         f.write_str(match self {
             SignInInput::UseQr => "UseQr",
             SignInInput::UsePhone => "UsePhone",
+            SignInInput::UsePasskey => "UsePasskey",
             SignInInput::Phone { .. } => "Phone { .. }",
             SignInInput::Code { .. } => "Code { .. }",
+            SignInInput::Email { .. } => "Email { .. }",
+            SignInInput::EmailCode { .. } => "EmailCode { .. }",
             SignInInput::Password { .. } => "Password { .. }",
+            SignInInput::RecoverPassword => "RecoverPassword",
+            SignInInput::RecoveryCode { .. } => "RecoveryCode { .. }",
+            SignInInput::Passkey { .. } => "Passkey { .. }",
+            SignInInput::SignUp { .. } => "SignUp { .. }",
             SignInInput::Server { .. } => "Server { .. }",
             SignInInput::HaveCode { .. } => "HaveCode { .. }",
             SignInInput::Invite { .. } => "Invite { .. }",
@@ -180,6 +271,18 @@ mod tests {
         let typed = SignInInput::Password { password: "hunter2".into() };
         assert!(!format!("{typed:?}").contains("hunter2"));
         assert!(!format!("{:?}", SignInInput::Code { code: "12345".into() }).contains("12345"));
+        assert!(!format!("{:?}", SignInInput::Email { email: "secret@example.com".into() }).contains("secret"));
+        assert!(!format!("{:?}", SignInInput::EmailCode { code: "654321".into() }).contains("654321"));
+        assert!(!format!("{:?}", SignInInput::RecoveryCode { code: "999888".into() }).contains("999888"));
+        assert!(!format!("{:?}", SignInInput::SignUp { first_name: "Mira".into(), last_name: "Kessler".into() }).contains("Mira"));
+        assert!(!format!("{:?}", SignInInput::Passkey {
+            id: "cred-1".into(),
+            raw_id: "raw-1".into(),
+            client_data: "{\"challenge\":\"secret\"}".into(),
+            authenticator_data: vec![1, 2],
+            signature: vec![3, 4],
+            user_handle: "u1".into(),
+        }).contains("secret"));
         let url = SignInInput::Server { url: "http://127.0.0.1:8080".into() };
         assert_eq!(format!("{url:?}"), "Server { .. }");
         assert!(!format!("{url:?}").contains("127.0.0.1"));
@@ -200,7 +303,37 @@ mod tests {
             serde_json::from_str::<SignInStep>(r#"{"step":"qr"}"#).unwrap(),
             SignInStep::Qr { link: String::new(), expires: 0, problem: None }
         );
-        let code = SignInStep::Code { via: CodeVia::App, length: 5, phone: String::new(), next: None, resend_at: 0, problem: None };
+        let code = SignInStep::Code {
+            via: CodeVia::App,
+            length: 5,
+            phone: String::new(),
+            email_pattern: String::new(),
+            reset_available_at: 0,
+            reset_pending_date: 0,
+            next: None,
+            resend_at: 0,
+            problem: None,
+        };
         assert_eq!(serde_json::to_string(&code).unwrap(), r#"{"step":"code","via":"app","length":5,"resend_at":0}"#);
+        assert_eq!(
+            serde_json::from_str::<SignInStep>(r#"{"step":"password","hint":"old"}"#).unwrap(),
+            SignInStep::Password { hint: "old".into(), has_recovery: false, problem: None }
+        );
+        assert_eq!(
+            serde_json::from_str::<SignInStep>(r#"{"step":"email_setup"}"#).unwrap(),
+            SignInStep::EmailSetup { phone: String::new(), problem: None }
+        );
+        assert_eq!(
+            serde_json::from_str::<SignInStep>(r#"{"step":"password_recovery","email_pattern":"m***@example.com"}"#).unwrap(),
+            SignInStep::PasswordRecovery { email_pattern: "m***@example.com".into(), problem: None }
+        );
+        assert_eq!(
+            serde_json::from_str::<SignInStep>(r#"{"step":"passkey"}"#).unwrap(),
+            SignInStep::Passkey { options: String::new(), problem: None }
+        );
+        assert_eq!(
+            serde_json::from_str::<SignInStep>(r#"{"step":"sign_up"}"#).unwrap(),
+            SignInStep::SignUp { phone: String::new(), terms: String::new(), problem: None }
+        );
     }
 }
