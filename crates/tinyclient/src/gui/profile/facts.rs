@@ -662,7 +662,9 @@ pub fn can_pin_on_network(conversation: &Conversation, can: &protocol::Capabilit
 
 /// A conversation whose account lets the user archive/unarchive it on the network (`Request::File`).
 pub fn can_archive(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
-    can.archive && conversation.space.is_none()
+    can.archive
+        && (conversation.space.is_none()
+            || (conversation.key.network == Network::Slack && conversation.kind == ConversationKind::Channel))
 }
 
 /// A conversation whose account lets the user add/remove it from network folders (`Request::File`).
@@ -710,14 +712,14 @@ pub fn remove_member_confirm_text(person_name: &str, group_title: &str) -> Strin
     format!("Remove {person_name} from {group_title}? Others in the conversation may see this.")
 }
 
-/// A group DM, Signal group, or Telegram group or channel: the user can leave it from the pane.
+/// A group DM, Signal group, Telegram group or channel, or Slack channel: the user can leave it from the pane.
 pub fn can_leave(conversation: &Conversation) -> bool {
     // Paired Messages cannot leave a group. The item stays off until it can.
     if conversation.key.network == Network::Messages {
         return false;
     }
     conversation.kind == ConversationKind::Group
-        || (conversation.key.network == Network::Telegram
+        || (matches!(conversation.key.network, Network::Telegram | Network::Slack)
             && matches!(conversation.kind, ConversationKind::Channel | ConversationKind::Announcement))
 }
 
@@ -1174,7 +1176,8 @@ mod tests {
         // A Telegram chat has no foot, so its menu opens it.
         assert_eq!(conversation_menu(&row(Network::Telegram, ConversationKind::Group), Some("l"), false), vec![Item::CopyLink, Item::OpenIn, Item::Separator, Item::Leave]);
         let channel = row(Network::Slack, ConversationKind::Channel);
-        assert_eq!(conversation_menu(&channel, None, false), Vec::<Item>::new());
+        assert_eq!(conversation_menu(&channel, None, false), vec![Item::Leave]);
+        assert!(can_leave(&channel));
         assert!(can_leave(&row(Network::Telegram, ConversationKind::Announcement)));
         assert!(!can_leave(&row(Network::Discord, ConversationKind::Channel)));
         assert!(can_leave(&row(Network::Teams, ConversationKind::Group)));
@@ -1202,6 +1205,9 @@ mod tests {
         assert!(can_edit_folders(&tg_dm, &tg_file));
         assert!(!can_pin_on_network(&tg_dm, &dc_caps));
         assert!(!can_archive(&dc_chan, &tg_file), "channel inside a space is not archived via home filing");
+        let mut slack_chan = row(Network::Slack, ConversationKind::Channel);
+        slack_chan.space = Some("T01".into());
+        assert!(can_archive(&slack_chan, &tg_file), "Slack channel can be archived when account supports archive");
         assert_eq!(network_pin_label(&tg_dm), "Pin on Telegram");
         assert_eq!(network_pin_label(&tg_pinned), "Unpin on Telegram");
 

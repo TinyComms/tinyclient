@@ -610,6 +610,8 @@ pub struct BrowsedChannel {
     pub joined: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub private: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
 }
 
 /// What kind of event an [`ActivityItem`] represents.

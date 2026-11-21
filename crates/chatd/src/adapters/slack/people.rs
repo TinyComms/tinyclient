@@ -596,6 +596,63 @@ impl Slack {
         self.ctx.members_changed(channel);
     }
 
+    /// Invites people to a channel (`conversations.invite`, up to 1,000 ids) and refreshes the active roster.
+    pub(super) fn members_add(&self, conversation: &str, people: &[String]) -> Result<(), Fault> {
+        if super::thread_of(conversation).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        let ids: Vec<&str> = people.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).take(1000).collect();
+        if ids.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        let joined = ids.join(",");
+        self.api("conversations.invite", &[("channel", conversation), ("users", &joined)])?;
+        {
+            let mut state = self.state();
+            if let Some(roster) = state.roster.as_mut().filter(|r| r.channel == conversation) {
+                let mut added = 0u32;
+                for id in &ids {
+                    if !roster.ids.iter().any(|existing| existing == id) {
+                        if roster.cursor.is_none() && roster.ids.len() < ROSTER {
+                            roster.ids.push((*id).to_owned());
+                        }
+                        added += 1;
+                    }
+                }
+                if let Some(count) = roster.count.as_mut() {
+                    *count += added;
+                }
+            }
+        }
+        self.ctx.members_changed(conversation);
+        Ok(())
+    }
+
+    /// Removes one person from a channel (`conversations.kick`) and refreshes the active roster.
+    pub(super) fn members_remove(&self, conversation: &str, person: &str) -> Result<(), Fault> {
+        if super::thread_of(conversation).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        let person = person.trim();
+        if person.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        self.api("conversations.kick", &[("channel", conversation), ("user", person)])?;
+        {
+            let mut state = self.state();
+            if let Some(roster) = state.roster.as_mut().filter(|r| r.channel == conversation) {
+                if let Some(at) = roster.ids.iter().position(|id| id == person) {
+                    roster.ids.remove(at);
+                }
+                if let Some(count) = roster.count.as_mut() {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
+        self.ctx.members_changed(conversation);
+        Ok(())
+    }
+
     /// The direct conversation with a person, opened on Slack if there was none. Opening sends
     /// nothing to them.
     pub(super) fn start_direct(&self, person: &str) -> Result<String, Fault> {

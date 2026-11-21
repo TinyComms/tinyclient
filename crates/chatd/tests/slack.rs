@@ -420,6 +420,9 @@ impl Fake {
             }
             "conversations.history" if BUSY.contains(&channel) => Some(json!({"ok": true, "has_more": false, "messages": []})),
             "conversations.members" => {
+                if channel == "C0RND" {
+                    return ok(json!({"ok": true, "members": ["U0ME", "U0ANA"], "response_metadata": {"next_cursor": ""}}));
+                }
                 // Slack may answer fewer than asked for: two at a time here, so a list of four
                 // takes two calls and the cursor is seen at work.
                 let listed = self.fixture(token, &format!("conversations.members.{channel}"));
@@ -496,6 +499,23 @@ impl Fake {
                             "topic": {"value": "Casual chat"},
                             "purpose": {"value": "Watercooler talk"},
                             "created": 1700000000
+                        }
+                    }));
+                }
+                if channel == "C0ARCH" {
+                    return ok(json!({
+                        "ok": true,
+                        "channel": {
+                            "id": "C0ARCH",
+                            "name": "old-proj",
+                            "is_channel": true,
+                            "is_private": false,
+                            "is_archived": true,
+                            "is_member": false,
+                            "num_members": 3,
+                            "topic": {"value": "Retired"},
+                            "purpose": {"value": "Archived project"},
+                            "created": 1690000000
                         }
                     }));
                 }
@@ -646,13 +666,18 @@ impl Fake {
             }
             "conversations.list" => {
                 let cursor = param("cursor");
+                let include_archived = param("exclude_archived") == "false";
                 if cursor.is_empty() {
+                    let mut list = vec![
+                        json!({"id": "C0GEN", "name": "general", "is_channel": true, "is_private": false, "is_member": true, "num_members": 12, "purpose": {"value": "Company wide"}}),
+                        json!({"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false, "is_member": false, "num_members": 42, "purpose": {"value": "Watercooler talk"}}),
+                    ];
+                    if include_archived {
+                        list.push(json!({"id": "C0ARCH", "name": "old-proj", "is_channel": true, "is_private": false, "is_archived": true, "is_member": false, "num_members": 3, "purpose": {"value": "Archived project"}}));
+                    }
                     Some(json!({
                         "ok": true,
-                        "channels": [
-                            {"id": "C0GEN", "name": "general", "is_channel": true, "is_private": false, "is_member": true, "num_members": 12, "purpose": {"value": "Company wide"}},
-                            {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false, "is_member": false, "num_members": 42, "purpose": {"value": "Watercooler talk"}}
-                        ],
+                        "channels": list,
                         "response_metadata": {"next_cursor": "page2"}
                     }))
                 } else {
@@ -664,6 +689,126 @@ impl Fake {
                         "response_metadata": {"next_cursor": ""}
                     }))
                 }
+            }
+            "conversations.leave" => {
+                if channel == "C0GEN" {
+                    return refused("cant_leave_general");
+                }
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.rename" => {
+                let name = param("name");
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                if name == "taken" {
+                    return refused("name_taken");
+                }
+                if name == "forbidden" {
+                    return refused("restricted_action");
+                }
+                Some(json!({
+                    "ok": true,
+                    "channel": {
+                        "id": channel,
+                        "name": name,
+                        "is_channel": true,
+                        "is_private": false
+                    }
+                }))
+            }
+            "conversations.archive" => {
+                if channel == "C0GEN" {
+                    return refused("cant_archive_general");
+                }
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.unarchive" => {
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.invite" => {
+                let users = param("users");
+                if channel.is_empty() || users.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if users.split(',').any(|u| u == "U0ALREADY") {
+                    return refused("already_in_channel");
+                }
+                if users.split(',').any(|u| u == "U0RESTRICTED") {
+                    return refused("restricted_action");
+                }
+                Some(json!({"ok": true, "channel": {"id": channel}}))
+            }
+            "conversations.kick" => {
+                let user = param("user");
+                if channel.is_empty() || user.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if user == me(token) {
+                    return refused("cant_kick_self");
+                }
+                if channel == "C0GEN" {
+                    return refused("cant_kick_from_general");
+                }
+                if user == "U0RESTRICTED" {
+                    return refused("restricted_action");
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.setTopic" => {
+                let topic = param("topic");
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                if topic == "FORBIDDEN" {
+                    return refused("restricted_action");
+                }
+                if topic.chars().count() > 250 {
+                    return refused("too_long");
+                }
+                Some(json!({"ok": true, "topic": topic}))
+            }
+            "conversations.setPurpose" => {
+                let purpose = param("purpose");
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                if purpose == "FORBIDDEN" {
+                    return refused("not_authorized");
+                }
+                if purpose.chars().count() > 250 {
+                    return refused("too_long");
+                }
+                Some(json!({"ok": true, "purpose": purpose}))
+            }
+            "pins.add" => {
+                let ts = param("timestamp");
+                if channel.is_empty() || ts.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if ts == "1760000000.999999" {
+                    return refused("permission_denied");
+                }
+                Some(json!({"ok": true}))
+            }
+            "pins.remove" => {
+                let ts = param("timestamp");
+                if channel.is_empty() || ts.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if ts == "1760000000.999999" {
+                    return refused("no_pin");
+                }
+                Some(json!({"ok": true}))
             }
             "conversations.join" => {
                 if channel.is_empty() {
@@ -2417,12 +2562,14 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
     assert!(set[1].params["prefs"].contains("mentions_dms") && set[1].params["channel_ids"] == "C0GEN");
     assert!(!world.conversation(&general).unwrap().muted);
 
-    // Pins: the pinned messages, not the file pinned on its own.
+    // Pins: includes both pinned messages and pinned files, newest first.
     let pinned = match world.ask(Request::Pinned { conversation: general.clone() }) {
         Response::Pinned { messages, .. } => messages,
         other => panic!("{other:?}"),
     };
-    assert_eq!(pinned.iter().map(|message| message.text.as_str()).collect::<Vec<_>>(), ["Release checklist lives in the wiki"]);
+    assert_eq!(pinned.len(), 2);
+    assert!(pinned.iter().any(|m| m.text == "Release checklist lives in the wiki"));
+    assert!(pinned.iter().any(|m| m.text == "logo.png"));
 
     // Files shared here, from Slack's list, because the user asked; links have no such list.
     let shared = |kind, search| world.ask(Request::Shared { conversation: general.clone(), kind, before: None, limit: 25, search });
@@ -3313,4 +3460,514 @@ fn slack_block_kit_images_video_stacked_cards_and_layout() {
     assert_eq!(cards[1].author, "AlertBot");
     assert_eq!(cards[1].title, "Staging warning");
     assert_eq!(cards[1].fields.len(), 1);
+}
+
+#[test]
+fn slack_leave_rename_archive_and_browse_archived_channels() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let side = alpha("C0SIDE");
+    assert!(world.account("T01ALPHA").can.archive, "Slack should advertise archive capability");
+
+    // Leaving #general refuses with a clear human-readable message.
+    let err = world.ask(Request::Leave { conversation: general.clone() });
+    match err {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("general"), "expected clear cant_leave_general message, got: {detail}");
+        }
+        other => panic!("expected Refused for leaving #general, got {other:?}"),
+    }
+    assert!(world.conversation(&general).is_some(), "#general must remain in the tree");
+
+    // Rename a channel: strips leading # and updates stored row.
+    let renamed = world.ask(Request::ConversationUpdate {
+        conversation: side.clone(),
+        title: Some("#side-renamed".into()),
+        topic: None,
+        description: None,
+    });
+    assert_eq!(renamed, Response::Ok);
+    let rename_calls = world.fake.calls(ALPHA, "conversations.rename");
+    assert_eq!(rename_calls.len(), 1);
+    assert_eq!(rename_calls[0].params["channel"], "C0SIDE");
+    assert_eq!(rename_calls[0].params["name"], "side-renamed");
+    assert_eq!(world.conversation(&side).unwrap().title, "#side-renamed");
+
+    // Rename refusal surfaces clear message.
+    let taken = world.ask(Request::ConversationUpdate {
+        conversation: side.clone(),
+        title: Some("taken".into()),
+        topic: None,
+        description: None,
+    });
+    match taken {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("already exists"), "got: {detail}");
+        }
+        other => panic!("expected Refused for name_taken, got {other:?}"),
+    }
+
+    // Archiving #general refuses with cant_archive_general.
+    let arch_gen = world.ask(Request::File {
+        conversation: general.clone(),
+        pinned: None,
+        archived: Some(true),
+        folder_add: None,
+        folder_remove: None,
+    });
+    match arch_gen {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("general"), "got: {detail}");
+        }
+        other => panic!("expected Refused for archiving #general, got {other:?}"),
+    }
+
+    // Archive and unarchive a channel.
+    let arch = world.ask(Request::File {
+        conversation: side.clone(),
+        pinned: None,
+        archived: Some(true),
+        folder_add: None,
+        folder_remove: None,
+    });
+    assert_eq!(arch, Response::Ok);
+    assert!(world.fake.calls(ALPHA, "conversations.archive").iter().any(|c| c.params["channel"] == "C0SIDE"));
+    let row = world.conversation(&side).unwrap();
+    assert!(row.archived && row.read_only, "archived channel must be marked archived and read-only");
+
+    let unarch = world.ask(Request::File {
+        conversation: side.clone(),
+        pinned: None,
+        archived: Some(false),
+        folder_add: None,
+        folder_remove: None,
+    });
+    assert_eq!(unarch, Response::Ok);
+    assert_eq!(world.fake.calls(ALPHA, "conversations.unarchive").len(), 1);
+    let row = world.conversation(&side).unwrap();
+    assert!(!row.archived && !row.read_only, "unarchived channel must clear archived and read-only");
+
+    // Leave a regular channel calls conversations.leave and drops it from the tree.
+    let left = world.ask(Request::Leave { conversation: side.clone() });
+    assert_eq!(left, Response::Ok);
+    let leave_calls = world.fake.calls(ALPHA, "conversations.leave");
+    assert!(leave_calls.iter().any(|c| c.params["channel"] == "C0SIDE"));
+    world.until("left channel to leave the tree", || world.conversation(&side).is_none().then_some(()));
+
+    // Channel browsing includes archived channels and previews them as read-only.
+    let Response::BrowsedChannels { channels, .. } = world.ask(Request::BrowseChannels {
+        space: alpha("T01ALPHA"),
+        query: "old-proj".into(),
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected BrowsedChannels");
+    };
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].name, "#old-proj");
+    assert!(channels[0].archived, "browsed archived channel must report archived=true");
+
+    let arch_key = alpha("C0ARCH");
+    let Response::Conversation { conversation: preview } = world.ask(Request::PreviewChannel {
+        conversation: arch_key,
+    }) else {
+        panic!("expected Conversation for archived channel preview");
+    };
+    assert!(preview.read_only && preview.archived, "previewed archived channel must be read-only and archived");
+}
+
+#[test]
+fn slack_invite_and_kick_channel_members() {
+    let world = World::start();
+    world.ready();
+
+    let rnd = alpha("C0RND");
+    let side = alpha("C0SIDE");
+    let general = alpha("C0GEN");
+    let row = world.conversation(&rnd).unwrap();
+    assert!(row.rights.add_members && row.rights.remove_members, "writable Slack channels must advertise add/remove member rights");
+    let ro = world.conversation(&side).unwrap();
+    assert!(!ro.rights.add_members && !ro.rights.remove_members, "read-only Slack channels must not advertise add/remove member rights");
+
+    // Load the member list first so roster is active.
+    let Response::Members { members, .. } = world.ask(Request::Members {
+        conversation: rnd.clone(),
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Members");
+    };
+    let initial_count = members.len();
+
+    // Invite people to the channel.
+    let added = world.ask(Request::MembersAdd {
+        conversation: rnd.clone(),
+        people: vec!["U0NEW1".into(), "U0NEW2".into()],
+    });
+    assert_eq!(added, Response::Ok);
+    let invites = world.fake.calls(ALPHA, "conversations.invite");
+    assert_eq!(invites.len(), 1);
+    assert_eq!(invites[0].params["channel"], "C0RND");
+    assert_eq!(invites[0].params["users"], "U0NEW1,U0NEW2");
+
+    // Roster reflects invited members immediately.
+    let Response::Members { members: after_add, .. } = world.ask(Request::Members {
+        conversation: rnd.clone(),
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Members after invite");
+    };
+    assert_eq!(after_add.len(), initial_count + 2);
+    assert!(after_add.iter().any(|p| p.key.id == "U0NEW1"));
+    assert!(after_add.iter().any(|p| p.key.id == "U0NEW2"));
+
+    // Invite refusal: already_in_channel translated clearly.
+    match world.ask(Request::MembersAdd {
+        conversation: rnd.clone(),
+        people: vec!["U0ALREADY".into()],
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("already"), "got: {detail}");
+        }
+        other => panic!("expected Refused for already_in_channel, got {other:?}"),
+    }
+
+    // Kick a member from the channel.
+    let kicked = world.ask(Request::MembersRemove {
+        conversation: rnd.clone(),
+        person: "U0NEW1".into(),
+    });
+    assert_eq!(kicked, Response::Ok);
+    let kicks = world.fake.calls(ALPHA, "conversations.kick");
+    assert_eq!(kicks.len(), 1);
+    assert_eq!(kicks[0].params["channel"], "C0RND");
+    assert_eq!(kicks[0].params["user"], "U0NEW1");
+
+    // Roster drops the kicked member immediately.
+    let Response::Members { members: after_kick, .. } = world.ask(Request::Members {
+        conversation: rnd.clone(),
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Members after kick");
+    };
+    assert_eq!(after_kick.len(), initial_count + 1);
+    assert!(!after_kick.iter().any(|p| p.key.id == "U0NEW1"));
+
+    // Kick refusals: cant_kick_self, cant_kick_from_general, restricted_action.
+    match world.ask(Request::MembersRemove {
+        conversation: rnd.clone(),
+        person: "U0ME".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("yourself") || detail.to_lowercase().contains("leave"), "got: {detail}");
+        }
+        other => panic!("expected Refused for cant_kick_self, got {other:?}"),
+    }
+    match world.ask(Request::MembersRemove {
+        conversation: general,
+        person: "U0ANA".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("general"), "got: {detail}");
+        }
+        other => panic!("expected Refused for cant_kick_from_general, got {other:?}"),
+    }
+    match world.ask(Request::MembersRemove {
+        conversation: rnd,
+        person: "U0RESTRICTED".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("workspace"), "got: {detail}");
+        }
+        other => panic!("expected Refused for restricted_action, got {other:?}"),
+    }
+}
+
+#[test]
+fn slack_edit_channel_topic_and_description() {
+    let world = World::start();
+    world.ready();
+
+    let rnd = alpha("C0RND");
+    let side = alpha("C0SIDE");
+    assert!(world.conversation(&rnd).unwrap().rights.edit_topic, "writable Slack channels must advertise edit_topic");
+    assert!(!world.conversation(&side).unwrap().rights.edit_topic, "read-only Slack channels must not advertise edit_topic");
+
+    // Set topic via ConversationUpdate -> conversations.setTopic, updating stored row immediately.
+    let set_topic = world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: Some("Ship Wave 4C".into()),
+        description: None,
+    });
+    assert_eq!(set_topic, Response::Ok);
+    let topic_calls = world.fake.calls(ALPHA, "conversations.setTopic");
+    assert_eq!(topic_calls.len(), 1);
+    assert_eq!(topic_calls[0].params["channel"], "C0RND");
+    assert_eq!(topic_calls[0].params["topic"], "Ship Wave 4C");
+    assert_eq!(world.conversation(&rnd).unwrap().topic, "Ship Wave 4C");
+
+    // Set description via ConversationUpdate -> conversations.setPurpose without overwriting topic.
+    let set_desc = world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: None,
+        description: Some("Random watercooler channel".into()),
+    });
+    assert_eq!(set_desc, Response::Ok);
+    let purpose_calls = world.fake.calls(ALPHA, "conversations.setPurpose");
+    assert_eq!(purpose_calls.len(), 1);
+    assert_eq!(purpose_calls[0].params["channel"], "C0RND");
+    assert_eq!(purpose_calls[0].params["purpose"], "Random watercooler channel");
+    assert_eq!(world.conversation(&rnd).unwrap().topic, "Ship Wave 4C", "setting purpose must not clobber topic");
+
+    // Refusals surface clear human-readable errors.
+    match world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: Some("FORBIDDEN".into()),
+        description: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("workspace"), "got: {detail}");
+        }
+        other => panic!("expected Refused for restricted setTopic, got {other:?}"),
+    }
+    match world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: None,
+        description: Some("FORBIDDEN".into()),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("permission"), "got: {detail}");
+        }
+        other => panic!("expected Refused for not_authorized setPurpose, got {other:?}"),
+    }
+    match world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: Some("x".repeat(251)),
+        description: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("250") || detail.to_lowercase().contains("long"), "got: {detail}");
+        }
+        other => panic!("expected Refused for too_long topic, got {other:?}"),
+    }
+
+    // Live socket events: channel_topic updates row.topic; channel_purpose invalidates ConversationInfo cache.
+    let info_before = world.fake.calls(ALPHA, "conversations.info").len();
+    let _ = world.ask(Request::ConversationInfo { conversation: rnd.clone() });
+    assert_eq!(world.fake.calls(ALPHA, "conversations.info").len(), info_before + 1);
+
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "subtype": "channel_topic",
+        "channel": "C0RND",
+        "user": "U0ANA",
+        "topic": "Live socket topic",
+        "text": "<@U0ANA> set the channel topic: Live socket topic",
+        "ts": "1760000991.000100"
+    }));
+    world.until("channel_topic to update row", || {
+        (world.conversation(&rnd)?.topic == "Live socket topic").then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "subtype": "channel_purpose",
+        "channel": "C0RND",
+        "user": "U0ANA",
+        "purpose": "Live socket purpose",
+        "text": "<@U0ANA> set the channel description: Live socket purpose",
+        "ts": "1760000992.000100"
+    }));
+    world.until("channel_purpose message stored", || world.message(&rnd, "1760000992.000100"));
+    // Because channel_purpose called info_stale, asking ConversationInfo re-fetches conversations.info!
+    let _ = world.ask(Request::ConversationInfo { conversation: rnd.clone() });
+    assert!(
+        world.fake.calls(ALPHA, "conversations.info").len() >= info_before + 2,
+        "channel_purpose should invalidate cached ConversationInfo"
+    );
+}
+
+#[test]
+fn slack_mark_unread_channel_and_thread() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    // Load #general history so messages are cached, then mark read to the newest.
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (m.len() >= 3).then_some(m)
+    });
+    let newest = msgs.last().unwrap().id.clone();
+    let second_newest = msgs[msgs.len() - 2].id.clone();
+    let third_newest = msgs[msgs.len() - 3].id.clone();
+    assert_eq!(world.ask(Request::MarkRead { conversation: general.clone(), message_id: newest }), Response::Ok);
+    world.until("mark_read conversations.mark sent", || {
+        (!world.fake.calls(ALPHA, "conversations.mark").is_empty()).then_some(())
+    });
+    assert_eq!(world.conversation(&general).unwrap().unread, 0);
+
+    // Mark unread from the second-newest message: Slack receives conversations.mark with the message BEFORE it (third_newest).
+    let marks_before = world.fake.calls(ALPHA, "conversations.mark").len();
+    assert_eq!(
+        world.ask(Request::MarkUnread {
+            conversation: general.clone(),
+            message_id: second_newest,
+        }),
+        Response::Ok
+    );
+    let row = world.conversation(&general).unwrap();
+    assert_eq!(row.unread, 2, "marking unread from 2nd-newest should show 2 unread immediately");
+    assert_eq!(row.last_read.as_deref(), Some(third_newest.as_str()));
+
+    let mark_call = world.until("conversations.mark for mark_unread", || {
+        let calls = world.fake.calls(ALPHA, "conversations.mark");
+        (calls.len() > marks_before).then(|| calls.last().unwrap().clone())
+    });
+    assert_eq!(mark_call.params["channel"], "C0GEN");
+    assert_eq!(mark_call.params["ts"], third_newest);
+
+    // Thread mark-unread: load thread replies, mark read, then mark unread from the newest reply.
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+    let tmsgs = world.until("thread replies loaded", || {
+        let m = world.messages(&thread);
+        (m.len() >= 2).then_some(m)
+    });
+    let t_newest = tmsgs.last().unwrap().id.clone();
+    let t_prev = tmsgs[tmsgs.len() - 2].id.clone();
+    assert_eq!(world.ask(Request::MarkRead { conversation: thread.clone(), message_id: t_newest.clone() }), Response::Ok);
+    world.until("thread mark_read sent", || {
+        (!world.fake.calls(ALPHA, "subscriptions.thread.mark").is_empty()).then_some(())
+    });
+
+    let tmarks_before = world.fake.calls(ALPHA, "subscriptions.thread.mark").len();
+    assert_eq!(
+        world.ask(Request::MarkUnread {
+            conversation: thread.clone(),
+            message_id: t_newest,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&thread).unwrap().unread, 1);
+
+    let tmark = world.until("subscriptions.thread.mark with read=0", || {
+        let calls = world.fake.calls(ALPHA, "subscriptions.thread.mark");
+        (calls.len() > tmarks_before).then(|| calls.last().unwrap().clone())
+    });
+    assert_eq!(tmark.params["channel"], "C0GEN");
+    assert_eq!(tmark.params["thread_ts"], ROOT);
+    assert_eq!(tmark.params["ts"], t_prev);
+    assert_eq!(tmark.params["read"], "0");
+}
+
+#[test]
+fn slack_pin_unpin_socket_events_and_pinned_files() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (!m.is_empty()).then_some(m)
+    });
+    let target = msgs[0].id.clone();
+
+    // ConversationInfo includes pinned count from pins.list.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.pinned, Some(2), "ConversationAbout.pinned should count pinned messages and files");
+
+    // Pinned list returns both message pins and file pins with created_by and created preserved.
+    let Response::Pinned { messages: pins, .. } = world.ask(Request::Pinned { conversation: general.clone() }) else {
+        panic!("expected Pinned");
+    };
+    assert_eq!(pins.len(), 2, "expected message pin + file pin");
+    let msg_pin = pins.iter().find(|m| m.text == "Release checklist lives in the wiki").expect("message pin");
+    assert!(msg_pin.pinned);
+    assert_eq!(msg_pin.pinned_by.as_deref(), Some("Ana"));
+    assert_eq!(msg_pin.pinned_at, Some(1760000400));
+    let file_pin = pins.iter().find(|m| m.text == "logo.png").expect("file pin");
+    assert!(file_pin.pinned);
+    assert_eq!(file_pin.pinned_by.as_deref(), Some("Ana"));
+    assert_eq!(file_pin.pinned_at, Some(1760000300));
+
+    // Pin and unpin a message via Request::Pin -> pins.add / pins.remove.
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            pinned: true,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "pins.add").len(), 1);
+    assert!(world.message(&general, &target).unwrap().pinned);
+
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            pinned: false,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "pins.remove").len(), 1);
+    assert!(!world.message(&general, &target).unwrap().pinned);
+
+    // Permission refusal translates clearly.
+    match world.ask(Request::Pin {
+        conversation: general.clone(),
+        message_id: "1760000000.999999".into(),
+        pinned: true,
+        notify: false,
+        me_only: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("pin"), "got: {detail}");
+        }
+        other => panic!("expected Refused for permission_denied, got {other:?}"),
+    }
+
+    // Live socket events pin_added and pin_removed flip the stored message's pinned flag without reloading history.
+    world.fake.push(ALPHA, json!({
+        "type": "pin_added",
+        "channel_id": "C0GEN",
+        "user": "U0ANA",
+        "item": {
+            "type": "message",
+            "channel": "C0GEN",
+            "message": {"ts": target}
+        }
+    }));
+    world.until("pin_added sets pinned=true", || {
+        world.message(&general, &target)?.pinned.then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "pin_removed",
+        "channel_id": "C0GEN",
+        "user": "U0ANA",
+        "item": {
+            "type": "message",
+            "channel": "C0GEN",
+            "message": {"ts": target}
+        }
+    }));
+    world.until("pin_removed clears pinned=false", || {
+        (!world.message(&general, &target)?.pinned).then_some(())
+    });
 }

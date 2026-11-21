@@ -603,6 +603,12 @@ pub struct Message {
     pub prior_text: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Who pinned this message, when the network reports it (e.g. Slack `pins.list`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_by: Option<String>,
+    /// Unix seconds when this message was pinned, when the network reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<i64>,
     /// Starred on the network (Google Messages).
     #[serde(default, skip_serializing_if = "is_false")]
     pub starred: bool,
@@ -741,6 +747,8 @@ impl Message {
             edited_at: None,
             prior_text: None,
             pinned: false,
+            pinned_by: None,
+            pinned_at: None,
             starred: false,
             views: None,
             mentions_me: false,

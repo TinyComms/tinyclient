@@ -151,6 +151,10 @@ impl Slack {
             }
         }
         let bookmarks = self.bookmarks(channel_of(conversation));
+        let pinned = self
+            .api("pins.list", &[("channel", channel_of(conversation))])
+            .ok()
+            .and_then(|v| v["items"].as_array().map(|items| items.len() as u32));
         Ok(ConversationAbout {
             description,
             members: channel["num_members"].as_u64().map(|count| count as u32),
@@ -159,6 +163,7 @@ impl Slack {
             notify,
             external: names.join(", "),
             bookmarks,
+            pinned,
             ..ConversationAbout::default()
         })
     }
@@ -246,19 +251,52 @@ impl Slack {
         self.ctx.muted(channel, muted).map_err(|err| Fault::Net(err.to_string()))
     }
 
-    /// The pinned messages, as `pins.list` gives them. Files pinned on their own are not
-    /// messages and are left out.
+    /// The pinned messages and files, as `pins.list` gives them, preserving who pinned each item and when.
     pub(super) fn pinned(&self, conversation: &str) -> Result<Vec<Message>, Fault> {
         let channel = channel_of(conversation);
         let pins = self.api("pins.list", &[("channel", channel)])?;
         let items = pins["items"].as_array().map_or(&[][..], Vec::as_slice);
-        let messages: Vec<Value> = items.iter().filter(|item| item["type"] == "message").map(|item| item["message"].clone()).collect();
-        self.authors(&messages);
-        let mut pinned: Vec<Message> = messages.iter().filter_map(|message| self.message(channel, message)).collect();
-        for message in &mut pinned {
-            message.pinned = true;
+        let mut user_ids: Vec<String> = Vec::new();
+        for item in items {
+            for id in [
+                item["created_by"].as_str(),
+                item["message"]["user"].as_str(),
+                item["file"]["user"].as_str(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !id.is_empty() {
+                    user_ids.push(id.to_owned());
+                }
+            }
         }
-        pinned.sort_by_key(|message| std::cmp::Reverse(message.sent));
+        self.users(&user_ids);
+        let mut pinned = Vec::new();
+        for item in items {
+            let built = match item["type"].as_str() {
+                Some("message") => self.message(channel, &item["message"]),
+                Some("file") => {
+                    let file = &item["file"];
+                    let shares = &file["shares"];
+                    let shared = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
+                    let created = file["created"].as_i64().or_else(|| item["created"].as_i64()).unwrap_or(0);
+                    let ts = shared.map(str::to_owned).unwrap_or_else(|| format!("{created}.000000"));
+                    let user = file["user"].as_str().or_else(|| item["created_by"].as_str()).unwrap_or("");
+                    let event = json!({"type": "message", "ts": ts, "user": user, "files": [file]});
+                    self.message(channel, &event)
+                }
+                _ => None,
+            };
+            let Some(mut message) = built else {
+                continue;
+            };
+            message.pinned = true;
+            message.pinned_by = item["created_by"].as_str().filter(|id| !id.is_empty()).map(|id| self.user(id).name);
+            message.pinned_at = item["created"].as_i64().filter(|ts| *ts > 0);
+            pinned.push(message);
+        }
+        pinned.sort_by_key(|message| std::cmp::Reverse(message.pinned_at.unwrap_or(message.sent)));
         pinned.truncate(protocol::PINNED_LIMIT);
         Ok(pinned)
     }

@@ -114,17 +114,26 @@ impl Slack {
         // Unverified: `is_read_only` is the documented flag; a channel only some may post in
         // (`posting_restricted_to`) is not told apart from one I may post in.
         row.read_only = ["is_read_only", "is_archived", "is_frozen"].iter().any(|flag| channel[*flag] == true);
+        if channel["is_archived"] == true {
+            row.read_only_reason = "This channel is archived.".to_owned();
+        }
         row.rights.pin = !row.read_only;
+        row.rights.rename = !row.read_only;
+        row.rights.edit_topic = !row.read_only;
+        row.rights.add_members = !row.read_only;
+        row.rights.remove_members = !row.read_only;
+        row.rights.manage_members = !row.read_only;
         Some(row)
     }
 
     /// Paged public channel browser (`conversations.list` with `types=public_channel`), never
-    /// fetched whole. Filters the returned page by `query` when non-empty.
+    /// fetched whole. Includes archived channels as read-only so their history can be read.
+    /// Filters the returned page by `query` when non-empty.
     pub(super) fn browse_channels(&self, query: &str, cursor: Option<&str>, limit: u32) -> Result<BrowsedPage, Fault> {
         let count = limit.clamp(1, 100).to_string();
         let mut params = vec![
             ("types", "public_channel"),
-            ("exclude_archived", "true"),
+            ("exclude_archived", "false"),
             ("limit", count.as_str()),
         ];
         if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
@@ -158,6 +167,7 @@ impl Slack {
                 members: ch["num_members"].as_u64().unwrap_or(0) as u32,
                 joined: ch["is_member"] == true,
                 private: ch["is_private"] == true,
+                archived: ch["is_archived"] == true,
             });
         }
         let next = page["response_metadata"]["next_cursor"]
@@ -167,28 +177,126 @@ impl Slack {
         Ok(BrowsedPage { channels, cursor: next })
     }
 
-    /// Previews an unjoined public channel: records it as `joined: false`, `read_only: true`,
-    /// outside the sidebar (`space: None`, `group: None`), and fetches one page of history.
+    /// Previews an unjoined public channel (or archived channel): records it as `joined: false`,
+    /// `read_only: true`, outside the sidebar (`space: None`, `group: None`), and fetches one page of history.
     pub(super) fn preview_channel(&self, channel_id: &str) -> Result<(), Fault> {
         let info = self.api("conversations.info", &[("channel", channel_id), ("include_num_members", "true")])?;
         let ch = &info["channel"];
         let mut row = self.row(ch).ok_or_else(|| Fault::Slack("channel_not_found".to_owned()))?;
         let is_member = ch["is_member"] == true;
+        let is_archived = ch["is_archived"] == true;
         if !is_member {
             row.joined = false;
             row.read_only = true;
-            row.read_only_reason = "Join this channel to post messages.".to_owned();
+            row.read_only_reason = if is_archived {
+                "This channel is archived.".to_owned()
+            } else {
+                "Join this channel to post messages.".to_owned()
+            };
             row.space = None;
             row.group = None;
             row.listed = false;
         }
         self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+        if is_archived {
+            self.ctx
+                .filing(channel_id, &crate::store::Filing { archived: true, ..Default::default() })
+                .map_err(|err| Fault::Net(err.to_string()))?;
+        }
         if let Ok(history) = self.api("conversations.history", &[("channel", channel_id), ("limit", "30")]) {
             let entries = history["messages"].as_array().map_or(&[][..], Vec::as_slice);
             self.authors(entries);
             let messages: Vec<protocol::Message> = entries.iter().filter_map(|e| self.message(channel_id, e)).collect();
             let _ = self.ctx.history(channel_id, &messages);
         }
+        Ok(())
+    }
+
+    /// Renames a channel (`conversations.rename`) and updates the stored row.
+    pub(super) fn rename_channel(&self, conversation_id: &str, title: &str) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        let name = title.trim().trim_start_matches('#').trim();
+        let renamed = self.api("conversations.rename", &[("channel", conversation_id), ("name", name)])?;
+        let final_name = renamed["channel"]["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(name);
+        if let Some(known) = self.ctx.known(conversation_id).map_err(|err| Fault::Net(err.to_string()))? {
+            let mut row = self.again(&known);
+            row.title = format!("#{final_name}");
+            self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+            self.ctx.set_note(&format!("c:{conversation_id}"), &row.title);
+        }
+        Ok(())
+    }
+
+    /// Archives (`conversations.archive`) or unarchives (`conversations.unarchive`) a channel.
+    pub(super) fn archive_channel(&self, conversation_id: &str, archive: bool) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        let method = if archive { "conversations.archive" } else { "conversations.unarchive" };
+        self.api(method, &[("channel", conversation_id)])?;
+        self.ctx
+            .filing(conversation_id, &crate::store::Filing { archived: archive, ..Default::default() })
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        if let Some(known) = self.ctx.known(conversation_id).map_err(|err| Fault::Net(err.to_string()))? {
+            let mut row = self.again(&known);
+            row.read_only = archive;
+            row.read_only_reason = if archive { "This channel is archived.".to_owned() } else { String::new() };
+            row.rights.pin = !archive;
+            row.rights.rename = !archive;
+            row.rights.edit_topic = !archive;
+            row.rights.add_members = !archive;
+            row.rights.remove_members = !archive;
+            row.rights.manage_members = !archive;
+            self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Updates a channel's name, topic, and/or description (purpose).
+    pub(super) fn update_conversation(
+        &self,
+        conversation_id: &str,
+        title: Option<&str>,
+        topic: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<(), Fault> {
+        if let Some(title) = title {
+            self.rename_channel(conversation_id, title)?;
+        }
+        if let Some(topic) = topic {
+            self.set_topic(conversation_id, topic)?;
+        }
+        if let Some(description) = description {
+            self.set_purpose(conversation_id, description)?;
+        }
+        Ok(())
+    }
+
+    /// Sets a channel's topic (`conversations.setTopic`) and updates the stored row.
+    pub(super) fn set_topic(&self, conversation_id: &str, topic: &str) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        let updated = self.api("conversations.setTopic", &[("channel", conversation_id), ("topic", topic)])?;
+        let final_topic = updated["topic"].as_str().unwrap_or(topic);
+        if let Some(known) = self.ctx.known(conversation_id).map_err(|err| Fault::Net(err.to_string()))? {
+            let mut row = self.again(&known);
+            row.topic = final_topic.to_owned();
+            self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        self.ctx.info_stale(conversation_id);
+        Ok(())
+    }
+
+    /// Sets a channel's description (`conversations.setPurpose`) and invalidates cached info.
+    pub(super) fn set_purpose(&self, conversation_id: &str, purpose: &str) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        self.api("conversations.setPurpose", &[("channel", conversation_id), ("purpose", purpose)])?;
+        self.ctx.info_stale(conversation_id);
         Ok(())
     }
 
@@ -222,7 +330,9 @@ impl Slack {
             parent: known.parent.clone(),
             root: known.root.clone(),
             read_only: known.read_only,
+            read_only_reason: known.read_only_reason.clone(),
             private: known.private,
+            joined: known.joined,
             bot: known.bot,
             special: known.special,
             mark: known.mark,
@@ -713,6 +823,12 @@ impl Slack {
         let mut row = self.again(&known);
         row.topic = topic.to_owned();
         self.ctx.conversation(&row)?;
+        Ok(())
+    }
+
+    /// `channel_purpose`, `group_purpose`: the channel description changed; refresh details on next open.
+    pub(super) fn purpose_changed(&self, channel: &str, _purpose: &str) -> Result<(), Failure> {
+        self.ctx.info_stale(channel);
         Ok(())
     }
 

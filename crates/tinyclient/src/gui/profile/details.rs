@@ -296,7 +296,18 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     .px(px(8.))
                     .type_small()
                     .on_click(cx.listener(move |pane, _, _, cx| {
-                        pane.start_manage(key.clone(), ManageKind::Topic, &current, "Topic or description", cx);
+                        pane.start_manage(key.clone(), ManageKind::Topic, &current, "Channel topic", cx);
+                    })),
+            );
+            let desc_key = row.key.clone();
+            let current_desc = info.map(|i| i.description.clone()).unwrap_or_default();
+            manage_bar = manage_bar.child(
+                button("details-description", ButtonKind::Secondary, "Edit description")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.start_manage(desc_key.clone(), ManageKind::Description, &current_desc, "Channel description", cx);
                     })),
             );
         }
