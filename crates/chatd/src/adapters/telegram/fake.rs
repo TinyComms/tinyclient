@@ -3535,7 +3535,13 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::SearchStickers>(body) {
             self.log("SearchStickers");
-            let stickers = if request.q.eq_ignore_ascii_case("camp") { vec![sticker_in(6_420, "⛺", 920, 921).into()] } else { Vec::new() };
+            let stickers = if request.q.eq_ignore_ascii_case("camp") {
+                vec![sticker_in(6_420, "⛺", 920, 921).into()]
+            } else if request.q.eq_ignore_ascii_case("gold") {
+                vec![sticker_named(6_431, "✨", "gold").into()]
+            } else {
+                Vec::new()
+            };
             let found = tl::types::messages::FoundStickers { next_offset: None, hash: 1, stickers };
             return Some(answer(tl::enums::messages::FoundStickers::Stickers(found)));
         }
@@ -3875,6 +3881,18 @@ fn sticker_in(id: i64, alt: &str, set_id: i64, access: i64) -> tl::types::Docume
         }
         .into()],
     }
+}
+
+fn sticker_named(id: i64, alt: &str, short: &str) -> tl::types::Document {
+    let mut document = sticker_in(id, alt, 0, 0);
+    document.attributes = vec![tl::types::DocumentAttributeSticker {
+        mask: false,
+        alt: alt.to_owned(),
+        stickerset: tl::types::InputStickerSetShortName { short_name: short.to_owned() }.into(),
+        mask_coords: None,
+    }
+    .into()];
+    document
 }
 
 fn sticker_by_id(id: i64) -> tl::types::Document {

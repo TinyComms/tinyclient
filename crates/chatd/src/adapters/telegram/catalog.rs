@@ -441,22 +441,43 @@ fn account_premium(account: &Account) -> bool {
     account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium)
 }
 
-/// Ids of Premium featured packs this account cannot add. Empty when the account is Premium
-/// or the featured list is not a Premium list. Fetched each time: a steer can change the list.
-fn premium_pack_ids(account: &Account) -> Result<Vec<i64>, Fault> {
+/// Premium featured packs this account cannot add, by id and by short name. Empty when the
+/// account is Premium or the featured list is not a Premium list. Fetched each time: a steer
+/// can change the list.
+struct PremiumPacks {
+    ids: Vec<i64>,
+    names: Vec<String>,
+}
+
+fn premium_packs(account: &Account) -> Result<PremiumPacks, Fault> {
     if account_premium(account) {
-        return Ok(Vec::new());
+        return Ok(PremiumPacks { ids: Vec::new(), names: Vec::new() });
     }
     let tl::enums::messages::FeaturedStickers::Stickers(found) = account.ask(&tl::functions::messages::GetFeaturedStickers { hash: 0 })? else {
-        return Ok(Vec::new());
+        return Ok(PremiumPacks { ids: Vec::new(), names: Vec::new() });
     };
     if !found.premium {
-        return Ok(Vec::new());
+        return Ok(PremiumPacks { ids: Vec::new(), names: Vec::new() });
     }
-    Ok(found.sets.into_iter().map(|covered| {
+    let mut ids = Vec::new();
+    let mut names = Vec::new();
+    for covered in found.sets {
         let tl::enums::StickerSet::Set(set) = covered.set();
-        set.id
-    }).collect())
+        ids.push(set.id);
+        if !set.short_name.is_empty() {
+            names.push(set.short_name);
+        }
+    }
+    Ok(PremiumPacks { ids, names })
+}
+
+/// A stickerset key is locked when it names a Premium featured pack, either as `id:access`
+/// or as that pack's short name.
+fn premium_locked(packs: &PremiumPacks, key: &str) -> bool {
+    if let Some((id, _)) = key.split_once(':') {
+        return id.parse::<i64>().ok().is_some_and(|id| packs.ids.contains(&id));
+    }
+    !key.is_empty() && packs.names.iter().any(|name| name == key)
 }
 
 fn sticker_pages(account: &Account) -> Result<Vec<StickerPage>, Fault> {
@@ -536,7 +557,7 @@ fn searched(account: &Account, query: &str) -> Result<CatalogPage, Fault> {
             tl::enums::messages::Stickers::NotModified => Vec::new(),
         }
     };
-    let locked_ids = premium_pack_ids(account)?;
+    let packs = premium_packs(account)?;
     let mut titles: Vec<(String, String)> = Vec::new();
     let mut items = Vec::new();
     for document in documents.iter().take(protocol::CATALOG_LIMIT) {
@@ -544,7 +565,7 @@ fn searched(account: &Account, query: &str) -> Result<CatalogPage, Fault> {
             tl::enums::Document::Document(raw) => content::sticker_set_key(&raw.attributes),
             tl::enums::Document::Empty(_) => String::new(),
         };
-        let locked = key.split_once(':').and_then(|(id, _)| id.parse::<i64>().ok()).is_some_and(|id| locked_ids.contains(&id));
+        let locked = premium_locked(&packs, &key);
         let title = titled(account, &key, &mut titles);
         let install = if locked { "" } else { key.as_str() };
         if let Some(shown) = item(account, document, &title, locked, install) {
@@ -596,10 +617,14 @@ pub(super) fn sticker_set(account: &Account, set: &str, install: Option<bool>, o
     let stickerset = input_set(set)?;
     match install {
         Some(true) => {
-            if let tl::enums::InputStickerSet::Id(chosen) = &stickerset {
-                if premium_pack_ids(account)?.contains(&chosen.id) {
-                    return Err(Fault::Rpc { code: 403, name: "PREMIUM_ACCOUNT_REQUIRED".to_owned(), value: None });
-                }
+            let packs = premium_packs(account)?;
+            let locked = match &stickerset {
+                tl::enums::InputStickerSet::Id(chosen) => packs.ids.contains(&chosen.id),
+                tl::enums::InputStickerSet::ShortName(chosen) => packs.names.iter().any(|name| name == &chosen.short_name),
+                _ => false,
+            };
+            if locked {
+                return Err(Fault::Rpc { code: 403, name: "PREMIUM_ACCOUNT_REQUIRED".to_owned(), value: None });
             }
             account.ask(&tl::functions::messages::InstallStickerSet { stickerset, archived: false })?;
         }

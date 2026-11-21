@@ -2538,6 +2538,12 @@ fn an_uninstalled_sticker_can_be_added_and_recent_favourite_and_searched_sticker
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].locked && found[0].set.is_empty(), "{found:?}");
     assert_eq!(found[0].pack, "Gold");
+    let refused_name = world.ask(Request::StickerSet { account: account(), set: "gold".into(), install: Some(true), order: Vec::new() });
+    assert_eq!(refused_name, Response::Error { code: ErrorCode::Refused, detail: "This needs Telegram Premium.".into() });
+    assert!(!world.calls().iter().any(|call| call.starts_with("InstallStickerSet")), "{:?}", world.calls());
+    let (found, _) = stickers(&world, "gold", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].locked && found[0].set.is_empty(), "{found:?}");
 
     world.steer("gold-installed");
     let (page, next) = stickers(&world, "", None);
