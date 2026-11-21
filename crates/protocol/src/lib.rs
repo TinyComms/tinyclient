@@ -1254,6 +1254,14 @@ pub enum Request {
     StartDirectCall {
         person: Key,
     },
+    /// Starts a new group conversation with two or more members (by person id or phone number)
+    /// and an optional group name. Answers `Response::Conversation`.
+    CreateGroup {
+        account: AccountKey,
+        members: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// The thread a channel message starts. Discord only: its thread is a new channel, so this
     /// creates it and answers with that conversation. Slack and Teams name a thread from the
     /// message, and opening or sending there is enough.

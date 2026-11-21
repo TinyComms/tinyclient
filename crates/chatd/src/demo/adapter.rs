@@ -738,7 +738,7 @@ impl Demo {
             Command::AnswerMessageRequest { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
-            Command::Source { reply, .. } => {
+            Command::Source { reply, .. } | Command::CreateGroup { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
             // Nothing is behind these: what is stored is all there is.

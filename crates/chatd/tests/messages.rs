@@ -1905,3 +1905,39 @@ fn start_direct_opens_a_chat_for_a_typed_number_or_contact_and_blocks_emergency(
         other => panic!("expected emergency refusal, got {other:?}"),
     }
 }
+
+#[test]
+fn create_group_starts_a_named_group_conversation_with_multiple_numbers() {
+    let world = World::linked();
+    world.connected();
+
+    match world.ask(Request::CreateGroup {
+        account: account(),
+        members: vec![
+            "participant-grace".into(),
+            "participant-alan".into(),
+            "(555) 010-0099".into(),
+        ],
+        name: Some("Weekend trip".into()),
+    }) {
+        Response::Conversation { conversation } => {
+            assert_eq!(conversation.kind, ConversationKind::Group);
+            assert_eq!(conversation.title, "Weekend trip");
+            assert!(conversation.topic.contains("RCS message"), "{}", conversation.topic);
+            let stored = world.conversation(&conversation.key.id).expect("group row stored");
+            assert_eq!(stored.title, "Weekend trip");
+        }
+        other => panic!("expected group Conversation, got {other:?}"),
+    }
+    world.heard("create +15550100002,+15550100003,+15550100099 Weekend trip");
+
+    // Fewer than two members is refused.
+    match world.ask(Request::CreateGroup {
+        account: account(),
+        members: vec!["+15550100002".into()],
+        name: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("two"), "{detail}"),
+        other => panic!("expected too-few-members refusal, got {other:?}"),
+    }
+}

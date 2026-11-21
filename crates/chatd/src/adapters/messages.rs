@@ -1842,6 +1842,13 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::StartDirect { person_id, reply } => {
             let _ = reply.send(start_direct(account, &person_id));
         }
+        Command::CreateGroup {
+            members,
+            name,
+            reply,
+        } => {
+            let _ = reply.send(create_group(account, &members, name.as_deref()));
+        }
         Command::SearchPeople(query) => search_people(account, &query),
         Command::ConversationInfo {
             conversation_id,
@@ -3096,6 +3103,41 @@ fn start_direct(account: &Account, person_id: &str) -> Result<String, Refusal> {
     let chat = account
         .drive
         .get_or_create_conversation(&[e164], None)
+        .map_err(Refusal::Refused)?;
+    Ok(record_started_chat(account, chat))
+}
+
+fn create_group(
+    account: &Account,
+    members: &[String],
+    name: Option<&str>,
+) -> Result<String, Refusal> {
+    let cc = default_country_code(account);
+    let mut numbers = Vec::new();
+    for member in members {
+        let trimmed = member.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let raw = resolve_number(account, trimmed)
+            .ok_or_else(|| Refusal::Refused("Enter valid phone numbers for each group member.".into()))?;
+        if bugle::is_emergency_number(&raw) {
+            return Err(Refusal::Refused(EMERGENCY_REASON.to_owned()));
+        }
+        let e164 = bugle::normalize_e164(&raw, &cc)
+            .ok_or_else(|| Refusal::Refused("Enter valid phone numbers for each group member.".into()))?;
+        if !numbers.contains(&e164) {
+            numbers.push(e164);
+        }
+    }
+    if numbers.len() < 2 {
+        return Err(Refusal::Refused(
+            "A group conversation needs at least two people.".into(),
+        ));
+    }
+    let chat = account
+        .drive
+        .get_or_create_conversation(&numbers, name)
         .map_err(Refusal::Refused)?;
     Ok(record_started_chat(account, chat))
 }

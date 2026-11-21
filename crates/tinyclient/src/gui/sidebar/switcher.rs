@@ -44,6 +44,12 @@ pub enum Target {
     Conversation(Rc<Conversation>),
     Space(Key),
     Person(Box<Person>),
+    /// Create a new group conversation (e.g. Google Messages) with two or more members.
+    CreateGroup {
+        account: AccountKey,
+        members: Vec<String>,
+        name: Option<String>,
+    },
     /// The last row: search messages for what was typed.
     Search(String),
     /// "Asking Slack and Telegram…": not a place.
@@ -59,6 +65,7 @@ impl Target {
             Target::Conversation(c) => format!("c/{:?}/{}/{}", c.key.network, c.key.account, c.key.id),
             Target::Space(key) => format!("s/{:?}/{}/{}", key.network, key.account, key.id),
             Target::Person(person) => format!("p/{:?}/{}/{}", person.key.network, person.key.account, person.key.id),
+            Target::CreateGroup { account, members, .. } => format!("g/{:?}/{}/{}", account.network, account.account, members.join(",")),
             Target::Search(_) => "search".into(),
             Target::Asking(_) => "asking".into(),
             Target::Command(id) => format!("cmd/{id}"),
@@ -351,6 +358,76 @@ pub fn text_number_hit(query: &str, accounts: &[AccountStatus]) -> Option<Hit> {
     })
 }
 
+/// When the user enters two or more comma-separated numbers or contact names (optionally
+/// prefixed with `Group name: ...`) and a Messages account is connected, offers a row to create
+/// a group conversation and warns whether it will use RCS or MMS.
+pub fn create_group_hit(query: &str, accounts: &[AccountStatus], people: &[Person]) -> Option<Hit> {
+    let (network, typed) = narrowed(query.trim());
+    if network.is_some_and(|n| n != Network::Messages) {
+        return None;
+    }
+    let raw = typed.trim_start_matches('@').trim();
+    if !raw.contains(',') {
+        return None;
+    }
+    let (name, list_part) = match raw.split_once(':') {
+        Some((group_name, rest)) if !group_name.trim().is_empty() && rest.contains(',') => {
+            (Some(group_name.trim().to_owned()), rest)
+        }
+        _ => (None, raw),
+    };
+    let messages = accounts
+        .iter()
+        .find(|a| a.key.network == Network::Messages && a.link == Link::Connected)?;
+    let mut members = Vec::new();
+    let mut labels = Vec::new();
+    for part in list_part.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let digits: String = token.chars().filter(char::is_ascii_digit).collect();
+        let is_phone = (7..=15).contains(&digits.len())
+            && token
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' ' | '.'));
+        if is_phone {
+            if !members.iter().any(|m: &String| m == token) {
+                members.push(token.to_owned());
+                labels.push(token.to_owned());
+            }
+        } else if let Some(found) = people.iter().find(|p| {
+            p.key.network == Network::Messages
+                && p.key.account == messages.key.account
+                && p.name.to_lowercase().contains(&token.to_lowercase())
+        }) {
+            if !members.contains(&found.key.id) {
+                members.push(found.key.id.clone());
+                labels.push(found.name.clone());
+            }
+        }
+    }
+    if members.len() < 2 {
+        return None;
+    }
+    let title = match &name {
+        Some(group_name) => format!("New group “{group_name}” ({})", labels.join(", ")),
+        None => format!("New group: {}", labels.join(", ")),
+    };
+    Some(Hit {
+        title,
+        context: "Messages · Group (RCS if all support RCS, otherwise MMS)".to_owned(),
+        matched: Vec::new(),
+        target: Target::CreateGroup {
+            account: messages.key.clone(),
+            members,
+            name,
+        },
+        section: Some("People"),
+        trailing: Some("New group"),
+    })
+}
+
 /// New rows from a later answer, with the ones down to the selected row kept where they were:
 /// what arrives goes in below what the user is aiming at.
 pub fn settle(old: &[Hit], selected: usize, new: Vec<Hit>) -> Vec<Hit> {
@@ -472,7 +549,9 @@ impl Shell {
         } else {
             hits(&query, &switcher.conversations, &self.spaces, &switcher.people, &switcher.asking, can_search, now())
         };
-        if let Some(number_hit) = text_number_hit(&query, accounts) {
+        if let Some(group_hit) = create_group_hit(&query, accounts, &switcher.people) {
+            fresh.insert(0, group_hit);
+        } else if let Some(number_hit) = text_number_hit(&query, accounts) {
             fresh.insert(0, number_hit);
         }
         if keep {
@@ -618,6 +697,14 @@ impl Shell {
             Target::Space(space) => self.go(Mode::Space(space), cx),
             // Their conversation if there is one; a new one only when there is not.
             Target::Person(person) => self.open_person(&person, cx),
+            Target::CreateGroup { account, members, name } => {
+                let request = Request::CreateGroup { account, members, name };
+                self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
+                    if let Ok(Response::Conversation { conversation }) = answer {
+                        this.select(conversation.key, &conversation.title, cx);
+                    }
+                });
+            }
             Target::Search(words) => {
                 if let Some(search) = self.slots.search {
                     search(self, words, window, cx);
@@ -718,6 +805,7 @@ impl Shell {
                 Avatar::new(key, &hit.title, 28.).shape(Shape::Place).image_at(icon).build()
             }
             Target::Person(person) => Avatar::new(&person.key, &person.name, 28.).image_at(self.person_picture(&person.key, cx)).build(),
+            Target::CreateGroup { .. } => div().size(px(28.)).flex_none().flex().items_center().justify_center().child(glyph("icons/users.svg", 16., theme::text_soft())),
             Target::Search(_) => div().size(px(28.)).flex_none().flex().items_center().justify_center().child(glyph("icons/search.svg", 16., theme::text_soft())),
             Target::Command(_) => div().size(px(28.)).flex_none().flex().items_center().justify_center().child(glyph("icons/command.svg", 16., theme::text_soft())),
             Target::Asking(words) => {
@@ -728,6 +816,7 @@ impl Shell {
             Target::Conversation(c) => Some(c.key.network),
             Target::Space(key) => Some(key.network),
             Target::Person(person) => Some(person.key.network),
+            Target::CreateGroup { account, .. } => Some(account.network),
             _ => None,
         };
         let trailing = match (&hit.target, hit.trailing) {
@@ -1185,5 +1274,21 @@ mod tests {
         assert!(text_number_hit("911", &accounts).is_none());
         assert!(text_number_hit("Grace", &accounts).is_none());
         assert!(text_number_hit("slack (555) 010-0099", &accounts).is_none());
+
+        let people = vec![
+            Person::new(Key::new(&accounts[0].key, "participant-grace"), "Grace Ombra"),
+            Person::new(Key::new(&accounts[0].key, "participant-alan"), "Alan Ferro"),
+        ];
+        let group = create_group_hit("Weekend: Grace, Alan, (555) 010-0099", &accounts, &people)
+            .expect("group creation hit");
+        assert!(group.title.contains("Weekend"));
+        assert!(group.context.contains("RCS") && group.context.contains("MMS"));
+        match group.target {
+            Target::CreateGroup { members, name, .. } => {
+                assert_eq!(name.as_deref(), Some("Weekend"));
+                assert_eq!(members, ["participant-grace", "participant-alan", "(555) 010-0099"]);
+            }
+            _ => panic!("expected Target::CreateGroup"),
+        }
     }
 }

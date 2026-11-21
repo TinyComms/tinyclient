@@ -2540,6 +2540,22 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::CreateGroup { account, members, name } => {
+                let started = self.ask(&account, |reply| Command::CreateGroup {
+                    members,
+                    name,
+                    reply,
+                });
+                let id = match started {
+                    Ok(id) => id,
+                    Err(refused) => return *refused,
+                };
+                match self.hub.store().conversation(&Key::new(&account, id)) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                    Ok(None) => error(ErrorCode::Internal, "group created, but not recorded"),
+                    Err(err) => internal(err),
+                }
+            }
             Request::StartThread { conversation, message } => self.start_thread(conversation, message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),

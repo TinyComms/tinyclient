@@ -334,6 +334,12 @@ pub enum Command {
     StartDirect { person_id: String, reply: Reply<String> },
     /// Tiny call setup can create encrypted text history without enrolling a text device.
     StartDirectCall { person_id: String, reply: Reply<String> },
+    /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
+    CreateGroup {
+        members: Vec<String>,
+        name: Option<String>,
+        reply: Reply<String>,
+    },
     /// The id of the thread a channel message starts. Discord only: create the thread channel,
     /// record it, and answer with its id. `name` is already one line, at most 100 characters.
     StartThread {
@@ -466,7 +472,11 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::StartDirectCall { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::StartDirect { reply, .. }
+            | Command::StartDirectCall { reply, .. }
+            | Command::CreateGroup { reply, .. }
+            | Command::StartThread { reply, .. }
+            | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
