@@ -619,7 +619,7 @@ mod tests {
             name: peer.into(),
             message_id: id.into(),
             outgoing,
-            note: protocol::CallNote { outcome, caller_id: peer.into(), seconds: None, video: false },
+            note: protocol::CallNote { outcome, caller_id: peer.into(), seconds: None, participants: Vec::new(), video: false },
             time: 100,
         };
         let list = vec![
