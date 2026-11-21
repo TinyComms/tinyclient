@@ -174,6 +174,9 @@ pub(crate) fn seal(
             sha256: info.sha256,
             width,
             height,
+            duration: 0,
+            voice: false,
+            waveform: Vec::new(),
         },
     })
 }

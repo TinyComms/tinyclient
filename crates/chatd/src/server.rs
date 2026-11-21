@@ -2284,6 +2284,35 @@ impl Chat {
         self.status()
     }
 
+    /// Wipes local session, history, and adapter state after `DELETE /v1/me` succeeded on the
+    /// server, without calling `DELETE /v1/session` or keeping history.
+    fn forget_deleted_tiny(&self, account: AccountKey) -> Response {
+        let _ = lock(&self.adapters).remove(&account);
+        let stored = match session::read(account.network) {
+            session::Stored::Found(session) => Some(session),
+            session::Stored::Absent => None,
+            session::Stored::Unreadable(why) => {
+                return error(ErrorCode::Internal, format!("The session could not be read from {}: {why}", session::STORE));
+            }
+        };
+        adapters::tiny::erase_history(&account.account);
+        let left = stored.and_then(|session| adapters::without(account.network, &session, &account.account));
+        match left {
+            Some(session) => {
+                if let Err(why) = session::save(account.network, &session) {
+                    if session::enabled() {
+                        return error(ErrorCode::Internal, why);
+                    }
+                }
+            }
+            None => session::forget(account.network),
+        }
+        self.forget(&account);
+        self.hub.set_link(&account, Link::SignedOut, "");
+        self.hub.changed(Change::Status);
+        self.status()
+    }
+
     /// A seat in a Tiny room's call, or someone else's taken away, over that server's live
     /// socket. The answer is the server's.
     fn tiny_call(&self, account: &AccountKey, may: &str, ids: &[String], ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
@@ -3156,6 +3185,17 @@ impl Chat {
                 Ok(()) => self.sign_out(account, false),
                 Err(answer) => answer,
             },
+            Request::TinyDeleteAccount { account } => match adapters::tiny::manage::delete_account(&account) {
+                Ok(()) => self.forget_deleted_tiny(account),
+                Err(answer) => answer,
+            },
+            Request::TinyReport { account, kind, target_id, category, note, evidence } => {
+                adapters::tiny::manage::report_create(account, kind, target_id, category, note, evidence)
+            }
+            Request::TinyEmojiList { account } => adapters::tiny::manage::emoji_list(account),
+            Request::TinyEmojiCreate { account, name, kind, path } => adapters::tiny::manage::emoji_create(account, name, kind, path),
+            Request::TinyEmojiRename { account, emoji_id, name } => adapters::tiny::manage::emoji_rename(account, emoji_id, name),
+            Request::TinyEmojiDelete { account, emoji_id } => adapters::tiny::manage::emoji_delete(account, emoji_id),
             Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
             Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
             Request::TinyAvatar { account, path } => adapters::tiny::manage::user_avatar(account, path),

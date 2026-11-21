@@ -980,11 +980,12 @@ impl Composer {
                 return;
             }
         };
+        let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
             silent: silent && controls.silent,
-            suppress_embeds: self.no_preview && controls.link_chip && !hosts.is_empty(),
+            suppress_embeds: (self.no_preview || tiny_previews_off) && controls.link_chip && !hosts.is_empty(),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
@@ -2394,7 +2395,42 @@ impl Composer {
         let rows = match (answer, target.space.as_deref()) {
             (Ok(Response::People { people, .. }), _) => {
                 self.hub.learn(&people);
-                complete::people(self.known(&target.key), people, &account, &trigger.query)
+                let mut rows = complete::people(self.known(&target.key), people, &account, &trigger.query);
+                if target.key.network == protocol::Network::Tiny {
+                    if let Some(shell) = self.shell.upgrade() {
+                        let shell = shell.read(cx);
+                        if let Some(community) = shell.tiny_state.community.as_ref().filter(|_| shell.tiny_state.account.as_ref() == Some(&account)) {
+                            let can_everyone = community.access.as_ref().is_some_and(|a| a.has(protocol::TINY_MENTION_EVERYONE));
+                            if can_everyone && mention::rank("everyone", "", &trigger.query).is_some() {
+                                rows.push(complete::Row {
+                                    kind: mention::Kind::Role,
+                                    key: Key::new(&account, "everyone"),
+                                    name: "everyone".to_owned(),
+                                    handle: String::new(),
+                                    second: "Notify everyone in this channel".to_owned(),
+                                    person: None,
+                                });
+                            }
+                            for role in &community.roles {
+                                if role.default || (!role.mentionable && !can_everyone) {
+                                    continue;
+                                }
+                                if mention::rank(&role.name, "", &trigger.query).is_some() {
+                                    rows.push(complete::Row {
+                                        kind: mention::Kind::Role,
+                                        key: Key::new(&account, &role.id),
+                                        name: role.name.clone(),
+                                        handle: String::new(),
+                                        second: "Role".to_owned(),
+                                        person: None,
+                                    });
+                                }
+                            }
+                            rows.truncate(complete::ROWS);
+                        }
+                    }
+                }
+                rows
             }
             (Ok(Response::Conversations { conversations, .. }), Some(space)) => complete::channels(conversations, &account, space, &trigger.query),
             _ => Vec::new(),
@@ -3097,7 +3133,8 @@ impl Composer {
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
         let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
-        let hosts = if self.controls().link_chip && unlocked { niceties::link_hosts(&text) } else { Vec::new() };
+        let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
+        let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
             let suppressed = self.no_preview;
             div()

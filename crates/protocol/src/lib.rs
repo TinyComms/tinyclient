@@ -1959,6 +1959,44 @@ pub enum Request {
     TinySignOutEverywhere {
         account: AccountKey,
     },
+    /// Permanently deletes this account on the Tiny server (`DELETE /v1/me` with confirmation),
+    /// then wipes this install's local session, keys, and cache for that server. Answers `Status`.
+    TinyDeleteAccount {
+        account: AccountKey,
+    },
+    /// Files an abuse report on a Tiny server (`POST /v1/reports`). Answers `TinyReported`.
+    TinyReport {
+        account: AccountKey,
+        kind: String,
+        target_id: String,
+        category: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+    },
+    /// Lists a Tiny server's custom emoji and stickers (`GET /v1/emoji`). Answers `TinyEmojiList`.
+    TinyEmojiList {
+        account: AccountKey,
+    },
+    /// Uploads a new custom emoji or sticker (`POST /v1/emoji`). Answers `Ok`.
+    TinyEmojiCreate {
+        account: AccountKey,
+        name: String,
+        kind: String,
+        path: String,
+    },
+    /// Renames a custom emoji or sticker (`PATCH /v1/emoji/{id}`). Answers `Ok`.
+    TinyEmojiRename {
+        account: AccountKey,
+        emoji_id: String,
+        name: String,
+    },
+    /// Deletes a custom emoji or sticker (`DELETE /v1/emoji/{id}`). Answers `Ok`.
+    TinyEmojiDelete {
+        account: AccountKey,
+        emoji_id: String,
+    },
     /// Makes a room, for an owner or an admin. Its call is empty until someone joins.
     TinyRoomCreate {
         account: AccountKey,
@@ -2697,6 +2735,15 @@ pub enum Response {
     TinyBotCreated {
         bot: TinyBot,
         token: String,
+    },
+    /// An abuse report was accepted (`POST /v1/reports`). `duplicate` is true on `200` when the
+    /// same reporter already has an open or reviewing report on this target.
+    TinyReported {
+        duplicate: bool,
+    },
+    /// A Tiny server's community custom emoji and stickers (`GET /v1/emoji`).
+    TinyEmojiList {
+        items: Vec<TinyEmoji>,
     },
     /// What `E2eeAsk::Status` asked.
     TinyE2ee {

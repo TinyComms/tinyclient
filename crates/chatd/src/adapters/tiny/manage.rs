@@ -17,10 +17,10 @@
 use super::{asked, endpoint, explain, open, refused, rows, safe_id, tiny_name, Missing, Saved, CHECK, NOT_YOURS, UNREACHABLE, UNREADABLE};
 use protocol::{
     tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyCapabilities, TinyCategory, TinyCode,
-    TinyBot, TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
+    TinyBot, TinyEmoji, TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
     TinyClaimLink, TinyPasskeys, TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
-    TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
-    TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
+    TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_ABUSE_REPORTS, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
+    TINY_FEATURE_CATEGORIES, TINY_FEATURE_CUSTOM_EMOJI, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_STICKERS, TINY_FEATURE_TIMEOUTS,
     TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
     TINY_WELCOME_MAX,
 };
@@ -49,6 +49,15 @@ const ICON_SIZE: &str = "That picture is too big. The most is 256 KB.";
 const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
 const PASSKEY_LABEL_MAX: usize = 60;
 const PASSKEY_GONE: &str = "That passkey is gone.";
+pub(crate) const DELETE_LAST_OWNER: &str = "You're the only owner. Hand the server to someone first.";
+const REPORT_NOTE_MAX: usize = 2000;
+const REPORT_EVIDENCE_MAX: usize = 32_768;
+const REPORT_KINDS: [&str; 3] = ["message", "member", "channel"];
+const REPORT_CATEGORIES: [&str; 8] = ["spam", "harassment", "hate", "violence", "sexual", "illegal", "impersonation", "other"];
+pub(crate) const REPORT_RATE_LIMIT: &str = "You've sent a lot of reports. Try again later.";
+pub(crate) const REPORT_NOT_FOUND: &str = "That is no longer available.";
+const REPORT_NOTE_SIZE: &str = "A note is at most 2000 characters.";
+const REPORT_EVIDENCE_SIZE: &str = "That message is too long to attach as evidence.";
 /// The longest reason the audit keeps from here.
 const REASON_MAX: usize = 500;
 /// The longest value of a setup choice, such as `activity_visibility`'s `everyone`, and the longest
@@ -73,6 +82,8 @@ pub(crate) struct Known {
     pub seats: HashMap<String, Vec<TinySeat>>,
     /// The sign-in provider's name, once asked (empty when the server did not say).
     pub provider: Option<String>,
+    /// Community custom emoji and stickers last fetched from `GET /v1/emoji`.
+    pub emoji: Vec<TinyEmoji>,
 }
 
 static KNOWN: Mutex<BTreeMap<String, Known>> = Mutex::new(BTreeMap::new());
@@ -1413,6 +1424,264 @@ fn created_bot(body: Value) -> Option<(TinyBot, String)> {
     let token = body.get("token").and_then(Value::as_str).filter(|token| !token.is_empty())?.to_owned();
     let bot = serde_json::from_value(body).ok()?;
     Some((bot, token))
+}
+
+/// Permanently deletes this account on the server (`DELETE /v1/me`). On 2xx, wipes local E2EE
+/// state and cached knowledge for this server without calling `DELETE /v1/session`. On any refusal
+/// (including `409 last_owner`), nothing local is wiped.
+pub(crate) fn delete_account(account: &AccountKey) -> Result<(), Response> {
+    let saved = open(account)?;
+    match asked("DELETE", &saved, "/v1/me", Some(json!({ "confirm": "delete my account" }))) {
+        Err(detail) => Err(refused(detail)),
+        Ok((200..=299, _)) => {
+            super::e2ee::forget_local(&saved);
+            crate::hub::lock(&KNOWN).remove(&key(&saved));
+            Ok(())
+        }
+        Ok((409, body)) if body.get("error").and_then(Value::as_str) == Some("last_owner") => {
+            Err(refused(DELETE_LAST_OWNER))
+        }
+        Ok((status, body)) => Err(refused(explain(status, &body, Missing::Plain))),
+    }
+}
+
+/// Files an abuse report (`POST /v1/reports`) for a message, member, or channel.
+/// Never logs `note` or `evidence`.
+pub(crate) fn report_create(
+    account: AccountKey,
+    kind: String,
+    target_id: String,
+    category: String,
+    note: Option<String>,
+    evidence: Option<String>,
+) -> Response {
+    if !REPORT_KINDS.contains(&kind.as_str()) || !safe_id(&target_id) || !REPORT_CATEGORIES.contains(&category.as_str()) {
+        return refused(CHECK);
+    }
+    let has_disallowed_control = |text: &str| text.chars().any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'));
+    let note = match note {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.chars().count() > REPORT_NOTE_MAX {
+                return refused(REPORT_NOTE_SIZE);
+            } else if has_disallowed_control(trimmed) {
+                return refused(CHECK);
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        None => None,
+    };
+    let evidence = match evidence {
+        Some(raw) if !raw.is_empty() => {
+            if raw.len() > REPORT_EVIDENCE_MAX {
+                return refused(REPORT_EVIDENCE_SIZE);
+            }
+            if has_disallowed_control(&raw) {
+                return refused(CHECK);
+            }
+            Some(raw)
+        }
+        _ => None,
+    };
+    let saved = match allowed(&account, Some(TINY_FEATURE_ABUSE_REPORTS), "community.members.read") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let mut payload = Map::new();
+    payload.insert("kind".to_owned(), Value::String(kind));
+    payload.insert("target_id".to_owned(), Value::String(target_id));
+    payload.insert("category".to_owned(), Value::String(category));
+    if let Some(note) = note {
+        payload.insert("note".to_owned(), Value::String(note));
+    }
+    if let Some(evidence) = evidence {
+        payload.insert("evidence".to_owned(), Value::String(evidence));
+    }
+    match asked("POST", &saved, "/v1/reports", Some(Value::Object(payload))) {
+        Err(detail) => refused(detail),
+        Ok((201, body)) => Response::TinyReported {
+            duplicate: body.get("duplicate").and_then(Value::as_bool).unwrap_or(false),
+        },
+        Ok((200, body)) => Response::TinyReported {
+            duplicate: body.get("duplicate").and_then(Value::as_bool).unwrap_or(true),
+        },
+        Ok((429, _)) => refused(REPORT_RATE_LIMIT),
+        Ok((404, _)) => refused(REPORT_NOT_FOUND),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// Validates a Tiny custom emoji / sticker name: 2 to 32 lowercase ASCII alphanumerics or `_`.
+pub(crate) fn valid_emoji_name(name: &str) -> bool {
+    let len = name.len();
+    (2..=32).contains(&len) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Fetches `GET /v1/emoji` and caches the list in [`KNOWN`]. Also downloads each image into the
+/// local media directory up front so displaying an encrypted message never triggers an on-demand
+/// request for an emoji image.
+pub(crate) fn fetch_emoji_set(saved: &Saved, account: &AccountKey) -> Vec<TinyEmoji> {
+    let Ok((200, body)) = asked("GET", saved, "/v1/emoji", None) else {
+        return Vec::new();
+    };
+    let mut items: Vec<TinyEmoji> = serde_json::from_value(body).unwrap_or_default();
+    items.retain(|item| safe_id(&item.id) && !item.name.is_empty());
+    for item in &mut items {
+        if item.kind.is_empty() {
+            item.kind = "emoji".to_owned();
+        }
+        if let Some(path) = emoji_file(saved, account, item) {
+            item.path = path.to_string_lossy().into_owned();
+        }
+    }
+    remember(saved, |known| known.emoji = items.clone());
+    items
+}
+
+fn emoji_file(saved: &Saved, account: &AccountKey, item: &TinyEmoji) -> Option<PathBuf> {
+    let key_part = if !item.sha256.is_empty() && item.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("tiny-emoji-{}-{}", item.id, &item.sha256[..item.sha256.len().min(16)])
+    } else {
+        format!("tiny-emoji-{}", item.id)
+    };
+    let path = crate::blobs::path_of(&protocol::support_dir().join("media"), account, &key_part);
+    if path.is_file() {
+        return Some(path);
+    }
+    let response = super::agent()
+        .get(&endpoint(&saved.base_url, &format!("/v1/emoji/{}", item.id)))
+        .header("Authorization", &format!("Bearer {}", saved.token))
+        .call()
+        .ok()?;
+    if response.status().as_u16() != 200 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    response.into_body().into_reader().take(512 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() || bytes.len() > 512 * 1024 {
+        return None;
+    }
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let partial = path.with_extension("part");
+    std::fs::write(&partial, &bytes).ok()?;
+    std::fs::rename(&partial, &path).ok()?;
+    Some(path)
+}
+
+/// Lists community custom emoji and stickers (`GET /v1/emoji`).
+pub(crate) fn emoji_list(account: AccountKey) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let items = fetch_emoji_set(&saved, &account);
+    Response::TinyEmojiList { items }
+}
+
+/// Uploads a new custom emoji or sticker (`POST /v1/emoji`, multipart).
+pub(crate) fn emoji_create(account: AccountKey, name: String, kind: String, path: String) -> Response {
+    let name = name.trim().to_ascii_lowercase();
+    if !valid_emoji_name(&name) {
+        return refused("Name must be 2 to 32 lowercase letters, numbers, or underscores.");
+    }
+    let kind = if kind == "sticker" { "sticker" } else { "emoji" };
+    let feature = if kind == "sticker" { TINY_FEATURE_STICKERS } else { TINY_FEATURE_CUSTOM_EMOJI };
+    let saved = match allowed(&account, Some(feature), "community.server.edit") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let real = match crate::blobs::upload::allowed(&path) {
+        Ok((real, _)) => real,
+        Err(why) => return refused(&format!("That picture {why}")),
+    };
+    let max_bytes: u64 = if kind == "sticker" { 512 * 1024 } else { 256 * 1024 };
+    let mut bytes = Vec::new();
+    if std::fs::File::open(&real).and_then(|f| f.take(max_bytes + 1).read_to_end(&mut bytes)).is_err() {
+        return refused("That picture couldn't be read.");
+    }
+    if bytes.len() as u64 > max_bytes {
+        return refused(if kind == "sticker" { "That sticker is too big. The most is 512 KB." } else { "That emoji is too big. The most is 256 KB." });
+    }
+    let mime = image_kind(&bytes).or_else(|| bytes.starts_with(b"GIF8").then_some("image/gif"));
+    let Some(mime) = mime else {
+        return refused("That picture isn't a PNG, JPEG, WebP, or GIF.");
+    };
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    };
+    let boundary = format!("----tinyemoji{}", crate::hub::now());
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n{name}\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"kind\"\r\n\r\n{kind}\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}.{ext}\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes());
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let response = super::agent()
+        .post(&endpoint(&saved.base_url, "/v1/emoji"))
+        .header("Authorization", &format!("Bearer {}", saved.token))
+        .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .send(&body[..]);
+    match response {
+        Err(_) => refused(UNREACHABLE),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.into_body().read_to_string().unwrap_or_default();
+            let val: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            match status {
+                200 | 201 => {
+                    let _ = fetch_emoji_set(&saved, &account);
+                    Response::Ok
+                }
+                409 if val.get("error").and_then(Value::as_str) == Some("name_taken") => refused("That name is already taken."),
+                409 if val.get("error").and_then(Value::as_str) == Some("emoji_limit") => refused("This server has reached its custom emoji limit."),
+                _ => refused(explain(status, &val, Missing::Plain)),
+            }
+        }
+    }
+}
+
+/// Renames a custom emoji or sticker (`PATCH /v1/emoji/{id}`).
+pub(crate) fn emoji_rename(account: AccountKey, emoji_id: String, name: String) -> Response {
+    let name = name.trim().to_ascii_lowercase();
+    if !safe_id(&emoji_id) || !valid_emoji_name(&name) {
+        return refused("Name must be 2 to 32 lowercase letters, numbers, or underscores.");
+    }
+    let saved = match allowed(&account, Some(TINY_FEATURE_CUSTOM_EMOJI), "community.server.edit") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("PATCH", &saved, &format!("/v1/emoji/{emoji_id}"), Some(json!({ "name": name }))) {
+        Err(detail) => refused(detail),
+        Ok((200..=299, _)) => {
+            let _ = fetch_emoji_set(&saved, &account);
+            Response::Ok
+        }
+        Ok((409, body)) if body.get("error").and_then(Value::as_str) == Some("name_taken") => refused("That name is already taken."),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// Deletes a custom emoji or sticker (`DELETE /v1/emoji/{id}`).
+pub(crate) fn emoji_delete(account: AccountKey, emoji_id: String) -> Response {
+    if !safe_id(&emoji_id) {
+        return refused(CHECK);
+    }
+    let saved = match allowed(&account, Some(TINY_FEATURE_CUSTOM_EMOJI), "community.server.edit") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let res = sent(&saved, "DELETE", &format!("/v1/emoji/{emoji_id}"), None, Missing::Plain);
+    if res == Response::Ok {
+        let _ = fetch_emoji_set(&saved, &account);
+    }
+    res
 }
 
 /// The checks before a call request goes to the live socket: the server has the feature, this

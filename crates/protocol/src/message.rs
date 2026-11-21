@@ -196,7 +196,9 @@ impl Attachment {
     }
 }
 
-/// A link's card, as the network built it. tinyclient never fetches the link itself.
+/// A link's card, as the network or sender built it. Readers never fetch the linked site;
+/// on Tiny servers, only the sender's device fetches the page before sending when link
+/// previews are enabled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
     pub url: String,

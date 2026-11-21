@@ -759,7 +759,7 @@ mod tests {
     }
 
     fn role(id: &str, name: &str, position: i32, hoist: bool) -> TinyRole {
-        TinyRole { id: id.into(), name: name.into(), color: Some("#3FBF7A".into()), position, permissions: TINY_ALL, hoist, default: position == 0, member_count: 0 }
+        TinyRole { id: id.into(), name: name.into(), color: Some("#3FBF7A".into()), position, permissions: TINY_ALL, hoist, mentionable: false, default: position == 0, member_count: 0 }
     }
 
     fn seated(room: &str, people: &[&str]) -> TinyRoom {
