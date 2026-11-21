@@ -1918,6 +1918,12 @@ impl Shell {
         pane
     }
 
+    /// Opens a web link the way a message link does: parse it, then confirm or strip tracking.
+    pub(in crate::gui) fn open_web_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.pane(cx);
+        pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
+    }
+
     /// My own id on the account a conversation belongs to.
     fn me(&self, conversation: &Key) -> String {
         let account = conversation.account();

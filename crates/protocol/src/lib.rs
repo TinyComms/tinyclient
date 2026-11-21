@@ -2666,7 +2666,12 @@ pub enum Change {
     /// A Space's groups or conversations: ask `Tree`.
     Tree { space: Key },
     /// The owned lists or a search result: ask `People`.
-    People { account: AccountKey },
+    /// `person` set means only that profile changed (a private note). Unset means the list.
+    People {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<Key>,
+    },
     /// Rows of a conversation's member list were added, removed or moved: ask `Members` again
     /// for the rows on screen.
     Members { conversation: Key },
@@ -2745,8 +2750,8 @@ impl Change {
             (Change::Spaces { account: a }, Change::Spaces { account: b })
             | (Change::Folders { account: a }, Change::Folders { account: b })
             | (Change::Searched { account: a, .. }, Change::Searched { account: b, .. })
-            | (Change::People { account: a }, Change::People { account: b })
             | (Change::Tiny { account: a }, Change::Tiny { account: b }) => a == b,
+            (Change::People { account: a, person: pa }, Change::People { account: b, person: pb }) => a == b && pa == pb,
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
             }

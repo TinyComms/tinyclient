@@ -393,6 +393,12 @@ impl Shell {
         if super::phone::active() {
             return self.phone_back(Some(window), cx);
         }
+        // The invite dialog is painted above the switcher, so Escape closes it first.
+        if self.sidebar_state.create_invite.is_some() {
+            self.sidebar_state.create_invite = None;
+            cx.notify();
+            return true;
+        }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {

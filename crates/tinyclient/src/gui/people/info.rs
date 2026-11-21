@@ -182,6 +182,7 @@ impl InfoPane {
     /// Those hooks run inside the shell's own update, so what the shell holds is read a moment
     /// later; the head is drawn at once.
     pub fn show(&mut self, person: Key, cx: &mut Context<Self>) {
+        self.release_note(Some(&person), cx);
         let subject = Subject::Person { key: person.clone(), space: None };
         if self.subject.as_ref().and_then(|subject| match subject {
             Subject::Person { key, .. } => Some(key),
@@ -221,6 +222,7 @@ impl InfoPane {
         direct: Option<Conversation>,
         cx: &mut Context<Self>,
     ) {
+        self.release_note(Some(&person), cx);
         let subject = Subject::Person { key: person.clone(), space: space.clone() };
         // Their presence is drawn, so it is watched for as long as the pane shows them.
         self.hub.watch("info", [person.clone()], cx);
@@ -314,12 +316,14 @@ impl InfoPane {
         self.note_error = None;
     }
 
-    fn save_note(&mut self, cx: &mut Context<Self>) {
+    /// Saves a dirty note. `force` sends even when a save is already in flight, so switching
+    /// the subject does not drop the latest text.
+    fn write_note(&mut self, cx: &mut Context<Self>, force: bool) {
         let Some((person, input)) = self.note_input.clone() else {
             return;
         };
         let text = input.read(cx).text().to_owned();
-        if text == self.note_baseline || self.note_saving || only_draws() {
+        if text == self.note_baseline || only_draws() || (!force && self.note_saving) {
             return;
         }
         if text.chars().count() > 256 {
@@ -335,25 +339,51 @@ impl InfoPane {
         let saved_text = text.clone();
         super::ask_later(cx, Request::SetNote { person: person.clone(), text }, move |answer, cx| {
             let _ = this.update(cx, |this, cx| {
-                this.note_saving = false;
-                match answer {
-                    Ok(Response::Ok) => {
-                        this.note_baseline = saved_text.clone();
-                        this.note_saved = true;
-                        this.note_error = None;
-                        if let Answer::Got(profile) = &mut this.profile {
-                            if profile.person.key == person {
-                                profile.note = saved_text;
-                            }
+                let still = this.note_input.as_ref().is_some_and(|(key, _)| key == &person);
+                let profile_hit = matches!(&this.profile, Answer::Got(profile) if profile.person.key == person);
+                if still {
+                    this.note_saving = false;
+                    match &answer {
+                        Ok(Response::Ok) => {
+                            this.note_baseline = saved_text.clone();
+                            this.note_saved = true;
+                            this.note_error = None;
                         }
+                        Ok(Response::Error { detail, .. }) => this.note_error = Some(detail.clone()),
+                        Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
+                        Err(err) => this.note_error = Some(err.to_string()),
                     }
-                    Ok(Response::Error { detail, .. }) => this.note_error = Some(detail),
-                    Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
-                    Err(err) => this.note_error = Some(err.to_string()),
                 }
-                cx.notify();
+                if profile_hit {
+                    if let (Ok(Response::Ok), Answer::Got(profile)) = (&answer, &mut this.profile) {
+                        profile.note = saved_text;
+                    }
+                }
+                if still || profile_hit {
+                    cx.notify();
+                }
             });
         });
+    }
+
+    fn save_note(&mut self, cx: &mut Context<Self>) {
+        self.write_note(cx, false);
+    }
+
+    /// Sends the latest note, then forgets the editor when `next` is not that person.
+    fn release_note(&mut self, next: Option<&Key>, cx: &mut Context<Self>) {
+        let current = self.note_input.as_ref().map(|(key, _)| key);
+        if current == next {
+            return;
+        }
+        if current.is_some() {
+            self.write_note(cx, true);
+            self.note_input = None;
+            self.note_baseline.clear();
+            self.note_saving = false;
+            self.note_saved = false;
+            self.note_error = None;
+        }
     }
 
     /// Re-fetches the open person's profile when `Change::People` signals a live update (e.g. `USER_NOTE_UPDATE`).
@@ -392,6 +422,7 @@ impl InfoPane {
 
     /// Puts a conversation's details in the pane. `row` is drawn at once; the answer adds the rest.
     pub(in crate::gui) fn show_conversation(&mut self, key: Key, row: Option<Conversation>, cx: &mut Context<Self>) {
+        self.release_note(None, cx);
         self.hub.watch("info", [], cx);
         let same = self.subject.as_ref() == Some(&Subject::Conversation(key.clone()));
         self.subject = Some(Subject::Conversation(key.clone()));
@@ -456,6 +487,7 @@ impl InfoPane {
 
     /// Puts a Space's own details in the pane.
     pub(in crate::gui) fn show_space(&mut self, space: Key, known: Option<Space>, cx: &mut Context<Self>) {
+        self.release_note(None, cx);
         self.hub.watch("info", [], cx);
         let same = self.subject.as_ref() == Some(&Subject::Space(space.clone()));
         self.subject = Some(Subject::Space(space.clone()));
@@ -485,7 +517,7 @@ impl InfoPane {
 
     /// The pane was closed: nobody in it is drawn any more.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
-        self.save_note(cx);
+        self.release_note(None, cx);
         self.hub.watch("info", [], cx);
         self.subject = None;
     }
@@ -852,7 +884,10 @@ impl InfoPane {
                 for (ix, conn) in profile.connections.iter().enumerate() {
                     let url = conn.url.clone();
                     let row = draw::connection_row(("info-conn", ix), conn).when(!url.is_empty(), |row| {
-                        row.on_click(move |_, _, cx| cx.open_url(&url))
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            let url = url.clone();
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_web_link(&url, window, cx));
+                        }))
                     });
                     sections = sections.child(row);
                 }

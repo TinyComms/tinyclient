@@ -443,7 +443,9 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
-    const CREATE_INVITE: i64 = 1 << 8;
+    // Bits 8..=11 are thread rights and bit 12 is slowmode exemption on the Discord
+    // thread lane, so an invite right cannot share them. The review asked for bit 12.
+    const CREATE_INVITE: i64 = 1 << 13;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()

@@ -184,7 +184,20 @@ impl Floating {
         self.open.is_some()
     }
 
+    /// The person whose card is up, when the float is a profile card.
+    pub fn card_person(&self) -> Option<&Key> {
+        match self.open.as_ref() {
+            Some((Float::Card(person), _)) => Some(person),
+            _ => None,
+        }
+    }
+
     pub fn open(&mut self, float: Float, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        let next = match &float {
+            Float::Card(person) => Some(person),
+            _ => None,
+        };
+        self.release_note(next, cx);
         // On a phone a person's card is their Profile page, never a popover over the screen.
         if let (true, Float::Card(person)) = (crate::gui::phone::active(), &float) {
             let person = person.clone();
@@ -291,12 +304,14 @@ impl Floating {
         self.note_error = None;
     }
 
-    fn save_note(&mut self, cx: &mut Context<Self>) {
+    /// Saves a dirty note. `force` sends even when a save is already in flight, so switching
+    /// people does not drop the latest text.
+    fn write_note(&mut self, cx: &mut Context<Self>, force: bool) {
         let Some((person, input)) = self.note_input.clone() else {
             return;
         };
         let text = input.read(cx).text().to_owned();
-        if text == self.note_baseline || self.note_saving || only_draws() {
+        if text == self.note_baseline || only_draws() || (!force && self.note_saving) {
             return;
         }
         if text.chars().count() > 256 {
@@ -312,23 +327,53 @@ impl Floating {
         let saved_text = text.clone();
         super::ask_later(cx, Request::SetNote { person: person.clone(), text }, move |answer, cx| {
             let _ = this.update(cx, |this, cx| {
-                this.note_saving = false;
-                match answer {
-                    Ok(Response::Ok) => {
-                        this.note_baseline = saved_text.clone();
-                        this.note_saved = true;
-                        this.note_error = None;
-                        if let Some(profile) = this.profile.as_mut().filter(|p| p.person.key == person) {
+                let still = this.note_input.as_ref().is_some_and(|(key, _)| key == &person);
+                let profile_hit = this.profile.as_ref().is_some_and(|profile| profile.person.key == person);
+                if still {
+                    this.note_saving = false;
+                    match &answer {
+                        Ok(Response::Ok) => {
+                            this.note_baseline = saved_text.clone();
+                            this.note_saved = true;
+                            this.note_error = None;
+                        }
+                        Ok(Response::Error { detail, .. }) => this.note_error = Some(detail.clone()),
+                        Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
+                        Err(err) => this.note_error = Some(err.to_string()),
+                    }
+                }
+                if profile_hit {
+                    if let Ok(Response::Ok) = &answer {
+                        if let Some(profile) = this.profile.as_mut() {
                             profile.note = saved_text;
                         }
                     }
-                    Ok(Response::Error { detail, .. }) => this.note_error = Some(detail),
-                    Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
-                    Err(err) => this.note_error = Some(err.to_string()),
                 }
-                cx.notify();
+                if still || profile_hit {
+                    cx.notify();
+                }
             });
         });
+    }
+
+    fn save_note(&mut self, cx: &mut Context<Self>) {
+        self.write_note(cx, false);
+    }
+
+    /// Sends the latest note for whoever is open, then forgets the editor when `next` is someone else.
+    fn release_note(&mut self, next: Option<&Key>, cx: &mut Context<Self>) {
+        let current = self.note_input.as_ref().map(|(key, _)| key);
+        if current == next {
+            return;
+        }
+        if current.is_some() {
+            self.write_note(cx, true);
+            self.note_input = None;
+            self.note_baseline.clear();
+            self.note_saving = false;
+            self.note_saved = false;
+            self.note_error = None;
+        }
     }
 
     /// Re-fetches the open card's profile when `Change::People` signals a live update (e.g. `USER_NOTE_UPDATE`).
@@ -359,6 +404,11 @@ impl Floating {
 
     /// Swaps what floats for something else in the same place.
     fn turn_to(&mut self, float: Float, cx: &mut Context<Self>) {
+        let next = match &float {
+            Float::Card(person) => Some(person),
+            _ => None,
+        };
+        self.release_note(next, cx);
         let anchor = self.open.as_ref().map(|(_, anchor)| *anchor).unwrap_or_default();
         self.open = Some((float, anchor));
         self.opened += 1;
@@ -367,7 +417,7 @@ impl Floating {
 
     /// The shell is told after this update: a float may be closed from inside the shell's own.
     fn close(&mut self, cx: &mut Context<Self>) {
-        self.save_note(cx);
+        self.release_note(None, cx);
         if self.open.take().is_some() {
             self.hub.watch("profile", [], cx);
             let shell = self.shell.clone();
@@ -521,7 +571,10 @@ impl Floating {
                 for (ix, conn) in profile.connections.iter().take(4).enumerate() {
                     let url = conn.url.clone();
                     let row = draw::connection_row(("card-conn", ix), conn).when(!url.is_empty(), |row| {
-                        row.on_click(move |_, _, cx| cx.open_url(&url))
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            let url = url.clone();
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_web_link(&url, window, cx));
+                        }))
                     });
                     conns = conns.child(row);
                 }
@@ -948,11 +1001,22 @@ impl Floating {
                             cx,
                         );
                     }))
-                    .child(crate::gui::components::glyph(
-                        if silent { "icons/square-check.svg" } else { "icons/square.svg" },
-                        16.,
-                        if silent { theme::accent() } else { theme::text_soft() },
-                    ))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_none()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(if silent { theme::accent() } else { theme::border() })
+                            .bg(if silent { theme::accent() } else { theme::canvas() })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(silent, |box_el| {
+                                box_el.child(crate::gui::components::glyph("icons/check.svg", 10., theme::on_accent()))
+                            }),
+                    )
                     .child("Leave without telling the group"),
             );
         }

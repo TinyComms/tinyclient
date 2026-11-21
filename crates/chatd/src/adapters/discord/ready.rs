@@ -747,6 +747,7 @@ impl Discord {
                 row.rights.add_members = true;
                 row.rights.rename = true;
                 row.rights.edit_picture = true;
+                row.rights.create_invite = true;
                 row.rights.remove_members = !owner.is_empty() && owner == state.me;
                 // A create or update can carry recipient ids and no user objects. Resolving
                 // nobody must not replace the list READY already recorded, while still updating
@@ -1051,13 +1052,25 @@ impl Discord {
             _ => Presence::Online,
         };
         let clock_ms = (now().max(0) as u64).saturating_mul(1000);
-        if custom.expires_at_ms.is_some_and(|ms| ms <= clock_ms) {
+        let expired = custom.expires_at_ms.is_some_and(|ms| ms <= clock_ms);
+        if expired {
             custom = proto::CustomStatus::default();
         }
+        let stored = if expired {
+            let word_out = match presence {
+                Presence::Idle => "idle",
+                Presence::Dnd => "dnd",
+                Presence::Offline => "invisible",
+                _ => "online",
+            };
+            proto::with_custom_status(&status, word_out, Some(&proto::CustomStatus::default()))
+        } else {
+            status
+        };
         let until = custom.expires_at_ms.map(|ms| (ms / 1000) as i64);
         let me = {
             let mut state = self.state.lock().unwrap();
-            state.status_settings = status;
+            state.status_settings = stored;
             state.own = (presence, custom.text.clone());
             state.own_emoji = custom.emoji_name.clone();
             state.own_emoji_id = custom.emoji_id;
@@ -1241,7 +1254,7 @@ impl Discord {
             return self.category_changed(&guild, &channel);
         }
         let me = self.me();
-        let (row, muted, heads, invite_became_true) = {
+        let (row, muted, heads, invite_became_true, invite_lost) = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(&guild) else {
                 return Ok(());
@@ -1264,14 +1277,21 @@ impl Discord {
             } else {
                 false
             };
+            let this_can = row.as_ref().is_some_and(|r| r.rights.create_invite);
+            let invite_lost = info.can_invite && !this_can;
             let muted = info.quiet.mutes(&channel.id, channel.parent_id.as_deref(), now());
-            (row, muted, heads, invite_became_true)
+            (row, muted, heads, invite_became_true, invite_lost)
         };
         if let Some(head) = heads {
             self.ctx.group(&guild, &head)?;
         }
         if invite_became_true {
             self.ctx.set_space_can_create_invites(&guild, true)?;
+        } else if invite_lost && self.invite_channel(&guild).is_none() {
+            if let Some(info) = self.state.lock().unwrap().guilds.get_mut(&guild) {
+                info.can_invite = false;
+            }
+            self.ctx.set_space_can_create_invites(&guild, false)?;
         }
         match row {
             Some(mut row) => {
@@ -1309,21 +1329,33 @@ impl Discord {
     }
 
     pub(super) fn channel_deleted(&self, channel: Channel) -> Result<(), Failure> {
-        let category = {
+        let (category, had_invite) = {
             let mut state = self.state.lock().unwrap();
             state.privates.remove(&channel.id);
             state.directs.retain(|_, id| *id != channel.id);
             state.covered.remove(&channel.id);
+            let had_invite = channel
+                .guild_id
+                .as_ref()
+                .and_then(|guild| state.guilds.get(guild))
+                .is_some_and(|info| info.can_invite);
             let info = channel.guild_id.as_ref().and_then(|guild| state.guilds.get_mut(guild));
-            info.is_some_and(|info| {
+            let category = info.is_some_and(|info| {
                 info.channels.retain(|(id, _)| *id != number(&channel.id));
                 info.categories.remove(&channel.id).is_some()
-            })
+            });
+            (category, had_invite)
         };
         if let Some(guild) = &channel.guild_id {
             self.keep(guild, |kept| kept.retain(|known| known.id != channel.id));
             if category {
                 self.ctx.group_gone(guild, &channel.id)?;
+            }
+            if had_invite && self.invite_channel(guild).is_none() {
+                if let Some(info) = self.state.lock().unwrap().guilds.get_mut(guild) {
+                    info.can_invite = false;
+                }
+                self.ctx.set_space_can_create_invites(guild, false)?;
             }
         }
         if self.ctx.known(&channel.id)?.is_some() {
@@ -1529,6 +1561,14 @@ impl Discord {
                 }
             }
             let expired_status = if state.own_status_until.is_some_and(|until| until <= clock) {
+                let word = match state.own.0 {
+                    Presence::Idle => "idle",
+                    Presence::Dnd => "dnd",
+                    Presence::Offline => "invisible",
+                    _ => "online",
+                };
+                let cleared = proto::with_custom_status(&state.status_settings, word, Some(&proto::CustomStatus::default()));
+                state.status_settings = cleared;
                 state.own.1.clear();
                 state.own_emoji.clear();
                 state.own_emoji_id = None;

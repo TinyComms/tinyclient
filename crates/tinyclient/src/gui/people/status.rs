@@ -110,6 +110,20 @@ fn summary(scene: &Scene) -> String {
 /// Quick-pick status emojis offered in the rich status editor.
 const STATUS_EMOJIS: [&str; 6] = ["📅", "🌴", "🤒", "🏠", "🚌", "💬"];
 
+/// How long until a custom status clears, for the menu under the clear-after chips.
+fn clears_line(until: i64) -> String {
+    let left = until.saturating_sub(crate::view::now());
+    if left >= 86_400 {
+        format!("Clears in {}d", left / 86_400)
+    } else if left >= 3_600 {
+        format!("Clears in {}h", left / 3_600)
+    } else if left >= 60 {
+        format!("Clears in {}m", left / 60)
+    } else {
+        "Clears soon".to_owned()
+    }
+}
+
 /// Preset expiration choices for "Clear after" in the rich status editor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ClearAfter {
@@ -651,6 +665,11 @@ impl StatusMenu {
                         }))
                 }));
             status_box = status_box.child(emoji_row).child(clear_row);
+            if let Some(until) = own.status_until.filter(|&until| until > crate::view::now()) {
+                status_box = status_box.child(
+                    div().type_micro().text_color(theme::text_faint()).child(clears_line(until)),
+                );
+            }
         }
         choices.child(status_box.when(unsent, |status| {
             status.child(div().type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label("Return sets it.")))

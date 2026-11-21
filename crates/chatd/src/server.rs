@@ -1668,9 +1668,10 @@ impl Chat {
             return *refused;
         }
         let person_id = person.id.clone();
+        let saved = text.clone();
         match self.ask(&account, |reply| Command::SetNote { person_id, text, reply }) {
             Ok(()) => {
-                self.hub.profiles.forget_where(|(key, _)| *key == person);
+                self.hub.profiles.update_where(|(key, _)| *key == person, |profile| profile.note = saved.clone());
                 Response::Ok
             }
             Err(refused) => *refused,

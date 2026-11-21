@@ -44,6 +44,21 @@ pub(super) struct MessageSearch {
     remembered: std::collections::VecDeque<(SearchScope, String, Vec<MessageHit>)>,
 }
 
+/// The file's magic matches the extension. A renamed text file is not an image.
+fn image_magic(ext: &str, bytes: &[u8]) -> bool {
+    let png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+    let jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    let gif = bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a");
+    let webp = bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP";
+    match ext {
+        "png" => png,
+        "jpg" | "jpeg" => jpeg,
+        "gif" => gif,
+        "webp" => webp,
+        _ => false,
+    }
+}
+
 fn refused(why: impl std::fmt::Display) -> Refusal {
     Refusal::Refused(why.to_string())
 }
@@ -183,13 +198,13 @@ impl Discord {
                 member_text
                     .and_then(|p| p.banner.as_deref())
                     .filter(|h| !h.is_empty())
-                    .map(|hash| model::member_banner(guild, person, hash))
+                    .and_then(|hash| model::member_banner(guild, person, hash))
             })
             .or_else(|| {
                 text.and_then(|p| p.banner.as_deref())
                     .filter(|h| !h.is_empty())
                     .or_else(|| profile.user.as_ref().and_then(|u| u.banner.as_deref()).filter(|h| !h.is_empty()))
-                    .map(|hash| model::user_banner(person, hash))
+                    .and_then(|hash| model::user_banner(person, hash))
             });
         let banner_file = banner.map(|(file, url)| {
             media.push((file.clone(), url));
@@ -216,10 +231,10 @@ impl Discord {
             if name.is_empty() {
                 continue;
             }
-            let icon = badge.icon.as_deref().filter(|h| !h.is_empty()).map(|hash| {
-                let (file, url) = model::badge_icon(hash);
+            let icon = badge.icon.as_deref().filter(|h| !h.is_empty()).and_then(|hash| {
+                let (file, url) = model::badge_icon(hash)?;
                 media.push((file.clone(), url));
-                file
+                Some(file)
             });
             badges.push(protocol::ProfileBadge { name, icon });
         }
@@ -475,9 +490,15 @@ impl Discord {
                 "webp" => "image/webp",
                 _ => return Err(refused("Choose a PNG, JPEG, GIF or WebP image.")),
             };
-            let bytes = std::fs::read(file_path).map_err(|err| refused(format!("Could not read picture: {err}")))?;
-            if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+            let len = std::fs::metadata(file_path)
+                .map_err(|err| refused(format!("Could not read picture: {err}")))?
+                .len();
+            if len == 0 || len > 10 * 1024 * 1024 {
                 return Err(refused("Choose an image under 10 MB."));
+            }
+            let bytes = std::fs::read(file_path).map_err(|err| refused(format!("Could not read picture: {err}")))?;
+            if !image_magic(&ext, &bytes) {
+                return Err(refused("Choose a PNG, JPEG, GIF or WebP image."));
             }
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             serde_json::Value::String(format!("data:{mime};base64,{encoded}"))
@@ -585,7 +606,8 @@ impl Discord {
         self.call("PUT", &format!("/users/@me/notes/{person}"), Some(json!({ "note": text })))
             .map_err(refusal)?;
         crate::hub::lock(&self.state).notes.insert(person.to_owned(), text.to_owned());
-        self.ctx.profile_stale(person);
+        // The open card already has this text. Patch the cache; do not refetch the profile.
+        self.ctx.patch_profile_note(person, text);
         Ok(())
     }
 

@@ -5306,6 +5306,20 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
     assert_eq!(friend_reqs.len(), 1);
     assert_eq!(friend_reqs[0].body, json!({}));
 
+    // A code that is not a single path token is refused and never turned into a link.
+    world.discord.script("/users/@me/invites", 200, json!({"code": "../evil"}));
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        max_age: 0,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for a bad invite code, got {other:?}"),
+    }
+
     // 2. Guild 4000 grants CREATE_INSTANT_INVITE (bit 0) on @everyone, but denies it on 4105 (#rules, first in sidebar).
     let mut ready: Value = serde_json::from_str(READY).unwrap();
     ready["guilds"][0]["roles"][0]["permissions"] = json!("36769345");
@@ -5385,6 +5399,65 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
         srv_reqs[0].body,
         json!({"max_age": 604_800, "max_uses": 0, "temporary": false, "flags": 0})
     );
+
+    // Losing invite on one channel keeps the server flag while another channel still has it.
+    // Deleting the rest, then the last one, clears it. Restoring that channel sets it again.
+    let guild_can_invite = || match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => spaces.iter().any(|space| space.key.id == "4000" && space.can_create_invites),
+        other => panic!("{other:?}"),
+    };
+    world.discord.push(
+        "CHANNEL_UPDATE",
+        json!({
+            "id": "4101",
+            "type": 0,
+            "name": "general",
+            "position": 0,
+            "parent_id": "4100",
+            "guild_id": "4000",
+            "permission_overwrites": [{"id": "4000", "type": 0, "allow": "0", "deny": "1"}]
+        }),
+    );
+    wait("4101 loses create invite", || (!world.conversation("4101").rights.create_invite).then_some(()));
+    assert!(guild_can_invite(), "one channel losing invite must leave the server flag set");
+
+    for (id, kind) in [("4102", 5), ("4106", 15), ("4201", 2)] {
+        world.discord.push("CHANNEL_DELETE", json!({"id": id, "type": kind, "guild_id": "4000"}));
+    }
+    wait("other invite channels deleted but one remains", || {
+        let gone = ["4102", "4106", "4201"].iter().all(|id| {
+            matches!(world.ask(Request::Conversation { conversation: world.key(id) }), Response::Error { .. })
+        });
+        (gone && guild_can_invite()).then_some(())
+    });
+
+    world.discord.push(
+        "CHANNEL_UPDATE",
+        json!({
+            "id": "4202",
+            "type": 13,
+            "name": "Town hall",
+            "guild_id": "4000",
+            "permission_overwrites": [{"id": "4000", "type": 0, "allow": "0", "deny": "1"}]
+        }),
+    );
+    wait("last invite channel update clears the flag", || (!guild_can_invite()).then_some(()));
+
+    world.discord.push(
+        "CHANNEL_UPDATE",
+        json!({
+            "id": "4101",
+            "type": 0,
+            "name": "general",
+            "position": 0,
+            "parent_id": "4100",
+            "guild_id": "4000",
+            "permission_overwrites": []
+        }),
+    );
+    wait("invite flag returns with 4101", || guild_can_invite().then_some(()));
+    world.discord.push("CHANNEL_DELETE", json!({"id": "4101", "type": 0, "guild_id": "4000"}));
+    wait("deleting the last invite channel clears the flag", || (!guild_can_invite()).then_some(()));
 }
 
 #[test]
@@ -5481,6 +5554,26 @@ fn custom_status_emoji_and_clear_after_round_trip_and_sync() {
     assert_eq!(status.status_emoji, "ferris");
     assert_eq!(status.status_until, None);
 
+    // Re-saving the bare name the UI publishes must keep emoji id 7001.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Rusting".into()),
+            status_emoji: Some("ferris".into()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    let decoded_bare = base64::engine::general_purpose::STANDARD
+        .decode(patches.last().unwrap().body["settings"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        decoded_bare.windows(8).any(|window| window == ferris_id_bytes),
+        "bare custom emoji name must keep emoji id 7001"
+    );
+
     // 3. Clear custom status (empty text + empty emoji).
     assert_eq!(
         world.ask(Request::SetPresence {
@@ -5515,6 +5608,64 @@ fn custom_status_emoji_and_clear_after_round_trip_and_sync() {
         let s = own();
         (s.status == "Focusing" && s.status_emoji == "🎯" && s.status_until == Some(future_secs)).then_some(())
     });
+
+    // An already-expired custom status is dropped, and field 2 stays off the stored settings.
+    fn push_varint(into: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                into.push(byte);
+                break;
+            }
+            into.push(byte | 0x80);
+        }
+    }
+    fn push_bytes(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
+        push_varint(into, number << 3 | 2);
+        push_varint(into, bytes.len() as u64);
+        into.extend_from_slice(bytes);
+    }
+    fn push_fixed(into: &mut Vec<u8>, number: u64, value: u64) {
+        push_varint(into, number << 3 | 1);
+        into.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut word = Vec::new();
+    push_bytes(&mut word, 1, b"online");
+    let mut custom = Vec::new();
+    push_bytes(&mut custom, 1, b"gone");
+    push_fixed(&mut custom, 4, 1);
+    let mut status_bytes = Vec::new();
+    push_bytes(&mut status_bytes, 1, &word);
+    push_bytes(&mut status_bytes, 2, &custom);
+    let mut whole = Vec::new();
+    push_bytes(&mut whole, 11, &status_bytes);
+    let expired_b64 = base64::engine::general_purpose::STANDARD.encode(&whole);
+    world.discord.push("USER_SETTINGS_PROTO_UPDATE", json!({"settings": {"type": 1, "proto": expired_b64}}));
+    wait("expired custom status cleared", || {
+        let status = own();
+        (status.status.is_empty() && status.status_emoji.is_empty() && status.status_until.is_none()).then_some(())
+    });
+    let before = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len();
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Idle,
+            status: None,
+            status_emoji: None,
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), before + 1);
+    let decoded_idle = base64::engine::general_purpose::STANDARD
+        .decode(patches.last().unwrap().body["settings"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        !decoded_idle.windows(b"gone".len()).any(|window| window == b"gone"),
+        "expired custom status field must stay cleared"
+    );
 }
 
 #[test]
@@ -5527,6 +5678,7 @@ fn group_dm_rename_icon_remove_transfer_owner_and_silent_leave() {
     assert!(g.rights.edit_picture);
     assert!(g.rights.add_members);
     assert!(g.rights.remove_members);
+    assert!(g.rights.create_invite);
 
     // 2. Rename group DM -> PATCH /channels/3003 with {"name": "Road Trip"}.
     world.discord.script(
@@ -5623,6 +5775,31 @@ fn group_dm_rename_icon_remove_transfer_owner_and_silent_leave() {
     assert_eq!(patches[2].body, json!({"icon": null}));
     assert!(world.conversation("3003").avatar.is_none());
 
+    let refused_picture = |path: String| match world.ask(Request::ConversationPicture {
+        conversation: world.key("3003"),
+        path,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused picture, got {other:?}"),
+    };
+    let tmp_txt = std::env::temp_dir().join(format!("tiny-group-icon-{}.txt", std::process::id()));
+    std::fs::write(&tmp_txt, b"hello").unwrap();
+    refused_picture(tmp_txt.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_txt);
+    let tmp_empty = std::env::temp_dir().join(format!("tiny-group-icon-empty-{}.png", std::process::id()));
+    std::fs::write(&tmp_empty, b"").unwrap();
+    refused_picture(tmp_empty.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_empty);
+    let tmp_big = std::env::temp_dir().join(format!("tiny-group-icon-big-{}.png", std::process::id()));
+    std::fs::File::create(&tmp_big).unwrap().set_len(10 * 1024 * 1024 + 1).unwrap();
+    refused_picture(tmp_big.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_big);
+    let tmp_fake = std::env::temp_dir().join(format!("tiny-group-icon-fake-{}.png", std::process::id()));
+    std::fs::write(&tmp_fake, b"not a png").unwrap();
+    refused_picture(tmp_fake.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_fake);
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/3003").len(), 3, "bad pictures must not be uploaded");
+
     // 5. Remove member 2002 as owner -> DELETE /channels/3003/recipients/2002.
     world.discord.script("/channels/3003/recipients/2002", 204, json!(null));
     assert_eq!(
@@ -5666,6 +5843,17 @@ fn group_dm_rename_icon_remove_transfer_owner_and_silent_leave() {
     assert_eq!(patches.len(), 4);
     assert_eq!(patches[3].body, json!({"owner": "2001"}));
     assert!(!world.conversation("3003").rights.remove_members, "non-owner must lose remove_members right");
+
+    match world.ask(Request::TransferOwner {
+        conversation: world.key("3003"),
+        person: "2001".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("owner"), "expected owner refusal, got: {detail}");
+        }
+        other => panic!("expected Refused for non-owner transfer, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/3003").len(), 4, "non-owner transfer must not PATCH");
 
     // 7. Attempting to remove 2001 after transferring ownership is refused locally with zero HTTP calls.
     match world.ask(Request::MembersRemove {
@@ -5874,6 +6062,35 @@ fn person_note_reads_writes_clears_validates_and_updates_live() {
     assert_eq!(puts[0].body, json!({"note": "Updated note"}));
     assert_eq!(puts[1].body, json!({"note": ""}));
 
+    // A local save patches the cached profile. It does not GET the profile again.
+    let profile_gets = world.discord.requests_to("GET", "/users/2001/profile").len();
+    match world.ask(Request::Profile { person: world.key("2001"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, ""),
+        other => panic!("expected cached profile, got {other:?}"),
+    }
+    assert_eq!(
+        world.discord.requests_to("GET", "/users/2001/profile").len(),
+        profile_gets,
+        "a local note save must not refetch the profile"
+    );
+
+    // 256 emoji (1024 bytes) fit. 257 characters do not, and send nothing.
+    let emoji_ok = "🎯".repeat(256);
+    world.discord.script("/users/@me/notes/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetNote { person: world.key("2001"), text: emoji_ok.clone() }),
+        Response::Ok
+    );
+    match world.ask(Request::SetNote { person: world.key("2001"), text: "🎯".repeat(257) }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("256"), "expected 256 char error, got: {detail}");
+        }
+        other => panic!("expected Refused over 256 emoji, got {other:?}"),
+    }
+    let puts = world.discord.requests_to("PUT", "/users/@me/notes/2001");
+    assert_eq!(puts.len(), 3);
+    assert_eq!(puts[2].body, json!({"note": emoji_ok}));
+
     // 7. Live gateway USER_NOTE_UPDATE updates cache & invalidates cached profiles.
     world.discord.push("USER_NOTE_UPDATE", json!({"id": "2001", "note": "From phone"}));
     world.discord.script(
@@ -5892,4 +6109,8 @@ fn person_note_reads_writes_clears_validates_and_updates_live() {
     });
     // Still only 1 GET /users/@me/notes/2001 total (USER_NOTE_UPDATE updated state.notes directly).
     assert_eq!(world.discord.requests_to("GET", "/users/@me/notes/2001").len(), 1);
+    assert!(
+        world.discord.requests_to("GET", "/users/2001/profile").len() > profile_gets,
+        "USER_NOTE_UPDATE must refetch the profile"
+    );
 }

@@ -1454,7 +1454,7 @@ impl Discord {
         let code = parsed
             .get("code")
             .and_then(Value::as_str)
-            .filter(|c| !c.is_empty())
+            .filter(|code| model::cdn_token(code))
             .ok_or_else(|| Refusal::Refused("Discord did not return an invite code.".to_owned()))?;
         Ok(format!("https://discord.gg/{code}"))
     }
@@ -1496,6 +1496,28 @@ impl Discord {
                 if let Ok(id) = found.id.parse::<u64>() {
                     return (Some(id), found.name.clone(), found.animated);
                 }
+            }
+        }
+        // A re-save publishes the bare name. Keep the id we already resolved for it.
+        if state.own_emoji_id.is_some() && trimmed == state.own_emoji {
+            let animated = state
+                .own_emoji_id
+                .and_then(|id| {
+                    let sid = id.to_string();
+                    state
+                        .guilds
+                        .values()
+                        .flat_map(|g| g.emojis.iter())
+                        .find(|e| e.id == sid)
+                        .map(|e| e.animated)
+                })
+                .unwrap_or(false);
+            return (state.own_emoji_id, trimmed.to_owned(), animated);
+        }
+        // A bare custom-emoji name, the form the status line shows.
+        if let Some(found) = state.guilds.values().flat_map(|g| g.emojis.iter()).find(|e| e.name == trimmed) {
+            if let Ok(id) = found.id.parse::<u64>() {
+                return (Some(id), found.name.clone(), found.animated);
             }
         }
         (None, trimmed.to_owned(), false)
@@ -1866,6 +1888,13 @@ impl Discord {
                     .find(|(_, ch)| ch.as_str() == channel)
                     .map(|(user, _)| user.clone())
             });
+            if known.kind == ConversationKind::Direct {
+                if let Some(peer_id) = peer.as_deref().filter(|id| !id.is_empty() && *id != state.me) {
+                    if state.relations.get(peer_id) != Some(&Relation::Friend) {
+                        return Err(refuse("Only Discord friends can be added to a group DM.".to_owned()));
+                    }
+                }
+            }
             (state.me.clone(), out, peer)
         };
         if added.is_empty() {

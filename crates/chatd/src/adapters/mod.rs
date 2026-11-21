@@ -1570,20 +1570,20 @@ impl Context {
     /// People seen: friends, direct partners, authors, search results. Never a whole directory.
     pub fn people(&self, people: &[PersonRow]) -> Stores {
         self.hub.store().upsert_people(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
     /// The whole list the user owns, by person id, as sent at connect. Record the people first.
     pub fn relations(&self, relations: &[(String, Relation)]) -> Stores {
         self.hub.store().replace_relations(&self.account, relations)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
     pub fn relation(&self, person_id: &str, relation: Relation) -> Stores {
         if self.hub.store().set_relation(&self.key(person_id), relation)? {
-            self.hub.changed(Change::People { account: self.account.clone() });
+            self.hub.changed(Change::People { account: self.account.clone(), person: None });
         }
         Ok(())
     }
@@ -1592,7 +1592,7 @@ impl Context {
     /// first.
     pub fn details(&self, people: &[(String, PersonDetails)]) -> Stores {
         self.hub.store().set_details(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
@@ -1648,11 +1648,19 @@ impl Context {
         self.hub.infos.forget(&self.key(conversation_id));
     }
 
-    /// Cached profiles for `person_id` are no longer current (e.g. a private note changed).
+    /// Cached profiles for `person_id` are no longer current (e.g. a note from another device).
+    /// Only that person's open card refetches.
     pub fn profile_stale(&self, person_id: &str) {
         let person = self.key(person_id);
         self.hub.profiles.forget_where(|(key, _)| *key == person);
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: Some(person) });
+    }
+
+    /// Writes `note` into every cached profile for `person_id` without dropping the cache.
+    pub fn patch_profile_note(&self, person_id: &str, note: &str) {
+        let person = self.key(person_id);
+        let note = note.to_owned();
+        self.hub.profiles.update_where(|(key, _)| *key == person, |profile| profile.note = note.clone());
     }
 
     /// What is held about a person's presence now, for a member row built here.
@@ -1754,7 +1762,7 @@ impl Context {
             self.row_changed(id, None);
         }
         if person {
-            self.hub.changed(Change::People { account: self.account.clone() });
+            self.hub.changed(Change::People { account: self.account.clone(), person: None });
         }
         Ok(())
     }

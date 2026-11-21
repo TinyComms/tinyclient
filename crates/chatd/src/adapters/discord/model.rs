@@ -227,33 +227,47 @@ pub fn member_avatar(guild: &str, user: &str, hash: &str) -> (MediaFile, String)
     )
 }
 
-pub fn user_banner(user: &str, hash: &str) -> (MediaFile, String) {
-    (
+/// A Discord CDN hash or invite code: non-empty ASCII letters, digits, `_` and `-`.
+pub fn cdn_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+pub fn user_banner(user: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         MediaFile {
             width: 600,
             height: 240,
             ..MediaFile::new(format!("banner:{user}:{hash}"), MediaKind::Image)
         },
         format!("{}/banners/{user}/{hash}.webp?size=600{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
-pub fn member_banner(guild: &str, user: &str, hash: &str) -> (MediaFile, String) {
-    (
+pub fn member_banner(guild: &str, user: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         MediaFile {
             width: 600,
             height: 240,
             ..MediaFile::new(format!("mbanner:{guild}:{user}:{hash}"), MediaKind::Image)
         },
         format!("{}/guilds/{guild}/users/{user}/banners/{hash}.webp?size=600{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
-pub fn badge_icon(hash: &str) -> (MediaFile, String) {
-    (
+pub fn badge_icon(hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         sized(format!("badge:{hash}"), MediaKind::Image, 24),
         format!("{}/badge-icons/{hash}.png", cdn()),
-    )
+    ))
 }
 
 pub fn connection_label(kind: &str) -> String {
@@ -292,26 +306,73 @@ pub fn connection_label(kind: &str) -> String {
     }
 }
 
+/// One path segment of a connection URL. Empty, traversal, or a character that would
+/// change the path or the query is rejected.
+fn path_token(raw: &str) -> Option<&str> {
+    let token = raw.trim().trim_start_matches('@');
+    if token.is_empty()
+        || token.contains('/')
+        || token.contains('\\')
+        || token.contains('?')
+        || token.contains('#')
+        || token.contains('@')
+        || token.contains("..")
+        || token.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(token)
+}
+
+/// A bare hostname for a domain connection: no scheme, user, port, path, or traversal.
+fn bare_host(raw: &str) -> Option<&str> {
+    let host = raw.trim();
+    if host.is_empty()
+        || !host.contains('.')
+        || host.contains("://")
+        || host.contains('@')
+        || host.contains(':')
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains("..")
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(host)
+}
+
+/// Keeps `url` only when it is an https address with no userinfo.
+fn https_link(url: String) -> String {
+    match protocol::link::Destination::parse(&url) {
+        Some(dest) if dest.url.starts_with("https://") && !dest.has_userinfo => url,
+        _ => String::new(),
+    }
+}
+
 pub fn connection_url(kind: &str, id: &str, name: &str) -> String {
     let clean = name.trim();
     let handle = clean.trim_start_matches('@');
-    match kind {
-        "github" if !clean.is_empty() => format!("https://github.com/{clean}"),
-        "twitter" | "x" if !handle.is_empty() => format!("https://x.com/{handle}"),
-        "twitch" if !clean.is_empty() => format!("https://twitch.tv/{clean}"),
-        "youtube" if !id.is_empty() => format!("https://www.youtube.com/channel/{id}"),
-        "spotify" if !id.is_empty() => format!("https://open.spotify.com/user/{id}"),
-        "steam" if !id.is_empty() => format!("https://steamcommunity.com/profiles/{id}"),
-        "reddit" if !clean.is_empty() => format!("https://www.reddit.com/u/{clean}"),
-        "bluesky" if !handle.is_empty() => format!("https://bsky.app/profile/{handle}"),
-        "tiktok" if !handle.is_empty() => format!("https://www.tiktok.com/@{handle}"),
-        "instagram" if !handle.is_empty() => format!("https://www.instagram.com/{handle}"),
-        "facebook" if !id.is_empty() => format!("https://www.facebook.com/{id}"),
-        "domain" if !clean.is_empty() => format!("https://{clean}"),
-        "ebay" if !clean.is_empty() => format!("https://www.ebay.com/usr/{clean}"),
-        "roblox" if !id.is_empty() => format!("https://www.roblox.com/users/{id}/profile"),
-        _ => String::new(),
-    }
+    let url = match kind {
+        "github" => path_token(clean).map(|token| format!("https://github.com/{token}")),
+        "twitter" | "x" => path_token(handle).map(|token| format!("https://x.com/{token}")),
+        "twitch" => path_token(clean).map(|token| format!("https://twitch.tv/{token}")),
+        "youtube" => path_token(id).map(|token| format!("https://www.youtube.com/channel/{token}")),
+        "spotify" => path_token(id).map(|token| format!("https://open.spotify.com/user/{token}")),
+        "steam" => path_token(id).map(|token| format!("https://steamcommunity.com/profiles/{token}")),
+        "reddit" => path_token(clean).map(|token| format!("https://www.reddit.com/u/{token}")),
+        "bluesky" => path_token(handle).map(|token| format!("https://bsky.app/profile/{token}")),
+        "tiktok" => path_token(handle).map(|token| format!("https://www.tiktok.com/@{token}")),
+        "instagram" => path_token(handle).map(|token| format!("https://www.instagram.com/{token}")),
+        "facebook" => path_token(id).map(|token| format!("https://www.facebook.com/{token}")),
+        "domain" => bare_host(clean).map(|host| format!("https://{host}")),
+        "ebay" => path_token(clean).map(|token| format!("https://www.ebay.com/usr/{token}")),
+        "roblox" => path_token(id).map(|token| format!("https://www.roblox.com/users/{token}/profile")),
+        _ => None,
+    };
+    url.map(https_link).unwrap_or_default()
 }
 
 pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
@@ -1278,5 +1339,32 @@ mod tests {
         let index = (175_928_847_299_117_063u64 >> 22) % 6;
         assert_eq!(url, format!("{}/embed/avatars/{index}.png", cdn()));
         assert_eq!(file.id, format!("avatar:default:{index}"));
+    }
+
+    #[test]
+    fn connection_urls_and_cdn_hashes_reject_injection() {
+        assert_eq!(connection_url("github", "", "mara-dev"), "https://github.com/mara-dev");
+        assert_eq!(connection_url("spotify", "sp99", "Spotify"), "https://open.spotify.com/user/sp99");
+        assert_eq!(connection_url("domain", "", "example.com"), "https://example.com");
+        assert_eq!(connection_url("github", "", "evil/../admin"), "");
+        assert_eq!(connection_url("github", "", "name?x=1"), "");
+        assert_eq!(connection_url("github", "", "name#frag"), "");
+        assert_eq!(connection_url("spotify", "a/b", "x"), "");
+        assert_eq!(connection_url("domain", "", "evil.com/foo?x=1"), "");
+        assert_eq!(connection_url("domain", "", "https://evil.com"), "");
+        assert_eq!(connection_url("domain", "", "user@evil.com"), "");
+        assert_eq!(connection_url("domain", "", "evil.com:443"), "");
+        assert_eq!(connection_url("domain", "", "localhost"), "");
+        assert!(user_banner("2001", "userban1").is_some());
+        assert!(user_banner("2001", "../x").is_none());
+        assert!(user_banner("2001", "a/b").is_none());
+        assert!(user_banner("2001", "").is_none());
+        assert!(member_banner("4000", "2001", "guildban4000").is_some());
+        assert!(member_banner("4000", "2001", "bad hash").is_none());
+        assert!(badge_icon("2ba85e8026a8614b640c2837bcdfe21b").is_some());
+        assert!(badge_icon("..").is_none());
+        assert!(badge_icon("").is_none());
+        assert!(!cdn_token("code/../admin"));
+        assert!(cdn_token("fr1end"));
     }
 }

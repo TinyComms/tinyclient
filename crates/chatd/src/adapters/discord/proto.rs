@@ -26,6 +26,10 @@ impl<'a> Reader<'a> {
         for shift in (0..64).step_by(7) {
             let (&byte, rest) = self.0.split_first()?;
             self.0 = rest;
+            // The 10th byte only has room for bit 63. A larger payload shifts out of u64.
+            if shift == 63 && byte > 1 {
+                return None;
+            }
             value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
                 return Some(value);
@@ -49,7 +53,7 @@ impl<'a> Reader<'a> {
             0 => Field::Varint(self.varint()?),
             1 => Field::Fixed64(u64::from_le_bytes(self.take(8)?.try_into().ok()?)),
             2 => {
-                let len = self.varint()? as usize;
+                let len = usize::try_from(self.varint()?).ok()?;
                 Field::Bytes(self.take(len)?)
             }
             5 => {
@@ -414,5 +418,17 @@ mod tests {
         let cleared = with_custom_status(&encoded2, "online", Some(&CustomStatus::default()));
         assert_eq!(own_custom_status(&cleared), ("online".into(), CustomStatus::default()));
         assert_eq!(bytes_of(&cleared, 2), None);
+    }
+
+    #[test]
+    fn an_overflowing_varint_is_rejected() {
+        let overflow = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert_eq!(Reader(&overflow).varint(), None);
+        let top_bit = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        assert_eq!(Reader(&top_bit).varint(), Some(1 << 63));
+        // A length that does not fit in usize is not a field.
+        let mut huge = vec![0x0au8]; // field 1, wire type 2
+        huge.extend([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        assert!(Reader(&huge).field().is_none());
     }
 }
