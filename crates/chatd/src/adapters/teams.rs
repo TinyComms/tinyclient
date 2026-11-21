@@ -330,6 +330,9 @@ struct State {
     away: HashMap<String, (String, Option<i64>)>,
     /// Subject and inline image HTML remembered for our own messages so edits keep them.
     own_meta: HashMap<(String, String), message::OwnMeta>,
+    /// Raw `properties.files` JSON remembered for messages with shared files so forwarding
+    /// references them without re-uploading.
+    file_props: HashMap<(String, String), Vec<Value>>,
 }
 
 /// What a call presents.
@@ -895,7 +898,7 @@ impl Teams {
             delete: true,
             threads: true,
             pins: false,
-            forward: false,
+            forward: true,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
@@ -974,6 +977,9 @@ impl Teams {
             }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+            }
+            Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+                let _ = reply.send(Ok(self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note)));
             }
             Command::CancelSend { client_id, .. } => self.cancel_send(&client_id),
             // Each row's line comes with the chat list (`lastMessage`); a row still without one

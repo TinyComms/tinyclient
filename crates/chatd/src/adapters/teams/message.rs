@@ -4,8 +4,8 @@
 use super::html::{self, Lookup};
 use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
 use protocol::{
-    Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind, Reaction,
-    ReplyTo, Span, Style, ThreadSummary,
+    Attachment, ConversationKind, Forwarded, MediaFile, MediaKind, MentionKind, Message,
+    MessageKind, Reaction, ReplyTo, Span, Style, ThreadSummary,
 };
 use serde_json::{json, Value};
 
@@ -378,6 +378,50 @@ fn quote_markup(reply: &ReplyTo) -> String {
     )
 }
 
+/// The forwarded message block, as Teams' client writes it, carrying original sender, time,
+/// source conversation, link back to the original, and body.
+fn forward_markup(original: &Message, from_title: &str, link: &str) -> String {
+    let text = |text: &str| html::escape_plain(text);
+    let sent_ms = match millis(&original.id) {
+        0 => original.sent.saturating_mul(1000).to_string(),
+        ms => ms.to_string(),
+    };
+    let mut out = format!(
+        "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Forward\" itemid=\"{id}\">\
+         <strong itemprop=\"mri\" itemid=\"{person}\">{name}</strong>\
+         <span itemprop=\"time\" itemid=\"{sent_ms}\"></span>",
+        id = text(&original.id),
+        person = text(&original.sender.id),
+        name = text(original.shown_sender()),
+    );
+    if !from_title.is_empty() {
+        out.push_str(&format!("<span itemprop=\"conversation\">{}</span>", text(from_title)));
+    }
+    if !link.is_empty() {
+        out.push_str(&format!("<a itemprop=\"sourceLink\" href=\"{}\"></a>", text(link)));
+    }
+    out.push_str(&format!("<p itemprop=\"preview\">{}</p></blockquote>", text(&original.text)));
+    out
+}
+
+/// Parses `properties.forwardedMessage` / `properties.forwardContext` when present as JSON.
+fn forwarded_property(props: &Value) -> Option<Value> {
+    for key in ["forwardedMessage", "forwardContext", "forwarded"] {
+        match props.get(key) {
+            Some(Value::Object(_)) => return Some(props[key].clone()),
+            Some(Value::String(s)) if s.trim().starts_with('{') => {
+                if let Ok(v) = serde_json::from_str::<Value>(s) {
+                    if v.is_object() {
+                        return Some(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl Teams {
     /// Where the official app opens one message. A reply names its post as `parentMessageId`.
     fn message_link(&self, conversation: &str, id: &str, raw: &Value) -> String {
@@ -557,7 +601,15 @@ impl Teams {
         for gif in parsed.gifs {
             message.attachments.push(giphy_gif(&gif, &mut media));
         }
-        for shared in listed(&props["files"]) {
+        let shared_files = listed(&props["files"]);
+        if !shared_files.is_empty() {
+            let mut state = self.state();
+            if state.file_props.len() >= super::REMEMBERED {
+                state.file_props.clear();
+            }
+            state.file_props.insert((conversation.to_owned(), id.clone()), shared_files.clone());
+        }
+        for shared in shared_files {
             let info = &shared["fileInfo"];
             let urls = [&info["shareUrl"], &shared["objectUrl"], &info["fileUrl"]];
             let Some(url) = urls.into_iter().filter_map(Value::as_str).find(|url| url.starts_with("https://")) else {
@@ -602,6 +654,86 @@ impl Teams {
             snippet: quote.preview.chars().take(120).collect(),
             deleted: false,
         });
+        // Forwarded message: from HTML `schema.skype.com/Forward` block and/or `properties.forwardedMessage`.
+        let fwd_prop = forwarded_property(props);
+        if parsed.forward.is_some() || fwd_prop.is_some() {
+            let prop_str = |keys: &[&str]| -> String {
+                fwd_prop
+                    .as_ref()
+                    .and_then(|v| keys.iter().find_map(|k| v[*k].as_str()).map(str::trim).filter(|s| !s.is_empty()))
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            let html_fwd = parsed.forward.as_ref();
+            let orig_sender = html_fwd
+                .map(|f| f.name.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| prop_str(&["originalSenderDisplayName", "originalSenderName", "senderName"]));
+            let orig_conv_id = prop_str(&["originalConversationId", "sourceThreadId", "conversationId"]);
+            let orig_conv_title = html_fwd
+                .map(|f| f.conversation.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let t = prop_str(&["originalConversationTitle", "sourceConversationName", "conversationTitle"]);
+                    (!t.is_empty()).then_some(t)
+                })
+                .or_else(|| {
+                    (!orig_conv_id.is_empty())
+                        .then(|| self.ctx.known(&orig_conv_id).ok().flatten().map(|r| r.title))
+                        .flatten()
+                })
+                .unwrap_or_default();
+            let orig_msg_id = html_fwd
+                .map(|f| f.id.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    fwd_prop
+                        .as_ref()
+                        .map(|v| id_of(&v["originalMessageId"]))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default()
+                });
+            let orig_link = html_fwd
+                .map(|f| f.link.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let l = prop_str(&["deepLink", "link", "sourceLink"]);
+                    (!l.is_empty()).then_some(l)
+                })
+                .or_else(|| {
+                    (!orig_conv_id.is_empty() && !orig_msg_id.is_empty())
+                        .then(|| super::links::message_share(&orig_conv_id, &orig_msg_id, &self.session.tenant, None))
+                })
+                .unwrap_or_default();
+            let fwd_body = html_fwd
+                .map(|f| f.preview.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| prop_str(&["originalMessageContent", "content", "preview"]));
+            if !fwd_body.is_empty() {
+                if message.text.is_empty() {
+                    message.text = fwd_body;
+                } else if !message.text.contains(&fwd_body) {
+                    message.text.push('\n');
+                    message.text.push_str(&fwd_body);
+                }
+            }
+            let (from_title, from_space) = match (orig_sender.is_empty(), orig_conv_title.is_empty()) {
+                (false, false) => (orig_sender, orig_conv_title),
+                (false, true) => (orig_sender, String::new()),
+                (true, false) => (orig_conv_title, String::new()),
+                (true, true) => (String::new(), String::new()),
+            };
+            message.forwarded = Some(Box::new(Forwarded {
+                from_title,
+                from_space,
+                link: orig_link,
+            }));
+        }
         message.reactions = self.reactions(&props["emotions"], &me);
         // What cannot be drawn is named and linked, never left blank.
         let cards = listed(&props["cards"]);
@@ -1286,6 +1418,82 @@ impl Teams {
         };
         self.chat(method, &path, Body::Json(&body), false)?;
         Ok(())
+    }
+
+    /// Forwards one or more messages to target conversations on this account, with an optional
+    /// note and Teams forward markup referencing original sender, time, link, and any shared
+    /// files without re-uploading.
+    pub(super) fn forward(
+        &self,
+        from: &str,
+        message_ids: &[String],
+        targets: &[String],
+        note: &str,
+    ) -> Vec<(String, Result<(), String>)> {
+        let source_title = self.ctx.known(from).ok().flatten().map(|r| r.title).unwrap_or_default();
+        let mut blocks = Vec::new();
+        let mut forwarded_files: Vec<Value> = Vec::new();
+        let mut first_meta: Option<Value> = None;
+
+        for mid in message_ids {
+            let Ok(Some(original)) = self.ctx.stored_message(from, mid) else {
+                continue;
+            };
+            let parent = chain_of(from).map(|(_, root)| root).filter(|r| *r != original.id);
+            let link = super::links::message_share(thread_of(from), &original.id, &self.session.tenant, parent);
+            blocks.push(forward_markup(&original, &source_title, &link));
+            if first_meta.is_none() {
+                let sent_ms = match millis(&original.id) {
+                    0 => original.sent.saturating_mul(1000),
+                    ms => ms,
+                };
+                first_meta = Some(json!({
+                    "originalMessageId": original.id,
+                    "originalConversationId": thread_of(from),
+                    "originalConversationTitle": source_title,
+                    "originalSenderMri": original.sender.id,
+                    "originalSenderDisplayName": original.shown_sender(),
+                    "originalArrivalTime": sent_ms,
+                    "deepLink": link,
+                }));
+            }
+            if let Some(files) = self.state().file_props.get(&(from.to_owned(), mid.clone())).cloned() {
+                forwarded_files.extend(files);
+            }
+        }
+        if blocks.is_empty() {
+            return targets
+                .iter()
+                .map(|target| (target.clone(), Err("Original message not found.".to_owned())))
+                .collect();
+        }
+        let mut content = String::new();
+        let note = note.trim();
+        if !note.is_empty() {
+            content.push_str(&html::compose_rich(note).0);
+        }
+        for block in &blocks {
+            content.push_str(block);
+        }
+        let mut props = serde_json::Map::new();
+        if let Some(meta) = first_meta {
+            props.insert("forwardedMessage".to_owned(), Value::String(meta.to_string()));
+        }
+        if !forwarded_files.is_empty() {
+            props.insert("files".to_owned(), Value::String(Value::Array(forwarded_files).to_string()));
+        }
+        let mut results = Vec::with_capacity(targets.len());
+        for (ix, target) in targets.iter().enumerate() {
+            let client_id = (now_ms().saturating_add(ix as i64)).to_string();
+            let mut body = self.body(&client_id, &content);
+            if !props.is_empty() {
+                body["properties"] = Value::Object(props.clone());
+            }
+            let path = format!("/v1/users/ME/conversations/{}/messages", escaped(target));
+            let res = self.chat("POST", &path, Body::Json(&body), false).map(|_| ()).map_err(super::reason);
+            results.push((target.clone(), res));
+        }
+        results
     }
 }
 

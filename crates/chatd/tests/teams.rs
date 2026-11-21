@@ -1823,3 +1823,86 @@ fn channel_post_subject_announcements_moderation_and_threads_layout() {
     let ann_chain = key(&format!("{GENERAL};messageid=1760000810001"));
     assert_eq!(world.messages(&ann_chain).last().map(|m| m.text.as_str()), Some("Count me in!"));
 }
+
+#[test]
+fn forwarded_messages_are_read_with_origin_metadata_and_forwarded_to_multiple_chats() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    let ana = key(CHAT_ANA);
+    let grp1 = key("19:grp1@thread.v2");
+    world.open(&general, 6);
+    world.open(&ana, 3);
+
+    // 1. Account advertises native forward capability.
+    assert!(world.account(HOME).can.forward);
+
+    // 2. Receiving a forwarded Teams message maps original sender, conversation, link, note, and body.
+    let orig_link = format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000100100?tenantId={HOME}");
+    let mut inbound = message(
+        CHAT_ANA,
+        None,
+        1_760_000_820_001,
+        ANA,
+        "Ana Ruiz",
+        &format!(
+            "<p>FYI see below</p>\
+             <blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Forward\" itemid=\"1760000100100\">\
+             <strong itemprop=\"mri\" itemid=\"{BEN}\">Ben Okafor</strong>\
+             <span itemprop=\"time\" itemid=\"1760000100100\"></span>\
+             <span itemprop=\"conversation\">General</span>\
+             <a itemprop=\"sourceLink\" href=\"{orig_link}\"></a>\
+             <p itemprop=\"preview\">Deploy is scheduled for 16:00.</p></blockquote>"
+        ),
+    );
+    inbound["properties"] = json!({
+        "forwardedMessage": json!({
+            "originalMessageId": "1760000100100",
+            "originalConversationId": GENERAL,
+            "originalConversationTitle": "General",
+            "originalSenderDisplayName": "Ben Okafor",
+            "originalArrivalTime": 1_760_000_100_100u64,
+            "deepLink": orig_link,
+        }).to_string()
+    });
+    world.fake.push("NewMessage", inbound, false);
+    let received = world.until("forwarded message to arrive", || world.message(&ana, "1760000820001"));
+    assert_eq!(received.text, "FYI see below\nDeploy is scheduled for 16:00.");
+    let fwd = received.forwarded.as_deref().expect("Message::forwarded populated");
+    assert_eq!(fwd.from_title, "Ben Okafor");
+    assert_eq!(fwd.from_space, "General");
+    assert_eq!(fwd.link, orig_link);
+
+    // 3. Forwarding a message with a shared file to two chats sends forward markup, optional note,
+    // and preserves file references without re-uploading to OneDrive.
+    let uploads_before = world.fake.calls("POST", ":/createUploadSession").len();
+    let req = Request::Forward {
+        from: general.clone(),
+        message_ids: vec!["1760000250250".to_owned()],
+        to: vec![ana.clone(), grp1.clone()],
+        note: "Sharing Q4 numbers".to_owned(),
+    };
+    let Response::Forwarded { results } = world.ask(req) else {
+        panic!("expected Response::Forwarded");
+    };
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.ok), "{results:?}");
+    assert_eq!(world.fake.calls("POST", ":/createUploadSession").len(), uploads_before, "forwarded files must not be re-uploaded");
+
+    for target_id in [CHAT_ANA, "19:grp1@thread.v2"] {
+        let sent = world
+            .fake
+            .calls("POST", &format!("/chat/v1/users/ME/conversations/{target_id}/messages"))
+            .pop()
+            .expect("forwarded post reached target");
+        let body = sent.json();
+        let html = body["content"].as_str().unwrap_or("");
+        assert!(html.contains("Sharing Q4 numbers"), "{html}");
+        assert!(html.contains("http://schema.skype.com/Forward"), "{html}");
+        assert!(html.contains("Ana Ruiz"), "{html}");
+        assert!(html.contains("Numbers are in"), "{html}");
+        assert!(body["properties"]["forwardedMessage"].as_str().is_some(), "forwardedMessage property present");
+        let files: Vec<Value> = serde_json::from_str(body["properties"]["files"].as_str().expect("preserved files property")).unwrap();
+        assert_eq!(files[0]["fileName"].as_str(), Some("Q4 plan.xlsx"));
+    }
+}
