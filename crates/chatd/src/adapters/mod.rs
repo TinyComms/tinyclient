@@ -1438,7 +1438,7 @@ impl Context {
         let conversation = self.key(conversation_id);
         if self.hub.store().react(&conversation, message_id, reaction, added)? {
             self.hub.changed(Change::Messages { conversation: conversation.clone() });
-            if added && !reaction.mine {
+            if added && !reaction.mine && !reaction.mine_burst {
                 if let Ok(Some(target)) = self.hub.store().message(&conversation, message_id) {
                     if target.outgoing {
                         let snippet = crate::store::preview_text(&target);
@@ -2254,7 +2254,7 @@ pub fn prove_reactors() -> Result<(), String> {
     let conversation = Key::new(&account, "c1");
     let said = Message::plain("m1", "Ada", "hello", 1_700_000_000, false);
     store.ingest(&conversation, &said, false).map_err(|err| err.to_string())?;
-    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()] };
+    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()], ..protocol::Reaction::default() };
     store.react(&conversation, "m1", &by("u-ana"), true).map_err(|err| err.to_string())?;
     store.react(&conversation, "m1", &by("u-bea"), true).map_err(|err| err.to_string())?;
     let who = |store: &crate::store::Store| -> Result<Vec<String>, String> {

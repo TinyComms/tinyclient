@@ -393,10 +393,10 @@ pub struct Pane {
     action_confirm: Option<PendingControlAction>,
     /// Currently open select/overflow/date/time picker popover for a Block Kit control.
     open_select: Option<OpenSelect>,
-    /// On-demand reactors fetched for messages in the open conversation, keyed by `(message_id, emoji)`.
-    fetched_reactors: HashMap<(String, String), (Vec<protocol::Reactor>, bool)>,
-    /// Reactor fetch currently in flight, keyed by `(message_id, emoji)`.
-    reactors_loading: Option<(String, String)>,
+    /// On-demand reactors fetched for messages in the open conversation, keyed by `(message_id, emoji, burst)`.
+    fetched_reactors: HashMap<(String, String, bool), (Vec<protocol::Reactor>, bool)>,
+    /// Reactor fetch currently in flight, keyed by `(message_id, emoji, burst)`.
+    reactors_loading: Option<(String, String, bool)>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,

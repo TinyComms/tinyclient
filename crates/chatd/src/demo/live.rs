@@ -134,6 +134,7 @@ impl Plan {
                     count: 1,
                     mine: false,
                     who: Vec::new(),
+                    ..Reaction::default()
                 };
                 let reacted = hub.store().react(&self.conversation, &message.id, &reaction, true);
                 if matches!(reacted, Ok(true)) {

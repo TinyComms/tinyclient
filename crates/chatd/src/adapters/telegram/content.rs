@@ -1590,6 +1590,7 @@ fn reactions(reactions: &tl::enums::MessageReactions) -> Vec<Reaction> {
             count: count.count.max(0) as u32,
             mine: count.chosen_order.is_some(),
             who,
+            ..Reaction::default()
         })
     };
     reactions.results.iter().filter_map(one).collect()

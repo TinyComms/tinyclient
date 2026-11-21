@@ -1053,12 +1053,16 @@ impl Discord {
     /// The query is what the web client adds; it is from the community documentation and
     /// unconfirmed against a real account. So is sending a placeholder name with an id whose
     /// name is not known here (Discord is said to go by the id).
-    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool) -> Result<(), Refusal> {
+    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool, burst: bool) -> Result<(), Refusal> {
+        if on && burst && !matches!(crate::hub::lock(&self.state).premium, 1..=3) {
+            return Err(Refusal::Refused("Super reactions require Discord Nitro.".to_owned()));
+        }
         let named = self.reaction_emoji(channel, message, emoji)?;
         let reaction = format!("/channels/{channel}/messages/{message}/reactions/{}", escaped(&named));
+        let rtype = if burst { 1 } else { 0 };
         let asked = match on {
-            true => self.call("PUT", &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type=0"), None),
-            false => self.call("DELETE", &format!("{reaction}/0/%40me?location=Message%20Inline%20Button&burst=false"), None),
+            true => self.call("PUT", &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type={rtype}"), None),
+            false => self.call("DELETE", &format!("{reaction}/{rtype}/%40me?location=Message%20Inline%20Button&burst={burst}"), None),
         };
         asked.map(drop).map_err(refusal)
     }
@@ -1828,8 +1832,8 @@ impl Discord {
                 let outcome = self.send(&conversation_id, &client_id, &text, reply_to.as_deref());
                 self.ctx.sent(&conversation_id, &client_id, outcome);
             }
-            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
-                answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
+            Command::React { conversation_id, message_id, emoji, on, burst, reply } => {
+                answer(reply, self.react(&conversation_id, &message_id, &emoji, on, burst))
             }
             Command::Reactors { conversation_id, message_id, emoji, burst, after, limit, reply } => {
                 answer(reply, self.reactors(&conversation_id, &message_id, &emoji, burst, after.as_deref(), limit))

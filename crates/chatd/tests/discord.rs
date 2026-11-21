@@ -201,12 +201,20 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
     }
     match (seen.method.as_str(), parts.as_slice()) {
         ("PUT", ["channels", channel, "messages", message, "reactions", emoji, "%40me"]) => {
-            let event = json!({"user_id": "1000", "channel_id": channel, "message_id": message, "emoji": emoji_of(emoji), "type": 0});
+            let burst = seen.path.contains("type=1");
+            let event = json!({
+                "user_id": "1000", "channel_id": channel, "message_id": message,
+                "emoji": emoji_of(emoji), "type": if burst { 1 } else { 0 }, "burst": burst,
+            });
             shared.push("MESSAGE_REACTION_ADD", event);
             (204, Value::Null)
         }
-        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji, "0", "%40me"]) => {
-            let event = json!({"user_id": "1000", "channel_id": channel, "message_id": message, "emoji": emoji_of(emoji), "type": 0});
+        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji, rtype, "%40me"]) => {
+            let burst = *rtype == "1" || seen.path.contains("burst=true");
+            let event = json!({
+                "user_id": "1000", "channel_id": channel, "message_id": message,
+                "emoji": emoji_of(emoji), "type": if burst { 1 } else { 0 }, "burst": burst,
+            });
             shared.push("MESSAGE_REACTION_REMOVE", event);
             (204, Value::Null)
         }
@@ -5044,4 +5052,81 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         }
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
+}
+
+#[test]
+fn super_reactions_split_counts_follow_burst_events_and_send_with_nitro() {
+    // Nitro account (premium_type: 2) enables burst_reactions and ReactionRules::burst.
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["premium_type"] = json!(2);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let dm = "5001";
+    let msg_id = world.incoming(dm, None, "burst test", json!({
+        "reactions": [{
+            "count": 5,
+            "count_details": {"burst": 2, "normal": 3},
+            "me": false,
+            "me_burst": true,
+            "burst_colors": ["#ff6b6b", "#feca57"],
+            "emoji": {"id": null, "name": "🔥"}
+        }]
+    }));
+    let loaded = wait("message with count_details", || {
+        world.messages(dm).into_iter().find(|m| m.id == msg_id)
+    });
+    assert_eq!(loaded.reactions.len(), 1);
+    let r = &loaded.reactions[0];
+    assert_eq!((r.count, r.mine, r.burst, r.mine_burst), (3, false, 2, true));
+    assert_eq!(r.burst_colors, vec!["#ff6b6b", "#feca57"]);
+
+    // ReactionRules exposes burst = true for Nitro.
+    match world.ask(Request::Reactions { conversation: world.key(dm) }) {
+        Response::Reactions { rules, .. } => assert!(rules.burst),
+        other => panic!("expected Response::Reactions, got {other:?}"),
+    }
+
+    // Live MESSAGE_REACTION_ADD with burst=true increments burst without touching normal count.
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": dm, "message_id": msg_id,
+        "emoji": {"id": null, "name": "🔥"}, "burst": true, "type": 1,
+        "burst_colors": ["#ff6b6b"]
+    }));
+    let after_add = wait("burst increment", || {
+        world.messages(dm).into_iter().find(|m| m.id == msg_id && m.reactions.first().is_some_and(|r| r.burst == 3))
+    });
+    assert_eq!(after_add.reactions[0].count, 3);
+
+    // Removing my super reaction sends DELETE .../1/%40me?...&burst=true.
+    assert_eq!(
+        world.ask(Request::React {
+            conversation: world.key(dm),
+            message_id: msg_id.clone(),
+            emoji: "🔥".into(),
+            on: false,
+            burst: true,
+        }),
+        Response::Ok
+    );
+    let del_reqs = world.discord.requests_to("DELETE", &format!("/channels/{dm}/messages/{msg_id}/reactions/"));
+    assert_eq!(del_reqs.len(), 1);
+    assert!(del_reqs[0].path.contains("/1/%40me") && del_reqs[0].path.contains("burst=true"), "{}", del_reqs[0].path);
+
+    // Adding a super reaction sends PUT .../%40me?...&type=1.
+    assert_eq!(
+        world.ask(Request::React {
+            conversation: world.key(dm),
+            message_id: msg_id.clone(),
+            emoji: "🎉".into(),
+            on: true,
+            burst: true,
+        }),
+        Response::Ok
+    );
+    let put_reqs = world.discord.requests_to("PUT", &format!("/channels/{dm}/messages/{msg_id}/reactions/"));
+    assert_eq!(put_reqs.len(), 1);
+    assert!(put_reqs[0].path.contains("type=1"), "{}", put_reqs[0].path);
 }

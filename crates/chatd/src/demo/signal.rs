@@ -38,7 +38,7 @@ const LENA: usize = 4;
 const ELIO: usize = 5;
 
 fn reactions(list: &[(&str, u32, bool)]) -> Vec<Reaction> {
-    list.iter().map(|(emoji, count, mine)| Reaction { emoji: (*emoji).to_owned(), file: None, count: *count, mine: *mine, who: Vec::new() }).collect()
+    list.iter().map(|(emoji, count, mine)| Reaction { emoji: (*emoji).to_owned(), file: None, count: *count, mine: *mine, who: Vec::new(), ..Reaction::default() }).collect()
 }
 
 pub fn seed(s: &mut Seeder) -> Fallible<Who> {

@@ -235,12 +235,13 @@ pub struct Preview {
 /// sends, never a reason to ask again.
 pub const REACTION_REACTORS: usize = 50;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     /// The emoji itself, or `:name:` for a custom one.
     pub emoji: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<MediaFile>,
+    #[serde(default)]
     pub count: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mine: bool,
@@ -250,6 +251,15 @@ pub struct Reaction {
     /// (Telegram in channels and large groups): the chip then stays a number and says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub who: Vec<String>,
+    /// Discord super / burst reaction count. Separate from `count` (normal reactions).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub burst: u32,
+    /// Whether this account gave a super / burst reaction with this emoji.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mine_burst: bool,
+    /// Accent colours Discord assigns to a super reaction (`#RRGGBB` hex strings, at most 4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub burst_colors: Vec<String>,
 }
 
 /// One person who reacted to a message (`Request::Reactors`).
@@ -977,6 +987,10 @@ impl Message {
             for id in &mut reaction.who {
                 clip(id, 200);
             }
+            reaction.burst_colors.truncate(4);
+            for color in &mut reaction.burst_colors {
+                clip(color, 16);
+            }
         }
         if let Some(forwarded) = &mut self.forwarded {
             clip(&mut forwarded.from_title, 200);
@@ -1163,17 +1177,32 @@ mod tests {
     /// holds the list to its cap.
     #[test]
     fn reaction_reactors_read_and_stay_bounded() {
-        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new() };
+        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new(), ..Reaction::default() };
         let on = serde_json::to_string(&plain).unwrap();
         assert!(!on.contains("who"), "an empty list stays off the wire");
+        assert!(!on.contains("burst"), "zero burst fields stay off the wire");
         assert_eq!(serde_json::from_str::<Reaction>(&on).unwrap(), plain);
 
         let older = r#"{"emoji":"👍","count":2,"mine":false}"#;
-        assert_eq!(serde_json::from_str::<Reaction>(older).unwrap().who, Vec::<String>::new());
+        let parsed: Reaction = serde_json::from_str(older).unwrap();
+        assert_eq!(parsed.who, Vec::<String>::new());
+        assert_eq!((parsed.burst, parsed.mine_burst), (0, false));
+
+        let super_rx = Reaction {
+            emoji: "🔥".into(),
+            count: 2,
+            mine: false,
+            burst: 3,
+            mine_burst: true,
+            burst_colors: vec!["#ff6b6b".into(), "#feca57".into()],
+            ..Reaction::default()
+        };
+        let wire = serde_json::to_string(&super_rx).unwrap();
+        assert_eq!(serde_json::from_str::<Reaction>(&wire).unwrap(), super_rx);
 
         let mut message = Message::plain("m1", "Ada", "hi", 1_700_000_000, false);
         let many: Vec<String> = (0..REACTION_REACTORS - 1).map(|one| format!("u{one}")).collect();
-        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many };
+        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many, ..Reaction::default() };
         named.who.insert(1, "u".repeat(500));
         message.reactions.push(named);
         message.bound();

@@ -3221,8 +3221,51 @@ impl Pane {
                 chip.bg(theme::raised()).border_color(gpui::transparent_black()).hover(|style| style.border_color(tokens::border_strong()))
             }
         };
+        let burst_chip = |id: ElementId, mine: bool, colors: &[String]| {
+            let parsed = colors
+                .first()
+                .and_then(|s| s.strip_prefix('#').or(Some(s.as_str())))
+                .filter(|s| s.len() == 6)
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok());
+            let base = parsed.unwrap_or(0x8b5cf6);
+            let accent = gpui::rgb(base);
+            let fill = gpui::rgba((base << 8) | if mine { if theme::is_light() { 0x33 } else { 0x42 } } else if theme::is_light() { 0x1a } else { 0x24 });
+            let edge_color = if mine { accent } else { gpui::rgba((base << 8) | 0x80) };
+            (
+                div()
+                    .id(id)
+                    .flex_none()
+                    .h(px(if phone { 32. } else { 26. }))
+                    .min_w(px(if phone { 48. } else { 0. }))
+                    .px(px(if phone { 10. } else { 8. }))
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .bg(fill)
+                    .border_color(edge_color)
+                    .hover(move |style| style.border_color(accent))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .when(acts, |chip| chip.cursor_pointer()),
+                accent,
+            )
+        };
         let mut row = div().mt(px(6.)).mb(px(3.)).flex().flex_wrap().gap(px(if phone { 8. } else { 6. }));
-        for (ix, reaction) in message.reactions.iter().take(CHIPS).enumerate() {
+        // Flatten each reaction into its burst chip (if any) and normal chip (if any), so a
+        // message with both normal and super reactions for the same emoji shows both distinctly.
+        let mut entries: Vec<(usize, bool)> = Vec::new();
+        for (ix, reaction) in message.reactions.iter().enumerate() {
+            if reaction.burst > 0 {
+                entries.push((ix, true));
+            }
+            if reaction.count > 0 {
+                entries.push((ix, false));
+            }
+        }
+        let total_chips = entries.len();
+        for (chip_ix, (ix, is_burst)) in entries.into_iter().take(CHIPS).enumerate() {
+            let reaction = &message.reactions[ix];
             let picture = match &reaction.file {
                 Some(file) => match self.still(file, edge, edge, None, cx) {
                     Picture::Ready(image) => Some(div().size(px(18.)).flex_none().child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element()),
@@ -3235,21 +3278,17 @@ impl Pane {
                 let (size, line) = if phone { (17., 22.) } else { (15., 20.) };
                 div().text_size(px(size)).line_height(px(line)).child(emoji::display(&reaction.emoji)).into_any_element()
             });
-            let count = div()
-                .type_small()
-                .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
-                .font_weight(theme::MEDIUM)
-                .text_color(if reaction.mine { theme::accent_text() } else { theme::text_soft() })
-                .child(reaction.count.to_string());
+            let mine = if is_burst { reaction.mine_burst } else { reaction.mine };
+            let shown_count = if is_burst { reaction.burst } else { reaction.count };
             // A custom one goes by its file, which names it where its `:name:` may not.
             let toggled = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
-            let (id, on) = (message.id.clone(), !reaction.mine);
+            let (id, on) = (message.id.clone(), !mine);
             // Joining one the conversation no longer takes, or past a limit, is not offered:
             // the chip says why instead.
-            let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
+            let refused = (!mine).then(|| self.refusal_kind(message, &toggled, is_burst)).flatten();
             // Who reacted, where the network said or after an on-demand fetch; a chip that is
             // only a count keeps its own words.
-            let named = !reaction.who.is_empty();
+            let named = !is_burst && !reaction.who.is_empty();
             let names = if named {
                 let said = |id: &str| match self.person(id) {
                     Some(person) => self.who(&person, cx).0,
@@ -3258,7 +3297,7 @@ impl Pane {
                 reactor_words(&reaction.who, said)
             } else {
                 self.fetched_reactors
-                    .get(&(message.id.clone(), toggled.clone()))
+                    .get(&(message.id.clone(), toggled.clone(), is_burst))
                     .and_then(|(reactors, _)| {
                         let ids: Vec<String> = reactors.iter().map(|r| r.name.clone()).collect();
                         reactor_words(&ids, |name| name.to_owned())
@@ -3266,8 +3305,11 @@ impl Pane {
             };
             let words = match (&refused, &names) {
                 (Some(why), _) => why.clone(),
+                (None, Some(names)) if is_burst => format!("Super reaction · {names}"),
                 (None, Some(names)) => names.clone(),
-                (None, None) if reaction.mine => "Take back your reaction".to_owned(),
+                (None, None) if is_burst && mine => "Take back your super reaction".to_owned(),
+                (None, None) if is_burst => "Super react with this too".to_owned(),
+                (None, None) if mine => "Take back your reaction".to_owned(),
                 (None, None) => "React with this too".to_owned(),
             };
             let joins = acts && refused.is_none();
@@ -3280,20 +3322,41 @@ impl Pane {
                     cx.stop_propagation();
                     let at = event.position;
                     let open = open.clone();
-                    this.open_reactors(open, ix, at, window, cx);
+                    this.open_reactors(open, ix, is_burst, at, window, cx);
                 })
             });
-            row = row.child(
-                chip(("chip", ix).into(), reaction.mine)
+            let built = if is_burst {
+                let (base_chip, accent) = burst_chip(("chip", chip_ix).into(), mine, &reaction.burst_colors);
+                let count = div()
+                    .type_small()
+                    .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(if mine { accent } else { theme::text() })
+                    .child(shown_count.to_string());
+                base_chip
+                    .child(div().type_micro().text_color(accent).child("✦"))
                     .child(emoji)
                     .child(count)
+            } else {
+                let count = div()
+                    .type_small()
+                    .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(if mine { theme::accent_text() } else { theme::text_soft() })
+                    .child(shown_count.to_string());
+                chip(("chip", chip_ix).into(), mine)
+                    .child(emoji)
+                    .child(count)
+            };
+            row = row.child(
+                built
                     .when(acts && !phone, |chip| chip.tooltip(tip(words, None)))
-                    .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
+                    .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react_kind(&id, &toggled, on, is_burst, cx))))
                     .when_some(list, |chip, list| chip.on_mouse_down(MouseButton::Right, list))
                     .when(!joins, |chip| chip.cursor_default()),
             );
         }
-        let hidden = message.reactions.len().saturating_sub(CHIPS);
+        let hidden = total_chips.saturating_sub(CHIPS);
         if hidden > 0 {
             row = row.child(chip("chips-more".into(), false).type_small().text_color(theme::text_soft()).child(format!("+{hidden}")));
         }

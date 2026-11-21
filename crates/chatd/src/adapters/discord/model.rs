@@ -916,12 +916,26 @@ pub struct Embed {
     pub fields: Vec<EmbedField>,
 }
 
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct CountDetails {
+    #[serde(default)]
+    pub burst: u32,
+    #[serde(default)]
+    pub normal: u32,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Reacted {
     #[serde(default)]
     pub count: u32,
     #[serde(default)]
+    pub count_details: Option<CountDetails>,
+    #[serde(default)]
     pub me: bool,
+    #[serde(default)]
+    pub me_burst: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub burst_colors: Vec<String>,
     pub emoji: Emoji,
 }
 

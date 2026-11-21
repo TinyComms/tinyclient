@@ -1519,17 +1519,20 @@ impl Chat {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        if burst && !self.hub.capabilities(&account).burst_reactions {
+        if on && burst && !self.hub.capabilities(&account).burst_reactions {
             return error(ErrorCode::Unsupported, "Super reactions are not available on this account.");
         }
-        let ours = |emoji: &str| Reaction {
+        let ours = |emoji: &str, burst: bool| Reaction {
             emoji: emoji.to_owned(),
             file: None,
-            count: 1,
-            mine: true,
+            count: if burst { 0 } else { 1 },
+            mine: !burst,
             // Ours is one person the store cannot name here; the network's word of the
             // reaction carries the id, and a fresh payload corrects the list.
             who: Vec::new(),
+            burst: if burst { 1 } else { 0 },
+            mine_burst: burst,
+            burst_colors: Vec::new(),
         };
         let message = match self.hub.store().message(&conversation, &message_id) {
             Ok(Some(message)) => message,
@@ -1539,7 +1542,7 @@ impl Chat {
         let known = self.hub.store().media(&account, std::slice::from_ref(&emoji)).is_ok_and(|known| !known.is_empty());
         // Rules the adapter cannot give leave it to the network, as before there were any.
         let (emoji, replacing) = match (on, self.reaction_rules(&conversation)) {
-            (true, Ok(rules)) => match rules.check(&message.reactions, &emoji, known || emoji.starts_with(':')) {
+            (true, Ok(rules)) => match rules.check_kind(&message.reactions, &emoji, known || emoji.starts_with(':'), burst) {
                 // Sent as the network spells it, so its own word of it is the same reaction.
                 Ok(replacing) => (rules.spelled(&emoji).to_owned(), replacing),
                 Err(why) => return error(ErrorCode::Refused, why),
@@ -1549,7 +1552,7 @@ impl Chat {
         let shown = {
             let mut store = self.hub.store();
             for old in &replacing {
-                if let Err(err) = store.react(&conversation, &message_id, &ours(old), false) {
+                if let Err(err) = store.react(&conversation, &message_id, &ours(old, false), false) {
                     return internal(err);
                 }
             }
@@ -1557,7 +1560,7 @@ impl Chat {
             if known && !on_it {
                 false
             } else {
-                match store.react(&conversation, &message_id, &ours(&emoji), on) {
+                match store.react(&conversation, &message_id, &ours(&emoji, burst), on) {
                     Ok(changed) => changed,
                     Err(err) => return internal(err),
                 }
@@ -1581,10 +1584,10 @@ impl Chat {
                 // What the network refused may be what the kept rules allowed: ask again next time.
                 self.hub.reactions.forget(&conversation);
                 let mut store = self.hub.store();
-                let mut undone = shown && store.react(&conversation, &message_id, &ours(&emoji), !on).unwrap_or(false);
+                let mut undone = shown && store.react(&conversation, &message_id, &ours(&emoji, burst), !on).unwrap_or(false);
                 for old in &replacing {
-                    let had = message.reactions.iter().find(|have| have.emoji == *old).map(|have| Reaction { count: 1, ..have.clone() });
-                    undone |= store.react(&conversation, &message_id, &had.unwrap_or_else(|| ours(old)), true).unwrap_or(false);
+                    let had = message.reactions.iter().find(|have| have.emoji == *old).map(|have| Reaction { count: 1, burst: 0, mine_burst: false, ..have.clone() });
+                    undone |= store.react(&conversation, &message_id, &had.unwrap_or_else(|| ours(old, false)), true).unwrap_or(false);
                 }
                 drop(store);
                 if undone {

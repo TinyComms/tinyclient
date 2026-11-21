@@ -3594,39 +3594,72 @@ impl Store {
             have.emoji == reaction.emoji || have.file.as_ref().is_some_and(|file| file.id == reaction.emoji)
         };
         let at = message.reactions.iter().position(same);
-        match (at, added) {
-            (Some(at), true) if reaction.mine && message.reactions[at].mine => return Ok(false),
-            (Some(at), false) if reaction.mine && !message.reactions[at].mine => return Ok(false),
-            (Some(at), true) => {
-                message.reactions[at].count += 1;
-                message.reactions[at].mine |= reaction.mine;
-                // Events arrive one person at a time; the list keeps who it was told of,
-                // newest last, and stays within the cap a payload is held to.
-                for id in &reaction.who {
-                    if !message.reactions[at].who.contains(id) {
-                        message.reactions[at].who.push(id.clone());
+        let is_burst = reaction.burst > 0 || reaction.mine_burst;
+        if is_burst {
+            match (at, added) {
+                (Some(at), true) if reaction.mine_burst && message.reactions[at].mine_burst => return Ok(false),
+                (Some(at), false) if reaction.mine_burst && !message.reactions[at].mine_burst => return Ok(false),
+                (Some(at), true) => {
+                    message.reactions[at].burst += 1;
+                    message.reactions[at].mine_burst |= reaction.mine_burst;
+                    if message.reactions[at].burst_colors.is_empty() && !reaction.burst_colors.is_empty() {
+                        message.reactions[at].burst_colors = reaction.burst_colors.clone();
                     }
                 }
-                message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
-            }
-            (None, true) => message.reactions.push(Reaction {
-                count: 1,
-                ..reaction.clone()
-            }),
-            (Some(at), false) => {
-                let have = &mut message.reactions[at];
-                have.count = have.count.saturating_sub(1);
-                have.mine &= !reaction.mine;
-                // The one who took theirs back leaves the list; a removal that names nobody
-                // (ours, before the network's word) leaves it as it was.
-                if !reaction.who.is_empty() {
-                    have.who.retain(|id| !reaction.who.contains(id));
+                (None, true) => message.reactions.push(Reaction {
+                    count: 0,
+                    mine: false,
+                    burst: 1,
+                    mine_burst: reaction.mine_burst,
+                    ..reaction.clone()
+                }),
+                (Some(at), false) => {
+                    let have = &mut message.reactions[at];
+                    have.burst = have.burst.saturating_sub(1);
+                    have.mine_burst &= !reaction.mine_burst;
+                    if have.count == 0 && have.burst == 0 {
+                        message.reactions.remove(at);
+                    }
                 }
-                if have.count == 0 {
-                    message.reactions.remove(at);
-                }
+                (None, false) => return Ok(false),
             }
-            (None, false) => return Ok(false),
+        } else {
+            match (at, added) {
+                (Some(at), true) if reaction.mine && message.reactions[at].mine => return Ok(false),
+                (Some(at), false) if reaction.mine && !message.reactions[at].mine => return Ok(false),
+                (Some(at), true) => {
+                    message.reactions[at].count += 1;
+                    message.reactions[at].mine |= reaction.mine;
+                    // Events arrive one person at a time; the list keeps who it was told of,
+                    // newest last, and stays within the cap a payload is held to.
+                    for id in &reaction.who {
+                        if !message.reactions[at].who.contains(id) {
+                            message.reactions[at].who.push(id.clone());
+                        }
+                    }
+                    message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
+                }
+                (None, true) => message.reactions.push(Reaction {
+                    count: 1,
+                    burst: 0,
+                    mine_burst: false,
+                    ..reaction.clone()
+                }),
+                (Some(at), false) => {
+                    let have = &mut message.reactions[at];
+                    have.count = have.count.saturating_sub(1);
+                    have.mine &= !reaction.mine;
+                    // The one who took theirs back leaves the list; a removal that names nobody
+                    // (ours, before the network's word) leaves it as it was.
+                    if !reaction.who.is_empty() {
+                        have.who.retain(|id| !reaction.who.contains(id));
+                    }
+                    if have.count == 0 && have.burst == 0 {
+                        message.reactions.remove(at);
+                    }
+                }
+                (None, false) => return Ok(false),
+            }
         }
         Ok(self.ingest(conversation, &message, false)? != Stored::Same)
     }
@@ -5614,7 +5647,7 @@ mod tests {
         store.register_media(&account, &[(thumb, "https://cdn.example/att-1".into())]).unwrap();
         store.ingest(&key, &message, false).unwrap();
 
-        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new() };
+        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new(), ..Reaction::default() };
         assert!(store.react(&key, "1", &thumbs_up(false), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(true), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(false), false).unwrap());
@@ -5640,7 +5673,7 @@ mod tests {
     fn a_reaction_keeps_who_the_network_named_and_lets_them_go() {
         let (mut store, key) = store();
         store.ingest(&key, &said("1", "look", 10), false).unwrap();
-        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()] };
+        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()], ..Reaction::default() };
         // One event at a time, as an event that names its one person arrives.
         assert!(store.react(&key, "1", &by("u-ana"), true).unwrap());
         assert!(store.react(&key, "1", &by("u-bea"), true).unwrap());
@@ -5656,7 +5689,7 @@ mod tests {
         let shown = store.message(&key, "1").unwrap().unwrap();
         assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2u32, &["u-bea".to_owned(), "u-cy".to_owned()][..]));
         // Ours goes before the network says who: the count moves, the list stands.
-        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new() };
+        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new(), ..Reaction::default() };
         assert!(store.react(&key, "1", &ours(true), true).unwrap());
         assert!(store.react(&key, "1", &ours(false), false).unwrap());
         let shown = store.message(&key, "1").unwrap().unwrap();

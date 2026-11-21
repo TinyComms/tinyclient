@@ -167,13 +167,14 @@ impl Discord {
     /// Reactions to start a new one (without it only existing ones can be added to), worked out
     /// from the kept channel as the tree is; a thread goes by its channel. Custom emoji: without
     /// Nitro only the server's own and none animated, none in a DM; with it any. A message holds
-    /// at most 20 different reactions. Super reactions are never sent.
+    /// at most 20 different reactions. Super reactions are offered only with Nitro.
     pub(super) fn reaction_rules(&self, channel: &str) -> ReactionRules {
         let nitro = matches!(crate::hub::lock(&self.state).premium, 1..=3);
         let mut rules = ReactionRules {
             custom: if nitro { EmojiScope::All } else { EmojiScope::Space },
             animated: nitro,
             distinct: 20,
+            burst: nitro,
             ..ReactionRules::default()
         };
         let row = self.ctx.known(channel).ok().flatten();
@@ -203,6 +204,7 @@ impl Discord {
             return ReactionRules::off("You can't react in this channel.");
         }
         rules.join_only = allowed & model::ADD_REACTIONS == 0;
+        rules.burst = nitro && !rules.join_only;
         rules
     }
 

@@ -657,21 +657,31 @@ fn card(embed: &Embed, names: &dyn Names) -> Card {
 }
 
 fn reactions(rich: &mut Rich, reacted: &[model::Reacted]) -> Vec<Reaction> {
-    let mapped = reacted.iter().filter(|reaction| reaction.count > 0).map(|reaction| {
+    let mapped = reacted.iter().filter_map(|reaction| {
+        let (normal, burst) = match &reaction.count_details {
+            Some(details) => (details.normal, details.burst),
+            None => (reaction.count, 0),
+        };
+        if normal == 0 && burst == 0 {
+            return None;
+        }
         let (emoji, file) = reaction.emoji.spelled();
         let file = file.map(|(file, url)| {
             rich.files.push((file.clone(), url));
             file
         });
-        Reaction {
+        Some(Reaction {
             emoji,
             file,
-            count: reaction.count,
+            count: normal,
             mine: reaction.me,
             // Discord's message payload counts reactions and never names who: the list
             // would need one request per emoji, which this build does not make.
             who: Vec::new(),
-        }
+            burst,
+            mine_burst: reaction.me_burst,
+            burst_colors: reaction.burst_colors.clone(),
+        })
     });
     mapped.collect()
 }

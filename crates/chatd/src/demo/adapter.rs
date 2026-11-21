@@ -237,6 +237,7 @@ impl Demo {
                 count: 1,
                 mine: true,
                 who: Vec::new(),
+                ..Reaction::default()
             },
             None => Reaction {
                 emoji: emoji.to_owned(),
@@ -244,6 +245,7 @@ impl Demo {
                 count: 1,
                 mine: true,
                 who: Vec::new(),
+                ..Reaction::default()
             },
         }
     }

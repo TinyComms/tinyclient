@@ -1616,7 +1616,7 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
             message.reactions[at].mine = mine;
         }
     } else {
-        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false), who: Vec::new() });
+        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false), who: Vec::new(), ..Reaction::default() });
     }
     let _ = ctx.message(conversation_id, &message);
 }
@@ -1640,7 +1640,7 @@ fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionL
         message.reactions[at].count = landed.count;
         message.reactions[at].mine = landed.mine;
     } else {
-        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine, who: Vec::new() });
+        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine, who: Vec::new(), ..Reaction::default() });
     }
     let _ = ctx.message(conversation_id, &message);
     true
@@ -3043,9 +3043,9 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         if let Some(emoji_id) = reaction.emoji_id.as_deref().filter(|id| super::safe_id(id)) {
             let file = emoji_media_for(saved, emoji_id);
             let label = reaction.name.as_deref().map(|n| format!(":{n}:")).unwrap_or_else(|| reaction.emoji.clone());
-            message.reactions.push(Reaction { emoji: label, file, count: reaction.count, mine: reaction.me, who: Vec::new() });
+            message.reactions.push(Reaction { emoji: label, file, count: reaction.count, mine: reaction.me, who: Vec::new(), ..Reaction::default() });
         } else if unicode_emoji(&reaction.emoji) {
-            message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+            message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new(), ..Reaction::default() });
         }
     }
     if !deleted {
@@ -3303,7 +3303,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new(), ..Reaction::default() });
     }
     relink(&mut message);
     Some(message)

@@ -830,7 +830,7 @@ impl Discord {
             gif_file: false,
             mention_format: protocol::MentionFormat::Discord,
             mention_spans: false,
-            burst_reactions: false,
+            burst_reactions: matches!(premium, 1..=3),
             blocks: true,
             add_friend_by_username: true,
             friend_nickname: true,
