@@ -3,10 +3,10 @@
 //! the contract. It proves nothing about Google's relay, which needs a real phone.
 
 use protocol::{
-    read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Encryption, Key,
-    Link, MediaKind, Message, MessageKind, Network, Notify, Outgoing, OutgoingFile, Page,
-    ReactionSet, RelateAction, Request, Response, SendState, SharedKind, Shelf, SignInInput,
-    SignInStep, Special,
+    read_frame, write_frame, AccountKey, CallSupport, Change, ChatStream, ConversationKind,
+    Encryption, ErrorCode, Key, Link, MediaKind, Message, MessageKind, Network, Notify, Outgoing,
+    OutgoingFile, Page, ReactionSet, RelateAction, Request, Response, SendState, SharedKind, Shelf,
+    SignInInput, SignInStep, Special,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -1573,4 +1573,91 @@ fn an_older_line_is_found_without_opening_the_chat() {
         }
         other => panic!("the shared list was not served: {other:?}"),
     }
+}
+
+#[test]
+fn a_direct_messages_chat_hands_off_to_tel_and_a_group_has_no_call() {
+    let world = World::linked();
+    world.connected();
+    let grace = world.conversation(GRACE).expect("Grace row");
+    let club = world.conversation(CLUB).expect("Club row");
+    assert_eq!(grace.call, CallSupport::Handoff);
+    assert_eq!(club.call, CallSupport::None);
+
+    match world.ask(Request::Handoff { conversation: key(GRACE) }) {
+        Response::Link { url } => assert_eq!(url, "tel:+15550100002"),
+        other => panic!("expected tel: handoff, got {other:?}"),
+    }
+    match world.ask(Request::Handoff { conversation: key(CLUB) }) {
+        Response::Error { code: ErrorCode::Unsupported | ErrorCode::Refused, .. } => {}
+        other => panic!("expected group handoff to be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_messages_group_answers_its_members_and_info() {
+    let world = World::linked();
+    world.connected();
+    match world.ask(Request::Members {
+        conversation: key(CLUB),
+        offset: 0,
+        limit: 20,
+    }) {
+        Response::Members { members, .. } => {
+            assert_eq!(members.len(), 3, "expected 3 group members: {members:?}");
+            let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+            assert!(names.contains(&"Ada Quill"), "{names:?}");
+            assert!(names.contains(&"Grace Ombra"), "{names:?}");
+            assert!(names.contains(&"Alan Ferro"), "{names:?}");
+        }
+        other => panic!("expected Members, got {other:?}"),
+    }
+    match world.ask(Request::ConversationInfo { conversation: key(CLUB) }) {
+        Response::ConversationInfo { info } => {
+            assert_eq!(info.members, Some(3));
+        }
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    }
+}
+
+#[test]
+fn typing_resolves_a_raw_number_to_the_contact_name() {
+    let world = World::linked();
+    world.connected();
+
+    let (_, since) = world.status();
+    world.steer(&format!("typing-raw {GRACE} +15550100002"));
+    let direct_typists = world.changed(since, "1:1 raw typing", |change| match change {
+        Change::Typing { conversation, typists } if conversation.id == GRACE && !typists.is_empty() => Some(typists.clone()),
+        _ => None,
+    });
+    assert_eq!(direct_typists.len(), 1);
+    assert_eq!(direct_typists[0].id, GRACE);
+    assert_eq!(direct_typists[0].name, "Grace Ombra");
+
+    let (_, since) = world.status();
+    world.steer(&format!("typing-raw {CLUB} +15550100002"));
+    let group_typists = world.changed(since, "group raw typing", |change| match change {
+        Change::Typing { conversation, typists } if conversation.id == CLUB && !typists.is_empty() => Some(typists.clone()),
+        _ => None,
+    });
+    assert!(
+        group_typists.iter().any(|t| t.name == "Grace Ombra"),
+        "expected Grace Ombra in group typists: {group_typists:?}"
+    );
+
+    let (_, since) = world.status();
+    world.steer(&format!("typing-raw {CLUB} +15550199999"));
+    let unknown_typists = world.changed(since, "unknown raw typing", |change| match change {
+        Change::Typing { conversation, typists } if conversation.id == CLUB && typists.iter().any(|t| t.name == "Someone" || t.name.contains("99999")) => Some(typists.clone()),
+        _ => None,
+    });
+    assert!(
+        unknown_typists.iter().any(|t| t.name == "Someone"),
+        "expected unknown number to show Someone: {unknown_typists:?}"
+    );
+    assert!(
+        !unknown_typists.iter().any(|t| t.name.contains("99999")),
+        "raw phone number leaked into typist name: {unknown_typists:?}"
+    );
 }

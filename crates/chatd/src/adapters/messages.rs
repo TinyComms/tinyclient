@@ -913,15 +913,13 @@ fn apply(account: &Account, event: Event) {
             name,
             started,
         } => {
+            let (person_id, resolved_name) = resolve_typist(account, &conversation, &by, &name);
             if started {
-                let name = if name.is_empty() {
-                    "Someone".into()
-                } else {
-                    name
-                };
-                account.ctx.typing(&conversation, &by, &name, TYPING_SHOWN);
+                account
+                    .ctx
+                    .typing(&conversation, &person_id, &resolved_name, TYPING_SHOWN);
             } else {
-                account.ctx.typing_stopped(&conversation, &by);
+                account.ctx.typing_stopped(&conversation, &person_id);
             }
             nudge(account);
         }
@@ -930,6 +928,72 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Ready | Event::Closed(_) | Event::Ended(_) => {}
     }
+}
+
+fn digits_only(text: &str) -> String {
+    text.chars().filter(char::is_ascii_digit).collect()
+}
+
+fn looks_like_number(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().any(|c| c.is_ascii_digit())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' ' | '.'))
+}
+
+fn resolve_typist(account: &Account, conversation: &str, by: &str, name: &str) -> (String, String) {
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned();
+    if let Some(chat) = chat {
+        if !chat.group {
+            let display = if !chat.title.is_empty() && !looks_like_number(&chat.title) {
+                chat.title.clone()
+            } else if let Some(found) = chat
+                .participants
+                .iter()
+                .find(|p| !p.is_me && !p.name.is_empty() && !looks_like_number(&p.name))
+            {
+                found.name.clone()
+            } else if !name.is_empty() && !looks_like_number(name) {
+                name.to_owned()
+            } else {
+                "Someone".to_owned()
+            };
+            return (chat.id, display);
+        }
+        let by_digits = digits_only(by);
+        if let Some(participant) = chat.participants.iter().find(|p| {
+            (!p.id.is_empty() && p.id == by)
+                || (!p.number.is_empty() && p.number == by)
+                || (!by_digits.is_empty()
+                    && !p.number.is_empty()
+                    && digits_only(&p.number) == by_digits)
+        }) {
+            let pid = if !participant.id.is_empty() {
+                participant.id.clone()
+            } else {
+                by.to_owned()
+            };
+            let display = if !participant.name.is_empty() && !looks_like_number(&participant.name) {
+                participant.name.clone()
+            } else {
+                "Someone".to_owned()
+            };
+            return (pid, display);
+        }
+    }
+    let display = if !name.is_empty() && !looks_like_number(name) {
+        name.to_owned()
+    } else {
+        "Someone".to_owned()
+    };
+    (by.to_owned(), display)
 }
 
 fn saw(account: &Account, note: &bugle::Note) {
