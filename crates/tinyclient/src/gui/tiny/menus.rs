@@ -343,7 +343,8 @@ impl Shell {
                 items.child(self.plain(menu_item("tiny-channel-rename", Some("icons/pencil.svg"), "Rename channel…", None), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::RenameRoom(id.clone()), window, cx))))
             };
         }
-        let link = format!("{}/rooms/{}", page.community.origin.trim_end_matches('/'), room.id);
+        let link = protocol::room_link(&page.community.origin, &room.id)
+            .unwrap_or_else(|| format!("tinyclient://room?server={}&id={}", protocol::join_host(&page.community.origin), room.id));
         items = items.child(self.plain(menu_item("tiny-channel-copy", Some("icons/link.svg"), "Copy channel link", None), cx).on_click(cx.listener(move |this, _, _, cx| {
             this.tiny_close_float(cx);
             this.tiny_copy(link.clone(), "Channel link copied", cx);

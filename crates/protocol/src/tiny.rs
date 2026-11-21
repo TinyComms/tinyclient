@@ -1345,6 +1345,62 @@ pub fn parse_invite_link(input: &str) -> Option<(String, String)> {
     Some((invite_origin(&origin)?, token))
 }
 
+const ROOM_APP_PREFIX: &str = "tinyclient://room?";
+
+fn safe_room_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id != "."
+        && id != ".."
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// Build an app deep link for a Tiny voice channel: `tinyclient://room?server=<host>&id=<id>`.
+pub fn room_link(origin: &str, room_id: &str) -> Option<String> {
+    let origin = invite_origin(origin)?;
+    if !safe_room_id(room_id) {
+        return None;
+    }
+    let host = join_host(&origin);
+    (!host.is_empty()).then(|| format!("{ROOM_APP_PREFIX}server={host}&id={room_id}"))
+}
+
+/// Parse a Tiny room deep link (`tinyclient://room?server=<host>&id=<id>`), returning the
+/// normalized server host (with non-default port) and validated room id.
+pub fn parse_room_link(input: &str) -> Option<(String, String)> {
+    if input.len() > INVITE_ORIGIN_MAX + 256
+        || !input.starts_with(ROOM_APP_PREFIX)
+        || input.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(input).ok()?;
+    if parsed.scheme() != "tinyclient"
+        || parsed.host_str() != Some("room")
+        || !parsed.path().is_empty()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let mut server = None;
+    let mut id = None;
+    for (k, v) in parsed.query_pairs() {
+        match k.as_ref() {
+            "server" if server.is_none() => server = Some(v.into_owned()),
+            "id" if id.is_none() => id = Some(v.into_owned()),
+            _ => return None,
+        }
+    }
+    let server = server?;
+    let id = id?;
+    if !safe_room_id(&id) {
+        return None;
+    }
+    let normalized = invite_origin(&format!("https://{server}"))?;
+    let host = join_host(&normalized);
+    (!host.is_empty()).then_some((host, id))
+}
+
 /// The host, and a port when it is not the usual one. `https://private.tinyclient.io` is
 /// `private.tinyclient.io`. `http://127.0.0.1:8080` keeps the port.
 pub fn join_host(origin: &str) -> String {
@@ -1553,6 +1609,42 @@ mod tests {
         assert!(parse_invite_link(&format!("https://tinyclient.io/invite?x=1#{code}")).is_none());
         assert!(parse_invite_link(&"a".repeat(2049)).is_none());
         assert!(parse_invite_link("tc1.zz.token").is_none());
+    }
+
+    #[test]
+    fn room_links_round_trip_and_reject_malformed_inputs() {
+        let link = room_link("https://Chat.Example:8443", "room_1-a.b").unwrap();
+        assert_eq!(link, "tinyclient://room?server=chat.example:8443&id=room_1-a.b");
+        assert_eq!(parse_room_link(&link), Some(("chat.example:8443".into(), "room_1-a.b".into())));
+
+        let plain = room_link("https://tiny.example", "lounge").unwrap();
+        assert_eq!(plain, "tinyclient://room?server=tiny.example&id=lounge");
+        assert_eq!(parse_room_link(&plain), Some(("tiny.example".into(), "lounge".into())));
+
+        let v6 = room_link("http://[::1]:8080", "r1").unwrap();
+        assert_eq!(parse_room_link(&v6), Some(("[::1]:8080".into(), "r1".into())));
+
+        for bad in [
+            "https://tiny.example/rooms/lounge",
+            "tinyclient://room",
+            "tinyclient://room?server=tiny.example",
+            "tinyclient://room?id=lounge",
+            "tinyclient://room?server=&id=lounge",
+            "tinyclient://room?server=tiny.example&id=",
+            "tinyclient://room?server=tiny.example&id=..",
+            "tinyclient://room?server=tiny.example&id=.",
+            "tinyclient://room?server=tiny.example&id=a/b",
+            "tinyclient://room?server=tiny.example&id=a%20b",
+            "tinyclient://room?server=user@tiny.example&id=lounge",
+            "tinyclient://room?server=tiny.example/evil&id=lounge",
+            "tinyclient://room/extra?server=tiny.example&id=lounge",
+            "tinyclient://room?server=tiny.example&id=lounge#frag",
+            "tinyclient://join#abc",
+        ] {
+            assert_eq!(parse_room_link(bad), None, "{bad}");
+        }
+        assert!(room_link("https://tiny.example", "../etc").is_none());
+        assert!(room_link("ftp://tiny.example", "lounge").is_none());
     }
 
     #[test]

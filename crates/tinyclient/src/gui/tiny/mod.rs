@@ -193,6 +193,8 @@ pub struct State {
 
     /// The channel on show. None is the server's home.
     channel: Option<String>,
+    /// A room deep link waiting for its server page to finish loading.
+    pending_room_link: Option<(AccountKey, String)>,
     /// The person drawn large, or the stream filling the stage, pinned by a click on its tile.
     focus: Option<stage::Focus>,
     /// Where the people go while a stream fills the stage.
@@ -312,6 +314,7 @@ impl State {
             warmed: None,
             call_error: None,
             channel: None,
+            pending_room_link: None,
             focus: None,
             strip: stage::Strip::default(),
             full: None,
@@ -741,6 +744,15 @@ impl Shell {
         }
         self.tiny_settings_refreshed(cx);
         self.tiny_setup_page_loaded(first, cx);
+        if let Some((account, room_id)) = self.tiny_state.pending_room_link.take() {
+            if self.tiny_state.account.as_ref() == Some(&account) {
+                if self.tiny_state.community.as_ref().is_some_and(|c| c.rooms.iter().any(|r| r.id == room_id)) {
+                    self.tiny_pick_channel(Some(room_id), cx);
+                } else {
+                    self.toast(None, "That channel isn't available.", cx);
+                }
+            }
+        }
     }
 
     /// Sends one request whose answer is `Ok` or a code, then reads the page again.
@@ -1086,6 +1098,47 @@ impl Shell {
         }
         self.tiny_state.channel = room_id;
         cx.notify();
+    }
+
+    /// Open a `tinyclient://room?server=<host>&id=<id>` link: switch to that server and show the
+    /// room without joining its call, or toast when the server or room isn't available.
+    pub(in crate::gui) fn tiny_open_room_link(&mut self, server: &str, room_id: &str, cx: &mut Context<Self>) {
+        let matched = self
+            .tiny_state
+            .community
+            .as_ref()
+            .filter(|c| protocol::join_host(&c.origin).eq_ignore_ascii_case(server))
+            .and_then(|_| self.tiny_state.account.clone())
+            .or_else(|| {
+                self.spaces
+                    .iter()
+                    .find(|s| s.key.network == Network::Tiny && s.name.eq_ignore_ascii_case(server))
+                    .map(|s| s.key.account())
+            })
+            .or_else(|| {
+                self.snapshot.as_ref()?.accounts.iter().find_map(|a| {
+                    (a.key.network == Network::Tiny
+                        && (a.name.eq_ignore_ascii_case(server)
+                            || protocol::join_host(&a.name).eq_ignore_ascii_case(server)))
+                    .then(|| a.key.clone())
+                })
+            });
+        let Some(account) = matched else {
+            self.toast(None, "You're not signed in to that server.", cx);
+            return;
+        };
+        self.open = None;
+        self.go(Mode::Network(Network::Tiny), cx);
+        if self.tiny_state.account.as_ref() == Some(&account) && self.tiny_state.community.is_some() {
+            if self.tiny_state.community.as_ref().is_some_and(|c| c.rooms.iter().any(|r| r.id == room_id)) {
+                self.tiny_pick_channel(Some(room_id.to_owned()), cx);
+            } else {
+                self.toast(None, "That channel isn't available.", cx);
+            }
+        } else {
+            self.tiny_state.pending_room_link = Some((account.clone(), room_id.to_owned()));
+            self.prefer_tiny(account, cx);
+        }
     }
 
     pub(super) fn tiny_fold(&mut self, key: String, cx: &mut Context<Self>) {
