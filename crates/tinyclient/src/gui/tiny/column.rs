@@ -6,7 +6,7 @@
 
 use super::model::{self, Line};
 use super::{Dragged, Float, Modal, Page};
-use crate::gui::components::{glyph, list_row, network_icon, tip, Avatar, Shape as AvatarShape};
+use crate::gui::components::{badge_for, badge_look, glyph, list_row, network_icon, tip, Avatar, Shape as AvatarShape};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
@@ -45,12 +45,25 @@ fn text_section(mut list: Stateful<Div>, label: &str, chats: &[Rc<Conversation>]
 /// A text channel or a direct message. Picking it opens the conversation pane.
 fn text_row(chat: &Conversation, open: Option<&Key>, cx: &mut Context<Shell>) -> Stateful<Div> {
     let selected = open.is_some_and(|open| open == &chat.key);
+    let unread = chat.unread > 0;
     let icon = if chat.kind == ConversationKind::Direct { "icons/user.svg" } else { "icons/hash.svg" };
-    let tone = if selected { theme::text() } else { theme::text_soft() };
+    let tone = if selected || unread { theme::text() } else { theme::text_soft() };
+    let title_el = div()
+        .flex_1()
+        .min_w_0()
+        .truncate()
+        .type_ui()
+        .when(unread, |el| el.font_weight(theme::MEDIUM))
+        .text_color(if selected || unread { theme::text() } else { theme::text_soft() })
+        .child(chat.title.clone());
     let content = div()
+        .w_full()
+        .flex()
+        .items_center()
         .gap(px(8.))
         .child(glyph(icon, 16., tone))
-        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(chat.title.clone()));
+        .child(title_el)
+        .children(badge_for(badge_look(chat)));
     let key = chat.key.clone();
     let title = chat.title.clone();
     let menu_id = key.id.clone();

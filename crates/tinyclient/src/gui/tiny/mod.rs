@@ -1270,6 +1270,9 @@ impl Shell {
                 }
                 cx.notify();
             }
+            Change::Conversation { conversation } if conversation.account() == account => {
+                cx.notify();
+            }
             _ => {}
         }
     }

@@ -1064,20 +1064,24 @@ impl Chat {
         let marked = self.hub.store().mark_read(&conversation, &message_id);
         match marked {
             Ok(true) => {
-                let marker = self
+                let row = self
                     .hub
                     .store()
                     .conversation(&conversation)
                     .ok()
-                    .flatten()
+                    .flatten();
+                let is_tiny_channel = conversation.network == Network::Tiny
+                    && row.as_ref().is_some_and(|row| row.kind != ConversationKind::Direct);
+                let marker = row
                     .and_then(|row| row.last_read)
                     .filter(|id| !id.is_empty())
                     .unwrap_or(message_id);
                 let conversation_id = conversation.id.clone();
                 // P2: off, the chat is read here and the network is not told, which is what
-                // others would see as a receipt.
+                // others would see as a receipt. On a Tiny server, a channel read is private
+                // (stored for this person's unread count only), so always send it.
                 let account = conversation.account();
-                if self.hub.settings().receipts(&account) && !marker.is_empty() {
+                if (is_tiny_channel || self.hub.settings().receipts(&account)) && !marker.is_empty() {
                     self.command(&account, Command::MarkRead { conversation_id, message_id: marker });
                 }
                 self.hub.changed(Change::Conversation { conversation });
@@ -4762,5 +4766,59 @@ mod tests {
         lock(&chat.adapters).remove(&account);
         drop(ctx);
         let _ = worker.join();
+    }
+
+    #[test]
+    fn tiny_channel_mark_read_sends_command_with_receipts_off_but_direct_does_not() {
+        use super::*;
+        let store = Store::open(std::path::Path::new(":memory:")).expect("memory store");
+        let chat = Chat::new(store);
+        let hub = chat.hub.clone();
+        let account = AccountKey { network: Network::Tiny, account: "me".into() };
+        hub.set_setting(&protocol::settings::account_scope(&account), protocol::settings::RECEIPTS, Some("off".into())).unwrap();
+        assert!(!hub.settings().receipts(&account));
+
+        let (adapter, ctx, inbox) = crate::adapters::local(account.clone(), hub);
+        lock(&chat.adapters).insert(account.clone(), adapter);
+
+        let mut ch_row = ConversationRow::new("ch-1", ConversationKind::Channel, "general");
+        ch_row.space = Some("server".into());
+        ctx.conversation(&ch_row).unwrap();
+        ctx.counts("ch-1", 2, 0, None, 10).unwrap();
+
+        let mut dm_row = ConversationRow::new("dm-1", ConversationKind::Direct, "Bea");
+        dm_row.space = Some("server".into());
+        ctx.conversation(&dm_row).unwrap();
+        ctx.counts("dm-1", 1, 0, None, 10).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let seen_worker = seen.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in inbox {
+                match cmd {
+                    Command::MarkRead { conversation_id, message_id } => {
+                        seen_worker.lock().unwrap().push((conversation_id, message_id));
+                    }
+                    Command::Stop => break,
+                    _ => {}
+                }
+            }
+        });
+
+        assert_eq!(
+            chat.handle(Request::MarkRead { conversation: Key::new(&account, "ch-1"), message_id: "m-1".into() }),
+            Response::Ok
+        );
+        assert_eq!(
+            chat.handle(Request::MarkRead { conversation: Key::new(&account, "dm-1"), message_id: "m-2".into() }),
+            Response::Ok
+        );
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+
+        let commands = seen.lock().unwrap().clone();
+        assert_eq!(commands, vec![("ch-1".to_owned(), "m-1".to_owned())]);
     }
 }

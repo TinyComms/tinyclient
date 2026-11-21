@@ -328,23 +328,41 @@ impl Shell {
         let (name, _) = self.tiny_text_channel_info(channel_id);
         let title = if name.is_empty() { channel_id.to_owned() } else { format!("#{name}") };
         let can_manage = self.tiny_text_channel_can_manage(page, channel_id);
-        if !can_manage {
+        let unread_key = self
+            .tiny_chats()
+            .into_iter()
+            .find(|chat| chat.key.id == channel_id && chat.unread > 0)
+            .map(|chat| chat.key.clone());
+        if !can_manage && unread_key.is_none() {
             return None;
         }
-        let edit_id = channel_id.to_owned();
-        let delete_id = channel_id.to_owned();
-        let items = menu()
-            .w(px(220.))
-            .child(menu_label(title))
-            .child(
-                self.plain(menu_item("tiny-text-channel-edit", Some("icons/pencil.svg"), "Edit channel…", None), cx)
-                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::EditChannel(edit_id.clone()), window, cx))),
-            )
-            .child(menu_separator())
-            .child(
-                self.plain(menu_item_danger("tiny-text-channel-delete", Some("icons/trash-2.svg"), "Delete channel…"), cx)
-                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::DeleteChannel(delete_id.clone()), window, cx))),
+        let mut items = menu().w(px(220.)).child(menu_label(title));
+        if let Some(key) = unread_key {
+            items = items.child(
+                self.plain(menu_item("tiny-text-channel-read", Some("icons/check.svg"), "Mark as read", None), cx)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tiny_close_float(cx);
+                        this.mark_conversation_read(key.clone(), cx);
+                    })),
             );
+            if can_manage {
+                items = items.child(menu_separator());
+            }
+        }
+        if can_manage {
+            let edit_id = channel_id.to_owned();
+            let delete_id = channel_id.to_owned();
+            items = items
+                .child(
+                    self.plain(menu_item("tiny-text-channel-edit", Some("icons/pencil.svg"), "Edit channel…", None), cx)
+                        .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::EditChannel(edit_id.clone()), window, cx))),
+                )
+                .child(menu_separator())
+                .child(
+                    self.plain(menu_item_danger("tiny-text-channel-delete", Some("icons/trash-2.svg"), "Delete channel…"), cx)
+                        .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::DeleteChannel(delete_id.clone()), window, cx))),
+                );
+        }
         Some(items)
     }
 
