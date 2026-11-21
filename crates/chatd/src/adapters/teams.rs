@@ -323,6 +323,12 @@ struct State {
     away: HashMap<String, (String, Option<i64>)>,
     /// Subject and inline image HTML remembered for our own messages so edits keep them.
     own_meta: HashMap<(String, String), message::OwnMeta>,
+    /// Chat ids pinned in Teams, in Teams' own order.
+    pinned_chats: Vec<String>,
+    /// Per-conversation notification level as reported by Teams.
+    notify: HashMap<String, protocol::Notify>,
+    /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
+    scheduled: HashMap<String, i64>,
 }
 
 /// What a call presents.
@@ -559,6 +565,25 @@ fn seconds(iso: &str) -> i64 {
     let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
     days * 86_400 + hour * 3600 + minute * 60 + second
+}
+
+/// ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.000Z`) from Unix seconds.
+pub(super) fn iso_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400) + 719_468;
+    let secs = unix_secs.rem_euclid(86_400);
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.000Z")
 }
 
 /// 16 bytes nobody can guess, as a version 4 UUID.
@@ -888,6 +913,11 @@ impl Teams {
             delete: true,
             threads: true,
             pins: false,
+            pin_chats: 15,
+            close_direct: true,
+            clear_history: true,
+            suppress_embeds: true,
+            schedule: true,
             forward: false,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
@@ -920,6 +950,9 @@ impl Teams {
             Command::HistoryAround { conversation_id, around } => self.report(self.around(&conversation_id, &around).map_err(Failure::from)),
             Command::OpenSpace(_) | Command::OpenHome => self.report(self.open_space().map_err(Failure::from)),
             Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id).map_err(Failure::from)),
+            Command::MarkUnread { conversation_id, message_id, mentions: _ } => {
+                self.report(self.mark_unread(&conversation_id, &message_id).map_err(Failure::from))
+            }
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 self.post(&conversation_id, &client_id, &text, reply_to.as_deref())
             }
@@ -963,6 +996,15 @@ impl Teams {
             }
             Command::Leave { conversation_id, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
+            }
+            Command::File { conversation_id, pinned, archived: _, folder_add: _, folder_remove: _, reply } => {
+                let _ = reply.send(self.file_chat(&conversation_id, pinned).map_err(refuse));
+            }
+            Command::CloseDirect { conversation_id, reply } => {
+                let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));
+            }
+            Command::ClearHistory { conversation_id, delete_chat, revoke: _, reply } => {
+                let _ = reply.send(self.delete_chat(&conversation_id, delete_chat).map_err(refuse));
             }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
@@ -1048,6 +1090,19 @@ impl Teams {
         if let Some((channel, root)) = chain_of(conversation) {
             self.clear_chain_unread(channel, root)?;
         }
+        Ok(())
+    }
+
+    /// Moves Teams' consumption horizon back to `message` (the last message that still counts
+    /// as read, or `"0"` when marking from the very start) so "Mark as unread" syncs across devices.
+    fn mark_unread(&self, conversation: &str, message: &str) -> Result<(), Fault> {
+        let marker = if millis(message) >= 1_000_000_000_000 { message } else { "0" };
+        let path = format!(
+            "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
+            escaped(thread_of(conversation))
+        );
+        let horizon = json!({"consumptionhorizon": format!("{marker};{};{marker}", now_ms())});
+        self.chat("PUT", &path, Body::Json(&horizon), true)?;
         Ok(())
     }
 }
