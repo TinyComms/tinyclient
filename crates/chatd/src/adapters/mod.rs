@@ -1811,6 +1811,13 @@ impl Context {
         }
     }
 
+    /// Whether the call allows camera and screen share (`video_enabled` on a Tiny room).
+    pub fn tiny_video_allowed(&self, conversation_id: &str, allowed: bool) {
+        if self.in_call(conversation_id) {
+            self.hub.calls.set_video_allowed(&self.hub, &self.key(conversation_id), allowed);
+        }
+    }
+
     /// Tells the call's mediad, if there is one: who holds priority speech.
     pub fn tell_media(&self, conversation_id: &str, request: protocol::MediaRequest) {
         if self.in_call(conversation_id) {

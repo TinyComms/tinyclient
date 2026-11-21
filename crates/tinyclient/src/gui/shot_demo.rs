@@ -976,6 +976,7 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     }
 }
 

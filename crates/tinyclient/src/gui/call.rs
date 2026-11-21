@@ -14,6 +14,8 @@ pub(crate) mod phone;
 pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
+pub(in crate::gui) mod stage;
+pub(in crate::gui) mod view;
 
 // The platform's side of a phone call: the mobile layer routes these (`phone::hooks`).
 #[allow(unused_imports)]
@@ -305,6 +307,15 @@ pub struct State {
     /// at 3 s and 10 s without waiting for a frame to arrive.
     pub(in crate::gui) watch_asked: Option<(String, Instant)>,
     watch_timer: Option<Task<()>>,
+    /// The call whose full call view has the main pane (`gui/call/view.rs`).
+    pub(in crate::gui) view: Option<Key>,
+    /// The person drawn large, or the stream filling the stage, pinned by a click on its tile.
+    pub(in crate::gui) focus: Option<stage::Focus>,
+    /// Where the people go while a stream fills the stage.
+    pub(in crate::gui) strip: stage::Strip,
+    /// The focused stream has the whole window. True when the window was made full screen for
+    /// it, and so goes back when it ends.
+    pub(in crate::gui) full: Option<bool>,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -486,6 +497,7 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     }
 }
 
@@ -756,6 +768,9 @@ impl Shell {
                 state.discord_speaker = None;
                 state.watch_asked = None;
                 state.watch_timer = None;
+                state.view = None;
+                state.focus = None;
+                state.full = None;
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -982,8 +997,8 @@ impl Shell {
         Some((failure.title, failure.line, again))
     }
 
-    /// Goes where the call is: its conversation, or for a Tiny room the server's page on it.
-    /// Only a known Tiny room goes to the server page; any direct call (even unlisted) opens its conversation.
+    /// Goes where the call is: for a Tiny room the server's page on it, else its conversation
+    /// with the main-pane call view open over it.
     pub(in crate::gui) fn call_go(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
         let is_room = key.network == Network::Tiny && self.tiny_room(&key).is_some();
         match call_go_target(&key, is_room) {
@@ -994,7 +1009,8 @@ impl Shell {
                 self.tiny_pick_channel(Some(room_id), cx);
             }
             CallGoTarget::Conversation => {
-                self.select(key, title, cx);
+                self.select(key.clone(), title, cx);
+                self.call_open_view(key, cx);
             }
         }
     }
@@ -1389,15 +1405,16 @@ impl Shell {
         }
     }
 
-    /// The received video frame on screen, when it belongs to `user_id`.
+    /// The received video frame on screen, when it belongs to `(user_id, kind)`.
     pub(in crate::gui) fn call_frame(
         &self,
         call: Option<&Call>,
         user_id: &str,
+        kind: protocol::PictureKind,
     ) -> Option<std::sync::Arc<gpui::RenderImage>> {
         call?.picture
             .as_ref()
-            .filter(|picture| !picture.path.is_empty() && picture.user_id == user_id)?;
+            .filter(|picture| !picture.path.is_empty() && picture.user_id == user_id && picture.kind == kind)?;
         self.call_state.feed.shown().cloned()
     }
 
@@ -1463,7 +1480,8 @@ impl Shell {
             .map(|p| p.kind == protocol::PictureKind::Share)
             .or_else(|| peer_sender.map(|p| p.sharing))
             .unwrap_or(false);
-        let peer_frame = peer_id.and_then(|id| self.call_frame(Some(call), id));
+        let peer_kind = if peer_is_share { protocol::PictureKind::Share } else { protocol::PictureKind::Camera };
+        let peer_frame = peer_id.and_then(|id| self.call_frame(Some(call), id, peer_kind));
         let my_share = self.call_self_frame(Some(call), true);
         let my_camera = self.call_self_frame(Some(call), false);
         let self_frame = my_share.clone().or_else(|| my_camera.clone());

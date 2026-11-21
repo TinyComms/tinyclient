@@ -285,6 +285,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -1959,6 +1960,21 @@ impl Calls {
         if self.update(hub, conversation, |live| {
             if live.call.picture_source != source {
                 live.call.picture_source = source;
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
+    /// Updates whether camera and screen share are allowed in this call (`video_enabled` on a
+    /// Tiny room, `true` for a direct call).
+    pub fn set_video_allowed(&self, hub: &Hub, conversation: &Key, allowed: bool) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.video_allowed != allowed {
+                live.call.video_allowed = allowed;
                 changed = true;
             }
         }) && changed

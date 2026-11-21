@@ -903,6 +903,7 @@ impl Shell {
             self.load_row(key.clone(), cx);
         }
         self.open = Some(key);
+        self.call_state.view = None;
         self.refused = None;
         // A floating sidebar closes on pick.
         self.layout_state.floating = false;

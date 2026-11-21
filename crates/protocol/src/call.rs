@@ -287,6 +287,18 @@ pub struct Call {
     /// has been decoded and painted. `None` when the slot is empty or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture_source: Option<(String, PictureKind)>,
+    /// Whether this call allows camera and screen share (a room's `video_enabled`, or `true` for
+    /// direct calls and Discord). Defaults to `true` when omitted by older builds.
+    #[serde(default = "video_allowed_default", skip_serializing_if = "is_true")]
+    pub video_allowed: bool,
+}
+
+fn video_allowed_default() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
@@ -1075,5 +1087,23 @@ mod tests {
         assert_ne!(SecurityMode::Blocked, SecurityMode::Transport);
         // The default is still the one that says nothing more than holds.
         assert_eq!(SecurityMode::default(), SecurityMode::Transport);
+    }
+
+    #[test]
+    fn call_video_allowed_defaults_true_and_omits_when_true() {
+        let old: Call = serde_json::from_value(serde_json::json!({
+            "conversation": { "network": "tiny", "account": "srv", "id": "room" },
+            "state": "joined", "participants": [], "muted": false, "deafened": false,
+            "joined": 1, "engine_linked": true, "video": []
+        }))
+        .unwrap();
+        assert!(old.video_allowed);
+        let wire = serde_json::to_string(&old).unwrap();
+        assert!(!wire.contains("video_allowed"), "default true stays off the wire: {wire}");
+        let mut disabled = old;
+        disabled.video_allowed = false;
+        let wire = serde_json::to_string(&disabled).unwrap();
+        assert!(wire.contains(r#""video_allowed":false"#), "{wire}");
+        assert!(!serde_json::from_str::<Call>(&wire).unwrap().video_allowed);
     }
 }

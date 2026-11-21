@@ -149,8 +149,24 @@ pub(super) fn security_at() -> Option<Place> {
     }
 }
 
+/// Whether a `--shot` fixture opens the main-pane call view directly (`view_*`).
+pub(super) fn view_open() -> bool {
+    named().is_some_and(|name| name.starts_with("view_"))
+}
+
+/// Optional focused tile for `--shot` fixtures (`view_room_share` focuses Mara's share).
+pub(super) fn focus() -> Option<super::stage::Focus> {
+    match named()?.as_str() {
+        "view_room_share" => Some(super::stage::Focus::Stream("mara-okafor".to_owned())),
+        _ => None,
+    }
+}
+
 fn channel(name: &str) -> bool {
-    matches!(name, "joined_channel" | "devices_menu" | "people_menu" | "confirm" | "incoming_strip" | "confirm_answer")
+    matches!(
+        name,
+        "joined_channel" | "devices_menu" | "people_menu" | "confirm" | "incoming_strip" | "confirm_answer" | "view_room_share"
+    )
 }
 
 fn person(name: &str, speaking: bool, muted: bool, deafened: bool) -> Participant {
@@ -175,7 +191,8 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         "ringing_out" => CallState::RingingOut,
         "incoming" => CallState::RingingIn { from: snapshot.open.as_ref().map_or_else(|| "Mara Okafor".to_owned(), |open| open.title.clone()) },
         "connecting" => CallState::Connecting,
-        "reconnecting" => CallState::Reconnecting,
+        "reconnecting" | "view_reconnecting" => CallState::Reconnecting,
+        "view_failed" => failed(CallFailure::Lost, "The connection dropped and didn't come back. You've left the call."),
         "failed_noanswer" => failed(CallFailure::NoAnswer, "Nobody picked up."),
         "failed_declined" => failed(CallFailure::NoAnswer, "They declined the call."),
         "failed_refused" => failed(CallFailure::Refused, "Discord refused the voice connection. Try again, or take this call in Discord."),
@@ -210,7 +227,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     let conversation = snapshot.open.as_ref().map_or_else(|| key("shot"), |open| open.key.clone());
     let muted = matches!(name.as_str(), "joined_muted" | "muted_talking");
     let sharing = name == "sharing";
-    let participants = if tiny() {
+    let mut participants = if tiny() {
         // A Tiny stage draws the room's seats, not the call's roster.
         Vec::new()
     } else if channel(&name) {
@@ -226,8 +243,18 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     } else {
         // With a conversation open the call is with it, so its own picture and name are drawn.
         let peer = snapshot.open.as_ref().map_or("Mara Okafor", |open| open.title.as_str());
-        vec![person(peer, name == "joined", muted, false)]
+        vec![person(peer, name == "joined" || name == "view_direct_voice", muted, false)]
     };
+    if name == "view_direct_video" {
+        if let Some(peer) = participants.first_mut() {
+            peer.camera = true;
+        }
+    }
+    if name == "view_room_share" {
+        if let Some(mara) = participants.iter_mut().find(|p| p.id == "mara-okafor") {
+            mara.sharing = true;
+        }
+    }
     let joined = match name.as_str() {
         "ringing_out" => now() - 12,
         "reconnecting" => now() - 8,
@@ -278,6 +305,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         self_view: None,
         share_view: sharing.then(screen_picture).flatten(),
         picture_source: None,
+        video_allowed: true,
     })
 }
 
@@ -420,6 +448,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     }
 }
 

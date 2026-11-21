@@ -1340,10 +1340,11 @@ fn send_then_room(
     Ok(())
 }
 
-/// The room's bitrate, push-to-talk, and roster. These wait on mediad.
+/// The room's bitrate, push-to-talk, video flag, and roster. These wait on mediad.
 fn apply_room(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) {
     let (kbps, push_to_talk) = super::manage::room_audio(saved, room);
     ctx.tiny_room(room, kbps, push_to_talk);
+    ctx.tiny_video_allowed(room, super::manage::room_video_enabled(saved, room));
     seat.rostered.clear();
     roster(ctx, seat, room);
 }

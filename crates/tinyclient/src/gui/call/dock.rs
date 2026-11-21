@@ -691,23 +691,12 @@ impl Shell {
         )
     }
 
-    /// Share and camera belong on a joined call that can carry a picture: a Discord voice
-    /// channel, or a Tiny room that allows video. A Tiny room that has not loaded yet still
-    /// shows them: the server's default is that video is allowed.
+    /// Share and camera belong on a joined call that allows video (`Call::video_allowed`) on a
+    /// network that carries it (Tiny or Discord).
     fn call_pictures(&self, call: &Call) -> bool {
-        if call.state != CallState::Joined {
-            return false;
-        }
-        if call.conversation.network == Network::Discord {
-            return true;
-        }
-        if call.conversation.network != Network::Tiny {
-            return false;
-        }
-        let Some(page) = self.tiny_page_facts().filter(|page| page.account == &call.conversation.account()) else {
-            return true;
-        };
-        page.community.rooms.iter().find(|room| room.id == call.conversation.id).is_none_or(|room| room.video_enabled)
+        call.state == CallState::Joined
+            && call.video_allowed
+            && matches!(call.conversation.network, Network::Discord | Network::Tiny)
     }
 
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
@@ -1389,6 +1378,7 @@ mod tests {
             self_view: None,
             share_view: None,
             picture_source: None,
+            video_allowed: true,
         }
     }
 

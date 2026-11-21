@@ -1011,11 +1011,12 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Listed::Failed(detail) => return refused(detail),
     };
     manage::remember(&saved, |kept| kept.rooms = rooms.clone());
-    // A call in one of these rooms follows a change to its bitrate or push-to-talk.
+    // A call in one of these rooms follows a change to its bitrate, push-to-talk, or video flag.
     if let Some(call) = hub.calls.describe().0.filter(|call| call.conversation.account() == account) {
-        if rooms.iter().any(|room| room.id == call.conversation.id) {
+        if let Some(room) = rooms.iter().find(|room| room.id == call.conversation.id) {
             let (kbps, push_to_talk) = manage::room_audio(&saved, &call.conversation.id);
             hub.calls.tiny_room(hub, &call.conversation, kbps, push_to_talk);
+            hub.calls.set_video_allowed(hub, &call.conversation, room.video_enabled);
         }
     }
     // Who sits where is the hub's, as the live socket put it; what the server says of each seat

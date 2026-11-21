@@ -397,9 +397,11 @@ impl Shell {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
-        } else if self.tiny_unfull(window, cx) {
+        } else if self.call_unfull(window, cx) {
             return true;
         } else if self.tiny_escape(cx) {
+            return true;
+        } else if self.call_escape(cx) {
             return true;
         } else if self.layout_state.floating {
             self.layout_state.floating = false;
@@ -1533,9 +1535,12 @@ impl Render for Shell {
         self.note_room(self.pane_narrow(), Some(conversation_width(width - overview, &plan)));
         let floating = plan.sidebar.is_none() && state.floating;
         let replaced = plan.right.is_some_and(|(_, replaces)| replaces);
+        let call_view = self.call_view_active(snapshot);
         // With nothing open on a phone, the list is the whole screen: there is no sidebar
         // column to fall back to, and the conversation only exists when something is open.
-        let list_alone = if phone(width) {
+        let list_alone = if call_view {
+            false
+        } else if phone(width) {
             snapshot.open.is_none()
         } else {
             snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced
@@ -1565,6 +1570,7 @@ impl Render for Shell {
             .when(!replaced && !list_alone, |root| {
                 let pane = match (&snapshot.open, self.keychain_state(window, cx)) {
                     (_, Some(waiting)) => waiting,
+                    (_, None) if call_view => self.call_view_pane(snapshot, window, cx),
                     (Some(_), None) => self.conversation(snapshot, window, cx),
                     (None, None) if self.tiny_open() => self.tiny_page(plan.sidebar.is_some() || floating, window, cx),
                     (None, None) => self.nothing_open(window, cx),
@@ -1599,6 +1605,7 @@ impl Render for Shell {
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
+            .children(self.call_full_stage(snapshot, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
