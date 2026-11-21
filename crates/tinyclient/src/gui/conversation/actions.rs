@@ -682,7 +682,14 @@ impl Pane {
             return;
         }
         // A menu or the picker belongs to a message: the toolbar stays with it.
-        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.link_ask.is_some() || self.viewer.is_some() {
+        if self.menu.is_some()
+            || self.picker.is_some()
+            || self.confirm.is_some()
+            || self.action_confirm.is_some()
+            || self.open_select.is_some()
+            || self.link_ask.is_some()
+            || self.viewer.is_some()
+        {
             return;
         }
         #[cfg(feature = "gui-shot")]
@@ -706,7 +713,13 @@ impl Pane {
 
     /// A menu, picker, dialog, viewer or a window-level layer is up: no toolbar shows.
     pub(super) fn overlay_up(&self, cx: &Context<Self>) -> bool {
-        let own = self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.link_ask.is_some() || self.viewer.is_some();
+        let own = self.menu.is_some()
+            || self.picker.is_some()
+            || self.confirm.is_some()
+            || self.action_confirm.is_some()
+            || self.open_select.is_some()
+            || self.link_ask.is_some()
+            || self.viewer.is_some();
         own || self.shell.upgrade().is_some_and(|shell| {
             let shell = shell.read(cx);
             shell.layout_state.menu.is_some() || shell.layout_state.floating || shell.sidebar_state.switcher.is_some() || shell.pane_card_open(cx)
@@ -718,6 +731,8 @@ impl Pane {
         self.menu.as_ref().is_some_and(|menu| menu.message.id == id)
             || self.picker.as_ref().is_some_and(|picking| picking.message == id)
             || self.confirm.as_ref().is_some_and(|message| message.id == id)
+            || self.action_confirm.as_ref().is_some_and(|pending| pending.message_id == id)
+            || self.open_select.as_ref().is_some_and(|open| open.message_id == id)
     }
 
     /// A phone's press on a message went down: the actions come up if it holds still for
@@ -766,6 +781,12 @@ impl Pane {
             self.close_viewer(cx);
         } else if self.confirm.is_some() {
             self.confirm = None;
+            cx.notify();
+        } else if self.action_confirm.is_some() {
+            self.action_confirm = None;
+            cx.notify();
+        } else if self.open_select.is_some() {
+            self.open_select = None;
             cx.notify();
         } else if self.link_ask.is_some() {
             self.close_link_ask(cx);
@@ -2288,13 +2309,124 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    fn select_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.open_select.as_ref()?;
+        let mut list = menu().w(px(240.));
+        for (ix, opt) in open.options.iter().enumerate() {
+            let active = open.selected.as_deref() == Some(opt.value.as_str());
+            let conversation = open.conversation.clone();
+            let msg_id = open.message_id.clone();
+            let block_id = open.block_id.clone();
+            let action_id = open.action_id.clone();
+            let element_type = open.element_type.clone();
+            let val = opt.value.clone();
+            let values = if element_type.starts_with("multi_") { vec![val.clone()] } else { Vec::new() };
+            let confirm = open.confirm.clone();
+            let label = if active { format!("✓ {}", opt.label) } else { opt.label.clone() };
+            list = list.child(
+                menu_item(("ctrl-opt", ix), None, label, None)
+                    .when(active, |row| row.bg(theme::selected()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.trigger_control(
+                            conversation.clone(),
+                            msg_id.clone(),
+                            block_id.clone(),
+                            action_id.clone(),
+                            element_type.clone(),
+                            val.clone(),
+                            values.clone(),
+                            confirm.clone(),
+                            cx,
+                        );
+                    })),
+            );
+        }
+        let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.open_select = None;
+            cx.notify();
+        }));
+        Some(placed(
+            "control-select-menu",
+            Place::Pointer(open.at),
+            Layer::Menu,
+            window,
+            fade_in("control-select", 120, list),
+        ))
+    }
+
+    fn action_confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pending = self.action_confirm.as_ref()?;
+        let title = if pending.confirm.title.is_empty() {
+            "Confirm action".to_owned()
+        } else {
+            pending.confirm.title.clone()
+        };
+        let body = pending.confirm.text.clone();
+        let deny = if pending.confirm.deny.is_empty() { "Cancel".to_owned() } else { pending.confirm.deny.clone() };
+        let ok = if pending.confirm.confirm.is_empty() { "Confirm".to_owned() } else { pending.confirm.confirm.clone() };
+        let to_run = pending.clone();
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let panel = modal(title)
+            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .when(!body.is_empty(), |m| m.child(modal_body(body)))
+            .child(
+                modal_buttons()
+                    .child(button("ctrl-confirm-cancel", ButtonKind::Secondary, deny).on_click(cx.listener(|this, _, _, cx| {
+                        this.action_confirm = None;
+                        cx.notify();
+                    })))
+                    .child(button("ctrl-confirm-ok", ButtonKind::Primary, ok).on_click(cx.listener(move |this, _, window, cx| {
+                        this.action_confirm = None;
+                        if let Some(url) = &to_run.open_url {
+                            if this.key() == Some(&to_run.conversation) {
+                                this.open_external_link(url, window, cx);
+                            }
+                            cx.notify();
+                        } else {
+                            this.execute_control(
+                                to_run.conversation.clone(),
+                                to_run.message_id.clone(),
+                                to_run.block_id.clone(),
+                                to_run.action_id.clone(),
+                                to_run.element_type.clone(),
+                                to_run.value.clone(),
+                                to_run.values.clone(),
+                                cx,
+                            );
+                        }
+                    }))),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("action-confirm-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.action_confirm = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("action-confirm-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
             return [
                 self.menu_sheet(window, cx),
+                self.select_menu_layer(window, cx),
                 self.revisions_layer(window, cx),
                 self.picker_sheet(window, cx),
                 self.confirm_layer(window, cx),
+                self.action_confirm_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
                 self.link_layer(window, cx),
@@ -2305,9 +2437,11 @@ impl Pane {
         }
         [
             self.menu_layer(window, cx),
+            self.select_menu_layer(window, cx),
             self.revisions_layer(window, cx),
             self.picker_layer(window, cx),
             self.confirm_layer(window, cx),
+            self.action_confirm_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),
             self.link_layer(window, cx),
@@ -2506,6 +2640,16 @@ impl Pane {
     pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         if self.link_key(event, cx) {
+            return true;
+        }
+        if key == "escape" && self.open_select.is_some() {
+            self.open_select = None;
+            cx.notify();
+            return true;
+        }
+        if key == "escape" && self.action_confirm.is_some() {
+            self.action_confirm = None;
+            cx.notify();
             return true;
         }
         if key == "escape" && self.forward.is_some() {

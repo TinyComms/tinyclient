@@ -4,7 +4,7 @@
 //! user opened or clicked something, or (previews) because the rows are on screen, paced.
 
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
-use crate::adapters::{ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
+use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
 use crate::store::Filing;
 use protocol::{ActivityItem, ActivityItemKind, Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
 use serde_json::{json, Value};
@@ -156,7 +156,28 @@ impl Slack {
                 description.push_str(&handoff);
             }
         }
-        let bookmarks = self.bookmarks(channel_of(conversation));
+        let mut bookmarks = self.bookmarks(channel_of(conversation));
+        // Surface the channel canvas from `conversations.info` (`properties.canvas`) when not
+        // already present in bookmarks.list.
+        let canvas = &channel["properties"]["canvas"];
+        if let Some(file_id) = canvas["file_id"].as_str().filter(|id| !id.is_empty() && canvas["is_empty"] != true) {
+            let already = bookmarks.iter().any(|b| {
+                b.kind == BookmarkKind::Canvas && (b.id == file_id || b.link.contains(file_id))
+            });
+            if !already {
+                let link = format!("{}docs/{}/{file_id}", self.session.url, self.session.team_id);
+                bookmarks.insert(
+                    0,
+                    Bookmark {
+                        id: file_id.to_owned(),
+                        title: "Channel canvas".to_owned(),
+                        link,
+                        emoji: String::new(),
+                        kind: BookmarkKind::Canvas,
+                    },
+                );
+            }
+        }
         let pinned = self
             .api("pins.list", &[("channel", channel_of(conversation))])
             .ok()
@@ -354,6 +375,37 @@ impl Slack {
             let shares = &file["shares"];
             let shared = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
             let ts = shared.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", file["created"].as_i64().unwrap_or(0)));
+            let permalink = file["permalink"]
+                .as_str()
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .unwrap_or("")
+                .to_owned();
+            if kind == SharedKind::Files && self.is_external(file) {
+                let url = file["url_private"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .unwrap_or(&permalink)
+                    .to_owned();
+                if !url.is_empty() {
+                    let sender = file["user"].as_str().filter(|u| !u.is_empty()).map(|u| self.user(u).name).unwrap_or_default();
+                    let title = file["title"]
+                        .as_str()
+                        .or_else(|| file["name"].as_str())
+                        .unwrap_or("External file")
+                        .to_owned();
+                    items.push(SharedItem {
+                        message_id: file["id"].as_str().unwrap_or(&ts).to_owned(),
+                        sent: file["created"].as_i64().unwrap_or_else(|| seconds(&ts)),
+                        sender,
+                        attachment: None,
+                        url,
+                        title,
+                    });
+                }
+                continue;
+            }
             let event = json!({"type": "message", "ts": ts, "user": file["user"], "files": [file]});
             let Some(message) = self.message(channel, &event) else {
                 continue;
@@ -365,8 +417,8 @@ impl Slack {
                     sent: message.sent,
                     sender: message.sender.name.clone(),
                     attachment: Some(attachment.clone()),
-                    url: String::new(),
-                    title: String::new(),
+                    url: permalink.clone(),
+                    title: attachment.name.clone(),
                 });
             }
         }
@@ -375,6 +427,112 @@ impl Slack {
         // The total counts files of every kind asked for; for "all" that includes pictures.
         let total = paging["total"].as_u64().filter(|_| before.is_none() && kind == SharedKind::Media).map(|total| total as u32);
         Ok(SharedPage { items, more, total })
+    }
+
+    /// Paged workspace-wide file browser (`files.list` without a channel). Never walks the whole
+    /// workspace; returns one page plus `cursor` for the next page.
+    pub(super) fn account_files(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<AccountFilesPage, Fault> {
+        let count = limit.clamp(1, FILES_PAGE).to_string();
+        let page_num: u32 = cursor.and_then(|c| c.parse().ok()).unwrap_or(1).max(1);
+        let page_str = page_num.to_string();
+        let types = match kind.map(str::trim).unwrap_or("") {
+            "" | "all" => "all",
+            "snippets" | "code" => "snippets",
+            "images" | "media" => "images",
+            "pdfs" | "pdf" => "pdfs",
+            "gdocs" | "external" => "gdocs",
+            other => other,
+        };
+        let listed = self.api(
+            "files.list",
+            &[("types", types), ("count", count.as_str()), ("page", page_str.as_str())],
+        )?;
+        let files = listed["files"].as_array().map_or(&[][..], Vec::as_slice);
+        let needle = query.trim().to_ascii_lowercase();
+        let mut items = Vec::with_capacity(files.len());
+        let mut media = Vec::new();
+        let mut variants = Vec::new();
+        for file in files {
+            let Some(id) = file["id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let title = file["title"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| file["name"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("untitled")
+                .to_owned();
+            let name = file["name"].as_str().unwrap_or(&title);
+            if !needle.is_empty()
+                && !title.to_ascii_lowercase().contains(&needle)
+                && !name.to_ascii_lowercase().contains(&needle)
+            {
+                continue;
+            }
+            let sent = file["created"].as_i64().unwrap_or(0);
+            let sender = file["user"]
+                .as_str()
+                .filter(|u| !u.is_empty())
+                .map(|u| self.user(u).name)
+                .unwrap_or_default();
+            let permalink = file["permalink"]
+                .as_str()
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .unwrap_or("")
+                .to_owned();
+            if self.is_external(file) {
+                let url = file["url_private"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .unwrap_or(&permalink)
+                    .to_owned();
+                items.push(SharedItem {
+                    message_id: id.to_owned(),
+                    sent,
+                    sender,
+                    attachment: None,
+                    url,
+                    title,
+                });
+                continue;
+            }
+            let attachment = self.file(file, &mut media, &mut variants);
+            items.push(SharedItem {
+                message_id: id.to_owned(),
+                sent,
+                sender,
+                attachment,
+                url: permalink,
+                title,
+            });
+        }
+        let mut sized = variants.iter().filter(|(_, sizes)| !sizes.is_empty());
+        if let Err(err) = self.ctx.media(&media).and_then(|()| sized.try_for_each(|(id, sizes)| self.ctx.media_variants(id, sizes))) {
+            tracing::warn!("chatd: Slack: {err}");
+        }
+        let paging = &listed["paging"];
+        let page = paging["page"].as_u64().unwrap_or(u64::from(page_num)) as u32;
+        let pages = paging["pages"].as_u64().unwrap_or(1) as u32;
+        let more = page < pages;
+        let next_cursor = more.then(|| (page + 1).to_string());
+        Ok(AccountFilesPage { items, cursor: next_cursor, more })
+    }
+
+    /// Deletes a Slack file (`files.delete`, own files).
+    pub(super) fn delete_file(&self, file_id: &str) -> Result<(), Fault> {
+        if file_id.trim().is_empty() {
+            return Err(Fault::Slack("file_not_found".to_owned()));
+        }
+        self.api("files.delete", &[("file", file_id.trim())])?;
+        Ok(())
     }
 
     /// The workspace's custom emoji, from the list kept a day (`list_emoji`), a page at a time,
@@ -408,6 +566,104 @@ impl Slack {
         self.ctx.media(&files).map_err(|err| Fault::Net(err.to_string()))?;
         let more = matching.next().is_some();
         Ok(CatalogPage { items, cursor: more.then(|| walked.to_string()) })
+    }
+
+    /// Trending or searched GIFs for the composer's GIF picker (`CatalogKind::Gifs`).
+    /// Preview thumbnails are registered with chatd's media store; `Command::Download` never
+    /// sends Slack credentials to third-party hosts (GIPHY/Tenor).
+    pub(super) fn gif_catalog(&self, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Fault> {
+        let q = query.trim();
+        let next_in = cursor.unwrap_or("");
+        let resp = if q.is_empty() {
+            self.api("gifs.trending", &[("limit", "24"), ("cursor", next_in)])?
+        } else {
+            self.api("gifs.search", &[("q", q), ("limit", "24"), ("cursor", next_in)])?
+        };
+        let entries = resp["results"]
+            .as_array()
+            .or_else(|| resp["gifs"].as_array())
+            .or_else(|| resp["data"].as_array())
+            .map_or(&[][..], Vec::as_slice);
+        let mut items = Vec::with_capacity(entries.len());
+        let mut files = Vec::new();
+        let gif_url_allowed = |u: &str| {
+            self.hosted(u)
+                || super::https_host(u)
+                    .is_some_and(|host| super::within(host, "giphy.com") || super::within(host, "tenor.com"))
+        };
+        let preview_url_allowed = |u: &str| {
+            self.hosted(u)
+                || super::https_host(u)
+                    .is_some_and(|host| super::within(host, "giphy.com") || super::within(host, "media.tenor.com"))
+        };
+        for entry in entries {
+            let gif_url = entry["url"]
+                .as_str()
+                .or_else(|| entry["media_url"].as_str())
+                .or_else(|| entry["images"]["original"]["url"].as_str())
+                .map(str::trim)
+                .filter(|u| gif_url_allowed(u));
+            let Some(gif_url) = gif_url else {
+                continue;
+            };
+            let preview_url = entry["preview_url"]
+                .as_str()
+                .or_else(|| entry["thumb_url"].as_str())
+                .or_else(|| entry["images"]["fixed_height_small"]["url"].as_str())
+                .or_else(|| entry["images"]["fixed_width_small"]["url"].as_str())
+                .map(str::trim)
+                .filter(|u| preview_url_allowed(u))
+                .or_else(|| preview_url_allowed(gif_url).then_some(gif_url));
+            let width = entry["width"]
+                .as_u64()
+                .or_else(|| entry["images"]["fixed_height_small"]["width"].as_str().and_then(|s| s.parse().ok()))
+                .or_else(|| entry["images"]["original"]["width"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(240)
+                .min(u64::from(u32::MAX)) as u32;
+            let height = entry["height"]
+                .as_u64()
+                .or_else(|| entry["images"]["fixed_height_small"]["height"].as_str().and_then(|s| s.parse().ok()))
+                .or_else(|| entry["images"]["original"]["height"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(180)
+                .min(u64::from(u32::MAX)) as u32;
+            let name = entry["title"]
+                .as_str()
+                .or_else(|| entry["name"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let pack = entry["pack"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| if q.is_empty() { "Trending".to_owned() } else { String::new() });
+            let file = preview_url.map(|url| {
+                let file = MediaFile {
+                    width,
+                    height,
+                    ..MediaFile::new(format!("gif:{:x}", fnv(url)), MediaKind::Image)
+                };
+                files.push((file.clone(), url.to_owned()));
+                file
+            });
+            items.push(CatalogItem {
+                id: gif_url.to_owned(),
+                name,
+                file,
+                pack,
+                animated: true,
+            });
+        }
+        if !files.is_empty() {
+            self.ctx.media(&files).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        let next_cursor = resp["response_metadata"]["next_cursor"]
+            .as_str()
+            .or_else(|| resp["next_cursor"].as_str())
+            .or_else(|| resp["next"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Ok(CatalogPage { items, cursor: next_cursor })
     }
 
     /// The threads the user follows, asked once when the Threads list opens (and not again

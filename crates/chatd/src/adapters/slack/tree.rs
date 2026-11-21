@@ -84,7 +84,7 @@ impl Slack {
     }
 
     /// The row for one of Slack's conversation objects. Looks up the partner of a direct one.
-    fn row(&self, channel: &Value) -> Option<ConversationRow> {
+    pub(super) fn row(&self, channel: &Value) -> Option<ConversationRow> {
         let id = channel["id"].as_str()?;
         if channel["is_im"] == true {
             return Some(self.direct_row(id, channel["user"].as_str()?));
@@ -426,7 +426,51 @@ impl Slack {
             icon: icon.map(|(file, _)| file.id),
             position: 0,
         }])?;
+        self.ctx.set_space_can_create_channels(&self.ctx.account.account, true)?;
         Ok(())
+    }
+
+    /// Creates a public or private Slack channel (`conversations.create`) and records it in the sidebar.
+    /// If the workspace restricts channel creation (`restricted_action`), turns off `can_create_channels`
+    /// on the Space so the shell hides the entry.
+    pub(super) fn create_channel(&self, name: &str, private: bool, group: Option<&str>) -> Result<String, Fault> {
+        let clean = name.trim().trim_start_matches('#').trim();
+        if clean.is_empty() {
+            return Err(Fault::Slack("invalid_name_required".to_owned()));
+        }
+        let is_private = if private { "true" } else { "false" };
+        let created = match self.api("conversations.create", &[("name", clean), ("is_private", is_private)]) {
+            Ok(created) => created,
+            Err(Fault::Slack(ref err)) if err == "restricted_action" => {
+                let _ = self.ctx.set_space_can_create_channels(&self.ctx.account.account, false);
+                return Err(Fault::Slack("restricted_action".to_owned()));
+            }
+            Err(fault) => return Err(fault),
+        };
+        let ch = &created["channel"];
+        let Some(id) = ch["id"].as_str().filter(|s| !s.is_empty()) else {
+            return Err(Fault::Net("conversations.create: no channel".to_owned()));
+        };
+        let mut row = self.row(ch).unwrap_or_else(|| {
+            let mut r = self.placed(id, ConversationKind::Channel, &format!("#{clean}"));
+            r.group = self.ctx.note("group:channel");
+            r.private = private;
+            r.rights.pin = true;
+            r.rights.rename = true;
+            r.rights.edit_topic = true;
+            r.rights.add_members = true;
+            r.rights.remove_members = true;
+            r.rights.manage_members = true;
+            r
+        });
+        row.joined = true;
+        row.private = ch["is_private"].as_bool().unwrap_or(private);
+        if let Some(section_id) = group.filter(|g| !g.is_empty() && *g != DIRECTS) {
+            row.group = Some(section_id.to_owned());
+        }
+        self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+        self.ctx.set_note(&format!("c:{id}"), &row.title);
+        Ok(id.to_owned())
     }
 
     /// The sidebar's sections in the user's order. Unverified against a real workspace:

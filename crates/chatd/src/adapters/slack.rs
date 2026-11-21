@@ -162,6 +162,8 @@ fn reason(fault: Fault) -> String {
         Fault::Slack(error) => match error.as_str() {
             "cant_update_message" | "edit_window_closed" => "This message can no longer be edited.",
             "cant_delete_message" => "Slack does not let you delete this message.",
+            "cant_delete_file" => "Slack does not let you delete this file.",
+            "file_not_found" | "file_deleted" => "That file is gone.",
             "message_not_found" => "That message is gone.",
             "too_many_reactions" => "You have added as many reactions to this message as Slack allows.",
             "too_many_emoji" => "This message has as many different reactions as Slack allows.",
@@ -184,12 +186,13 @@ fn reason(fault: Fault) -> String {
             "already_in_channel" => "That person is already in this channel.",
             "user_not_in_channel" => "That person is not in this channel.",
             "name_taken" => "A channel with that name already exists.",
-            "invalid_name_required"
-            | "invalid_name_punctuation"
-            | "invalid_name_maxlength"
+            "invalid_name_required" => "Channel name cannot be empty.",
+            "invalid_name_maxlength" => "Slack channel names can be at most 80 characters.",
+            "invalid_name_reserved" => "That channel name is reserved by Slack.",
+            "invalid_name_punctuation"
             | "invalid_name_specials"
-            | "invalid_name_reserved"
-            | "invalid_name_nonmatching" => "That channel name is not valid for Slack.",
+            | "invalid_name_nonmatching" => "Slack channel names must be lowercase letters, numbers, hyphens, or underscores, with no spaces.",
+            "too_many_users" => "Slack group DMs can include at most 8 other people.",
             "not_authorized" => "You do not have permission to do that in this workspace.",
             "permission_denied" => "This workspace does not let you pin messages here.",
             "already_pinned" => "This message is already pinned.",
@@ -213,6 +216,8 @@ fn reason(fault: Fault) -> String {
             // takes. Slack's own search is one such: its web client may use an internal call.
             "not_allowed_token_type" => "Slack's own search isn't reachable with this session.",
             "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
+            "action_not_found" | "invalid_action" | "invalid_blocks" => "That app action is no longer available.",
+            "trigger_expired" => "That app interaction expired. Try clicking again.",
             "restricted_action" => "This workspace does not let you do that.",
             error if error.starts_with("restricted_action_") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
@@ -298,6 +303,8 @@ struct State {
     abouts: HashMap<String, About>,
     /// Active Slack reminder ids keyed by `(channel_id, message_id)` so cancel calls `reminders.delete`.
     reminders: HashMap<(String, String), String>,
+    /// App/bot id per `(channel, ts)` for messages carrying interactive Block Kit controls.
+    message_apps: HashMap<(String, String), String>,
     /// Synced Slack drafts keyed by conversation id (`C0…` or `C0…:root_ts`).
     drafts: HashMap<String, SlackDraft>,
     /// Unix seconds of the latest local draft edit per conversation (conflict rule: newest wins).
@@ -342,7 +349,12 @@ fn per_minute(method: &str) -> f64 {
         | "reminders.add"
         | "reminders.list"
         | "reminders.complete"
-        | "reminders.delete" => 20.,
+        | "reminders.delete"
+        | "drafts.list"
+        | "drafts.create"
+        | "drafts.update"
+        | "drafts.delete"
+        | "files.delete" => 20.,
         "conversations.members" | "users.info" | "users.profile.get" => 100.,
         // One message a second per channel, and the sign-in check is in a tier of its own.
         "chat.postMessage" | "auth.test" => 60.,
@@ -1025,6 +1037,10 @@ impl Slack {
                 self.subteam_updated(event);
                 Ok(())
             }
+            "view_opened" | "view_updated" | "view_closed" => {
+                tracing::debug!(event_type = event["type"].as_str().unwrap_or(""), "chatd: Slack modal view event");
+                Ok(())
+            }
             "draft_saved" => self.draft_saved(event),
             "draft_deleted" | "draft_sent" => self.draft_deleted(event),
             "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
@@ -1264,6 +1280,8 @@ impl Slack {
                 return Ok(());
             }
             let counted = self.state().warm.remove(conversation);
+            // A conversation already in the tree when warming was queued (`counted.is_none()`)
+            // that has since been closed or left must not be resurrected by warming.
             if counted.is_none() && self.ctx.known(conversation)?.is_none() {
                 return Ok(());
             }
@@ -1531,6 +1549,27 @@ impl Slack {
             Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
                 answer(reply, self.pin(&conversation_id, &message_id, pinned))
             }
+            Command::MessageAction {
+                conversation_id,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                reply,
+            } => answer(
+                reply,
+                self.message_action(
+                    &conversation_id,
+                    &message_id,
+                    &block_id,
+                    &action_id,
+                    &element_type,
+                    &value,
+                    &values,
+                ),
+            ),
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
@@ -1547,10 +1586,13 @@ impl Slack {
                     None => drop(reply.send(Err(Refusal::Unsupported))),
                 }
             }
-            // Only the workspace's emoji: Slack has no GIFs or stickers of its own (see
-            // `capabilities`).
+            // Workspace custom emoji and GIF picker (`CatalogKind::Emoji` / `CatalogKind::Gifs`).
+            // Slack has no stickers catalog.
             Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
                 answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
+            }
+            Command::Catalog { kind: protocol::CatalogKind::Gifs, query, cursor, reply, .. } => {
+                answer(reply, self.gif_catalog(&query, cursor.as_deref()))
             }
             Command::ActivityFeed { kind, cursor, limit, reply } => {
                 answer(reply, self.activity_feed(kind, cursor.as_deref(), limit))
@@ -1575,6 +1617,12 @@ impl Slack {
             }
             Command::Join { conversation_id, reply } => {
                 answer(reply, self.join_channel(&conversation_id))
+            }
+            Command::AccountFiles { query, kind, cursor, limit, reply } => {
+                answer(reply, self.account_files(&query, kind.as_deref(), cursor.as_deref(), limit))
+            }
+            Command::DeleteFile { file_id, reply } => {
+                answer(reply, self.delete_file(&file_id))
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
@@ -1612,6 +1660,10 @@ impl Slack {
                 answer(reply, self.members_remove(&conversation_id, &person));
             }
             Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
+            Command::StartGroup { people, reply, .. } => answer(reply, self.start_group(&people)),
+            Command::CreateChannel { name, private, group, reply, .. } => {
+                answer(reply, self.create_channel(&name, private, group.as_deref()))
+            }
             Command::CloseDirect { conversation_id, reply } => {
                 answer(reply, self.close_direct(&conversation_id));
             }
@@ -1827,6 +1879,11 @@ impl Slack {
             accepted.ok_or_else(|| "Slack accepted it but sent nothing back.".to_owned())
         });
         outcome.map(|mut message| {
+            {
+                let mut state = self.state();
+                state.drafts.remove(conversation);
+                state.local_draft_at.remove(conversation);
+            }
             if let Some(root) = thread {
                 self.report(self.bump(channel, root, &message));
                 if broadcast_thread {
@@ -2089,6 +2146,120 @@ impl Slack {
             self.ctx.pinned(conversation, ts, pinned).map_err(|err| Fault::Net(err.to_string()))?;
         }
         self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// Fires a Slack Block Kit interactive control (`blocks.actions`). The app responds
+    /// asynchronously with a `message_changed`, ephemeral message, or `view_opened` event.
+    #[allow(clippy::too_many_arguments)]
+    fn message_action(
+        &self,
+        conversation: &str,
+        ts: &str,
+        block_id: &str,
+        action_id: &str,
+        element_type: &str,
+        value: &str,
+        values: &[String],
+    ) -> Result<(), Fault> {
+        let channel = thread_of(conversation).map_or(conversation, |(ch, _)| ch);
+        if channel.is_empty() || ts.is_empty() || action_id.trim().is_empty() {
+            return Err(Fault::Slack("invalid_action".to_owned()));
+        }
+        let now = crate::hub::now();
+        let action_ts = format!("{now}.000000");
+        let kind = if element_type.trim().is_empty() { "button" } else { element_type.trim() };
+        let mut action = json!({
+            "type": kind,
+            "action_id": action_id,
+            "action_ts": action_ts,
+        });
+        if !block_id.is_empty() {
+            action["block_id"] = block_id.into();
+        }
+        match kind {
+            "static_select" | "external_select" | "overflow" | "radio_buttons" => {
+                action["selected_option"] = json!({"value": value});
+            }
+            "users_select" => {
+                action["selected_user"] = value.into();
+            }
+            "conversations_select" => {
+                action["selected_conversation"] = value.into();
+            }
+            "channels_select" => {
+                action["selected_channel"] = value.into();
+            }
+            "datepicker" => {
+                action["selected_date"] = value.into();
+            }
+            "timepicker" => {
+                action["selected_time"] = value.into();
+            }
+            "checkboxes" | "multi_static_select" | "multi_external_select" => {
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                let selected: Vec<Value> = picked.iter().map(|v| json!({"value": v})).collect();
+                action["selected_options"] = Value::Array(selected);
+            }
+            "multi_users_select" => {
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                action["selected_users"] = json!(picked);
+            }
+            "multi_conversations_select" => {
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                action["selected_conversations"] = json!(picked);
+            }
+            "multi_channels_select" => {
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                action["selected_channels"] = json!(picked);
+            }
+            _ => {
+                if !value.is_empty() {
+                    action["value"] = value.into();
+                }
+            }
+        }
+        let actions = json!([action]).to_string();
+        let container = json!({
+            "type": "message",
+            "message_ts": ts,
+            "channel_id": channel,
+            "is_ephemeral": false,
+        })
+        .to_string();
+        let client_token = format!("tiny-{now}");
+        let service_id = self
+            .state()
+            .message_apps
+            .get(&(channel.to_owned(), ts.to_owned()))
+            .cloned()
+            .unwrap_or_default();
+        let mut params = vec![
+            ("actions", actions.as_str()),
+            ("container", container.as_str()),
+            ("channel_id", channel),
+            ("client_token", client_token.as_str()),
+        ];
+        if !service_id.is_empty() {
+            params.push(("service_id", service_id.as_str()));
+        }
+        self.api("blocks.actions", &params)?;
         Ok(())
     }
 
@@ -2759,17 +2930,15 @@ pub(crate) fn prove_profile_fields() -> Result<(), String> {
 }
 
 /// What a Slack account may send. The same on every plan (unverified: a workspace may lower
-/// the file limit or turn uploads off, which Slack then refuses in words). No GIF picker:
-/// Slack has no GIF search of its own. Its GIFs come from the Giphy app a workspace may
-/// install, run as `/giphy`, which a client can only reach through the web client's
-/// undocumented `chat.command` (an imitation the account rules rule out, ruling 09); any other
-/// search would be a third-party service with a key of ours. A GIF pasted as a link still
-/// unfurls, and one sent as a file plays.
+/// the file limit or turn uploads off, which Slack then refuses in words). GIFs are enabled
+/// through `CatalogKind::Gifs` (`gifs.trending` / `gifs.search`) and posted as unfurled GIF URLs;
+/// a GIF pasted as a link or sent as a file also plays.
 fn capabilities() -> protocol::Capabilities {
     protocol::Capabilities {
         max_file_bytes: send::LARGEST,
         max_files: send::FILES as u32,
         custom_emoji: protocol::EmojiScope::All,
+        gifs: true,
         schedule: true,
         suppress_embeds: true,
         search: true,
@@ -2790,8 +2959,10 @@ fn capabilities() -> protocol::Capabilities {
         bookmarks: true,
         browse_channels: true,
         archive: true,
+        groups: 8,
         save_messages: true,
         rich_status: true,
+        manage_files: true,
         dnd_snooze: true,
         follow_threads: true,
         ..protocol::Capabilities::default()

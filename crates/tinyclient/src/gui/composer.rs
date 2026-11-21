@@ -1038,6 +1038,7 @@ impl Composer {
             effect: if controls.effects { self.effect.clone() } else { None },
             contact: None,
             send_as: self.send_as.get(&target.key).cloned(),
+            snippet_type: None,
             subject,
         };
         self.importance = protocol::Importance::Normal;

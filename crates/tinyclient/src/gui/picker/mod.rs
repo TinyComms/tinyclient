@@ -1297,7 +1297,7 @@ fn standin(glyph: &str, size: f32) -> AnyElement {
 }
 
 /// Who the GIF search goes through, named in the footer: from the results' own addresses, and
-/// on Discord, whose search proxies Tenor, Tenor when they do not say.
+/// on Discord (Tenor) or Slack (GIPHY) when they do not say.
 fn gif_provider(items: &[CatalogItem], network: Option<Network>) -> Option<&'static str> {
     let named = items.iter().find_map(|item| {
         let host = item.id.split("://").nth(1)?.split('/').next()?.to_ascii_lowercase();
@@ -1307,7 +1307,11 @@ fn gif_provider(items: &[CatalogItem], network: Option<Network>) -> Option<&'sta
             _ => None,
         }
     });
-    named.or((network == Some(Network::Discord)).then_some("Tenor"))
+    named.or(match network {
+        Some(Network::Discord) => Some("Tenor"),
+        Some(Network::Slack) => Some("GIPHY"),
+        _ => None,
+    })
 }
 
 /// The cell of a row nearest, across, to the one left in the row before: ↑ and ↓ keep the
@@ -1584,6 +1588,7 @@ mod tests {
         assert!(gif_lines(&items, 332., false, &["c".to_owned()]).iter().all(|line| line.label.is_none()));
         assert_eq!(gif_provider(&[CatalogItem { id: "https://media.giphy.com/x".into(), ..gif("x", 1, 1) }], Some(Network::Discord)), Some("GIPHY"));
         assert_eq!(gif_provider(&items, Some(Network::Discord)), Some("Tenor"));
+        assert_eq!(gif_provider(&items, Some(Network::Slack)), Some("GIPHY"));
         assert_eq!(gif_provider(&items, Some(Network::Telegram)), None);
     }
 

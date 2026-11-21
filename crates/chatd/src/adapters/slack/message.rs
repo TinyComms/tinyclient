@@ -4,8 +4,10 @@ use super::emoji;
 use super::text::{emoji_end, Custom, Names, Rich};
 use super::{fnv, seconds, thread_id, Slack};
 use protocol::{
-    Attachment, Card, Forwarded, MediaFile, MediaKind, Message, MessageKind, Preview, Reaction,
-    Sender, Span, Style, ThreadSummary, CARD_FIELDS, THREAD_FACES, WAVEFORM_LIMIT,
+    Attachment, Card, ConfirmDialog, ControlKind, ControlOption, ControlStyle, Forwarded,
+    MediaFile, MediaKind, Message, MessageControl, MessageKind, Preview, Reaction, Sender, Span,
+    Style, ThreadSummary, CARD_FIELDS, CONTROL_OPTIONS_LIMIT, MESSAGE_CONTROLS_LIMIT, THREAD_FACES,
+    WAVEFORM_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -52,6 +54,535 @@ fn first<'a>(values: &[&'a Value]) -> Option<&'a str> {
 
 fn pixels(value: &Value) -> u32 {
     value.as_u64().unwrap_or(0).min(u64::from(u32::MAX)) as u32
+}
+
+/// True when a Slack file entry represents a Canvas (`quip`, `canvas`, `slack_canvas`).
+pub(super) fn is_canvas(file: &Value) -> bool {
+    if file["is_canvas"] == true {
+        return true;
+    }
+    let ft = file["filetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    if matches!(ft.as_str(), "quip" | "canvas" | "slack_canvas") {
+        return true;
+    }
+    let mime = file["mimetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    matches!(mime.as_str(), "application/vnd.slack-docs" | "application/vnd.slack.canvas")
+}
+
+/// True when a Slack file entry represents a Slack List (`list`, `slack_list`).
+pub(super) fn is_list(file: &Value) -> bool {
+    if file["is_list"] == true {
+        return true;
+    }
+    let ft = file["filetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    if matches!(ft.as_str(), "list" | "slack_list") {
+        return true;
+    }
+    let mime = file["mimetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    matches!(mime.as_str(), "application/vnd.slack-list" | "application/vnd.slack.list")
+}
+
+/// True when a Slack file entry is an inline code/text snippet (`mode == "snippet"`).
+pub(super) fn is_snippet(file: &Value) -> bool {
+    file["mode"].as_str() == Some("snippet")
+}
+
+/// True when a Slack file entry is a legacy Slack Post (`mode == "post"` or `filetype` `post`/`space`).
+pub(super) fn is_post(file: &Value) -> bool {
+    if file["mode"].as_str() == Some("post") {
+        return true;
+    }
+    let ft = file["filetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    matches!(ft.as_str(), "post" | "space")
+}
+
+/// Human-readable provider name for an externally hosted file (Google Drive, Dropbox, OneDrive, Box).
+pub(super) fn external_provider(file: &Value) -> String {
+    let raw = file["external_type"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "gdrive" | "google_drive" | "google" => return "Google Drive".to_owned(),
+        "dropbox" => return "Dropbox".to_owned(),
+        "onedrive" | "sharepoint" => return "OneDrive".to_owned(),
+        "box" => return "Box".to_owned(),
+        _ => {}
+    }
+    let url = first(&[&file["url_private"], &file["permalink"]]).unwrap_or("").to_ascii_lowercase();
+    if url.contains("docs.google.com") || url.contains("drive.google.com") {
+        "Google Drive".to_owned()
+    } else if url.contains("dropbox.com") {
+        "Dropbox".to_owned()
+    } else if url.contains("onedrive.live.com") || url.contains("sharepoint.com") {
+        "OneDrive".to_owned()
+    } else if url.contains("box.com") {
+        "Box".to_owned()
+    } else if !raw.is_empty() {
+        raw
+    } else {
+        "External file".to_owned()
+    }
+}
+
+/// Appends a Slack snippet's inline preview as a `Style::CodeBlock` span onto `rich`.
+fn append_snippet_preview(file: &Value, rich: &mut Rich) {
+    let raw = first(&[&file["preview"], &file["plain_text"], &file["preview_plain_text"]]);
+    let Some(code) = raw else {
+        return;
+    };
+    let title = first(&[&file["title"], &file["name"]]).unwrap_or("");
+    if !title.is_empty() {
+        rich.line();
+        let start = rich.text.len() as u32;
+        rich.text.push_str(title);
+        let end = rich.text.len() as u32;
+        if end > start {
+            rich.spans.push(Span { start, end, style: Style::Bold });
+        }
+    }
+    rich.line();
+    let start = rich.text.len() as u32;
+    rich.text.push_str(code);
+    let end = rich.text.len() as u32;
+    if end > start {
+        let language = file["filetype"].as_str().unwrap_or("").to_owned();
+        rich.spans.push(Span { start, end, style: Style::CodeBlock { language } });
+    }
+    let more = file["lines_more"].as_u64().unwrap_or(0);
+    if more > 0 {
+        rich.line();
+        let total = file["lines"].as_u64().unwrap_or(0);
+        if total > 0 {
+            rich.text.push_str(&format!("… {more} more lines ({total} total)"));
+        } else {
+            rich.text.push_str(&format!("… {more} more lines"));
+        }
+    }
+}
+
+/// Decodes common HTML entities and strips HTML markup into clean, readable plain text.
+pub(super) fn strip_html(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    let mut skip_until: Option<&str> = None;
+    while !rest.is_empty() {
+        if let Some(end_tag) = skip_until {
+            if let Some(pos) = rest.to_ascii_lowercase().find(end_tag) {
+                rest = &rest[pos + end_tag.len()..];
+            } else {
+                break;
+            }
+            skip_until = None;
+            continue;
+        }
+        if let Some(lt) = rest.find('<') {
+            push_entities(&mut out, &rest[..lt]);
+            let after = &rest[lt + 1..];
+            let Some(gt) = after.find('>') else {
+                // Unclosed angle bracket: keep text without raw partial tag if it looks like a tag.
+                break;
+            };
+            let tag_raw = after[..gt].trim();
+            let tag_lower = tag_raw.to_ascii_lowercase();
+            let name = tag_lower
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or("");
+            if !tag_lower.starts_with('/') && matches!(name, "script" | "style") {
+                skip_until = Some(if name == "script" { "</script>" } else { "</style>" });
+            } else if name == "input" && tag_lower.contains("checkbox") {
+                if tag_lower.contains("checked") {
+                    out.push_str("☑ ");
+                } else {
+                    out.push_str("☐ ");
+                }
+            } else if name == "li" && !tag_lower.starts_with('/') {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("• ");
+            } else if matches!(name, "br" | "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "tr" | "section" | "hr") {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            rest = &after[gt + 1..];
+        } else {
+            push_entities(&mut out, rest);
+            break;
+        }
+    }
+    // Collapse excess blank lines and trim each line.
+    let mut lines: Vec<String> = Vec::new();
+    let mut prev_blank = false;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !prev_blank && !lines.is_empty() {
+                lines.push(String::new());
+                prev_blank = true;
+            }
+        } else {
+            lines.push(trimmed.to_owned());
+            prev_blank = false;
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn push_entities(out: &mut String, text: &str) {
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.find(';').filter(|&i| i > 0 && i <= 10) {
+            let entity = &after[..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" | "#39" | "#x27" | "#X27" => Some('\''),
+                "nbsp" => Some(' '),
+                s if s.starts_with("#x") || s.starts_with("#X") => {
+                    u32::from_str_radix(&s[2..], 16).ok().and_then(char::from_u32)
+                }
+                s if s.starts_with('#') => s[1..].parse::<u32>().ok().and_then(char::from_u32),
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+}
+
+fn push_card(framed: &mut Option<Box<Card>>, extra: &mut Vec<Card>, card: Card) {
+    if framed.is_none() {
+        *framed = Some(Box::new(card));
+    } else {
+        extra.push(card);
+    }
+}
+
+fn parse_confirm(raw: &Value) -> Option<ConfirmDialog> {
+    if !raw.is_object() {
+        return None;
+    }
+    let title = raw["title"]["text"].as_str().or_else(|| raw["title"].as_str()).unwrap_or("").trim().to_owned();
+    let text = raw["text"]["text"].as_str().or_else(|| raw["text"].as_str()).unwrap_or("").trim().to_owned();
+    let confirm = raw["confirm"]["text"]
+        .as_str()
+        .or_else(|| raw["confirm"].as_str())
+        .or_else(|| raw["ok_text"].as_str())
+        .unwrap_or("Confirm")
+        .trim()
+        .to_owned();
+    let deny = raw["deny"]["text"]
+        .as_str()
+        .or_else(|| raw["deny"].as_str())
+        .or_else(|| raw["dismiss_text"].as_str())
+        .unwrap_or("Cancel")
+        .trim()
+        .to_owned();
+    if title.is_empty() && text.is_empty() {
+        return None;
+    }
+    Some(ConfirmDialog { title, text, confirm, deny })
+}
+
+fn parse_options(el: &Value) -> Vec<ControlOption> {
+    let mut out = Vec::new();
+    let push_opt = |opt: &Value, out: &mut Vec<ControlOption>| {
+        if out.len() >= CONTROL_OPTIONS_LIMIT {
+            return;
+        }
+        let label = opt["text"]["text"]
+            .as_str()
+            .or_else(|| opt["text"].as_str())
+            .or_else(|| opt["label"].as_str())
+            .unwrap_or("")
+            .trim();
+        let value = opt["value"].as_str().unwrap_or(label).trim();
+        if !label.is_empty() || !value.is_empty() {
+            out.push(ControlOption {
+                label: if label.is_empty() { value.to_owned() } else { label.to_owned() },
+                value: value.to_owned(),
+            });
+        }
+    };
+    for opt in el["options"].as_array().into_iter().flatten() {
+        push_opt(opt, &mut out);
+    }
+    for group in el["option_groups"].as_array().into_iter().flatten() {
+        for opt in group["options"].as_array().into_iter().flatten() {
+            push_opt(opt, &mut out);
+        }
+    }
+    out
+}
+
+fn parse_button_style(raw: Option<&str>) -> ControlStyle {
+    match raw {
+        Some("primary") => ControlStyle::Primary,
+        Some("danger") => ControlStyle::Danger,
+        _ => ControlStyle::Default,
+    }
+}
+
+fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallback_idx: usize) -> Option<MessageControl> {
+    let kind = el["type"].as_str().filter(|s| !s.is_empty())?;
+    let action_id = el["action_id"]
+        .as_str()
+        .or_else(|| el["name"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{kind}_{fallback_idx}"));
+    let confirm = parse_confirm(&el["confirm"]);
+    match kind {
+        "button" => {
+            let label = el["text"]["text"]
+                .as_str()
+                .or_else(|| el["text"].as_str())
+                .or(label_override)
+                .unwrap_or("Action")
+                .trim()
+                .to_owned();
+            let url = el["url"]
+                .as_str()
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .unwrap_or("")
+                .to_owned();
+            let value = el["value"].as_str().unwrap_or("").to_owned();
+            let style = parse_button_style(el["style"].as_str());
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label,
+                value,
+                confirm,
+                kind: ControlKind::Button { url, style },
+            })
+        }
+        "static_select"
+        | "external_select"
+        | "users_select"
+        | "conversations_select"
+        | "channels_select"
+        | "multi_static_select"
+        | "multi_external_select"
+        | "multi_users_select"
+        | "multi_conversations_select"
+        | "multi_channels_select" => {
+            let placeholder = el["placeholder"]["text"]
+                .as_str()
+                .or_else(|| el["placeholder"].as_str())
+                .or(label_override)
+                .unwrap_or("Select an option")
+                .trim()
+                .to_owned();
+            let options = parse_options(el);
+            let selected = el["initial_option"]["value"]
+                .as_str()
+                .or_else(|| el["initial_user"].as_str())
+                .or_else(|| el["initial_conversation"].as_str())
+                .or_else(|| el["initial_channel"].as_str())
+                .map(str::to_owned);
+            let external = matches!(
+                kind,
+                "external_select"
+                    | "multi_external_select"
+                    | "users_select"
+                    | "conversations_select"
+                    | "channels_select"
+                    | "multi_users_select"
+                    | "multi_conversations_select"
+                    | "multi_channels_select"
+            );
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: selected.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::Select { placeholder, options, selected, external },
+            })
+        }
+        "overflow" => {
+            let options = parse_options(el);
+            if options.is_empty() {
+                return None;
+            }
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("More…").trim().to_owned(),
+                value: String::new(),
+                confirm,
+                kind: ControlKind::Select {
+                    placeholder: "More…".to_owned(),
+                    options,
+                    selected: None,
+                    external: false,
+                },
+            })
+        }
+        "datepicker" => {
+            let placeholder = el["placeholder"]["text"]
+                .as_str()
+                .or(label_override)
+                .unwrap_or("Select a date")
+                .trim()
+                .to_owned();
+            let initial = el["initial_date"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: initial.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::DatePicker { placeholder, initial },
+            })
+        }
+        "timepicker" => {
+            let placeholder = el["placeholder"]["text"]
+                .as_str()
+                .or(label_override)
+                .unwrap_or("Select a time")
+                .trim()
+                .to_owned();
+            let initial = el["initial_time"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: initial.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::TimePicker { placeholder, initial },
+            })
+        }
+        "checkboxes" => {
+            let options = parse_options(el);
+            if options.is_empty() {
+                return None;
+            }
+            let selected: Vec<String> = el["initial_options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o["value"].as_str().map(str::to_owned))
+                .collect();
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: String::new(),
+                confirm,
+                kind: ControlKind::Checkboxes { options, selected },
+            })
+        }
+        "radio_buttons" => {
+            let options = parse_options(el);
+            if options.is_empty() {
+                return None;
+            }
+            let selected = el["initial_option"]["value"].as_str().map(str::to_owned);
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: selected.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::RadioButtons { options, selected },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn collect_block_controls(blocks: &[Value], out: &mut Vec<MessageControl>) {
+    for block in blocks {
+        if out.len() >= MESSAGE_CONTROLS_LIMIT {
+            break;
+        }
+        let block_id = block["block_id"].as_str().unwrap_or("");
+        match block["type"].as_str() {
+            Some("actions") => {
+                for el in block["elements"].as_array().into_iter().flatten() {
+                    if out.len() >= MESSAGE_CONTROLS_LIMIT {
+                        break;
+                    }
+                    if let Some(ctrl) = parse_element(block_id, el, None, out.len()) {
+                        out.push(ctrl);
+                    }
+                }
+            }
+            Some("section") => {
+                let acc = &block["accessory"];
+                if acc.is_object() && acc["type"].as_str() != Some("image") {
+                    if let Some(ctrl) = parse_element(block_id, acc, None, out.len()) {
+                        out.push(ctrl);
+                    }
+                }
+            }
+            Some("input") => {
+                let label = block["label"]["text"].as_str();
+                if let Some(ctrl) = parse_element(block_id, &block["element"], label, out.len()) {
+                    out.push(ctrl);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_controls(event: &Value) -> Vec<MessageControl> {
+    let mut out = Vec::new();
+    if let Some(blocks) = event["blocks"].as_array() {
+        collect_block_controls(blocks, &mut out);
+    }
+    for att in event["attachments"].as_array().into_iter().flatten() {
+        if out.len() >= MESSAGE_CONTROLS_LIMIT {
+            break;
+        }
+        if let Some(blocks) = att["blocks"].as_array() {
+            collect_block_controls(blocks, &mut out);
+        }
+        let callback_id = att["callback_id"].as_str().unwrap_or("");
+        for act in att["actions"].as_array().into_iter().flatten() {
+            if out.len() >= MESSAGE_CONTROLS_LIMIT {
+                break;
+            }
+            let kind = act["type"].as_str().unwrap_or("");
+            if kind == "button" {
+                if let Some(ctrl) = parse_element(callback_id, act, None, out.len()) {
+                    out.push(ctrl);
+                }
+            } else if kind == "select" {
+                let mut normalized = act.clone();
+                normalized["type"] = "static_select".into();
+                if let Some(ctrl) = parse_element(callback_id, &normalized, None, out.len()) {
+                    out.push(ctrl);
+                }
+            }
+        }
+    }
+    out.truncate(MESSAGE_CONTROLS_LIMIT);
+    out
 }
 
 /// What a stored custom-emoji note stands for: `=glyph` is an alias of a standard emoji.
@@ -663,12 +1194,102 @@ impl Slack {
         }
     }
 
+    /// True when a Slack file is hosted outside Slack (Google Drive, Dropbox, Box, OneDrive)
+    /// and should open externally rather than attempting a Slack blob download.
+    pub(super) fn is_external(&self, file: &Value) -> bool {
+        if file["mode"].as_str() == Some("external") || file["is_external"] == true {
+            return true;
+        }
+        file["url_private"]
+            .as_str()
+            .is_some_and(|u| (u.starts_with("https://") || u.starts_with("http://")) && !self.hosted(u))
+    }
+
+    /// Maps an externally hosted file (`mode == "external"`, Google Drive, Dropbox, etc.) into a
+    /// structured card with an open link instead of attempting a broken Slack blob download.
+    fn external_file_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let provider = external_provider(file);
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("External file").trim().to_owned();
+        let link = first(&[&file["url_private"], &file["permalink"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(pretty) = first(&[&file["pretty_type"]]) {
+            parts.push(pretty.to_owned());
+        }
+        let size = file["size"].as_u64().unwrap_or(0);
+        if size > 0 {
+            let label = if size >= 1024 * 1024 {
+                format!("{:.1} MB", size as f64 / (1024. * 1024.))
+            } else if size >= 1024 {
+                format!("{} KB", size.div_ceil(1024))
+            } else {
+                format!("{size} B")
+            };
+            parts.push(label);
+        }
+        let preview = first(&[&file["preview_plain_text"], &file["preview"]])
+            .map(strip_html)
+            .unwrap_or_default();
+        let text = match (parts.is_empty(), preview.is_empty()) {
+            (false, false) => format!("{}\n{}", parts.join(" · "), preview),
+            (false, true) => parts.join(" · "),
+            (true, false) => preview,
+            (true, true) => format!("Hosted in {provider}"),
+        };
+        let footer = if provider == "External file" {
+            "Open in browser".to_owned()
+        } else {
+            format!("Open in {provider}")
+        };
+        Card {
+            author: provider,
+            title,
+            title_link: link,
+            text,
+            fields: Vec::new(),
+            footer,
+            image: None,
+            thumbnail: None,
+            color: Some(0x1d_9bd1),
+            sponsored: false,
+            actions: Vec::new(),
+        }
+    }
+
+    /// Maps a legacy Slack Post (`mode == "post"`, `filetype` `post`/`space`) into a read-only card.
+    fn post_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("Slack Post").trim().to_owned();
+        let link = first(&[&file["permalink"], &file["url_private"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let text = first(&[&file["preview_plain_text"], &file["plain_text"], &file["preview"], &file["preview_highlight"]])
+            .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { self.words(raw) })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Shared Slack post".to_owned());
+        Card {
+            author: "Slack Post".to_owned(),
+            title,
+            title_link: link,
+            text,
+            fields: Vec::new(),
+            footer: "Open in Slack".to_owned(),
+            image: None,
+            thumbnail: None,
+            color: Some(0x4a_154b),
+            sponsored: false,
+            actions: Vec::new(),
+        }
+    }
+
     /// An upload as an attachment: the file itself and the picture a row shows inline. Both
     /// addresses need the session to fetch (see `Command::Download`).
     ///
     /// The picture a row shows is registered at the size a row normally draws, and every other
     /// size Slack made of it as a variant, so a 2x screen is given one large enough.
-    fn file(&self, file: &Value, media: &mut Registered, variants: &mut Sizes) -> Option<Attachment> {
+    pub(super) fn file(&self, file: &Value, media: &mut Registered, variants: &mut Sizes) -> Option<Attachment> {
         let id = file["id"].as_str()?;
         let url = file["url_private"].as_str().filter(|url| self.hosted(url))?;
         let mime = file["mimetype"].as_str().unwrap_or("");
@@ -711,7 +1332,11 @@ impl Slack {
             MediaKind::Gif if !moving.is_empty() => moving,
             MediaKind::Image | MediaKind::Gif => THUMBS.iter().filter_map(|side| still(&format!("thumb_{side}"), *side)).collect(),
             MediaKind::Video => still("thumb_video", 0).into_iter().collect(),
-            MediaKind::File => still("thumb_pdf", 0).into_iter().collect::<Vec<_>>(),
+            MediaKind::File => still("thumb_pdf", 0)
+                .or_else(|| still("thumb_480", 480))
+                .or_else(|| still("thumb_360", 360))
+                .into_iter()
+                .collect::<Vec<_>>(),
             _ => Vec::new(),
         };
         // The picture itself, where it is small enough to stand in for a size Slack did not make.
@@ -863,6 +1488,199 @@ impl Slack {
             rich.mrkdwn(pretext);
         }
         Some(framed)
+    }
+
+    /// Maps a Slack Canvas file (`filetype` `quip` / `canvas` / `slack_canvas`) into a structured
+    /// readable card with an "Open in Slack" link instead of a bare download chip.
+    fn canvas_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("Untitled Canvas").trim().to_owned();
+        let title = if title.is_empty() { "Untitled Canvas".to_owned() } else { title };
+        let link = first(&[&file["permalink"], &file["url_private"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let creator = file["user"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.cached(id))
+            .map(|u| u.name);
+        let author = match creator {
+            Some(who) if !who.is_empty() => format!("Slack Canvas · {who}"),
+            _ => "Slack Canvas".to_owned(),
+        };
+
+        let mut text = String::new();
+        let mut fields: Vec<(String, String)> = Vec::new();
+
+        // Structured sections when present in the payload.
+        if let Some(sections) = file["sections"].as_array() {
+            for sec in sections {
+                if fields.len() >= CARD_FIELDS {
+                    break;
+                }
+                let heading = first(&[&sec["title"], &sec["heading"]]).map(strip_html).unwrap_or_default();
+                let body = first(&[&sec["text"], &sec["content"], &sec["markdown"], &sec["body"]])
+                    .map(|raw| {
+                        if raw.contains('<') && raw.contains('>') {
+                            strip_html(raw)
+                        } else {
+                            self.words(raw)
+                        }
+                    })
+                    .unwrap_or_default();
+                if !heading.is_empty() || !body.is_empty() {
+                    fields.push((heading, body));
+                }
+            }
+        }
+
+        // Canvas Block Kit document content when present.
+        if let Some(blocks) = file["blocks"].as_array().filter(|b| !b.is_empty()) {
+            let mut inner = Rich::new(self);
+            inner.blocks(blocks);
+            inner.finish();
+            if !inner.text.is_empty() {
+                text = inner.text;
+            }
+        }
+
+        // Plain/HTML preview text from Slack's file payload.
+        if text.is_empty() {
+            if let Some(raw) = first(&[
+                &file["preview_plain_text"],
+                &file["plain_text"],
+                &file["document_content"],
+                &file["preview"],
+                &file["preview_highlight"],
+            ]) {
+                let cleaned = if raw.contains('<') && raw.contains('>') {
+                    strip_html(raw)
+                } else {
+                    self.words(raw)
+                };
+                if !cleaned.is_empty() {
+                    text = cleaned;
+                }
+            }
+        }
+
+        if text.is_empty() && fields.is_empty() {
+            text = if file["is_huddle_notes"] == true || title.to_ascii_lowercase().contains("huddle") {
+                "Huddle notes canvas".to_owned()
+            } else {
+                "Shared Slack canvas".to_owned()
+            };
+        }
+
+        Card {
+            author,
+            title,
+            title_link: link,
+            text,
+            fields,
+            footer: "Open in Slack".to_owned(),
+            image: None,
+            thumbnail: None,
+            color: Some(0x4a_154b),
+            sponsored: false,
+            actions: Vec::new(),
+        }
+    }
+
+    /// Maps a Slack List file (`filetype` `list` / `slack_list`) into a structured readable card
+    /// with columns/items summary and an "Open in Slack" link instead of a bare download chip.
+    fn list_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("Untitled List").trim().to_owned();
+        let title = if title.is_empty() { "Untitled List".to_owned() } else { title };
+        let link = first(&[&file["permalink"], &file["url_private"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let creator = file["user"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.cached(id))
+            .map(|u| u.name);
+        let author = match creator {
+            Some(who) if !who.is_empty() => format!("Slack List · {who}"),
+            _ => "Slack List".to_owned(),
+        };
+
+        let meta = &file["list_metadata"];
+        let mut text = first(&[
+            &meta["description"],
+            &file["preview_plain_text"],
+            &file["plain_text"],
+            &file["preview"],
+        ])
+        .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { self.words(raw) })
+        .unwrap_or_default();
+
+        let mut fields: Vec<(String, String)> = Vec::new();
+        let items = meta["items"]
+            .as_array()
+            .or_else(|| file["items"].as_array())
+            .or_else(|| file["rows"].as_array());
+        if let Some(items) = items {
+            for item in items.iter().take(CARD_FIELDS) {
+                let item_title = first(&[&item["title"], &item["name"], &item["text"]])
+                    .map(strip_html)
+                    .unwrap_or_default();
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(status) = first(&[&item["status"], &item["state"]]) {
+                    parts.push(strip_html(status));
+                }
+                if let Some(assignee) = first(&[&item["assignee"], &item["owner"]]) {
+                    let who = self.cached(assignee).map(|u| u.name).unwrap_or_else(|| strip_html(assignee));
+                    if !who.is_empty() {
+                        parts.push(who);
+                    }
+                }
+                if let Some(due) = first(&[&item["due_date"], &item["due"]]) {
+                    parts.push(format!("Due {}", strip_html(due)));
+                }
+                if !item_title.is_empty() || !parts.is_empty() {
+                    let label = if item_title.is_empty() { "Item".to_owned() } else { item_title };
+                    fields.push((label, parts.join(" · ")));
+                }
+            }
+        }
+
+        if let Some(schema) = meta["schema"].as_array().filter(|s| !s.is_empty()) {
+            let cols: Vec<String> = schema
+                .iter()
+                .filter_map(|c| first(&[&c["name"], &c["label"], &c["key"]]).map(strip_html))
+                .filter(|s| !s.is_empty())
+                .take(8)
+                .collect();
+            if !cols.is_empty() {
+                let col_line = format!("Columns: {}", cols.join(", "));
+                if text.is_empty() {
+                    text = col_line;
+                } else {
+                    text.push('\n');
+                    text.push_str(&col_line);
+                }
+            }
+        }
+
+        if text.is_empty() && fields.is_empty() {
+            text = "Shared Slack list".to_owned();
+        }
+
+        Card {
+            author,
+            title,
+            title_link: link,
+            text,
+            fields,
+            footer: "Open in Slack".to_owned(),
+            image: None,
+            thumbnail: None,
+            color: Some(0x2e_7d6f),
+            sponsored: false,
+            actions: Vec::new(),
+        }
     }
 
     /// Extracts hosted image blocks, section image accessories, and video blocks from Block Kit.
@@ -1070,9 +1888,28 @@ impl Slack {
                 }
                 _ => {}
             }
+            if is_canvas(file) {
+                push_card(&mut framed, &mut extra_cards, self.canvas_card(file, &link));
+                continue;
+            }
+            if is_list(file) {
+                push_card(&mut framed, &mut extra_cards, self.list_card(file, &link));
+                continue;
+            }
+            if is_post(file) {
+                push_card(&mut framed, &mut extra_cards, self.post_card(file, &link));
+                continue;
+            }
+            if self.is_external(file) {
+                push_card(&mut framed, &mut extra_cards, self.external_file_card(file, &link));
+                continue;
+            }
+            if is_snippet(file) {
+                append_snippet_preview(file, &mut rich);
+            }
             match self.file(file, &mut media, &mut variants) {
                 Some(attachment) => attachments.push(attachment),
-                // Kept somewhere Slack does not serve (Drive, Dropbox): a link to it.
+                // Fallback for minimal file stubs without a hosted address (e.g. pinned file stubs).
                 None => {
                     rich.line();
                     let target = first(&[&file["url_private"], &file["permalink"]]).unwrap_or(&link);
@@ -1080,8 +1917,21 @@ impl Slack {
                 }
             }
         }
-        if rich.undrawn && !rich.text.is_empty() {
-            // Buttons and menus are not drawn; the official app has them.
+        let controls = parse_controls(event);
+        if !controls.is_empty() {
+            if let Some(app_id) = first(&[&event["app_id"], &event["bot_id"]]) {
+                let mut state = self.state();
+                if state.message_apps.len() >= 512 {
+                    state.message_apps.clear();
+                }
+                state.message_apps.insert((channel.to_owned(), ts.to_owned()), app_id.to_owned());
+            }
+        }
+        if subtype == Some("channel_canvas_updated") && rich.text.trim().is_empty() {
+            rich.text = "Updated the channel canvas".to_owned();
+        }
+        if rich.undrawn && controls.is_empty() && !rich.text.is_empty() {
+            // Controls we could not parse still link out to Slack.
             rich.line();
             rich.link(&link, Some("Open in Slack"));
         }
@@ -1137,7 +1987,7 @@ impl Slack {
             (suppress, kw)
         };
         message.mentions_me = !outgoing && (rich.mentioned || (rich.broadcast && !suppress_broadcast) || keyword_hit);
-        let empty = rich.text.is_empty() && attachments.is_empty() && previews.is_empty() && framed.is_none();
+        let empty = rich.text.is_empty() && attachments.is_empty() && previews.is_empty() && framed.is_none() && controls.is_empty();
         // What Slack leaves of a deleted message that a thread still hangs off.
         let tombstone = subtype == Some("tombstone");
         message.kind = if tombstone {
@@ -1162,6 +2012,7 @@ impl Slack {
         message.thread = summary;
         message.card = framed;
         message.cards = extra_cards;
+        message.controls = controls;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
         message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);

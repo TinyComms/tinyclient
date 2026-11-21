@@ -668,6 +668,55 @@ impl Slack {
         Ok(id.to_owned())
     }
 
+    /// Starts a multi-person group DM (MPIM) via `conversations.open` with up to 8 comma-separated
+    /// user ids, recording the resulting row just as `mpim_open` does. A single-person list opens
+    /// a regular 1:1 DM.
+    pub(super) fn start_group(&self, people: &[String]) -> Result<String, Fault> {
+        let me = self.me.get().map(String::as_str).unwrap_or("");
+        let mut ids: Vec<String> = Vec::new();
+        for person in people {
+            let trimmed = person.trim();
+            if trimmed.is_empty() || trimmed == me {
+                continue;
+            }
+            if trimmed.contains('@') {
+                return Err(Fault::Slack("external_email".to_owned()));
+            }
+            if !ids.iter().any(|existing| existing == trimmed) {
+                ids.push(trimmed.to_owned());
+            }
+        }
+        if ids.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        if ids.len() == 1 {
+            return self.start_direct(&ids[0]);
+        }
+        if ids.len() > 8 {
+            return Err(Fault::Slack("too_many_users".to_owned()));
+        }
+        let joined = ids.join(",");
+        let opened = self.api("conversations.open", &[("users", &joined), ("return_im", "true")])?;
+        let ch = &opened["channel"];
+        let Some(id) = ch["id"].as_str().filter(|s| !s.is_empty()) else {
+            return Err(Fault::Net("conversations.open: no channel".to_owned()));
+        };
+        self.users(&ids);
+        let fallback_title = ids.iter().map(|uid| self.user(uid).name).collect::<Vec<_>>().join(", ");
+        let mut row = self.row(ch).unwrap_or_else(|| {
+            self.placed(id, protocol::ConversationKind::Group, &fallback_title)
+        });
+        row.kind = protocol::ConversationKind::Group;
+        if row.title.trim().is_empty() || row.title.starts_with("mpdm-") {
+            row.title = fallback_title;
+        }
+        row.group = self.ctx.note("group:directs");
+        row.private = true;
+        row.joined = true;
+        self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(id.to_owned())
+    }
+
     /// Who the user has direct conversations with, as the last sidebar load left it: read from
     /// its note once a run, so a connection that does not load the sidebar still knows.
     pub(super) fn partners(&self) {

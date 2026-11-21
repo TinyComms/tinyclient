@@ -1,0 +1,12 @@
+{
+  "id": "wave-6-slack",
+  "title": "Wave 6B Slack canvases & lists, channel/group DM creation, snippets & file management, GIF picker, and Block Kit interactive controls",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 6B Slack enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 6B Slack enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

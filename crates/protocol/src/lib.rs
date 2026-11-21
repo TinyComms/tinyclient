@@ -2562,6 +2562,38 @@ pub enum Request {
     Join {
         conversation: Key,
     },
+    /// Paged workspace/account-wide file list (Slack `files.list` without a channel).
+    /// Answers `Response::AccountFiles`.
+    AccountFiles {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Delete a file on the network (Slack `files.delete`, own files).
+    DeleteFile {
+        account: AccountKey,
+        file_id: String,
+    },
+    /// Execute an interactive control on a message (Slack Block Kit `blocks.actions`).
+    /// Answers `Response::Ok` when accepted; message updates arrive asynchronously.
+    MessageAction {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        value: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        values: Vec<String>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3058,6 +3090,14 @@ pub enum Response {
         channels: Vec<BrowsedChannel>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+    },
+    /// One page of workspace/account-wide files (`Request::AccountFiles`).
+    AccountFiles {
+        items: Vec<SharedItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
     /// Pending scheduled messages for a conversation (`Request::ScheduledMessages`).
     ScheduledMessages {

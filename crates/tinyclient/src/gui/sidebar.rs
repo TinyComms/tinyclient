@@ -451,12 +451,18 @@ impl Shell {
             drafts.clear();
         }
         if drafts.insert(conversation.clone(), text.trim().to_owned()).as_deref() != Some(text.trim()) {
-            cx.notify();
+            if self.sidebar_state.mode == Mode::Network(Network::Slack)
+                || matches!(self.sidebar_state.drill, Some(home::Drill::Drafts(_)))
+            {
+                self.rebuild_rows(cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 
     /// The draft a row shows: what the composer last said, else what chatd stored.
-    fn draft_of<'a>(&'a self, c: &'a Conversation) -> &'a str {
+    pub(super) fn draft_of<'a>(&'a self, c: &'a Conversation) -> &'a str {
         self.sidebar_state.drafts.get(&c.key).map_or(c.draft.as_str(), String::as_str)
     }
 
@@ -2461,25 +2467,27 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .id("create-chan-kind")
-                            .type_small()
-                            .text_color(theme::accent_text())
-                            .cursor_pointer()
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(m) = this.sidebar_state.create_channel.as_mut() {
-                                    m.kind = if m.kind == ConversationKind::Voice {
-                                        ConversationKind::Channel
-                                    } else {
-                                        ConversationKind::Voice
-                                    };
-                                    cx.notify();
-                                }
-                            }))
-                            .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
-                    )
+                    .when(modal.space.network != Network::Slack, |row| {
+                        row.child(
+                            div()
+                                .id("create-chan-kind")
+                                .type_small()
+                                .text_color(theme::accent_text())
+                                .cursor_pointer()
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(m) = this.sidebar_state.create_channel.as_mut() {
+                                        m.kind = if m.kind == ConversationKind::Voice {
+                                            ConversationKind::Channel
+                                        } else {
+                                            ConversationKind::Voice
+                                        };
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
+                        )
+                    })
                     .child(
                         div()
                             .id("create-chan-private")

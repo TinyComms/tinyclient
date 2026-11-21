@@ -221,6 +221,14 @@ pub struct SharedPage {
     pub total: Option<u32>,
 }
 
+/// One page of workspace/account-wide files (`Command::AccountFiles`).
+#[derive(Debug, Clone, Default)]
+pub struct AccountFilesPage {
+    pub items: Vec<SharedItem>,
+    pub cursor: Option<String>,
+    pub more: bool,
+}
+
 /// A page of a picker's catalog, and where the next one starts.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogPage {
@@ -501,6 +509,19 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<()>,
     },
+    /// Paged workspace/account-wide file list (Slack `files.list` without a channel).
+    AccountFiles {
+        query: String,
+        kind: Option<String>,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<AccountFilesPage>,
+    },
+    /// Delete a file on the network (Slack `files.delete`).
+    DeleteFile {
+        file_id: String,
+        reply: Reply<()>,
+    },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
     /// Preview a Space invite link or code.
@@ -607,6 +628,17 @@ pub enum Command {
         pinned: bool,
         notify: bool,
         me_only: bool,
+        reply: Reply<()>,
+    },
+    /// Executes an interactive Block Kit control on a message (Slack `blocks.actions`).
+    MessageAction {
+        conversation_id: String,
+        message_id: String,
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        value: String,
+        values: Vec<String>,
         reply: Reply<()>,
     },
     /// Forwards one or more messages to target conversations on the same account.
@@ -833,6 +865,7 @@ impl Command {
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -848,7 +881,9 @@ impl Command {
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
-            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::Join { reply, .. }
+            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
@@ -1003,6 +1038,15 @@ impl Context {
     pub fn spaces(&self, spaces: &[SpaceRow]) -> Stores {
         self.hub.store().replace_spaces(&self.account, spaces)?;
         self.hub.changed(Change::Spaces { account: self.account.clone() });
+        Ok(())
+    }
+
+    /// Sets whether the user can create channels in `space_id`.
+    pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
         Ok(())
     }
 

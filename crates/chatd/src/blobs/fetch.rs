@@ -55,8 +55,9 @@ impl Hosts {
             // The CDN and the media proxy. Their addresses are signed and expire.
             // Discord's own GIF search answers with stills on Tenor's host.
             Network::Discord => (&["cdn.discordapp.com", "discordapp.net", "media.tenor.com"], &[]),
-            // Avatars, emoji and unfurled images are public; files need the workspace's token.
-            Network::Slack => (&["slack-edge.com", "slack-imgs.com", "slack-files.com"], &["files.slack.com"]),
+            // Avatars, emoji, unfurled images, and GIF picker thumbnails (GIPHY/Tenor) are public;
+            // workspace files need the session's token.
+            Network::Slack => (&["slack-edge.com", "slack-imgs.com", "slack-files.com", "giphy.com", "media.tenor.com"], &["files.slack.com"]),
             // Pictures in messages and people's pictures, each behind the session's own token;
             // GIFs from Teams' Giphy button, public, on Giphy's host. A shared file is fetched
             // from Graph with the session. Graph redirects to a pre-authenticated SharePoint
