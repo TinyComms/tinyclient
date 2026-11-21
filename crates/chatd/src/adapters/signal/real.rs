@@ -1663,9 +1663,10 @@ impl Session {
                     }
                     None => (ta.text_background_color.unwrap_or(0), Vec::new()),
                 };
+                let body = ta.text.unwrap_or_default();
                 let preview = ta.preview.and_then(|p| {
                     let url = p.url.unwrap_or_default();
-                    if !(url.starts_with("https://") || url.starts_with("http://")) {
+                    if !super::wire::story_preview_kept(&body, &url) {
                         return None;
                     }
                     Some(LinkPreview {
@@ -1681,7 +1682,7 @@ impl Session {
                 (
                     None,
                     Some(StoryText {
-                        text: ta.text.unwrap_or_default(),
+                        text: body,
                         style,
                         fg_color: ta.text_foreground_color.unwrap_or(0xffff_ffff),
                         bg_color,

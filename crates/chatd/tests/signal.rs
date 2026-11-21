@@ -3102,6 +3102,62 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
 }
 
 #[test]
+fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
+    let plain = b"not-a-real-voice-note".to_vec();
+    let key = [0x5au8; 64];
+    let iv = [0x11u8; 16];
+    let (enc, digest) = encrypt_signal_blob(&plain, &key, &iv);
+    let mut bad = digest;
+    bad[0] ^= 0xff;
+    let (base, stop_cdn) = spawn_cdn_stub(vec![("/bad-voice.enc".into(), enc)]);
+
+    let world = World::linked();
+    world.connected();
+    let sent = T0 + 40_000;
+    world.steer(&format!(
+        "voice grace {sent} {base}/bad-voice.enc {} {}",
+        hex_of(&key),
+        hex_of(&bad),
+    ));
+    let voice_msg = world.arrived(GRACE, &id(sent, GRACE));
+    let file_id = voice_msg.attachments[0].file.id.clone();
+    assert!(voice_msg.attachments[0].file.path.is_none());
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let failed = world.until("bad digest marked failed", || {
+        let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
+        let file = msg.attachments.first()?.file.clone();
+        if file.failed.as_deref() == Some("Attachment digest mismatch.") {
+            Some(file)
+        } else {
+            None
+        }
+    });
+    assert!(failed.path.is_none(), "a bad digest must not leave a file to play");
+
+    let play = world.ask(Request::Play(protocol::PlayRequest::Start {
+        account: account(),
+        file: file_id,
+        path: String::new(),
+        conversation: key(GRACE),
+        message: voice_msg.id,
+        title: "Voice message".into(),
+        at: Some(0),
+        rate: 100,
+        output: None,
+    }));
+    assert!(
+        matches!(play, Response::Error { code: ErrorCode::Media, .. }),
+        "playback must not start, got {play:?}"
+    );
+    assert!(
+        world.calls().iter().all(|line| !line.starts_with("viewed ")),
+        "fake wire heard a viewed line: {:?}",
+        world.calls().iter().filter(|line| line.starts_with("viewed ")).collect::<Vec<_>>()
+    );
+    stop_cdn.store(true, Ordering::Relaxed);
+}
+
+#[test]
 fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
     let mut world = World::linked();
     world.connected();
@@ -3256,8 +3312,7 @@ fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
 
 #[test]
 fn stories_receive_expire_reply_react_view_post_with_distribution_lists_and_toggle_off() {
-    let mut world = World::new();
-    world.linked();
+    let world = World::linked();
     world.connected();
 
     let now_ms = std::time::SystemTime::now()

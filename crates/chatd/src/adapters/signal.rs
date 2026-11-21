@@ -809,7 +809,7 @@ struct Live {
     story_view_receipts: bool,
     /// Synced Signal story distribution lists (`StoryDistributionListRecord`).
     story_lists: Vec<wire::StoryDistributionList>,
-    /// Active stories remembered for reply snippet attribution, permission checks, and viewer tracking.
+    /// Active stories remembered for reply snippet attribution, permission checks, audience, and viewer tracking.
     stories: HashMap<String, HeldStory>,
 }
 
@@ -822,6 +822,8 @@ struct HeldStory {
     allows_replies: bool,
     snippet: String,
     expires_at: i64,
+    /// Recipient ACIs for a direct story. A group story leaves this empty; its members are the audience.
+    audience: Vec<String>,
     viewed_by: Vec<String>,
 }
 
@@ -2028,6 +2030,14 @@ fn apply(account: &Account, event: Event) {
             // Every time in the receipt, not only the newest: one receipt can name several messages.
             let at = i64::try_from(at).unwrap_or(0);
             for sent_at in sent {
+                if viewed {
+                    match story_view_from(account, &by, sent_at) {
+                        Some(true) => note_story_viewer(account, sent_at, &by),
+                        // Held story, but this person was not in its audience or its group.
+                        Some(false) => continue,
+                        None => {}
+                    }
+                }
                 file_receipt(account, &by, sent_at, read, viewed, at);
             }
         }
@@ -2424,6 +2434,9 @@ fn apply(account: &Account, event: Event) {
                 return;
             }
             let story_id = wire::message_id(story_sent, &story_author);
+            if visible_story(account, &story_id).is_none() {
+                return;
+            }
             let mine = by == account.me;
             let prior = account.live().react(&story_id, &by, (!removed).then_some(emoji.as_str()));
             if let Some(old) = prior {
@@ -2776,7 +2789,7 @@ fn apply_story(account: &Account, story: wire::StoryMessageData) {
             ..protocol::Card::default()
         }));
         if let Some(preview) = &st.preview {
-            if preview.url.starts_with("https://") || preview.url.starts_with("http://") {
+            if wire::story_preview_kept(&st.text, &preview.url) {
                 msg.previews.push(protocol::Preview {
                     url: preview.url.clone(),
                     site: crate::adapters::tiny::preview::real_host(&preview.url),
@@ -2817,18 +2830,27 @@ fn apply_story(account: &Account, story: wire::StoryMessageData) {
         msg.attachments.push(att);
     }
 
-    account.live().stories.insert(
-        msg_id.clone(),
-        HeldStory {
-            author: story.author,
-            sent: story.sent,
-            group_id: story.group_id,
-            allows_replies: story.allows_replies,
-            snippet,
-            expires_at,
-            viewed_by: Vec::new(),
-        },
-    );
+    {
+        let mut live = account.live();
+        let (audience, viewed_by) = live
+            .stories
+            .get(&msg_id)
+            .map(|old| (old.audience.clone(), old.viewed_by.clone()))
+            .unwrap_or_default();
+        live.stories.insert(
+            msg_id.clone(),
+            HeldStory {
+                author: story.author,
+                sent: story.sent,
+                group_id: story.group_id,
+                allows_replies: story.allows_replies,
+                snippet,
+                expires_at,
+                audience,
+                viewed_by,
+            },
+        );
+    }
     let _ = account.ctx.message(STORIES_CONVERSATION, &msg);
 }
 
@@ -4397,12 +4419,16 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
         if !wire::is_aci(author) {
             return Err(Refusal::Refused("Invalid story author.".into()));
         }
-        let (disabled, send_receipts) = {
+        let story_id = wire::message_id(sent, author);
+        let send_receipts = {
             let live = account.live();
-            (live.stories_disabled, live.story_view_receipts)
+            if live.stories_disabled {
+                return Err(Refusal::Refused("Stories are turned off.".into()));
+            }
+            live.story_view_receipts
         };
-        if disabled {
-            return Err(Refusal::Refused("Stories are turned off.".into()));
+        if visible_story(account, &story_id).is_none() {
+            return Err(Refusal::Refused("That story is no longer available.".into()));
         }
         if author != account.me {
             account
@@ -4419,35 +4445,25 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
             .next()
             .and_then(|s| s.trim().parse().ok())
             .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
-        let group_str = parts.next().unwrap_or("").trim();
+        // The handoff's group is not the destination. Only the held story's group is.
+        let _group = parts.next().unwrap_or("");
         let reply_text = parts.next().unwrap_or("").trim();
         if !wire::is_aci(author) || reply_text.is_empty() {
             return Err(Refusal::Refused("A story reply needs text.".into()));
         }
         let story_id = wire::message_id(sent, author);
-        let (disabled, allowed, story_group, snippet) = {
-            let live = account.live();
-            let held = live.stories.get(&story_id);
-            (
-                live.stories_disabled,
-                held.map_or(true, |s| s.allows_replies),
-                held.and_then(|s| s.group_id.clone()),
-                held.map(|s| s.snippet.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Story".to_owned()),
-            )
-        };
-        if disabled {
+        if account.live().stories_disabled {
             return Err(Refusal::Refused("Stories are turned off.".into()));
         }
-        if !allowed {
+        let Some(story) = visible_story(account, &story_id) else {
+            return Err(Refusal::Refused("That story is no longer available.".into()));
+        };
+        if !story.allows_replies {
             return Err(Refusal::Refused("Replies are turned off for this story.".into()));
         }
-        let target_group = if !group_str.is_empty() {
-            Some(group_str.strip_prefix("g.").unwrap_or(group_str).to_owned())
-        } else {
-            story_group
-        };
-        let to = match &target_group {
-            Some(gid) => Peer::Group(gid.clone()),
+        let snippet = if story.snippet.is_empty() { "Story".to_owned() } else { story.snippet.clone() };
+        let to = match story.group_id.as_deref() {
+            Some(gid) => Peer::Group(gid.to_owned()),
             None => Peer::Direct(author.to_owned()),
         };
         let conv = to.conversation();
@@ -4491,7 +4507,8 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
             .next()
             .and_then(|s| s.trim().parse().ok())
             .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
-        let group_str = parts.next().unwrap_or("").trim();
+        // The handoff's group is not the destination. Only the held story's group is.
+        let _group = parts.next().unwrap_or("");
         let emoji = parts.next().unwrap_or("").trim();
         if !wire::is_aci(author) || emoji.is_empty() {
             return Err(Refusal::Refused("A story reaction needs an emoji.".into()));
@@ -4500,13 +4517,11 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
             return Err(Refusal::Refused("Stories are turned off.".into()));
         }
         let story_id = wire::message_id(sent, author);
-        let target_group = if !group_str.is_empty() {
-            Some(group_str.strip_prefix("g.").unwrap_or(group_str).to_owned())
-        } else {
-            account.live().stories.get(&story_id).and_then(|s| s.group_id.clone())
+        let Some(story) = visible_story(account, &story_id) else {
+            return Err(Refusal::Refused("That story is no longer available.".into()));
         };
-        let to = match &target_group {
-            Some(gid) => Peer::Group(gid.clone()),
+        let to = match story.group_id.as_deref() {
+            Some(gid) => Peer::Group(gid.to_owned()),
             None => Peer::Direct(author.to_owned()),
         };
         account
@@ -4539,15 +4554,16 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
             return Err(Refusal::Refused("A text story can't be empty.".into()));
         }
         let bg_color = u32::from_str_radix(bg_hex, 16).unwrap_or(0x0022_4488) | 0xff00_0000;
-        let (disabled, group_id, recipients) = {
+        let (group_id, recipients) = {
             let live = account.live();
             if live.stories_disabled {
-                (true, None, Vec::new())
-            } else if let Some(Peer::Group(gid)) = Peer::parse(target) {
-                (false, Some(gid), Vec::new())
+                return Err(Refusal::Refused("Stories are turned off.".into()));
+            }
+            if let Some(Peer::Group(gid)) = Peer::parse(target) {
+                (Some(gid), Vec::new())
             } else {
-                let all_contacts: Vec<String> = live.contacts.iter().cloned().collect();
-                let list = live
+                // No matching list: do not invent "My Story" with an empty blocklist. That sends to everyone.
+                let Some(list) = live
                     .story_lists
                     .iter()
                     .find(|l| {
@@ -4557,20 +4573,14 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
                                 && (l.id == "00000000000000000000000000000000" || l.name.eq_ignore_ascii_case("My Story"))
                     })
                     .cloned()
-                    .unwrap_or_else(|| wire::StoryDistributionList {
-                        id: "00000000000000000000000000000000".to_owned(),
-                        name: "My Story".to_owned(),
-                        recipients: Vec::new(),
-                        allows_replies,
-                        is_block_list: true,
-                    });
-                let resolved = wire::resolve_story_recipients(&list, &all_contacts, &live.blocked, &account.me);
-                (false, None, resolved)
+                else {
+                    return Err(Refusal::Refused("That story audience isn't on this account.".into()));
+                };
+                let accepted: Vec<String> = live.accepted.iter().cloned().collect();
+                let resolved = wire::resolve_story_recipients(&list, &accepted, &live.blocked, &account.me);
+                (None, resolved)
             }
         };
-        if disabled {
-            return Err(Refusal::Refused("Stories are turned off.".into()));
-        }
         if group_id.is_none() && recipients.is_empty() {
             return Err(Refusal::Refused("No recipients in this story audience.".into()));
         }
@@ -4582,6 +4592,7 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
             gradient_colors: Vec::new(),
             preview: None,
         };
+        let direct = group_id.is_none();
         let peer_anchor = match &group_id {
             Some(gid) => Peer::Group(gid.clone()),
             None => Peer::Direct(account.me.clone()),
@@ -4591,7 +4602,7 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
             .send(
                 &peer_anchor,
                 Body::PostStory {
-                    recipients,
+                    recipients: recipients.clone(),
                     group_id: group_id.clone(),
                     text: Some(story_text.clone()),
                     file: None,
@@ -4612,7 +4623,11 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
                 outgoing: true,
             },
         );
-        return Ok(wire::message_id(posted_ms, &account.me));
+        let id = wire::message_id(posted_ms, &account.me);
+        if let Some(held) = account.live().stories.get_mut(&id) {
+            held.audience = if direct { recipients } else { Vec::new() };
+        }
+        return Ok(id);
     }
     if let Some(arg) = raw.strip_prefix(STORY_TOGGLE) {
         let on = arg.trim().eq_ignore_ascii_case("on") || arg.trim() == "1" || arg.trim().eq_ignore_ascii_case("true");
@@ -5564,6 +5579,51 @@ fn typing(account: &Account, conversation: &str) {
         live.typed.insert(conversation.to_owned(), Instant::now());
     }
     let _ = account.wire.typing(&to, true);
+}
+
+/// A story still on this device: held, unexpired, and not from a blocked author or group.
+fn visible_story(account: &Account, id: &str) -> Option<HeldStory> {
+    let live = account.live();
+    let story = live.stories.get(id)?.clone();
+    if story.expires_at <= crate::hub::now() || live.blocked.contains(&story.author) {
+        return None;
+    }
+    if let Some(gid) = &story.group_id {
+        if live.blocked.contains(&Peer::Group(gid.clone()).conversation()) {
+            return None;
+        }
+    }
+    Some(story)
+}
+
+/// `Some(true)` when `by` may have seen our story sent at `sent_at`.
+/// `Some(false)` when that story is held but `by` is not in its audience or its group.
+/// `None` when this time is not one of our held stories (a voice note, for example).
+fn story_view_from(account: &Account, by: &str, sent_at: u64) -> Option<bool> {
+    let id = wire::message_id(sent_at, &account.me);
+    let live = account.live();
+    let story = live.stories.get(&id)?;
+    if story.expires_at <= crate::hub::now() || by.is_empty() || by == account.me {
+        return Some(false);
+    }
+    if let Some(gid) = &story.group_id {
+        let conv = Peer::Group(gid.clone()).conversation();
+        if live.blocked.contains(&conv) {
+            return Some(false);
+        }
+        return Some(live.groups.get(&conv).is_some_and(|members| members.iter().any(|id| id == by)));
+    }
+    Some(story.audience.iter().any(|aci| aci == by))
+}
+
+fn note_story_viewer(account: &Account, sent_at: u64, by: &str) {
+    let id = wire::message_id(sent_at, &account.me);
+    let mut live = account.live();
+    if let Some(story) = live.stories.get_mut(&id) {
+        if !story.viewed_by.iter().any(|seen| seen == by) {
+            story.viewed_by.push(by.to_owned());
+        }
+    }
 }
 
 /// One receipt for one of our messages. A direct chat's tick moves on that one receipt. A

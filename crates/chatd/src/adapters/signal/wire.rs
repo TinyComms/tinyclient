@@ -654,6 +654,13 @@ pub fn preview_url_in_body(body: &str, url: &str) -> bool {
     false
 }
 
+/// A story text preview is kept only for an `https://` URL that appears in the story text.
+/// `http://` is not enough: story fetches go through Signal's content proxy, which is https-only.
+pub fn story_preview_kept(body: &str, url: &str) -> bool {
+    let url = url.trim();
+    url.starts_with("https://") && preview_url_in_body(body, url)
+}
+
 /// One message's words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Text {
@@ -1504,6 +1511,10 @@ mod tests {
         assert!(!preview_url_in_body("No links here", "https://example.org/post"));
         assert!(!preview_url_in_body("javascript:alert(1)", "javascript:alert(1)"));
         assert!(!preview_url_in_body("anything", ""));
+        assert!(story_preview_kept("See https://example.org/post for details", "https://example.org/post"));
+        assert!(!story_preview_kept("See https://example.org/post for details", "https://evil.example.net/phish"));
+        assert!(!story_preview_kept("See http://example.org/post for details", "http://example.org/post"));
+        assert!(!story_preview_kept("No links here", "https://example.org/post"));
     }
 
     #[test]
