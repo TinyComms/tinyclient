@@ -2329,7 +2329,10 @@ impl World {
             return answer(tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters { tags_enabled: false, filters }));
         }
         if let Some(request) = asked::<f::messages::UpdateDialogFilter>(body) {
-            let folders = self.custom_folders.get_or_insert_with(|| vec![self.folder(WORK), self.folder(FAMILY)]);
+            if self.custom_folders.is_none() {
+                let defaults = vec![self.folder(WORK), self.folder(FAMILY)];
+                self.custom_folders = Some(defaults);
+            }
             let id_of = |f: &tl::enums::DialogFilter| match f {
                 tl::enums::DialogFilter::Filter(f) => Some(f.id),
                 tl::enums::DialogFilter::Chatlist(c) => Some(c.id),
@@ -2338,7 +2341,7 @@ impl World {
             match request.filter {
                 None => {
                     self.log(&format!("UpdateDialogFilter {} delete", request.id));
-                    folders.retain(|f| id_of(f) != Some(request.id));
+                    self.custom_folders.as_mut().unwrap().retain(|f| id_of(f) != Some(request.id));
                     return answer(true);
                 }
                 Some(filter) => {
@@ -2361,14 +2364,16 @@ impl World {
                     if empty_include {
                         return Err(rpc(400, "FILTER_INCLUDE_EMPTY", None));
                     }
-                    let existing = folders.iter().position(|f| id_of(f) == Some(request.id));
+                    let existing = self.custom_folders.as_ref().unwrap().iter().position(|f| id_of(f) == Some(request.id));
+                    let count = self.custom_folders.as_ref().unwrap().len();
                     let premium = std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1");
                     let limit = if premium { 30 } else { 10 };
-                    if existing.is_none() && folders.len() >= limit {
+                    if existing.is_none() && count >= limit {
                         self.log(&format!("UpdateDialogFilter {} refused FILTERS_TOO_MUCH", request.id));
                         return Err(rpc(400, "FILTERS_TOO_MUCH", None));
                     }
                     self.log(&format!("UpdateDialogFilter {} {}", request.id, title_text));
+                    let folders = self.custom_folders.as_mut().unwrap();
                     if let Some(pos) = existing {
                         folders[pos] = filter;
                     } else {
@@ -2383,7 +2388,11 @@ impl World {
                 "UpdateDialogFiltersOrder {}",
                 request.order.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
             ));
-            let folders = self.custom_folders.get_or_insert_with(|| vec![self.folder(WORK), self.folder(FAMILY)]);
+            if self.custom_folders.is_none() {
+                let defaults = vec![self.folder(WORK), self.folder(FAMILY)];
+                self.custom_folders = Some(defaults);
+            }
+            let folders = self.custom_folders.as_mut().unwrap();
             let id_of = |f: &tl::enums::DialogFilter| match f {
                 tl::enums::DialogFilter::Filter(f) => f.id,
                 tl::enums::DialogFilter::Chatlist(c) => c.id,

@@ -2951,8 +2951,8 @@ impl Chat {
                 }
             }
             Request::JumpToDate { conversation, date } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::JumpToDate {
                     conversation_id: conversation.id.clone(),
@@ -2968,8 +2968,8 @@ impl Chat {
                 }
             }
             Request::SearchCalendar { conversation, kind, offset_date } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::SearchCalendar {
                     conversation_id: conversation.id.clone(),
@@ -3120,8 +3120,8 @@ impl Chat {
                 }
             }
             Request::ScheduledMessages { conversation } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::ScheduledList {
                     conversation_id: conversation.id.clone(),
@@ -3132,8 +3132,8 @@ impl Chat {
                 }
             }
             Request::CancelScheduled { conversation, scheduled_id } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::CancelScheduled {
                     conversation_id: conversation.id.clone(),
@@ -3145,8 +3145,8 @@ impl Chat {
                 }
             }
             Request::SendScheduledNow { conversation, scheduled_id } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::SendScheduledNow {
                     conversation_id: conversation.id.clone(),
@@ -3158,8 +3158,8 @@ impl Chat {
                 }
             }
             Request::RescheduleMessage { conversation, scheduled_id, text, post_at } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::Reschedule {
                     conversation_id: conversation.id.clone(),
@@ -3538,6 +3538,9 @@ impl Chat {
                 if message_ids.is_empty() {
                     return Response::Ok;
                 }
+                if message_ids.len() > 1_000 {
+                    return error(ErrorCode::Invalid, "at most 1,000 messages may be deleted in one batch");
+                }
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {
                     return *refused;
@@ -3562,6 +3565,9 @@ impl Chat {
                 }
             }
             Request::DeleteParticipantHistory { conversation, person } => {
+                if person.account() != conversation.account() {
+                    return error(ErrorCode::Invalid, "person and conversation must belong to the same account");
+                }
                 self.act(&conversation, |conversation_id, reply| Command::DeleteParticipantHistory {
                     conversation_id,
                     person_id: person.id,
@@ -3569,6 +3575,12 @@ impl Chat {
                 })
             }
             Request::ReportSpamMessages { conversation, person, message_ids } => {
+                if person.account() != conversation.account() {
+                    return error(ErrorCode::Invalid, "person and conversation must belong to the same account");
+                }
+                if message_ids.len() > 1_000 {
+                    return error(ErrorCode::Invalid, "at most 1,000 messages may be reported in one batch");
+                }
                 self.act(&conversation, |conversation_id, reply| Command::ReportSpamMessages {
                     conversation_id,
                     person_id: person.id,

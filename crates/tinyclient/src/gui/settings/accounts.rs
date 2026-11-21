@@ -278,6 +278,8 @@ impl SettingsWindow {
                 if let Some(seconds) = loaded {
                     this.tg_default_ttl.insert(account, seconds);
                     cx.notify();
+                } else {
+                    this.tg_default_ttl_requested.remove(&account);
                 }
             });
         })
@@ -482,6 +484,8 @@ impl SettingsWindow {
                 if let Some(folders) = loaded {
                     this.tg_folders.insert(account, folders);
                     cx.notify();
+                } else {
+                    this.tg_folders_requested.remove(&account);
                 }
             });
         })
@@ -547,6 +551,11 @@ impl SettingsWindow {
             );
         }
         let acc_create = account.key.clone();
+        let name_input = self
+            .tg_folder_name
+            .entry(account.key.clone())
+            .or_insert_with(|| cx.new(|cx| crate::gui::input::TextInput::new("New folder name", cx)))
+            .clone();
         let create_row = div()
             .flex()
             .items_center()
@@ -562,17 +571,21 @@ impl SettingsWindow {
                     .border_color(theme::border())
                     .flex()
                     .items_center()
-                    .child(self.tg_folder_name.clone()),
+                    .child(name_input.clone()),
             )
             .child(button(("tg-folder-add", ix), ButtonKind::Secondary, "Create folder").on_click(cx.listener(
                 move |this, _, _, cx| {
-                    let name = this.tg_folder_name.read(cx).text().trim().to_owned();
+                    let name = this
+                        .tg_folder_name
+                        .get(&acc_create)
+                        .map(|input| input.read(cx).text().trim().to_owned())
+                        .unwrap_or_default();
                     if name.is_empty() {
-                        this.tg_folder_error = Some("Give the folder a name.".to_owned());
+                        this.tg_folder_error.insert(acc_create.clone(), "Give the folder a name.".to_owned());
                         cx.notify();
                         return;
                     }
-                    this.tg_folder_error = None;
+                    this.tg_folder_error.remove(&acc_create);
                     let spec = protocol::FolderSpec {
                         name,
                         contacts: true,
@@ -583,13 +596,19 @@ impl SettingsWindow {
                     let acc = acc_create.clone();
                     this.off_thread(cx, move || crate::client::ask(&req), move |this, answer, cx| {
                         match answer {
-                            Ok(protocol::Response::Error { detail, .. }) => this.tg_folder_error = Some(detail),
+                            Ok(protocol::Response::Error { detail, .. }) => {
+                                this.tg_folder_error.insert(acc, detail);
+                            }
                             Ok(_) => {
-                                this.tg_folder_name.update(cx, |input, cx| input.clear(cx));
+                                if let Some(input) = this.tg_folder_name.get(&acc).cloned() {
+                                    input.update(cx, |input, cx| input.clear(cx));
+                                }
                                 this.tg_folders_requested.remove(&acc);
                                 this.load_telegram_folders(acc, cx);
                             }
-                            Err(err) => this.tg_folder_error = Some(err.to_string()),
+                            Err(err) => {
+                                this.tg_folder_error.insert(acc, err.to_string());
+                            }
                         }
                         cx.notify();
                     });
@@ -605,7 +624,7 @@ impl SettingsWindow {
                 .child(div().type_ui().text_color(theme::text()).child("Chat folders"))
                 .child(list)
                 .child(create_row)
-                .children(self.tg_folder_error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone()))),
+                .children(self.tg_folder_error.get(&account.key).map(|err| div().type_small().text_color(theme::danger()).child(err.clone()))),
         )
     }
 

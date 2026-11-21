@@ -554,46 +554,86 @@ fn spec_from_filter(filter: &tl::enums::DialogFilter, me: i64) -> Option<protoco
     }
 }
 
+fn parse_folder_id(raw: &str) -> Result<i32, Fault> {
+    let id = raw
+        .parse::<i32>()
+        .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?;
+    if !(2..=255).contains(&id) {
+        return Err(Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None });
+    }
+    Ok(id)
+}
+
 /// Creates or edits a Telegram chat folder (`messages.updateDialogFilter`).
 pub(super) fn save_folder(account: &Account, spec: &protocol::FolderSpec) -> Result<protocol::Folder, Fault> {
     let name = spec.name.trim().to_owned();
     if name.is_empty() {
         return Err(Fault::Rpc { code: 400, name: "FILTER_TITLE_EMPTY".to_owned(), value: None });
     }
+    if name.chars().count() > 12 {
+        return Err(Fault::Rpc { code: 400, name: "FILTER_TITLE_TOO_LONG".to_owned(), value: None });
+    }
+    let any_kind = spec.contacts || spec.non_contacts || spec.groups || spec.broadcasts || spec.bots;
+    let any_peer = !spec.include.is_empty() || !spec.pinned.is_empty();
+    if !any_kind && !any_peer {
+        return Err(Fault::Rpc { code: 400, name: "FILTER_INCLUDE_EMPTY".to_owned(), value: None });
+    }
+    let editing = spec.id.is_some();
     let id = match &spec.id {
-        Some(raw) => raw
-            .parse::<i32>()
-            .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?,
+        Some(raw) => parse_folder_id(raw)?,
         None => {
             let live = account.live();
             let used: HashSet<i32> = live.filed.rules.iter().map(|r| r.id).collect();
-            (2..=255).find(|cand| !used.contains(cand)).unwrap_or(2)
+            (2..=255)
+                .find(|cand| !used.contains(cand))
+                .ok_or_else(|| Fault::Rpc { code: 400, name: "FILTERS_TOO_MUCH".to_owned(), value: None })?
         }
     };
     let include_peers = resolve_peers(account, &spec.include)?;
     let exclude_peers = resolve_peers(account, &spec.exclude)?;
     let pinned_peers = resolve_peers(account, &spec.pinned)?;
-    let filter = tl::enums::DialogFilter::Filter(tl::types::DialogFilter {
-        contacts: spec.contacts,
-        non_contacts: spec.non_contacts,
-        groups: spec.groups,
-        broadcasts: spec.broadcasts,
-        bots: spec.bots,
-        exclude_muted: spec.exclude_muted,
-        exclude_read: spec.exclude_read,
-        exclude_archived: spec.exclude_archived,
-        title_noanimate: false,
-        id,
-        title: tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
-            text: name.clone(),
-            entities: Vec::new(),
-        }),
-        emoticon: spec.emoticon.clone(),
-        color: None,
-        pinned_peers,
-        include_peers,
-        exclude_peers,
+    let title_entities = tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+        text: name.clone(),
+        entities: Vec::new(),
     });
+    // Preserve shared Chatlist metadata when editing an existing DialogFilterChatlist.
+    let existing_chatlist = if editing {
+        match account.ask(&tl::functions::messages::GetDialogFilters {}) {
+            Ok(tl::enums::messages::DialogFilters::Filters(found)) => found.filters.into_iter().find_map(|f| match f {
+                tl::enums::DialogFilter::Chatlist(c) if c.id == id => Some(c),
+                _ => None,
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let filter = if let Some(mut chatlist) = existing_chatlist {
+        chatlist.title = title_entities;
+        chatlist.emoticon = spec.emoticon.clone();
+        chatlist.pinned_peers = pinned_peers;
+        chatlist.include_peers = include_peers;
+        tl::enums::DialogFilter::Chatlist(chatlist)
+    } else {
+        tl::enums::DialogFilter::Filter(tl::types::DialogFilter {
+            contacts: spec.contacts,
+            non_contacts: spec.non_contacts,
+            groups: spec.groups,
+            broadcasts: spec.broadcasts,
+            bots: spec.bots,
+            exclude_muted: spec.exclude_muted,
+            exclude_read: spec.exclude_read,
+            exclude_archived: spec.exclude_archived,
+            title_noanimate: false,
+            id,
+            title: title_entities,
+            emoticon: spec.emoticon.clone(),
+            color: None,
+            pinned_peers,
+            include_peers,
+            exclude_peers,
+        })
+    };
     account.ask(&tl::functions::messages::UpdateDialogFilter { id, filter: Some(filter.clone()) })?;
     let position = {
         let mut live = account.live();
@@ -624,9 +664,7 @@ pub(super) fn save_folder(account: &Account, spec: &protocol::FolderSpec) -> Res
 
 /// Deletes a Telegram chat folder (`messages.updateDialogFilter` with `filter: None`).
 pub(super) fn delete_folder(account: &Account, folder_id: &str) -> Result<(), Fault> {
-    let id: i32 = folder_id
-        .parse()
-        .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?;
+    let id = parse_folder_id(folder_id)?;
     account.ask(&tl::functions::messages::UpdateDialogFilter { id, filter: None })?;
     {
         let mut live = account.live();
@@ -641,10 +679,7 @@ pub(super) fn delete_folder(account: &Account, folder_id: &str) -> Result<(), Fa
 pub(super) fn reorder_folders(account: &Account, order: &[String]) -> Result<(), Fault> {
     let mut ids = Vec::with_capacity(order.len());
     for raw in order {
-        let id: i32 = raw
-            .parse()
-            .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?;
-        ids.push(id);
+        ids.push(parse_folder_id(raw)?);
     }
     account.ask(&tl::functions::messages::UpdateDialogFiltersOrder { order: ids.clone() })?;
     {

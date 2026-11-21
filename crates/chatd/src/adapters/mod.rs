@@ -1644,6 +1644,24 @@ impl Context {
         Ok(())
     }
 
+    /// Drops cached messages sent by `sender_id` in `conversation_id` (and its child forum topics).
+    pub fn clear_sender_messages(&self, conversation_id: &str, sender_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        let affected = self.hub.store().clear_sender_messages(&conversation, sender_id)?;
+        for conv_id in affected {
+            let key = self.key(&conv_id);
+            self.hub.changed(Change::Messages { conversation: key.clone() });
+            self.hub.changed(Change::Conversation { conversation: key });
+        }
+        Ok(())
+    }
+
+    /// Cached pinned topics of a forum conversation.
+    pub fn pinned_topics(&self, forum_id: &str) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        let (rows, _) = self.hub.store().topics(&self.key(forum_id), 0, 200)?;
+        Ok(rows.into_iter().filter(|c| c.pin.is_some()).collect())
+    }
+
     /// Drops the cached messages of a conversation while keeping its row.
     pub fn clear_messages(&self, conversation_id: &str) -> Stores {
         let conversation = self.key(conversation_id);

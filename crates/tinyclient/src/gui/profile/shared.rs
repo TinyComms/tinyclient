@@ -155,7 +155,12 @@ impl Shared {
         self.ask(false, entity, cx, held);
         // Where the network counts it all, every tab's count is asked with the open one.
         if let Some(conversation) = self.conversation.clone().filter(|key| whole_at_open(key.network)) {
-            for kind in [SharedKind::Files, SharedKind::Links] {
+            let kinds: &[SharedKind] = if conversation.network == Network::Telegram {
+                &[SharedKind::Files, SharedKind::Links, SharedKind::Music, SharedKind::Voice, SharedKind::Gifs]
+            } else {
+                &[SharedKind::Files, SharedKind::Links]
+            };
+            for &kind in kinds {
                 self.count(conversation.clone(), kind, entity, cx, held);
             }
         }

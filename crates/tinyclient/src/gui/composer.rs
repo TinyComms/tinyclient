@@ -278,6 +278,7 @@ struct Target {
     /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
     blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
+    bot: bool,
     /// What the account may send.
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
@@ -3540,7 +3541,7 @@ impl Composer {
                     schedule::when_online_for(
                         t.key.network,
                         t.kind,
-                        t.special == protocol::Special::Saved,
+                        t.special != protocol::Special::None || t.bot,
                         false,
                     )
                 });
@@ -4005,6 +4006,7 @@ impl Shell {
             joined: open.joined,
             blocked_peer,
             special: open.special,
+            bot: open.bot,
             can,
             send_as: self.send_as_of(&open.key),
         };
@@ -4036,6 +4038,7 @@ impl Shell {
             joined: true,
             blocked_peer: None,
             special: protocol::Special::None,
+            bot: false,
             can: self.can_of(thread),
             send_as: self.send_as_of(thread),
         };
@@ -4646,6 +4649,7 @@ mod tests {
             read_only_reason: String::new(),
             blocked_peer: None,
             special: protocol::Special::None,
+            bot: false,
             joined: true,
             can: Capabilities::default(),
             send_as: Vec::new(),

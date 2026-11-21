@@ -210,11 +210,18 @@ fn chat_photo(photo: &tl::enums::ChatPhoto) -> (i64, i32) {
     }
 }
 
+/// Whether a specific ban flag in `rights` is currently active (`until_date == 0` never expires).
+fn banned_active(rights: Option<&tl::enums::ChatBannedRights>, check: impl Fn(&tl::types::ChatBannedRights) -> bool) -> bool {
+    let Some(tl::enums::ChatBannedRights::Rights(rights)) = rights else {
+        return false;
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|age| age.as_secs()).unwrap_or(0);
+    check(rights) && (rights.until_date == 0 || u64::try_from(rights.until_date).unwrap_or(0) > now)
+}
+
 /// `send_messages` is on, and the ban has not expired. `until_date` of 0 does not expire.
 fn send_banned(rights: &tl::enums::ChatBannedRights) -> bool {
-    let tl::enums::ChatBannedRights::Rights(rights) = rights;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|age| age.as_secs()).unwrap_or(0);
-    rights.send_messages && (rights.until_date == 0 || u64::try_from(rights.until_date).unwrap_or(0) > now)
+    banned_active(Some(rights), |r| r.send_messages)
 }
 
 /// A member cannot post. The creator always can. A personal ban stops that one member. The
@@ -284,13 +291,8 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 &channel.banned_rights,
                 Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
             );
-            let topics_banned = matches!(
-                &channel.default_banned_rights,
-                Some(tl::enums::ChatBannedRights::Rights(r)) if r.manage_topics
-            ) || matches!(
-                &channel.banned_rights,
-                Some(tl::enums::ChatBannedRights::Rights(r)) if r.manage_topics
-            );
+            let topics_banned = banned_active(channel.default_banned_rights.as_ref(), |r| r.manage_topics)
+                || banned_active(channel.banned_rights.as_ref(), |r| r.manage_topics);
             let active = !channel.left;
             let rights = protocol::ConversationRights {
                 pin: active
