@@ -32,9 +32,9 @@ use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    canvas, div, prelude::*, px, Action, AnyElement, App, Bounds, Context, Div, Entity, FontWeight,
-    Global, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Rgba, SharedString,
-    Stateful, Svg, Task, WeakEntity, Window,
+    canvas, div, prelude::*, px, Action, AnyElement, App, Bounds, ClickEvent, Context, Div, Entity,
+    FontWeight, Global, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Pixels, Rgba, SharedString, Stateful, Svg, Task, WeakEntity, Window,
 };
 use protocol::settings::MUTED_TALK;
 use protocol::{
@@ -738,6 +738,30 @@ fn call_go_target(key: &Key, is_tiny_room: bool) -> CallGoTarget {
     }
 }
 
+/// Keyboard action on a participant row in the call card's participant list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKeyAction {
+    Profile,
+    Menu,
+}
+
+fn call_row_key_action(key: &str, shift: bool, other_mod: bool) -> Option<RowKeyAction> {
+    if !shift && !other_mod && key == "enter" {
+        Some(RowKeyAction::Profile)
+    } else if (!other_mod && key == "contextmenu") || (shift && !other_mod && key == "f10") {
+        Some(RowKeyAction::Menu)
+    } else {
+        None
+    }
+}
+
+/// Number of joined people in a call (me plus every participant who is not still ringing).
+pub(super) fn call_people_count(call: &Call) -> usize {
+    call.participants.iter().filter(|p| !p.ringing).count() + 1
+}
+
+/// The call's popover menu for a participant: volume slider, local mute, Message, Profile, and
+/// room moderation when the user has permission on a Tiny server.
 impl Shell {
     /// The speaker chosen (V2), in the call's menu or in Settings, which a voice message plays
     /// through too. `None` is the automatic choice.
@@ -1131,14 +1155,103 @@ impl Shell {
     }
 
     pub(super) fn call_person_menu(&self, account: AccountKey, user_id: &str, name: &str, cx: &mut Context<Self>) -> Div {
-        div()
+        let person_key = Key::new(&account, user_id);
+        let msg_person = protocol::Person::new(person_key.clone(), name.to_owned());
+        let profile_key = person_key.clone();
+        let mut items = div()
             .flex()
             .flex_col()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
             .child(menu_label(name.to_owned()))
             .child(menu_separator().mx(px(8.)))
-            .child(self.call_volume_controls(account, user_id, cx))
+            .child(self.call_volume_controls(account.clone(), user_id, cx))
+            .child(menu_separator().mx(px(8.)))
+            .child(
+                menu_item(
+                    SharedString::from(format!("call-person-message-{user_id}")),
+                    Some("icons/message-square.svg"),
+                    "Message",
+                    None,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_close(cx);
+                    this.open_person(&msg_person, cx);
+                })),
+            )
+            .child(
+                menu_item(
+                    SharedString::from(format!("call-person-profile-{user_id}")),
+                    Some("icons/user.svg"),
+                    "Profile",
+                    None,
+                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_close(cx);
+                    this.open_profile(profile_key.clone(), event.position(), cx);
+                })),
+            );
+        if account.network == Network::Tiny {
+            if let Some(page) = self.tiny_page_facts().filter(|page| page.account == &account) {
+                let facts = super::tiny::model::person_menu(page.community, user_id);
+                if facts.server_mute.is_some() || facts.server_deafen.is_some() || facts.disconnect {
+                    items = items.child(menu_separator().mx(px(8.))).child(menu_label("Moderation"));
+                    if let Some(on) = facts.server_mute {
+                        let id = user_id.to_owned();
+                        let words = super::tiny::model::server_mute_words(on);
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("call-person-server-mute-{user_id}")),
+                                Some(words.icon),
+                                words.label,
+                                None,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.tiny_moderate(id.clone(), Some(!on), None, cx);
+                            })),
+                        );
+                    }
+                    if let Some(on) = facts.server_deafen {
+                        let id = user_id.to_owned();
+                        let words = super::tiny::model::server_deafen_words(on);
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("call-person-server-deafen-{user_id}")),
+                                Some(words.icon),
+                                words.label,
+                                None,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.tiny_moderate(id.clone(), None, Some(!on), cx);
+                            })),
+                        );
+                    }
+                    if facts.disconnect {
+                        let id = user_id.to_owned();
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("call-person-disconnect-{user_id}")),
+                                Some("icons/phone-off.svg"),
+                                "Disconnect from call",
+                                None,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.tiny_disconnect(id.clone(), cx);
+                            })),
+                        );
+                    }
+                }
+            }
+        }
+        items
     }
 
     /// Picture path for a call participant: their avatar reference when present (queued once
@@ -1163,7 +1276,7 @@ impl Shell {
         let account = call.conversation.account();
         let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
         people.sort_by_key(|who| (who.ringing, who.name.to_lowercase()));
-        let joined_count = people.iter().filter(|p| !p.ringing).count() + 1;
+        let joined_count = call_people_count(call);
         let noun = if joined_count == 1 { "PERSON" } else { "PEOPLE" };
         let own = super::components::Avatar::named("You", 22.).build();
         let heard = call.speaking && !call.muted && !call.deafened;
@@ -1245,32 +1358,109 @@ impl Shell {
             let menu_account = account.clone();
             let menu_id = who.id.clone();
             let menu_name = who.name.clone();
-            let open_person = move |this: &mut Shell, cx: &mut Context<Shell>| {
+            let open_menu = move |this: &mut Shell, cx: &mut Context<Shell>| {
                 cx.stop_propagation();
                 this.call_menu_set(Some(Menu::Person { account: menu_account.clone(), user_id: menu_id.clone(), name: menu_name.clone() }), cx);
             };
-            let open_click = open_person.clone();
+            let open_menu_more = open_menu.clone();
+            let open_menu_key = open_menu.clone();
+            let profile_key = key.clone();
+            let key_enter = key.clone();
+            let row_group: SharedString = format!("call-person-row-{}", who.id).into();
+            let watch_btn = who.sharing.then(|| {
+                let watch_id = who.id.clone();
+                let watch_call = call.conversation.clone();
+                let watch_title = subject.title.clone();
+                div()
+                    .id(SharedString::from(format!("call-person-watch-{}", who.id)))
+                    .flex_none()
+                    .size(px(22.))
+                    .rounded(px(5.))
+                    .bg(theme::accent_soft())
+                    .hover(|s| s.bg(theme::accent_wash()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .tooltip(tip(format!("Watch {}'s screen", who.name), None))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_menu_close(cx);
+                        this.call_watch(watch_id.clone(), cx);
+                        this.call_state.focus = Some(stage::Focus::Stream(watch_id.clone()));
+                        this.call_go(watch_call.clone(), &watch_title, cx);
+                    }))
+                    .child(glyph("icons/monitor-up.svg", 13., theme::accent()))
+            });
+            let camera_glyph = who.camera.then(|| {
+                div()
+                    .id(SharedString::from(format!("call-person-camera-{}", who.id)))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .tooltip(tip("Camera on", None))
+                    .child(glyph("icons/video.svg", 13., theme::text_soft()))
+            });
+            let more_btn = div()
+                .id(SharedString::from(format!("call-person-more-{}", who.id)))
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(5.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(0.)
+                .group_hover(row_group.clone(), |s| s.opacity(1.))
+                .hover(|s| s.bg(theme::selected()))
+                .cursor_pointer()
+                .tooltip(tip("Volume and more", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| open_menu_more(this, cx)))
+                .child(glyph("icons/ellipsis.svg", 13., theme::text_soft()));
             rows.push(
                 div()
-                    .id(SharedString::from(format!("call-person-row-{}", who.id)))
+                    .id(row_group.clone())
+                    .group(row_group)
                     .w_full()
                     .h(px(32.))
                     .flex_none()
                     .pl(px(12.))
-                    .pr(px(10.))
+                    .pr(px(8.))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(px(8.))
                     .cursor_pointer()
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring()))
                     .hover(|s| s.bg(theme::hover()))
                     .text_size(px(13.))
                     .text_color(if who.speaking { theme::text() } else { theme::text_soft() })
-                    .tooltip(tip("Adjust volume", None))
-                    .on_click(cx.listener(move |this, _, _, cx| open_click(this, cx)))
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| open_person(this, cx)))
+                    .tooltip(tip("Open profile", None))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.call_menu_close(cx);
+                        this.open_profile(profile_key.clone(), event.position(), cx);
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| open_menu(this, cx)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        let mods = event.keystroke.modifiers;
+                        let other = mods.control || mods.alt || mods.platform || mods.function;
+                        match call_row_key_action(event.keystroke.key.as_str(), mods.shift, other) {
+                            Some(RowKeyAction::Profile) => {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.show_info(key_enter.clone(), cx);
+                            }
+                            Some(RowKeyAction::Menu) => open_menu_key(this, cx),
+                            None => {}
+                        }
+                    }))
                     .child(ringed(avatar, 22., who.speaking))
                     .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
                     .children(gain_tag.map(|tag| div().flex_none().type_micro().text_color(if muted { theme::warning() } else { theme::text_faint() }).child(tag)))
+                    .children(watch_btn)
+                    .children(camera_glyph)
                     .when(who.server_muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::danger())))
                     .when(!who.server_muted && who.suppressed, |r| r.child(glyph("icons/mic-off.svg", 13., theme::warning())))
                     .when(!who.server_muted && !who.suppressed && who.muted && !who.deafened && !who.server_deafened, |r| {
@@ -1278,6 +1468,7 @@ impl Shell {
                     })
                     .when(who.server_deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::danger())))
                     .when(!who.server_deafened && who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
+                    .child(more_btn)
                     .into_any_element(),
             );
         }
@@ -2525,5 +2716,28 @@ mod tests {
         call.participants[0].camera = false;
         call.participants[1].camera = false;
         assert_eq!(discord_speaker_step(&call, None, Some(("u1", t0)), t0 + Duration::from_secs(2)), Some(None));
+    }
+
+    #[test]
+    fn call_people_count_includes_me_and_excludes_ringing() {
+        let mut call = bare_call(key("lounge"), CallState::Joined, false, false);
+        assert_eq!(call_people_count(&call), 1);
+        call.participants = vec![
+            protocol::Participant { id: "u1".into(), name: "Ada".into(), ringing: false, ..Default::default() },
+            protocol::Participant { id: "u2".into(), name: "Bea".into(), ringing: true, ..Default::default() },
+            protocol::Participant { id: "u3".into(), name: "Cam".into(), ringing: false, ..Default::default() },
+        ];
+        assert_eq!(call_people_count(&call), 3);
+    }
+
+    #[test]
+    fn participant_row_keyboard_shortcuts_map_enter_and_context_menu() {
+        assert_eq!(call_row_key_action("enter", false, false), Some(RowKeyAction::Profile));
+        assert_eq!(call_row_key_action("enter", true, false), None);
+        assert_eq!(call_row_key_action("contextmenu", false, false), Some(RowKeyAction::Menu));
+        assert_eq!(call_row_key_action("f10", true, false), Some(RowKeyAction::Menu));
+        assert_eq!(call_row_key_action("f10", false, false), None);
+        assert_eq!(call_row_key_action("f10", true, true), None);
+        assert_eq!(call_row_key_action("space", false, false), None);
     }
 }

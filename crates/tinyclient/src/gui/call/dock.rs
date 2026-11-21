@@ -750,13 +750,43 @@ impl Shell {
                     .text_color(if notice.is_some() { theme::warning() } else { theme::text_soft() })
                     .child(notice.unwrap_or(place)),
             );
+        let people_chip = in_call(call).then(|| {
+            let count = super::call_people_count(call);
+            let open = self.call_menu() == Some(Menu::People);
+            let fg = if open { theme::text() } else { theme::text_soft() };
+            div()
+                .id("call-compact-people")
+                .flex_none()
+                .h(px(24.))
+                .px(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(if open { theme::selected() } else { theme::hover() })
+                .hover(|style| style.bg(theme::selected()).text_color(theme::text()))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .cursor_pointer()
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(fg)
+                .tooltip(tip("People in this call", None))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::People, cx);
+                }))
+                .child(glyph("icons/users.svg", 12., fg))
+                .child(count.to_string())
+        });
         let disconnect = leave()
             .w(px(36.))
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.call_leave(cx);
             }));
-        // The name takes the card's width. Signal, lock and Leave sit on the row above it,
+        // The name takes the card's width. Signal, lock, people and Leave sit on the row above it,
         // and wrap under it when the column is the narrowest sidebar.
         card()
             .id("call-compact-card")
@@ -774,9 +804,62 @@ impl Shell {
                     .gap(px(8.))
                     .children(self.call_signal(call, cx))
                     .children(self.call_security(call, Place::TinyBar, cx))
+                    .children(people_chip)
                     .child(disconnect.ml_auto()),
             )
             .child(words)
+            .children(self.call_popover(call, subject, Place::TinyBar, cx))
+    }
+
+    /// The popover hung above the call dock card or the compact voice bar.
+    fn call_popover(
+        &self,
+        call: &Call,
+        subject: &Subject,
+        place: Place,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let joined = call.state == CallState::Joined;
+        let enabled = call.state != CallState::Reconnecting;
+        let menu = self.call_menu().filter(|_| enabled)?;
+        let (width, body) = match (place, menu) {
+            (Place::Dock, Menu::Devices) => (300., self.call_devices_menu(call, cx).p(px(6.))),
+            (Place::Dock, Menu::CameraPreview) if joined => {
+                (284., self.call_camera_preview_menu(call, cx).p(px(8.)))
+            }
+            (_, Menu::People) if joined => (280., self.call_people_list(call, subject, cx).py(px(6.))),
+            (Place::Dock, Menu::AddPeople) if joined => (280., self.call_add_people_menu(call, cx).p(px(6.))),
+            (Place::Dock, Menu::Security) if self.call_security_open(Place::Dock) => {
+                (320., div().child(self.call_security_panel(call, cx)))
+            }
+            (_, Menu::Person { account, user_id, name }) if joined => {
+                (260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.)))
+            }
+            _ => return None,
+        };
+        // Above the card, level with its left edge, on top of whatever the list shows.
+        // The card is as tall as its rows, so the popover hangs off the top of it.
+        Some(
+            deferred(
+                div()
+                    .id("call-popover")
+                    .absolute()
+                    .left(px(-1.))
+                    .bottom(relative(1.))
+                    .pb(px(6.))
+                    .w(px(width))
+                    .rounded(px(12.))
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow(theme::shadow_popover())
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+                    .child(body),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
     }
 
     /// Who or where, then the server or notice on its own line, then signal, lock and who else
@@ -1161,19 +1244,6 @@ impl Shell {
                     })),
             );
 
-        let popover = match menu {
-            Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
-            Some(Menu::CameraPreview) if joined => Some((284., self.call_camera_preview_menu(call, cx).p(px(8.)))),
-            Some(Menu::People) if joined => Some((280., self.call_people_list(call, subject, cx).py(px(6.)))),
-            Some(Menu::AddPeople) if joined => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
-            Some(Menu::Security) if self.call_security_open(Place::Dock) => {
-                Some((320., div().child(self.call_security_panel(call, cx))))
-            }
-            Some(Menu::Person { account, user_id, name }) if joined => {
-                Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
-            }
-            _ => None,
-        };
         let card_key = call.conversation.clone();
         let card_title = subject.title.clone();
         card()
@@ -1187,28 +1257,7 @@ impl Shell {
             )
             .child(self.call_title(call, subject, words, cx))
             .child(controls)
-            .children(popover.map(|(width, body)| {
-                // Above the card, level with its left edge, on top of whatever the list shows.
-                // The card is as tall as its rows, so the popover hangs off the top of it.
-                deferred(
-                    div()
-                        .id("call-popover")
-                        .absolute()
-                        .left(px(-1.))
-                        .bottom(relative(1.))
-                        .pb(px(6.))
-                        .w(px(width))
-                        .rounded(px(12.))
-                        .bg(theme::overlay())
-                        .border_1()
-                        .border_color(theme::border())
-                        .shadow(theme::shadow_popover())
-                        .occlude()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                        .child(body),
-                )
-                .priority(1)
-            }))
+            .children(self.call_popover(call, subject, Place::Dock, cx))
     }
 
     /// Someone is calling: the same card with a `positive` edge and two equal buttons. It holds

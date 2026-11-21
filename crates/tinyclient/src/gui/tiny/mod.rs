@@ -1470,7 +1470,7 @@ impl Shell {
 
     // What the menus and modals send.
 
-    pub(super) fn tiny_moderate(&mut self, user_id: String, muted: Option<bool>, deafened: Option<bool>, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn tiny_moderate(&mut self, user_id: String, muted: Option<bool>, deafened: Option<bool>, cx: &mut Context<Self>) {
         if self.tiny_state.busy {
             return;
         }
@@ -1498,7 +1498,7 @@ impl Shell {
         self.act(Request::TinyCallMove { account, user_id, room_id }, cx);
     }
 
-    pub(super) fn tiny_disconnect(&mut self, user_id: String, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn tiny_disconnect(&mut self, user_id: String, cx: &mut Context<Self>) {
         let Some(account) = self.with_account() else {
             return;
         };
