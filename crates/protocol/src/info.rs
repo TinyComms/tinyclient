@@ -667,6 +667,12 @@ pub struct Capabilities {
     /// This account supports saving and removing GIFs in the saved GIFs collection (`Request::SaveGif`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub save_gif: bool,
+    /// This account supports pausing notifications for a duration (`SetPresence { presence: Dnd, clear_at: Some(..) }` -> `dnd.setSnooze` / `dnd.endSnooze`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dnd_snooze: bool,
+    /// This account supports following and unfollowing threads (`Request::FollowThread`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follow_threads: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
@@ -703,6 +709,19 @@ pub struct BrowsedChannel {
     pub private: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
+}
+
+/// One pending scheduled message returned by [`crate::Request::ScheduledMessages`] or
+/// [`crate::Request::RescheduleMessage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledMessage {
+    pub id: String,
+    pub conversation: Key,
+    #[serde(default)]
+    pub text: String,
+    pub post_at: i64,
+    #[serde(default)]
+    pub created: i64,
 }
 
 /// What kind of event an [`ActivityItem`] represents.

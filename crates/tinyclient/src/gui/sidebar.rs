@@ -668,7 +668,8 @@ impl Shell {
             Mode::Network(Network::Slack) => match self.slack_space() {
                 Some(space) => {
                     let threads = self.threads_row(&space);
-                    threads.into_iter().chain(flat(&space, 0)).collect()
+                    let drafts = self.drafts_row(&space);
+                    threads.into_iter().chain(drafts).chain(flat(&space, 0)).collect()
                 }
                 None => Vec::new(),
             },
@@ -988,6 +989,7 @@ impl Shell {
             Row::Conversation { conversation, .. } => self.pick_row(&conversation, cx),
             Row::Group { space, id, collapsed, .. } => self.collapse(space, id, !collapsed, cx),
             Row::Threads { space, .. } => self.drill(home::Drill::Threads(space), cx),
+            Row::Drafts { space, .. } => self.drill(home::Drill::Drafts(space), cx),
             Row::Fold { reveal, .. } => {
                 let space = match &self.sidebar_state.mode {
                     Mode::Space(space) => Some(space.clone()),
@@ -1393,6 +1395,11 @@ impl Shell {
                 self.action_row(("threads", ix), Some("icons/messages-square.svg"), "Threads".into(), *count > 0, trailing, focused)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
+            Row::Drafts { count, .. } => {
+                let trailing = (*count > 0).then(|| super::components::badge_count_unread(*count));
+                self.action_row(("drafts", ix), Some("icons/pencil.svg"), "Drafts & sent".into(), false, trailing, focused)
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+            }
             Row::Fold { words, depth, .. } => {
                 let content = div()
                     .children(indent(*depth, 8.))
@@ -1727,13 +1734,14 @@ impl Shell {
         if let Some(drill) = &self.sidebar_state.drill {
             let title = match drill {
                 home::Drill::Threads(_) => "Threads".to_owned(),
+                home::Drill::Drafts(_) => "Drafts & sent".to_owned(),
                 home::Drill::Archive => "Archive".to_owned(),
                 home::Drill::Calls => "Calls".to_owned(),
                 home::Drill::Requests => "Message requests".to_owned(),
                 home::Drill::Topics(forum) => forum.title.clone(),
             };
             let place = match drill {
-                home::Drill::Threads(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
+                home::Drill::Threads(space) | home::Drill::Drafts(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
                 _ => None,
             };
             return strip
