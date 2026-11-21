@@ -886,6 +886,16 @@ pub struct SearchFilters {
     pub mentions_me: bool,
 }
 
+/// One calendar day with matching messages (`Request::SearchCalendar` / Telegram `messages.getSearchResultsCalendar`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchCalendarDay {
+    /// Unix timestamp for the day.
+    pub date: i64,
+    pub min_message_id: String,
+    pub max_message_id: String,
+    pub count: u32,
+}
+
 impl SearchFilters {
     pub fn is_empty(&self) -> bool {
         *self == SearchFilters::default()

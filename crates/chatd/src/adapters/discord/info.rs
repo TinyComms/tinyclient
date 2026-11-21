@@ -81,8 +81,16 @@ pub(super) fn shared_items(message: &Message, kind: SharedKind) -> Vec<SharedIte
     };
     let pictured = |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Video | MediaKind::Gif);
     match kind {
-        SharedKind::Media | SharedKind::Files => {
-            let wanted = message.attachments.iter().filter(|attachment| !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media));
+        SharedKind::Media | SharedKind::Files | SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => {
+            let wanted = message.attachments.iter().filter(|attachment| {
+                !attachment.sticker && match kind {
+                    SharedKind::Media => pictured(attachment.file.kind),
+                    SharedKind::Gifs => attachment.file.kind == MediaKind::Gif,
+                    SharedKind::Voice => attachment.voice,
+                    SharedKind::Music => attachment.file.kind == MediaKind::Audio && !attachment.voice,
+                    _ => !pictured(attachment.file.kind),
+                }
+            });
             wanted.map(|attachment| item(Some(attachment.clone()), "", "")).collect()
         }
         SharedKind::Links => {
@@ -356,7 +364,8 @@ impl Discord {
         let guild = self.guild_of(&known);
         let has = match kind {
             SharedKind::Media => "has=image&has=video",
-            SharedKind::Files => "has=file",
+            SharedKind::Files | SharedKind::Music | SharedKind::Voice => "has=file",
+            SharedKind::Gifs => "has=image",
             SharedKind::Links => "has=link",
         };
         let wanted = limit.clamp(1, SEARCH_PAGE);
@@ -393,11 +402,11 @@ impl Discord {
         query: String,
         scope: SearchScope,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<crate::adapters::SearchPage>,
     ) {
         let searching = discord.clone();
         let run = move || {
-            let _ = reply.send(searching.search_messages(&query, &scope, at));
+            let _ = reply.send(searching.search_messages(&query, &scope, at).map(Into::into));
         };
         if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
             tracing::warn!("chatd: Discord: no thread for a search: {err}");

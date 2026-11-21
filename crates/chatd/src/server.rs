@@ -2865,7 +2865,7 @@ impl Chat {
                 match found {
                     Ok(hits) => {
                         let hits: Vec<_> = hits.into_iter().filter(|hit| self.shows(&hit.conversation.account())).collect();
-                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new() }
+                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new(), total: None }
                     }
                     Err(err) => internal(err),
                 }
@@ -2873,7 +2873,7 @@ impl Chat {
             Request::SearchNetwork { conversation, space, account, network, query, filters, cursor } => {
                 let query = query.trim().to_owned();
                 if query.is_empty() && filters.is_empty() {
-                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() }
+                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: Some(0) }
                 } else if conversation.is_some() || space.is_some() {
                     let (target_account, scope) = match (&conversation, &space) {
                         (Some(key), _) => (key.account(), SearchScope::Conversation(key.id.clone())),
@@ -2881,7 +2881,7 @@ impl Chat {
                         (None, None) => unreachable!(),
                     };
                     if !self.shows(&target_account) {
-                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() };
+                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: Some(0) };
                     }
                     match self.ask(&target_account, |reply| Command::Search {
                         query,
@@ -2891,7 +2891,12 @@ impl Chat {
                         at: std::time::Instant::now(),
                         reply,
                     }) {
-                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
+                        Ok(page) => Response::MessageHits {
+                            hits: page.hits,
+                            cursor: page.cursor,
+                            not_searched: Vec::new(),
+                            total: page.total,
+                        },
                         Err(refused) => *refused,
                     }
                 } else {
@@ -2916,7 +2921,7 @@ impl Chat {
                     for acct in accounts {
                         let can = self.hub.capabilities(&acct);
                         if self.hub.link(&acct) == Link::Connected && can.search_global {
-                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
+                            if let Ok(page) = self.ask(&acct, |reply| Command::Search {
                                 query: query.clone(),
                                 scope: SearchScope::Account,
                                 filters: filters.clone(),
@@ -2927,7 +2932,7 @@ impl Chat {
                                 if !asked_networks.contains(&acct.network) {
                                     asked_networks.push(acct.network);
                                 }
-                                merged.extend(hits);
+                                merged.extend(page.hits);
                                 continue;
                             }
                         }
@@ -2939,9 +2944,41 @@ impl Chat {
                     merged.sort_by(|a, b| b.sent.cmp(&a.sent).then_with(|| b.message_id.cmp(&a.message_id)));
                     let mut seen = std::collections::HashSet::new();
                     merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
+                    let total = Some(merged.len() as u32);
                     let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
                     let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
-                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
+                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched, total }
+                }
+            }
+            Request::JumpToDate { conversation, date } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::JumpToDate {
+                    conversation_id: conversation.id.clone(),
+                    date,
+                    reply,
+                }) {
+                    Ok(message_id) => Response::Resolved {
+                        conversation: Some(conversation),
+                        message_id,
+                        error: String::new(),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SearchCalendar { conversation, kind, offset_date } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::SearchCalendar {
+                    conversation_id: conversation.id.clone(),
+                    kind,
+                    offset_date,
+                    reply,
+                }) {
+                    Ok(days) => Response::SearchCalendar { days },
+                    Err(refused) => *refused,
                 }
             }
             Request::SetDraft { conversation, text } => {

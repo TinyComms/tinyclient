@@ -509,18 +509,51 @@ pub(super) fn clear_history(account: &Account, conversation: &str, delete_chat: 
     Ok(())
 }
 
-fn search(account: &Account, conversation: &str, query: &str, filter: tl::enums::MessagesFilter, offset_id: i32, limit: i32) -> Result<(Vec<Message>, Option<u32>), Fault> {
+fn shared_filter(kind: SharedKind) -> tl::enums::MessagesFilter {
+    match kind {
+        SharedKind::Media => tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo,
+        SharedKind::Files => tl::enums::MessagesFilter::InputMessagesFilterDocument,
+        SharedKind::Links => tl::enums::MessagesFilter::InputMessagesFilterUrl,
+        SharedKind::Music => tl::enums::MessagesFilter::InputMessagesFilterMusic,
+        SharedKind::Voice => tl::enums::MessagesFilter::InputMessagesFilterRoundVoice,
+        SharedKind::Gifs => tl::enums::MessagesFilter::InputMessagesFilterGif,
+    }
+}
+
+fn search_filter(filters: &protocol::SearchFilters) -> tl::enums::MessagesFilter {
+    if filters.mentions_me {
+        return tl::enums::MessagesFilter::InputMessagesFilterMyMentions;
+    }
+    match filters.has {
+        Some(protocol::SearchHas::Images) => tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo,
+        Some(protocol::SearchHas::Files) => tl::enums::MessagesFilter::InputMessagesFilterDocument,
+        Some(protocol::SearchHas::Links) => tl::enums::MessagesFilter::InputMessagesFilterUrl,
+        None => tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+    }
+}
+
+fn search_filtered(
+    account: &Account,
+    conversation: &str,
+    query: &str,
+    filter: tl::enums::MessagesFilter,
+    from_id: Option<tl::enums::InputPeer>,
+    min_date: i32,
+    max_date: i32,
+    offset_id: i32,
+    limit: i32,
+) -> Result<(Vec<Message>, Option<u32>), Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     let request = tl::functions::messages::Search {
         peer: account.input(who)?,
         q: query.chars().take(1024).collect(),
-        from_id: None,
+        from_id,
         saved_peer_id: None,
         saved_reaction: None,
         top_msg_id: topic.filter(|topic| *topic != 1),
         filter,
-        min_date: 0,
-        max_date: 0,
+        min_date,
+        max_date,
         offset_id,
         add_offset: 0,
         limit,
@@ -534,11 +567,33 @@ fn search(account: &Account, conversation: &str, query: &str, filter: tl::enums:
     Ok((messages, count))
 }
 
-/// Text matches from Telegram, bounded to one page and mapped like cached search hits.
-pub(super) fn search_messages(account: &Account, conversation: &str, query: &str) -> Result<Vec<protocol::MessageHit>, Fault> {
-    let (messages, _) = search(account, conversation, query, tl::enums::MessagesFilter::InputMessagesFilterEmpty, 0, 100)?;
+fn search(account: &Account, conversation: &str, query: &str, filter: tl::enums::MessagesFilter, offset_id: i32, limit: i32) -> Result<(Vec<Message>, Option<u32>), Fault> {
+    search_filtered(account, conversation, query, filter, None, 0, 0, offset_id, limit)
+}
+
+/// Text/filtered matches from Telegram in one conversation (or forum topic), paged by `offset_id`
+/// via `cursor` with optional sender (`from_id`), date range (`min_date`/`max_date`), and media filter.
+pub(super) fn search_messages(
+    account: &Account,
+    conversation: &str,
+    query: &str,
+    filters: &protocol::SearchFilters,
+    cursor: Option<&str>,
+) -> Result<crate::adapters::SearchPage, Fault> {
+    let from_id = match &filters.from {
+        Some(person) => {
+            let (who, _) = Who::parse(&person.id).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+            Some(account.input(who)?)
+        }
+        None => None,
+    };
+    let min_date = filters.after.and_then(|d| i32::try_from(d).ok()).unwrap_or(0);
+    let max_date = filters.before.and_then(|d| i32::try_from(d).ok()).unwrap_or(0);
+    let offset_id = cursor.and_then(|c| c.parse::<i32>().ok()).unwrap_or(0);
+    let filter = search_filter(filters);
+    let (messages, total) = search_filtered(account, conversation, query, filter, from_id, min_date, max_date, offset_id, 100)?;
     let known = account.ctx.known(conversation).ok().flatten();
-    Ok(messages.into_iter().take(100).map(|message| protocol::MessageHit {
+    let hits: Vec<protocol::MessageHit> = messages.into_iter().take(100).map(|message| protocol::MessageHit {
         conversation: account.ctx.key(conversation),
         message_id: message.id,
         sent: message.sent,
@@ -547,7 +602,67 @@ pub(super) fn search_messages(account: &Account, conversation: &str, query: &str
         title: known.as_ref().map(|row| row.title.clone()).unwrap_or_default(),
         space_title: known.as_ref().map(|row| row.space_title.clone()).unwrap_or_default(),
         outgoing: message.outgoing,
-    }).collect())
+    }).collect();
+    let next_cursor = (hits.len() >= 100 && total.is_none_or(|t| t as usize > hits.len()))
+        .then(|| hits.last().map(|h| h.message_id.clone()))
+        .flatten();
+    Ok(crate::adapters::SearchPage { hits, cursor: next_cursor, total })
+}
+
+/// Jumps to the message closest to `date` (Unix seconds) via `messages.getHistory` with `offset_date`.
+pub(super) fn jump_to_date(account: &Account, conversation: &str, date: i64) -> Result<Option<String>, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let offset_date = i32::try_from(date).map_err(|_| invalid("DATE_INVALID"))?;
+    let request = tl::functions::messages::GetHistory {
+        peer,
+        offset_id: 0,
+        offset_date,
+        add_offset: -1,
+        limit: 1,
+        max_id: 0,
+        min_id: 0,
+        hash: 0,
+    };
+    let (raw, _) = sync::searched(account, account.ask(&request)?);
+    let (messages, wants) = sync::mapped(account, conversation, &raw);
+    account.files.want(wants);
+    if !messages.is_empty() {
+        let _ = account.ctx.history(conversation, &messages);
+    }
+    Ok(messages.into_iter().next().map(|m| m.id))
+}
+
+/// Returns calendar day buckets for a conversation (`messages.getSearchResultsCalendar`).
+pub(super) fn search_calendar(
+    account: &Account,
+    conversation: &str,
+    kind: Option<SharedKind>,
+    offset_date: i64,
+) -> Result<Vec<protocol::SearchCalendarDay>, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let filter = kind.map_or(tl::enums::MessagesFilter::InputMessagesFilterEmpty, shared_filter);
+    let tl::enums::messages::SearchResultsCalendar::Calendar(cal) = account.ask(
+        &tl::functions::messages::GetSearchResultsCalendar {
+            peer,
+            saved_peer_id: None,
+            filter,
+            offset_id: 0,
+            offset_date: i32::try_from(offset_date).unwrap_or(0),
+        },
+    )?;
+    account.learn(&cal.users, &cal.chats);
+    Ok(cal
+        .periods
+        .into_iter()
+        .map(|tl::enums::SearchResultsCalendarPeriod::Period(p)| protocol::SearchCalendarDay {
+            date: i64::from(p.date),
+            min_message_id: p.min_msg_id.to_string(),
+            max_message_id: p.max_msg_id.to_string(),
+            count: p.count.max(0) as u32,
+        })
+        .collect())
 }
 
 /// Parses an optional global search cursor `"<offset_rate>:<peer>:<offset_id>"`.
@@ -564,10 +679,17 @@ fn parse_global_cursor(cursor: Option<&str>) -> (i32, Option<Who>, i32) {
 
 /// Account-wide text search across all Telegram chats (`messages.searchGlobal`), bounded to 100 hits
 /// with pagination via `(offset_rate, offset_peer, offset_id)`.
-pub(super) fn search_global(account: &Account, query: &str, cursor: Option<&str>) -> Result<Vec<protocol::MessageHit>, Fault> {
+pub(super) fn search_global(
+    account: &Account,
+    query: &str,
+    filters: &protocol::SearchFilters,
+    cursor: Option<&str>,
+) -> Result<crate::adapters::SearchPage, Fault> {
     const LIMIT: usize = 100;
     const MAX_PAGES: usize = 4;
     let q: String = query.chars().take(1024).collect();
+    let min_date = filters.after.and_then(|d| i32::try_from(d).ok()).unwrap_or(0);
+    let max_date = filters.before.and_then(|d| i32::try_from(d).ok()).unwrap_or(0);
     let (mut offset_rate, initial_peer, mut offset_id) = parse_global_cursor(cursor);
     let mut offset_peer = initial_peer
         .and_then(|who| account.input(who).ok())
@@ -587,9 +709,9 @@ pub(super) fn search_global(account: &Account, query: &str, cursor: Option<&str>
             users_only: false,
             folder_id: None,
             q: q.clone(),
-            filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
-            min_date: 0,
-            max_date: 0,
+            filter: search_filter(filters),
+            min_date,
+            max_date,
             offset_rate,
             offset_peer: offset_peer.clone(),
             offset_id,
@@ -652,7 +774,7 @@ pub(super) fn search_global(account: &Account, query: &str, cursor: Option<&str>
             _ => break,
         }
     }
-    Ok(hits)
+    Ok(hits.into())
 }
 
 /// The pinned messages, newest first.
@@ -783,11 +905,7 @@ pub(super) fn forward(
 
 /// What was shared, from Telegram's own search, with Telegram's count of it as the total.
 pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, before: Option<&str>, limit: u32) -> Result<SharedPage, Fault> {
-    let filter = match kind {
-        SharedKind::Media => tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo,
-        SharedKind::Files => tl::enums::MessagesFilter::InputMessagesFilterDocument,
-        SharedKind::Links => tl::enums::MessagesFilter::InputMessagesFilterUrl,
-    };
+    let filter = shared_filter(kind);
     let limit = limit.clamp(1, 100);
     let offset = before.and_then(|id| id.parse::<i32>().ok()).unwrap_or(0);
     let (messages, total) = search(account, conversation, "", filter, offset, limit as i32)?;
@@ -803,7 +921,7 @@ pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, be
             title,
         };
         match kind {
-            SharedKind::Media | SharedKind::Files => {
+            SharedKind::Media | SharedKind::Files | SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => {
                 items.extend(message.attachments.iter().map(|attachment| item(Some(attachment.clone()), String::new(), String::new())));
             }
             SharedKind::Links => {

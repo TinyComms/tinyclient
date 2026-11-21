@@ -62,7 +62,7 @@ fn everywhere_search_merges_two_networks_and_reports_unsearched() {
     let daemon = Daemon::demo();
 
     // Common word "the" appears across demo Slack and Telegram accounts.
-    let Response::MessageHits { hits, cursor, not_searched } = daemon.ask(&Request::SearchNetwork {
+    let Response::MessageHits { hits, cursor, not_searched, .. } = daemon.ask(&Request::SearchNetwork {
         conversation: None,
         space: None,
         account: None,

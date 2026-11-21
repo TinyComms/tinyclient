@@ -1577,7 +1577,7 @@ impl Slack {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
-                    answer(reply, self.search_messages(&query, &scope, &filters));
+                    answer(reply, self.search_messages(&query, &scope, &filters).map(Into::into));
                 }
             }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {

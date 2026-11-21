@@ -3728,6 +3728,23 @@ impl Store {
                     });
                     items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
                 }
+                SharedKind::Music => {
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        !attachment.sticker && attachment.file.kind == protocol::MediaKind::Audio && !attachment.voice
+                    });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Voice => {
+                    let wanted = message.attachments.iter().filter(|attachment| attachment.voice);
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Gifs => {
+                    let wanted = message
+                        .attachments
+                        .iter()
+                        .filter(|attachment| !attachment.sticker && attachment.file.kind == protocol::MediaKind::Gif);
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
                 SharedKind::Links => {
                     let mut seen: Vec<&str> = Vec::new();
                     for preview in &message.previews {

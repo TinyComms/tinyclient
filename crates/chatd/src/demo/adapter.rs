@@ -830,6 +830,7 @@ impl Demo {
                     .hub
                     .store()
                     .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
+                    .map(Into::into)
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }
@@ -1046,6 +1047,8 @@ impl Demo {
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)

@@ -4238,3 +4238,103 @@ fn scheduled_messages_list_reschedule_send_now_cancel_and_when_online() {
         other => panic!("expected empty ScheduledMessages, got {other:?}"),
     }
 }
+
+#[test]
+fn chat_search_filters_paging_hashtags_jump_to_date_calendar_and_shared_tabs() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_SEARCH_BULK", "125")]);
+    world.connected();
+
+    // Hashtag search across 125 messages pages past 100 using cursor and reports total.
+    let (page1, cursor1, total1) = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, cursor, total, .. } => (hits, cursor, total),
+        other => panic!("expected MessageHits, got {other:?}"),
+    };
+    assert_eq!(total1, Some(125));
+    assert_eq!(page1.len(), 100);
+    assert!(cursor1.is_some(), "expected continuation cursor past 100 hits");
+
+    let (page2, cursor2) = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: cursor1,
+    }) {
+        Response::MessageHits { hits, cursor, .. } => (hits, cursor),
+        other => panic!("expected page 2 MessageHits, got {other:?}"),
+    };
+    assert_eq!(page2.len(), 25);
+    assert!(cursor2.is_none());
+
+    // Filter by sender (Tobin u7003) + date range (last 10 days).
+    let base_t0 = 1_791_892_800i64;
+    let after = base_t0 - 10 * 86_400;
+    let before = base_t0;
+    let filtered = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters {
+            from: Some(key("u7003")),
+            after: Some(after),
+            before: Some(before),
+            ..protocol::SearchFilters::default()
+        },
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("expected filtered MessageHits, got {other:?}"),
+    };
+    assert!(!filtered.is_empty() && filtered.len() <= 10, "got {} hits", filtered.len());
+    assert!(filtered.iter().all(|h| h.sender.contains("Tobin") && h.sent >= after && h.sent <= before), "{filtered:?}");
+
+    // Jump to date resolves the message closest to a target timestamp.
+    let target_date = base_t0 - 50 * 86_400;
+    match world.ask(Request::JumpToDate { conversation: key("g8001"), date: target_date }) {
+        Response::Resolved { conversation, message_id, error } => {
+            assert_eq!(conversation, Some(key("g8001")));
+            assert!(message_id.is_some(), "expected a resolved message id");
+            assert!(error.is_empty());
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|c| c.contains("GetHistory g8001 date=")));
+
+    // Search calendar lists day buckets with counts.
+    match world.ask(Request::SearchCalendar { conversation: key("g8001"), kind: None, offset_date: 0 }) {
+        Response::SearchCalendar { days } => {
+            assert!(days.len() >= 100, "expected >= 100 calendar days, got {}", days.len());
+            assert!(days.iter().all(|d| d.count >= 1));
+        }
+        other => panic!("expected SearchCalendar, got {other:?}"),
+    }
+
+    // Extra Telegram shared tabs: Music, Voice, GIFs.
+    for kind in [protocol::SharedKind::Music, protocol::SharedKind::Voice, protocol::SharedKind::Gifs] {
+        match world.ask(Request::Shared {
+            conversation: key("u7002"),
+            kind,
+            before: None,
+            limit: 20,
+            search: true,
+        }) {
+            Response::Shared { items, total, .. } => {
+                assert_eq!(total, Some(1), "expected total=1 for {kind:?}");
+                assert_eq!(items.len(), 1, "expected 1 item for {kind:?}: {items:?}");
+            }
+            other => panic!("expected Shared for {kind:?}, got {other:?}"),
+        }
+    }
+}

@@ -257,6 +257,20 @@ pub struct ReactorsPage {
     pub more: bool,
 }
 
+/// One page of network message search results (`Command::Search`).
+#[derive(Debug, Clone, Default)]
+pub struct SearchPage {
+    pub hits: Vec<MessageHit>,
+    pub cursor: Option<String>,
+    pub total: Option<u32>,
+}
+
+impl From<Vec<MessageHit>> for SearchPage {
+    fn from(hits: Vec<MessageHit>) -> Self {
+        Self { hits, cursor: None, total: None }
+    }
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -851,7 +865,20 @@ pub enum Command {
         filters: protocol::SearchFilters,
         cursor: Option<String>,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<SearchPage>,
+    },
+    /// Jump to the message closest to `date` (Unix seconds) in a conversation; answers with the message id.
+    JumpToDate {
+        conversation_id: String,
+        date: i64,
+        reply: Reply<Option<String>>,
+    },
+    /// Calendar days with matching messages in a conversation (Telegram `messages.getSearchResultsCalendar`).
+    SearchCalendar {
+        conversation_id: String,
+        kind: Option<SharedKind>,
+        offset_date: i64,
+        reply: Reply<Vec<protocol::SearchCalendarDay>>,
     },
     /// The shell asked for these files and the media cache knows none of them, or knows them
     /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
@@ -992,6 +1019,8 @@ impl Command {
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {
                 ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
             }

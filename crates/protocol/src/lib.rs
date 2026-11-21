@@ -915,6 +915,12 @@ pub enum SharedKind {
     /// Every other attachment: documents, archives, audio.
     Files,
     Links,
+    /// Audio/music files (Telegram `inputMessagesFilterMusic`).
+    Music,
+    /// Voice and round video notes (Telegram `inputMessagesFilterRoundVoice`).
+    Voice,
+    /// GIF animations (Telegram `inputMessagesFilterGif`).
+    Gifs,
 }
 
 /// One thing shared in a conversation, and the message it was shared in.
@@ -1335,6 +1341,20 @@ pub enum Request {
     SendScheduledNow {
         conversation: Key,
         scheduled_id: String,
+    },
+    /// Jumps to the message closest to `date` (Unix seconds) in a conversation (Telegram `messages.getHistory` with `offset_date`).
+    /// Answers with [`Response::Resolved`].
+    JumpToDate {
+        conversation: Key,
+        date: i64,
+    },
+    /// Lists calendar days containing messages (or matching `kind`) in a conversation (Telegram `messages.getSearchResultsCalendar`).
+    SearchCalendar {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<SharedKind>,
+        #[serde(default)]
+        offset_date: i64,
     },
     /// Edits and/or reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
     RescheduleMessage {
@@ -2927,6 +2947,12 @@ pub enum Response {
         cursor: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_searched: Vec<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u32>,
+    },
+    /// Calendar days with matching messages (`Request::SearchCalendar`).
+    SearchCalendar {
+        days: Vec<SearchCalendarDay>,
     },
     /// Answers `Reminders`: what is still waiting in the conversation, due first.
     Reminders {
@@ -3444,7 +3470,7 @@ mod tests {
             outgoing: false,
         };
         assert_eq!(
-            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),
+            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new(), total: None }).unwrap(),
             r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
         );
         // The network's own ask: the scope is a conversation, Space, account, network, or everywhere.

@@ -736,6 +736,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
+        Command::JumpToDate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SearchCalendar { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
@@ -921,13 +923,23 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ReportReasons { reply, .. } => {
             let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
         }
-        Command::Search { query, scope, cursor, reply, .. } => {
+        Command::Search { query, scope, filters, cursor, reply, .. } => {
             let result = match scope {
-                super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
-                super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
+                super::SearchScope::Conversation(id) => {
+                    info::search_messages(account, &id, &query, &filters, cursor.as_deref()).map_err(refused)
+                }
+                super::SearchScope::Account => {
+                    info::search_global(account, &query, &filters, cursor.as_deref()).map_err(refused)
+                }
                 super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result);
+        }
+        Command::JumpToDate { conversation_id, date, reply } => {
+            let _ = reply.send(info::jump_to_date(account, &conversation_id, date).map_err(refused));
+        }
+        Command::SearchCalendar { conversation_id, kind, offset_date, reply } => {
+            let _ = reply.send(info::search_calendar(account, &conversation_id, kind, offset_date).map_err(refused));
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));

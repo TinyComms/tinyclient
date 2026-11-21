@@ -692,6 +692,19 @@ impl World {
             let who = Who::User(CROWD + at);
             world.store(None, message(who, 1, CROWD + at, t0() - 200_000 - at as i32 * 60, &format!("Hello from {at}")));
         }
+        let search_bulk: usize = std::env::var("TINYCLIENT_TELEGRAM_SEARCH_BULK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        for i in 0..search_bulk {
+            let id = 1_000 + i as i32;
+            let sender = if i % 2 == 0 { ODALYS } else { TOBIN };
+            let date = t0() - (search_bulk as i32 - i as i32) * 86_400;
+            world.store(
+                None,
+                message(Who::Group(CREW), id, sender, date, &format!("Bulk note {i} #ridge")),
+            );
+        }
         world
     }
 
@@ -2551,6 +2564,29 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::GetHistory>(body) {
             let peer = input_who(&request.peer);
+            if request.offset_date > 0 && request.offset_id == 0 {
+                self.log(&format!("GetHistory {} date={}", peer.text(), request.offset_date));
+                let target = request.offset_date;
+                let picked = self.messages.get(&peer.text()).and_then(|held| {
+                    held.values()
+                        .min_by_key(|m| {
+                            let d = match m {
+                                tl::enums::Message::Message(m) => m.date,
+                                tl::enums::Message::Service(m) => m.date,
+                                tl::enums::Message::Empty(_) => 0,
+                            };
+                            (d - target).abs()
+                        })
+                        .cloned()
+                });
+                let messages: Vec<tl::enums::Message> = picked.into_iter().collect();
+                return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                    messages,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                }));
+            }
             self.log(&format!("GetHistory {} {} {}", peer.text(), request.offset_id, request.add_offset));
             return answer(self.page(&peer.text(), request.offset_id, request.add_offset, request.limit));
         }
@@ -3378,10 +3414,13 @@ impl World {
                 return Some(answer(tl::enums::messages::Messages::Slice(slice)));
             }
             let peer = input_who(&request.peer);
-            let (name, count, ids): (&str, i32, Vec<i32>) = match request.filter {
+            let (name, mut count, ids): (&str, i32, Vec<i32>) = match request.filter {
                 tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, vec![12]),
                 tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo => ("media", 37, vec![14]),
                 tl::enums::MessagesFilter::InputMessagesFilterUrl => ("links", 4, vec![17]),
+                tl::enums::MessagesFilter::InputMessagesFilterMusic => ("music", 1, Vec::new()),
+                tl::enums::MessagesFilter::InputMessagesFilterRoundVoice => ("voice", 1, Vec::new()),
+                tl::enums::MessagesFilter::InputMessagesFilterGif => ("gifs", 1, Vec::new()),
                 _ => ("files", 0, Vec::new()),
             };
             self.log(&format!("Search {} {name} {}", peer.text(), request.offset_id));
@@ -3390,21 +3429,127 @@ impl World {
             if matches!(request.filter, tl::enums::MessagesFilter::InputMessagesFilterEmpty) {
                 self.log(&format!("SearchText {} {} topic={:?}", peer.text(), request.q, request.top_msg_id));
                 let query = request.q.to_lowercase();
+                let from_who = request.from_id.as_ref().map(input_who);
                 let held = self.messages.get(&key(peer, request.top_msg_id));
-                messages = held.into_iter().flat_map(|held| held.values()).filter(|message| match message {
-                    tl::enums::Message::Message(message) => message.message.to_lowercase().contains(&query),
-                    _ => false,
-                }).cloned().collect();
-                messages.sort_by_key(|message| std::cmp::Reverse(match message {
+                let mut matched: Vec<tl::enums::Message> = held
+                    .into_iter()
+                    .flat_map(|held| held.values())
+                    .filter(|message| match message {
+                        tl::enums::Message::Message(msg) => {
+                            let text_ok = query.is_empty() || msg.message.to_lowercase().contains(&query);
+                            let from_ok = from_who.is_none_or(|want| {
+                                msg.from_id.as_ref().is_some_and(|p| Who::of(p) == want)
+                            });
+                            let min_ok = request.min_date <= 0 || msg.date >= request.min_date;
+                            let max_ok = request.max_date <= 0 || msg.date <= request.max_date;
+                            text_ok && from_ok && min_ok && max_ok
+                        }
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                matched.sort_by_key(|message| std::cmp::Reverse(match message {
                     tl::enums::Message::Message(message) => message.id,
                     _ => 0,
                 }));
-                messages.truncate(request.limit.max(0) as usize);
+                count = matched.len() as i32;
+                if request.offset_id > 0 {
+                    matched.retain(|message| match message {
+                        tl::enums::Message::Message(msg) => msg.id < request.offset_id,
+                        _ => false,
+                    });
+                }
+                matched.truncate(request.limit.max(0) as usize);
+                messages = matched;
             }
             if name == "links" {
                 let mut linked = message(peer, 17, ODALYS, t0() - 30, "Route map");
                 linked.entities = Some(vec![tl::types::MessageEntityTextUrl { offset: 0, length: 5, url: "https://example.org/route".to_owned() }.into()]);
                 messages = vec![linked.into()];
+            } else if name == "music" {
+                let mut track = message(peer, 18, ODALYS, t0() - 25, "");
+                let doc = tl::types::Document {
+                    id: 6_601,
+                    access_hash: 6_608,
+                    file_reference: vec![1, 2, 3],
+                    date: t0() - 25,
+                    mime_type: "audio/mpeg".to_owned(),
+                    size: 120_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![
+                        tl::types::DocumentAttributeAudio {
+                            voice: false,
+                            duration: 185,
+                            title: Some("Alpine Theme".to_owned()),
+                            performer: Some("Trail Band".to_owned()),
+                            waveform: None,
+                        }.into(),
+                        tl::types::DocumentAttributeFilename { file_name: "alpine.mp3".to_owned() }.into(),
+                    ],
+                };
+                track.media = Some(tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(doc.into()),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                }.into());
+                messages = vec![track.into()];
+            } else if name == "voice" {
+                let mut note = message(peer, 19, ODALYS, t0() - 20, "");
+                let doc = tl::types::Document {
+                    id: 6_602,
+                    access_hash: 6_609,
+                    file_reference: vec![1, 2, 3],
+                    date: t0() - 20,
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 16_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 9,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![1, 2, 3]),
+                    }.into()],
+                };
+                note.media = Some(tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: true,
+                    document: Some(doc.into()),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                }.into());
+                messages = vec![note.into()];
+            } else if name == "gifs" {
+                let mut animated = message(peer, 21, ODALYS, t0() - 15, "");
+                animated.media = Some(tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(gif(6_200).into()),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                }.into());
+                messages = vec![animated.into()];
             }
             let slice = tl::types::messages::MessagesSlice {
                 inexact: false,
@@ -3418,6 +3563,53 @@ impl World {
                 users: users(),
             };
             return Some(answer(tl::enums::messages::Messages::Slice(slice)));
+        }
+        if let Some(request) = asked::<f::messages::GetSearchResultsCalendar>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetSearchResultsCalendar {} {}", peer.text(), request.offset_date));
+            let mut by_day: BTreeMap<i32, (i32, i32, i32)> = BTreeMap::new();
+            let mut total = 0i32;
+            if let Some(held) = self.messages.get(&peer.text()) {
+                for msg in held.values() {
+                    if let tl::enums::Message::Message(m) = msg {
+                        if request.offset_date > 0 && m.date > request.offset_date {
+                            continue;
+                        }
+                        let day = (m.date / 86_400) * 86_400;
+                        let entry = by_day.entry(day).or_insert((m.id, m.id, 0));
+                        entry.0 = entry.0.min(m.id);
+                        entry.1 = entry.1.max(m.id);
+                        entry.2 += 1;
+                        total += 1;
+                    }
+                }
+            }
+            let min_date = by_day.keys().next().copied().unwrap_or(0);
+            let min_msg_id = by_day.values().map(|(lo, _, _)| *lo).min().unwrap_or(0);
+            let periods: Vec<tl::enums::SearchResultsCalendarPeriod> = by_day
+                .into_iter()
+                .rev()
+                .map(|(date, (min_msg_id, max_msg_id, count))| {
+                    tl::enums::SearchResultsCalendarPeriod::Period(tl::types::SearchResultsCalendarPeriod {
+                        date,
+                        min_msg_id,
+                        max_msg_id,
+                        count,
+                    })
+                })
+                .collect();
+            let cal = tl::types::messages::SearchResultsCalendar {
+                inexact: false,
+                count: total,
+                min_date,
+                min_msg_id,
+                offset_id_offset: None,
+                periods,
+                messages: Vec::new(),
+                chats: chats(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::messages::SearchResultsCalendar::Calendar(cal)));
         }
         if let Some(request) = asked::<f::channels::GetFullChannel>(body) {
             let tl::enums::InputChannel::Channel(channel) = &request.channel else {
