@@ -460,6 +460,12 @@ pub enum Command {
         item_id: Option<String>,
         reply: Reply<()>,
     },
+    /// Members who have read a given message (`Request::ReadBy`).
+    ReadBy {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<Vec<protocol::ReadBy>>,
+    },
     /// Add a bookmark to a channel.
     BookmarkAdd {
         conversation_id: String,
@@ -807,6 +813,7 @@ impl Command {
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

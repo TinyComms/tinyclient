@@ -3823,6 +3823,17 @@ impl Chat {
                 self.hub.notify(crate::notify::Event::Play(sound));
                 Response::Ok
             }
+            Request::ReadBy { conversation, message_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::ReadBy { conversation_id, message_id, reply }) {
+                    Ok(readers) => Response::ReadBy { readers },
+                    Err(refused) => *refused,
+                }
+            }
         }
     }
 }

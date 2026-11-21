@@ -335,6 +335,8 @@ struct State {
     scheduled: HashMap<String, i64>,
     /// Activity feed item ids marked read locally this session.
     activity_read: HashSet<String>,
+    /// Per-thread member consumption horizons (thread_id -> member_id -> arrival_ms), excluding me.
+    member_horizons: HashMap<String, HashMap<String, i64>>,
 }
 
 /// What a call presents.
@@ -934,6 +936,7 @@ impl Teams {
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
             activity_feed: true,
+            read_by: true,
             ..protocol::Capabilities::default()
         });
         {
@@ -1008,6 +1011,9 @@ impl Teams {
             }
             Command::ActivityMarkRead { item_id, reply } => {
                 let _ = reply.send(self.mark_activity_read(item_id.as_deref()).map_err(refuse));
+            }
+            Command::ReadBy { conversation_id, message_id, reply } => {
+                let _ = reply.send(self.read_by(&conversation_id, &message_id).map_err(refuse));
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));

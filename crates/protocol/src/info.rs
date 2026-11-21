@@ -646,6 +646,9 @@ pub struct Capabilities {
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,
+    /// This account supports per-message read-receipt lookup (`Request::ReadBy`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_by: bool,
     /// This account supports channel bookmarks (`bookmarks.list` / `add` / `edit` / `remove`, Slack).
     #[serde(default, skip_serializing_if = "is_false")]
     pub bookmarks: bool,
@@ -746,6 +749,19 @@ pub struct ActivityItem {
     /// Whether the network considers this item unread.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread: bool,
+}
+
+/// One member who has read up to a given message (`Request::ReadBy`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadBy {
+    pub person: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+    /// Unix seconds when they read it, if reported by the network.
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.

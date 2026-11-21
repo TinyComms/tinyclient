@@ -2534,6 +2534,11 @@ pub enum Request {
     Join {
         conversation: Key,
     },
+    /// Who has read a given message in a chat (`Capabilities::read_by`).
+    ReadBy {
+        conversation: Key,
+        message_id: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3030,6 +3035,10 @@ pub enum Response {
         channels: Vec<BrowsedChannel>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+    },
+    /// Members who have read a given message (`Request::ReadBy`).
+    ReadBy {
+        readers: Vec<ReadBy>,
     },
 }
 

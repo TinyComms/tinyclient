@@ -226,6 +226,12 @@ impl Teams {
             return Ok(());
         };
         let props = &conversation["properties"];
+        if let Some(horizons) = conversation["consumptionhorizons"]
+            .as_array()
+            .or_else(|| props["consumptionhorizons"].as_array())
+        {
+            self.apply_member_horizons(id, horizons)?;
+        }
         let parse_flag = |val: &Value| -> Option<bool> {
             match val {
                 Value::Bool(b) => Some(*b),

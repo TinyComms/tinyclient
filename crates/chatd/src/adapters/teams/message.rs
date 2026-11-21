@@ -789,6 +789,36 @@ impl Teams {
             }
             return Ok(());
         }
+        if raw["messagetype"].as_str() == Some("ThreadActivity/MemberConsumptionHorizonUpdate") {
+            let content = raw["content"].as_str().unwrap_or("");
+            if let Ok(parsed) = serde_json::from_str::<Value>(content) {
+                if let Some(entries) = parsed["consumptionhorizons"].as_array() {
+                    self.apply_member_horizons(&place, entries)?;
+                } else {
+                    let member_id = parsed["id"]
+                        .as_str()
+                        .or_else(|| parsed["mri"].as_str())
+                        .unwrap_or_else(|| person(raw["from"].as_str().unwrap_or("")));
+                    let horizon = parsed["consumptionhorizon"]
+                        .as_str()
+                        .or_else(|| raw["properties"]["consumptionhorizon"].as_str())
+                        .unwrap_or("");
+                    self.apply_single_member_horizon(&place, member_id, horizon)?;
+                }
+            } else {
+                let member_id = inside(content, "id")
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| person(raw["from"].as_str().unwrap_or("")));
+                let horizon = inside(content, "consumptionhorizon")
+                    .first()
+                    .copied()
+                    .or_else(|| raw["properties"]["consumptionhorizon"].as_str())
+                    .unwrap_or("");
+                self.apply_single_member_horizon(&place, member_id, horizon)?;
+            }
+            return Ok(());
+        }
         match self.read(&place, raw) {
             Read::Typing { person, name, on } => {
                 if person != self.me() && self.ctx.known(&place)?.is_some() {

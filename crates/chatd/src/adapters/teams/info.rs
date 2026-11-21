@@ -335,21 +335,150 @@ impl Teams {
             Err(fault) => return Err(fault),
         };
         let me = self.me();
-        let horizons: Vec<i64> = answer["consumptionhorizons"]
+        let entries: Vec<(String, i64)> = answer["consumptionhorizons"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|member| member["id"].as_str().is_some_and(|id| id != me))
-            .filter_map(|member| member["consumptionhorizon"].as_str()?.split(';').next().map(millis))
+            .filter_map(|member| {
+                let id = member["id"].as_str()?;
+                if id.is_empty() || id == me {
+                    return None;
+                }
+                let arrival = member["consumptionhorizon"].as_str()?.split(';').next().map(millis).unwrap_or(0);
+                Some((id.to_owned(), arrival))
+            })
             .collect();
-        if horizons.is_empty() || horizons.len() > SMALL {
+        if entries.is_empty() || entries.len() > SMALL {
             return Ok(());
         }
+        {
+            let mut state = self.state();
+            let map = state.member_horizons.entry(conversation.to_owned()).or_default();
+            for (id, arrival) in &entries {
+                if *arrival > 0 {
+                    map.insert(id.clone(), *arrival);
+                }
+            }
+        }
         // Everyone has read up to the least of their markers.
-        if let Some(least) = horizons.into_iter().min().filter(|least| *least > 0) {
+        if let Some(least) = entries.into_iter().map(|(_, ms)| ms).min().filter(|least| *least > 0) {
             self.ctx.seen(conversation, &least.to_string())?;
         }
         Ok(())
+    }
+
+    /// Returns who has read `message_id` in a Teams chat (up to [`SMALL`] members).
+    pub(super) fn read_by(&self, conversation: &str, message_id: &str) -> Result<Vec<protocol::ReadBy>, Fault> {
+        let thread = thread_of(conversation);
+        if super::tree::is_channel(thread) || super::chain_of(conversation).is_some() || thread.starts_with("48:") {
+            return Ok(Vec::new());
+        }
+        let target_ms = millis(message_id);
+        let path = format!("/v1/threads/{}/consumptionhorizons", escaped(thread));
+        let answer = match self.chat("GET", &path, Body::None, true) {
+            Ok(answer) => answer.body,
+            Err(Fault::Refused { .. }) => return Ok(Vec::new()),
+            Err(fault) => return Err(fault),
+        };
+        let me = self.me();
+        let mut parsed: Vec<(String, i64, i64)> = Vec::new();
+        for member in answer["consumptionhorizons"].as_array().into_iter().flatten() {
+            let Some(id) = member["id"].as_str().filter(|id| !id.is_empty() && *id != me) else {
+                continue;
+            };
+            let Some(horizon) = member["consumptionhorizon"].as_str() else {
+                continue;
+            };
+            let mut parts = horizon.split(';');
+            let arrival = parts.next().map(millis).unwrap_or(0);
+            let client_ts = parts.next().map(millis).unwrap_or(0);
+            parsed.push((id.to_owned(), arrival, client_ts));
+        }
+        if parsed.is_empty() || parsed.len() > SMALL {
+            return Ok(Vec::new());
+        }
+        {
+            let mut state = self.state();
+            let map = state.member_horizons.entry(thread.to_owned()).or_default();
+            for (id, arrival, _) in &parsed {
+                if *arrival > 0 {
+                    map.insert(id.clone(), *arrival);
+                }
+            }
+        }
+        if let Some(least) = parsed.iter().map(|(_, ms, _)| *ms).min().filter(|least| *least > 0) {
+            let _ = self.ctx.seen(thread, &least.to_string());
+        }
+        let matching: Vec<(String, i64, i64)> = parsed
+            .into_iter()
+            .filter(|(_, arrival, _)| *arrival > 0 && (target_ms == 0 || *arrival >= target_ms))
+            .collect();
+        let ids: Vec<String> = matching.iter().map(|(id, _, _)| id.clone()).collect();
+        self.lookup(&ids);
+        let readers = matching
+            .into_iter()
+            .map(|(id, arrival, client_ts)| {
+                let name = self.name_of(&id).unwrap_or_default();
+                let avatar = self.picture(&id, &name);
+                let at = if client_ts > 0 { client_ts / 1000 } else { arrival / 1000 };
+                protocol::ReadBy {
+                    person: self.ctx.key(&id),
+                    name,
+                    avatar,
+                    at,
+                }
+            })
+            .collect();
+        Ok(readers)
+    }
+
+    /// Updates live Seen state from an array of `{id, consumptionhorizon}` entries pushed by Teams.
+    pub(super) fn apply_member_horizons(&self, conversation: &str, entries: &[Value]) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        if super::tree::is_channel(thread) || thread.starts_with("48:") {
+            return Ok(());
+        }
+        let me = self.me();
+        let mut updated = false;
+        let least = {
+            let mut state = self.state();
+            let map = state.member_horizons.entry(thread.to_owned()).or_default();
+            for member in entries {
+                let Some(id) = member["id"].as_str().filter(|id| !id.is_empty() && *id != me) else {
+                    continue;
+                };
+                let arrival = member["consumptionhorizon"]
+                    .as_str()
+                    .and_then(|h| h.split(';').next())
+                    .map(millis)
+                    .unwrap_or(0);
+                if arrival > 0 {
+                    let prev = map.get(id).copied().unwrap_or(0);
+                    if arrival >= prev {
+                        map.insert(id.to_owned(), arrival);
+                        updated = true;
+                    }
+                }
+            }
+            if updated && !map.is_empty() && map.len() <= SMALL {
+                map.values().copied().min().filter(|ms| *ms > 0)
+            } else {
+                None
+            }
+        };
+        if let Some(least) = least {
+            self.ctx.seen(thread, &least.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Updates live Seen state when one member's consumption horizon arrives via push.
+    pub(super) fn apply_single_member_horizon(&self, conversation: &str, member_id: &str, horizon: &str) -> Result<(), Fault> {
+        if member_id.is_empty() || horizon.is_empty() {
+            return Ok(());
+        }
+        let entry = json!({"id": member_id, "consumptionhorizon": horizon});
+        self.apply_member_horizons(conversation, &[entry])
     }
 }
 

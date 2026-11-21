@@ -2294,3 +2294,69 @@ fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
 
     let _ = std::fs::remove_dir_all(&staged);
 }
+
+#[test]
+fn read_by_lists_readers_and_live_seen_updates_on_horizon_push() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Account advertises read_by capability.
+    assert!(world.account(HOME).can.read_by);
+
+    // 2. Request::ReadBy on Launch crew (19:grp2@thread.v2) returns members who read past message id.
+    let grp2 = key("19:grp2@thread.v2");
+    let Response::ReadBy { readers } = world.ask(Request::ReadBy {
+        conversation: grp2.clone(),
+        message_id: "1759000000000".into(),
+    }) else {
+        panic!("expected Response::ReadBy");
+    };
+    let reader_ids: Vec<&str> = readers.iter().map(|r| r.person.id.as_str()).collect();
+    assert!(reader_ids.contains(&BEN), "Ben read 1759000000000: {readers:?}");
+    assert!(
+        reader_ids.contains(&"8:orgid:00000000-0000-4000-8000-0000000000c3"),
+        "third member read past 1759000000000: {readers:?}"
+    );
+    assert!(!reader_ids.contains(&ME), "self should not be listed in ReadBy");
+
+    // For a newer message (1759000000250), only member c3 (horizon 1759000000500) has read it.
+    let Response::ReadBy { readers: partial } = world.ask(Request::ReadBy {
+        conversation: grp2,
+        message_id: "1759000000250".into(),
+    }) else {
+        panic!("expected Response::ReadBy for newer message");
+    };
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].person.id, "8:orgid:00000000-0000-4000-8000-0000000000c3");
+
+    // 3. Live Seen update: send a message in Ana's 1:1 chat; initially not seen, then push a
+    //    ThreadActivity/MemberConsumptionHorizonUpdate from Ana and verify `seen` flips to true live.
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+    let cid = "1760000999000654";
+    world.send(&ana, cid, "Did you see the PR?");
+    let sent = world.until("message sent to Ana", || {
+        world.messages(&ana).into_iter().find(|m| m.client_id.as_deref() == Some(cid) && m.state == SendState::Sent)
+    });
+    assert!(!world.conversation(&ana).unwrap().seen, "not seen before peer reads it");
+
+    let horizon_push = json!({
+        "id": "1760001999999",
+        "conversationid": CHAT_ANA,
+        "conversationLink": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/{CHAT_ANA}"),
+        "type": "Message",
+        "messagetype": "ThreadActivity/MemberConsumptionHorizonUpdate",
+        "contenttype": "text",
+        "content": json!({
+            "id": ANA,
+            "consumptionhorizon": format!("{};1760001999999;{}", sent.id, sent.id)
+        }).to_string(),
+        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+        "properties": {}
+    });
+    world.fake.push("NewMessage", horizon_push, false);
+    let seen_row = world.until("Ana chat becomes seen live", || {
+        world.conversation(&ana).filter(|row| row.seen)
+    });
+    assert!(seen_row.seen);
+}
