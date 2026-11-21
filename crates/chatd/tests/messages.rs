@@ -1941,3 +1941,74 @@ fn create_group_starts_a_named_group_conversation_with_multiple_numbers() {
         other => panic!("expected too-few-members refusal, got {other:?}"),
     }
 }
+
+#[test]
+fn link_previews_unfurl_for_known_contacts_and_skip_unknown_numbers_and_spam() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_bg = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            hits_bg.fetch_add(1, Ordering::SeqCst);
+            let mut stream = stream;
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"<!doctype html><html><head>
+                <meta property="og:title" content="Bridge Schedule">
+                <meta property="og:site_name" content="Club News">
+                <meta property="og:description" content="Tuesday at seven.">
+            </head><body>ok</body></html>"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let world = World::linked();
+    world.connected();
+
+    // 1. Unknown number triggers NO fetch by default.
+    let unknown_url = format!("http://{addr}/phish");
+    world.steer(&format!("unknown-link +15550199888 Verify now {unknown_url}"));
+    let unk_msg = world.arrived("phone-unk-15550199888", &format!("Verify now {unknown_url}"));
+    sleep(Duration::from_millis(250));
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "unknown number must not trigger a link fetch by default");
+    assert!(unk_msg.previews.is_empty());
+
+    // 2. Known contact (Grace) unfurls the link into a preview card.
+    let known_url = format!("http://{addr}/schedule");
+    world.steer(&format!("incoming grace See {known_url}"));
+    let with_card = world.until("link preview card", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text.contains(&known_url) && !m.previews.is_empty())
+    });
+    assert_eq!(with_card.previews[0].title, "Bridge Schedule");
+    assert_eq!(with_card.previews[0].site, "Club News");
+    assert_eq!(with_card.previews[0].description, "Tuesday at seven.");
+    let hits_after_known = hits.load(Ordering::SeqCst);
+    assert!(hits_after_known >= 1);
+
+    // 3. Spam folder never unfurls, even for a previously named sender.
+    world.steer("spam grace");
+    world.until("Grace in spam", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.special == Special::Request)
+    });
+    let spam_url = format!("http://{addr}/spam-link");
+    world.steer(&format!("incoming grace Win {spam_url}"));
+    world.arrived(GRACE, &format!("Win {spam_url}"));
+    sleep(Duration::from_millis(250));
+    assert_eq!(hits.load(Ordering::SeqCst), hits_after_known, "spam conversation must never unfurl links");
+}

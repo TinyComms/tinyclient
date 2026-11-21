@@ -888,6 +888,47 @@ fn steer(line: &str) -> Vec<Event> {
                 ..Chat::default()
             }])]
         }
+        "unknown-link" => {
+            let number = words.next().unwrap_or("+15550199888");
+            let text = rest(2);
+            let conv_id = format!("phone-unk-{}", number.trim_start_matches('+'));
+            vec![
+                Event::Chats(vec![Chat {
+                    id: conv_id.clone(),
+                    title: number.into(),
+                    mine: ME.into(),
+                    peer: format!("participant-{conv_id}"),
+                    status: 1,
+                    participants: vec![
+                        Participant {
+                            id: ME.into(),
+                            name: "Ada Quill".into(),
+                            number: "+15550100001".into(),
+                            is_me: true,
+                            ..Participant::default()
+                        },
+                        Participant {
+                            id: format!("participant-{conv_id}"),
+                            name: number.into(),
+                            number: number.into(),
+                            is_me: false,
+                            ..Participant::default()
+                        },
+                    ],
+                    ..Chat::default()
+                }]),
+                Event::Message(note(
+                    &format!("participant-{conv_id}"),
+                    number,
+                    &conv_id,
+                    &format!("m-unk-{}", text.len()),
+                    &text,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+            ]
+        }
         _ => Vec::new(),
     }
 }

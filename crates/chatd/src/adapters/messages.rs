@@ -1148,6 +1148,7 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
     }
     let id = shown.id.clone();
     let _ = account.ctx.message(&note.conversation, &shown);
+    maybe_unfurl(account, &note.conversation, &id, &shown.text, shown.outgoing);
     let tag = bugle::wire_tag(note.wire, carrier_of(account, &note.conversation));
     if !tag.is_empty() {
         let mut line = Message::plain(format!("{}:kind", note.id), String::new(), tag, note.sent, false);
@@ -1155,6 +1156,83 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
         let _ = account.ctx.history(&note.conversation, &[line]);
     }
     receipt(account, &note.conversation, note, &id);
+}
+
+fn should_unfurl(
+    chat: Option<&Chat>,
+    known_contact: bool,
+    link_previews: bool,
+    allow_unknown: bool,
+) -> bool {
+    if !link_previews {
+        return false;
+    }
+    if chat.is_some_and(|c| bugle::place(c.status) == bugle::Place::Request) {
+        return false;
+    }
+    known_contact || allow_unknown
+}
+
+fn is_known_contact(account: &Account, chat: Option<&Chat>, outgoing: bool) -> bool {
+    if outgoing {
+        return true;
+    }
+    let Some(chat) = chat else {
+        return false;
+    };
+    if !chat.group {
+        // A saved contact has a display name that is not just their raw phone number.
+        if !chat.title.is_empty() && !looks_like_number(&chat.title) && !bugle::is_alphanumeric_sender(peer_number_raw(chat).unwrap_or("")) {
+            return true;
+        }
+        let peer_num = peer_number_raw(chat).map(digits_only).unwrap_or_default();
+        if !peer_num.is_empty() {
+            let contacts = account
+                .contacts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if contacts.iter().any(|c| digits_only(&c.number) == peer_num) {
+                return true;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn maybe_unfurl(account: &Account, conversation: &str, message_id: &str, text: &str, outgoing: bool) {
+    let Some(url) = crate::unfurl::extract_url(text) else {
+        return;
+    };
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned();
+    let settings = account.ctx.hub.settings();
+    let link_previews = settings.on(protocol::settings::LINK_PREVIEWS);
+    let allow_unknown = settings.on(protocol::settings::LINK_PREVIEWS_UNKNOWN);
+    let known = is_known_contact(account, chat.as_ref(), outgoing);
+    if !should_unfurl(chat.as_ref(), known, link_previews, allow_unknown) {
+        return;
+    }
+    let ctx = account.ctx.clone();
+    let conversation = conversation.to_owned();
+    let message_id = message_id.to_owned();
+    let _ = std::thread::Builder::new()
+        .name("messages-unfurl".into())
+        .spawn(move || {
+            let Some(preview) = crate::unfurl::fetch(&url) else {
+                return;
+            };
+            if let Ok(Some(mut stored)) = ctx.stored_message(&conversation, &message_id) {
+                if stored.previews.is_empty() {
+                    stored.previews.push(preview);
+                    let _ = ctx.message(&conversation, &stored);
+                }
+            }
+        });
 }
 
 fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Message {
