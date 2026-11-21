@@ -38,6 +38,12 @@ pub fn prove_discord_mark_unread() -> Result<(), String> {
     discord::prove_mark_unread()
 }
 
+/// `TINYCLIENT_PROVE=discord-forward-report`. A forward is a type-1 reference, and a report
+/// uses one captured message-menu path.
+pub fn prove_discord_forward_report() -> Result<(), String> {
+    discord::prove_forward_report()
+}
+
 /// `TINYCLIENT_PROVE=discord-voice-move`. A move to another voice channel in the same server is followed.
 pub fn prove_discord_voice_move() -> Result<(), String> {
     discord::prove_voice_move()

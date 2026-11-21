@@ -885,6 +885,7 @@ impl Discord {
             direct_threads: false,
             pins: true,
             forward: true,
+            abuse_reports: true,
             polls: None,
             reactions: true,
             reactors: true,
