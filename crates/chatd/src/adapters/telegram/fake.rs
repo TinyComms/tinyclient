@@ -2794,6 +2794,55 @@ impl World {
     fn panes(&mut self, body: &[u8], events: &Sender<Event>) -> Option<Result<Vec<u8>, Fault>> {
         use tl::functions as f;
         if let Some(request) = asked::<f::messages::Search>(body) {
+            if let tl::enums::MessagesFilter::InputMessagesFilterPhoneCalls(filter) = &request.filter {
+                self.log(&format!("Search calls missed={} offset={}", filter.missed, request.offset_id));
+                let mut calls: Vec<tl::enums::Message> = self
+                    .messages
+                    .values()
+                    .flat_map(|held| held.values())
+                    .filter(|msg| match msg {
+                        tl::enums::Message::Service(svc) => match &svc.action {
+                            tl::enums::MessageAction::PhoneCall(call) => {
+                                if request.offset_id > 0 && svc.id >= request.offset_id {
+                                    return false;
+                                }
+                                if filter.missed {
+                                    !svc.out
+                                        && matches!(
+                                            (&call.reason, call.duration),
+                                            (Some(tl::enums::PhoneCallDiscardReason::Missed), _) | (None, None)
+                                        )
+                                } else {
+                                    true
+                                }
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                calls.sort_by_key(|msg| {
+                    std::cmp::Reverse(match msg {
+                        tl::enums::Message::Service(svc) => svc.id,
+                        _ => 0,
+                    })
+                });
+                let total = calls.len() as i32;
+                calls.truncate(request.limit.max(0) as usize);
+                let slice = tl::types::messages::MessagesSlice {
+                    inexact: false,
+                    count: total,
+                    next_rate: None,
+                    offset_id_offset: None,
+                    search_flood: None,
+                    messages: calls,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                };
+                return Some(answer(tl::enums::messages::Messages::Slice(slice)));
+            }
             let peer = input_who(&request.peer);
             let (name, count, ids): (&str, i32, Vec<i32>) = match request.filter {
                 tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, vec![12]),

@@ -1574,6 +1574,7 @@ impl Shell {
             let title = match drill {
                 home::Drill::Threads(_) => "Threads".to_owned(),
                 home::Drill::Archive => "Archive".to_owned(),
+                home::Drill::Calls => "Calls".to_owned(),
                 home::Drill::Requests => "Message requests".to_owned(),
                 home::Drill::Topics(forum) => forum.title.clone(),
             };

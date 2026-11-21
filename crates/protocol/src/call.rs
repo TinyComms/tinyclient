@@ -6,6 +6,27 @@
 use crate::{is_false, Key, Network};
 use serde::{Deserialize, Serialize};
 
+/// One entry in a network's recent calls list (`Request::CallHistory`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallLogEntry {
+    /// The conversation this call belongs to (to open at `message_id` or call back).
+    pub conversation: Key,
+    /// The other person's id on this account, if 1:1.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub person_id: String,
+    /// Display name of the person or group.
+    pub name: String,
+    /// The message id of the call service message (for jumping to it or deleting it).
+    pub message_id: String,
+    /// True when we placed the call.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outgoing: bool,
+    /// Structured call metadata (outcome, caller_id, seconds, video) shared with call rows.
+    pub note: crate::CallNote,
+    /// Unix seconds when the call happened.
+    pub time: i64,
+}
+
 /// Most device names of one kind a call lists.
 pub const DEVICES_LIMIT: usize = 32;
 

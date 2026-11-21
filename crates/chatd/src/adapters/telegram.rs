@@ -713,6 +713,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
+        Command::CallHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
@@ -849,6 +851,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
+        }
+        Command::CallHistory { missed, before, limit, reply } => {
+            let _ = reply.send(info::call_history(account, missed, before.as_deref(), limit).map_err(refused));
+        }
+        Command::DeleteCallEntries { message_ids, revoke, reply } => {
+            let _ = reply.send(info::delete_call_entries(account, &message_ids, revoke).map_err(refused));
         }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));

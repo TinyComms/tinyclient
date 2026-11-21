@@ -1565,6 +1565,24 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         search: bool,
     },
+    /// Recent calls across all chats on an account, newest first. `missed` filters to missed
+    /// incoming calls only; `before` continues below a message id already listed.
+    CallHistory {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "is_false")]
+        missed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        limit: u32,
+    },
+    /// Delete one or more entries from an account's recent calls list. `revoke` removes for both
+    /// sides when the network supports it.
+    DeleteCallEntries {
+        account: AccountKey,
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        revoke: bool,
+    },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2655,6 +2673,13 @@ pub enum Response {
         /// The exact total, only where the network counted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total: Option<u32>,
+    },
+    CallHistory {
+        entries: Vec<CallLogEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
     Folders {
         folders: Vec<Folder>,

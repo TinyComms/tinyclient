@@ -569,3 +569,79 @@ pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, be
     }
     Ok(SharedPage { items, more, total })
 }
+
+/// Recent calls across all chats on this Telegram account via `messages.search` with an empty
+/// peer and `inputMessagesFilterPhoneCalls`, paged by `offset_id`.
+pub(super) fn call_history(
+    account: &Account,
+    missed: bool,
+    before: Option<&str>,
+    limit: u32,
+) -> Result<crate::adapters::CallHistoryPage, Fault> {
+    let limit = limit.clamp(1, 100);
+    let offset_id = before.and_then(|id| id.parse::<i32>().ok()).unwrap_or(0);
+    let request = tl::functions::messages::Search {
+        peer: tl::enums::InputPeer::Empty,
+        q: String::new(),
+        from_id: None,
+        saved_peer_id: None,
+        saved_reaction: None,
+        top_msg_id: None,
+        filter: tl::types::InputMessagesFilterPhoneCalls { missed }.into(),
+        min_date: 0,
+        max_date: 0,
+        offset_id,
+        add_offset: 0,
+        limit: limit as i32,
+        max_id: 0,
+        min_id: 0,
+        hash: 0,
+    };
+    let answer = account.ask(&request)?;
+    let (raw, users, chats) = match answer {
+        tl::enums::messages::Messages::Messages(list) => (list.messages, list.users, list.chats),
+        tl::enums::messages::Messages::Slice(list) => (list.messages, list.users, list.chats),
+        tl::enums::messages::Messages::ChannelMessages(list) => (list.messages, list.users, list.chats),
+        tl::enums::messages::Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new()),
+    };
+    account.learn(&users, &chats);
+    let raw_len = raw.len() as u32;
+    let dir = account.dir();
+    let mut entries = Vec::with_capacity(raw.len());
+    for item in &raw {
+        let Some(mapped) = super::content::map(&dir, item) else {
+            continue;
+        };
+        let Some(note) = mapped.message.call else {
+            continue;
+        };
+        let peer_id = mapped.peer.text();
+        let name = dir.name(mapped.peer);
+        let person_id = match mapped.peer {
+            Who::User(_) => peer_id.clone(),
+            _ => String::new(),
+        };
+        entries.push(protocol::CallLogEntry {
+            conversation: protocol::Key::new(&account.ctx.account, peer_id),
+            person_id,
+            name,
+            message_id: mapped.message.id,
+            outgoing: mapped.message.outgoing,
+            note,
+            time: mapped.message.sent,
+        });
+    }
+    let next = entries.last().map(|e| e.message_id.clone());
+    let more = raw_len >= limit && next.is_some();
+    Ok(crate::adapters::CallHistoryPage { entries, next, more })
+}
+
+/// Deletes call entries from the account's call log via `messages.deleteMessages`.
+pub(super) fn delete_call_entries(account: &Account, message_ids: &[String], revoke: bool) -> Result<(), Fault> {
+    let ids: Vec<i32> = message_ids.iter().filter_map(|id| id.parse::<i32>().ok()).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    account.ask(&tl::functions::messages::DeleteMessages { revoke, id: ids })?;
+    Ok(())
+}

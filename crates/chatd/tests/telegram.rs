@@ -3394,3 +3394,84 @@ fn call_service_rows_map_direction_reason_video_and_group_actions() {
     assert_eq!(conf_missed.kind, MessageKind::System);
     assert_eq!(conf_missed.text, "Missed group video call");
 }
+
+#[test]
+fn call_history_pages_filters_missed_and_deletes_entries() {
+    use protocol::CallOutcome;
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+
+    // Emit 3 calls: outgoing ended, incoming missed, outgoing video ended.
+    world.steer("call-event out hangup voice 45");
+    world.steer("call-event in missed voice");
+    world.steer("call-event out hangup video 120");
+    world.until("3 calls stored", || {
+        let count = world.messages("u7002").into_iter().filter(|m| m.call.is_some()).count();
+        (count >= 3).then_some(())
+    });
+
+    // Page 1 (limit 2): newest two calls.
+    let Response::CallHistory { entries: p1, next: next1, more: more1 } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: false,
+        before: None,
+        limit: 2,
+    }) else {
+        panic!("expected CallHistory");
+    };
+    assert_eq!(p1.len(), 2);
+    assert!(more1);
+    assert!(p1[0].note.video && p1[0].note.seconds == Some(120));
+    assert_eq!(p1[1].note.outcome, CallOutcome::Missed);
+
+    // Page 2 using `next1`: remaining call.
+    let Response::CallHistory { entries: p2, more: more2, .. } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: false,
+        before: next1,
+        limit: 2,
+    }) else {
+        panic!("expected CallHistory page 2");
+    };
+    assert_eq!(p2.len(), 1);
+    assert!(!more2);
+    assert_eq!(p2[0].note.seconds, Some(45));
+
+    // Missed filter returns only the missed incoming call.
+    let Response::CallHistory { entries: missed, .. } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: true,
+        before: None,
+        limit: 10,
+    }) else {
+        panic!("expected missed CallHistory");
+    };
+    assert_eq!(missed.len(), 1);
+    assert_eq!(missed[0].note.outcome, CallOutcome::Missed);
+
+    // Delete with revoke = true removes it on the wire.
+    let target_id = missed[0].message_id.clone();
+    assert!(matches!(
+        world.ask(Request::DeleteCallEntries {
+            account: account(),
+            message_ids: vec![target_id.clone()],
+            revoke: true,
+        }),
+        Response::Ok
+    ));
+    assert!(
+        world.calls().iter().any(|c| c.contains("DeleteMessages") && c.contains("revoke true")),
+        "expected DeleteMessages revoke true, got: {:#?}",
+        world.calls()
+    );
+    let Response::CallHistory { entries: after_del, .. } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: true,
+        before: None,
+        limit: 10,
+    }) else {
+        panic!("expected CallHistory after delete");
+    };
+    assert!(after_del.is_empty());
+}

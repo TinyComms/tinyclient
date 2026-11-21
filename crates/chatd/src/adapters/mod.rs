@@ -124,6 +124,14 @@ pub enum SearchScope {
     Account,
 }
 
+/// One page of recent calls across all chats on an account (`Command::CallHistory`).
+#[derive(Debug, Clone, Default)]
+pub struct CallHistoryPage {
+    pub entries: Vec<protocol::CallLogEntry>,
+    pub next: Option<String>,
+    pub more: bool,
+}
+
 /// One window of a member list.
 #[derive(Debug, Clone)]
 pub struct Members {
@@ -484,6 +492,19 @@ pub enum Command {
         limit: u32,
         reply: Reply<SharedPage>,
     },
+    /// Recent calls across all chats on an account, newest first.
+    CallHistory {
+        missed: bool,
+        before: Option<String>,
+        limit: u32,
+        reply: Reply<CallHistoryPage>,
+    },
+    /// Delete one or more call log entries by message id (`revoke` for both sides).
+    DeleteCallEntries {
+        message_ids: Vec<String>,
+        revoke: bool,
+        reply: Reply<()>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -631,6 +652,8 @@ impl Command {
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
