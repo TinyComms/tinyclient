@@ -755,7 +755,11 @@ impl Chat {
         if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native {
             conversation.occupants = self.hub.occupants(&conversation.key);
         }
-        conversation.slowmode_until = self.hub.slowmode_until(&conversation.key);
+        conversation.slowmode_until = if conversation.slowmode_seconds == 0 || conversation.rights.slowmode_exempt {
+            None
+        } else {
+            self.hub.slowmode_until(&conversation.key)
+        };
         conversation
     }
 

@@ -419,6 +419,9 @@ pub struct ConversationRights {
     /// May rename, archive, lock, or delete threads here (Discord `MANAGE_THREADS`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_threads: bool,
+    /// Exempt from channel/thread slowmode (Discord `MANAGE_MESSAGES` / `MANAGE_CHANNELS` / `MANAGE_THREADS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub slowmode_exempt: bool,
 }
 
 impl ConversationRights {
@@ -434,6 +437,7 @@ impl ConversationRights {
     const CREATE_PRIVATE_THREADS: i64 = 1 << 9;
     const SEND_IN_THREADS: i64 = 1 << 10;
     const MANAGE_THREADS: i64 = 1 << 11;
+    const SLOWMODE_EXEMPT: i64 = 1 << 12;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -481,6 +485,9 @@ impl ConversationRights {
         if self.manage_threads {
             bits |= Self::MANAGE_THREADS;
         }
+        if self.slowmode_exempt {
+            bits |= Self::SLOWMODE_EXEMPT;
+        }
         bits
     }
 
@@ -498,6 +505,7 @@ impl ConversationRights {
             create_private_threads: (bits & Self::CREATE_PRIVATE_THREADS) != 0,
             send_in_threads: (bits & Self::SEND_IN_THREADS) != 0,
             manage_threads: (bits & Self::MANAGE_THREADS) != 0,
+            slowmode_exempt: (bits & Self::SLOWMODE_EXEMPT) != 0,
         }
     }
 }

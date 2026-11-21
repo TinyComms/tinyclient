@@ -951,15 +951,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         }),
         _ => None,
     };
-    let jump = if matches!(kind, 6 | 18 | 21 | 46) {
-        posted
-            .message_reference
-            .as_ref()
-            .and_then(|r| r.message_id.clone())
-            .or_else(|| (kind == 21).then(|| posted.referenced_message.as_ref().map(|m| m.id.clone())).flatten())
-    } else {
-        None
-    };
+    let jump = jump_target(posted, kind);
     // The thread object names the count and the newest id. Faces and unread are filled
     // as replies arrive, and a thread update can raise the count.
     let thread = posted.thread.as_ref().map(|thread| ThreadSummary {
@@ -1042,6 +1034,21 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         jump,
     };
     (message, rich.files)
+}
+
+/// A system-message jump stays in this channel. A reference or quoted message in another
+/// channel is still a quote, and it is not a clickable jump.
+fn jump_target(posted: &Posted, kind: u8) -> Option<String> {
+    if !matches!(kind, 6 | 18 | 21 | 46) {
+        return None;
+    }
+    let reference = posted.message_reference.as_ref();
+    let referenced = posted.referenced_message.as_deref();
+    let same = |channel: Option<&str>| channel.is_none_or(|id| id.is_empty() || id == posted.channel_id);
+    if !same(reference.and_then(|item| item.channel_id.as_deref())) || !same(referenced.map(|item| item.channel_id.as_str())) {
+        return None;
+    }
+    reference.and_then(|item| item.message_id.clone()).or_else(|| (kind == 21).then(|| referenced.map(|item| item.id.clone())).flatten())
 }
 
 /// The first embed a bot or webhook composed (`by_bot`, type `rich`) is the message's card;
@@ -1403,7 +1410,17 @@ mod tests {
         let (poll_msg, _) = message(&poll_res, &place);
         assert_eq!(poll_msg.jump.as_deref(), Some("9002"));
 
-        // Thread starter (type 21) quotes referenced_message and carries jump.
+        // A pin in another channel is quoted only when the message is included; it is not a jump.
+        let mut far_pin = make(6, "");
+        far_pin.message_reference = Some(model::Reference {
+            message_id: Some("9003".into()),
+            channel_id: Some("999".into()),
+            guild_id: Some("4000".into()),
+            kind: 0,
+        });
+        assert!(message(&far_pin, &place).0.jump.is_none());
+
+        // Thread starter (type 21) quotes referenced_message. A starter in another channel is not a jump.
         let starter: Posted = serde_json::from_value(serde_json::json!({
             "id": "500", "channel_id": "4500", "type": 21, "content": "",
             "author": {"id": "300", "username": "ana", "global_name": "Ana"},
@@ -1416,7 +1433,7 @@ mod tests {
         .unwrap();
         let (starter_msg, _) = message(&starter, &place);
         assert_eq!(starter_msg.kind, MessageKind::System);
-        assert_eq!(starter_msg.jump.as_deref(), Some("499"));
+        assert!(starter_msg.jump.is_none(), "a thread starter does not jump into its parent channel");
         let quote = starter_msg.reply_to.as_ref().expect("thread starter carries quoted original");
         assert_eq!((quote.id.as_str(), quote.sender.as_str(), quote.snippet.as_str()), ("499", "Ben", "Let's plan the release"));
 

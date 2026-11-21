@@ -214,6 +214,20 @@ pub(super) fn slowmode_exempt(perms: u64, thread: bool) -> bool {
     perms & mask != 0
 }
 
+/// A thread is read-only while this account is timed out, while it is locked and this account
+/// cannot manage threads, or while this account cannot send in threads.
+pub(super) fn thread_read_only(timed_out: Option<i64>, now: i64, locked: bool, rights: &protocol::ConversationRights) -> (bool, String) {
+    if let Some(until) = timed_out {
+        (true, timeout_reason(until, now))
+    } else if locked && !rights.manage_threads {
+        (true, "This thread is locked.".to_owned())
+    } else if !rights.send_in_threads {
+        (true, String::new())
+    } else {
+        (false, String::new())
+    }
+}
+
 impl GuildInfo {
     /// Unix seconds when our server timeout ends, if still active.
     pub(super) fn timed_out(&self, now: i64) -> Option<i64> {
@@ -281,6 +295,7 @@ impl GuildInfo {
             create_private_threads: timed_out.is_none() && kind == ConversationKind::Channel && (perms & CREATE_PRIVATE_THREADS != 0),
             send_in_threads: timed_out.is_none() && (perms & SEND_MESSAGES_IN_THREADS != 0),
             manage_threads: timed_out.is_none() && (perms & MANAGE_THREADS != 0),
+            slowmode_exempt: slowmode_exempt(perms, false),
             ..protocol::ConversationRights::default()
         };
         let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
@@ -301,7 +316,7 @@ impl GuildInfo {
             private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
             opted_out: self.quiet.opted_out(&channel.id, parent),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
-            slowmode_seconds: if slowmode_exempt(perms, false) { 0 } else { channel.rate_limit_per_user },
+            slowmode_seconds: channel.rate_limit_per_user,
             ..ConversationRow::new(&channel.id, kind, name)
         })
     }
@@ -440,14 +455,9 @@ impl Discord {
             let is_owner = thread.owner_id.as_deref() == Some(me);
             thread_rights.add_members = timed_out.is_none() && (thread_rights.send_in_threads || thread_rights.manage_threads);
             thread_rights.rename = timed_out.is_none() && (thread_rights.manage_threads || is_owner);
+            thread_rights.slowmode_exempt = slowmode_exempt(*parent_perms, true);
             let locked = thread.thread_metadata.as_ref().is_some_and(|m| m.locked);
-            let (read_only, read_only_reason) = if let Some(until) = timed_out {
-                (true, timeout_reason(until, clock))
-            } else if locked && !thread_rights.manage_threads {
-                (true, "This thread is locked.".to_owned())
-            } else {
-                (false, String::new())
-            };
+            let (read_only, read_only_reason) = thread_read_only(timed_out, clock, locked, &thread_rights);
             let row = ConversationRow {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
@@ -456,7 +466,7 @@ impl Discord {
                 read_only,
                 read_only_reason,
                 rights: thread_rights,
-                slowmode_seconds: if slowmode_exempt(*parent_perms, true) { 0 } else { thread.rate_limit_per_user },
+                slowmode_seconds: thread.rate_limit_per_user,
                 locked,
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
@@ -501,11 +511,13 @@ impl Discord {
     fn plant(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> rusqlite::Result<()> {
         let tree = self.tree(guild, info, me, read);
         self.ctx.tree(&guild.id, &tree.groups, &tree.rows)?;
+        self.release_idle_slowmode(&tree.rows);
         // A post is told alone: it holds no place in the tree, so the tree's replacement
         // would not keep it.
         for post in &tree.posts {
             self.ctx.conversation(post)?;
         }
+        self.release_idle_slowmode(&tree.posts);
         let now = now();
         // CONTRACT: unread state and mute are written a row at a time, each its own commit.
         // The first connect of an account with 3,000 channels is some 6,000 of them and takes
@@ -580,8 +592,8 @@ impl Discord {
     }
 
     /// Works out a server's visible channels again from what is kept of them, after a role's
-    /// permissions or our own roles changed. Unread state and threads stay as they are: the
-    /// store keeps both through a tree replacement.
+    /// permissions or our own roles changed. Unread counts stay. Child threads keep their
+    /// messages and their slowmode interval, and pick up the new rights.
     fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
         let kept: Vec<Kept> = match self.ctx.note(&format!("kept:{guild_id}")).map(|kept| serde_json::from_str(&kept)) {
             Some(Ok(kept)) => kept,
@@ -609,6 +621,13 @@ impl Discord {
             (tree, muted)
         };
         self.ctx.tree(guild_id, &tree.groups, &tree.rows)?;
+        self.release_idle_slowmode(&tree.rows);
+        self.release_idle_slowmode(&tree.posts);
+        for row in &tree.rows {
+            if matches!(row.kind, ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Forum) {
+                self.sync_child_threads(&row.id)?;
+            }
+        }
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
@@ -1261,6 +1280,8 @@ impl Discord {
                 row.space = Some(guild);
                 self.ctx.conversation(&row)?;
                 self.ctx.muted(&row.id, muted)?;
+                self.release_slowmode(&row.id, row.slowmode_seconds, row.rights.slowmode_exempt);
+                self.sync_child_threads(&row.id)?;
             }
             // It was visible and no longer is.
             None if self.ctx.known(&channel.id)?.is_some() => self.ctx.conversation_gone(&channel.id)?,
@@ -1335,20 +1356,23 @@ impl Discord {
             .space
             .as_deref()
             .and_then(|guild| self.channel_permissions(guild, &parent.key.id))
-            .map_or(parent.rights.delete_others, |perms| slowmode_exempt(perms, true));
+            .map_or(parent.rights.slowmode_exempt || parent.rights.manage_threads, |perms| slowmode_exempt(perms, true));
         let me = self.me();
         let is_owner = thread.owner_id.as_deref() == Some(me.as_str());
+        let clock = now();
+        let timed_out = parent.space.as_deref().and_then(|guild| {
+            let state = self.state.lock().unwrap();
+            state.guilds.get(guild).and_then(|info| info.timed_out(clock))
+        });
+        let open = timed_out.is_none();
         let mut thread_rights = parent.rights;
-        thread_rights.add_members = thread_rights.send_in_threads || thread_rights.manage_threads;
-        thread_rights.rename = thread_rights.manage_threads || is_owner;
+        thread_rights.add_members = open && (thread_rights.send_in_threads || thread_rights.manage_threads);
+        thread_rights.rename = open && (thread_rights.manage_threads || is_owner);
+        thread_rights.slowmode_exempt = exempt;
         let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
         let locked = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.locked);
         let followed = joined || thread.member.is_some() || known.as_ref().is_some_and(|k| k.followed);
-        let (read_only, read_only_reason) = if locked && !thread_rights.manage_threads {
-            (true, "This thread is locked.".to_owned())
-        } else {
-            (parent.read_only && !thread_rights.send_in_threads, parent.read_only_reason.clone())
-        };
+        let (read_only, read_only_reason) = thread_read_only(timed_out, clock, locked, &thread_rights);
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
@@ -1356,45 +1380,96 @@ impl Discord {
             read_only,
             read_only_reason,
             rights: thread_rights,
-            slowmode_seconds: if exempt { 0 } else { thread.rate_limit_per_user },
+            slowmode_seconds: thread.rate_limit_per_user,
             locked,
-            filing: Some(Filing {
-                archived,
-                followed,
-                ..Filing::default()
-            }),
+            filing: Some(super::kept_filing(known.as_ref(), archived, followed)),
             ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
         };
         // An archived thread leaves the tree, and a forum's posts were never in it
         // (`polish/01` §3): both stay recorded, read by their parent.
         let in_tree = !archived && followed && parent.kind != ConversationKind::Forum;
-        if let Some(guild) = &parent.space {
-            self.ctx.set_note(&format!("guild:{}", thread.id), guild);
-        }
         if in_tree {
             row.space = parent.space.clone();
             row.group = parent.group.clone();
             row.position = parent.position + 1;
-            let mut state = self.state.lock().unwrap();
-            if let Some(info) = parent.space.as_ref().and_then(|guild| state.guilds.get_mut(guild)) {
-                info.remember(&thread.id, thread.parent_id.as_deref());
-            }
         }
-        // The note `unlist_threads` reads at the next connect follows what is listed now.
         if let Some(guild) = &parent.space {
-            let note = format!("threads:{guild}");
-            let before = self.ctx.note(&note).unwrap_or_default();
-            let mut listed: Vec<&str> = before.split(',').filter(|id| !id.is_empty() && *id != thread.id).collect();
-            if in_tree {
-                listed.push(&thread.id);
-            }
-            let listed = listed.join(",");
-            if listed != before {
-                self.ctx.set_note(&note, &listed);
-            }
+            self.note_thread_listed(guild, &thread.id, thread.parent_id.as_deref(), in_tree);
         }
         self.ctx.conversation(&row)?;
-        self.note_thread_update(&thread)?;
+        self.release_slowmode(&thread.id, row.slowmode_seconds, row.rights.slowmode_exempt);
+        Ok(())
+    }
+
+    /// Lists a thread under its server, or takes it back out, and remembers it on the guild
+    /// while it stays in the sidebar tree.
+    pub(super) fn note_thread_listed(&self, guild: &str, thread_id: &str, parent_id: Option<&str>, in_tree: bool) {
+        self.ctx.set_note(&format!("guild:{thread_id}"), guild);
+        let note = format!("threads:{guild}");
+        let before = self.ctx.note(&note).unwrap_or_default();
+        let mut listed: Vec<&str> = before.split(',').filter(|id| !id.is_empty() && *id != thread_id).collect();
+        if in_tree {
+            listed.push(thread_id);
+        }
+        let after = listed.join(",");
+        if after != before {
+            self.ctx.set_note(&note, &after);
+        }
+        if in_tree {
+            let mut state = self.state.lock().unwrap();
+            if let Some(info) = state.guilds.get_mut(guild) {
+                info.remember(thread_id, parent_id);
+            }
+        }
+    }
+
+    /// Drops a live slowmode countdown when the interval is off or this account is exempt.
+    pub(super) fn release_slowmode(&self, id: &str, seconds: u32, exempt: bool) {
+        if seconds == 0 || exempt {
+            self.ctx.slowmode_until(id, 0);
+        }
+    }
+
+    fn release_idle_slowmode(&self, rows: &[ConversationRow]) {
+        for row in rows {
+            self.release_slowmode(&row.id, row.slowmode_seconds, row.rights.slowmode_exempt);
+        }
+    }
+
+    /// Rewrites stored child threads after the parent's permissions or slowmode change.
+    /// The stored interval stays; exemption and read-only follow the parent channel's permissions.
+    fn sync_child_threads(&self, parent_id: &str) -> rusqlite::Result<()> {
+        let Some(parent) = self.ctx.known(parent_id)? else {
+            return Ok(());
+        };
+        let children = self.ctx.child_threads(parent_id)?;
+        if children.is_empty() {
+            return Ok(());
+        }
+        let perms = parent.space.as_deref().and_then(|guild| self.channel_permissions(guild, parent_id));
+        let clock = now();
+        let timed_out = parent.space.as_deref().and_then(|guild| {
+            let state = self.state.lock().unwrap();
+            state.guilds.get(guild).and_then(|info| info.timed_out(clock))
+        });
+        let exempt = match perms {
+            Some(bits) => slowmode_exempt(bits, true),
+            None => parent.rights.slowmode_exempt || parent.rights.manage_threads,
+        };
+        let open = timed_out.is_none();
+        for child in children {
+            let mut row = super::renamed(&child, &child.title);
+            let mut rights = parent.rights;
+            rights.add_members = open && (rights.send_in_threads || rights.manage_threads);
+            rights.rename = open && (rights.manage_threads || child.rights.rename);
+            rights.slowmode_exempt = exempt;
+            let (read_only, read_only_reason) = thread_read_only(timed_out, clock, child.locked, &rights);
+            row.rights = rights;
+            row.read_only = read_only;
+            row.read_only_reason = read_only_reason;
+            self.ctx.conversation(&row)?;
+            self.release_slowmode(&child.key.id, child.slowmode_seconds, exempt);
+        }
         Ok(())
     }
 

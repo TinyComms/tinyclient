@@ -412,7 +412,7 @@ pub struct ConversationRow {
     pub can_pin: bool,
     /// Whether this account has joined the conversation (`false` for an unjoined channel preview).
     pub joined: bool,
-    /// Slowmode interval in seconds (`0` when off or when this account is exempt).
+    /// Slowmode interval in seconds (`0` when off). Exemption is `rights.slowmode_exempt`.
     pub slowmode_seconds: u32,
     /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
     pub locked: bool,
@@ -1629,6 +1629,18 @@ impl Store {
                 conversation_from,
             )
             .optional()
+    }
+
+    /// Known threads whose `parent` is `parent` (active or archived, in or out of the tree).
+    pub fn child_threads(&self, parent: &Key) -> rusqlite::Result<Vec<Conversation>> {
+        let mut stmt = self.db.prepare(&format!(
+            "{CONVERSATION} WHERE c.network = ?1 AND c.account = ?2 AND c.kind = 'thread' AND c.parent = ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![word(&parent.network), parent.account, parent.id],
+            conversation_from,
+        )?;
+        rows.collect()
     }
 
     /// Lists cached conversations matching `scope` for local export. Never touches any network

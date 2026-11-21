@@ -312,7 +312,7 @@ pub fn can_with_network_topic(
         remind: act && caps.save_messages,
         unsent,
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
-        clear_reactions: act && caps.reactions && rights.delete_others && !message.reactions.is_empty(),
+        clear_reactions: act && network == Network::Discord && caps.reactions && rights.delete_others && !message.reactions.is_empty(),
     }
 }
 
@@ -1312,16 +1312,35 @@ impl Pane {
         let Some(conversation) = self.key().cloned() else {
             return;
         };
+        let mid = message_id.to_owned();
+        let evict_emoji = emoji.clone();
         let request = Request::ClearReactions {
             conversation,
-            message_id: message_id.to_owned(),
+            message_id: mid.clone(),
             emoji,
             user_id,
         };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| match answer {
-                Ok(Response::Ok) => {}
+                Ok(Response::Ok) => {
+                    match evict_emoji {
+                        Some(emoji) => {
+                            let cache_key = (mid, emoji);
+                            this.fetched_reactors.remove(&cache_key);
+                            if this.reactors_loading.as_ref() == Some(&cache_key) {
+                                this.reactors_loading = None;
+                            }
+                        }
+                        None => {
+                            this.fetched_reactors.retain(|(id, _), _| id != &mid);
+                            if this.reactors_loading.as_ref().is_some_and(|(id, _)| id == &mid) {
+                                this.reactors_loading = None;
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
                 Ok(Response::Error { detail, .. }) => this.say(detail, cx),
                 Err(err) => this.say(crate::client::trouble_words("remove reactions", &err), cx),
                 _ => {}
@@ -1871,7 +1890,10 @@ impl Pane {
     fn reactors_layer(&self, message: &Rc<Message>, reactor: usize, at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let reaction = message.reactions.get(reactor)?;
-        let can_mod = self.open.as_ref().is_some_and(|open| open.rights.delete_others || open.moderate);
+        let can_mod = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.key.network == Network::Discord && (open.rights.delete_others || open.moderate));
         let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
         let mut list = menu().w(px(248.));
         if !reaction.who.is_empty() {
@@ -3023,14 +3045,17 @@ mod tests {
         assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Voice, false, 1_100).thread);
         assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Forum, false, 1_100).thread);
 
-        // Moderator rights grant delete on others' messages, pin, and clearing reactions when present.
+        // Moderator rights grant delete on others' messages, pin, and clearing reactions on Discord only.
         let mod_rights = ConversationRights { pin: true, delete_others: true, manage_members: true, ..ConversationRights::default() };
-        let moderated = can(&theirs, &discord_caps(), mod_rights, channel, false, 1_100);
+        let moderated = can_with_network(&theirs, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100);
         assert!(moderated.delete && moderated.delete_everyone && moderated.pin && !moderated.edit && !moderated.clear_reactions);
         let mut reacted = theirs.clone();
         reacted.reactions.push(protocol::Reaction { emoji: "👍".into(), file: None, count: 2, mine: false, who: Vec::new() });
-        assert!(can(&reacted, &discord_caps(), mod_rights, channel, false, 1_100).clear_reactions);
-        assert!(!can(&reacted, &discord_caps(), none, channel, false, 1_100).clear_reactions);
+        assert!(can_with_network(&reacted, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_network(&reacted, Network::Discord, &discord_caps(), none, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_network(&reacted, Network::Tiny, &tiny_caps(), mod_rights, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_rights(&reacted, Network::Telegram, ConversationKind::Group, false, mod_rights).clear_reactions);
+        assert!(!can_with_rights(&reacted, Network::Signal, ConversationKind::Group, false, mod_rights).clear_reactions);
 
         // Slack fixture: no inline reply, threads in both channels and DMs.
         let slack = can(&theirs, &slack_caps(), none, channel, false, 1_100);

@@ -529,7 +529,6 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                     "owner_id": "1000",
                     "message_count": 2,
                     "last_message_id": "1300000000000000790",
-                    "member": {"id": "4511", "user_id": "1000"},
                     "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": 1440},
                 }),
             ];
@@ -537,7 +536,12 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 let needle = q.to_lowercase();
                 threads.retain(|t| t["name"].as_str().unwrap_or("").to_lowercase().contains(&needle));
             }
-            (200, json!({"threads": threads, "has_more": false, "total_results": threads.len()}))
+            let members: Vec<Value> = threads
+                .iter()
+                .filter(|thread| thread["id"] == "4511")
+                .map(|thread| json!({"id": thread["id"], "user_id": "1000"}))
+                .collect();
+            (200, json!({"threads": threads, "members": members, "has_more": false, "total_results": threads.len()}))
         }
         ("GET", ["channels", channel, "threads", "archived", "public"]) => (
             200,
@@ -5300,7 +5304,7 @@ fn system_messages_render_boosts_pins_thread_starter_and_all_types() {
         world.messages("4500").into_iter().find(|m| m.id == starter_id)
     });
     assert_eq!(starter.kind, MessageKind::System);
-    assert_eq!(starter.jump.as_deref(), Some("1300000000000000201"));
+    assert!(starter.jump.is_none(), "a thread starter does not jump into its parent channel");
     let quote = starter.reply_to.as_ref().expect("type 21 carries reply_to quote");
     assert_eq!(quote.snippet, "Ship it Friday");
 
@@ -5381,6 +5385,26 @@ fn moderator_manage_messages_flag_delete_others_and_clear_reactions() {
     );
     let emoji_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions/%F0%9F%94%A5", other_msg.id));
     assert_eq!(emoji_del.len(), 1);
+
+    // A custom emoji is removed as name:id, with the colon escaped.
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": "555", "name": "party_blob"}, "type": 0
+    }));
+    wait("custom reaction recorded", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.iter().any(|reaction| reaction.emoji == ":party_blob:"))
+    });
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: Some(":party_blob:".into()),
+            user_id: None,
+        }),
+        Response::Ok
+    );
+    let custom_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions/party_blob%3A555", other_msg.id));
+    assert_eq!(custom_del.len(), 1);
 
     // 3. Remove all reactions on a message: DELETE .../reactions
     world.discord.push("MESSAGE_REACTION_ADD", json!({
@@ -5488,14 +5512,72 @@ fn slowmode_reports_interval_exemption_and_cooldown() {
     }));
     wait("slowmode updated to 60", || (world.conversation("4101").slowmode_seconds == 60).then_some(()));
 
-    // Granting MANAGE_MESSAGES exempts this account from slowmode (slowmode_seconds becomes 0).
+    // Granting MANAGE_MESSAGES exempts this account. The interval stays 60 so settings can show it.
     let manage_messages: u64 = 1 << 13;
     world.discord.push("GUILD_ROLE_UPDATE", json!({
         "guild_id": "4000",
         "role": {"id": "4010", "name": "mods", "permissions": manage_messages.to_string()}
     }));
     wait("slowmode exempt for moderator", || {
-        (world.conversation("4101").slowmode_seconds == 0).then_some(())
+        let row = world.conversation("4101");
+        (row.rights.slowmode_exempt && row.slowmode_seconds == 60 && row.slowmode_until.is_none()).then_some(())
+    });
+}
+
+#[test]
+fn role_update_refreshes_child_thread_rights_and_slowmode() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("thread 4500 loaded", || (world.conversation("4500").key.id == "4500").then_some(()));
+
+    world.discord.push("CHANNEL_UPDATE", json!({
+        "id": "4101",
+        "guild_id": "4000",
+        "type": 0,
+        "name": "general",
+        "parent_id": "4100",
+        "position": 0,
+        "rate_limit_per_user": 40
+    }));
+    wait("parent slowmode 40", || (world.conversation("4101").slowmode_seconds == 40).then_some(()));
+
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: None,
+            archived: None,
+            locked: None,
+            auto_archive_minutes: None,
+            slowmode_seconds: Some(20),
+        }),
+        Response::Ok
+    );
+    wait("thread slowmode 20", || (world.conversation("4500").slowmode_seconds == 20).then_some(()));
+    let sent = world.ask(Request::Send {
+        conversation: world.key("4500"),
+        client_id: "thread-slow".into(),
+        text: "inside the thread".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    wait("thread cooldown", || world.conversation("4500").slowmode_until.filter(|until| *until > 0));
+
+    let manage_messages: u64 = 1 << 13;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": manage_messages.to_string()}
+    }));
+    wait("role update refreshes the thread without a thread event", || {
+        let thread = world.conversation("4500");
+        let parent = world.conversation("4101");
+        (thread.slowmode_seconds == 20
+            && thread.rights.slowmode_exempt
+            && thread.slowmode_until.is_none()
+            && parent.slowmode_seconds == 40
+            && parent.rights.slowmode_exempt
+            && parent.slowmode_until.is_none())
+        .then_some(())
     });
 }
 
@@ -5728,6 +5810,19 @@ fn thread_settings_rename_archive_lock_delete_notifications_and_members() {
     assert_eq!(notif[1].body["flags"], json!(8));
     assert_eq!(notif[1].body["muted"], json!(true));
     assert!(world.conversation("4500").muted);
+    let info = match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(info.notify, protocol::Notify::Nothing, "a thread's level is its own, not the parent channel's");
+
+    world.discord.push("THREAD_MEMBER_UPDATE", json!({ "id": "4500", "user_id": "1000", "flags": 2 }));
+    wait("thread member update stores all-messages", || {
+        match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+            Response::ConversationInfo { info } if info.notify == protocol::Notify::All => Some(()),
+            _ => None,
+        }
+    });
 
     // 3. ThreadUpdate PATCH sends only the specified fields (rename, slowmode, auto-archive, archive, lock).
     assert_eq!(

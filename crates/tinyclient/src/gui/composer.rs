@@ -9,8 +9,9 @@
 //!
 //! For the other views, all on `Shell`:
 //! - `composer(open, link, cx)` is the whole dock: the 20 pt typing row, the card, and the line
-//!   under it. Nothing else needs to reserve the typing slot. `thread_composer(thread, title,
-//!   link, cx)` is the same for the thread pane; it sends to the thread's key.
+//!   under it. Nothing else needs to reserve the typing slot. `thread_composer(open, link, cx)`
+//!   is the same for the thread pane; it sends to the thread's key and follows that thread's
+//!   slowmode, lock, and archive.
 //! - `composer_edit(message, cx)` and `composer_reply(message, cx)` put the open conversation's
 //!   composer in edit or reply mode; `composer_editing(cx)` is the id of the message being
 //!   edited, for tinting its row.
@@ -265,13 +266,22 @@ fn delete_later(paths: Vec<PathBuf>) {
 
 /// Remaining slowmode cooldown in seconds, or 0 when clear.
 fn slowmode_remaining(until: Option<i64>, now: i64) -> u32 {
-    until.map_or(0, |end| end.saturating_sub(now).max(0) as u32)
+    until.map_or(0, |end| {
+        let left = end.saturating_sub(now).max(0);
+        u32::try_from(left).unwrap_or(u32::MAX)
+    })
 }
 
-/// Formats a slowmode duration in concise units (`30 s`, `2 m`, `1 m 30 s`, `1 h`).
+/// Formats a slowmode duration in concise units (`30 s`, `2 m`, `1 m 30 s`, `1 h`, `1 h 1 m`).
 fn format_slowmode(seconds: u32) -> String {
-    if seconds >= 3600 && seconds % 3600 == 0 {
-        format!("{} h", seconds / 3600)
+    if seconds >= 3600 {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours} h")
+        } else {
+            format!("{hours} h {minutes} m")
+        }
     } else if seconds >= 60 && seconds % 60 == 0 {
         format!("{} m", seconds / 60)
     } else if seconds >= 60 {
@@ -312,7 +322,7 @@ struct Target {
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
     send_as: Vec<protocol::SendAs>,
-    /// Slowmode interval in seconds (0 when off or exempt).
+    /// Slowmode interval in seconds (the raw interval; 0 when off). Exemption is `rights.slowmode_exempt`.
     slowmode_seconds: u32,
     /// Unix seconds until the next send is allowed in this conversation.
     slowmode_until: Option<i64>,
@@ -846,6 +856,12 @@ impl Composer {
             .map_or(0, |target| slowmode_remaining(target.slowmode_until, now()))
     }
 
+    /// True while a non-exempt account is still inside its slowmode cooldown.
+    fn slowmode_blocks(&self) -> bool {
+        let exempt = self.target.as_ref().is_some_and(|target| target.rights.slowmode_exempt);
+        !exempt && self.slowmode_left() > 0
+    }
+
     /// Runs a 1-second repaint ticker only while a slowmode countdown is active. Never auto-sends.
     fn schedule_slowmode_tick(&mut self, cx: &mut Context<Self>) {
         if self.slowmode_left() == 0 {
@@ -1054,7 +1070,7 @@ impl Composer {
             self.save_edit(&target, cx);
             return;
         }
-        if self.slowmode_left() > 0 {
+        if self.slowmode_blocks() {
             self.schedule_at = None;
             self.schedule_slowmode_tick(cx);
             cx.notify();
@@ -1208,7 +1224,7 @@ impl Composer {
         let Some(target) = self.target.clone().filter(|target| target.locked().is_none()) else {
             return;
         };
-        if self.sending || self.slowmode_left() > 0 || !live() {
+        if self.sending || self.slowmode_blocks() || !live() {
             return;
         }
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
@@ -1991,9 +2007,12 @@ impl Composer {
                 .cursor_pointer()
                 .hover(|s| s.underline())
                 .on_click(cx.listener(|this, _, _, cx| {
+                    let can_public = this.target.as_ref().is_some_and(|target| target.rights.create_public_threads);
                     if let Some(form) = this.thread_composer.as_mut() {
-                        form.private = !form.private;
-                        cx.notify();
+                        if can_public {
+                            form.private = !form.private;
+                            cx.notify();
+                        }
                     }
                 }))
                 .child(if priv_on { "☑ Private thread" } else { "☐ Private thread" })
@@ -3652,7 +3671,7 @@ impl Composer {
         let controls = self.controls();
         let ready = !self.sending
             && !self.scan_blocks_current()
-            && (self.editing.is_some() || self.slowmode_left() == 0)
+            && (self.editing.is_some() || !self.slowmode_blocks())
             && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
@@ -3886,7 +3905,7 @@ impl Composer {
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
         let slowmode_active = || {
-            (unlocked && self.editing.is_none() && slowmode_remaining(target.slowmode_until, now()) > 0)
+            (unlocked && self.editing.is_none() && self.slowmode_blocks())
                 .then(|| slowmode_words(target.slowmode_seconds, target.slowmode_until, now()).map(|words| (words, Tone::Note)))
                 .flatten()
         };
@@ -4568,7 +4587,7 @@ impl Shell {
             can,
             send_as: self.send_as_of(&open.key),
             slowmode_seconds: open.slowmode_seconds,
-            slowmode_until: open.slowmode_until,
+            slowmode_until: (open.slowmode_seconds > 0 && !open.rights.slowmode_exempt).then_some(open.slowmode_until).flatten(),
             rights: open.rights,
             archived: open.archived,
             locked: open.locked,
@@ -4588,30 +4607,42 @@ impl Shell {
     }
 
     /// The same dock for the thread pane. A message typed here goes to the thread.
+    /// The pane's `Open` has no slowmode or lock, so those come from the held row when one exists.
     #[allow(dead_code)]
-    pub(super) fn thread_composer(&self, thread: &Key, title: &str, link: Link, cx: &mut Context<Self>) -> Div {
+    pub(super) fn thread_composer(&self, open: &super::conversation::Open, link: Link, cx: &mut Context<Self>) -> Div {
+        let held = self.held_rows().find(|row| row.key == open.key).cloned();
+        let title = held.as_ref().map(|row| row.title.clone()).unwrap_or_else(|| open.title.clone());
+        let rights = held.as_ref().map(|row| row.rights).unwrap_or(open.rights);
+        let slowmode_seconds = held.as_ref().map(|row| row.slowmode_seconds).unwrap_or(0);
+        let slowmode_until = held.as_ref().and_then(|row| {
+            (row.slowmode_seconds > 0 && !row.rights.slowmode_exempt).then_some(row.slowmode_until).flatten()
+        });
+        let mut can = self.can_of(&open.key);
+        if let Some(bytes) = held.as_ref().map(|row| row.max_file_bytes).filter(|bytes| *bytes > 0) {
+            can.max_file_bytes = can.max_file_bytes.max(bytes);
+        }
         let target = Target {
-            key: thread.clone(),
-            title: title.to_owned(),
+            key: open.key.clone(),
+            title,
             kind: ConversationKind::Thread,
             link,
-            space: None,
-            read_only: false,
-            read_only_reason: String::new(),
-            joined: true,
+            space: held.as_ref().and_then(|row| row.space.clone()),
+            read_only: held.as_ref().is_some_and(|row| row.read_only),
+            read_only_reason: held.as_ref().map(|row| row.read_only_reason.clone()).unwrap_or_default(),
+            joined: held.as_ref().map(|row| row.joined).unwrap_or(true),
             blocked_peer: None,
-            special: protocol::Special::None,
-            can: self.can_of(thread),
-            send_as: self.send_as_of(thread),
-            slowmode_seconds: 0,
-            slowmode_until: None,
-            rights: protocol::ConversationRights::default(),
-            archived: false,
-            locked: false,
+            special: held.as_ref().map(|row| row.special).unwrap_or(protocol::Special::None),
+            can,
+            send_as: self.send_as_of(&open.key),
+            slowmode_seconds,
+            slowmode_until,
+            rights,
+            archived: held.as_ref().is_some_and(|row| row.archived),
+            locked: held.as_ref().is_some_and(|row| row.locked),
         };
+        let draft = held.as_ref().map(|row| row.draft.as_str()).unwrap_or("");
         let composer = self.composer_in(true, cx);
-        // A thread's row is not handed over, so its draft is the one this window remembers.
-        composer.update(cx, |composer, cx| composer.aim(target, "", cx));
+        composer.update(cx, |composer, cx| composer.aim(target, draft, cx));
         div().flex_none().child(composer)
     }
 
@@ -4999,14 +5030,13 @@ impl Shell {
         let check = |slot: &OnceCell<Entity<Composer>>| {
             slot.get()
                 .and_then(|composer| {
-                    composer
-                        .read(cx)
-                        .target
-                        .as_ref()
-                        .filter(|target| &target.key == conversation)
-                        .and_then(|target| target.slowmode_until)
+                    let target = composer.read(cx).target.as_ref().filter(|target| &target.key == conversation)?.clone();
+                    if target.rights.slowmode_exempt {
+                        return Some(0);
+                    }
+                    Some(slowmode_remaining(target.slowmode_until, clock))
                 })
-                .map_or(0, |until| slowmode_remaining(Some(until), clock))
+                .unwrap_or(0)
         };
         check(&self.composer_state.main).max(check(&self.composer_state.thread))
     }
@@ -5271,6 +5301,9 @@ mod tests {
         assert_eq!(slowmode_remaining(Some(1012), 1000), 12);
         assert_eq!(slowmode_remaining(Some(1000), 1000), 0);
         assert_eq!(slowmode_words(30, Some(1000), 1000).as_deref(), Some("Slowmode · 30 s"));
+        assert_eq!(format_slowmode(3600), "1 h");
+        assert_eq!(format_slowmode(3661), "1 h 1 m");
+        assert_eq!(format_slowmode(7200), "2 h");
     }
 
     #[test]

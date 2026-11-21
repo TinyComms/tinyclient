@@ -102,6 +102,9 @@ struct ThreadMemberUpdate {
     id: String,
     #[serde(default)]
     user_id: Option<String>,
+    /// Discord thread notification flags. Absent on older events.
+    #[serde(default)]
+    flags: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +190,9 @@ impl Discord {
                 let me = self.me();
                 if update.user_id.as_deref().is_none_or(|id| id == me) {
                     self.set_thread_membership(&update.id, true)?;
+                    if let Some(word) = update.flags.and_then(super::info::thread_notify_word) {
+                        self.note_thread_notify(&update.id, word);
+                    }
                 }
             }
             "THREAD_MEMBERS_UPDATE" => {

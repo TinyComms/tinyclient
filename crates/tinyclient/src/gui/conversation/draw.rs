@@ -282,7 +282,7 @@ fn system_line_div(pane: &Pane, message: &Message, cx: &mut Context<Pane>) -> Di
         div().max_w(px(MEASURE)).child(message.text.clone()).into_any_element()
     };
     let quote_el = message.reply_to.as_ref().map(|reply| {
-        let target = reply.id.clone();
+        let target = message.jump.as_ref().filter(|id| !id.is_empty()).cloned();
         let snippet = if reply.deleted {
             "Original message was deleted".to_owned()
         } else if reply.sender.is_empty() {
@@ -301,13 +301,13 @@ fn system_line_div(pane: &Pane, message: &Message, cx: &mut Context<Pane>) -> Di
             .text_color(theme::text_soft())
             .truncate()
             .child(snippet);
-        if target.is_empty() {
-            row
-        } else {
+        if let Some(target) = target {
             row.cursor_pointer()
                 .hover(|style| style.text_color(theme::text()))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| this.jump_to(&target, cx)))
+        } else {
+            row
         }
     });
     div()

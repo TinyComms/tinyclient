@@ -1551,6 +1551,11 @@ impl Context {
         self.hub.store().conversation(&self.key(conversation_id))
     }
 
+    /// Known threads whose parent conversation is `parent_id`.
+    pub fn child_threads(&self, parent_id: &str) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        self.hub.store().child_threads(&self.key(parent_id))
+    }
+
     pub(crate) fn unread_telegram_channels(&self, after: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
         self.hub.store().unread_telegram_channels(&self.account, after, limit)
     }

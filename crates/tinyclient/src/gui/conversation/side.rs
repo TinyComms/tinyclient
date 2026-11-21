@@ -1839,7 +1839,7 @@ fn draw_thread(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> An
     let Some(thread) = thread.filter(|_| thread_belongs(conversation, shell.open_key())) else {
         return div().into_any_element();
     };
-    let target = thread.read(cx).open.as_ref().map(|open| (open.key.clone(), open.title.clone()));
+    let open = thread.read(cx).open.clone();
     let link = shell.snapshot.as_ref().map_or(Link::Offline, |snapshot| snapshot.account_link(conversation));
     div()
         .size_full()
@@ -1847,7 +1847,7 @@ fn draw_thread(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> An
         .flex_col()
         .bg(theme::canvas())
         .child(div().flex_1().min_h_0().child(thread))
-        .children(target.map(|(key, title)| shell.thread_composer(&key, &title, link, cx)))
+        .children(open.as_ref().map(|open| shell.thread_composer(open, link, cx)))
         .into_any_element()
 }
 

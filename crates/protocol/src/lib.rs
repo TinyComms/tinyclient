@@ -573,7 +573,7 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
-    /// Slowmode interval in seconds (`0` when off or when this account is exempt).
+    /// Slowmode interval in seconds. `0` when off. Exemption is [`ConversationRights::slowmode_exempt`], not a zeroed interval.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub slowmode_seconds: u32,
     /// Unix seconds until this account may send again in a slowmode conversation. Never stored:
@@ -3672,6 +3672,7 @@ mod tests {
             create_private_threads: true,
             send_in_threads: true,
             manage_threads: true,
+            slowmode_exempt: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }
