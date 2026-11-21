@@ -1979,7 +1979,34 @@ impl Shell {
             menu = menu.child(super::components::menu_separator());
         }
         let account = current.as_ref().map(Key::account);
-        let name = current.as_ref().and_then(|key| self.spaces.iter().find(|s| &s.key == key)).map_or_else(String::new, |s| s.name.clone());
+        let is_grid = account.as_ref().is_some_and(|a| a.account.starts_with('E'));
+        if is_grid {
+            if let Some(org_id) = account.as_ref().map(|a| a.account.clone()) {
+                let browse_url = format!("https://app.slack.com/client/{org_id}");
+                menu = menu.child(
+                    super::components::menu_item("slack-browse-workspaces", None, "Browse workspaces").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.sidebar_state.slack_menu = false;
+                            cx.open_url(&browse_url);
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+        }
+        let name = if is_grid {
+            account
+                .as_ref()
+                .and_then(|acc| snapshot.accounts.iter().find(|a| a.key == *acc))
+                .map(|a| a.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Slack".to_owned())
+        } else {
+            current
+                .as_ref()
+                .and_then(|key| self.spaces.iter().find(|s| &s.key == key))
+                .map_or_else(String::new, |s| s.name.clone())
+        };
         menu = menu.child(super::components::menu_item_danger("slack-sign-out", Some("icons/log-out.svg"), format!("Sign out of {name}")).on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_state.slack_menu = false;
             if let Some(account) = account.clone() {

@@ -1,5 +1,6 @@
 //! Slack, with the session the web client uses: its API for the sidebar, history and sending, and
-//! its websocket for everything live. One adapter is one workspace, with a socket of its own.
+//! its websocket for everything live. One adapter is one workspace, or one Enterprise Grid
+//! organisation, with a socket of its own.
 //!
 //! Slack documents its public API; several calls here are the web client's own and are marked
 //! "unverified" where no primary source confirmed their shape. The integrator should check those
@@ -95,13 +96,21 @@ const DEMANDS: &[(&str, &str)] = &[
 /// Addresses Slack itself serves. Nothing else in a message is ever registered for fetching.
 const HOSTS: &[&str] = &["slack.com", "slack-edge.com", "slack-imgs.com", "slack-files.com"];
 
-/// One workspace's part of the sign-in: what `accounts` hands to `start`.
+/// One workspace under an Enterprise Grid org. The org account holds these; each becomes a Space.
+#[derive(Deserialize)]
+struct Workspace {
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// One workspace's part of the sign-in, or one Enterprise Grid org: what `accounts` hands to `start`.
 #[derive(Deserialize)]
 struct Session {
     token: String,
     /// The `d` cookie, as the browser stored it. One for every workspace of the sign-in.
     cookie: String,
-    /// The workspace's own address, `https://example.slack.com/`.
+    /// The workspace's own address, `https://example.slack.com/`, or the org's for a Grid account.
     url: String,
     #[serde(default)]
     team_id: String,
@@ -109,6 +118,15 @@ struct Session {
     /// agent changes as an anomaly, so every request and the socket carry this one.
     #[serde(default)]
     user_agent: String,
+    /// Workspaces of an Enterprise Grid org. Empty for a standalone workspace.
+    #[serde(default)]
+    workspaces: Vec<Workspace>,
+    /// The org id (`E…`) when this session is one Enterprise Grid organisation.
+    #[serde(default)]
+    enterprise_id: String,
+    /// The org's display name. Empty for a standalone workspace.
+    #[serde(default)]
+    enterprise_name: String,
 }
 
 /// Why a call to Slack failed. Deliberately not `Display`: it becomes a [`Failure`] or words
@@ -456,6 +474,8 @@ struct Slack {
     ctx: Context,
     agent: ureq::Agent,
     session: Session,
+    /// The `xoxc` token. Replaced when Slack rotates it, the way [`Self::cookie`] is.
+    token: Mutex<String>,
     /// `d=…`, sent with every request and the socket. Replaced when Slack reissues it.
     cookie: Mutex<String>,
     /// Where the API is: the workspace's own address unless a test moved it.
@@ -495,27 +515,62 @@ fn team_id(team: &Value) -> &str {
     }
 }
 
-/// One account per workspace. They share the sign-in's cookie and User-Agent and nothing else.
-///
-/// Enterprise Grid is not treated specially: each workspace of an org is its own account, so
-/// org-wide channels and direct messages appear under each of them. Making an org one account
-/// needs the org-level token, which this has not been run against.
+fn shown_name<'a>(team: &'a Value, url: &'a str, id: &'a str) -> &'a str {
+    match text_of(team, &["name", "team"]) {
+        "" => host(url).split('.').next().unwrap_or(id),
+        name => name,
+    }
+}
+
+/// One account per standalone workspace. An Enterprise Grid org whose sign-in carries an org
+/// token is one account: its workspaces are Spaces under that account, so an org-wide channel
+/// and a direct message are listed once. A workspace whose org has no token stays its own account.
+/// The org-token shape is what the sign-in helper records; it has not been run against a live org.
 pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     let parsed: Value = serde_json::from_str(session).map_err(|err| err.to_string())?;
     let cookie = parsed["cookie"].as_str().ok_or("the Slack session has no cookie")?;
+    let agent = text_of(&parsed, &["user_agent"]);
     let mut found: Vec<Signed> = Vec::new();
+    let mut covered: HashSet<String> = HashSet::new();
+    for org in parsed["enterprises"].as_array().into_iter().flatten() {
+        let (token, url, id) = (text_of(org, &["token"]), text_of(org, &["url"]), team_id(org));
+        if token.is_empty() || url.is_empty() || !id.starts_with('E') || found.iter().any(|signed| signed.account == id) {
+            continue;
+        }
+        let name = shown_name(org, url, id);
+        let workspaces: Vec<Value> = teams(&parsed)
+            .into_iter()
+            .filter(|team| text_of(team, &["enterprise_id"]) == id && team_id(team) != id)
+            .map(|team| {
+                let wid = team_id(team);
+                json!({"id": wid, "name": shown_name(team, text_of(team, &["url"]), wid)})
+            })
+            .collect();
+        covered.insert(id.to_owned());
+        let session = json!({
+            "token": token, "cookie": cookie, "url": url, "team_id": id,
+            "user_agent": agent, "enterprise_id": id, "enterprise_name": name,
+            "workspaces": workspaces,
+        });
+        found.push(Signed {
+            account: id.to_owned(),
+            name: name.to_owned(),
+            session: session.to_string(),
+        });
+    }
     for team in teams(&parsed) {
+        let ent = text_of(team, &["enterprise_id"]);
+        if !ent.is_empty() && covered.contains(ent) {
+            continue;
+        }
         let (token, url, id) = (text_of(team, &["token"]), text_of(team, &["url"]), team_id(team));
         if token.is_empty() || url.is_empty() || found.iter().any(|signed| signed.account == id) {
             continue;
         }
-        let name = match text_of(team, &["name", "team"]) {
-            "" => host(url).split('.').next().unwrap_or(id),
-            name => name,
-        };
+        let name = shown_name(team, url, id);
         let session = json!({
             "token": token, "cookie": cookie, "url": url, "team_id": id,
-            "user_agent": text_of(&parsed, &["user_agent"]),
+            "user_agent": agent,
         });
         found.push(Signed {
             account: id.to_owned(),
@@ -535,12 +590,25 @@ pub(crate) fn prove_custom_emoji() -> Result<(), String> {
     message::prove_custom_emoji()
 }
 
-/// The session without one workspace, or `None` when it was the last.
+/// The session without one workspace or one org, or `None` when it was the last.
+/// Signing an org out also drops the workspaces that belonged to it.
 pub fn without(session: &str, account: &str) -> Option<String> {
     let mut parsed: Value = serde_json::from_str(session).ok()?;
-    let teams = parsed["teams"].as_array_mut()?;
-    teams.retain(|team| team_id(team) != account);
-    if teams.is_empty() {
+    let had_teams = parsed["teams"].is_array();
+    if let Some(teams) = parsed["teams"].as_array_mut() {
+        teams.retain(|team| team_id(team) != account && text_of(team, &["enterprise_id"]) != account);
+    } else if !parsed["enterprises"].is_array() {
+        return None;
+    }
+    if let Some(orgs) = parsed["enterprises"].as_array_mut() {
+        orgs.retain(|org| team_id(org) != account);
+    }
+    if parsed["enterprises"].as_array().is_some_and(|orgs| orgs.is_empty()) {
+        parsed.as_object_mut()?.remove("enterprises");
+    }
+    let teams_left = parsed["teams"].as_array().is_some_and(|teams| !teams.is_empty());
+    let orgs_left = parsed["enterprises"].as_array().is_some_and(|orgs| !orgs.is_empty());
+    if (!had_teams && !orgs_left) || (!teams_left && !orgs_left) {
         return None;
     }
     Some(parsed.to_string())
@@ -556,6 +624,40 @@ fn recookied(stored: &str, old: &str, fresh: &str) -> Option<String> {
     }
     parsed["cookie"] = fresh.into();
     Some(parsed.to_string())
+}
+
+/// The stored session with one account's token replaced, when it still holds the token this
+/// adapter was started with. Another save may have stored a newer one already; then it is left
+/// alone. The same rule as [`recookied`], for the `xoxc` token Slack rotates.
+fn retokened(stored: &str, account: &str, old: &str, fresh: &str) -> Option<String> {
+    if old.is_empty() || fresh.is_empty() || old == fresh {
+        return None;
+    }
+    let mut parsed: Value = serde_json::from_str(stored).ok()?;
+    let mut changed = false;
+    let replace = |entry: &mut Value| {
+        if team_id(entry) == account && entry["token"].as_str() == Some(old) {
+            entry["token"] = fresh.into();
+            true
+        } else {
+            false
+        }
+    };
+    if let Some(orgs) = parsed["enterprises"].as_array_mut() {
+        for org in orgs {
+            changed |= replace(org);
+        }
+    }
+    if let Some(teams) = parsed["teams"].as_array_mut() {
+        for team in teams {
+            changed |= replace(team);
+        }
+    }
+    if parsed["token"].as_str() == Some(old) && text_of(&parsed, &["team_id", "id"]) == account {
+        parsed["token"] = fresh.into();
+        changed = true;
+    }
+    changed.then(|| parsed.to_string())
 }
 
 /// Parses the session and returns at once: everything that could be slow (finding out which
@@ -589,6 +691,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         let slack = Arc::new(Slack {
             ctx,
             agent,
+            token: Mutex::new(session.token.clone()),
             cookie: Mutex::new(format!("d={}", session.cookie)),
             edge: if moved { format!("{api}cache/") } else { "https://edgeapi.slack.com/cache/".to_owned() },
             api,
@@ -707,6 +810,43 @@ impl Slack {
         crate::hub::lock(&self.cookie).clone()
     }
 
+    /// The `xoxc` token in use now. Slack rotates it; the stored session is updated beside the cookie.
+    pub(super) fn token(&self) -> String {
+        crate::hub::lock(&self.token).clone()
+    }
+
+    /// True when this account is one Enterprise Grid org with its workspaces listed under it.
+    pub(super) fn is_enterprise(&self) -> bool {
+        self.ctx.account.account.starts_with('E') && !self.session.workspaces.is_empty()
+    }
+
+    /// The id the websocket names. On Enterprise Grid that is the org, which is what the web
+    /// client is believed to send. Unverified against a live org.
+    fn gateway(&self) -> String {
+        if self.is_enterprise() && !self.session.enterprise_id.is_empty() {
+            return self.session.enterprise_id.clone();
+        }
+        self.session.team_id.clone()
+    }
+
+    /// A response that carries a new `xoxc` token replaces the one in use and is saved, the same
+    /// way a reissued `d` cookie is. Unverified: which answers include it was not seen.
+    fn note_token(&self, body: &Value) {
+        let Some(fresh) = body.get("token").and_then(Value::as_str).filter(|token| token.starts_with("xoxc-")) else {
+            return;
+        };
+        let old = {
+            let mut held = crate::hub::lock(&self.token);
+            if held.as_str() == fresh {
+                return;
+            }
+            std::mem::replace(&mut *held, fresh.to_owned())
+        };
+        let account = self.ctx.account.account.clone();
+        let fresh = fresh.to_owned();
+        self.ctx.save_session(move |stored| retokened(stored, &account, &old, &fresh));
+    }
+
     /// True for an address Slack serves: its files, avatars, emoji and image proxy.
     fn hosted(&self, url: &str) -> bool {
         (self.moved && url.starts_with(&self.api))
@@ -727,7 +867,7 @@ impl Slack {
     /// agent, `net::browser()`, which is this session's browser only while the Safari installed
     /// is the one the user signed in with.
     fn download(&self, url: String) -> Download {
-        let headers = download_headers(&self.session.user_agent, &self.session.token, &self.cookie(), self.private(&url));
+        let headers = download_headers(&self.session.user_agent, &self.token(), &self.cookie(), self.private(&url));
         Download { url, headers, sealed: None }
     }
 
@@ -818,7 +958,8 @@ impl Slack {
     fn api(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, Fault> {
         self.halted(method)?;
         let url = format!("{}api/{method}", self.api);
-        let mut form = vec![("token", self.session.token.as_str())];
+        let token = self.token();
+        let mut form = vec![("token", token.as_str())];
         form.extend(params.iter().filter(|(_, value)| !value.is_empty()));
         let net = |err: ureq::Error| Fault::Net(format!("{method}: {err}"));
         let stopped = || Fault::Net(format!("{method}: stopped"));
@@ -833,6 +974,9 @@ impl Slack {
             let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
             let limited = response.status().as_u16() == 429;
             let body: Value = if limited { Value::Null } else { response.body_mut().read_json().map_err(net)? };
+            if !limited {
+                self.note_token(&body);
+            }
             if !limited && body["error"] != "ratelimited" {
                 return self.checked(method, body);
             }
@@ -853,13 +997,13 @@ impl Slack {
     /// bots and apps): the web client derives the address from the token and the workspace,
     /// every time it connects. Unverified against a real workspace; the form is the one
     /// wee-slack uses for the same kind of token, `gateway_server=<team>-1` included. On
-    /// Enterprise Grid the web client is believed to name the org there; that was not confirmed
-    /// either, so the workspace's own id is kept.
+    /// Enterprise Grid the gateway names the org.
     fn socket_url(&self) -> String {
         let base = address("TINYCLIENT_SLACK_SOCKET", "wss://wss-primary.slack.com/");
         format!(
             "{base}?token={}&gateway_server={}-1&slack_client=desktop&batch_presence_aware=1",
-            self.session.token, self.session.team_id
+            self.token(),
+            self.gateway()
         )
     }
 
@@ -888,7 +1032,12 @@ impl Slack {
         }
         let me = auth["user_id"].as_str().unwrap_or_default();
         let _ = self.me.set(me.to_owned());
-        let name = auth["team"].as_str().unwrap_or_default();
+        let team = auth["team"].as_str().unwrap_or_default();
+        let name = if self.is_enterprise() && !self.session.enterprise_name.is_empty() {
+            self.session.enterprise_name.as_str()
+        } else {
+            team
+        };
         self.ctx.describe(name, me)?;
         self.ctx.capabilities(capabilities());
         self.space(name)?;
@@ -3133,6 +3282,68 @@ mod tests {
         let ids: Vec<String> = accounts(&left).unwrap().into_iter().map(|signed| signed.account).collect();
         assert_eq!(ids, ["T2"]);
         assert_eq!(without(&without(&left, "T3").unwrap(), "T2"), None);
+    }
+
+    #[test]
+    fn an_enterprise_grid_org_is_one_account_and_its_workspaces_are_not() {
+        let session = json!({
+            "cookie": "xoxd-abc", "user_agent": "Safari/1",
+            "enterprises": [{"id": "E9", "name": "Acme Org", "url": "https://acme.enterprise.slack.com/", "token": "xoxc-org"}],
+            "teams": [
+                {"id": "T1", "name": "Acme", "url": "https://acme.slack.com/", "token": "", "enterprise_id": "E9"},
+                {"id": "T2", "name": "Side", "url": "https://side.slack.com/", "token": "xoxc-2", "enterprise_id": "E9"},
+                {"id": "T3", "name": "Other", "url": "https://other.slack.com/", "token": "xoxc-3", "enterprise_id": ""},
+            ],
+        })
+        .to_string();
+        let found = accounts(&session).unwrap();
+        let listed: Vec<(&str, &str)> = found.iter().map(|signed| (signed.account.as_str(), signed.name.as_str())).collect();
+        assert_eq!(listed, [("E9", "Acme Org"), ("T3", "Other")]);
+        let org: Session = serde_json::from_str(&found[0].session).unwrap();
+        assert_eq!((org.token.as_str(), org.team_id.as_str(), org.enterprise_id.as_str()), ("xoxc-org", "E9", "E9"));
+        assert_eq!(org.enterprise_name.as_str(), "Acme Org");
+        let spaces: Vec<(&str, &str)> = org.workspaces.iter().map(|workspace| (workspace.id.as_str(), workspace.name.as_str())).collect();
+        assert_eq!(spaces, [("T1", "Acme"), ("T2", "Side")]);
+        let left = without(&session, "E9").unwrap();
+        let ids: Vec<String> = accounts(&left).unwrap().into_iter().map(|signed| signed.account).collect();
+        assert_eq!(ids, ["T3"]);
+        assert_eq!(without(&left, "T3"), None);
+    }
+
+    #[test]
+    fn a_channel_is_filed_under_one_workspace_of_the_org() {
+        let known = ["T1", "T2"];
+        let org_wide = json!({"id": "C0", "context_team_id": "EOTHER"});
+        assert_eq!(tree::workspace_of(&org_wide, &known, "T1"), "T1");
+        let named = json!({"id": "C1", "team": "T2"});
+        assert_eq!(tree::workspace_of(&named, &known, "T1"), "T2");
+        let shared = json!({"id": "C2", "shared_team_ids": ["EOTHER", "T1", "T2"]});
+        assert_eq!(tree::workspace_of(&shared, &known, "T1"), "T1");
+        let internal = json!({"id": "C3", "internal_team_ids": ["T2"]});
+        assert_eq!(tree::workspace_of(&internal, &known, "T1"), "T2");
+    }
+
+    #[test]
+    fn a_rotated_token_replaces_only_the_account_that_still_holds_the_old_one() {
+        let stored = json!({
+            "cookie": "xoxd-old",
+            "enterprises": [{"id": "E9", "token": "xoxc-org", "url": "https://acme.enterprise.slack.com/"}],
+            "teams": [
+                {"id": "T1", "token": "xoxc-1", "url": "https://a.slack.com/", "enterprise_id": "E9"},
+                {"id": "T3", "token": "xoxc-3", "url": "https://other.slack.com/"},
+            ],
+        })
+        .to_string();
+        let fresh: Value = serde_json::from_str(&retokened(&stored, "E9", "xoxc-org", "xoxc-new").unwrap()).unwrap();
+        assert_eq!(fresh["enterprises"][0]["token"], "xoxc-new");
+        assert_eq!(fresh["teams"][0]["token"], "xoxc-1");
+        assert_eq!(fresh["teams"][1]["token"], "xoxc-3");
+        assert_eq!(fresh["cookie"], "xoxd-old");
+        assert_eq!(retokened(&fresh.to_string(), "E9", "xoxc-org", "xoxc-other"), None);
+        assert_eq!(retokened(&stored, "T3", "xoxc-3", "xoxc-3"), None);
+        let team: Value = serde_json::from_str(&retokened(&stored, "T3", "xoxc-3", "xoxc-4").unwrap()).unwrap();
+        assert_eq!(team["teams"][1]["token"], "xoxc-4");
+        assert_eq!(team["enterprises"][0]["token"], "xoxc-org");
     }
 
     #[test]

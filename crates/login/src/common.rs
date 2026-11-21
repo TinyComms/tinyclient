@@ -62,26 +62,68 @@ pub fn user_agent() -> String {
 pub fn slack_session(local_config: &str) -> Option<serde_json::Value> {
     let config: serde_json::Value = serde_json::from_str(local_config).ok()?;
     let text = |value: &serde_json::Value| value.as_str().unwrap_or("").to_owned();
-    let teams: Vec<serde_json::Value> = config["teams"]
-        .as_object()?
+    let mut enterprises: Vec<serde_json::Value> = Vec::new();
+    if let Some(orgs) = config["enterprises"].as_object() {
+        for (id, org) in orgs {
+            let token = text(&org["token"]);
+            let url = text(&org["url"]);
+            if token.is_empty() || url.is_empty() {
+                continue;
+            }
+            enterprises.push(serde_json::json!({
+                "id": id,
+                "name": text(&org["name"]),
+                "url": url,
+                "token": token,
+                "enterprise_id": id,
+            }));
+        }
+    }
+    let org_ids_with_token: std::collections::HashSet<String> = enterprises
         .iter()
-        .filter(|(_, team)| !text(&team["token"]).is_empty() && !text(&team["url"]).is_empty())
-        .map(|(id, team)| {
-            serde_json::json!({
+        .filter_map(|org| org["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut teams: Vec<serde_json::Value> = Vec::new();
+    if let Some(map) = config["teams"].as_object() {
+        for (id, team) in map {
+            let token = text(&team["token"]);
+            let url = text(&team["url"]);
+            let ent_id = text(&team["enterprise_id"]);
+            let covered_by_org = !ent_id.is_empty() && org_ids_with_token.contains(&ent_id);
+            if url.is_empty() || (token.is_empty() && !covered_by_org) {
+                continue;
+            }
+            let mut entry = serde_json::json!({
                 "id": id,
                 "name": text(&team["name"]),
-                "url": text(&team["url"]),
-                "token": text(&team["token"]),
-                "enterprise_id": text(&team["enterprise_id"]),
-            })
-        })
-        .collect();
-    let first = text(&teams.first()?["id"]);
+                "url": url,
+                "token": token,
+                "enterprise_id": ent_id,
+            });
+            let ent_name = text(&team["enterprise_name"]);
+            if !ent_name.is_empty() {
+                entry["enterprise_name"] = ent_name.into();
+            }
+            teams.push(entry);
+        }
+    }
+    if teams.is_empty() && enterprises.is_empty() {
+        return None;
+    }
+    let first = teams
+        .first()
+        .or_else(|| enterprises.first())
+        .map(|entry| text(&entry["id"]))
+        .unwrap_or_default();
     let active = match config["lastActiveTeamId"].as_str() {
         Some(active) if !active.is_empty() => active.to_owned(),
         _ => first,
     };
-    Some(serde_json::json!({"teams": teams, "active": active}))
+    let mut out = serde_json::json!({"teams": teams, "active": active});
+    if !enterprises.is_empty() {
+        out["enterprises"] = serde_json::Value::Array(enterprises);
+    }
+    Some(out)
 }
 
 pub fn web_client(url: &str) -> bool {
@@ -389,6 +431,27 @@ mod tests {
             "enterprise_id":"E9"}},"lastActiveTeamId":"T1"}"#;
         assert_eq!(slack_session(listed), None);
         assert_eq!(slack_session(r#"{"teams":{"T1":{"url":"https://a.slack.com/","token":""}}}"#), None);
+    }
+
+    #[test]
+    fn an_org_token_keeps_workspaces_whose_own_tokens_are_empty() {
+        let config = r#"{"teams":{
+            "T1":{"name":"Acme","url":"https://acme.slack.com/","enterprise_id":"E9","enterprise_name":"Acme Org"},
+            "T2":{"name":"Side","url":"https://side.slack.com/","token":"xoxc-2","enterprise_id":"E9"}},
+            "enterprises":{"E9":{"name":"Acme Org","url":"https://acme.enterprise.slack.com/","token":"xoxc-org"}},
+            "lastActiveTeamId":"T1"}"#;
+        let made = slack_session(config).expect("a session");
+        assert_eq!(made["enterprises"][0]["id"], "E9");
+        assert_eq!(made["enterprises"][0]["token"], "xoxc-org");
+        assert_eq!(made["enterprises"][0]["name"], "Acme Org");
+        let teams = made["teams"].as_array().expect("teams");
+        assert_eq!(teams.len(), 2);
+        assert_eq!(teams[0]["id"], "T1");
+        assert_eq!(teams[0]["token"], "");
+        assert_eq!(teams[0]["enterprise_name"], "Acme Org");
+        assert_eq!(teams[1]["id"], "T2");
+        assert_eq!(teams[1]["token"], "xoxc-2");
+        assert_eq!(made["active"], "T1");
     }
 
     #[test]

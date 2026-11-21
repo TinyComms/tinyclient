@@ -5,7 +5,7 @@ Sign-in, first run, accounts, sign-out. Settings are `09-settings.md`. Researche
 | Network | How you sign in | Who can |
 | --- | --- | --- |
 | Discord | `tinyclient-login`, the real login page. Captcha, 2FA, and passkeys are the page's. | A Discord account. The session uses the web client's API shape. |
-| Slack | The login page. One `d` cookie, one `xoxc` token per workspace. The browser User-Agent is stored and reused. | Ordinary workspaces. Enterprise Grid is still a risk. |
+| Slack | The login page. One `d` cookie, one `xoxc` token per workspace. An Enterprise Grid org token is one account, with its workspaces as Spaces. The browser User-Agent is stored and reused. A rotated token is saved the same way the `d` cookie is. | Ordinary workspaces. The Grid path is unverified against a live org. |
 | Telegram | QR, or phone, code, and 2FA. grammers. No web page. The `api_id` is a build-time secret, not in the repo. | Yes. Telegram's terms allow a third-party client and forbid a ghost mode. Typing and read receipts stay on. |
 | Teams | Microsoft's login page, then the Teams chat token. Personal accounts and work accounts whose tenant allows this client. | A tenant that requires a compliant device or an approved app fails on Microsoft's own page. Say so, and do not retry in a loop. |
 | Signal | QR from Linked devices. | The phone stays in the pair. |
@@ -73,8 +73,9 @@ One sign-in window, one `d` cookie, every workspace that browser session holds. 
 is an account under Slack with its own token, connection, unread count and sign-out. The rail
 keeps **one** Slack button (the rail is 72 px; ten workspaces would take it over); its badge is a dot, and the Inbox holds the number. Inside the Slack filter the list is sectioned by workspace, and in the Inbox a row's
 second line carries the workspace name only when the person has more than one. An Enterprise
-Grid org is one account whose channels span its workspaces. That Grid path was not re-tested
-(`localConfig_v2.teams` empty, rotating tokens). "Add another workspace" reopens the
+Grid org whose sign-in carries an org token is one account whose workspaces are Spaces, so an
+org-wide channel and a direct message are listed once. That path reads `localConfig_v2.enterprises`
+and has not been run against a live org. "Add another workspace" reopens the
 window on the same cookie. SSO is the page's own; the browser User-Agent from sign-in is stored and reused on later calls.
 
 ## First run
@@ -130,7 +131,7 @@ There is no open-at-login switch (`G1`). Closing the window's effect on chatd is
 
 ## Uncertainties
 
-- Slack Enterprise Grid (`localConfig_v2.teams` empty, rotating tokens) was not re-tested. One 2026 report describes that shape [V that the report exists, U that it is general]. The probe reads that key.
+- Slack Enterprise Grid was not run against a live org. The helper reads an `enterprises` entry and its token when `teams` is empty, and a rotated `xoxc` token is saved the same way the `d` cookie is. One 2026 report describes the empty-`teams` shape [V that the report exists, U that it is general].
 - A live Messages pair has not been run [U]. The Google-and-emoji flow and the adapter tests are in the tree.
 - `keep_connected` dropping every Slack workspace when one token dies was not re-read. The keychain item is still one per network.
 - Notarization was not checked. A second Discord or Telegram login was not found as its own keychain account.
