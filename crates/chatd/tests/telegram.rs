@@ -3452,3 +3452,50 @@ fn global_search_across_chats_with_pagination() {
         world.calls()
     );
 }
+
+#[test]
+fn report_message_and_peer() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.abuse_reports, "Telegram must advertise abuse_reports capability");
+
+    // Query report reasons.
+    match world.ask(Request::ReportReasons {
+        target: protocol::ReportTarget::Message { conversation: key("u7005"), message_id: "6".into() },
+    }) {
+        Response::ReportReasons { reasons } => {
+            assert!(!reasons.is_empty());
+            assert!(reasons.contains(&protocol::ReportReason::Spam));
+        }
+        other => panic!("expected ReportReasons, got {other:?}"),
+    }
+
+    // Report a message via messages.report (walks Telegram's option tree to Reported).
+    let resp = world.ask(Request::Report {
+        target: protocol::ReportTarget::Message { conversation: key("u7005"), message_id: "6".into() },
+        reason: protocol::ReportReason::Spam,
+        note: "Unsolicited prize scam".into(),
+        block: false,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok reporting message, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("messages.report u7005 [6]")),
+        "expected messages.report on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Report a peer (user/channel) via account.reportPeer with reason mapping.
+    let resp = world.ask(Request::Report {
+        target: protocol::ReportTarget::Person(key("u7006")),
+        reason: protocol::ReportReason::Impersonation,
+        note: "Fake support account".into(),
+        block: false,
+    });
+    assert!(matches!(resp, Response::Ok), "expected Ok reporting peer, got {resp:?}");
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.reportPeer u7006 fake")),
+        "expected account.reportPeer with fake reason on wire, got: {:#?}",
+        world.calls()
+    );
+}

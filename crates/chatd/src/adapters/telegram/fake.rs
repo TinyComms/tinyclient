@@ -2995,6 +2995,45 @@ impl World {
             self.log(&format!("UploadMedia {kind}"));
             return Some(answer(media));
         }
+        if let Some(request) = asked::<f::messages::Report>(body) {
+            let peer = input_who(&request.peer);
+            let opt = String::from_utf8_lossy(&request.option);
+            self.log(&format!("messages.report {} {:?} opt={opt}", peer.text(), request.id));
+            if request.option.is_empty() {
+                let choose = tl::types::ReportResultChooseOption {
+                    title: "Choose a reason".to_owned(),
+                    options: vec![
+                        tl::enums::MessageReportOption::Option(tl::types::MessageReportOption {
+                            text: "Spam".to_owned(),
+                            option: b"spam".to_vec(),
+                        }),
+                        tl::enums::MessageReportOption::Option(tl::types::MessageReportOption {
+                            text: "Violence".to_owned(),
+                            option: b"violence".to_vec(),
+                        }),
+                        tl::enums::MessageReportOption::Option(tl::types::MessageReportOption {
+                            text: "Other".to_owned(),
+                            option: b"other".to_vec(),
+                        }),
+                    ],
+                };
+                return Some(answer(tl::enums::ReportResult::ChooseOption(choose)));
+            }
+            return Some(answer(tl::enums::ReportResult::Reported));
+        }
+        if let Some(request) = asked::<f::account::ReportPeer>(body) {
+            let peer = input_who(&request.peer);
+            let reason = match request.reason {
+                tl::enums::ReportReason::InputReportReasonSpam => "spam",
+                tl::enums::ReportReason::InputReportReasonViolence => "violence",
+                tl::enums::ReportReason::InputReportReasonIllegalDrugs => "illegal",
+                tl::enums::ReportReason::InputReportReasonFake => "fake",
+                tl::enums::ReportReason::InputReportReasonPersonalDetails => "personal",
+                _ => "other",
+            };
+            self.log(&format!("account.reportPeer {} {reason} {}", peer.text(), request.message));
+            return Some(answer(true));
+        }
         if let Some(request) = asked::<f::messages::SearchGlobal>(body) {
             self.log(&format!("SearchGlobal {} rate={} id={}", request.q, request.offset_rate, request.offset_id));
             let needle = request.q.to_lowercase();

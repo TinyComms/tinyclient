@@ -712,6 +712,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Report { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ReportReasons { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
@@ -839,6 +841,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
             let _ = reply.send(info::forward(account, &from_conversation_id, &message_ids, &to_conversation_ids, &note).map_err(refused));
+        }
+        Command::Report { target, reason, note, block, reply } => {
+            let _ = reply.send(info::report(account, &target, reason, &note, block).map_err(refused));
+        }
+        Command::ReportReasons { reply, .. } => {
+            let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
         }
         Command::Search { query, scope, cursor, reply, .. } => {
             let result = match scope {

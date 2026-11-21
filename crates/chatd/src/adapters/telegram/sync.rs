@@ -337,6 +337,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         edit_window: 48 * 3_600,
         file_scan: false,
         allow_archives: false,
+        abuse_reports: true,
         voice_notes: true,
         direct_calls: false,
         revisions: false,

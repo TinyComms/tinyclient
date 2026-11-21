@@ -674,6 +674,106 @@ pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, be
     Ok(SharedPage { items, more, total })
 }
 
+fn tl_report_reason(reason: protocol::ReportReason) -> tl::enums::ReportReason {
+    match reason {
+        protocol::ReportReason::Spam => tl::enums::ReportReason::InputReportReasonSpam,
+        protocol::ReportReason::Violence => tl::enums::ReportReason::InputReportReasonViolence,
+        protocol::ReportReason::Illegal => tl::enums::ReportReason::InputReportReasonIllegalDrugs,
+        protocol::ReportReason::Impersonation => tl::enums::ReportReason::InputReportReasonFake,
+        protocol::ReportReason::Harassment => tl::enums::ReportReason::InputReportReasonPersonalDetails,
+        protocol::ReportReason::Other => tl::enums::ReportReason::InputReportReasonOther,
+    }
+}
+
+fn pick_report_option(options: &[tl::enums::MessageReportOption], reason: protocol::ReportReason) -> Option<Vec<u8>> {
+    let keywords: &[&str] = match reason {
+        protocol::ReportReason::Spam => &["spam"],
+        protocol::ReportReason::Violence => &["violence", "threat"],
+        protocol::ReportReason::Illegal => &["illegal", "drug", "abuse"],
+        protocol::ReportReason::Impersonation => &["fake", "impersonat", "scam"],
+        protocol::ReportReason::Harassment => &["harass", "personal", "bully", "abuse"],
+        protocol::ReportReason::Other => &["other"],
+    };
+    fn unwrap(opt: &tl::enums::MessageReportOption) -> &tl::types::MessageReportOption {
+        let tl::enums::MessageReportOption::Option(o) = opt;
+        o
+    }
+    options
+        .iter()
+        .map(unwrap)
+        .find(|o| {
+            let lower = o.text.to_lowercase();
+            keywords.iter().any(|kw| lower.contains(kw))
+        })
+        .or_else(|| options.iter().map(unwrap).find(|o| o.text.to_lowercase().contains("other")))
+        .or_else(|| options.first().map(unwrap))
+        .map(|o| o.option.clone())
+}
+
+/// Reports a message (`messages.report`, walking Telegram's option tree) or a user/chat (`account.reportPeer`).
+pub(super) fn report(
+    account: &Account,
+    target: &protocol::ReportTarget,
+    reason: protocol::ReportReason,
+    note: &str,
+    block: bool,
+) -> Result<(), Fault> {
+    match target {
+        protocol::ReportTarget::Message { conversation, message_id } => {
+            let (who, _) = Who::parse(&conversation.id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+            let id = message_id.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+            let peer = account.input(who)?;
+            let mut option = Vec::new();
+            for _ in 0..4 {
+                let result = account.ask(&tl::functions::messages::Report {
+                    peer: peer.clone(),
+                    id: vec![id],
+                    option: option.clone(),
+                    message: note.to_owned(),
+                })?;
+                match result {
+                    tl::enums::ReportResult::Reported => break,
+                    tl::enums::ReportResult::ChooseOption(choose) => {
+                        let Some(next) = pick_report_option(&choose.options, reason) else {
+                            break;
+                        };
+                        if next == option {
+                            break;
+                        }
+                        option = next;
+                    }
+                    tl::enums::ReportResult::AddComment(add) => {
+                        account.ask(&tl::functions::messages::Report {
+                            peer: peer.clone(),
+                            id: vec![id],
+                            option: add.option,
+                            message: note.to_owned(),
+                        })?;
+                        break;
+                    }
+                }
+            }
+            if block && matches!(who, Who::User(_)) {
+                let _ = super::relate(account, &conversation.id, protocol::RelateAction::Block);
+            }
+            Ok(())
+        }
+        protocol::ReportTarget::Person(key) | protocol::ReportTarget::Conversation(key) => {
+            let (who, _) = Who::parse(&key.id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+            let peer = account.input(who)?;
+            account.ask(&tl::functions::account::ReportPeer {
+                peer,
+                reason: tl_report_reason(reason),
+                message: note.to_owned(),
+            })?;
+            if block && matches!(who, Who::User(_)) {
+                let _ = super::relate(account, &key.id, protocol::RelateAction::Block);
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +783,24 @@ mod tests {
         assert_eq!(parse_global_cursor(None), (0, None, 0));
         assert_eq!(parse_global_cursor(Some("1700000000:u7003:31")), (1_700_000_000, Some(Who::User(7003)), 31));
         assert_eq!(parse_global_cursor(Some("bad")), (0, None, 0));
+    }
+
+    #[test]
+    fn report_reason_and_option_mapping() {
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Spam), tl::enums::ReportReason::InputReportReasonSpam));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Violence), tl::enums::ReportReason::InputReportReasonViolence));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Illegal), tl::enums::ReportReason::InputReportReasonIllegalDrugs));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Impersonation), tl::enums::ReportReason::InputReportReasonFake));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Harassment), tl::enums::ReportReason::InputReportReasonPersonalDetails));
+        assert!(matches!(tl_report_reason(protocol::ReportReason::Other), tl::enums::ReportReason::InputReportReasonOther));
+
+        let opts = vec![
+            tl::enums::MessageReportOption::Option(tl::types::MessageReportOption { text: "Spam".into(), option: b"spam".to_vec() }),
+            tl::enums::MessageReportOption::Option(tl::types::MessageReportOption { text: "Violence".into(), option: b"violence".to_vec() }),
+            tl::enums::MessageReportOption::Option(tl::types::MessageReportOption { text: "Other".into(), option: b"other".to_vec() }),
+        ];
+        assert_eq!(pick_report_option(&opts, protocol::ReportReason::Spam).as_deref(), Some(&b"spam"[..]));
+        assert_eq!(pick_report_option(&opts, protocol::ReportReason::Violence).as_deref(), Some(&b"violence"[..]));
+        assert_eq!(pick_report_option(&opts, protocol::ReportReason::Impersonation).as_deref(), Some(&b"other"[..]));
     }
 }
