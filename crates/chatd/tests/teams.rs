@@ -1358,7 +1358,7 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
 
     // My own presence is set only when I ask.
     assert!(world.fake.calls("PUT", "/presence/v1/me/forceavailability/").is_empty());
-    let set = Request::SetPresence { account: key("").account(), presence: Presence::Dnd, status: None, clear_at: None };
+    let set = Request::SetPresence { account: key("").account(), presence: Presence::Dnd, status: None, status_emoji: None, clear_at: None };
     assert_eq!(world.ask(set), Response::Ok);
     assert_eq!(world.fake.calls("PUT", "/presence/v1/me/forceavailability/").pop().unwrap().json(), json!({"availability": "DoNotDisturb"}));
 
@@ -1589,6 +1589,7 @@ fn setting_a_status_message_publishes_the_note_and_availability() {
         account: key("").account(),
         presence: Presence::Dnd,
         status: Some("Heads down until 3".to_owned()),
+        status_emoji: None,
         clear_at: None,
     };
     assert_eq!(world.ask(set), Response::Ok);
@@ -1603,6 +1604,7 @@ fn setting_a_status_message_publishes_the_note_and_availability() {
         account: key("").account(),
         presence: Presence::Online,
         status: Some(String::new()),
+        status_emoji: None,
         clear_at: None,
     };
     assert_eq!(world.ask(clear), Response::Ok);

@@ -885,6 +885,7 @@ impl Teams {
                     message.text.push_str(&fwd_body);
                 }
             }
+            let author = orig_sender.clone();
             let (from_title, from_space) = match (orig_sender.is_empty(), orig_conv_title.is_empty()) {
                 (false, false) => (orig_sender, orig_conv_title),
                 (false, true) => (orig_sender, String::new()),
@@ -895,6 +896,8 @@ impl Teams {
                 from_title,
                 from_space,
                 link: orig_link,
+                author,
+                text: String::new(),
             }));
         }
         message.reactions = self.reactions(&props["emotions"], &me);

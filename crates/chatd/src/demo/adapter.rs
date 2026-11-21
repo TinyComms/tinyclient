@@ -722,7 +722,7 @@ impl Demo {
             Command::ReportReasons { reply, .. } => {
                 let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
             }
-            Command::SetPresence { presence, status, clear_at: _, reply } => {
+            Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => {
                 let (_, old) = demo.hub.shown(&demo.key(&demo.me.id));
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
@@ -800,6 +800,7 @@ impl Demo {
                             from_title: from_title.clone(),
                             from_space: from_space.clone(),
                             link: String::new(),
+                            ..protocol::Forwarded::default()
                         }));
                         if let Err(e) = demo.ctx.message(&target, &fwd) {
                             err = Some(e.to_string());
@@ -1009,6 +1010,16 @@ impl Demo {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::CallAddPeople { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)));
+            }
+            Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StarredMessages { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)));
+            }
+            Command::Remind { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::Backfill(_)

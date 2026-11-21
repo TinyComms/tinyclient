@@ -3295,3 +3295,248 @@ fn sent_video_carries_dimensions_duration_streaming_flag_and_thumb() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn full_user_call_flags_gate_call_support_and_video() {
+    let world = World::signed_in();
+    world.connected();
+    let row = |id: &str| world.conversation(id).expect(id);
+    // Before users.getFullUser is asked, both people keep the optimistic hand-off button.
+    assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
+    assert!(!row("u7002").call_video);
+    assert_eq!(row("u7003").call, protocol::CallSupport::Handoff);
+
+    // 1. phone_calls_available = false, phone_calls_private = false -> CallSupport::None.
+    world.steer("call-flags 7002 0 0 0");
+    assert!(matches!(world.ask(Request::Profile { person: key("u7002"), space: None }), Response::Profile { .. }));
+    assert_eq!(row("u7002").call, protocol::CallSupport::None);
+    assert!(!row("u7002").call_video);
+
+    // 2. phone_calls_private = true -> CallSupport::Restricted (explained tooltip, not silently hidden).
+    world.steer("call-flags 7003 0 1 0");
+    assert!(matches!(world.ask(Request::ConversationInfo { conversation: key("u7003") }), Response::ConversationInfo { .. }));
+    assert_eq!(row("u7003").call, protocol::CallSupport::Restricted);
+    assert!(!row("u7003").call_video);
+
+    // 3. phone_calls_available = true, video_calls_available = true -> Handoff + call_video.
+    world.steer("call-flags 7002 1 0 1");
+    assert!(matches!(world.ask(Request::ConversationInfo { conversation: key("u7002") }), Response::ConversationInfo { .. }));
+    assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
+    assert!(row("u7002").call_video);
+}
+
+#[test]
+fn call_service_rows_map_direction_reason_video_and_group_actions() {
+    use protocol::CallOutcome;
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+
+    // 1. Missed incoming voice call -> Missed, preview "Missed call", raises unread.
+    let unread_before = world.conversation("u7002").unwrap().unread;
+    world.steer("call-event in missed voice");
+    let missed = world.until("missed call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Missed))
+    });
+    assert_eq!(missed.kind, MessageKind::System);
+    assert_eq!(missed.text, "Missed call");
+    assert!(!missed.outgoing);
+    assert!(!missed.call.as_ref().unwrap().video);
+    let conv = world.conversation("u7002").unwrap();
+    assert_eq!(conv.preview, "Missed call");
+    assert!(conv.unread > unread_before, "missed incoming call must count as unread");
+
+    // 2. Cancelled outgoing call (out + missed reason).
+    world.steer("call-event out missed voice");
+    let cancelled = world.until("cancelled call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Cancelled))
+    });
+    assert!(cancelled.outgoing);
+    assert_eq!(cancelled.text, "Cancelled call");
+
+    // 3. Line busy (out + busy reason).
+    world.steer("call-event out busy voice");
+    let busy = world.until("busy call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Busy))
+    });
+    assert!(busy.outgoing);
+    assert_eq!(busy.text, "Line busy");
+
+    // 4. Declined incoming call (in + busy reason).
+    world.steer("call-event in busy voice");
+    let declined = world.until("declined call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Declined))
+    });
+    assert!(!declined.outgoing);
+    assert_eq!(declined.text, "Declined call");
+
+    // 5. Outgoing ended video call with duration (out + hangup + video + 95s).
+    world.steer("call-event out hangup video 95");
+    let ended_vid = world.until("ended video call", || {
+        world.messages("u7002").into_iter().find(|m| {
+            m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Ended && c.video && c.seconds == Some(95))
+        })
+    });
+    assert!(ended_vid.outgoing);
+    assert!(ended_vid.text.starts_with("Outgoing video call"), "{}", ended_vid.text);
+
+    // 6. Group video chat started (Live) and ended, plus conference call.
+    world.steer("call-event in group-live video");
+    let group_live = world.until("group live", || {
+        world.messages("g8001").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Live))
+    });
+    assert!(group_live.text.contains("started a video chat"), "{}", group_live.text);
+
+    world.steer("call-event in conf-missed video");
+    let conf_missed = world.until("conf missed", || {
+        world.messages("g8001").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Missed))
+    });
+    assert_eq!(conf_missed.kind, MessageKind::System);
+    assert_eq!(conf_missed.text, "Missed group video call");
+}
+
+#[test]
+fn call_history_pages_filters_missed_and_deletes_entries() {
+    use protocol::CallOutcome;
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+
+    // Emit 3 calls: outgoing ended, incoming missed, outgoing video ended.
+    world.steer("call-event out hangup voice 45");
+    world.steer("call-event in missed voice");
+    world.steer("call-event out hangup video 120");
+    world.until("3 calls stored", || {
+        let count = world.messages("u7002").into_iter().filter(|m| m.call.is_some()).count();
+        (count >= 3).then_some(())
+    });
+
+    // Page 1 (limit 2): newest two calls.
+    let Response::CallHistory { entries: p1, next: next1, more: more1 } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: false,
+        before: None,
+        limit: 2,
+    }) else {
+        panic!("expected CallHistory");
+    };
+    assert_eq!(p1.len(), 2);
+    assert!(more1);
+    assert!(p1[0].note.video && p1[0].note.seconds == Some(120));
+    assert_eq!(p1[1].note.outcome, CallOutcome::Missed);
+
+    // Page 2 using `next1`: remaining call.
+    let Response::CallHistory { entries: p2, more: more2, .. } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: false,
+        before: next1,
+        limit: 2,
+    }) else {
+        panic!("expected CallHistory page 2");
+    };
+    assert_eq!(p2.len(), 1);
+    assert!(!more2);
+    assert_eq!(p2[0].note.seconds, Some(45));
+
+    // Missed filter returns only the missed incoming call.
+    let Response::CallHistory { entries: missed, .. } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: true,
+        before: None,
+        limit: 10,
+    }) else {
+        panic!("expected missed CallHistory");
+    };
+    assert_eq!(missed.len(), 1);
+    assert_eq!(missed[0].note.outcome, CallOutcome::Missed);
+
+    // Delete with revoke = true removes it on the wire.
+    let target_id = missed[0].message_id.clone();
+    assert!(matches!(
+        world.ask(Request::DeleteCallEntries {
+            account: account(),
+            message_ids: vec![target_id.clone()],
+            revoke: true,
+        }),
+        Response::Ok
+    ));
+    assert!(
+        world.calls().iter().any(|c| c.contains("DeleteMessages") && c.contains("revoke true")),
+        "expected DeleteMessages revoke true, got: {:#?}",
+        world.calls()
+    );
+    let Response::CallHistory { entries: after_del, .. } = world.ask(Request::CallHistory {
+        account: account(),
+        missed: true,
+        before: None,
+        limit: 10,
+    }) else {
+        panic!("expected CallHistory after delete");
+    };
+    assert!(after_del.is_empty());
+}
+
+#[test]
+fn privacy_settings_read_and_write_rules_with_user_and_chat_exceptions() {
+    use protocol::{PrivacyAudience, PrivacyException, PrivacyKey, PrivacyPolicy};
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Read default PhoneCall, PhoneP2p, and VoiceMessages rules.
+    let Response::Privacy { policy: call_pol, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneCall,
+    }) else {
+        panic!("expected Privacy for PhoneCall");
+    };
+    assert_eq!(call_pol.audience, PrivacyAudience::Everybody);
+    assert!(!call_pol.premium_only);
+
+    let Response::Privacy { policy: p2p_pol, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneP2p,
+    }) else {
+        panic!("expected Privacy for PhoneP2p");
+    };
+    assert_eq!(p2p_pol.audience, PrivacyAudience::Contacts);
+
+    let Response::Privacy { policy: voice_pol, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::VoiceMessages,
+    }) else {
+        panic!("expected Privacy for VoiceMessages");
+    };
+    assert!(voice_pol.premium_only, "free account should mark VoiceMessages as premium_only");
+
+    // 2. Write PhoneCall = Contacts with one always-allow user (u7002), one never-allow user (u7003),
+    //    and one always-allow chat (g8001).
+    let updated = PrivacyPolicy {
+        audience: PrivacyAudience::Contacts,
+        always_allow: vec![
+            PrivacyException { id: "u7002".into(), name: String::new(), chat: false },
+            PrivacyException { id: "g8001".into(), name: String::new(), chat: true },
+        ],
+        never_allow: vec![PrivacyException { id: "u7003".into(), name: String::new(), chat: false }],
+        premium_only: false,
+    };
+    let Response::Privacy { policy: saved, .. } = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneCall,
+        policy: updated,
+    }) else {
+        panic!("expected Privacy after SetPrivacy");
+    };
+    assert_eq!(saved.audience, PrivacyAudience::Contacts);
+    assert!(saved.always_allow.iter().any(|e| e.id == "u7002" && !e.chat));
+    assert!(saved.always_allow.iter().any(|e| e.id == "g8001" && e.chat));
+    assert!(saved.never_allow.iter().any(|e| e.id == "u7003" && !e.chat));
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy phone_call")
+            && c.contains("allow_users:[7002]")
+            && c.contains("allow_chats:[8001]")
+            && c.contains("disallow_users:[7003]")
+            && c.contains("allow_contacts")),
+        "expected exact setPrivacy rules on wire, got: {:#?}",
+        world.calls()
+    );
+}

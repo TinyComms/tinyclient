@@ -6,6 +6,27 @@
 use crate::{is_false, Key, Network};
 use serde::{Deserialize, Serialize};
 
+/// One entry in a network's recent calls list (`Request::CallHistory`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallLogEntry {
+    /// The conversation this call belongs to (to open at `message_id` or call back).
+    pub conversation: Key,
+    /// The other person's id on this account, if 1:1.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub person_id: String,
+    /// Display name of the person or group.
+    pub name: String,
+    /// The message id of the call service message (for jumping to it or deleting it).
+    pub message_id: String,
+    /// True when we placed the call.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outgoing: bool,
+    /// Structured call metadata (outcome, caller_id, seconds, video) shared with call rows.
+    pub note: crate::CallNote,
+    /// Unix seconds when the call happened.
+    pub time: i64,
+}
+
 /// Most device names of one kind a call lists.
 pub const DEVICES_LIMIT: usize = 32;
 
@@ -276,6 +297,11 @@ pub struct CallSecurity {
     /// the call, new whenever someone joins or leaves. Empty until the group has keys.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub code: String,
+    /// Explicit verification emoji for a 1:1 end-to-end encrypted call (Telegram's 4 emoji from
+    /// `SHA-256(key || g_a)` over the 333-emoji table). Empty before `phone.confirmCall` succeeds
+    /// and the fingerprint matches, and empty for group video chats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emojis: Vec<String>,
     /// The group's epoch. It moves on every join and leave.
     #[serde(default)]
     pub epoch: u64,
@@ -294,6 +320,25 @@ pub struct CallSecurity {
     /// then offers no way on but leaving.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub required: bool,
+}
+
+impl CallSecurity {
+    /// Builds [`CallSecurity`] for a confirmed Telegram 1:1 call whose key fingerprint matched.
+    /// Returns `None` before `phone.confirmCall` succeeds or when the fingerprint did not match.
+    pub fn telegram_verified(key: &[u8], g_a: &[u8], confirmed: bool, fingerprint_matched: bool) -> Option<Self> {
+        if !confirmed || !fingerprint_matched {
+            return None;
+        }
+        let emojis = crate::telegram_call_emojis(key, g_a)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        Some(CallSecurity {
+            mode: SecurityMode::EndToEnd,
+            emojis,
+            ..CallSecurity::default()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

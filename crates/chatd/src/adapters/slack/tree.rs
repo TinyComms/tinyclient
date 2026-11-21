@@ -696,34 +696,67 @@ impl Slack {
         if prefs.is_null() {
             return Ok(());
         }
-        self.muted("muted_channels", &prefs["muted_channels"])?;
-        if prefs["muted_channels"].is_null() {
-            self.muted("all_notifications_prefs", &prefs["all_notifications_prefs"])?;
+        if !prefs["muted_channels"].is_null() {
+            self.pref_changed("muted_channels", &prefs["muted_channels"])?;
+        }
+        if !prefs["all_notifications_prefs"].is_null() {
+            self.pref_changed("all_notifications_prefs", &prefs["all_notifications_prefs"])?;
+        }
+        if !prefs["highlight_words"].is_null() {
+            self.pref_changed("highlight_words", &prefs["highlight_words"])?;
+        }
+        if !prefs["threads_everything"].is_null() {
+            self.pref_changed("threads_everything", &prefs["threads_everything"])?;
         }
         Ok(())
     }
 
-    /// One of the two prefs that carry mutes, from `users.prefs.get` or a `pref_change` event:
-    /// `muted_channels` is a comma-separated list, `all_notifications_prefs` a JSON document
-    /// with a `muted` flag per channel.
-    pub(super) fn muted(&self, pref: &str, value: &Value) -> Result<(), Failure> {
-        let now: HashSet<String> = match pref {
+    /// Handles `users.prefs.get` fields and live `pref_change` socket events for mutes,
+    /// `all_notifications_prefs` (per-channel levels & `suppress_at_channel`), `highlight_words`,
+    /// and `threads_everything`.
+    pub(super) fn pref_changed(&self, pref: &str, value: &Value) -> Result<(), Failure> {
+        match pref {
             "muted_channels" => {
                 let list = value.as_str().unwrap_or("");
-                list.split(',').filter(|id| !id.is_empty()).map(str::to_owned).collect()
+                let now: HashSet<String> = list.split(',').filter(|id| !id.is_empty()).map(str::to_owned).collect();
+                self.update_muted(now)?;
             }
             "all_notifications_prefs" => {
-                let parsed = value.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok());
-                let Some(parsed) = parsed.as_ref().or(Some(value)).filter(|parsed| parsed["channels"].is_object()) else {
+                let Some(parsed) = parse_notification_prefs(value) else {
                     return Ok(());
                 };
-                let channels = parsed["channels"].as_object().into_iter().flatten();
-                channels.filter(|(_, prefs)| prefs["muted"] == true).map(|(id, _)| id.clone()).collect()
+                let affected: Vec<String> = {
+                    let mut state = self.state();
+                    let mut ids: HashSet<String> = state.channel_notify.keys().cloned().collect();
+                    ids.extend(parsed.channel_notify.keys().cloned());
+                    state.global_notify = parsed.global;
+                    state.channel_notify = parsed.channel_notify;
+                    state.suppress_at_channel = parsed.suppress_at_channel;
+                    ids.into_iter().collect()
+                };
+                for id in &affected {
+                    self.ctx.info_stale(id);
+                }
+                if !parsed.muted.is_empty() || !self.state().mutes_read {
+                    self.update_muted(parsed.muted)?;
+                }
             }
-            _ => return Ok(()),
-        };
-        // What was muted when chatd last ran is in the store's rows, so the comparison is with
-        // the list as it was then.
+            "highlight_words" => {
+                let raw = value.as_str().unwrap_or("");
+                let words = parse_highlight_words(raw);
+                self.state().highlight_words = words;
+                self.ctx.set_note("highlight_words", raw);
+            }
+            "threads_everything" => {
+                let on = value.as_bool().unwrap_or(false);
+                self.state().thread_replies_notify = on;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn update_muted(&self, now: HashSet<String>) -> Result<(), Failure> {
         let before: HashSet<String> = {
             let mut state = self.state();
             if !state.mutes_read {
@@ -735,9 +768,11 @@ impl Slack {
         };
         for id in before.difference(&now) {
             self.ctx.muted(id, false)?;
+            self.ctx.info_stale(id);
         }
         for id in &now {
             self.ctx.muted(id, true)?;
+            self.ctx.info_stale(id);
         }
         let mut list: Vec<&str> = now.iter().map(String::as_str).collect();
         list.sort_unstable();
@@ -841,4 +876,90 @@ impl Slack {
         let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
         format!("https://app.slack.com/huddle/{}/{channel}", self.session.team_id)
     }
+}
+
+/// Parsed `all_notifications_prefs` document from Slack `users.prefs.get` or `pref_change`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct NotificationPrefs {
+    pub global: protocol::Notify,
+    pub channel_notify: HashMap<String, protocol::Notify>,
+    pub muted: HashSet<String>,
+    pub suppress_at_channel: HashSet<String>,
+}
+
+fn parse_notify_level(raw: &str) -> Option<protocol::Notify> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "all" | "everything" => Some(protocol::Notify::All),
+        "mentions_dms" | "mentions" | "highlights" | "nothing_except_mentions" => Some(protocol::Notify::Mentions),
+        "nothing" | "none" => Some(protocol::Notify::Nothing),
+        _ => None,
+    }
+}
+
+/// Parses Slack's `all_notifications_prefs` (either a JSON-encoded string or a JSON object).
+pub(super) fn parse_notification_prefs(value: &Value) -> Option<NotificationPrefs> {
+    let owned = value.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let doc = owned.as_ref().unwrap_or(value);
+    if !doc.is_object() {
+        return None;
+    }
+    let mut out = NotificationPrefs::default();
+    if let Some(desktop) = doc["global"]["desktop"].as_str().and_then(parse_notify_level) {
+        out.global = desktop;
+    }
+    if let Some(channels) = doc["channels"].as_object() {
+        for (id, prefs) in channels {
+            let is_muted = prefs["muted"] == true;
+            if is_muted {
+                out.muted.insert(id.clone());
+                out.channel_notify.insert(id.clone(), protocol::Notify::Nothing);
+            } else if let Some(level) = prefs["desktop"].as_str().and_then(parse_notify_level) {
+                out.channel_notify.insert(id.clone(), level);
+            } else if prefs["mentions"] == true {
+                out.channel_notify.insert(id.clone(), protocol::Notify::Mentions);
+            }
+            if prefs["suppress_at_channel"] == true {
+                out.suppress_at_channel.insert(id.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Splits Slack's comma-separated `highlight_words` pref into trimmed, lowercased keywords.
+pub(super) fn parse_highlight_words(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Returns true if `text` contains any keyword in `keywords` on ASCII/Unicode word boundaries,
+/// case-insensitively.
+pub(super) fn matches_keyword(text: &str, keywords: &[String]) -> bool {
+    if text.is_empty() || keywords.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    for kw in keywords {
+        if kw.is_empty() {
+            continue;
+        }
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(kw.as_str()) {
+            let at = start + pos;
+            let end = at + kw.len();
+            let before_ok = lower[..at].chars().next_back().is_none_or(|c| !is_word(c));
+            let after_ok = lower[end..].chars().next().is_none_or(|c| !is_word(c));
+            if before_ok && after_ok {
+                return true;
+            }
+            start = at + kw.len().max(1);
+            if !lower.is_char_boundary(start) {
+                break;
+            }
+        }
+    }
+    false
 }

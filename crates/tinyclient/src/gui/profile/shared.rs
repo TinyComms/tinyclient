@@ -15,6 +15,7 @@ const LIMIT: u32 = 60;
 pub enum Tab {
     Kind(SharedKind),
     Pinned,
+    Later,
 }
 
 /// What one tab holds, and how much of the whole that is.
@@ -46,15 +47,16 @@ fn none_words(network: Network, tab: Tab) -> &'static str {
         Tab::Kind(SharedKind::Links) => "No links in this chat",
         Tab::Pinned if network == Network::Messages => "No starred messages in this chat",
         Tab::Pinned => "Nothing pinned in this chat",
+        Tab::Later => "Nothing saved for later",
     }
 }
 
 /// The honesty rule, decided from the answer alone.
 pub fn source(network: Network, tab: Tab, page: &Page) -> Source {
-    let count = if tab == Tab::Pinned { page.pinned.len() } else { page.items.len() } as u32;
+    let count = if matches!(tab, Tab::Pinned | Tab::Later) { page.pinned.len() } else { page.items.len() } as u32;
     let net = network.label();
-    // Pinned is the network's own list, asked of it.
-    if page.complete || tab == Tab::Pinned {
+    // Pinned / Later is the network's own list, asked of it.
+    if page.complete || matches!(tab, Tab::Pinned | Tab::Later) {
         let line = match (count, page.total.unwrap_or(count)) {
             (0, _) => none_words(network, tab).to_owned(),
             (_, total) => format!("All on {net} · {total}"),
@@ -104,6 +106,9 @@ pub fn tabs_for(network: Network, has_pins: bool) -> Vec<Tab> {
         || (network == Network::Tiny && has_pins)
     {
         tabs.push(Tab::Pinned);
+    }
+    if network == Network::Slack {
+        tabs.push(Tab::Later);
     }
     tabs
 }
@@ -203,6 +208,11 @@ impl Shared {
         let request = match tab {
             Tab::Kind(kind) => Request::Shared { conversation, kind, before: None, limit: LIMIT, search: search || whole },
             Tab::Pinned => Request::Pinned { conversation },
+            Tab::Later => Request::StarredMessages {
+                account: conversation.account(),
+                conversation: None,
+                limit: LIMIT,
+            },
         };
         crate::gui::people::ask_later(cx, request, move |answer, cx| {
             let page = match answer {
@@ -317,6 +327,7 @@ pub fn draw(shared: &Shared, network: Network, has_pins: bool, hub: &Hub, width:
                 Tab::Kind(SharedKind::Links) => "Links",
                 Tab::Pinned if network == Network::Messages => "Starred",
                 Tab::Pinned => "Pinned",
+                Tab::Later => "Later",
             };
             let count = shared.total_of(tab);
             let pick = pick.clone();
@@ -448,7 +459,7 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
             two_line(("shared-link", ix), div().child(glyph("icons/link.svg", 16., theme::text_soft())), title, host(&item.url).to_owned())
                 .on_click(move |_, _, cx| cx.open_url(&url))
         })),
-        Tab::Pinned => div().flex().flex_col().gap(px(8.)).children(page.pinned.iter().map(|message| {
+        Tab::Pinned | Tab::Later => div().flex().flex_col().gap(px(8.)).children(page.pinned.iter().map(|message| {
             let author = message.sender.clone();
             div()
                 .flex()
@@ -538,7 +549,8 @@ mod tests {
         assert_eq!(source(Network::Messages, Tab::Pinned, &none).line, "No starred messages in this chat");
         assert_eq!(tabs(Network::Tiny).len(), 3);
         assert_eq!(tabs_for(Network::Tiny, true).last(), Some(&Tab::Pinned));
-        assert_eq!(tabs(Network::Slack).last(), Some(&Tab::Pinned));
+        assert!(tabs(Network::Slack).contains(&Tab::Pinned));
+        assert_eq!(tabs(Network::Slack).last(), Some(&Tab::Later));
         let slack_links = Page { items: vec![item()], read: true, ..Page::default() };
         assert!(!source(Network::Slack, Tab::Kind(SharedKind::Links), &slack_links).search);
         assert!(source(Network::Slack, Tab::Kind(SharedKind::Files), &slack_links).search);

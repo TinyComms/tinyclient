@@ -1595,6 +1595,7 @@ fn forwarded(dir: &Directory, header: &tl::enums::MessageFwdHeader) -> Forwarded
         from_title: title,
         from_space: String::new(),
         link,
+        ..Forwarded::default()
     }
 }
 
@@ -1673,6 +1674,85 @@ fn header_quote(header: Option<&tl::enums::MessageReplyHeader>) -> Option<String
     header.quote_text.clone().filter(|text| !text.trim().is_empty())
 }
 
+/// Maps a Telegram call service action (`PhoneCall`, `GroupCall`, `ConferenceCall`) into its
+/// display line (also used as the conversation preview) and structured [`protocol::CallNote`].
+pub(super) fn call_action(
+    action: &MessageAction,
+    outgoing: bool,
+    who: &str,
+    caller_id: String,
+) -> Option<(String, protocol::CallNote)> {
+    use protocol::{CallNote, CallOutcome};
+    use tl::enums::PhoneCallDiscardReason as R;
+    match action {
+        MessageAction::PhoneCall(call) => {
+            let video = call.video;
+            let seconds = call.duration.filter(|&d| d > 0).map(|d| d as u32);
+            let kind = if video { "video call" } else { "call" };
+            let (outcome, text) = match (&call.reason, outgoing, seconds) {
+                (Some(R::Missed), false, _) | (None, false, None) => {
+                    let line = if video { "Missed video call" } else { "Missed call" };
+                    (CallOutcome::Missed, line.to_owned())
+                }
+                (Some(R::Missed), true, _) | (None, true, None) => {
+                    let line = if video { "Cancelled video call" } else { "Cancelled call" };
+                    (CallOutcome::Cancelled, line.to_owned())
+                }
+                (Some(R::Busy), true, _) => {
+                    let line = if video { "Video call · line busy" } else { "Line busy" };
+                    (CallOutcome::Busy, line.to_owned())
+                }
+                (Some(R::Busy), false, _) => {
+                    let line = if video { "Declined video call" } else { "Declined call" };
+                    (CallOutcome::Declined, line.to_owned())
+                }
+                (Some(R::Hangup | R::Disconnect | R::MigrateConferenceCall(_)) | None, out, secs) => {
+                    let prefix = if out { "Outgoing" } else { "Incoming" };
+                    let line = match secs {
+                        Some(s) => format!("{prefix} {kind}, {}", duration_words(s as i32)),
+                        None => format!("{prefix} {kind}"),
+                    };
+                    (CallOutcome::Ended, line)
+                }
+            };
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video }))
+        }
+        MessageAction::GroupCall(call) => {
+            let (outcome, seconds, text) = match call.duration {
+                Some(d) => (
+                    CallOutcome::Ended,
+                    (d > 0).then_some(d as u32),
+                    format!("Video chat ended, {}", duration_words(d)),
+                ),
+                None => (CallOutcome::Live, None, format!("{who} started a video chat")),
+            };
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video: true }))
+        }
+        MessageAction::ConferenceCall(conf) => {
+            let video = conf.video;
+            let kind = if video { "group video call" } else { "group call" };
+            let seconds = conf.duration.filter(|&d| d > 0).map(|d| d as u32);
+            let (outcome, text) = if conf.active {
+                (CallOutcome::Live, format!("{who} started a {kind}"))
+            } else if conf.missed && !outgoing {
+                let line = if video { "Missed group video call" } else { "Missed group call" };
+                (CallOutcome::Missed, line.to_owned())
+            } else if let Some(s) = seconds {
+                let cap = if video { "Group video call" } else { "Group call" };
+                (CallOutcome::Ended, format!("{cap}, {}", duration_words(s as i32)))
+            } else if outgoing {
+                let line = if video { "Cancelled group video call" } else { "Cancelled group call" };
+                (CallOutcome::Cancelled, line.to_owned())
+            } else {
+                let line = if video { "Declined group video call" } else { "Declined group call" };
+                (CallOutcome::Declined, line.to_owned())
+            };
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video }))
+        }
+        _ => None,
+    }
+}
+
 /// A service message as one line, and whether the line names the event. `who` did it; "You"
 /// when it was us. An unnamed event stays the fallback: the caller gives it a link into Telegram.
 fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) {
@@ -1722,6 +1802,11 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
             users => format!("{who} invited {} to the video chat", names(users)),
         }),
         A::GroupCallScheduled(_) => named(format!("{who} scheduled a video chat")),
+        A::ConferenceCall(conf) => {
+            let (text, _) = call_action(&A::ConferenceCall(conf.clone()), false, who, String::new())
+                .unwrap_or_else(|| (format!("{who} started a group call"), protocol::CallNote { outcome: protocol::CallOutcome::Live, caller_id: String::new(), seconds: None, participants: Vec::new(), video: conf.video }));
+            named(text)
+        }
         A::ScreenshotTaken => named(format!("{who} took a screenshot")),
         A::ContactSignUp => named(format!("{who} joined Telegram")),
         A::TopicCreate(topic) => named(format!("{who} created the topic \"{}\"", topic.title)),
@@ -1815,7 +1900,13 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             let outgoing = service.out || from == Who::User(dir.me);
             let who = if outgoing { "You".to_owned() } else { dir.name(from) };
             let (topic, reply) = topic_of(service.reply_to.as_ref());
-            let (mut text, known) = action(dir, &who, &service.action);
+            let (mut text, known, call_note) = match call_action(&service.action, outgoing, &who, from.text()) {
+                Some((text, note)) => (text, true, Some(note)),
+                None => {
+                    let (text, known) = action(dir, &who, &service.action);
+                    (text, known, None)
+                }
+            };
             let pin = matches!(service.action, MessageAction::PinMessage);
             if pin {
                 if let Some(words) = header_quote(service.reply_to.as_ref()) {
@@ -1824,6 +1915,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             }
             let mut message = Message::plain(service.id.to_string(), "", text, i64::from(service.date), outgoing);
             message.sender = sender(dir, from);
+            message.call = call_note;
             // A named event is the grey line. One this build does not word opens in Telegram,
             // the same way a poll or a story does.
             message.kind = if known {

@@ -1646,7 +1646,7 @@ impl Chat {
     }
 
     /// Our own presence, shown at once and put back if the network refuses it.
-    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>, clear_at: Option<i64>) -> Response {
+    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>, status_emoji: Option<String>, clear_at: Option<i64>) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
@@ -1657,12 +1657,16 @@ impl Chat {
             clip(&mut status, 128);
             status
         });
+        let status_emoji = status_emoji.map(|mut emoji| {
+            clip(&mut emoji, 64);
+            emoji
+        });
         let before = me.as_ref().map(|me| self.hub.shown(me));
         if let (Some(me), Some((_, old))) = (&me, &before) {
             self.hub.set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
             self.hub.changed(Change::Status);
         }
-        match self.ask(&account, |reply| Command::SetPresence { presence, status, clear_at, reply }) {
+        match self.ask(&account, |reply| Command::SetPresence { presence, status, status_emoji, clear_at, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => {
                 if let (Some(me), Some((presence, status))) = (me, before) {
@@ -1697,7 +1701,7 @@ impl Chat {
                 return *refused;
             }
             let status = adapters::signal::profile_status(name.as_deref(), about.as_deref(), emoji.as_deref());
-            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), clear_at: None, reply }) {
+            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), status_emoji: None, clear_at: None, reply }) {
                 Ok(()) => {
                     self.forget_own_profile(&account, None);
                     Response::Ok
@@ -2138,6 +2142,53 @@ impl Chat {
         }
     }
 
+    fn call_history(&self, account: AccountKey, missed: bool, before: Option<String>, limit: u32) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let limit = limit.clamp(1, PAGE_LIMIT);
+        match self.ask(&account, |reply| Command::CallHistory { missed, before, limit, reply }) {
+            Ok(mut page) => {
+                page.entries.truncate(limit as usize);
+                Response::CallHistory { entries: page.entries, next: page.next, more: page.more }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn delete_call_entries(&self, account: AccountKey, message_ids: Vec<String>, revoke: bool) -> Response {
+        if message_ids.is_empty() {
+            return Response::Ok;
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::DeleteCallEntries { message_ids, revoke, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn get_privacy(&self, account: AccountKey, key: protocol::PrivacyKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetPrivacy { key, reply }) {
+            Ok(policy) => Response::Privacy { key, policy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_privacy(&self, account: AccountKey, key: protocol::PrivacyKey, policy: protocol::PrivacyPolicy) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetPrivacy { key, policy, reply }) {
+            Ok(policy) => Response::Privacy { key, policy },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Drops an unsent row locally. A queued send is cancelled this way: the adapter never had it.
     fn drop_unsent(&self, conversation: Key, client_id: &str, message: &Message) -> Response {
         match self.hub.store().delete_message(&conversation, client_id) {
@@ -2372,6 +2423,9 @@ impl Chat {
             Ok(Some(row)) if row.call == CallSupport::Native => {}
             Ok(Some(row)) if row.call == CallSupport::Handoff => {
                 return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
+            }
+            Ok(Some(row)) if row.call == CallSupport::Restricted => {
+                return error(ErrorCode::Refused, "This person's privacy settings don't allow calls.")
             }
             Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
             Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
@@ -2753,11 +2807,24 @@ impl Chat {
                 })
             }
             Request::Remind { conversation, message_id, remind_at } => {
-                if !self.shows(&conversation.account()) {
+                let account = conversation.account();
+                if !self.shows(&account) {
                     return error(ErrorCode::NotFound, "signed out");
                 }
                 if remind_at.is_some_and(|due| due <= now()) {
                     return error(ErrorCode::Refused, "That time has passed.");
+                }
+                if self.online(&account).is_ok() {
+                    if let Err(refused) = self.ask(&account, |reply| Command::Remind {
+                        conversation_id: conversation.id.clone(),
+                        message_id: message_id.clone(),
+                        remind_at,
+                        reply,
+                    }) {
+                        if !matches!(*refused, Response::Error { code: ErrorCode::Unsupported, .. }) {
+                            return *refused;
+                        }
+                    }
                 }
                 match self.hub.store().remind(&conversation, &message_id, remind_at) {
                     Ok(crate::store::RemindOutcome::Set | crate::store::RemindOutcome::Cleared) => {
@@ -3002,6 +3069,22 @@ impl Chat {
             Request::StarredMessages { account, conversation, limit } => {
                 let conv_id = conversation.as_ref().map(|c| c.id.clone());
                 let key = conversation.unwrap_or_else(|| Key::new(&account, ""));
+                if self.online(&account).is_ok() {
+                    match self.ask(&account, |reply| Command::StarredMessages {
+                        conversation_id: conv_id.clone(),
+                        limit,
+                        reply,
+                    }) {
+                        Ok(mut messages) => {
+                            messages.iter_mut().for_each(Message::bound);
+                            return Response::Pinned { conversation: key, messages };
+                        }
+                        Err(refused) if !matches!(*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                            return *refused;
+                        }
+                        Err(_) => {}
+                    }
+                }
                 match self.hub.store().starred_messages(&account, conv_id.as_deref(), limit) {
                     Ok(mut messages) => {
                         messages.iter_mut().for_each(Message::bound);
@@ -3011,10 +3094,14 @@ impl Chat {
                 }
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
+            Request::CallHistory { account, missed, before, limit } => self.call_history(account, missed, before, limit),
+            Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
+            Request::GetPrivacy { account, key } => self.get_privacy(account, key),
+            Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::Relate { person, action } => self.relate(person, action),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
-            Request::SetPresence { account, presence, status, clear_at } => self.set_presence(account, presence, status, clear_at),
+            Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
             Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
                 self.set_profile(account, name, about, pronouns, emoji, username, photo)
             }

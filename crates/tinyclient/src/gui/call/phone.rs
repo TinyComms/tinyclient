@@ -496,21 +496,40 @@ impl Shell {
         let counted = if hero { call.state == CallState::Joined } else { call.state != CallState::Connecting };
         let clock = counted.then(|| self.call_phone_clock(call, cx)).flatten();
         let security = call.security.as_ref().map(|security| {
-            let shown = super::security::badge(security, call.participants.is_empty());
-            let (icon, tint) = super::security::badge_look(shown);
-            div()
-                .id("call-phone-security")
-                .flex_none()
-                .size(px(28.))
-                .rounded_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .active(|style| style.bg(theme::pressed()))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Security, cx)))
-                .child(glyph(icon, 14., tint))
+            if let Some(emojis) = super::security::telegram_header_emojis(call) {
+                div()
+                    .id("call-phone-security")
+                    .flex_none()
+                    .h(px(28.))
+                    .px(px(8.))
+                    .rounded_full()
+                    .bg(theme::hover())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::pressed()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Security, cx)))
+                    .text_size(px(14.))
+                    .child(emojis)
+            } else {
+                let shown = super::security::badge(security, call.participants.is_empty());
+                let (icon, tint) = super::security::badge_look(shown);
+                div()
+                    .id("call-phone-security")
+                    .flex_none()
+                    .size(px(28.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::pressed()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Security, cx)))
+                    .child(glyph(icon, 14., tint))
+            }
         });
         let signal = (call.state == CallState::Joined && network == Network::Tiny)
             .then(|| self.tiny_health())

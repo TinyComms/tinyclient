@@ -266,8 +266,9 @@ pub struct ThreadSummary {
     pub unread: u32,
 }
 
-/// Where a forwarded message came from. What was forwarded is the message's own text and
-/// attachments.
+/// Where a forwarded message came from. When the forwarder also wrote a note of their own,
+/// the note stays in `Message::text` and the forwarded message's body sits in `text` (with
+/// `author` naming who originally said it).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Forwarded {
     /// The conversation it was first said in: `#announcements`, a person's name.
@@ -279,6 +280,12 @@ pub struct Forwarded {
     /// Opens the original in the network's own app. Empty when it cannot be linked to.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub link: String,
+    /// Who originally wrote the forwarded message, when distinct from the forwarder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author: String,
+    /// The forwarded message's own text when kept distinct from a forwarder's note.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
 }
 
 /// A labelled link or action button at the foot of a [`Card`].
@@ -698,6 +705,10 @@ pub struct Message {
     /// Short label of the sending line or identity when reported (e.g. carrier name or "SIM 2").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_via: Option<String>,
+    /// Canonical HTTPS permalink for this message when the network supplies one (e.g. Slack
+    /// `https://<workspace>.slack.com/archives/<channel>/p<ts>`). Used by "Copy link".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permalink: String,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -707,6 +718,7 @@ pub enum CallOutcome {
     Missed,
     Declined,
     Cancelled,
+    Busy,
     Ended,
     Live,
 }
@@ -722,6 +734,8 @@ pub struct CallNote {
     /// User ids who took part in the call, when the network names them (e.g. Discord).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that
@@ -802,6 +816,7 @@ impl Message {
             effect: None,
             contacts: Vec::new(),
             sent_via: None,
+            permalink: String::new(),
         }
     }
 
@@ -833,6 +848,8 @@ impl Message {
             clip(&mut forwarded.from_title, 200);
             clip(&mut forwarded.from_space, 200);
             clip(&mut forwarded.link, 2_000);
+            clip(&mut forwarded.author, 200);
+            clip(&mut forwarded.text, 4_000);
         }
         if let Some(prior) = &mut self.prior_text {
             clip(prior, PRIOR_LIMIT);

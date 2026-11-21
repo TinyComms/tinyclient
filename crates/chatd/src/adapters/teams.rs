@@ -992,7 +992,7 @@ impl Teams {
             // Each row's line comes with the chat list (`lastMessage`); a row still without one
             // has no message, or one the list did not show.
             Command::Previews(_) => {}
-            Command::SetPresence { presence, status, clear_at: _, reply } => {
+            Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => {
                 let _ = reply.send(self.set_presence(presence, status.as_deref()).map_err(refuse));
             }
             Command::Download { url, reply, .. } => {
