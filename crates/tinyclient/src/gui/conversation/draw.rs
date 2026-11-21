@@ -272,10 +272,11 @@ fn system_line(message: &Message) -> Div {
         .px(px(20.))
         .py(px(5.))
         .flex()
-        .justify_center()
+        .flex_col()
+        .items_center()
         .type_small()
         .text_color(theme::text_faint())
-        .child(div().max_w(px(MEASURE)).child(message.text.clone()))
+        .child(div().max_w(px(MEASURE)).text_center().whitespace_normal().child(message.text.clone()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,7 +482,7 @@ impl Pane {
             Item::New => new_line(metrics).into_any_element(),
             Item::Message { message, head } => self.message_row(message, *head, false, window, cx),
             Item::System(message) if message.call.is_some() => self.call_line(message, cx).into_any_element(),
-            Item::System(message) => system_line(message).into_any_element(),
+            Item::System(message) => self.system_row(message, cx).into_any_element(),
         };
         let seen = self.seen.clone();
         let mark = canvas(move |bounds, _, _| seen.borrow_mut().push((ix, bounds)), |_, (), _, _| {});
@@ -504,6 +505,28 @@ impl Pane {
         } else {
             self.metrics.media.min(room).max(120.).floor()
         }
+    }
+
+    /// AutoMod alerts are system rows. Their buttons are not drawn here, so the alert opens in Discord.
+    fn system_row(&self, message: &Message, cx: &mut Context<Self>) -> Div {
+        let link = message
+            .text
+            .starts_with("AutoMod ")
+            .then(|| message.permalink.clone())
+            .filter(|link| link.starts_with("https://") || link.starts_with("http://"));
+        let mut row = system_line(message);
+        if let Some(link) = link {
+            let id = SharedString::from(format!("automod-{}", message.id));
+            row = row.child(
+                div()
+                    .id(id)
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&link)))
+                    .child("Open in Discord"),
+            );
+        }
+        row
     }
 
     fn call_line(&self, message: &Message, cx: &mut Context<Self>) -> Div {

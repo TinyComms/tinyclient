@@ -694,7 +694,6 @@ fn system_line(kind: u8, who: &str, content: &str, mentioned: &str) -> Option<St
         8..=11 => format!("{who} boosted the server."),
         12 => format!("{who} added {content} to this channel."),
         18 => format!("{who} started a thread: {content}"),
-        24 => "AutoMod flagged a message.".to_owned(),
         27 => format!("{who} started {content}"),
         28 => format!("{who} ended {content}"),
         29 => format!("{who} is now a speaker."),
@@ -703,6 +702,56 @@ fn system_line(kind: u8, who: &str, content: &str, mentioned: &str) -> Option<St
         67 => format!("{who} accepted your friend request."),
         _ => return Some(String::new()),
     })
+}
+
+fn embed_field(embed: &Embed, name: &str) -> Option<String> {
+    embed
+        .fields
+        .iter()
+        .find(|field| field.name == name)
+        .map(|field| field.value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn push_quote(line: &mut String, seen: &mut Vec<String>, text: &str) {
+    let text = text.trim();
+    if text.is_empty() || seen.iter().any(|have| have == text) {
+        return;
+    }
+    seen.push(text.to_owned());
+    line.push('\n');
+    line.push('"');
+    line.push_str(text);
+    line.push('"');
+}
+
+/// Type 24, from the alert embed. Missing pieces drop out of the sentence.
+fn automod_alert(who: &str, posted: &Posted, names: &dyn Names) -> String {
+    let Some(embed) = posted.embeds.as_deref().and_then(|embeds| embeds.first()) else {
+        return "AutoMod flagged a message.".to_owned();
+    };
+    let name = if who.is_empty() { "someone" } else { who };
+    let mut line = format!("AutoMod blocked a message from {name}");
+    if let Some(id) = embed_field(embed, "channel_id") {
+        let title = names.channel(&id).filter(|title| !title.is_empty()).unwrap_or(id);
+        line.push_str(" in #");
+        line.push_str(title.trim_start_matches('#'));
+    }
+    if let Some(rule) = embed_field(embed, "rule_name") {
+        line.push_str(" — rule ");
+        line.push_str(&rule);
+    }
+    let mut seen = Vec::new();
+    if let Some(text) = embed.description.as_deref() {
+        push_quote(&mut line, &mut seen, text);
+    }
+    if let Some(text) = embed_field(embed, "keyword_matched_content") {
+        push_quote(&mut line, &mut seen, &text);
+    }
+    if let Some(text) = embed_field(embed, "keyword") {
+        push_quote(&mut line, &mut seen, &text);
+    }
+    line
 }
 
 /// Where the official app shows this message.
@@ -786,21 +835,27 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let forwarded = posted.message_snapshots.first().map(|snapshot| &*snapshot.message);
     let mut message_kind = MessageKind::Normal;
     let mentioned = posted.mentions.first().map_or("", |user| user.name());
-    match system_line(kind, &who, content, mentioned) {
-        None => {
-            markdown(&mut rich, content, place.names);
-            // What was forwarded is the message's own text; a forward has none of its own.
-            if let Some(forwarded) = forwarded {
-                markdown(&mut rich, forwarded.content.as_deref().unwrap_or(""), place.names);
+    if kind == 24 {
+        // Posted by the member AutoMod caught. The row is the alert, not their message.
+        rich.text = automod_alert(&who, posted, place.names);
+        message_kind = MessageKind::System;
+    } else {
+        match system_line(kind, &who, content, mentioned) {
+            None => {
+                markdown(&mut rich, content, place.names);
+                // What was forwarded is the message's own text; a forward has none of its own.
+                if let Some(forwarded) = forwarded {
+                    markdown(&mut rich, forwarded.content.as_deref().unwrap_or(""), place.names);
+                }
             }
-        }
-        Some(line) if line.is_empty() => {
-            rich.text = if content.is_empty() { "A message tinyclient cannot show.".to_owned() } else { content.to_owned() };
-            message_kind = MessageKind::Unsupported { link: link.clone() };
-        }
-        Some(line) => {
-            rich.text = line;
-            message_kind = MessageKind::System;
+            Some(line) if line.is_empty() => {
+                rich.text = if content.is_empty() { "A message tinyclient cannot show.".to_owned() } else { content.to_owned() };
+                message_kind = MessageKind::Unsupported { link: link.clone() };
+            }
+            Some(line) => {
+                rich.text = line;
+                message_kind = MessageKind::System;
+            }
         }
     }
 
@@ -808,7 +863,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let attached = carried.attachments.as_deref().unwrap_or(&[]);
     let mut attachments: Vec<Attachment> = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
     attachments.extend(carried.sticker_items.iter().map(|item| sticker(&mut rich, item)));
-    let embeds = carried.embeds.as_deref().unwrap_or(&[]);
+    // The alert's embed is the system line. A preview would glue those fields back on.
+    let embeds = carried.embeds.as_deref().filter(|_| kind != 24).unwrap_or(&[]);
     let composed = carried.author.as_ref().is_some_and(|author| author.bot) || carried.webhook_id.is_some();
     let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed);
     attachments.extend(moving_pictures);
@@ -822,7 +878,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
     let app_id = posted.application_id.as_deref().unwrap_or(&author.id);
     let (controls, _dropped_components) = match carried.components.as_deref() {
-        Some(comps) if !comps.is_empty() => extract_components(
+        Some(comps) if kind != 24 && !comps.is_empty() => extract_components(
             comps,
             &posted.id,
             app_id,

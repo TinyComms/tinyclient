@@ -5604,3 +5604,59 @@ fn context_commands_post_the_target() {
     assert!(matches!(missing, Response::Error { code: ErrorCode::Refused, .. }), "{missing:?}");
     assert_eq!(world.discord.requests_to("POST", "/interactions").len(), posted);
 }
+
+/// AutoMod's refusal names the rule, and the typed text stays on the failed row.
+/// A type-24 alert is a system line built from the embed, not the member's message.
+#[test]
+fn automod_block_keeps_the_text_and_an_alert_is_a_system_line() {
+    let world = World::start();
+    world.discord.script(
+        "/channels/4101/messages",
+        400,
+        json!({"message": "Message blocked by AutoMod", "code": 200000}),
+    );
+    world.send("4101", "1730000000000000091", "the blocked words", None);
+    let failed = world.outcome("4101", "1730000000000000091");
+    assert_eq!(failed.text, "the blocked words");
+    assert_eq!(world.failure("4101", "1730000000000000091"), "This server's AutoMod blocked your message.");
+
+    world.discord.script(
+        "/channels/4101/messages",
+        400,
+        json!({"message": "Message blocked by AutoMod", "code": 200001}),
+    );
+    world.send("4101", "1730000000000000092", "also blocked", None);
+    let blocked = world.outcome("4101", "1730000000000000092");
+    assert_eq!(blocked.text, "also blocked");
+    assert_eq!(world.failure("4101", "1730000000000000092"), "This server's AutoMod blocked your message.");
+
+    // Opening the channel is what keeps a later alert; until then a server message is only a count.
+    let _ = world.messages("4101");
+    let id = world.incoming(
+        "4101",
+        Some("4000"),
+        "",
+        json!({
+            "type": 24,
+            "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0"},
+            "embeds": [{
+                "type": "auto_moderation_message",
+                "description": "don't say the bad word",
+                "fields": [
+                    {"name": "rule_name", "value": "Slurs", "inline": true},
+                    {"name": "channel_id", "value": "4101", "inline": true},
+                    {"name": "keyword", "value": "bad word", "inline": true},
+                    {"name": "keyword_matched_content", "value": "bad word", "inline": true}
+                ]
+            }]
+        }),
+    );
+    let alert = wait("the automod alert", || world.messages("4101").into_iter().find(|message| message.id == id));
+    assert_eq!(alert.kind, MessageKind::System);
+    assert_eq!(alert.sender.name, "Sam Whitlock");
+    assert!(alert.previews.is_empty(), "the embed is the line, not a preview");
+    assert_eq!(
+        alert.text,
+        "AutoMod blocked a message from Sam Whitlock in #general — rule Slurs\n\"don't say the bad word\"\n\"bad word\""
+    );
+}

@@ -156,6 +156,7 @@ impl Refused {
             Refused::Status { code: 50013 | 50001, .. } => "You do not have permission to do this here.".to_owned(),
             Refused::Status { code: 50007, .. } => "This person does not accept direct messages from you.".to_owned(),
             Refused::Status { code: 40002, .. } => "Discord wants you to verify your account. Finish it in Discord.".to_owned(),
+            Refused::Status { code: 200000 | 200001, .. } => "This server's AutoMod blocked your message.".to_owned(),
             Refused::Status { status: 403, message, .. } if message.is_empty() => {
                 "You do not have permission to do this here.".to_owned()
             }
@@ -538,5 +539,9 @@ mod tests {
         assert_eq!(Refused::Limited(2.5).reason(), "Rate limited: try again in 3 s.");
         let forbidden = Refused::Status { status: 403, code: 50013, message: "Missing Permissions".into(), retry_after: None };
         assert_eq!(forbidden.reason(), "You do not have permission to do this here.");
+        for code in [200000, 200001] {
+            let blocked = Refused::Status { status: 400, code, message: "Message blocked by AutoMod".into(), retry_after: None };
+            assert_eq!(blocked.reason(), "This server's AutoMod blocked your message.");
+        }
     }
 }
