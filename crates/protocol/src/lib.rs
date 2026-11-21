@@ -2369,6 +2369,30 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
     },
+    /// Add a link bookmark to a channel (Slack `bookmarks.add`).
+    BookmarkAdd {
+        conversation: Key,
+        title: String,
+        link: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        emoji: String,
+    },
+    /// Edit a channel bookmark (Slack `bookmarks.edit`).
+    BookmarkEdit {
+        conversation: Key,
+        bookmark_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+    },
+    /// Remove a channel bookmark (Slack `bookmarks.remove`).
+    BookmarkRemove {
+        conversation: Key,
+        bookmark_id: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -2824,6 +2848,10 @@ pub enum Response {
         items: Vec<ActivityItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+    },
+    /// A created or edited channel bookmark (`BookmarkAdd` / `BookmarkEdit`).
+    Bookmark {
+        bookmark: Bookmark,
     },
 }
 

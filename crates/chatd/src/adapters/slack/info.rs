@@ -6,7 +6,7 @@
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
 use crate::store::Filing;
-use protocol::{ActivityItem, ActivityItemKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
+use protocol::{ActivityItem, ActivityItemKind, Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -150,6 +150,7 @@ impl Slack {
                 description.push_str(&handoff);
             }
         }
+        let bookmarks = self.bookmarks(channel_of(conversation));
         Ok(ConversationAbout {
             description,
             members: channel["num_members"].as_u64().map(|count| count as u32),
@@ -157,6 +158,7 @@ impl Slack {
             creator: creator.unwrap_or_default(),
             notify,
             external: names.join(", "),
+            bookmarks,
             ..ConversationAbout::default()
         })
     }
@@ -271,7 +273,27 @@ impl Slack {
         let types = match kind {
             SharedKind::Media => "images",
             SharedKind::Files => "all",
-            SharedKind::Links => return None,
+            SharedKind::Links => {
+                if before.is_some() {
+                    return Some(Ok(SharedPage::default()));
+                }
+                let bookmarks = self.bookmarks(channel_of(conversation));
+                let items: Vec<SharedItem> = bookmarks
+                    .into_iter()
+                    .filter(|b| !b.link.is_empty())
+                    .take(limit.clamp(1, FILES_PAGE) as usize)
+                    .map(|b| SharedItem {
+                        message_id: format!("bookmark:{}", b.id),
+                        sent: 0,
+                        sender: String::new(),
+                        attachment: None,
+                        url: b.link,
+                        title: b.title,
+                    })
+                    .collect();
+                let total = Some(items.len() as u32);
+                return Some(Ok(SharedPage { items, more: false, total }));
+            }
         };
         Some(self.files(channel_of(conversation), kind, types, before, limit))
     }
@@ -602,6 +624,84 @@ impl Slack {
                 self.api("activity.mark", &[("all", "true")])?;
             }
         }
+        Ok(())
+    }
+
+    fn map_bookmark(raw: &Value) -> Option<Bookmark> {
+        let id = raw["id"].as_str().filter(|s| !s.is_empty())?.to_owned();
+        let title = raw["title"].as_str().unwrap_or("").to_owned();
+        let link = raw["link"].as_str().unwrap_or("").to_owned();
+        let raw_emoji = raw["emoji"].as_str().unwrap_or("").trim().trim_matches(':');
+        let emoji_str = if raw_emoji.is_empty() {
+            String::new()
+        } else {
+            emoji::standard(raw_emoji).unwrap_or_else(|| format!(":{raw_emoji}:"))
+        };
+        let kind = match raw["type"].as_str().unwrap_or("link") {
+            "canvas" | "quip" => BookmarkKind::Canvas,
+            "folder" => BookmarkKind::Folder,
+            _ => BookmarkKind::Link,
+        };
+        Some(Bookmark { id, title, link, emoji: emoji_str, kind })
+    }
+
+    /// Lists a channel's bookmarks (`bookmarks.list`). Returns empty if unsupported or absent.
+    pub(super) fn bookmarks(&self, channel: &str) -> Vec<Bookmark> {
+        let Ok(listed) = self.api("bookmarks.list", &[("channel_id", channel)]) else {
+            return Vec::new();
+        };
+        listed["bookmarks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Self::map_bookmark)
+            .collect()
+    }
+
+    /// Adds a link bookmark to a channel (`bookmarks.add`).
+    pub(super) fn bookmark_add(&self, conversation: &str, title: &str, link: &str, emoji: &str) -> Result<Bookmark, Fault> {
+        let channel = channel_of(conversation);
+        let mut params = vec![
+            ("channel_id", channel),
+            ("title", title),
+            ("type", "link"),
+            ("link", link),
+        ];
+        if !emoji.is_empty() {
+            params.push(("emoji", emoji));
+        }
+        let added = self.api("bookmarks.add", &params)?;
+        Self::map_bookmark(&added["bookmark"]).ok_or_else(|| Fault::Slack("invalid_bookmark".to_owned()))
+    }
+
+    /// Edits an existing channel bookmark (`bookmarks.edit`).
+    pub(super) fn bookmark_edit(
+        &self,
+        conversation: &str,
+        bookmark_id: &str,
+        title: Option<&str>,
+        link: Option<&str>,
+        emoji: Option<&str>,
+    ) -> Result<Bookmark, Fault> {
+        let channel = channel_of(conversation);
+        let mut params = vec![("channel_id", channel), ("bookmark_id", bookmark_id)];
+        if let Some(t) = title {
+            params.push(("title", t));
+        }
+        if let Some(l) = link {
+            params.push(("link", l));
+        }
+        if let Some(e) = emoji {
+            params.push(("emoji", e));
+        }
+        let edited = self.api("bookmarks.edit", &params)?;
+        Self::map_bookmark(&edited["bookmark"]).ok_or_else(|| Fault::Slack("invalid_bookmark".to_owned()))
+    }
+
+    /// Removes a channel bookmark (`bookmarks.remove`).
+    pub(super) fn bookmark_remove(&self, conversation: &str, bookmark_id: &str) -> Result<(), Fault> {
+        let channel = channel_of(conversation);
+        self.api("bookmarks.remove", &[("channel_id", channel), ("bookmark_id", bookmark_id)])?;
         Ok(())
     }
 }

@@ -931,6 +931,16 @@ impl Slack {
                 self.emoji_changed(event);
                 Ok(())
             }
+            "bookmark_added" | "bookmark_changed" | "bookmark_deleted" => {
+                if let Some(channel) = event["channel_id"]
+                    .as_str()
+                    .or_else(|| event["bookmark"]["channel_id"].as_str())
+                    .filter(|c| !c.is_empty())
+                {
+                    self.ctx.info_stale(channel);
+                }
+                Ok(())
+            }
             "subteam_self_added" => {
                 self.subteam_self(event, true);
                 Ok(())
@@ -1391,6 +1401,15 @@ impl Slack {
             }
             Command::ActivityMarkRead { item_id, reply } => {
                 answer(reply, self.activity_mark_read(item_id.as_deref()))
+            }
+            Command::BookmarkAdd { conversation_id, title, link, emoji, reply } => {
+                answer(reply, self.bookmark_add(&conversation_id, &title, &link, &emoji))
+            }
+            Command::BookmarkEdit { conversation_id, bookmark_id, title, link, emoji, reply } => {
+                answer(reply, self.bookmark_edit(&conversation_id, &bookmark_id, title.as_deref(), link.as_deref(), emoji.as_deref()))
+            }
+            Command::BookmarkRemove { conversation_id, bookmark_id, reply } => {
+                answer(reply, self.bookmark_remove(&conversation_id, &bookmark_id))
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
@@ -2048,6 +2067,7 @@ fn capabilities() -> protocol::Capabilities {
         mention_format: protocol::MentionFormat::Slack,
         mention_spans: false,
         activity_feed: true,
+        bookmarks: true,
         ..protocol::Capabilities::default()
     }
 }

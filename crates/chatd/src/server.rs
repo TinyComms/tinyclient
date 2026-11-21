@@ -1844,6 +1844,7 @@ impl Chat {
             pinned: about.pinned,
             external: about.external,
             link: about.link,
+            bookmarks: about.bookmarks,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
@@ -3452,6 +3453,48 @@ impl Chat {
                 }
                 match self.ask(&account, |reply| Command::ActivityMarkRead { item_id, reply }) {
                     Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::BookmarkAdd { conversation, title, link, emoji } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::BookmarkAdd { conversation_id, title, link, emoji, reply }) {
+                    Ok(bookmark) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Bookmark { bookmark }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::BookmarkEdit { conversation, bookmark_id, title, link, emoji } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::BookmarkEdit { conversation_id, bookmark_id, title, link, emoji, reply }) {
+                    Ok(bookmark) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Bookmark { bookmark }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::BookmarkRemove { conversation, bookmark_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::BookmarkRemove { conversation_id, bookmark_id, reply }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
                     Err(refused) => *refused,
                 }
             }

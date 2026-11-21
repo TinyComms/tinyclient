@@ -189,6 +189,7 @@ pub struct ConversationAbout {
     pub external: String,
     pub link: String,
     pub disappearing: Option<u32>,
+    pub bookmarks: Vec<protocol::Bookmark>,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -427,6 +428,29 @@ pub enum Command {
         item_id: Option<String>,
         reply: Reply<()>,
     },
+    /// Add a bookmark to a channel.
+    BookmarkAdd {
+        conversation_id: String,
+        title: String,
+        link: String,
+        emoji: String,
+        reply: Reply<protocol::Bookmark>,
+    },
+    /// Edit an existing channel bookmark.
+    BookmarkEdit {
+        conversation_id: String,
+        bookmark_id: String,
+        title: Option<String>,
+        link: Option<String>,
+        emoji: Option<String>,
+        reply: Reply<protocol::Bookmark>,
+    },
+    /// Remove a channel bookmark.
+    BookmarkRemove {
+        conversation_id: String,
+        bookmark_id: String,
+        reply: Reply<()>,
+    },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
@@ -653,6 +677,9 @@ impl Command {
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BookmarkAdd { reply, .. }
+            | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());

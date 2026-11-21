@@ -243,6 +243,32 @@ pub struct ConversationInfo {
     /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disappearing: Option<u32>,
+    /// Channel bookmarks (links, canvases, folders; Slack `bookmarks.list`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+/// Kind of a channel bookmark.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkKind {
+    #[default]
+    Link,
+    Canvas,
+    Folder,
+}
+
+/// One bookmark pinned in a channel's bookmarks bar (`ConversationInfo::bookmarks`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    #[serde(default)]
+    pub kind: BookmarkKind,
 }
 
 /// A Space's info: opened from its name, never from a conversation.
@@ -563,6 +589,9 @@ pub struct Capabilities {
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,
+    /// This account supports channel bookmarks (`bookmarks.list` / `add` / `edit` / `remove`, Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bookmarks: bool,
 }
 
 /// What kind of event an [`ActivityItem`] represents.

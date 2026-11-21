@@ -128,6 +128,8 @@ struct Fake {
     limited: AtomicBool,
     /// Optional override for `dnd.info` response.
     dnd_info: Mutex<Option<Value>>,
+    /// Channel bookmarks keyed by channel_id.
+    bookmarks: Mutex<HashMap<String, Vec<Value>>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -172,6 +174,13 @@ impl Fake {
             reissue: Mutex::default(),
             limited: AtomicBool::new(false),
             dnd_info: Mutex::default(),
+            bookmarks: Mutex::new(HashMap::from([(
+                "C0GEN".to_owned(),
+                vec![
+                    json!({"id": "Bk1", "channel_id": "C0GEN", "title": "Runbook", "link": "https://docs.example.com/runbook", "emoji": ":book:", "type": "link"}),
+                    json!({"id": "Bk2", "channel_id": "C0GEN", "title": "Team Canvas", "link": "https://alpha.slack.com/docs/T01ALPHA/F0CANVAS", "emoji": "", "type": "canvas"}),
+                ],
+            )])),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -565,6 +574,51 @@ impl Fake {
                 }))
             }
             "activity.mark" => Some(json!({"ok": true})),
+            "bookmarks.list" => {
+                let cid = param("channel_id");
+                let list = self.bookmarks.lock().unwrap().get(cid).cloned().unwrap_or_default();
+                Some(json!({"ok": true, "bookmarks": list}))
+            }
+            "bookmarks.add" => {
+                let cid = param("channel_id").to_owned();
+                let mut map = self.bookmarks.lock().unwrap();
+                let entry = map.entry(cid.clone()).or_default();
+                let id = format!("BkNew{}", entry.len() + 1);
+                let bm = json!({
+                    "id": id,
+                    "channel_id": cid,
+                    "title": param("title"),
+                    "link": param("link"),
+                    "emoji": param("emoji"),
+                    "type": "link",
+                });
+                entry.push(bm.clone());
+                Some(json!({"ok": true, "bookmark": bm}))
+            }
+            "bookmarks.edit" => {
+                let cid = param("channel_id");
+                let bid = param("bookmark_id");
+                let mut map = self.bookmarks.lock().unwrap();
+                let found = map.get_mut(cid).and_then(|list| list.iter_mut().find(|b| b["id"] == bid));
+                let Some(bm) = found else {
+                    return refused("not_found");
+                };
+                if !param("title").is_empty() {
+                    bm["title"] = param("title").into();
+                }
+                if !param("link").is_empty() {
+                    bm["link"] = param("link").into();
+                }
+                Some(json!({"ok": true, "bookmark": bm.clone()}))
+            }
+            "bookmarks.remove" => {
+                let cid = param("channel_id");
+                let bid = param("bookmark_id");
+                if let Some(list) = self.bookmarks.lock().unwrap().get_mut(cid) {
+                    list.retain(|b| b["id"] != bid);
+                }
+                Some(json!({"ok": true}))
+            }
             method => self.fixture(token, method),
         };
         found.map_or_else(|| refused("unknown_method"), ok)
@@ -2945,4 +2999,83 @@ fn slack_activity_feed_lists_mentions_threads_reactions_and_marks_read() {
     let mark = world.fake.calls(ALPHA, "activity.mark");
     assert_eq!(mark.len(), 1);
     assert_eq!(mark[0].params.get("item_id").map(String::as_str), Some("act-3"));
+}
+
+#[test]
+fn slack_bookmarks_list_add_edit_remove_and_socket_invalidation() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.bookmarks, "Slack should advertise bookmarks");
+    let general = alpha("C0GEN");
+
+    // ConversationInfo reads bookmarks.list: one link bookmark and one canvas bookmark.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.bookmarks.len(), 2);
+    assert_eq!(info.bookmarks[0].title, "Runbook");
+    assert_eq!(info.bookmarks[0].link, "https://docs.example.com/runbook");
+    assert_eq!(info.bookmarks[0].kind, protocol::BookmarkKind::Link);
+    assert_eq!(info.bookmarks[1].title, "Team Canvas");
+    assert_eq!(info.bookmarks[1].kind, protocol::BookmarkKind::Canvas);
+
+    // SharedKind::Links is fed from channel bookmarks.
+    let Response::Shared { items, .. } = world.ask(Request::Shared {
+        conversation: general.clone(),
+        kind: protocol::SharedKind::Links,
+        before: None,
+        limit: 20,
+        search: true,
+    }) else {
+        panic!("expected Shared");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].url, "https://docs.example.com/runbook");
+
+    // Add a bookmark via Request::BookmarkAdd.
+    let Response::Bookmark { bookmark: added } = world.ask(Request::BookmarkAdd {
+        conversation: general.clone(),
+        title: "Status Page".into(),
+        link: "https://status.example.com".into(),
+        emoji: String::new(),
+    }) else {
+        panic!("expected Response::Bookmark");
+    };
+    assert_eq!(added.title, "Status Page");
+
+    // Edit it via Request::BookmarkEdit.
+    let Response::Bookmark { bookmark: edited } = world.ask(Request::BookmarkEdit {
+        conversation: general.clone(),
+        bookmark_id: added.id.clone(),
+        title: Some("System Status".into()),
+        link: None,
+        emoji: None,
+    }) else {
+        panic!("expected Response::Bookmark");
+    };
+    assert_eq!(edited.title, "System Status");
+
+    // Remove it via Request::BookmarkRemove.
+    let Response::Ok = world.ask(Request::BookmarkRemove {
+        conversation: general.clone(),
+        bookmark_id: added.id,
+    }) else {
+        panic!("expected Response::Ok");
+    };
+
+    // Simulate a remote bookmark_deleted event: removes Bk2 on server and invalidates cached ConversationInfo.
+    world.fake.bookmarks.lock().unwrap().get_mut("C0GEN").unwrap().retain(|b| b["id"] != "Bk2");
+    world.fake.push(ALPHA, json!({
+        "type": "bookmark_deleted",
+        "channel_id": "C0GEN",
+        "bookmark": {"id": "Bk2", "channel_id": "C0GEN"},
+    }));
+    sleep(Duration::from_millis(200));
+
+    let Response::ConversationInfo { info: refreshed } = world.ask(Request::ConversationInfo { conversation: general }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(refreshed.bookmarks.len(), 1);
+    assert_eq!(refreshed.bookmarks[0].id, "Bk1");
 }
