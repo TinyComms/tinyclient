@@ -1158,6 +1158,10 @@ pub struct Watching {
     /// it, and plays no sound for any other. Lapses with the rest.
     #[serde(default, skip_serializing_if = "is_false")]
     pub focused: bool,
+    /// True when the window is focused AND the user has interacted recently (within the idle
+    /// threshold). Teams sends `user.activity: active` only while both `focused` and `active` hold.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active: bool,
 }
 
 /// One hit of a message search: where the message is, and enough of it to choose by.

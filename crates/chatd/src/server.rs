@@ -825,6 +825,7 @@ impl Chat {
         };
         let typists = watching.conversation.as_ref().map_or_else(Vec::new, |open| self.hub.typists(open));
         // Focus alone is chatd's own business (notifications): the networks are not told again.
+        // `active` (focus + recent input) IS compared so Teams can send `user.activity` heartbeats.
         let mut before = (*self.hub.watching()).clone();
         before.focused = watching.focused;
         let for_networks = before != watching;

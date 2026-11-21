@@ -2867,3 +2867,123 @@ fn polls_praise_and_approvals_cards_render_vote_create_and_act() {
     assert!(sp.anonymous);
 }
 
+#[test]
+fn active_presence_heartbeat_privacy_toggle_timed_status_and_reset() {
+    let world = World::start();
+    world.ready();
+
+    let account = protocol::AccountKey {
+        network: Network::Teams,
+        account: HOME.to_owned(),
+    };
+
+    // 1. Focused + active Watch triggers trouter `user.activity` = "active".
+    let _ = world.ask(Request::Watch(Watching {
+        focused: true,
+        active: true,
+        ..Watching::default()
+    }));
+    world.until("user.activity active frame", || {
+        world
+            .fake
+            .heard
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains("\"user.activity\"") && f.contains("\"active\""))
+            .then_some(())
+    });
+
+    // 2. Unfocused / idle transitions to `user.activity` = "inactive".
+    let _ = world.ask(Request::Watch(Watching {
+        focused: false,
+        active: false,
+        ..Watching::default()
+    }));
+    world.until("user.activity inactive frame", || {
+        world
+            .fake
+            .heard
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains("\"user.activity\"") && f.contains("\"inactive\""))
+            .then_some(())
+    });
+
+    // 3. Turning off Privacy `presence_activity` suppresses future "active" heartbeats.
+    let scope = protocol::settings::account_scope(&account);
+    assert_eq!(
+        world.ask(Request::Set {
+            scope,
+            key: protocol::settings::PRESENCE_ACTIVITY.to_owned(),
+            value: Some("off".to_owned()),
+        }),
+        Response::Ok
+    );
+    let active_before = world
+        .fake
+        .heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f.contains("\"user.activity\"") && f.contains("\"active\""))
+        .count();
+    let _ = world.ask(Request::Watch(Watching {
+        focused: true,
+        active: true,
+        ..Watching::default()
+    }));
+    sleep(Duration::from_millis(2500));
+    let active_after = world
+        .fake
+        .heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f.contains("\"user.activity\"") && f.contains("\"active\""))
+        .count();
+    assert_eq!(active_after, active_before, "privacy opt-out must suppress active heartbeats");
+
+    // 4. Timed forced availability sends `expiry` to forceavailability.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Busy,
+            status: Some("Deep work".to_owned()),
+            status_emoji: None,
+            clear_at: Some(1_800_000_000),
+        }),
+        Response::Ok
+    );
+    let put = world
+        .fake
+        .calls("PUT", "/presence/v1/me/forceavailability/")
+        .pop()
+        .expect("timed forceavailability PUT");
+    assert_eq!(put.json()["availability"].as_str(), Some("Busy"));
+    assert_eq!(put.json()["expiry"].as_str(), Some("2027-01-15T08:00:00.000Z"));
+    let note = world
+        .fake
+        .calls("PUT", "/presence/v1/me/publishnote")
+        .pop()
+        .expect("timed publishnote PUT");
+    assert_eq!(note.json()["expiry"].as_str(), Some("2027-01-15T08:00:00.000Z"));
+
+    // 5. Reset status (`Presence::Unknown`, `status: None`) sends DELETE /v1/me/forceavailability/.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account,
+            presence: Presence::Unknown,
+            status: None,
+            status_emoji: None,
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        !world.fake.calls("DELETE", "/presence/v1/me/forceavailability/").is_empty(),
+        "Reset status must DELETE /v1/me/forceavailability/"
+    );
+}
+

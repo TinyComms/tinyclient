@@ -461,6 +461,13 @@ impl StatusMenu {
                 self.clear_after.until(crate::view::now())
             };
             (em, until)
+        } else if own.key.network == Network::Teams {
+            let until = if text.is_empty() {
+                None
+            } else {
+                self.clear_after.until(crate::view::now())
+            };
+            (None, until)
         } else {
             (None, None)
         };
@@ -750,8 +757,69 @@ impl StatusMenu {
                     .children(Shape::of(state).map(|shape| presence::inline(shape, 10., theme::overlay())))
                     .child(div().flex_1().min_w_0().truncate().child(state_word(state, network)))
                     .when(own.presence == state, |row| row.child(glyph("icons/check.svg", 14., theme::text_soft())))
-                    .on_click(cx.listener(move |this, _, _, cx| this.send(account.clone(), state, None, None, None, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let clear_at = (network == Network::Teams)
+                            .then(|| this.clear_after.until(crate::view::now()))
+                            .flatten();
+                        this.send(account.clone(), state, None, None, clear_at, cx);
+                    })),
             );
+        }
+        if network == Network::Teams {
+            let reset_acc = own.key.clone();
+            choices = choices
+                .child(
+                    div()
+                        .id(("own-reset-status", ix))
+                        .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::selected()))
+                        .child(glyph("icons/rotate-ccw.svg", 14., theme::text_soft()))
+                        .child(div().flex_1().min_w_0().truncate().child("Reset status"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.clear_after = ClearAfter::Never;
+                            this.send(reset_acc.clone(), Presence::Unknown, None, None, None, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .mt(px(2.))
+                        .px(px(8.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().type_micro().text_color(theme::text_faint()).child("Reset automatically after"))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(4.))
+                                .children(ClearAfter::ALL.iter().enumerate().map(|(cix, &preset)| {
+                                    let chosen = self.clear_after == preset;
+                                    div()
+                                        .id(("own-teams-clear-after", ix * 8 + cix))
+                                        .px(px(6.))
+                                        .py(px(2.))
+                                        .rounded(px(theme::R_CHIP))
+                                        .type_micro()
+                                        .text_color(if chosen { theme::text() } else { theme::text_soft() })
+                                        .when(chosen, |el| el.bg(theme::selected()))
+                                        .cursor_pointer()
+                                        .hover(|el| el.bg(theme::hover()))
+                                        .child(preset.label())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.clear_after = preset;
+                                            cx.notify();
+                                        }))
+                                })),
+                        ),
+                );
         }
         if own.can.dnd_snooze {
             if own.presence == Presence::Dnd {

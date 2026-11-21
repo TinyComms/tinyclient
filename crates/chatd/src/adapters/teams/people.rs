@@ -878,16 +878,20 @@ impl Teams {
         Ok(())
     }
 
-    /// Sets our own availability and/or status message note.
-    pub(super) fn set_presence(&self, presence: Presence, status: Option<&str>) -> Result<(), Fault> {
-        let refuse = |message: &str| Fault::Refused {
-            status: 400,
-            message: message.to_owned(),
-        };
-        if presence == Presence::Unknown && status.is_none() {
-            return Err(refuse("Teams decides that one itself"));
-        }
+    /// Sets our own availability and/or status message note, with optional expiry (`clear_at`).
+    /// Passing `Presence::Unknown` with `status: None` clears any forced availability ("Reset status")
+    /// via `DELETE /v1/me/forceavailability/` so Teams resumes automatic presence.
+    pub(super) fn set_presence(&self, presence: Presence, status: Option<&str>, clear_at: Option<i64>) -> Result<(), Fault> {
         let place = self.place()?;
+        if presence == Presence::Unknown && status.is_none() {
+            let url = format!("{}/v1/me/forceavailability/", place.presence);
+            self.call("DELETE", &url, Auth::Bearer(PRESENCE), Body::None, false)?;
+            let me = self.me();
+            if !me.is_empty() {
+                self.fetch_presence_for(&[me]);
+            }
+            return Ok(());
+        }
         if presence != Presence::Unknown {
             let availability = match presence {
                 Presence::Online => "Available",
@@ -898,12 +902,39 @@ impl Teams {
                 Presence::Unknown => unreachable!(),
             };
             let url = format!("{}/v1/me/forceavailability/", place.presence);
-            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&json!({"availability": availability})), false)?;
+            let mut body = json!({"availability": availability});
+            if let Some(ts) = clear_at.filter(|&ts| ts > 0) {
+                body["expiry"] = Value::String(iso_utc(ts));
+            }
+            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
         }
         if let Some(note) = status {
             let url = format!("{}/v1/me/publishnote", place.presence);
-            let body = json!({"message": note, "expiry": "9999-12-30T23:00:00.000Z"});
+            let expiry = clear_at
+                .filter(|&ts| ts > 0)
+                .map(iso_utc)
+                .unwrap_or_else(|| "9999-12-30T23:00:00.000Z".to_owned());
+            let body = json!({"message": note, "expiry": expiry});
             self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
+        }
+        Ok(())
+    }
+
+    /// Reports in-call / presenting presence to Teams when a call is active, or clears forced
+    /// call presence on hangup so Teams resumes automatic presence.
+    #[allow(dead_code)]
+    pub(super) fn report_call_presence(&self, in_call: bool, presenting: bool) -> Result<(), Fault> {
+        let place = self.place()?;
+        let url = format!("{}/v1/me/forceavailability/", place.presence);
+        if in_call {
+            let body = if presenting {
+                json!({"availability": "DoNotDisturb", "activity": "Presenting"})
+            } else {
+                json!({"availability": "Busy", "activity": "InACall"})
+            };
+            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
+        } else {
+            self.call("DELETE", &url, Auth::Bearer(PRESENCE), Body::None, false)?;
         }
         Ok(())
     }

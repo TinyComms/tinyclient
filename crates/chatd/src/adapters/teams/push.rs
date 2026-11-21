@@ -14,8 +14,10 @@ const TROUTER: &str = "https://go.trouter.teams.microsoft.com";
 const VERSION: &str = "49/25113001312";
 const TRACE: &str = "2024.23.01.2";
 /// How long the socket waits for a frame before looking at what else is due.
-const TICK: Duration = Duration::from_secs(5);
+const TICK: Duration = Duration::from_secs(2);
 const PING: Duration = Duration::from_secs(30);
+/// How often `user.activity: active` is repeated while the user is actively using the window.
+const ACTIVITY_HEARTBEAT: Duration = Duration::from_secs(240);
 /// How long a registration lasts, in seconds, and how long before its end it is made again.
 const REGISTERED: u64 = 86_400;
 const RENEW: Duration = Duration::from_secs(REGISTERED - 600);
@@ -31,6 +33,8 @@ pub(super) struct Push {
     sent: u64,
     pinged: Instant,
     registered: Option<Instant>,
+    active_sent: bool,
+    activity_at: Option<Instant>,
 }
 
 /// The payload of a socket.io 0.9 frame: what follows its third colon.
@@ -115,6 +119,8 @@ impl Teams {
             sent: 0,
             pinged: Instant::now(),
             registered: None,
+            active_sent: false,
+            activity_at: None,
         })
     }
 
@@ -133,6 +139,35 @@ impl Teams {
         if push.registered.is_some_and(|at| at.elapsed() > RENEW) {
             self.register(push)?;
         }
+        if push.registered.is_some() {
+            self.sync_activity(push)?;
+        }
+        Ok(())
+    }
+
+    fn want_active_presence(&self) -> bool {
+        let watching = self.ctx.watching();
+        watching.focused && watching.active && self.ctx.hub.settings().presence_activity(&self.ctx.account)
+    }
+
+    /// Sends trouter `user.activity` (`active` on focus+input + 240 s heartbeat, `inactive` when
+    /// unfocused, idle, or when Settings › Privacy turns active presence off).
+    fn sync_activity(&self, push: &mut Push) -> Result<(), Failure> {
+        let want = self.want_active_presence();
+        if want {
+            let due = !push.active_sent || push.activity_at.is_none_or(|at| at.elapsed() >= ACTIVITY_HEARTBEAT);
+            if due {
+                let frame = json!({"name": "user.activity", "args": [{"state": "active"}]});
+                push.socket.send(format!("5:::{frame}"))?;
+                push.active_sent = true;
+                push.activity_at = Some(Instant::now());
+            }
+        } else if push.active_sent {
+            let frame = json!({"name": "user.activity", "args": [{"state": "inactive"}]});
+            push.socket.send(format!("5:::{frame}"))?;
+            push.active_sent = false;
+            push.activity_at = Some(Instant::now());
+        }
         Ok(())
     }
 
@@ -147,6 +182,7 @@ impl Teams {
                 }]});
                 push.socket.send(format!("5:::{hello}"))?;
                 self.register(push)?;
+                self.sync_activity(push)?;
             }
             Some(b'2') => push.socket.send("2::".to_owned())?,
             Some(b'3') => {

@@ -891,6 +891,7 @@ impl Composer {
     }
 
     fn typed(&mut self, cx: &mut Context<Self>) {
+        self.hub.watch_input(cx);
         self.follow_text(cx);
         self.touched = true;
         self.caption = None;

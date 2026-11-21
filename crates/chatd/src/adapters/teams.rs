@@ -82,9 +82,9 @@
 //! Events arrive as requests to answer (`3:::`), `EventMessage` with `NewMessage` or
 //! `MessageUpdate` [C]. The chat service's own long poll is gone (purple-teams 58c649f, Apr
 //! 2025), so there is no fallback. A read marker moved elsewhere (`ConversationUpdate`) [U].
-//! Not sent: `user.activity: active`, which the other clients send. A daemon that is always
-//! on would tell Teams the user is always at the desk, and Teams holds back phone
-//! notifications for someone who is. If nothing arrives live on a real account, try it first.
+//! `user.activity` (`active` / `inactive`) is sent only while the window is focused AND receiving
+//! recent input (and the per-account `presence_activity` Privacy setting is on), heartbeat every
+//! 240 s; when unfocused, idle, or opted out it sends `inactive` so mobile notifications stay normal.
 //!
 //! Deep links: `…/l/meetup-join/{thread}/0` [C]; `msteams:/l/call/0/0?users=`, `/l/chat/…`,
 //! `/l/channel/…` and `/l/message/…` are Microsoft's documented forms, in no client read [U].
@@ -1049,8 +1049,8 @@ impl Teams {
             // Each row's line comes with the chat list (`lastMessage`); a row still without one
             // has no message, or one the list did not show.
             Command::Previews(_) => {}
-            Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => {
-                let _ = reply.send(self.set_presence(presence, status.as_deref()).map_err(refuse));
+            Command::SetPresence { presence, status, status_emoji: _, clear_at, reply } => {
+                let _ = reply.send(self.set_presence(presence, status.as_deref(), clear_at).map_err(refuse));
             }
             Command::GetOutOfOffice { reply } => {
                 let _ = reply.send(self.get_out_of_office().map_err(refuse));
