@@ -1039,6 +1039,10 @@ impl Demo {
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetSpaceView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EditChannel { reply, .. }
+            | Command::MoveChannels { reply, .. }
+            | Command::DeleteChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

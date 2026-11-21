@@ -407,6 +407,12 @@ pub struct ConversationRights {
     /// May change this conversation's picture (`Request::ConversationPicture`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit_picture: bool,
+    /// May delete this channel (`Request::DeleteChannel`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_channel: bool,
+    /// May edit this channel's permission overwrites (`Request::SetOverwrite`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_permissions: bool,
 }
 
 impl ConversationRights {
@@ -418,6 +424,8 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
+    const DELETE_CHANNEL: i64 = 1 << 8;
+    const MANAGE_PERMISSIONS: i64 = 1 << 9;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -453,6 +461,12 @@ impl ConversationRights {
         if self.edit_picture {
             bits |= Self::EDIT_PICTURE;
         }
+        if self.delete_channel {
+            bits |= Self::DELETE_CHANNEL;
+        }
+        if self.manage_permissions {
+            bits |= Self::MANAGE_PERMISSIONS;
+        }
         bits
     }
 
@@ -466,8 +480,77 @@ impl ConversationRights {
             rename: (bits & Self::RENAME) != 0,
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+            delete_channel: (bits & Self::DELETE_CHANNEL) != 0,
+            manage_permissions: (bits & Self::MANAGE_PERMISSIONS) != 0,
         }
     }
+}
+
+/// Server-level management rights for this account inside a Space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRights {
+    /// May create, edit, reorder, or delete channels and categories (Discord `MANAGE_CHANNELS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_channels: bool,
+    /// May edit channel/category permission overwrites or roles (Discord `MANAGE_ROLES`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_roles: bool,
+    /// May read the server's audit log (Discord `VIEW_AUDIT_LOG`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_audit_log: bool,
+    /// May edit server safety setup and AutoMod rules (Discord `MANAGE_GUILD`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_server: bool,
+}
+
+impl SpaceRights {
+    const MANAGE_CHANNELS: i64 = 1 << 0;
+    const MANAGE_ROLES: i64 = 1 << 1;
+    const VIEW_AUDIT_LOG: i64 = 1 << 2;
+    const MANAGE_SERVER: i64 = 1 << 3;
+
+    pub fn is_none(&self) -> bool {
+        *self == SpaceRights::default()
+    }
+
+    pub fn to_bits(self) -> i64 {
+        let mut bits = 0i64;
+        if self.manage_channels {
+            bits |= Self::MANAGE_CHANNELS;
+        }
+        if self.manage_roles {
+            bits |= Self::MANAGE_ROLES;
+        }
+        if self.view_audit_log {
+            bits |= Self::VIEW_AUDIT_LOG;
+        }
+        if self.manage_server {
+            bits |= Self::MANAGE_SERVER;
+        }
+        bits
+    }
+
+    pub fn from_bits(bits: i64) -> Self {
+        Self {
+            manage_channels: (bits & Self::MANAGE_CHANNELS) != 0,
+            manage_roles: (bits & Self::MANAGE_ROLES) != 0,
+            view_audit_log: (bits & Self::VIEW_AUDIT_LOG) != 0,
+            manage_server: (bits & Self::MANAGE_SERVER) != 0,
+        }
+    }
+}
+
+/// One channel or category's target position in a bulk reorder (`Request::MoveChannels`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPosition {
+    pub id: String,
+    pub position: i32,
+    /// `Some(Some(cat))` moves under that category; `Some(None)` uncategorises; `None` leaves parent unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Option<String>>,
+    /// When moving under a category, sync overwrites with the new category's permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_permissions: Option<bool>,
 }
 
 /// What an account may send and do on messages, as the session says (the plan, the workspace's

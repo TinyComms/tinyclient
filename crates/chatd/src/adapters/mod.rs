@@ -435,6 +435,34 @@ pub enum Command {
         group: Option<String>,
         reply: Reply<String>,
     },
+    /// Create a category in a Space; record it and answer with its group header.
+    CreateCategory {
+        space_id: String,
+        name: String,
+        reply: Reply<Group>,
+    },
+    /// Edit a channel's or category's properties (name, topic, slow mode, NSFW, user limit, parent).
+    EditChannel {
+        conversation_id: String,
+        name: Option<String>,
+        topic: Option<String>,
+        rate_limit_per_user: Option<u32>,
+        nsfw: Option<bool>,
+        user_limit: Option<u32>,
+        parent_id: Option<Option<String>>,
+        reply: Reply<()>,
+    },
+    /// Bulk-reorder channels/categories in a Space in one request.
+    MoveChannels {
+        space_id: String,
+        order: Vec<protocol::ChannelPosition>,
+        reply: Reply<()>,
+    },
+    /// Permanently delete a channel or category.
+    DeleteChannel {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
     CreateGroup {
         members: Vec<String>,
@@ -848,7 +876,11 @@ impl Command {
             Command::MembersAdd { reply, .. }
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }
-            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::ConversationPicture { reply, .. }
+            | Command::EditChannel { reply, .. }
+            | Command::MoveChannels { reply, .. }
+            | Command::DeleteChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }
             | Command::StartGroup { reply, .. }
@@ -1078,6 +1110,15 @@ impl Context {
     pub fn set_space_opt_in(&self, space_id: &str, opt_in: bool) -> Stores {
         let space = self.key(space_id);
         if self.hub.store().set_space_opt_in(&space, opt_in)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sets server-level management rights for this account in `space_id`.
+    pub fn set_space_rights(&self, space_id: &str, rights: protocol::SpaceRights) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_rights(&space, rights)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())

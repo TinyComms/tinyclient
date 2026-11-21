@@ -83,6 +83,7 @@ const TABLES: &str = "
         hide_muted INTEGER NOT NULL DEFAULT 0,
         can_create_channels INTEGER NOT NULL DEFAULT 0,
         opt_in_channels INTEGER NOT NULL DEFAULT 0,
+        rights INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     -- A folder: of chats (Telegram, membership on the conversation) or of Spaces (Discord,
@@ -1154,6 +1155,9 @@ impl Store {
         if !column(&store.db, "space", "opt_in_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN opt_in_channels INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !column(&store.db, "space", "rights")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN rights INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(store)
     }
 
@@ -1364,7 +1368,7 @@ impl Store {
                     (SELECT f.id FROM folder f
                       WHERE f.network = s.network AND f.account = s.account
                         AND instr(f.spaces, ',' || s.id || ',') > 0 LIMIT 1),
-                    s.muted, s.hide_muted, s.can_create_channels, s.opt_in_channels
+                    s.muted, s.hide_muted, s.can_create_channels, s.opt_in_channels, s.rights
              FROM space s
              LEFT JOIN media m ON m.network = s.network AND m.account = s.account AND m.id = s.icon
              WHERE ?1 IS NULL OR s.network = ?1
@@ -1383,6 +1387,7 @@ impl Store {
                 hide_muted: row.get(16)?,
                 can_create_channels: row.get(17)?,
                 opt_in_channels: row.get(18)?,
+                rights: protocol::SpaceRights::from_bits(row.get(19)?),
             })
         })?;
         rows.collect()
@@ -2224,6 +2229,16 @@ impl Store {
             "UPDATE space SET opt_in_channels = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3 AND opt_in_channels != ?4",
             params![word(&space.network), space.account, space.id, opt_in],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_space_rights(&mut self, space: &Key, rights: protocol::SpaceRights) -> rusqlite::Result<bool> {
+        let bits = rights.to_bits();
+        let changed = self.db.execute(
+            "UPDATE space SET rights = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND rights != ?4",
+            params![word(&space.network), space.account, space.id, bits],
         )?;
         Ok(changed == 1)
     }

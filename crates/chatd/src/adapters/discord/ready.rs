@@ -5,7 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    KICK_MEMBERS, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES, SEND_MESSAGES, VIEW_CHANNEL,
+    KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_GUILD, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES,
+    SEND_MESSAGES, VIEW_AUDIT_LOG, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -180,7 +181,7 @@ fn kind_of(channel: &Channel) -> Option<ConversationKind> {
 }
 
 /// A category's header: just above the first row `place` puts under it.
-fn header(id: &str, name: &str, position: i32) -> Group {
+pub(super) fn header(id: &str, name: &str, position: i32) -> Group {
     Group::new(id, name, place(Some(position), false, 0) - 1)
 }
 
@@ -214,6 +215,33 @@ impl GuildInfo {
     /// Unix seconds when our server timeout ends, if still active.
     pub(super) fn timed_out(&self, now: i64) -> Option<i64> {
         self.timeout_until.filter(|until| *until > now)
+    }
+
+    /// Guild-level permissions from ownership and roles (without channel overwrites).
+    pub(super) fn guild_permissions(&self, guild: &str) -> u64 {
+        if self.owner {
+            return u64::MAX;
+        }
+        let everyone = number(guild);
+        let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
+        let allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
+        if allowed & ADMINISTRATOR != 0 {
+            u64::MAX
+        } else {
+            allowed
+        }
+    }
+
+    /// Server-level management flags exposed on [`protocol::Space`].
+    pub(super) fn space_rights(&self, guild: &str, now: i64) -> protocol::SpaceRights {
+        let perms = self.guild_permissions(guild);
+        let not_timed_out = self.timed_out(now).is_none();
+        protocol::SpaceRights {
+            manage_channels: not_timed_out && (perms & MANAGE_CHANNELS != 0),
+            manage_roles: not_timed_out && (perms & MANAGE_ROLES != 0),
+            view_audit_log: perms & VIEW_AUDIT_LOG != 0,
+            manage_server: not_timed_out && (perms & MANAGE_GUILD != 0),
+        }
     }
 
     /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
@@ -273,6 +301,10 @@ impl GuildInfo {
             pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
             delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
             manage_members: timed_out.is_none() && (perms & (KICK_MEMBERS | BAN_MEMBERS | MANAGE_ROLES) != 0),
+            rename: timed_out.is_none() && (perms & MANAGE_CHANNELS != 0),
+            edit_topic: timed_out.is_none() && (perms & MANAGE_CHANNELS != 0),
+            delete_channel: timed_out.is_none() && (perms & MANAGE_CHANNELS != 0),
+            manage_permissions: timed_out.is_none() && (perms & MANAGE_ROLES != 0),
             ..protocol::ConversationRights::default()
         };
         let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
@@ -535,7 +567,7 @@ impl Discord {
     }
 
     /// Changes what is kept of a server's channels.
-    fn keep(&self, guild: &str, change: impl FnOnce(&mut Vec<Kept>)) {
+    pub(super) fn keep(&self, guild: &str, change: impl FnOnce(&mut Vec<Kept>)) {
         let note = format!("kept:{guild}");
         let mut kept: Vec<Kept> = self.ctx.note(&note).and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
         change(&mut kept);
@@ -575,16 +607,20 @@ impl Discord {
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
-        let flags = self
-            .state
-            .lock()
-            .unwrap()
-            .guilds
-            .get(guild_id)
-            .map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted, info.quiet.opt_in));
-        if let Some((muted, hide, opt_in)) = flags {
+        let clock = now();
+        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| {
+            (
+                info.quiet.server_muted(clock),
+                info.quiet.hide_muted,
+                info.quiet.opt_in,
+                info.space_rights(guild_id, clock),
+            )
+        });
+        if let Some((muted, hide, opt_in, rights)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
             self.ctx.set_space_opt_in(guild_id, opt_in)?;
+            self.ctx.set_space_can_create_channels(guild_id, rights.manage_channels)?;
+            self.ctx.set_space_rights(guild_id, rights)?;
         }
         Ok(())
     }
@@ -652,7 +688,13 @@ impl Discord {
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
             flags.extend(state.guilds.iter().map(|(id, info)| {
-                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.quiet.opt_in)
+                (
+                    id.clone(),
+                    info.quiet.server_muted(now),
+                    info.quiet.hide_muted,
+                    info.quiet.opt_in,
+                    info.space_rights(id, now),
+                )
             }));
             let listed = state.guilds.iter().map(|(id, info)| {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
@@ -669,10 +711,12 @@ impl Discord {
         };
         self.ctx.media(&files)?;
         self.ctx.spaces(&rows)?;
-        // A server's own mute, "hide muted channels" and opt-in filter, once its Space exists.
-        for (id, muted, hide, opt_in) in flags {
+        // A server's own mute, "hide muted channels", opt-in filter and permissions, once its Space exists.
+        for (id, muted, hide, opt_in, rights) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
             self.ctx.set_space_opt_in(&id, opt_in)?;
+            self.ctx.set_space_can_create_channels(&id, rights.manage_channels)?;
+            self.ctx.set_space_rights(&id, rights)?;
         }
         Ok(())
     }

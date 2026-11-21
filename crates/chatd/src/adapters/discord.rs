@@ -19,6 +19,7 @@ pub(super) fn prove_code_colors() -> Result<(), String> {
 /// Its socket waits are shared with the Tiny server's live socket.
 pub(super) mod gateway;
 mod info;
+mod manage;
 mod members;
 mod model;
 mod picker;
@@ -1879,6 +1880,42 @@ impl Discord {
             }
             Command::BrowseChannels { space_id, query, cursor: _, limit, reply } => {
                 answer(reply, self.browse_channels(&space_id, &query, limit))
+            }
+            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+                answer(reply, self.create_channel(&space_id, &name, kind, private, group.as_deref()))
+            }
+            Command::CreateCategory { space_id, name, reply } => {
+                answer(reply, self.create_category(&space_id, &name))
+            }
+            Command::EditChannel {
+                conversation_id,
+                name,
+                topic,
+                rate_limit_per_user,
+                nsfw,
+                user_limit,
+                parent_id,
+                reply,
+            } => answer(
+                reply,
+                self.edit_channel(
+                    &conversation_id,
+                    name.as_deref(),
+                    topic.as_deref(),
+                    rate_limit_per_user,
+                    nsfw,
+                    user_limit,
+                    parent_id.as_ref().map(|p| p.as_deref()),
+                ),
+            ),
+            Command::ConversationUpdate { conversation_id, title, topic, description: _, reply } => {
+                answer(reply, self.edit_channel(&conversation_id, title.as_deref(), topic.as_deref(), None, None, None, None))
+            }
+            Command::MoveChannels { space_id, order, reply } => {
+                answer(reply, self.move_channels(&space_id, &order))
+            }
+            Command::DeleteChannel { conversation_id, reply } => {
+                answer(reply, self.delete_channel(&conversation_id))
             }
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),

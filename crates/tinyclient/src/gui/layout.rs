@@ -397,6 +397,18 @@ impl Shell {
         }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
+        } else if self.sidebar_state.delete_channel.is_some() {
+            self.sidebar_state.delete_channel = None;
+        } else if self.sidebar_state.move_channels.is_some() {
+            self.sidebar_state.move_channels = None;
+        } else if self.sidebar_state.edit_channel.is_some() {
+            self.sidebar_state.edit_channel = None;
+        } else if self.sidebar_state.create_category.is_some() {
+            self.sidebar_state.create_category = None;
+        } else if self.sidebar_state.create_channel.is_some() {
+            self.sidebar_state.create_channel = None;
+        } else if self.sidebar_state.browse_channels.is_some() {
+            self.sidebar_state.browse_channels = None;
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
         } else if self.tiny_unfull(window, cx) {
@@ -880,6 +892,27 @@ impl Shell {
                     let space_muted = space_row.is_some_and(|s| s.muted);
                     let opt_in_on = space_row.is_some_and(|s| s.opt_in_channels);
                     let hide_muted = space_row.is_some_and(|s| s.hide_muted);
+                    let manage_channels = space_row.is_some_and(|s| s.rights.manage_channels);
+                    if manage_channels {
+                        let cat_space = space.clone();
+                        let move_space = space.clone();
+                        items.push(
+                            menu_item("space-create-category", Some("icons/folder-plus.svg"), "Create category…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_create_category(cat_space.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                        items.push(
+                            menu_item("space-move-channels", Some("icons/grip-vertical.svg"), "Reorder channels…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_move_channels(move_space.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
                     let browse_space = space.clone();
                     let view_all_space = space.clone();
                     let hide_muted_space = space.clone();
@@ -966,8 +999,43 @@ impl Shell {
                     );
                 }
             }
-            Menu::Group { space, id, muted, .. } => {
+            Menu::Group { space, id, name, muted, .. } => {
                 if space.network == Network::Discord {
+                    let manage_channels = self.spaces.iter().any(|s| &s.key == space && s.rights.manage_channels);
+                    if manage_channels {
+                        let create_space = space.clone();
+                        let create_cat = id.clone();
+                        items.push(
+                            menu_item("group-create-channel", Some("icons/plus.svg"), "Create channel…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_create_channel(create_space.clone(), Some(create_cat.clone()), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                        let rename_space = space.clone();
+                        let rename_id = id.clone();
+                        let rename_name = name.clone();
+                        items.push(
+                            menu_item("group-rename", Some("icons/pencil.svg"), "Rename category…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_edit_category(rename_space.clone(), rename_id.clone(), rename_name.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                        let delete_key = Key { id: id.clone(), ..space.clone() };
+                        let delete_name = name.clone();
+                        items.push(
+                            menu_item_danger("group-delete", Some("icons/trash-2.svg"), "Delete category…")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_delete_channel(delete_key.clone(), delete_name.clone(), true, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                        items.push(menu_separator().into_any_element());
+                    }
                     if *muted {
                         let space_key = space.clone();
                         let cat_id = id.clone();
@@ -1163,6 +1231,36 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                if conversation.key.network == Network::Discord
+                    && !conversation.kind.is_direct()
+                    && conversation.kind != protocol::ConversationKind::Thread
+                    && (conversation.rights.rename || conversation.rights.delete_channel)
+                {
+                    items.push(menu_separator().into_any_element());
+                    if conversation.rights.rename {
+                        let edited = (**conversation).clone();
+                        items.push(
+                            menu_item("discord-edit-channel", Some("icons/pencil.svg"), "Edit channel…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_edit_channel(&edited, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    if conversation.rights.delete_channel {
+                        let del_key = conversation.key.clone();
+                        let del_name = conversation.title.clone();
+                        items.push(
+                            menu_item_danger("discord-delete-channel", Some("icons/trash-2.svg"), "Delete channel…")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_delete_channel(del_key.clone(), del_name.clone(), false, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                }
                 if conversation.kind.is_direct() {
                     let row = (**conversation).clone();
                     items.push(menu_separator().into_any_element());
@@ -1715,6 +1813,10 @@ impl Render for Shell {
             })
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))
+            .children(self.create_category_modal(cx))
+            .children(self.edit_channel_modal(cx))
+            .children(self.move_channels_modal(cx))
+            .children(self.delete_channel_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.browse_channels_modal(cx))

@@ -295,6 +295,39 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             )
         }
         ("DELETE", ["channels", channel]) => (200, json!({"id": channel, "type": 1})),
+        ("POST", ["guilds", guild, "channels"]) => {
+            let id = shared.snowflake();
+            let mut ch = json!({
+                "id": id,
+                "guild_id": guild,
+                "type": seen.body.get("type").and_then(Value::as_u64).unwrap_or(0),
+                "name": seen.body.get("name").and_then(Value::as_str).unwrap_or("channel"),
+                "position": 5,
+                "parent_id": seen.body.get("parent_id").cloned().unwrap_or(Value::Null),
+                "permission_overwrites": seen.body.get("permission_overwrites").cloned().unwrap_or_else(|| json!([])),
+            });
+            if let Some(topic) = seen.body.get("topic") {
+                ch["topic"] = topic.clone();
+            }
+            (201, ch)
+        }
+        ("PATCH", ["channels", channel]) => {
+            let ch = json!({
+                "id": channel,
+                "guild_id": "4000",
+                "type": 0,
+                "name": seen.body.get("name").and_then(Value::as_str).unwrap_or("renamed"),
+                "topic": seen.body.get("topic").cloned().unwrap_or(Value::Null),
+                "rate_limit_per_user": seen.body.get("rate_limit_per_user").and_then(Value::as_u64).unwrap_or(0),
+                "nsfw": seen.body.get("nsfw").and_then(Value::as_bool).unwrap_or(false),
+                "user_limit": seen.body.get("user_limit").and_then(Value::as_u64).unwrap_or(0),
+                "parent_id": seen.body.get("parent_id").cloned().unwrap_or(Value::Null),
+                "position": 0,
+                "permission_overwrites": [],
+            });
+            (200, ch)
+        }
+        ("PATCH", ["guilds", _guild, "channels"]) => (204, Value::Null),
         ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
         ("GET", ["channels", channel, "messages", "pins"]) => {
             let pinned = json!({
@@ -5234,4 +5267,150 @@ fn follow_channel_space_view_and_onboarding_defaults() {
         }
         other => panic!("expected Spaces, got {other:?}"),
     }
+}
+
+#[test]
+fn channel_and_category_create_edit_move_delete_and_permissions() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Make user 1000 a server manager (MANAGE_CHANNELS = 1<<4 = 16) on guild 4000,
+    // and add a read-only guild 4888 where user 1000 has only VIEW_CHANNEL (1<<10 = 1024).
+    ready["guilds"][0]["roles"][0]["permissions"] = json!(((1u64 << 10) | (1u64 << 11) | (1u64 << 4) | (1u64 << 28)).to_string());
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4888",
+        "properties": {"id": "4888", "name": "ReadOnly", "owner_id": "2001", "icon": null},
+        "roles": [{"id": "4888", "name": "@everyone", "permissions": "1024"}],
+        "channels": [{"id": "4881", "type": 0, "name": "lobby", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Space::rights reflects MANAGE_CHANNELS on 4000 and denies it on 4888.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let g4000 = spaces.iter().find(|s| s.key.id == "4000").expect("4000");
+            let g4888 = spaces.iter().find(|s| s.key.id == "4888").expect("4888");
+            assert!(g4000.rights.manage_channels && g4000.can_create_channels);
+            assert!(!g4888.rights.manage_channels && !g4888.can_create_channels);
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+
+    // 2. Without MANAGE_CHANNELS, create/edit/move/delete are refused locally with no HTTP traffic.
+    for req in [
+        Request::CreateChannel {
+            space: world.key("4888"),
+            name: "nope".into(),
+            kind: ConversationKind::Channel,
+            private: false,
+            group: None,
+        },
+        Request::CreateCategory { space: world.key("4888"), name: "Nope".into() },
+        Request::EditChannel {
+            conversation: world.key("4881"),
+            name: Some("renamed".into()),
+            topic: None,
+            rate_limit_per_user: None,
+            nsfw: None,
+            user_limit: None,
+            parent_id: None,
+        },
+        Request::MoveChannels {
+            space: world.key("4888"),
+            order: vec![protocol::ChannelPosition { id: "4881".into(), position: 0, parent_id: None, lock_permissions: None }],
+        },
+        Request::DeleteChannel { conversation: world.key("4881") },
+    ] {
+        match world.ask(req) {
+            Response::Error { code: ErrorCode::Refused, detail } => {
+                assert!(detail.contains("permission"), "expected permission refusal, got {detail}");
+            }
+            other => panic!("expected Refused without MANAGE_CHANNELS, got {other:?}"),
+        }
+    }
+    assert!(world.discord.requests_to("POST", "/guilds/4888/channels").is_empty());
+    assert!(world.discord.requests_to("DELETE", "/channels/4881").is_empty());
+
+    // 3. CreateCategory sends POST /guilds/4000/channels with type: 4.
+    let cat_id = match world.ask(Request::CreateCategory {
+        space: world.key("4000"),
+        name: "Projects".into(),
+    }) {
+        Response::Group { group } => {
+            assert_eq!(group.name, "Projects");
+            group.id
+        }
+        other => panic!("expected Response::Group, got {other:?}"),
+    };
+    let creates = world.discord.requests_to("POST", "/guilds/4000/channels");
+    assert_eq!(creates.len(), 1);
+    assert_eq!(creates[0].body, json!({"name": "Projects", "type": 4}));
+
+    // 4. CreateChannel (private Forum under the new category) sends type 15, parent_id, and VIEW_CHANNEL deny overwrite.
+    let ch_id = match world.ask(Request::CreateChannel {
+        space: world.key("4000"),
+        name: "ideas".into(),
+        kind: ConversationKind::Forum,
+        private: true,
+        group: Some(cat_id.clone()),
+    }) {
+        Response::Conversation { conversation } => {
+            assert_eq!(conversation.kind, ConversationKind::Forum);
+            assert!(conversation.private);
+            conversation.key.id
+        }
+        other => panic!("expected Response::Conversation, got {other:?}"),
+    };
+    let creates = world.discord.requests_to("POST", "/guilds/4000/channels");
+    assert_eq!(creates.len(), 2);
+    assert_eq!(creates[1].body["type"], 15);
+    assert_eq!(creates[1].body["parent_id"], cat_id);
+    assert_eq!(creates[1].body["permission_overwrites"][0]["deny"], (1u64 << 10).to_string());
+
+    // 5. EditChannel sends PATCH /channels/{id} with name, topic, slow mode, NSFW, and parent_id null.
+    assert_eq!(
+        world.ask(Request::EditChannel {
+            conversation: world.key(&ch_id),
+            name: Some("roadmap".into()),
+            topic: Some("Quarterly plans".into()),
+            rate_limit_per_user: Some(15),
+            nsfw: Some(true),
+            user_limit: None,
+            parent_id: Some(None),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", &format!("/channels/{ch_id}"));
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["name"], "roadmap");
+    assert_eq!(patches[0].body["topic"], "Quarterly plans");
+    assert_eq!(patches[0].body["rate_limit_per_user"], 15);
+    assert_eq!(patches[0].body["nsfw"], true);
+    assert_eq!(patches[0].body["parent_id"], Value::Null);
+
+    // 6. MoveChannels sends one bulk PATCH /guilds/4000/channels array.
+    assert_eq!(
+        world.ask(Request::MoveChannels {
+            space: world.key("4000"),
+            order: vec![
+                protocol::ChannelPosition { id: ch_id.clone(), position: 0, parent_id: Some(Some(cat_id.clone())), lock_permissions: Some(true) },
+                protocol::ChannelPosition { id: "4101".into(), position: 1, parent_id: None, lock_permissions: None },
+            ],
+        }),
+        Response::Ok
+    );
+    let moves = world.discord.requests_to("PATCH", "/guilds/4000/channels");
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].body.as_array().unwrap().len(), 2);
+    assert_eq!(moves[0].body[0]["id"], ch_id);
+    assert_eq!(moves[0].body[0]["lock_permissions"], true);
+
+    // 7. DeleteChannel removes the channel and category.
+    assert_eq!(world.ask(Request::DeleteChannel { conversation: world.key(&ch_id) }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", &format!("/channels/{ch_id}")).len(), 1);
+    assert_eq!(world.ask(Request::DeleteChannel { conversation: world.key(&cat_id) }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", &format!("/channels/{cat_id}")).len(), 1);
 }

@@ -265,6 +265,9 @@ pub struct Space {
     /// Opt-in channel filter is active ("Show all channels" is off, Discord `OPT_IN_CHANNELS_ON`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub opt_in_channels: bool,
+    /// Server-level management permissions for this account inside this Space.
+    #[serde(default, skip_serializing_if = "SpaceRights::is_none")]
+    pub rights: SpaceRights,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1532,6 +1535,38 @@ pub enum Request {
         private: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+    },
+    /// Create a category inside a Space where the user has Manage Channels. Answers `Response::Group`.
+    CreateCategory {
+        space: Key,
+        name: String,
+    },
+    /// Edit a channel's or category's properties (name, topic, slow mode, age restriction,
+    /// voice user limit, or parent category). Unset fields are left unchanged.
+    EditChannel {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit_per_user: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nsfw: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<Option<String>>,
+    },
+    /// Bulk-reorder channels and categories (and optionally move channels between categories)
+    /// in a Space in one request (`PATCH /guilds/{id}/channels`).
+    MoveChannels {
+        space: Key,
+        order: Vec<ChannelPosition>,
+    },
+    /// Permanently delete a channel or category in a Space (`DELETE /channels/{id}`).
+    DeleteChannel {
+        conversation: Key,
     },
     /// Starts a new group conversation with two or more members (by person id or phone number)
     /// and an optional group name. Answers `Response::Conversation`.
@@ -2806,6 +2841,9 @@ pub enum Response {
     Conversation {
         conversation: Conversation,
     },
+    Group {
+        group: Group,
+    },
     Spaces {
         spaces: Vec<Space>,
     },
@@ -3609,8 +3647,17 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            delete_channel: true,
+            manage_permissions: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
+        let space_all = SpaceRights {
+            manage_channels: true,
+            manage_roles: true,
+            view_audit_log: true,
+            manage_server: true,
+        };
+        assert_eq!(SpaceRights::from_bits(space_all.to_bits()), space_all);
     }
 }
 

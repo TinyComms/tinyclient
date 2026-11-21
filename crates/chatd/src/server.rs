@@ -3168,6 +3168,96 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::CreateCategory { space, name } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let mut name = name.trim().to_owned();
+                protocol::clip(&mut name, 100);
+                if name.is_empty() {
+                    return error(ErrorCode::Refused, "Category name cannot be empty.");
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::CreateCategory { space_id, name, reply }) {
+                    Ok(group) => Response::Group { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditChannel {
+                conversation,
+                name,
+                topic,
+                rate_limit_per_user,
+                nsfw,
+                user_limit,
+                parent_id,
+            } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let name = match name {
+                    Some(raw) => {
+                        let mut trimmed = raw.trim().to_owned();
+                        protocol::clip(&mut trimmed, 100);
+                        if trimmed.is_empty() {
+                            return error(ErrorCode::Refused, "Channel name cannot be empty.");
+                        }
+                        Some(trimmed)
+                    }
+                    None => None,
+                };
+                let topic = topic.map(|mut t| {
+                    protocol::clip(&mut t, 1024);
+                    t
+                });
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::EditChannel {
+                    conversation_id,
+                    name,
+                    topic,
+                    rate_limit_per_user,
+                    nsfw,
+                    user_limit,
+                    parent_id,
+                    reply,
+                }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::MoveChannels { space, order } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                if order.is_empty() {
+                    return Response::Ok;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::MoveChannels { space_id, order, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteChannel { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::DeleteChannel { conversation_id, reply }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::CreateGroup { account, members, name } => {
                 let started = self.ask(&account, |reply| Command::CreateGroup {
                     members,
