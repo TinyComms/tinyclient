@@ -355,6 +355,30 @@ fn a_refused_notification_plays_no_sound() {
     assert!(!notes.test(&Values::default(), false).0);
 }
 
+#[test]
+fn otp_notification_offers_copy_only_when_previews_are_shown() {
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let otp = message("Bank", "Your verification code is 482910.");
+    let full = Verdict { banner: true, sound: None, preview: Preview::Full, mention: false };
+    notes.message(&dm(), &otp, &full, Instant::now());
+    let id = note_id(&dm().key);
+    assert_eq!(fake.log().shown[&id].copy_code.as_deref(), Some("482910"));
+    assert_eq!(notes.code(&id), Some("482910"));
+
+    // Hidden previews: neither the body nor copy_code exposes the code.
+    let hidden = Verdict { banner: true, sound: None, preview: Preview::Sender, mention: false };
+    notes.message(&dm(), &otp, &hidden, Instant::now());
+    assert_eq!(fake.log().shown[&id].copy_code, None);
+    assert!(!fake.log().shown[&id].body.contains("482910"));
+    assert_eq!(notes.code(&id), None);
+
+    let nothing = Verdict { banner: true, sound: None, preview: Preview::Nothing, mention: false };
+    notes.message(&dm(), &otp, &nothing, Instant::now());
+    assert_eq!(fake.log().shown[&id].copy_code, None);
+    assert!(!fake.log().shown[&id].body.contains("482910"));
+}
+
 fn ringing(conversation: &Key, from: &str) -> Call {
     serde_json::from_value(serde_json::json!({
         "conversation": conversation,

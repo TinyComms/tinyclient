@@ -688,21 +688,38 @@ fn connect(
     ended
 }
 
-fn peer_phone(chat: &Chat) -> Option<String> {
+fn peer_number_raw(chat: &Chat) -> Option<&str> {
     if chat.group {
         return None;
     }
-    let raw = chat
-        .participants
+    chat.participants
         .iter()
         .find(|p| !p.is_me && !p.number.is_empty())
-        .map(|p| p.number.as_str())?;
+        .map(|p| p.number.as_str())
+}
+
+fn peer_is_emergency(chat: &Chat) -> bool {
+    peer_number_raw(chat).is_some_and(bugle::is_emergency_number)
+}
+
+fn peer_is_alphanumeric(chat: &Chat) -> bool {
+    peer_number_raw(chat).is_some_and(bugle::is_alphanumeric_sender)
+}
+
+fn peer_phone(chat: &Chat) -> Option<String> {
+    let raw = peer_number_raw(chat)?;
+    if bugle::is_alphanumeric_sender(raw) || bugle::is_emergency_number(raw) {
+        return None;
+    }
     let cleaned: String = raw
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '+')
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
 }
+
+const NO_REPLY_REASON: &str = "This sender can't receive replies";
+const EMERGENCY_REASON: &str = "Emergency numbers must be contacted directly from your phone.";
 
 fn row(chat: &Chat) -> ConversationRow {
     let kind = if chat.group {
@@ -713,12 +730,27 @@ fn row(chat: &Chat) -> ConversationRow {
     let mut row = ConversationRow::new(chat.id.clone(), kind, chat.title.clone());
     row.listed = true;
     row.private = !chat.group;
-    // A 1:1 chat with a phone number hands off to the OS `tel:` handler; groups have no call button.
-    row.call = if peer_phone(chat).is_some() {
-        protocol::CallSupport::Handoff
+    let emergency = peer_is_emergency(chat);
+    let no_reply = !emergency && (chat.read_only || (!chat.group && peer_is_alphanumeric(chat)));
+    if emergency {
+        row.read_only = true;
+        row.read_only_reason = EMERGENCY_REASON.to_owned();
+        row.call = protocol::CallSupport::None;
+    } else if no_reply {
+        row.read_only = true;
+        row.read_only_reason = NO_REPLY_REASON.to_owned();
+        row.call = protocol::CallSupport::None;
     } else {
-        protocol::CallSupport::None
-    };
+        // A 1:1 chat with a phone number hands off to the OS `tel:` handler; groups have no call button.
+        row.call = if peer_phone(chat).is_some() {
+            protocol::CallSupport::Handoff
+        } else {
+            protocol::CallSupport::None
+        };
+    }
+    if chat.verified {
+        row.mark = Some(protocol::Mark::Verified);
+    }
     if !chat.group && !chat.mine.is_empty() {
         row.peer = Some(chat.id.clone());
     }
@@ -746,15 +778,8 @@ fn file_as(account: &Account, id: &str, status: u64) {
         let mut chat = held.get(id).cloned().unwrap_or_else(|| Chat {
             id: id.to_owned(),
             title: "Messages".into(),
-            group: false,
-            unread: false,
-            mine: String::new(),
-            peer: String::new(),
-            carrier: 0,
-            updated: 0,
-            phones: false,
             status,
-            participants: Vec::new(),
+            ..Chat::default()
         });
         chat.status = status;
         chat
@@ -787,6 +812,8 @@ fn remember(account: &Account, incoming: &[Chat]) -> Vec<Chat> {
         let mut chat = chat.clone();
         if let Some(had) = held.get(&chat.id) {
             chat.phones = chat.phones || had.phones;
+            chat.read_only = chat.read_only || had.read_only;
+            chat.verified = chat.verified || had.verified;
             // 0 means this update did not say. An archived chat must not bounce back to the inbox.
             if chat.status == 0 {
                 chat.status = had.status;
@@ -810,15 +837,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
         let chat = held.entry(conversation.to_owned()).or_insert_with(|| Chat {
             id: conversation.to_owned(),
             title: "Messages".into(),
-            group: false,
-            unread: false,
-            mine: String::new(),
-            peer: String::new(),
-            carrier: 0,
-            updated: 0,
-            phones: false,
-            status: 0,
-            participants: Vec::new(),
+            ..Chat::default()
         });
         chat.phones = on;
         chat.clone()
@@ -885,15 +904,7 @@ fn apply(account: &Account, event: Event) {
                 let chat = Chat {
                     id: note.conversation.clone(),
                     title: note.name.clone(),
-                    group: false,
-                    unread: false,
-                    mine: String::new(),
-                    peer: String::new(),
-                    carrier: 0,
-                    updated: 0,
-                    phones: false,
-                    status: 0,
-                    participants: Vec::new(),
+                    ..Chat::default()
                 };
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));

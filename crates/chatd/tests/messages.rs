@@ -1668,3 +1668,45 @@ fn typing_resolves_a_raw_number_to_the_contact_name() {
         "raw phone number leaked into typist name: {unknown_typists:?}"
     );
 }
+
+#[test]
+fn alphanumeric_senders_are_read_only_short_codes_stay_replyable_and_emergency_is_blocked() {
+    let world = World::linked();
+    world.connected();
+
+    // Alphanumeric sender: read_only with exact reason, no call handoff.
+    world.steer("noreply phone-bank BANKOTP");
+    let bank = world.until("bank chat", || world.conversation("phone-bank"));
+    assert!(bank.read_only, "alphanumeric sender should be read_only");
+    assert_eq!(bank.read_only_reason, "This sender can't receive replies");
+    assert_eq!(bank.call, CallSupport::None);
+    match world.ask(Request::Send {
+        conversation: key("phone-bank"),
+        client_id: "no-reply-1".into(),
+        text: "STOP".into(),
+        reply_to: None,
+        with: Default::default(),
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.contains("can't receive replies"), "{detail}");
+        }
+        other => panic!("expected send to alphanumeric sender to be refused, got {other:?}"),
+    }
+
+    // Numeric short code: stays replyable (e.g. "STOP").
+    world.steer("shortcode phone-short 89203");
+    let short = world.until("short code chat", || world.conversation("phone-short"));
+    assert!(!short.read_only, "numeric short code should stay replyable");
+
+    // Verified business sender: Mark::Verified.
+    world.steer("verified phone-biz Acme Bank");
+    let biz = world.until("verified biz chat", || world.conversation("phone-biz"));
+    assert_eq!(biz.mark, Some(protocol::Mark::Verified));
+
+    // Emergency number: never offer call or text from tinyclient.
+    world.steer("emergency phone-911 911");
+    let em = world.until("emergency chat", || world.conversation("phone-911"));
+    assert!(em.read_only, "emergency number must be read_only");
+    assert_eq!(em.call, CallSupport::None);
+    assert!(em.read_only_reason.contains("phone"), "{}", em.read_only_reason);
+}

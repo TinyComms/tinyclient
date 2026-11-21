@@ -1106,7 +1106,7 @@ pub struct Participant {
     pub is_me: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Chat {
     pub id: String,
     pub title: String,
@@ -1116,7 +1116,7 @@ pub struct Chat {
     /// The other side of a one-to-one chat, by participant id: whose picture the row shows.
     /// Empty for a group.
     pub peer: String,
-    /// `Conversation.type`, field 22: 1 SMS, 2 RCS, 0 when the phone did not say.
+    /// `Conversation.type`, field 22: 1 SMS, 2 RCS, 3 RBM (business), 0 when the phone did not say.
     pub carrier: u64,
     /// Unix seconds of the latest message, from field 5. 0 when the phone did not say.
     /// The inbox cursor uses it when the response has no cursor of its own.
@@ -1127,8 +1127,30 @@ pub struct Chat {
     /// `Conversation.status`, field 12. 0 when the phone did not say, which keeps the status
     /// already stored. 3 is DELETED.
     pub status: u64,
+    /// `Conversation.readOnly`, field 13: the phone says this sender cannot receive replies.
+    pub read_only: bool,
+    /// Verified business sender (RBM or verified business flag).
+    pub verified: bool,
     /// Participants reported on this conversation (id, name, number, is_me).
     pub participants: Vec<Participant>,
+}
+
+/// True when a sender identifier is alphanumeric (e.g. "BANKOTP", "FedEx") rather than a phone
+/// number or numeric short code. Alphanumeric senders cannot receive SMS replies; numeric short
+/// codes often accept "STOP" and stay replyable unless the phone marks the chat read-only.
+pub fn is_alphanumeric_sender(number: &str) -> bool {
+    let trimmed = number.trim();
+    !trimmed.is_empty() && trimmed.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Standard emergency numbers that must never be texted or called from tinyclient.
+pub fn is_emergency_number(number: &str) -> bool {
+    let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+    matches!(
+        digits.as_str(),
+        "911" | "112" | "999" | "000" | "111" | "110" | "119" | "118" | "100" | "101" | "102"
+            | "108" | "190" | "192" | "193" | "995" | "997" | "998"
+    )
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -2559,6 +2581,8 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let unread = field_int(&conv, 6) != 0;
         let carrier = field_int(&conv, 22);
         let status = field_int(&conv, 12);
+        let read_only = field_int(&conv, 13) != 0;
+        let mut verified = carrier == 3 || field_int(&conv, 26) != 0;
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
         let mut participants = Vec::new();
@@ -2566,6 +2590,9 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             let participant = fields(&person.bytes);
             let info = fields(&field_bytes(&participant, 1));
             let pid = field_text(&info, 3);
+            if field_int(&participant, 18) != 0 || field_int(&info, 1) == 3 {
+                verified = true;
+            }
             let name = {
                 let full = field_text(&participant, 3);
                 if full.is_empty() {
@@ -2620,6 +2647,8 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             updated: unix_seconds(field_int(&conv, 5) as i64),
             phones: false,
             status,
+            read_only,
+            verified,
             participants,
         });
     }
@@ -3484,5 +3513,30 @@ mod tests {
         assert!(clear_action(46));
         assert!(clear_action(44));
         assert!(!clear_action(3));
+    }
+
+    #[test]
+    fn read_only_verified_alphanumeric_and_emergency_helpers() {
+        assert!(is_alphanumeric_sender("BANKOTP"));
+        assert!(is_alphanumeric_sender("FedEx"));
+        assert!(!is_alphanumeric_sender("89203"));
+        assert!(!is_alphanumeric_sender("+15550100002"));
+
+        assert!(is_emergency_number("911"));
+        assert!(is_emergency_number("112"));
+        assert!(is_emergency_number("999"));
+        assert!(!is_emergency_number("+15550100911"));
+
+        let mut conv = Buf::new();
+        conv.text(1, "c-ro");
+        conv.text(2, "Acme Alerts");
+        conv.int(13, 1); // readOnly
+        conv.int(22, 3); // RBM verified business
+        let mut list = Buf::new();
+        list.msg(2, &conv.0);
+        let chats = decode_chats(&list.0);
+        assert_eq!(chats.len(), 1);
+        assert!(chats[0].read_only);
+        assert!(chats[0].verified);
     }
 }

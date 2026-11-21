@@ -97,6 +97,8 @@ impl Fake {
                 updated: 0,
                 phones: false,
                 status: 1,
+                read_only: false,
+                verified: false,
                 participants: vec![
                     Participant {
                         id: ME.into(),
@@ -123,6 +125,8 @@ impl Fake {
                 updated: 0,
                 phones: false,
                 status: 1,
+                read_only: false,
+                verified: false,
                 participants: vec![
                     Participant {
                         id: ME.into(),
@@ -408,6 +412,8 @@ fn listed(id: &str, title: &str, status: u64) -> Chat {
         updated: 0,
         phones: false,
         status,
+        read_only: false,
+        verified: false,
         participants: Vec::new(),
     }
 }
@@ -623,6 +629,8 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones,
                 status: 0,
+                read_only: false,
+                verified: false,
                 participants: Vec::new(),
             }])]
         }
@@ -699,6 +707,8 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones: false,
                 status: 3,
+                read_only: false,
+                verified: false,
                 participants: Vec::new(),
             }])]
         }
@@ -722,7 +732,116 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones: false,
                 status: 1,
+                read_only: false,
+                verified: false,
                 participants: Vec::new(),
+            }])]
+        }
+        "noreply" => {
+            let id = words.next().unwrap_or("phone-bank");
+            let sender = words.next().unwrap_or("BANKOTP");
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: sender.into(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: sender.into(),
+                        number: sender.into(),
+                        is_me: false,
+                    },
+                ],
+                ..Chat::default()
+            }])]
+        }
+        "shortcode" => {
+            let id = words.next().unwrap_or("phone-short");
+            let code = words.next().unwrap_or("89203");
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: code.into(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: code.into(),
+                        number: code.into(),
+                        is_me: false,
+                    },
+                ],
+                ..Chat::default()
+            }])]
+        }
+        "verified" => {
+            let id = words.next().unwrap_or("phone-biz");
+            let name = rest(2);
+            let title = if name.is_empty() { "Acme Bank".into() } else { name };
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: title.clone(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                carrier: 3,
+                status: 1,
+                verified: true,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: title,
+                        number: "+18005550199".into(),
+                        is_me: false,
+                    },
+                ],
+                ..Chat::default()
+            }])]
+        }
+        "emergency" => {
+            let id = words.next().unwrap_or("phone-911");
+            let number = words.next().unwrap_or("911");
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: number.into(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: number.into(),
+                        number: number.into(),
+                        is_me: false,
+                    },
+                ],
+                ..Chat::default()
             }])]
         }
         _ => Vec::new(),

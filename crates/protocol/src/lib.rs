@@ -26,6 +26,7 @@ pub mod ipc;
 pub mod launch;
 pub mod link;
 mod message;
+pub mod otp;
 mod play;
 mod record;
 pub mod quarantine;
