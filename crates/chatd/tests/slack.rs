@@ -764,6 +764,32 @@ impl Fake {
                 }
                 Some(json!({"ok": true}))
             }
+            "conversations.setTopic" => {
+                let topic = param("topic");
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                if topic == "FORBIDDEN" {
+                    return refused("restricted_action");
+                }
+                if topic.chars().count() > 250 {
+                    return refused("too_long");
+                }
+                Some(json!({"ok": true, "topic": topic}))
+            }
+            "conversations.setPurpose" => {
+                let purpose = param("purpose");
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                if purpose == "FORBIDDEN" {
+                    return refused("not_authorized");
+                }
+                if purpose.chars().count() > 250 {
+                    return refused("too_long");
+                }
+                Some(json!({"ok": true, "purpose": purpose}))
+            }
             "conversations.join" => {
                 if channel.is_empty() {
                     return refused("channel_not_found");
@@ -3637,4 +3663,113 @@ fn slack_invite_and_kick_channel_members() {
         }
         other => panic!("expected Refused for restricted_action, got {other:?}"),
     }
+}
+
+#[test]
+fn slack_edit_channel_topic_and_description() {
+    let world = World::start();
+    world.ready();
+
+    let rnd = alpha("C0RND");
+    let side = alpha("C0SIDE");
+    assert!(world.conversation(&rnd).unwrap().rights.edit_topic, "writable Slack channels must advertise edit_topic");
+    assert!(!world.conversation(&side).unwrap().rights.edit_topic, "read-only Slack channels must not advertise edit_topic");
+
+    // Set topic via ConversationUpdate -> conversations.setTopic, updating stored row immediately.
+    let set_topic = world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: Some("Ship Wave 4C".into()),
+        description: None,
+    });
+    assert_eq!(set_topic, Response::Ok);
+    let topic_calls = world.fake.calls(ALPHA, "conversations.setTopic");
+    assert_eq!(topic_calls.len(), 1);
+    assert_eq!(topic_calls[0].params["channel"], "C0RND");
+    assert_eq!(topic_calls[0].params["topic"], "Ship Wave 4C");
+    assert_eq!(world.conversation(&rnd).unwrap().topic, "Ship Wave 4C");
+
+    // Set description via ConversationUpdate -> conversations.setPurpose without overwriting topic.
+    let set_desc = world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: None,
+        description: Some("Random watercooler channel".into()),
+    });
+    assert_eq!(set_desc, Response::Ok);
+    let purpose_calls = world.fake.calls(ALPHA, "conversations.setPurpose");
+    assert_eq!(purpose_calls.len(), 1);
+    assert_eq!(purpose_calls[0].params["channel"], "C0RND");
+    assert_eq!(purpose_calls[0].params["purpose"], "Random watercooler channel");
+    assert_eq!(world.conversation(&rnd).unwrap().topic, "Ship Wave 4C", "setting purpose must not clobber topic");
+
+    // Refusals surface clear human-readable errors.
+    match world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: Some("FORBIDDEN".into()),
+        description: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("workspace"), "got: {detail}");
+        }
+        other => panic!("expected Refused for restricted setTopic, got {other:?}"),
+    }
+    match world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: None,
+        description: Some("FORBIDDEN".into()),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("permission"), "got: {detail}");
+        }
+        other => panic!("expected Refused for not_authorized setPurpose, got {other:?}"),
+    }
+    match world.ask(Request::ConversationUpdate {
+        conversation: rnd.clone(),
+        title: None,
+        topic: Some("x".repeat(251)),
+        description: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("250") || detail.to_lowercase().contains("long"), "got: {detail}");
+        }
+        other => panic!("expected Refused for too_long topic, got {other:?}"),
+    }
+
+    // Live socket events: channel_topic updates row.topic; channel_purpose invalidates ConversationInfo cache.
+    let info_before = world.fake.calls(ALPHA, "conversations.info").len();
+    let _ = world.ask(Request::ConversationInfo { conversation: rnd.clone() });
+    assert_eq!(world.fake.calls(ALPHA, "conversations.info").len(), info_before + 1);
+
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "subtype": "channel_topic",
+        "channel": "C0RND",
+        "user": "U0ANA",
+        "topic": "Live socket topic",
+        "text": "<@U0ANA> set the channel topic: Live socket topic",
+        "ts": "1760000991.000100"
+    }));
+    world.until("channel_topic to update row", || {
+        (world.conversation(&rnd)?.topic == "Live socket topic").then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "subtype": "channel_purpose",
+        "channel": "C0RND",
+        "user": "U0ANA",
+        "purpose": "Live socket purpose",
+        "text": "<@U0ANA> set the channel description: Live socket purpose",
+        "ts": "1760000992.000100"
+    }));
+    world.until("channel_purpose message stored", || world.message(&rnd, "1760000992.000100"));
+    // Because channel_purpose called info_stale, asking ConversationInfo re-fetches conversations.info!
+    let _ = world.ask(Request::ConversationInfo { conversation: rnd.clone() });
+    assert!(
+        world.fake.calls(ALPHA, "conversations.info").len() >= info_before + 2,
+        "channel_purpose should invalidate cached ConversationInfo"
+    );
 }

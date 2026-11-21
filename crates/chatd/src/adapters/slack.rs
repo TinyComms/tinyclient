@@ -191,6 +191,7 @@ fn reason(fault: Fault) -> String {
             | "invalid_name_reserved"
             | "invalid_name_nonmatching" => "That channel name is not valid for Slack.",
             "not_authorized" => "You do not have permission to do that in this workspace.",
+            "too_long" => "That text is too long for Slack (250 character limit).",
             "msg_too_long" => "The message is too long for Slack.",
             "is_archived" => "This channel is archived.",
             "channel_not_found" => "Slack cannot find this conversation.",
@@ -1005,6 +1006,11 @@ impl Slack {
             Some("message_replied") => self.replied(channel, &event["message"]),
             Some("channel_topic" | "group_topic") => {
                 self.topic_changed(channel, event["topic"].as_str().unwrap_or(""))?;
+                self.ctx.info_stale(channel);
+                self.arrived(channel, event)
+            }
+            Some("channel_purpose" | "group_purpose") => {
+                self.purpose_changed(channel, event["purpose"].as_str().unwrap_or(""))?;
                 self.arrived(channel, event)
             }
             _ => self.arrived(channel, event),
@@ -1475,13 +1481,15 @@ impl Slack {
                 answer(reply, self.leave(&conversation_id));
             }
             Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
-                if let Some(title) = title {
-                    answer(reply, self.rename_channel(&conversation_id, &title));
-                } else if topic.is_some() || description.is_some() {
-                    let _ = reply.send(Err(Refusal::Unsupported));
-                } else {
-                    let _ = reply.send(Ok(()));
-                }
+                answer(
+                    reply,
+                    self.update_conversation(
+                        &conversation_id,
+                        title.as_deref(),
+                        topic.as_deref(),
+                        description.as_deref(),
+                    ),
+                );
             }
             Command::File { conversation_id, archived, reply, .. } => {
                 if let Some(archive) = archived {

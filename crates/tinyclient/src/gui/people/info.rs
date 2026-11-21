@@ -57,6 +57,7 @@ impl<T> Answer<T> {
 pub(in crate::gui) enum ManageKind {
     Rename,
     Topic,
+    Description,
     AddMembers,
 }
 
@@ -1007,6 +1008,12 @@ impl InfoPane {
                 title: None,
                 topic: Some(value),
                 description: None,
+            },
+            ManageKind::Description => Request::ConversationUpdate {
+                conversation,
+                title: None,
+                topic: None,
+                description: Some(value),
             },
             ManageKind::AddMembers => {
                 let people: Vec<String> = value
