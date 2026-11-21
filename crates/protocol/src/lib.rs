@@ -1867,6 +1867,17 @@ pub enum Request {
         #[serde(default)]
         limit: u32,
     },
+    /// Moderator reaction removal (Discord `MANAGE_MESSAGES`): clears all reactions when
+    /// `emoji` is `None`, all reactions for `emoji` when `user_id` is `None`, or one user's
+    /// reaction when both `emoji` and `user_id` are set.
+    ClearReactions {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+    },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
     /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
     /// empty keeps the edit as plain text. An older client omits them.

@@ -338,6 +338,15 @@ pub enum Command {
         limit: u32,
         reply: Reply<ReactorsPage>,
     },
+    /// Moderator reaction removal: all reactions (`emoji: None`), one emoji (`user_id: None`),
+    /// or one person's reaction (`emoji: Some`, `user_id: Some`).
+    ClearReactions {
+        conversation_id: String,
+        message_id: String,
+        emoji: Option<String>,
+        user_id: Option<String>,
+        reply: Reply<()>,
+    },
     /// Replace the text of one of our messages. Report the edited message through
     /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
     /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
@@ -886,6 +895,7 @@ impl Command {
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
                 ctx.sent(&conversation_id, &client_id, Err(why));

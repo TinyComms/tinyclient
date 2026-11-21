@@ -1595,6 +1595,35 @@ impl Chat {
         }
     }
 
+    /// Moderator removal of all reactions, all of one emoji, or one person's reaction.
+    fn clear_reactions(&self, conversation: Key, message_id: String, emoji: Option<String>, user_id: Option<String>) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        if user_id.is_some() && emoji.is_none() {
+            return error(ErrorCode::Refused, "An emoji is required to remove one person's reaction.");
+        }
+        let message = match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) => message,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        if message.state != SendState::Sent {
+            return error(ErrorCode::Refused, "This message was never sent.");
+        }
+        match self.ask(&account, |reply| Command::ClearReactions {
+            conversation_id: conversation.id,
+            message_id,
+            emoji,
+            user_id,
+            reply,
+        }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     /// Edit and delete change nothing here: the answer is the network's, and the message
     /// changes when the adapter reports it.
     fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>, scope: protocol::DeleteScope) -> Response {
@@ -3357,6 +3386,9 @@ impl Chat {
             Request::Reactions { conversation } => self.reactions(conversation),
             Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
+            }
+            Request::ClearReactions { conversation, message_id, emoji, user_id } => {
+                self.clear_reactions(conversation, message_id, emoji, user_id)
             }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),

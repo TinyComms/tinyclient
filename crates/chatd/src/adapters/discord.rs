@@ -305,6 +305,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.max_file_bytes = known.max_file_bytes;
     row.read_only_reason = known.read_only_reason.clone();
     row.spam = known.spam;
+    row.rights = known.rights;
     row
 }
 
@@ -1063,6 +1064,46 @@ impl Discord {
         asked.map(drop).map_err(refusal)
     }
 
+    /// Moderator reaction removal:
+    /// - `emoji: None`: `DELETE /channels/{channel}/messages/{message}/reactions`
+    /// - `emoji: Some(e), user_id: None`: `DELETE /channels/{channel}/messages/{message}/reactions/{e}`
+    /// - `emoji: Some(e), user_id: Some(u)`: `DELETE /channels/{channel}/messages/{message}/reactions/{e}/{u}`
+    fn clear_reactions(&self, channel: &str, message: &str, emoji: Option<&str>, user_id: Option<&str>) -> Result<(), Refusal> {
+        let base = format!("/channels/{channel}/messages/{message}/reactions");
+        match (emoji, user_id) {
+            (None, _) => {
+                self.call("DELETE", &base, None).map_err(refusal)?;
+                if let Ok(Some(mut stored)) = self.ctx.stored_message(channel, message) {
+                    if !stored.reactions.is_empty() {
+                        stored.reactions.clear();
+                        let _ = self.ctx.message(channel, &stored);
+                    }
+                }
+                Ok(())
+            }
+            (Some(emoji), None) => {
+                let named = self.reaction_emoji(channel, message, emoji)?;
+                self.call("DELETE", &format!("{base}/{}", escaped(&named)), None).map_err(refusal)?;
+                if let Ok(Some(mut stored)) = self.ctx.stored_message(channel, message) {
+                    let before = stored.reactions.len();
+                    stored.reactions.retain(|r| {
+                        r.emoji != emoji && !r.file.as_ref().is_some_and(|f| f.id == emoji)
+                    });
+                    if stored.reactions.len() != before {
+                        let _ = self.ctx.message(channel, &stored);
+                    }
+                }
+                Ok(())
+            }
+            (Some(emoji), Some(user)) => {
+                let named = self.reaction_emoji(channel, message, emoji)?;
+                self.call("DELETE", &format!("{base}/{}/{}", escaped(&named), escaped(user)), None)
+                    .map(drop)
+                    .map_err(refusal)
+            }
+        }
+    }
+
     /// Fetches one page of users who reacted to `message` with `emoji`.
     fn reactors(
         &self,
@@ -1652,6 +1693,7 @@ impl Discord {
         row.root = Some(root.to_owned());
         row.private = parent.private;
         row.read_only = parent.read_only;
+        row.rights = parent.rights;
         self.ctx.conversation(&row).map_err(refuse)
     }
 
@@ -1833,6 +1875,9 @@ impl Discord {
             }
             Command::Reactors { conversation_id, message_id, emoji, burst, after, limit, reply } => {
                 answer(reply, self.reactors(&conversation_id, &message_id, &emoji, burst, after.as_deref(), limit))
+            }
+            Command::ClearReactions { conversation_id, message_id, emoji, user_id, reply } => {
+                answer(reply, self.clear_reactions(&conversation_id, &message_id, emoji.as_deref(), user_id.as_deref()))
             }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text))

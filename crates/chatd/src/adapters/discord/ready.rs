@@ -358,7 +358,7 @@ impl Discord {
     fn tree(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> Tree {
         let mut rows = Vec::new();
         let mut counts = Vec::new();
-        let mut placed: HashMap<&str, (Option<String>, i32)> = HashMap::new();
+        let mut placed: HashMap<&str, (Option<String>, i32, protocol::ConversationRights)> = HashMap::new();
         info.channels.clear();
         let standing = |channel: &Channel, joined: Option<i64>| {
             let state = read.get(&channel.id);
@@ -388,7 +388,7 @@ impl Discord {
             let Some(row) = info.row(&guild.id, me, channel) else {
                 continue;
             };
-            placed.insert(&channel.id, (row.group.clone(), row.position));
+            placed.insert(&channel.id, (row.group.clone(), row.position, row.rights));
             info.remember(&channel.id, channel.parent_id.as_deref());
             // A voice channel's chat is not "unread" in the tree. A forum's own marker is:
             // its posts hold no row to carry a badge, so the forum itself counts them, and a
@@ -410,7 +410,7 @@ impl Discord {
         let mut under: HashMap<&str, i32> = HashMap::new();
         for thread in &guild.threads {
             let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
-            let Some((group, position)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
+            let Some((group, position, parent_rights)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
                 continue;
             };
             if archived || !thread.is_thread() {
@@ -425,6 +425,7 @@ impl Discord {
                 root: Some(thread.id.clone()),
                 read_only: timed_out.is_some(),
                 read_only_reason: timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default(),
+                rights: *parent_rights,
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
                     followed: true,
@@ -1287,6 +1288,7 @@ impl Discord {
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
+            rights: parent.rights,
             // Joined, or our membership came with it: followed. Otherwise left as it was.
             filing: (joined || thread.member.is_some()).then(|| Filing {
                 followed: true,

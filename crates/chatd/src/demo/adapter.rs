@@ -1027,6 +1027,7 @@ impl Demo {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AddFriend { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

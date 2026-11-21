@@ -210,6 +210,19 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             shared.push("MESSAGE_REACTION_REMOVE", event);
             (204, Value::Null)
         }
+        ("DELETE", ["channels", channel, "messages", message, "reactions"]) => {
+            shared.push("MESSAGE_REACTION_REMOVE_ALL", json!({"channel_id": channel, "message_id": message}));
+            (204, Value::Null)
+        }
+        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji]) => {
+            shared.push("MESSAGE_REACTION_REMOVE_EMOJI", json!({"channel_id": channel, "message_id": message, "emoji": emoji_of(emoji)}));
+            (204, Value::Null)
+        }
+        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji, user]) => {
+            let event = json!({"user_id": unescaped(user), "channel_id": channel, "message_id": message, "emoji": emoji_of(emoji), "type": 0});
+            shared.push("MESSAGE_REACTION_REMOVE", event);
+            (204, Value::Null)
+        }
         ("PATCH", ["channels", channel, "messages", message]) => {
             let edited = json!({
                 "id": message, "channel_id": channel, "type": 0, "author": me(), "content": seen.body["content"],
@@ -5113,4 +5126,115 @@ fn system_messages_render_boosts_pins_thread_starter_and_all_types() {
     });
     assert_eq!(incident.kind, MessageKind::System);
     assert_eq!(incident.text, "Mara O enabled security actions for this server.");
+}
+
+#[test]
+fn moderator_manage_messages_flag_delete_others_and_clear_reactions() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Give role 4010 (which our user holds in guild 4000) MANAGE_MESSAGES (1 << 13 = 8192).
+    if let Some(roles) = ready["guilds"][0]["roles"].as_array_mut() {
+        for role in roles {
+            if role["id"] == "4010" {
+                role["permissions"] = json!("8192");
+            }
+        }
+    }
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Channel 4101 reports delete_others because role 4010 has MANAGE_MESSAGES; DM 3001 does not.
+    assert!(world.conversation("4101").rights.delete_others);
+    assert!(!world.conversation("3001").rights.delete_others);
+
+    // Load messages in 4101 and add reactions from another user onto a message by someone else.
+    let history = wait("channel 4101 messages", || Some(world.messages("4101")).filter(|m| m.len() >= 3));
+    let other_msg = history.iter().find(|m| !m.outgoing && m.kind == MessageKind::Normal).unwrap().clone();
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": null, "name": "👍"}, "type": 0
+    }));
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": null, "name": "🔥"}, "type": 0
+    }));
+    wait("two reactions recorded", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.len() == 2)
+    });
+
+    // 1. Remove a single user's reaction: DELETE .../reactions/{emoji}/{user}
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: Some("👍".into()),
+            user_id: Some("2002".into()),
+        }),
+        Response::Ok
+    );
+    let user_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions/%F0%9F%91%8D/2002", other_msg.id));
+    assert_eq!(user_del.len(), 1);
+    wait("user reaction removed", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.len() == 1)
+    });
+
+    // 2. Remove all reactions of one emoji: DELETE .../reactions/{emoji}
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: Some("🔥".into()),
+            user_id: None,
+        }),
+        Response::Ok
+    );
+    let emoji_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions/%F0%9F%94%A5", other_msg.id));
+    assert_eq!(emoji_del.len(), 1);
+
+    // 3. Remove all reactions on a message: DELETE .../reactions
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": null, "name": "🎉"}, "type": 0
+    }));
+    wait("reaction re-added", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && !m.reactions.is_empty())
+    });
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: None,
+            user_id: None,
+        }),
+        Response::Ok
+    );
+    let all_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions", other_msg.id));
+    assert!(all_del.iter().any(|r| r.path == format!("/channels/4101/messages/{}/reactions", other_msg.id)));
+    wait("all reactions cleared", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.is_empty())
+    });
+
+    // 4. Moderator can delete another person's message.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}", other_msg.id)).len(),
+        1
+    );
+
+    // 5. Revoking MANAGE_MESSAGES via GUILD_ROLE_UPDATE clears rights.delete_others.
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": "0"}
+    }));
+    wait("manage_messages revoked", || {
+        (!world.conversation("4101").rights.delete_others).then_some(())
+    });
 }
