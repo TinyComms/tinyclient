@@ -379,6 +379,10 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         blocks: true,
         share_contact: true,
         save_gif: true,
+        notify_defaults: true,
+        saved_subdialogs: true,
+        active_sessions: true,
+        unread_jumps: true,
         ..Capabilities::default()
     }
 }
@@ -834,6 +838,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     // stands untouched: the tell is on its way and the next dialog count is the truth.
     let mut unread = unread;
     let mut mentions = dialog.unread_mentions_count.max(0) as u32;
+    let mut unread_reactions = dialog.unread_reactions_count.max(0) as u32;
     let mut read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
     let mut through = Some(dialog.top_message);
     if let Some(up_to) = account.ctx.read_up_to(&id) {
@@ -845,6 +850,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
                 Some(fresh) => {
                     unread = unread_of(fresh.unread_count, fresh.unread_mark);
                     mentions = fresh.unread_mentions_count.max(0) as u32;
+                    unread_reactions = fresh.unread_reactions_count.max(0) as u32;
                     read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
                     through = Some(fresh.top_message);
                 }
@@ -854,6 +860,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     }
     if through.is_some() {
         account.ctx.counts(&id, unread, mentions, read.as_deref(), updated)?;
+        let _ = account.ctx.unread_reactions(&id, unread_reactions);
     }
     // The cloud draft rides the dialog: what the phone left on this chat shows on its row as
     // "Draft:", and a draft the phone dropped is dropped here too. An empty one clears.
@@ -1088,6 +1095,7 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         let read = (topic.read_inbox_max_id > 0).then(|| topic.read_inbox_max_id.to_string());
         let updated = dates.get(&topic.top_message).copied().unwrap_or(i64::from(topic.date));
         let _ = account.ctx.counts(&id, topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
+        let _ = account.ctx.unread_reactions(&id, topic.unread_reactions_count.max(0) as u32);
         let _ = account.ctx.muted(&id, muted(account, forum, &topic.notify_settings));
     }
     fetch_icons(account, forum, &found.topics);

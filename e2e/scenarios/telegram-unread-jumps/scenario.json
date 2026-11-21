@@ -1,0 +1,8 @@
+{
+  "id": "telegram-unread-jumps",
+  "title": "Jumping an unread Telegram mention or reaction marks that one, and the last reaction clears the chat",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

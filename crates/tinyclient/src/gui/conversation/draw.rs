@@ -1050,6 +1050,7 @@ impl Pane {
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
                 .children(self.message_controls(message, cx))
+                .children(self.message_buttons(message, cx))
                 .children(self.cards(message, window, cx));
         }
         if pending {
@@ -1297,11 +1298,23 @@ impl Pane {
                             .type_body()
                             .when(phone, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
                             .font_weight(theme::SEMIBOLD)
+                            .when_some(message.sender.role_color, |name, color| name.text_color(theme::role_color(color)))
                             .child(name),
                         "author-name",
                         message,
                         cx,
                     ))
+                    .children(message.sender.role_icon.as_ref().and_then(|f| f.path.as_deref()).filter(|p| !p.is_empty()).map(|path| {
+                        gpui::img(std::path::PathBuf::from(path))
+                            .size(px(14.))
+                            .rounded(px(3.))
+                            .flex_none()
+                    }))
+                    .children(message.sender.role_icon.is_none().then(|| {
+                        message.sender.role_emoji.as_deref().filter(|e| !e.is_empty()).map(|emoji| {
+                            div().flex_none().text_size(px(13.)).line_height(px(14.)).child(emoji.to_owned())
+                        })
+                    }).flatten())
                     .child(
                         div()
                             .flex_none()
@@ -2449,6 +2462,109 @@ impl Pane {
             .child(div().w(px(3.)).flex_none().bg(bar))
             .child(words);
         div().pt(px(5.)).flex().child(framed).into_any_element()
+    }
+
+    /// Inline keyboard button rows under a bot message (Telegram `replyInlineMarkup`).
+    fn message_buttons(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if message.buttons.is_empty() {
+            return None;
+        }
+        let conversation = self.key()?.clone();
+        let mut grid = div().pt(px(6.)).flex().flex_col().gap(px(4.)).max_w(px(360.));
+        for (row_ix, buttons) in message.buttons.iter().enumerate() {
+            let mut row = div().flex().items_center().gap(px(4.));
+            for (col_ix, btn_spec) in buttons.iter().enumerate() {
+                let pending_key = format!("btn:{row_ix}:{col_ix}");
+                let pending = self
+                    .pending_actions
+                    .get(&(message.id.clone(), pending_key.clone()))
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(15));
+                let el_id = SharedString::from(format!("ibtn-{}-{row_ix}-{col_ix}", message.id));
+                let label = match &btn_spec.kind {
+                    protocol::InlineButtonKind::Callback { .. } if pending => format!("{}…", btn_spec.label),
+                    protocol::InlineButtonKind::Url { .. } => format!("{} ↗", btn_spec.label),
+                    protocol::InlineButtonKind::Copy { .. } => format!("{} ⧉", btn_spec.label),
+                    _ => btn_spec.label.clone(),
+                };
+                let muted = matches!(btn_spec.kind, protocol::InlineButtonKind::Unsupported);
+                let mut btn = div()
+                    .id(el_id)
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(tokens::card())
+                    .border_1()
+                    .border_color(tokens::border_strong())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .type_small()
+                    .font_weight(theme::MEDIUM)
+                    .text_color(if muted { theme::text_disabled() } else { theme::text() })
+                    .cursor_pointer()
+                    .when(pending, |d| d.opacity(0.6))
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().truncate().child(label));
+                match &btn_spec.kind {
+                    protocol::InlineButtonKind::Callback { data, requires_password } => {
+                        if *requires_password {
+                            btn = btn.on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.say("This button requires your Telegram password. Open in Telegram.".to_owned(), cx);
+                            }));
+                        } else if !pending {
+                            let conv = conversation.clone();
+                            let msg_id = message.id.clone();
+                            let data = data.clone();
+                            let key = pending_key.clone();
+                            btn = btn.on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.press_inline_button(conv.clone(), msg_id.clone(), key.clone(), data.clone(), window, cx);
+                            }));
+                        }
+                    }
+                    protocol::InlineButtonKind::Url { url } => {
+                        let conv = conversation.clone();
+                        let msg_id = message.id.clone();
+                        let target = url.clone();
+                        btn = btn.on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.trigger_link_control(conv.clone(), msg_id.clone(), target.clone(), None, window, cx);
+                        }));
+                    }
+                    protocol::InlineButtonKind::Copy { text } => {
+                        let text = text.clone();
+                        btn = btn.on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                            this.say("Copied to clipboard.".to_owned(), cx);
+                        }));
+                    }
+                    protocol::InlineButtonKind::SwitchInline { query, .. } => {
+                        let query = query.clone();
+                        btn = btn.on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if !query.is_empty() {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(query.clone()));
+                                this.say("Inline query copied to clipboard.".to_owned(), cx);
+                            }
+                        }));
+                    }
+                    protocol::InlineButtonKind::Unsupported => {
+                        btn = btn.on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.say("Open in Telegram to use this button.".to_owned(), cx);
+                        }));
+                    }
+                }
+                row = row.child(btn);
+            }
+            grid = grid.child(row);
+        }
+        Some(grid.into_any_element())
     }
 
     /// Interactive Block Kit controls attached to a message (buttons, menus, pickers, radios, checkboxes).

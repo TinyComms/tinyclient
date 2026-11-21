@@ -1019,6 +1019,42 @@ impl Teams {
         let Some((place, root)) = placed(raw) else {
             return Ok(());
         };
+        if place == "48:notifications" {
+            if new {
+                self.handle_activity_push(raw)?;
+            }
+            return Ok(());
+        }
+        if raw["messagetype"].as_str() == Some("ThreadActivity/MemberConsumptionHorizonUpdate") {
+            let content = raw["content"].as_str().unwrap_or("");
+            if let Ok(parsed) = serde_json::from_str::<Value>(content) {
+                if let Some(entries) = parsed["consumptionhorizons"].as_array() {
+                    self.apply_member_horizons(&place, entries)?;
+                } else {
+                    let member_id = parsed["id"]
+                        .as_str()
+                        .or_else(|| parsed["mri"].as_str())
+                        .unwrap_or_else(|| person(raw["from"].as_str().unwrap_or("")));
+                    let horizon = parsed["consumptionhorizon"]
+                        .as_str()
+                        .or_else(|| raw["properties"]["consumptionhorizon"].as_str())
+                        .unwrap_or("");
+                    self.apply_single_member_horizon(&place, member_id, horizon)?;
+                }
+            } else {
+                let member_id = inside(content, "id")
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| person(raw["from"].as_str().unwrap_or("")));
+                let horizon = inside(content, "consumptionhorizon")
+                    .first()
+                    .copied()
+                    .or_else(|| raw["properties"]["consumptionhorizon"].as_str())
+                    .unwrap_or("");
+                self.apply_single_member_horizon(&place, member_id, horizon)?;
+            }
+            return Ok(());
+        }
         match self.read(&place, raw) {
             Read::Typing { person, name, on } => {
                 if person != self.me() && self.ctx.known(&place)?.is_some() {
@@ -1470,7 +1506,22 @@ impl Teams {
     }
 
     /// The same, with `properties` (the files or links a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing, mut properties: Option<Value>) -> Result<Message, Fault> {
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing, properties: Option<Value>) -> Result<Message, Fault> {
+        self.posted_with_html(conversation, client_id, text, reply_to, with, properties, None)
+    }
+
+    /// Posts a message with optional extra HTML (e.g. inline AMS `<img>` tags) appended to the body.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn posted_with_html(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        with: &protocol::Outgoing,
+        mut properties: Option<Value>,
+        extra_html: Option<&str>,
+    ) -> Result<Message, Fault> {
         let mention_spans = &with.spans;
         let mut sent_previews = Vec::new();
         let allow_previews = !with.suppress_embeds && self.ctx.hub.settings().on(protocol::settings::LINK_PREVIEWS);
@@ -1492,6 +1543,9 @@ impl Teams {
             let (c, m) = html::compose_rich(text);
             (c, (!m.is_empty()).then(|| html::mentions_property(&m)))
         };
+        if let Some(extra) = extra_html.filter(|s| !s.is_empty()) {
+            content.push_str(extra);
+        }
         if let Some(encoded) = mentions_json {
             let props = properties.get_or_insert_with(|| json!({}));
             if let Some(map) = props.as_object_mut() {

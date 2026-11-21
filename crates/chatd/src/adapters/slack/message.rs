@@ -1172,6 +1172,7 @@ impl Slack {
                 avatar: user.avatar(),
                 bot: user.bot || by_app,
                 name: user.name,
+                ..Sender::default()
             };
         }
         let profile = &event["bot_profile"];
@@ -1191,6 +1192,7 @@ impl Slack {
             name: chosen.or(first(&[&profile["name"]])).unwrap_or("App").to_owned(),
             avatar,
             bot: true,
+            ..Sender::default()
         }
     }
 
