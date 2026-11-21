@@ -332,6 +332,10 @@ impl Names for Slack {
             }
         }
     }
+
+    fn hosted(&self, url: &str) -> bool {
+        Slack::hosted(self, url)
+    }
 }
 
 impl Slack {
@@ -790,21 +794,67 @@ impl Slack {
     /// `None` when the card says nothing in a form a `Card` holds.
     // CONTRACT: the store previews a message by its text or first attachment, so a row whose
     // newest message is only a card previews as nothing.
-    fn framed(&self, card: &Value, rich: &mut Rich) -> Option<Card> {
+    fn framed(&self, card: &Value, rich: &mut Rich, media: &mut Registered) -> Option<Card> {
         let words = |value: &Value| self.words(value.as_str().unwrap_or(""));
         let fields = card["fields"].as_array().into_iter().flatten().take(CARD_FIELDS);
+        let hosted_image = |url: Option<&str>, w: &Value, h: &Value, media: &mut Registered| -> Option<MediaFile> {
+            let url = url.filter(|u| self.hosted(u))?;
+            let file = MediaFile {
+                width: pixels(w),
+                height: pixels(h),
+                ..MediaFile::new(format!("card:{:x}", fnv(url)), MediaKind::Image)
+            };
+            media.push((file.clone(), url.to_owned()));
+            Some(file)
+        };
+        let image = hosted_image(first(&[&card["image_url"]]), &card["image_width"], &card["image_height"], media);
+        let thumbnail = hosted_image(first(&[&card["thumb_url"]]), &card["thumb_width"], &card["thumb_height"], media);
+        let mut text = words(&card["text"]);
+        let mut card_fields: Vec<(String, String)> = fields.map(|field| (words(&field["title"]), words(&field["value"]))).collect();
+        if let Some(blocks) = card["blocks"].as_array() {
+            let mut inner = Rich::new(self);
+            inner.blocks(blocks);
+            inner.finish();
+            if !inner.text.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&inner.text);
+            }
+            for block in blocks {
+                if block["type"] == "section" {
+                    for f in block["fields"].as_array().into_iter().flatten() {
+                        if card_fields.len() >= CARD_FIELDS {
+                            break;
+                        }
+                        if let Some(val) = f["text"].as_str().filter(|s| !s.is_empty()) {
+                            let w = self.words(val);
+                            if let Some((k, v)) = w.split_once('\n') {
+                                card_fields.push((k.trim().to_owned(), v.trim().to_owned()));
+                            } else {
+                                card_fields.push((String::new(), w));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut framed = Card {
+            author: words(&card["author_name"]),
             title: words(&card["title"]),
-            text: words(&card["text"]),
-            fields: fields.map(|field| (words(&field["title"]), words(&field["value"]))).collect(),
+            title_link: first(&[&card["title_link"]]).unwrap_or("").to_owned(),
+            text,
+            fields: card_fields,
             footer: words(&card["footer"]),
+            image,
+            thumbnail,
             color: colour(&card["color"]),
             sponsored: false,
         };
-        if framed.title.is_empty() && framed.text.is_empty() && framed.fields.is_empty() {
+        if framed.title.is_empty() && framed.text.is_empty() && framed.fields.is_empty() && framed.image.is_none() {
             framed.text = words(&card["fallback"]);
         }
-        if framed.title.is_empty() && framed.text.is_empty() && framed.fields.is_empty() {
+        if framed.title.is_empty() && framed.text.is_empty() && framed.fields.is_empty() && framed.image.is_none() {
             return None;
         }
         if let Some(pretext) = first(&[&card["pretext"]]) {
@@ -812,6 +862,56 @@ impl Slack {
             rich.mrkdwn(pretext);
         }
         Some(framed)
+    }
+
+    /// Extracts hosted image blocks, section image accessories, and video blocks from Block Kit.
+    fn block_media(&self, blocks: &[Value], media: &mut Registered, attachments: &mut Vec<Attachment>, previews: &mut Vec<Preview>) {
+        for block in blocks {
+            match block["type"].as_str().unwrap_or("") {
+                "image" => {
+                    let url = first(&[&block["image_url"], &block["slack_file"]["url_private"]]);
+                    if let Some(url) = url.filter(|u| self.hosted(u)) {
+                        let name = first(&[&block["title"]["text"], &block["alt_text"]]).unwrap_or("image").to_owned();
+                        let file = MediaFile {
+                            width: pixels(&block["image_width"]),
+                            height: pixels(&block["image_height"]),
+                            ..MediaFile::new(format!("blockimg:{:x}", fnv(url)), MediaKind::Image)
+                        };
+                        media.push((file.clone(), url.to_owned()));
+                        attachments.push(Attachment::new(name, file));
+                    }
+                }
+                "section" => {
+                    let acc = &block["accessory"];
+                    if acc["type"] == "image" {
+                        if let Some(url) = first(&[&acc["image_url"]]).filter(|u| self.hosted(u)) {
+                            let name = first(&[&acc["alt_text"]]).unwrap_or("thumbnail").to_owned();
+                            let file = MediaFile::new(format!("blockacc:{:x}", fnv(url)), MediaKind::Image);
+                            media.push((file.clone(), url.to_owned()));
+                            attachments.push(Attachment::new(name, file));
+                        }
+                    }
+                }
+                "video" => {
+                    let url = first(&[&block["title_url"], &block["video_url"]]).unwrap_or("");
+                    if !url.is_empty() {
+                        let image = first(&[&block["thumbnail_url"]]).filter(|u| self.hosted(u)).map(|u| {
+                            let file = MediaFile::new(format!("video:{:x}", fnv(u)), MediaKind::Image);
+                            media.push((file.clone(), u.to_owned()));
+                            file
+                        });
+                        previews.push(Preview {
+                            url: url.to_owned(),
+                            site: first(&[&block["provider_name"], &block["author_name"]]).unwrap_or("Video").to_owned(),
+                            title: first(&[&block["title"]["text"], &block["alt_text"]]).unwrap_or("Video").to_owned(),
+                            description: first(&[&block["description"]["text"]]).unwrap_or("").chars().take(DESCRIPTION).collect(),
+                            image,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// A message shared from elsewhere ("Share message"): where it came from, and what it said
@@ -912,19 +1012,33 @@ impl Slack {
 
         let mut previews = Vec::new();
         let mut attachments = Vec::new();
-        let (mut framed, mut forwarded) = (None, None);
+        let (mut framed, mut extra_cards, mut forwarded) = (None, Vec::new(), None);
+        if let Some(blocks) = event["blocks"].as_array() {
+            self.block_media(blocks, &mut media, &mut attachments, &mut previews);
+        }
         for card in event["attachments"].as_array().into_iter().flatten() {
             if card["is_share"] == true && forwarded.is_none() {
                 forwarded = Some(Box::new(self.forwarded(card, &mut rich, &mut media, &mut variants, &mut attachments)));
                 continue;
             }
-            match first(&[&card["from_url"], &card["original_url"], &card["title_link"]]) {
-                Some(url) => previews.push(self.preview(card, url, &mut media)),
-                None if framed.is_none() && !card["blocks"].is_array() => match self.framed(card, &mut rich) {
-                    Some(card) => framed = Some(Box::new(card)),
-                    None => self.card(card, &mut rich),
+            let is_rich_card = card["fields"].as_array().is_some_and(|f| !f.is_empty())
+                || card["blocks"].as_array().is_some_and(|b| !b.is_empty())
+                || card["color"].as_str().is_some_and(|c| !c.is_empty());
+            match first(&[&card["from_url"], &card["original_url"]]) {
+                Some(url) if !is_rich_card => previews.push(self.preview(card, url, &mut media)),
+                _ => match self.framed(card, &mut rich, &mut media) {
+                    Some(c) => {
+                        if framed.is_none() {
+                            framed = Some(Box::new(c));
+                        } else {
+                            extra_cards.push(c);
+                        }
+                    }
+                    None => match first(&[&card["from_url"], &card["original_url"], &card["title_link"]]) {
+                        Some(url) => previews.push(self.preview(card, url, &mut media)),
+                        None => self.card(card, &mut rich),
+                    },
                 },
-                None => self.card(card, &mut rich),
             }
         }
         if framed.is_none() {
@@ -1032,6 +1146,7 @@ impl Slack {
         message.reactions = reactions;
         message.thread = summary;
         message.card = framed;
+        message.cards = extra_cards;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
         message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);

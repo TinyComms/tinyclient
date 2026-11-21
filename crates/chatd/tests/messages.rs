@@ -2090,3 +2090,472 @@ fn messages_can_be_starred_unstarred_and_listed_under_starred() {
         other => panic!("expected Pinned/Starred response, got {other:?}"),
     }
 }
+
+#[test]
+fn shared_location_and_vcard_render_as_cards_without_leaking_coordinates() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Shared location decodes into a Location card (not Unsupported) with geo: link and
+    //    empty message text so notification previews only show the label, not coordinates.
+    world.steer("location grace 37.7749 -122.4194 Ferry Building");
+    let loc_msg = world.until("location message", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-phone-grace-loc")
+    });
+    assert_eq!(loc_msg.kind, MessageKind::Normal);
+    assert!(loc_msg.text.is_empty(), "location text stays empty so previews omit coordinates");
+    let card = loc_msg.card.as_deref().expect("location card present");
+    assert_eq!(card.title, "Ferry Building");
+    assert_eq!(card.footer, "Open in Maps");
+    assert!(card.text.contains("geo:37.7749,-122.4194"));
+    assert_eq!(
+        card.fields,
+        [
+            ("Latitude".to_owned(), "37.7749".to_owned()),
+            ("Longitude".to_owned(), "-122.4194".to_owned()),
+        ]
+    );
+
+    // 2. Inline vCard renders immediately as a masked contact card while keeping the .vcf file.
+    world.steer("vcard grace");
+    let inline_vc = world.until("inline vcard", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-vcard-inline")
+    });
+    let card = inline_vc.card.as_deref().expect("inline vcard card present");
+    assert_eq!(card.title, "Linnea Sol");
+    assert_eq!(card.text, "Harbor Co");
+    assert_eq!(card.footer, "Contact card");
+    assert_eq!(card.fields[0].0, "Phone");
+    assert!(card.fields[0].1.contains("42"));
+    assert!(!card.fields[0].1.contains("555"), "phone number must be masked");
+    assert_eq!(card.fields[1], ("Email".to_owned(), "linnea@harbor.example".to_owned()));
+    assert_eq!(inline_vc.attachments.len(), 1);
+    assert_eq!(inline_vc.attachments[0].name, "linnea.vcf");
+
+    // 3. Remote vCard starts as a downloadable file and upgrades to a contact card once fetched.
+    world.steer("vcard grace remote");
+    let remote_vc = world.until("remote vcard", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-vcard-remote")
+    });
+    assert!(remote_vc.card.is_none());
+    let file_id = remote_vc.attachments[0].file.id.clone();
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec![file_id],
+        size: None,
+        retry: false,
+    });
+    let upgraded = world.until("fetched vcard card", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-vcard-remote" && m.card.is_some())
+    });
+    let card = upgraded.card.as_deref().unwrap();
+    assert_eq!(card.title, "Linnea Sol");
+    assert_eq!(card.footer, "Contact card");
+    assert!(!card.fields[0].1.contains("555"));
+}
+
+#[test]
+fn voice_note_uploads_with_waveform_and_enforces_mms_cap() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Account advertises voice_notes capability.
+    let status = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages account status");
+    assert!(status.can.voice_notes, "Messages must advertise voice_notes");
+
+    // 2. Recorded voice note uploads on an RCS chat and carries duration + waveform.
+    world.steer("rcs grace");
+    world.until("grace is RCS", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.topic.contains("RCS"))
+    });
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let voice_path = outbox.join("voice-1001.opus");
+    // Minimal OggS + OpusHead header so mime_of identifies audio/opus.
+    let mut ogg = b"OggS\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0OpusHead".to_vec();
+    ogg.extend_from_slice(&[0u8; 64]);
+    std::fs::write(&voice_path, &ogg).unwrap();
+    let res = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-voice-rcs".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: voice_path.to_string_lossy().into_owned(),
+                name: "voice-1001.opus".into(),
+                ..OutgoingFile::default()
+            }],
+            voice: Some(protocol::VoiceNote {
+                duration: 4_500,
+                waveform: vec![12, 40, 88, 30],
+            }),
+            ..Outgoing::default()
+        },
+    });
+    assert!(matches!(res, Response::Sent { .. }), "expected Sent, got {res:?}");
+    let sent = world.until("voice message settled", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-voice-rcs" && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent.attachments[0].duration, 5);
+    assert_eq!(sent.attachments[0].waveform, vec![12, 40, 88, 30]);
+    assert!(
+        world
+            .calls()
+            .iter()
+            .any(|c| c.starts_with(&format!("voice {GRACE} ")) && c.ends_with(" 5")),
+        "expected voice call record, got {:?}",
+        world.calls()
+    );
+
+    // 3. On an SMS/MMS chat, a voice message longer than 60 seconds is refused with a clear reason.
+    world.steer("sms grace");
+    world.until("grace is SMS", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.topic.contains("Text message"))
+    });
+    let long_voice = outbox.join("voice-1002.opus");
+    std::fs::write(&long_voice, &ogg).unwrap();
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-voice-sms-too-long".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: long_voice.to_string_lossy().into_owned(),
+                name: "voice-1002.opus".into(),
+                ..OutgoingFile::default()
+            }],
+            voice: Some(protocol::VoiceNote {
+                duration: 65_000,
+                waveform: vec![20, 20],
+            }),
+            ..Outgoing::default()
+        },
+    });
+    let failed = world.until("long SMS voice failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-voice-sms-too-long" && matches!(m.state, SendState::Failed { .. }))
+    });
+    match failed.state {
+        SendState::Failed { reason } => {
+            assert!(
+                reason.contains("60 seconds"),
+                "expected 60-second MMS cap reason, got {reason:?}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[test]
+fn gif_file_capability_mms_gif_warning_and_photomoji_custom_reactions() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Messages advertises gif_file so the composer shows the GIF button without a third-party key.
+    let status = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages account status");
+    assert!(status.can.gif_file, "Messages must advertise gif_file");
+
+    // 2. Incoming Photomoji reaction with media is kept as a custom-emoji reaction (Reaction::file).
+    world.steer("photomoji grace inline Nice photo");
+    let with_media = world.arrived(GRACE, "Nice photo");
+    assert_eq!(with_media.reactions.len(), 1);
+    assert_eq!(with_media.reactions[0].emoji, ":photomoji:");
+    let file = with_media.reactions[0]
+        .file
+        .as_ref()
+        .expect("Photomoji reaction must carry custom emoji file");
+    assert_eq!(file.kind, MediaKind::Emoji);
+    assert!(file.path.is_some());
+
+    // 3. Incoming custom reaction without media is kept with a neutral placeholder instead of dropped.
+    world.steer("photomoji grace placeholder Still kept");
+    let placeholder = world.arrived(GRACE, "Still kept");
+    assert_eq!(placeholder.reactions.len(), 1);
+    assert_eq!(placeholder.reactions[0].emoji, "🖼️");
+    assert!(placeholder.reactions[0].file.is_none());
+
+    // 4. Sending a large GIF (> 1 MB) in an SMS/MMS chat emits the MMS GIF size warning.
+    world.steer("sms grace");
+    world.until("grace is SMS", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.topic.contains("Text message"))
+    });
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let gif_path = outbox.join("big.gif");
+    let mut gif_bytes = b"GIF89a".to_vec();
+    gif_bytes.resize(1024 * 1024 + 64, 0);
+    std::fs::write(&gif_path, &gif_bytes).unwrap();
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-big-gif".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: gif_path.to_string_lossy().into_owned(),
+                name: "big.gif".into(),
+                ..OutgoingFile::default()
+            }],
+            ..Outgoing::default()
+        },
+    });
+    world.until("MMS GIF warning", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.kind == MessageKind::System && m.text.contains("Large GIFs"))
+    });
+}
+
+#[test]
+fn scheduled_send_waits_until_clock_reaches_time_supports_cancel_and_reports_missed() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Account advertises schedule capability.
+    let status = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages account status");
+    assert!(status.can.schedule, "Messages must advertise schedule");
+
+    // 2. Set controlled clock to T0 = 1_800_000_000 (09:00 UTC on a fixed day -> 2027-01-15 08:00:00 UTC).
+    //    Use 1_800_003_600 = exact 09:00 UTC so HH:MM is 09:00.
+    let t0: i64 = 1_800_000_000;
+    let t_due: i64 = t0 + 300;
+    let t_cancel: i64 = t0 + 600;
+    let t_missed: i64 = 1_800_003_600; // 09:00 UTC
+    world.steer(&format!("clock {t0}"));
+    world.heard(&format!("clock {t0}"));
+
+    // 3. Schedule a text for t_due: shown as pending/waiting before t_due and NOT sent yet.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sched-1".into(),
+        text: "Good morning!".into(),
+        reply_to: None,
+        with: Outgoing {
+            schedule: Some(t_due),
+            ..Outgoing::default()
+        },
+    });
+    let pending = world.until("scheduled message pending", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-1" && m.state == SendState::Pending && m.waiting)
+    });
+    assert_eq!(pending.sent, t_due);
+    assert!(
+        !world.calls().iter().any(|c| c.contains("Good morning!")),
+        "scheduled message must not be sent before T"
+    );
+
+    // 4. Schedule a second message and cancel it before its time.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sched-cancel".into(),
+        text: "Never mind".into(),
+        reply_to: None,
+        with: Outgoing {
+            schedule: Some(t_cancel),
+            ..Outgoing::default()
+        },
+    });
+    world.until("cancel target pending", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-cancel" && m.state == SendState::Pending)
+    });
+    assert_eq!(
+        world.ask(Request::CancelSend {
+            conversation: key(GRACE),
+            client_id: "c-sched-cancel".into(),
+        }),
+        Response::Ok
+    );
+    world.until("cancelled schedule failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-cancel" && matches!(m.state, SendState::Failed { .. }))
+    });
+
+    // 5. Schedule a third message for 09:00 UTC (t_missed) to verify missed-while-off reporting.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sched-missed".into(),
+        text: "Missed reminder".into(),
+        reply_to: None,
+        with: Outgoing {
+            schedule: Some(t_missed),
+            ..Outgoing::default()
+        },
+    });
+    world.until("missed target pending", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-missed" && m.state == SendState::Pending)
+    });
+
+    // 6. Advance clock to t_due: first message sends!
+    world.steer(&format!("clock {t_due}"));
+    world.heard(&format!("send {GRACE} Good morning!"));
+    world.until("scheduled message sent", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-1" && m.state == SendState::Sent)
+    });
+
+    // 7. Jump clock far past t_missed (simulating computer sleep): must NOT send, must report off at 09:00.
+    let t_late = t_missed + 600;
+    world.steer(&format!("clock {t_late}"));
+    let missed = world.until("missed schedule failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-missed" && matches!(m.state, SendState::Failed { .. }))
+    });
+    match missed.state {
+        SendState::Failed { reason } => {
+            assert_eq!(reason, "Not sent: this computer was off at 09:00");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(
+        !world.calls().iter().any(|c| c.contains("Missed reminder")),
+        "missed scheduled message must not be silently sent late"
+    );
+    assert!(
+        !world.calls().iter().any(|c| c.contains("Never mind")),
+        "cancelled scheduled message must never be sent"
+    );
+
+    // 8. Phone-created scheduled message (status 16) shows as pending/waiting in the conversation.
+    world.steer(&format!("phone-scheduled grace {} From phone", t_late + 3600));
+    let from_phone = world.until("phone scheduled shown", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-phone-sched")
+    });
+    assert_eq!(from_phone.state, SendState::Pending);
+    assert!(from_phone.waiting);
+}
+
+#[test]
+fn dual_sim_settings_publish_chooser_and_send_with_sim_2_carries_sim() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Before settings update, no send_as chooser is offered.
+    let before = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages status");
+    assert!(before.send_as.is_empty());
+
+    // 2. Settings update with two SIMs publishes the chooser and updates the account label
+    //    with the primary SIM's carrier and masked number.
+    world.steer("dual-sim");
+    let after = world.until("dual-sim send_as published", || {
+        world
+            .status()
+            .0
+            .into_iter()
+            .find(|a| a.key == account() && a.send_as.len() == 2)
+    });
+    assert!(after.name.contains("T-Mobile"), "account label should include carrier: {:?}", after.name);
+    assert!(after.name.contains("01"), "account label should include last 2 digits: {:?}", after.name);
+    assert!(!after.name.contains("555"), "account label must mask phone number: {:?}", after.name);
+    assert_eq!(after.send_as[0].id, "sim-1");
+    assert_eq!(after.send_as[0].label, "T-Mobile");
+    assert!(after.send_as[0].detail.contains("RCS"));
+    assert_eq!(after.send_as[1].id, "sim-2");
+    assert_eq!(after.send_as[1].label, "Work");
+    assert!(after.send_as[1].detail.contains("SMS"));
+
+    // 3. Plain send with no explicit SIM choice must NOT override SIM.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sim-default".into(),
+        text: "Default line".into(),
+        reply_to: None,
+        with: Outgoing::default(),
+    });
+    world.heard(&format!("send {GRACE} Default line"));
+    assert!(
+        !world.calls().iter().any(|c| c.starts_with(&format!("sim {GRACE} "))),
+        "default send must not pass a SIM override"
+    );
+
+    // 4. Send with SIM 2 explicitly picked carries sim-2 in the request and marks sent_via.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sim-2".into(),
+        text: "From work SIM".into(),
+        reply_to: None,
+        with: Outgoing {
+            send_as: Some("sim-2".into()),
+            ..Outgoing::default()
+        },
+    });
+    world.heard(&format!("send {GRACE} From work SIM"));
+    world.heard(&format!("sim {GRACE} sim-2"));
+    let sent = world.until("sim-2 message stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sim-2" && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.sent_via.as_deref(), Some("Work"));
+
+    // 5. Incoming message reporting SIM 2 resolves its label onto sent_via.
+    world.steer("incoming-sim grace sim-2 Work reply");
+    let incoming = world.arrived(GRACE, "Work reply");
+    assert_eq!(incoming.sent_via.as_deref(), Some("Work"));
+}

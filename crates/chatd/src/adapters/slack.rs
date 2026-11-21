@@ -931,6 +931,16 @@ impl Slack {
                 self.emoji_changed(event);
                 Ok(())
             }
+            "bookmark_added" | "bookmark_changed" | "bookmark_deleted" => {
+                if let Some(channel) = event["channel_id"]
+                    .as_str()
+                    .or_else(|| event["bookmark"]["channel_id"].as_str())
+                    .filter(|c| !c.is_empty())
+                {
+                    self.ctx.info_stale(channel);
+                }
+                Ok(())
+            }
             "subteam_self_added" => {
                 self.subteam_self(event, true);
                 Ok(())
@@ -1386,6 +1396,30 @@ impl Slack {
             Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
                 answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
             }
+            Command::ActivityFeed { kind, cursor, limit, reply } => {
+                answer(reply, self.activity_feed(kind, cursor.as_deref(), limit))
+            }
+            Command::ActivityMarkRead { item_id, reply } => {
+                answer(reply, self.activity_mark_read(item_id.as_deref()))
+            }
+            Command::BookmarkAdd { conversation_id, title, link, emoji, reply } => {
+                answer(reply, self.bookmark_add(&conversation_id, &title, &link, &emoji))
+            }
+            Command::BookmarkEdit { conversation_id, bookmark_id, title, link, emoji, reply } => {
+                answer(reply, self.bookmark_edit(&conversation_id, &bookmark_id, title.as_deref(), link.as_deref(), emoji.as_deref()))
+            }
+            Command::BookmarkRemove { conversation_id, bookmark_id, reply } => {
+                answer(reply, self.bookmark_remove(&conversation_id, &bookmark_id))
+            }
+            Command::BrowseChannels { query, cursor, limit, reply, .. } => {
+                answer(reply, self.browse_channels(&query, cursor.as_deref(), limit))
+            }
+            Command::PreviewChannel { conversation_id, reply } => {
+                answer(reply, self.preview_channel(&conversation_id))
+            }
+            Command::Join { conversation_id, reply } => {
+                answer(reply, self.join_channel(&conversation_id))
+            }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
@@ -1534,12 +1568,12 @@ impl Slack {
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
     fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
-        let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[]);
+        let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[], false);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
     /// The post itself, answering what Slack accepted.
-    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool, spans: &[protocol::Span]) -> Result<Message, String> {
+    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool, spans: &[protocol::Span], broadcast: bool) -> Result<Message, String> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
@@ -1552,10 +1586,11 @@ impl Slack {
             params.push(("blocks", blocks));
         }
         let shown = reply_to.filter(|_| thread.is_none());
+        let broadcast_thread = broadcast && thread.is_some();
         if let Some(root) = thread.or(shown) {
             params.push(("thread_ts", root));
         }
-        if shown.is_some() {
+        if shown.is_some() || broadcast_thread {
             params.push(("reply_broadcast", "true"));
         }
         // The preview chip dismissed: Slack is asked not to unfurl the links.
@@ -1575,6 +1610,11 @@ impl Slack {
         outcome.map(|mut message| {
             if let Some(root) = thread {
                 self.report(self.bump(channel, root, &message));
+                if broadcast_thread {
+                    let mut in_channel = message.clone();
+                    in_channel.reply_to = self.quote(channel, root);
+                    self.report(self.ctx.message(channel, &in_channel).map_err(Into::into));
+                }
             }
             if let Some(root) = shown {
                 message.reply_to = self.quote(channel, root);
@@ -2028,12 +2068,16 @@ fn capabilities() -> protocol::Capabilities {
         delete: true,
         threads: true,
         direct_threads: true,
+        thread_broadcast: true,
         pins: true,
         forward: true,
         polls: None,
         reactions: true,
         mention_format: protocol::MentionFormat::Slack,
         mention_spans: false,
+        activity_feed: true,
+        bookmarks: true,
+        browse_channels: true,
         ..protocol::Capabilities::default()
     }
 }

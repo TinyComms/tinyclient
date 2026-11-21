@@ -1,0 +1,12 @@
+{
+  "id": "wave-4-gmsg-slack",
+  "title": "Wave 4A Google Messages & Slack enhancements",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 4A Google Messages & Slack enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 4A Google Messages & Slack enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

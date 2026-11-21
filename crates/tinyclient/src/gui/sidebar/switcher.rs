@@ -1199,6 +1199,7 @@ mod tests {
             presence: Presence::Unknown,
             status: String::new(),
             can: Default::default(),
+            send_as: Vec::new(),
         }
     }
 
@@ -1409,6 +1410,7 @@ mod tests {
             presence: protocol::Presence::Unknown,
             status: String::new(),
             can: protocol::Capabilities::default(),
+            send_as: Vec::new(),
         }];
         let hit = text_number_hit("@(555) 010-0099", &accounts).expect("text a number hit");
         assert_eq!(hit.title, "Text (555) 010-0099");

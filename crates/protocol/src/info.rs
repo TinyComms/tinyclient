@@ -243,6 +243,32 @@ pub struct ConversationInfo {
     /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disappearing: Option<u32>,
+    /// Channel bookmarks (links, canvases, folders; Slack `bookmarks.list`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+/// Kind of a channel bookmark.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkKind {
+    #[default]
+    Link,
+    Canvas,
+    Folder,
+}
+
+/// One bookmark pinned in a channel's bookmarks bar (`ConversationInfo::bookmarks`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    #[serde(default)]
+    pub kind: BookmarkKind,
 }
 
 /// A Space's info: opened from its name, never from a conversation.
@@ -560,6 +586,76 @@ pub struct Capabilities {
     /// This account supports blocking and unblocking people (`Request::Relate` with Block/Unblock).
     #[serde(default, skip_serializing_if = "is_false")]
     pub blocks: bool,
+    /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub activity_feed: bool,
+    /// This account supports channel bookmarks (`bookmarks.list` / `add` / `edit` / `remove`, Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bookmarks: bool,
+    /// This account supports browsing unjoined public channels, previewing, and joining them (`BrowseChannels`, `PreviewChannel`, `Join`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub browse_channels: bool,
+}
+
+/// One public channel returned by [`crate::Request::BrowseChannels`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowsedChannel {
+    pub key: Key,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub members: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub joined: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub private: bool,
+}
+
+/// What kind of event an [`ActivityItem`] represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityItemKind {
+    Mention,
+    ThreadReply,
+    Reaction,
+    App,
+    Invite,
+    Other,
+}
+
+/// One row of an account's activity feed (mentions, thread replies, reactions to my messages, apps).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityItem {
+    /// Stable identifier from the network (used for mark-read and keying).
+    pub id: String,
+    pub kind: ActivityItemKind,
+    /// Conversation where the activity occurred.
+    pub conversation: Key,
+    /// Target message id to jump to when clicked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message_id: String,
+    /// Thread conversation id when the activity is inside a thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// Display name of the person or app who triggered the activity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    /// Network user/app id of the actor.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor_id: String,
+    /// Emoji for a reaction item (Unicode or `:name:`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Short preview text of the message or notification.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Unix seconds when the activity happened.
+    #[serde(default)]
+    pub time: i64,
+    /// Whether the network considers this item unread.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread: bool,
 }
 
 /// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.
@@ -759,6 +855,22 @@ pub struct PollDraft {
     pub anonymous: bool,
 }
 
+/// One selectable sending identity or line on an account (e.g. a SIM card on a dual-SIM phone,
+/// or a channel send-as alias).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendAs {
+    /// Adapter-opaque id carried back in `Outgoing::send_as`.
+    pub id: String,
+    /// Short display label shown beside the composer (e.g. carrier name or "SIM 2").
+    pub label: String,
+    /// Optional accent colour (`0xRRGGBB`), e.g. SIM colour from the phone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    /// Optional secondary detail (e.g. "RCS" / "SMS" or masked number).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
 /// message leaves it off the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,6 +917,10 @@ pub struct Outgoing {
     /// Optional contact card to share (Signal, Telegram).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<crate::SharedContact>,
+    /// Optional sending identity or line id from `AccountStatus::send_as` (e.g. a SIM card on a
+    /// dual-SIM phone). `None` keeps the conversation's default line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_as: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -823,6 +939,7 @@ impl Default for Outgoing {
             broadcast: false,
             effect: None,
             contact: None,
+            send_as: None,
         }
     }
 }
@@ -935,5 +1052,30 @@ mod tests {
         let got_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(got_resp, resp);
         assert_eq!(ReportReason::ALL.len(), 6);
+    }
+
+    #[test]
+    fn send_as_round_trips_and_stays_off_wire_when_unset() {
+        let plain = Outgoing::default();
+        assert!(plain.is_plain());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("send_as"));
+
+        let chosen = Outgoing {
+            send_as: Some("sim-2".into()),
+            ..Outgoing::default()
+        };
+        assert!(!chosen.is_plain());
+        let wire = serde_json::to_string(&chosen).unwrap();
+        let back: Outgoing = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, chosen);
+
+        let opt = SendAs {
+            id: "sim-2".into(),
+            label: "Work".into(),
+            color: Some(0x34A853),
+            detail: "SMS · +1 •••• ••99".into(),
+        };
+        let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
+        assert_eq!(back_opt, opt);
     }
 }

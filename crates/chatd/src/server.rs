@@ -688,6 +688,7 @@ impl Chat {
                     presence,
                     status,
                     can: linked.map_or_else(Capabilities::default, |linked| linked.can),
+                    send_as: linked.map_or_else(Vec::new, |linked| linked.send_as.clone()),
                 }
             })
             .collect();
@@ -1844,6 +1845,7 @@ impl Chat {
             pinned: about.pinned,
             external: about.external,
             link: about.link,
+            bookmarks: about.bookmarks,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
@@ -3046,6 +3048,8 @@ impl Chat {
                     Err(refused) => return *refused,
                 };
                 if message.waiting {
+                    let conversation_id = conversation.id.clone();
+                    self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id: client_id.clone() });
                     return self.drop_unsent(conversation, &client_id, &message);
                 }
                 let conversation_id = conversation.id.clone();
@@ -3066,6 +3070,10 @@ impl Chat {
                     Ok(message) => message,
                     Err(refused) => return *refused,
                 };
+                if message.waiting {
+                    let conversation_id = conversation.id.clone();
+                    self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id: client_id.clone() });
+                }
                 self.drop_unsent(conversation, &client_id, &message)
             }
             Request::Typing { conversation, activity } => {
@@ -3428,6 +3436,130 @@ impl Chat {
                     }
                 }
                 Response::LogsSaved { paths }
+            }
+            Request::ActivityFeed { account, kind, cursor, limit } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 20 } else { limit.min(50) };
+                match self.ask(&account, |reply| Command::ActivityFeed { kind, cursor, limit, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.actor, 120);
+                            clip(&mut item.text, 500);
+                            clip(&mut item.emoji, 64);
+                        }
+                        Response::ActivityFeed { items: page.items, cursor: page.cursor }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ActivityMarkRead { account, item_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::ActivityMarkRead { item_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::BookmarkAdd { conversation, title, link, emoji } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::BookmarkAdd { conversation_id, title, link, emoji, reply }) {
+                    Ok(bookmark) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Bookmark { bookmark }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::BookmarkEdit { conversation, bookmark_id, title, link, emoji } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::BookmarkEdit { conversation_id, bookmark_id, title, link, emoji, reply }) {
+                    Ok(bookmark) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Bookmark { bookmark }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::BookmarkRemove { conversation, bookmark_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::BookmarkRemove { conversation_id, bookmark_id, reply }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::BrowseChannels { space, query, cursor, limit } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 50 } else { limit.min(100) };
+                match self.ask(&account, |reply| Command::BrowseChannels {
+                    space_id: space.id,
+                    query,
+                    cursor,
+                    limit,
+                    reply,
+                }) {
+                    Ok(mut page) => {
+                        for ch in &mut page.channels {
+                            clip(&mut ch.name, 120);
+                            clip(&mut ch.topic, 300);
+                        }
+                        Response::BrowsedChannels { channels: page.channels, cursor: page.cursor }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::PreviewChannel { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::PreviewChannel { conversation_id, reply }) {
+                    Ok(()) => match self.hub.store().conversation(&conversation) {
+                        Ok(Some(row)) => Response::Conversation { conversation: self.row(row) },
+                        Ok(None) => error(ErrorCode::NotFound, "no such conversation"),
+                        Err(err) => internal(err),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Join { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::Join { conversation_id, reply }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        match self.hub.store().conversation(&conversation) {
+                            Ok(Some(row)) => Response::Conversation { conversation: self.row(row) },
+                            Ok(None) => Response::Ok,
+                            Err(err) => internal(err),
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
             }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {

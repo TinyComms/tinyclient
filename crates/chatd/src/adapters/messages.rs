@@ -102,6 +102,7 @@ struct Saved {
 pub enum Event {
     Ready,
     Chats(Vec<Chat>),
+    Settings(Vec<bugle::SimCard>),
     Message(bugle::Note),
     Typing {
         conversation: String,
@@ -132,6 +133,7 @@ trait Drive: Send + Sync {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
     fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String>;
@@ -141,6 +143,7 @@ trait Drive: Send + Sync {
         caption: &str,
         parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
     /// Asks the phone to send again a copy it already has.
@@ -203,9 +206,10 @@ impl Drive for LiveDrive {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        self.inner.send(conversation, text, reply, noted)
+        self.inner.send(conversation, text, reply, sim, noted)
     }
     fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String> {
         self.inner.upload_bytes(packed, mime)
@@ -216,9 +220,10 @@ impl Drive for LiveDrive {
         caption: &str,
         parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        self.inner.send_media(conversation, caption, parts, reply, noted)
+        self.inner.send_media(conversation, caption, parts, reply, sim, noted)
     }
     fn resend(&self, message: &str) -> Result<(), String> {
         self.inner.resend(message)
@@ -501,9 +506,40 @@ pub fn reaction_rules() -> protocol::ReactionRules {
 struct Held {
     media_id: String,
     key: Vec<u8>,
+    conversation: String,
     message: String,
     action: String,
     mime: String,
+    name: String,
+}
+
+/// A locally scheduled text held by chatd until `at` (unix seconds).
+struct ScheduledSend {
+    conversation: String,
+    client_id: String,
+    text: String,
+    reply: Option<String>,
+    sim: Option<String>,
+    at: i64,
+}
+
+/// Grace window past a scheduled time before assuming the computer was asleep / off.
+const SCHEDULE_MISSED_GRACE: i64 = 120;
+
+fn clock_now() -> i64 {
+    if scripted() {
+        if let Some(t) = fake::clock() {
+            return t;
+        }
+    }
+    crate::hub::now()
+}
+
+fn format_hhmm(unix_secs: i64) -> String {
+    let secs_in_day = unix_secs.rem_euclid(86_400);
+    let hour = secs_in_day / 3_600;
+    let minute = (secs_in_day % 3_600) / 60;
+    format!("{hour:02}:{minute:02}")
 }
 
 /// A text this computer has not asked the phone to send yet. Kept only for this connection.
@@ -514,6 +550,8 @@ struct WaitingSend {
     since: i64,
     /// The message this one answers, when the chat is RCS. Empty otherwise.
     reply: Option<String>,
+    /// Explicit SIM id chosen by the user for this send, if any.
+    sim: Option<String>,
 }
 
 /// How far one conversation has been read this session. `started` means the phone said there
@@ -579,6 +617,10 @@ struct Account {
     /// Phone contacts cached for this session.
     contacts: Mutex<Vec<bugle::ContactEntry>>,
     contacts_loaded: std::sync::atomic::AtomicBool,
+    /// Locally scheduled texts waiting for their send time while chatd runs.
+    scheduled: Arc<Mutex<Vec<ScheduledSend>>>,
+    /// SIM cards reported by the phone's settings update for this session.
+    sims: Mutex<Vec<bugle::SimCard>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -587,13 +629,15 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         return Err("the Messages session is for another account".to_owned());
     }
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
-    let (socket_ctx, held, socket_saved) = (ctx.clone(), current.clone(), saved.clone());
+    let scheduled: Arc<Mutex<Vec<ScheduledSend>>> = Arc::default();
+    let (socket_ctx, held, socket_saved, socket_scheduled) =
+        (ctx.clone(), current.clone(), saved.clone(), scheduled.clone());
     std::thread::Builder::new()
         .name("messages-link".into())
         .spawn(move || {
             let mut gate = bugle::Gate::default();
             keep_connected(&socket_ctx, || {
-                connect(&socket_ctx, &socket_saved, &held, &mut gate)
+                connect(&socket_ctx, &socket_saved, &held, &socket_scheduled, &mut gate)
             });
             held.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -620,6 +664,12 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                 },
                 |command| match (account(), command) {
                     (Some(account), command) => serve(&account, command),
+                    (None, Command::CancelSend { client_id, .. }) => {
+                        scheduled
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .retain(|item| item.client_id != client_id);
+                    }
                     (None, Command::SignOut(reply)) => {
                         if scripted() {
                             fake::record(STILL_LISTED);
@@ -642,6 +692,7 @@ fn connect(
     ctx: &Context,
     saved: &Saved,
     current: &Mutex<Option<Arc<Account>>>,
+    scheduled: &Arc<Mutex<Vec<ScheduledSend>>>,
     gate: &mut bugle::Gate,
 ) -> Failure {
     let drive = match open(saved) {
@@ -667,10 +718,15 @@ fn connect(
         newest: Mutex::default(),
         contacts: Mutex::default(),
         contacts_loaded: std::sync::atomic::AtomicBool::new(false),
+        scheduled: scheduled.clone(),
+        sims: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
+        gif_file: true,
+        schedule: true,
+        voice_notes: true,
         edit: true,
         edit_window: bugle::EDIT_WINDOW_SECS,
         close_direct: true,
@@ -694,6 +750,29 @@ fn connect(
         return Failure::Dropped("stopped".to_owned());
     }
     ctx.link(protocol::Link::Connected);
+    let sched_account = Arc::downgrade(&account);
+    let _ = std::thread::Builder::new()
+        .name("messages-schedule".into())
+        .spawn(move || {
+            while let Some(acc) = sched_account.upgrade() {
+                if acc.ctx.stopped() {
+                    break;
+                }
+                let due = {
+                    let now = clock_now();
+                    acc.scheduled
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .iter()
+                        .any(|item| now >= item.at)
+                };
+                if due {
+                    let _ = acc.ctx.commands.send(Command::OpenHome);
+                }
+                drop(acc);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
     let ended = loop {
         match events.recv() {
             Ok(Event::Ready) => {
@@ -884,8 +963,65 @@ fn seal(account: &Account, conversation: &str, on: bool) {
     let _ = account.ctx.conversation(&row(&chat));
 }
 
+fn apply_settings(account: &Account, sims: Vec<bugle::SimCard>) {
+    if sims.is_empty() {
+        return;
+    }
+    if let Some(primary) = sims.first() {
+        let mut parts = Vec::new();
+        if !primary.carrier.trim().is_empty() {
+            parts.push(primary.carrier.trim().to_owned());
+        }
+        if !primary.number.trim().is_empty() {
+            parts.push(mask_phone(primary.number.trim()));
+        }
+        let label = if parts.is_empty() {
+            if account.name.is_empty() {
+                "Messages".to_owned()
+            } else {
+                account.name.clone()
+            }
+        } else {
+            parts.join(" · ")
+        };
+        let _ = account.ctx.describe(&label, &account.me);
+    }
+    let options: Vec<protocol::SendAs> = if sims.len() > 1 {
+        sims.iter()
+            .map(|sim| {
+                let mut detail = if sim.rcs { "RCS" } else { "SMS" }.to_owned();
+                if !sim.number.trim().is_empty() {
+                    detail.push_str(" · ");
+                    detail.push_str(&mask_phone(sim.number.trim()));
+                }
+                protocol::SendAs {
+                    id: sim.id.clone(),
+                    label: sim.label(),
+                    color: sim.color,
+                    detail,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    *account.sims.lock().unwrap_or_else(|p| p.into_inner()) = sims;
+    account.ctx.send_as(options);
+}
+
+fn sim_label(account: &Account, sim_id: &str) -> String {
+    let sims = account.sims.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(sim) = sims.iter().find(|s| s.id == sim_id) {
+        return sim.label();
+    }
+    sim_id.to_owned()
+}
+
 fn apply(account: &Account, event: Event) {
     match event {
+        Event::Settings(sims) => {
+            apply_settings(account, sims);
+        }
         Event::Chats(chats) => {
             let chats = remember(account, &chats);
             let mut people = Vec::new();
@@ -1135,6 +1271,9 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
     let mut shown = message(account, note, page);
     if note.outgoing || note.author == account.me {
         shown.state = state_of(note);
+        if note.scheduled {
+            shown.waiting = true;
+        }
         if let Some(client_id) = claim(account, note) {
             if shown.attachments.is_empty() || shown.text.is_empty() || shown.reply_to.is_none() {
                 if let Ok(Some(had)) = account.ctx.stored_message(&note.conversation, &client_id) {
@@ -1267,8 +1406,14 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
     message.edited = note.edited;
     message.edited_at = note.edited_at;
     message.starred = note.starred;
+    if let Some(sim_id) = note.sim.as_deref() {
+        message.sent_via = Some(sim_label(account, sim_id));
+    }
     if !note.reply.is_empty() {
         message.reply_to = Some(quoted(account, &note.conversation, &note.reply, page));
+    }
+    if let Some(loc) = &note.location {
+        message.card = Some(Box::new(location_card(loc)));
     }
     let mut shown = Vec::new();
     for (index, piece) in note.pieces.iter().enumerate() {
@@ -1299,15 +1444,20 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
                 }
             }
             if !piece.media_id.is_empty() {
-                remember_held(account, &id, piece, &note.id);
+                remember_held(account, &id, piece, &note.conversation, &note.id);
             }
         } else if !piece.inline.is_empty() {
             if let Some(path) = land(account, &file, &piece.inline) {
                 file.path = Some(path);
                 file.bytes = piece.inline.len() as u64;
             }
+            if message.card.is_none() && is_vcard(&piece.mime, &piece.name) {
+                if let Some(vc) = parse_vcard(&piece.inline) {
+                    message.card = Some(Box::new(vcard_card(&vc)));
+                }
+            }
         } else if !piece.media_id.is_empty() {
-            remember_held(account, &id, piece, &note.id);
+            remember_held(account, &id, piece, &note.conversation, &note.id);
         }
         let label = if piece.name.is_empty() {
             "File".into()
@@ -1334,13 +1484,39 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
     message.reactions = note
         .reactions
         .iter()
-        .map(|mark| Reaction {
-            emoji: mark.emoji.clone(),
-            file: None,
-            count: mark.who.len().max(1) as u32,
-            mine: mark.who.iter().any(|who| who == &account.me),
-            // The phone names the participants who reacted, as the sender ids do.
-            who: mark.who.iter().take(protocol::REACTION_REACTORS).cloned().collect(),
+        .enumerate()
+        .map(|(idx, mark)| {
+            let file = mark.media.as_ref().and_then(|piece| {
+                if piece.inline.is_empty() && piece.media_id.is_empty() {
+                    return None;
+                }
+                let id = format!("messages:{}:react:{idx}", note.id);
+                let mut mf = MediaFile::new(id.clone(), MediaKind::Emoji);
+                mf.width = piece.width;
+                mf.height = piece.height;
+                mf.bytes = if piece.size == 0 {
+                    piece.inline.len() as u64
+                } else {
+                    piece.size
+                };
+                if !piece.inline.is_empty() {
+                    if let Some(path) = land(account, &mf, &piece.inline) {
+                        mf.path = Some(path);
+                        mf.bytes = piece.inline.len() as u64;
+                    }
+                } else if !piece.media_id.is_empty() {
+                    remember_held(account, &id, piece, &note.conversation, &note.id);
+                }
+                Some(mf)
+            });
+            Reaction {
+                emoji: mark.emoji.clone(),
+                file,
+                count: mark.who.len().max(1) as u32,
+                mine: mark.who.iter().any(|who| who == &account.me),
+                // The phone names the participants who reacted, as the sender ids do.
+                who: mark.who.iter().take(protocol::REACTION_REACTORS).cloned().collect(),
+            }
         })
         .collect();
     if message.attachments.is_empty() && note.file {
@@ -1413,7 +1589,7 @@ fn kind_of(mime: &str) -> MediaKind {
     }
 }
 
-fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, message: &str) {
+fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, conversation: &str, message: &str) {
     account
         .held
         .lock()
@@ -1423,11 +1599,183 @@ fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, message: &st
             Held {
                 media_id: piece.media_id.clone(),
                 key: piece.key.clone(),
+                conversation: conversation.to_owned(),
                 message: message.to_owned(),
                 action: piece.action_id.clone(),
                 mime: piece.mime.clone(),
+                name: piece.name.clone(),
             },
         );
+}
+
+fn coord(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn location_card(loc: &bugle::Location) -> protocol::Card {
+    let geo = format!("geo:{},{}", coord(loc.lat), coord(loc.lng));
+    let title = if loc.label.is_empty() {
+        "Location".to_owned()
+    } else {
+        loc.label.clone()
+    };
+    let text = if loc.address.is_empty() {
+        geo
+    } else {
+        format!("{}\n{geo}", loc.address)
+    };
+    protocol::Card {
+        title,
+        text,
+        fields: vec![
+            ("Latitude".to_owned(), coord(loc.lat)),
+            ("Longitude".to_owned(), coord(loc.lng)),
+        ],
+        footer: "Open in Maps".to_owned(),
+        color: None,
+        sponsored: false,
+        ..protocol::Card::default()
+    }
+}
+
+pub(crate) fn mask_phone(phone: &str) -> String {
+    let code = if phone.starts_with('+') {
+        match phone.find(|ch: char| ch.is_whitespace() || ch == '-') {
+            Some(sep) if sep <= 4 && phone[1..sep].chars().all(|c| c.is_ascii_digit()) => sep,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let digits = phone
+        .char_indices()
+        .filter(|(ix, ch)| *ix >= code && ch.is_ascii_digit())
+        .count();
+    let mut seen = 0;
+    phone
+        .char_indices()
+        .map(|(ix, ch)| {
+            if !ch.is_ascii_digit() || ix < code {
+                return ch;
+            }
+            seen += 1;
+            if seen + 2 > digits {
+                ch
+            } else {
+                '•'
+            }
+        })
+        .collect()
+}
+
+fn is_vcard(mime: &str, name: &str) -> bool {
+    let mime = mime.to_ascii_lowercase();
+    mime.contains("vcard") || name.to_ascii_lowercase().ends_with(".vcf")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VCard {
+    name: String,
+    org: String,
+    phones: Vec<String>,
+    emails: Vec<String>,
+}
+
+fn parse_vcard(bytes: &[u8]) -> Option<VCard> {
+    let raw = std::str::from_utf8(bytes).ok()?;
+    let mut unfolded = Vec::<String>::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix(' ').or_else(|| line.strip_prefix('\t')) {
+            if let Some(last) = unfolded.last_mut() {
+                last.push_str(rest);
+                continue;
+            }
+        }
+        unfolded.push(line.to_owned());
+    }
+    if !unfolded
+        .iter()
+        .any(|line| line.trim().eq_ignore_ascii_case("BEGIN:VCARD"))
+    {
+        return None;
+    }
+    let mut card = VCard::default();
+    let mut fallback_name = String::new();
+    for line in unfolded {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let prop = key.split(';').next().unwrap_or("").trim().to_ascii_uppercase();
+        let val = value.trim();
+        if val.is_empty() {
+            continue;
+        }
+        match prop.as_str() {
+            "FN" if card.name.is_empty() => card.name = val.to_owned(),
+            "N" if fallback_name.is_empty() => {
+                let parts: Vec<&str> = val.split(';').collect();
+                let last = parts.first().copied().unwrap_or("").trim();
+                let first = parts.get(1).copied().unwrap_or("").trim();
+                let joined = format!("{first} {last}").trim().to_owned();
+                if !joined.is_empty() {
+                    fallback_name = joined;
+                }
+            }
+            "ORG" if card.org.is_empty() => {
+                card.org = val.split(';').next().unwrap_or(val).trim().to_owned();
+            }
+            "TEL" => {
+                let clean = val.strip_prefix("tel:").unwrap_or(val).trim().to_owned();
+                if !clean.is_empty() && !card.phones.contains(&clean) {
+                    card.phones.push(clean);
+                }
+            }
+            "EMAIL" => {
+                let clean = val.to_owned();
+                if !card.emails.contains(&clean) {
+                    card.emails.push(clean);
+                }
+            }
+            _ => {}
+        }
+    }
+    if card.name.is_empty() {
+        card.name = fallback_name;
+    }
+    if card.name.is_empty() && card.phones.is_empty() && card.emails.is_empty() {
+        return None;
+    }
+    Some(card)
+}
+
+fn vcard_card(vcard: &VCard) -> protocol::Card {
+    let mut fields = Vec::new();
+    for phone in &vcard.phones {
+        fields.push(("Phone".to_owned(), mask_phone(phone)));
+    }
+    for email in &vcard.emails {
+        fields.push(("Email".to_owned(), email.clone()));
+    }
+    protocol::Card {
+        title: if vcard.name.is_empty() {
+            "Contact".to_owned()
+        } else {
+            vcard.name.clone()
+        },
+        text: vcard.org.clone(),
+        fields,
+        footer: "Contact card".to_owned(),
+        color: None,
+        sponsored: false,
+        ..protocol::Card::default()
+    }
 }
 
 /// A JPEG or PNG, which is the only still a video's inline bytes can be. The layout has no
@@ -1622,9 +1970,11 @@ fn wanted(account: &Account, ids: &[String]) {
             .map(|held| Held {
                 media_id: held.media_id.clone(),
                 key: held.key.clone(),
+                conversation: held.conversation.clone(),
                 message: held.message.clone(),
                 action: held.action.clone(),
                 mime: held.mime.clone(),
+                name: held.name.clone(),
             });
         let Some(held) = held else {
             continue;
@@ -1637,6 +1987,18 @@ fn wanted(account: &Account, ids: &[String]) {
                 let mut file = MediaFile::new(id.clone(), kind_of(&held.mime));
                 file.bytes = bytes.len() as u64;
                 let _ = land(account, &file, &bytes);
+                if is_vcard(&held.mime, &held.name) {
+                    if let Some(vc) = parse_vcard(&bytes) {
+                        if let Ok(Some(mut stored)) =
+                            account.ctx.stored_message(&held.conversation, &held.message)
+                        {
+                            if stored.card.is_none() {
+                                stored.card = Some(Box::new(vcard_card(&vc)));
+                                let _ = account.ctx.message(&held.conversation, &stored);
+                            }
+                        }
+                    }
+                }
             }
             Err(why) => {
                 let file = MediaFile::new(id.clone(), kind_of(&held.mime));
@@ -1791,7 +2153,11 @@ fn serve(account: &Arc<Account>, command: Command) {
             client_id,
             text,
             reply_to,
-        } => post_text(account, &conversation_id, &client_id, text, reply_to),
+        } => {
+            // If this client_id was scheduled locally, treat a direct Send as "send now".
+            let sim = take_scheduled(account, &conversation_id, &client_id).and_then(|s| s.sim);
+            post_text(account, &conversation_id, &client_id, text, reply_to, sim);
+        }
         Command::SendWith {
             conversation_id,
             client_id,
@@ -1799,11 +2165,23 @@ fn serve(account: &Arc<Account>, command: Command) {
             reply_to,
             with,
         } => {
-            if with.files.is_empty() {
-                post_text(account, &conversation_id, &client_id, text, reply_to);
+            let sim = with.send_as.clone();
+            if let Some(at) = with.schedule {
+                if !with.files.is_empty() {
+                    ctx.sent(
+                        &conversation_id,
+                        &client_id,
+                        Err("Messages schedules text only, not files.".into()),
+                    );
+                } else {
+                    schedule_text(account, &conversation_id, &client_id, text, reply_to, sim, at);
+                }
+            } else if with.files.is_empty() {
+                post_text(account, &conversation_id, &client_id, text, reply_to, sim);
             } else {
-                warn_mms(account, &conversation_id, &client_id);
+                warn_mms(account, &conversation_id, &client_id, &with.files);
                 let reply = carried_reply(account, &conversation_id, reply_to);
+                let voice = with.voice.clone();
                 let account = Arc::clone(account);
                 let conversation = conversation_id.clone();
                 let cid = client_id.clone();
@@ -1821,6 +2199,8 @@ fn serve(account: &Arc<Account>, command: Command) {
                             &cid,
                             &caption,
                             reply.as_deref(),
+                            voice.as_ref(),
+                            sim.as_deref(),
                         )
                     },
                 );
@@ -1832,7 +2212,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             client_id,
         } => {
             upload::cancel(&ctx.account, &client_id);
-            let mut queued = false;
+            let mut queued = take_scheduled(account, &conversation_id, &client_id).is_some();
             phone(account).queue.retain(|held| {
                 let drop = held.conversation == conversation_id && held.client_id == client_id;
                 queued |= drop;
@@ -1903,6 +2283,11 @@ fn serve(account: &Arc<Account>, command: Command) {
             scope,
             reply,
         } => {
+            if take_scheduled(account, &conversation_id, &message_id).is_some() {
+                let _ = ctx.deleted(&conversation_id, &message_id);
+                let _ = reply.send(Ok(()));
+                return;
+            }
             let answer = if scope == protocol::DeleteScope::Everyone {
                 Err(Refusal::Refused("Google Messages can only delete messages for you.".to_owned()))
             } else {
@@ -2057,14 +2442,27 @@ fn star_message(
     Ok(())
 }
 
-fn warn_mms(account: &Account, conversation: &str, client_id: &str) {
+const MMS_GIF_WARN_BYTES: u64 = 1024 * 1024;
+const MMS_GIF_WARNING: &str = "Large GIFs sent over MMS may be compressed or rejected by your carrier.";
+
+fn warn_mms(account: &Account, conversation: &str, client_id: &str, files: &[protocol::OutgoingFile]) {
     if carrier_of(account, conversation) != 1 {
         return;
     }
+    let large_gif = files.iter().any(|f| {
+        let is_gif = f.name.to_ascii_lowercase().ends_with(".gif")
+            || f.path.to_ascii_lowercase().ends_with(".gif");
+        is_gif && std::fs::metadata(&f.path).is_ok_and(|m| m.len() > MMS_GIF_WARN_BYTES)
+    });
+    let text = if large_gif {
+        MMS_GIF_WARNING
+    } else {
+        bugle::MMS_WARNING
+    };
     let mut line = Message::plain(
         format!("mms-warn-{client_id}"),
         String::new(),
-        bugle::MMS_WARNING,
+        text,
         crate::hub::now(),
         false,
     );
@@ -2110,6 +2508,55 @@ fn send_failure(name: &str, why: String) -> String {
     }
 }
 
+/// Maximum length (seconds) and size (bytes) for a voice message sent over SMS/MMS.
+const MMS_VOICE_MAX_SECS: u32 = 60;
+const MMS_VOICE_MAX_BYTES: u64 = 300 * 1024;
+const MMS_VOICE_CAP_ERR: &str =
+    "Voice messages in SMS/MMS chats are limited to 60 seconds (300 KB) so your carrier doesn't reject them.";
+
+fn check_mms_voice_limit(carrier: u64, voice: Option<&protocol::VoiceNote>, bytes: u64) -> Result<(), String> {
+    if carrier != 1 {
+        return Ok(());
+    }
+    if let Some(note) = voice {
+        if note.duration > MMS_VOICE_MAX_SECS * 1000 || bytes > MMS_VOICE_MAX_BYTES {
+            return Err(MMS_VOICE_CAP_ERR.to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort transcode of a recorded Ogg/Opus voice note via `ffmpeg` to AAC-in-M4A (RCS)
+/// or AMR-NB (SMS/MMS) so Android Messages and MMS gateways accept and play it reliably.
+/// Returns `None` if `ffmpeg` is unavailable or fails, in which case the original file is sent.
+fn transcode_voice(src: &std::path::Path, is_sms: bool) -> Option<(std::path::PathBuf, String, &'static str)> {
+    let ext = if is_sms { "amr" } else { "m4a" };
+    let mime = if is_sms { "audio/amr" } else { "audio/mp4" };
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("voice");
+    let dst = src.with_file_name(format!("{stem}-transcoded.{ext}"));
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-i"])
+        .arg(src);
+    if is_sms {
+        cmd.args(["-ar", "8000", "-ac", "1", "-c:a", "libopencore_amrnb", "-b:a", "12.2k"]);
+    } else {
+        cmd.args(["-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart"]);
+    }
+    cmd.arg(&dst);
+    protocol::launch::no_console(&mut cmd);
+    let ok = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok && std::fs::metadata(&dst).is_ok_and(|m| m.len() > 0) {
+        Some((dst, format!("{stem}.{ext}"), mime))
+    } else {
+        let _ = std::fs::remove_file(&dst);
+        None
+    }
+}
+
 struct Prepared {
     media_id: String,
     key: Vec<u8>,
@@ -2117,6 +2564,9 @@ struct Prepared {
     mime: &'static str,
     size: u64,
     path: std::path::PathBuf,
+    temp_path: Option<std::path::PathBuf>,
+    voice: bool,
+    duration_secs: Option<u32>,
 }
 
 /// Seals and uploads each file, then asks the phone to send them as one message.
@@ -2127,15 +2577,23 @@ fn deliver_files(
     client_id: &str,
     caption: &str,
     reply: Option<&str>,
+    voice: Option<&protocol::VoiceNote>,
+    sim: Option<&str>,
 ) -> Result<Message, String> {
+    let carrier = carrier_of(account, conversation);
     let staged: Vec<(String, u64, std::path::PathBuf)> = upload
         .files()
         .iter()
         .map(|source| (source.name.clone(), source.bytes, source.path.clone()))
         .collect();
+    let voice_index = voice.and_then(|_| staged.len().checked_sub(1));
     let mut prepared = Vec::with_capacity(staged.len());
-    for (at, (name, size, path)) in staged.into_iter().enumerate() {
+    for (at, (mut name, mut size, mut path)) in staged.into_iter().enumerate() {
         upload.check()?;
+        let is_voice = voice_index == Some(at);
+        if is_voice {
+            check_mms_voice_limit(carrier, voice, size)?;
+        }
         if size > bugle::FILE_CAP {
             return Err(format!(
                 "{name} is larger than 100 MB, which tinyclient won't send through Messages."
@@ -2145,19 +2603,57 @@ fn deliver_files(
         let n = std::fs::File::open(&path)
             .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
             .unwrap_or(0);
-        let mime = bugle::mime_of(&name, &head[..n]);
+        let mut mime = bugle::mime_of(&name, &head[..n]);
+        let mut temp_path = None;
+        if is_voice && (mime == "audio/ogg" || mime == "audio/opus") {
+            if let Some((dst, new_name, new_mime)) = transcode_voice(&path, carrier == 1) {
+                if let Ok(meta) = std::fs::metadata(&dst) {
+                    size = meta.len();
+                    name = new_name;
+                    mime = new_mime;
+                    path = dst.clone();
+                    temp_path = Some(dst);
+                }
+            }
+        }
+        if is_voice {
+            if let Err(err) = check_mms_voice_limit(carrier, voice, size) {
+                if let Some(tmp) = temp_path {
+                    let _ = std::fs::remove_file(tmp);
+                }
+                return Err(err);
+            }
+        }
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
         let mut packer = media::Packer::open(&key)?;
-        upload
-            .parts(at, media::CHUNK, 0, |part| packer.push(part.bytes))
-            .map_err(|why| send_failure(&name, why))?;
+        if temp_path.is_some() {
+            let mut file = std::fs::File::open(&path)
+                .map_err(|err| send_failure(&name, err.to_string()))?;
+            let mut buf = vec![0u8; media::CHUNK];
+            loop {
+                upload.check().map_err(|why| send_failure(&name, why))?;
+                let read = std::io::Read::read(&mut file, &mut buf)
+                    .map_err(|err| send_failure(&name, err.to_string()))?;
+                if read == 0 {
+                    break;
+                }
+                packer.push(&buf[..read]).map_err(|why| send_failure(&name, why))?;
+            }
+        } else {
+            upload
+                .parts(at, media::CHUNK, 0, |part| packer.push(part.bytes))
+                .map_err(|why| send_failure(&name, why))?;
+        }
         let packed = packer.finish().map_err(|why| send_failure(&name, why))?;
         upload.check().map_err(|why| send_failure(&name, why))?;
         let media_id = account
             .drive
             .upload_media(&packed, mime)
             .map_err(|why| send_failure(&name, why))?;
+        let duration_secs = is_voice
+            .then(|| voice.map(|v| ((v.duration + 999) / 1000).max(1)))
+            .flatten();
         prepared.push(Prepared {
             media_id,
             key: key.to_vec(),
@@ -2165,6 +2661,9 @@ fn deliver_files(
             mime,
             size,
             path,
+            temp_path,
+            voice: is_voice,
+            duration_secs,
         });
     }
     upload.check()?;
@@ -2176,18 +2675,28 @@ fn deliver_files(
             name: &part.name,
             mime: part.mime,
             size: part.size,
+            voice: part.voice,
+            duration_secs: part.duration_secs,
         })
         .collect();
     let sent = account
         .drive
-        .send_media(conversation, caption, &parts, reply, &mut |id| {
+        .send_media(conversation, caption, &parts, reply, sim, &mut |id| {
             keep_copy(account, client_id, id);
         });
     if sent.is_err() {
+        for part in &prepared {
+            if let Some(tmp) = &part.temp_path {
+                let _ = std::fs::remove_file(tmp);
+            }
+        }
         forget(account, client_id);
     }
     let id = sent?;
     let mut message = outgoing(account, client_id.to_owned(), caption.to_owned());
+    if let Some(sim_id) = sim.filter(|s| !s.is_empty()) {
+        message.sent_via = Some(sim_label(account, sim_id));
+    }
     if let Some(reply_id) = reply {
         message.reply_to = Some(quoted(account, conversation, reply_id, &[]));
     }
@@ -2201,14 +2710,22 @@ fn deliver_files(
         if let Some(path) = land_copy(account, &file, &part.path, part.size) {
             file.path = Some(path);
         }
-        let (duration, waveform) =
-            if part.mime.starts_with("audio/") || part.mime.starts_with("video/") {
-                std::fs::read(&part.path)
-                    .map(|bytes| facts(part.mime, &bytes))
-                    .unwrap_or_default()
+        let (duration, waveform) = if part.voice {
+            if let Some(v) = voice {
+                (((v.duration + 999) / 1000).max(1), v.waveform.clone())
             } else {
-                (0, Vec::new())
-            };
+                (part.duration_secs.unwrap_or(0), Vec::new())
+            }
+        } else if part.mime.starts_with("audio/") || part.mime.starts_with("video/") {
+            std::fs::read(&part.path)
+                .map(|bytes| facts(part.mime, &bytes))
+                .unwrap_or_default()
+        } else {
+            (0, Vec::new())
+        };
+        if let Some(tmp) = &part.temp_path {
+            let _ = std::fs::remove_file(tmp);
+        }
         attachments.push(Attachment {
             name: part.name.clone(),
             file,
@@ -2567,13 +3084,21 @@ fn hold(account: &Account, item: WaitingSend) {
     account.ctx.sent(&conversation, &client_id, Err(WAITING.to_owned()));
 }
 
-fn post_text(account: &Account, conversation: &str, client_id: &str, text: String, reply: Option<String>) {
+fn post_text(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: String,
+    reply: Option<String>,
+    sim: Option<String>,
+) {
     let item = WaitingSend {
         conversation: conversation.to_owned(),
         client_id: client_id.to_owned(),
         text,
         since: crate::hub::now(),
         reply: carried_reply(account, conversation, reply),
+        sim,
     };
     post(account, item);
 }
@@ -2609,7 +3134,7 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
         account.drive.resend(&copy)?;
         return Ok(finish(account, &item.client_id, carried(account, item)));
     }
-    let sent = account.drive.send(&item.conversation, &item.text, reply, &mut |id| {
+    let sent = account.drive.send(&item.conversation, &item.text, reply, item.sim.as_deref(), &mut |id| {
         keep_copy(account, &item.client_id, id);
     });
     if sent.is_err() {
@@ -2622,7 +3147,10 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
 /// The shell's id stays the stored row. The phone's id is only for a later retry.
 fn carried(account: &Account, item: &WaitingSend) -> Message {
     let id = item.client_id.clone();
-    let message = outgoing(account, id, item.text.clone());
+    let mut message = outgoing(account, id, item.text.clone());
+    if let Some(sim_id) = item.sim.as_deref().filter(|s| !s.is_empty()) {
+        message.sent_via = Some(sim_label(account, sim_id));
+    }
     with_reply(account, message, item)
 }
 
@@ -2816,7 +3344,105 @@ fn retry_due(account: &Account, due: Due) -> bool {
     phone(account).down
 }
 
+fn schedule_text(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: String,
+    reply: Option<String>,
+    sim: Option<String>,
+    at: i64,
+) {
+    let now = clock_now();
+    if at <= now {
+        account
+            .ctx
+            .sent(conversation, client_id, Err("That time has passed.".into()));
+        return;
+    }
+    let reply = carried_reply(account, conversation, reply);
+    let mut pending = outgoing(account, client_id.to_owned(), text.clone());
+    pending.sent = at;
+    pending.state = SendState::Pending;
+    pending.waiting = true;
+    pending.client_id = Some(client_id.to_owned());
+    if let Some(sim_id) = sim.as_deref().filter(|s| !s.is_empty()) {
+        pending.sent_via = Some(sim_label(account, sim_id));
+    }
+    if let Some(id) = reply.as_deref() {
+        pending.reply_to = Some(quoted(account, conversation, id, &[]));
+    }
+    let _ = account.ctx.message(conversation, &pending);
+    let mut sched = account
+        .scheduled
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    sched.retain(|item| item.conversation != conversation || item.client_id != client_id);
+    sched.push(ScheduledSend {
+        conversation: conversation.to_owned(),
+        client_id: client_id.to_owned(),
+        text,
+        reply,
+        sim,
+        at,
+    });
+}
+
+fn take_scheduled(account: &Account, conversation: &str, client_id: &str) -> Option<ScheduledSend> {
+    let mut sched = account
+        .scheduled
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let pos = sched
+        .iter()
+        .position(|item| item.conversation == conversation && item.client_id == client_id)?;
+    Some(sched.remove(pos))
+}
+
+fn drain_scheduled(account: &Account) {
+    let now = clock_now();
+    let due: Vec<ScheduledSend> = {
+        let mut sched = account
+            .scheduled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < sched.len() {
+            if now >= sched[i].at {
+                ready.push(sched.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    };
+    for item in due {
+        if now - item.at > SCHEDULE_MISSED_GRACE {
+            let hhmm = format_hhmm(item.at);
+            account.ctx.sent(
+                &item.conversation,
+                &item.client_id,
+                Err(format!("Not sent: this computer was off at {hhmm}")),
+            );
+            continue;
+        }
+        post(
+            account,
+            WaitingSend {
+                conversation: item.conversation,
+                client_id: item.client_id,
+                text: item.text,
+                since: now,
+                reply: item.reply,
+                sim: item.sim,
+            },
+        );
+    }
+}
+
 fn catch_up(account: &Arc<Account>) {
+    drain_scheduled(account);
     loop {
         let next = {
             let mut phone = phone(account);
@@ -3413,8 +4039,45 @@ mod outbox_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_full_page_keeps_reading_and_a_short_one_stops() {
         super::prove_message_search().unwrap();
+    }
+
+    #[test]
+    fn location_card_omits_coordinates_from_notification_preview() {
+        let loc = bugle::Location {
+            lat: 37.7749,
+            lng: -122.4194,
+            label: "Ferry Building".into(),
+            address: "1 Ferry Building, SF".into(),
+        };
+        let mut msg = Message::plain("m-loc", "Grace", "", 1_700_000_000, false);
+        msg.card = Some(Box::new(location_card(&loc)));
+        let preview = crate::store::preview_text(&msg);
+        assert_eq!(preview, "Ferry Building");
+        assert!(!preview.contains("37.7749"), "coordinates must not leak into notification previews");
+        assert!(!preview.contains("-122.4194"), "coordinates must not leak into notification previews");
+    }
+
+    #[test]
+    fn vcard_parses_folded_lines_and_masks_phone_numbers() {
+        let raw = b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Linnea\r\n  Sol\r\nORG:Harbor Co\r\nTEL;TYPE=CELL:+1 555 010 0042\r\nEMAIL:linnea@harbor.example\r\nEND:VCARD\r\n";
+        let vc = parse_vcard(raw).expect("vcard parsed");
+        assert_eq!(vc.name, "Linnea Sol");
+        assert_eq!(vc.org, "Harbor Co");
+        assert_eq!(vc.phones, ["+1 555 010 0042"]);
+        assert_eq!(vc.emails, ["linnea@harbor.example"]);
+
+        let card = vcard_card(&vc);
+        assert_eq!(card.title, "Linnea Sol");
+        assert_eq!(card.text, "Harbor Co");
+        assert_eq!(card.footer, "Contact card");
+        assert_eq!(card.fields[0].0, "Phone");
+        assert!(card.fields[0].1.contains("42"));
+        assert!(!card.fields[0].1.contains("555"), "phone number must be masked");
+        assert_eq!(card.fields[1], ("Email".to_owned(), "linnea@harbor.example".to_owned()));
     }
 }

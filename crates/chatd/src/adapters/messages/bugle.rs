@@ -222,6 +222,12 @@ impl Buf {
     fn msg(&mut self, field: u32, inner: &[u8]) {
         self.bytes(field, inner);
     }
+
+    #[cfg(test)]
+    fn double(&mut self, field: u32, value: f64) {
+        self.key(field, 1);
+        self.0.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
 }
 
 fn config_version() -> Vec<u8> {
@@ -265,6 +271,8 @@ struct Field {
     number: u32,
     bytes: Vec<u8>,
     varint: Option<u64>,
+    fixed64: Option<u64>,
+    fixed32: Option<u32>,
 }
 
 fn read_varint(input: &mut &[u8]) -> Option<u64> {
@@ -299,6 +307,8 @@ fn fields(mut input: &[u8]) -> Vec<Field> {
                     number,
                     bytes: Vec::new(),
                     varint: Some(n),
+                    fixed64: None,
+                    fixed32: None,
                 });
             }
             2 => {
@@ -315,19 +325,37 @@ fn fields(mut input: &[u8]) -> Vec<Field> {
                     number,
                     bytes: data.to_vec(),
                     varint: None,
+                    fixed64: None,
+                    fixed32: None,
                 });
             }
             1 => {
                 if input.len() < 8 {
                     break;
                 }
+                let raw = u64::from_le_bytes(input[..8].try_into().unwrap());
                 input = &input[8..];
+                out.push(Field {
+                    number,
+                    bytes: Vec::new(),
+                    varint: None,
+                    fixed64: Some(raw),
+                    fixed32: None,
+                });
             }
             5 => {
                 if input.len() < 4 {
                     break;
                 }
+                let raw = u32::from_le_bytes(input[..4].try_into().unwrap());
                 input = &input[4..];
+                out.push(Field {
+                    number,
+                    bytes: Vec::new(),
+                    varint: None,
+                    fixed64: None,
+                    fixed32: Some(raw),
+                });
             }
             _ => break,
         }
@@ -355,6 +383,20 @@ fn field_int(list: &[Field], number: u32) -> u64 {
     field(list, number)
         .and_then(|field| field.varint)
         .unwrap_or(0)
+}
+
+fn field_double(list: &[Field], number: u32) -> Option<f64> {
+    let f = field(list, number)?;
+    if let Some(bits) = f.fixed64 {
+        return Some(f64::from_bits(bits));
+    }
+    if let Some(bits) = f.fixed32 {
+        return Some(f64::from(f32::from_bits(bits)));
+    }
+    if !f.bytes.is_empty() {
+        return std::str::from_utf8(&f.bytes).ok()?.trim().parse::<f64>().ok();
+    }
+    None
 }
 
 /// `RPCPairData.revoked` (field 5) with no `paired` (field 4): the phone removed this computer.
@@ -683,7 +725,14 @@ fn oldest_cursor(chats: &[Chat]) -> Option<Cursor> {
     Some(Cursor { id: oldest.id.clone(), millis: oldest.updated.saturating_mul(1000) })
 }
 
-fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str, reply: Option<&str>) -> Vec<u8> {
+fn send_request(
+    conversation: &str,
+    text: &str,
+    tmp: &str,
+    mine: &str,
+    reply: Option<&str>,
+    sim: Option<&str>,
+) -> Vec<u8> {
     let mut content = Buf::new();
     content.text(1, text);
     let mut info = Buf::new();
@@ -700,6 +749,11 @@ fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str, reply: Op
     let mut req = Buf::new();
     req.text(2, conversation);
     req.msg(3, &payload.0);
+    if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+        let mut sim_payload = Buf::new();
+        sim_payload.text(1, sim_id);
+        req.msg(4, &sim_payload.0);
+    }
     req.text(5, tmp);
     // `SendMessageRequest.reply`, field 8: `ReplyPayload.messageID`. Absent on a plain send.
     if let Some(id) = reply.filter(|id| !id.is_empty()) {
@@ -979,6 +1033,21 @@ pub(super) struct MediaPart<'a> {
     pub name: &'a str,
     pub mime: &'a str,
     pub size: u64,
+    /// True when this part is a recorded voice message (`Outgoing::voice`).
+    pub voice: bool,
+    /// Voice message length in seconds, when `voice` is true.
+    pub duration_secs: Option<u32>,
+}
+
+fn audio_format_of(mime: &str) -> u64 {
+    match mime {
+        "audio/aac" => 15,
+        "audio/mp4" => 16,
+        "audio/amr" => 17,
+        "audio/mpeg" => 18,
+        "audio/ogg" | "audio/opus" => 20,
+        _ => 16,
+    }
 }
 
 fn send_media_request(
@@ -988,6 +1057,7 @@ fn send_media_request(
     mine: &str,
     parts: &[MediaPart<'_>],
     reply: Option<&str>,
+    sim: Option<&str>,
 ) -> Vec<u8> {
     let mut payload = Buf::new();
     payload.text(1, tmp);
@@ -995,11 +1065,17 @@ fn send_media_request(
     payload.text(9, mine);
     for part in parts {
         let mut media = Buf::new();
+        if part.voice {
+            media.int(1, audio_format_of(part.mime));
+        }
         media.text(2, part.media_id);
         media.text(4, part.name);
         media.int(5, part.size);
         media.bytes(11, part.key);
         media.text(14, part.mime);
+        if let Some(secs) = part.duration_secs.filter(|s| *s > 0) {
+            media.int(18, u64::from(secs));
+        }
         let mut media_info = Buf::new();
         media_info.msg(3, &media.0);
         payload.msg(10, &media_info.0);
@@ -1018,6 +1094,11 @@ fn send_media_request(
     let mut req = Buf::new();
     req.text(2, conversation);
     req.msg(3, &payload.0);
+    if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+        let mut sim_payload = Buf::new();
+        sim_payload.text(1, sim_id);
+        req.msg(4, &sim_payload.0);
+    }
     req.text(5, tmp);
     if let Some(id) = reply.filter(|id| !id.is_empty()) {
         let mut quoted = Buf::new();
@@ -1088,12 +1169,39 @@ fn decode_thumbnails(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
 
 /// Unix seconds from a Bugle timestamp, which arrives in microseconds.
 fn unix_seconds(raw: i64) -> i64 {
-    if raw > 10_000_000_000_000_000 {
+    if raw > 1_000_000_000_000_000 {
         raw / 1_000_000
-    } else if raw > 10_000_000_000_000 {
+    } else if raw > 1_000_000_000_000 {
         raw / 1_000
     } else {
         raw
+    }
+}
+
+/// One SIM card reported by the phone in `SettingsUpdate` (field 5 of `UpdateEvents`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SimCard {
+    /// Subscription / participant id carried in `SIMPayload`.
+    pub id: String,
+    /// 1-based slot number (e.g. 1, 2).
+    pub slot: u32,
+    /// Carrier display name (e.g. "T-Mobile", "Work").
+    pub carrier: String,
+    /// Phone number for this SIM, when reported by the phone.
+    pub number: String,
+    /// SIM colour (`0xRRGGBB`), when reported by the phone.
+    pub color: Option<u32>,
+    /// Whether RCS is enabled on this SIM.
+    pub rcs: bool,
+}
+
+impl SimCard {
+    pub fn label(&self) -> String {
+        if !self.carrier.trim().is_empty() {
+            self.carrier.trim().to_owned()
+        } else {
+            format!("SIM {}", self.slot.max(1))
+        }
     }
 }
 
@@ -1224,11 +1332,22 @@ pub struct Piece {
     pub height: u32,
 }
 
-/// One emoji on a message, and who put it there.
+/// One emoji or custom (Photomoji) reaction on a message, and who put it there.
 #[derive(Clone, Default)]
 pub struct Mark {
     pub emoji: String,
     pub who: Vec<String>,
+    /// Optional media reference for Photomoji / custom image reactions.
+    pub media: Option<Piece>,
+}
+
+/// A shared geographic location decoded from `MessageInfo.location` (field 5).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Location {
+    pub lat: f64,
+    pub lng: f64,
+    pub label: String,
+    pub address: String,
 }
 
 #[derive(Clone, Default)]
@@ -1242,6 +1361,7 @@ pub struct Note {
     pub outgoing: bool,
     pub file: bool,
     pub pieces: Vec<Piece>,
+    pub location: Option<Location>,
     pub reactions: Vec<Mark>,
     /// The phone's word on the message (`MessageStatus.status`, field 4.2).
     pub status: u64,
@@ -1261,6 +1381,10 @@ pub struct Note {
     pub edited_at: Option<i64>,
     /// `Message.isStarred`, field 24.
     pub starred: bool,
+    /// True when the phone reports this message as scheduled (`status == 16`).
+    pub scheduled: bool,
+    /// SIM subscription / participant id reported on this message, when present.
+    pub sim: Option<String>,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -1950,12 +2074,13 @@ impl Session {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         let mine = self.mine_of(conversation);
         let tmp = uuid();
         noted(&tmp);
-        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine, reply), 2)?;
+        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine, reply, sim), 2)?;
         refused(&bytes)?;
         Ok(tmp)
     }
@@ -1979,6 +2104,7 @@ impl Session {
         caption: &str,
         parts: &[MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         let mine = self.mine_of(conversation);
@@ -1986,7 +2112,7 @@ impl Session {
         noted(&tmp);
         let bytes = self.rpc(
             3,
-            &send_media_request(conversation, caption, &tmp, &mine, parts, reply),
+            &send_media_request(conversation, caption, &tmp, &mine, parts, reply, sim),
             2,
         )?;
         refused(&bytes)?;
@@ -2596,6 +2722,129 @@ fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters:
             _ => {}
         }
     }
+    if let Some(settings) = field(&list, 5) {
+        let sims = decode_settings(&settings.bytes);
+        if !sims.is_empty() {
+            let _ = events.send(crate::adapters::messages::Event::Settings(sims));
+        }
+    }
+}
+
+/// Decodes `SettingsUpdate` (field 5 of `UpdateEvents`) into the phone's SIM card list.
+/// Supports both Bugle's nested `SIMCard { 1: { 1: id, 2: slot }, 2: color, 3: { 1: carrier, 2: number, 5: rcs }, 4: rcs }`
+/// and flat `SIMCard { 1: id, 2: slot, 3: carrier, 4: number, 5: color, 6: rcs }` layouts.
+fn decode_settings(bytes: &[u8]) -> Vec<SimCard> {
+    let list = fields(bytes);
+    let mut sims = Vec::new();
+    for item in list.iter().filter(|f| f.number == 2 || f.number == 3) {
+        if item.bytes.is_empty() {
+            continue;
+        }
+        let card = fields(&item.bytes);
+        let (id, mut slot) = if let Some(f1) = field(&card, 1) {
+            if f1.varint.is_some() {
+                (f1.varint.unwrap().to_string(), 0)
+            } else {
+                let inner = fields(&f1.bytes);
+                let nested_id = field_text(&inner, 1);
+                let nested_slot = field_int(&inner, 2) as u32;
+                if !nested_id.is_empty() {
+                    (nested_id, nested_slot)
+                } else {
+                    (String::from_utf8_lossy(&f1.bytes).into_owned(), 0)
+                }
+            }
+        } else {
+            (String::new(), 0)
+        };
+        let mut carrier = String::new();
+        let mut number = String::new();
+        let mut color = None;
+        let mut rcs = false;
+
+        if let Some(f2) = field(&card, 2) {
+            if let Some(v) = f2.varint {
+                if v <= 8 && slot == 0 {
+                    slot = v as u32;
+                } else if v > 8 {
+                    color = Some((v as u32) & 0x00FF_FFFF);
+                }
+            } else if !f2.bytes.is_empty() {
+                color = parse_hex_color(&String::from_utf8_lossy(&f2.bytes));
+            }
+        }
+        if let Some(f3) = field(&card, 3).filter(|f| !f.bytes.is_empty()) {
+            let sub = fields(&f3.bytes);
+            let sub_carrier = field_text(&sub, 1);
+            let sub_number = field_text(&sub, 2);
+            if !sub_carrier.is_empty() || !sub_number.is_empty() {
+                carrier = sub_carrier;
+                number = sub_number;
+                if slot == 0 {
+                    slot = field_int(&sub, 3) as u32;
+                }
+                if color.is_none() {
+                    let c = field_int(&sub, 4);
+                    if c != 0 {
+                        color = Some((c as u32) & 0x00FF_FFFF);
+                    }
+                }
+                if field_int(&sub, 5) != 0 {
+                    rcs = true;
+                }
+            } else {
+                carrier = String::from_utf8_lossy(&f3.bytes).into_owned();
+            }
+        }
+        if number.is_empty() {
+            if let Some(f4) = field(&card, 4) {
+                if let Some(v) = f4.varint {
+                    rcs |= v != 0;
+                } else if !f4.bytes.is_empty() {
+                    let text = String::from_utf8_lossy(&f4.bytes).into_owned();
+                    if text.chars().any(|c| c.is_ascii_digit()) {
+                        number = text;
+                    } else {
+                        let sub = fields(&f4.bytes);
+                        rcs |= field_int(&sub, 1) != 0;
+                    }
+                }
+            }
+        } else if let Some(f4) = field(&card, 4) {
+            if let Some(v) = f4.varint {
+                rcs |= v != 0;
+            }
+        }
+        if color.is_none() {
+            if let Some(f5) = field(&card, 5) {
+                if let Some(v) = f5.varint {
+                    if v != 0 {
+                        color = Some((v as u32) & 0x00FF_FFFF);
+                    }
+                } else if !f5.bytes.is_empty() {
+                    color = parse_hex_color(&String::from_utf8_lossy(&f5.bytes));
+                }
+            }
+        }
+        if field_int(&card, 6) != 0 {
+            rcs = true;
+        }
+        if !id.is_empty() || !carrier.is_empty() || !number.is_empty() {
+            if slot == 0 {
+                slot = (sims.len() + 1) as u32;
+            }
+            let id = if id.is_empty() { format!("sim-{slot}") } else { id };
+            sims.push(SimCard {
+                id,
+                slot,
+                carrier,
+                number,
+                color,
+                rcs,
+            });
+        }
+    }
+    sims
 }
 
 /// The lab sets `TINYCLIENT_PROVE=messages-unread`. A build from before this ignores that
@@ -2918,19 +3167,34 @@ fn decode_reactions(msg: &[Field]) -> Vec<Mark> {
     for entry in msg.iter().filter(|field| field.number == 19) {
         let parts = fields(&entry.bytes);
         let data = fields(&field_bytes(&parts, 1));
-        let emoji = emoji_of(&field_text(&data, 1), field_int(&data, 2));
+        let kind = field_int(&data, 2);
+        let mut emoji = emoji_of(&field_text(&data, 1), kind);
+        let media = field(&data, 3)
+            .or_else(|| field(&parts, 3))
+            .filter(|f| !f.bytes.is_empty())
+            .and_then(|f| decode_piece(&f.bytes, ""));
         if emoji.is_empty() {
-            continue;
+            // Photomoji or another custom/unknown reaction: never drop it silently.
+            if media.is_some() {
+                emoji = ":photomoji:".to_owned();
+            } else if kind != 0 || !data.is_empty() {
+                emoji = "🖼️".to_owned();
+            } else {
+                continue;
+            }
         }
         let who = field_texts(&parts, 2);
-        if let Some(have) = marks.iter_mut().find(|mark| mark.emoji == emoji) {
+        if let Some(have) = marks
+            .iter_mut()
+            .find(|mark| mark.emoji == emoji && mark.media.is_none() && media.is_none())
+        {
             for id in who {
                 if !have.who.contains(&id) {
                     have.who.push(id);
                 }
             }
         } else {
-            marks.push(Mark { emoji, who });
+            marks.push(Mark { emoji, who, media });
         }
     }
     marks
@@ -3004,7 +3268,11 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             continue;
         }
         let wire = field_int(&msg, 11);
-        let sent = unix_seconds(field_int(&msg, 5) as i64);
+        let mut sent = unix_seconds(field_int(&msg, 5) as i64);
+        let scheduled = status == 16;
+        if scheduled && sent == 0 {
+            sent = unix_seconds(field_int(&msg, 26) as i64);
+        }
         let mut author = field_text(&msg, 9);
         let mut name = String::new();
         let mut outgoing = false;
@@ -3026,6 +3294,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         let mut text = String::new();
         let mut file = false;
         let mut pieces = Vec::new();
+        let mut location = None;
         for info in msg.iter().filter(|field| field.number == 10) {
             let parts = fields(&info.bytes);
             let action_id = field_text(&parts, 1);
@@ -3044,13 +3313,17 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
                     pieces.push(piece);
                 }
             }
-            if field(&parts, 5).is_some() && pieces.is_empty() {
-                file = true;
-                pieces.push(Piece {
-                    name: "Location".into(),
-                    mime: "text/plain".into(),
-                    ..Piece::default()
-                });
+            if let Some(loc_field) = field(&parts, 5) {
+                if let Some(loc) = decode_location(&loc_field.bytes) {
+                    location = Some(loc);
+                } else if location.is_none() && pieces.is_empty() {
+                    file = true;
+                    pieces.push(Piece {
+                        name: "Location".into(),
+                        mime: "text/plain".into(),
+                        ..Piece::default()
+                    });
+                }
             }
         }
         let reactions = decode_reactions(&msg);
@@ -3059,8 +3332,21 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             .unwrap_or_default();
         let (edited, edited_at) = decode_edit_status(&msg);
         let starred = field_int(&msg, 24) != 0;
+        let sim = field(&msg, 29)
+            .or_else(|| field(&msg, 17))
+            .and_then(|f| {
+                if let Some(v) = f.varint {
+                    (v != 0).then(|| v.to_string())
+                } else if !f.bytes.is_empty() {
+                    let s = String::from_utf8_lossy(&f.bytes).into_owned();
+                    (!s.is_empty()).then_some(s)
+                } else {
+                    None
+                }
+            });
         if text.is_empty()
             && file
+            && location.is_none()
             && pieces
                 .iter()
                 .all(|piece| piece.inline.is_empty() && piece.media_id.is_empty())
@@ -3085,6 +3371,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             outgoing,
             file,
             pieces,
+            location,
             reactions,
             status,
             tmp,
@@ -3095,9 +3382,68 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             edited,
             edited_at,
             starred,
+            scheduled,
+            sim,
         });
     }
     notes
+}
+
+/// Decodes a Bugle `Location` part (`MessageInfo` field 5).
+/// Supports both flat coordinates (`1: lat, 2: lng, 3: label, 4: address`) and nested
+/// `Coordinates` submessages (`1: name, 2: address, 3: { 1: lat, 2: lng }` or
+/// `1: { 1: lat, 2: lng }, 2: label, 3: address`).
+fn decode_location(bytes: &[u8]) -> Option<Location> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let list = fields(bytes);
+    let valid = |lat: f64, lng: f64| {
+        lat.is_finite()
+            && lng.is_finite()
+            && (-90.0..=90.0).contains(&lat)
+            && (-180.0..=180.0).contains(&lng)
+    };
+    // 1. Flat layout: field 1 = lat, field 2 = lng, field 3 = label, field 4 = address.
+    if let (Some(lat), Some(lng)) = (field_double(&list, 1), field_double(&list, 2)) {
+        if valid(lat, lng) {
+            return Some(Location {
+                lat,
+                lng,
+                label: field_text(&list, 3),
+                address: field_text(&list, 4),
+            });
+        }
+    }
+    // 2. Nested Coordinates in field 3: field 1 = label, field 2 = address, field 3 = { 1: lat, 2: lng }.
+    if let Some(coords_field) = field(&list, 3).filter(|f| !f.bytes.is_empty()) {
+        let coords = fields(&coords_field.bytes);
+        if let (Some(lat), Some(lng)) = (field_double(&coords, 1), field_double(&coords, 2)) {
+            if valid(lat, lng) {
+                return Some(Location {
+                    lat,
+                    lng,
+                    label: field_text(&list, 1),
+                    address: field_text(&list, 2),
+                });
+            }
+        }
+    }
+    // 3. Nested Coordinates in field 1: field 1 = { 1: lat, 2: lng }, field 2 = label, field 3 = address.
+    if let Some(coords_field) = field(&list, 1).filter(|f| !f.bytes.is_empty()) {
+        let coords = fields(&coords_field.bytes);
+        if let (Some(lat), Some(lng)) = (field_double(&coords, 1), field_double(&coords, 2)) {
+            if valid(lat, lng) {
+                return Some(Location {
+                    lat,
+                    lng,
+                    label: field_text(&list, 2),
+                    address: field_text(&list, 3),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Decodes RCS edit metadata from a Bugle `Message`:
@@ -3156,12 +3502,12 @@ pub(super) fn prove_message_reply() -> Result<(), String> {
     if allows_reply(1) || allows_reply(0) || !allows_reply(2) {
         return Err("a reply was allowed outside an RCS chat".into());
     }
-    let asked = fields(&send_request("rcs-chat", "On my way", "tmp-1", "me", Some("m-orig")));
+    let asked = fields(&send_request("rcs-chat", "On my way", "tmp-1", "me", Some("m-orig"), None));
     let quoted = fields(&field_bytes(&asked, 8));
     if field_text(&quoted, 1) != "m-orig" {
         return Err("the send dropped the message it answers".into());
     }
-    let plain = fields(&send_request("sms-chat", "On my way", "tmp-2", "me", None));
+    let plain = fields(&send_request("sms-chat", "On my way", "tmp-2", "me", None, None));
     if field(&plain, 8).is_some() {
         return Err("a plain send carried a reply".into());
     }
@@ -3176,8 +3522,11 @@ pub(super) fn prove_message_reply() -> Result<(), String> {
             name: "a.png",
             mime: "image/png",
             size: 4,
+            voice: false,
+            duration_secs: None,
         }],
         Some("m-orig"),
+        None,
     ));
     if field_text(&fields(&field_bytes(&media, 8)), 1) != "m-orig" {
         return Err("the file send dropped the message it answers".into());
@@ -3347,6 +3696,8 @@ pub(super) fn prove_several_files() -> Result<(), String> {
             name: "one.txt",
             mime: "application/octet-stream",
             size: 3,
+            voice: false,
+            duration_secs: None,
         },
         MediaPart {
             media_id: "m2",
@@ -3354,6 +3705,8 @@ pub(super) fn prove_several_files() -> Result<(), String> {
             name: "two.txt",
             mime: "application/octet-stream",
             size: 4,
+            voice: false,
+            duration_secs: None,
         },
         MediaPart {
             media_id: "m3",
@@ -3361,9 +3714,11 @@ pub(super) fn prove_several_files() -> Result<(), String> {
             name: "three.txt",
             mime: "application/octet-stream",
             size: 5,
+            voice: false,
+            duration_secs: None,
         },
     ];
-    let bytes = send_media_request("phone-grace", "picnic", "tmp", "phone-ada", &parts, None);
+    let bytes = send_media_request("phone-grace", "picnic", "tmp", "phone-ada", &parts, None, None);
     let payload = fields(&field_bytes(&fields(&bytes), 3));
     let mut media = 0;
     let mut caption = 0;
@@ -3876,5 +4231,175 @@ mod tests {
         assert_eq!(field_text(&req, 1), "c1");
         assert_eq!(field_text(&req, 2), "m-star");
         assert_eq!(field_int(&req, 3), 1);
+    }
+
+    #[test]
+    fn location_part_decodes_flat_and_nested_coordinates_and_rejects_out_of_range() {
+        // Flat layout: double lat/lng + label + address.
+        let mut loc = Buf::new();
+        loc.double(1, 37.7749);
+        loc.double(2, -122.4194);
+        loc.text(3, "Ferry Building");
+        loc.text(4, "1 Ferry Building, San Francisco, CA");
+        let mut info = Buf::new();
+        info.msg(5, &loc.0);
+        let mut msg = Buf::new();
+        msg.text(1, "m-loc-1");
+        msg.text(7, "c1");
+        msg.msg(10, &info.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        let got = notes[0].location.as_ref().expect("location decoded");
+        assert!((got.lat - 37.7749).abs() < 1e-6);
+        assert!((got.lng + 122.4194).abs() < 1e-6);
+        assert_eq!(got.label, "Ferry Building");
+        assert_eq!(got.address, "1 Ferry Building, San Francisco, CA");
+        assert!(!notes[0].file, "decoded location must not be flagged as unsupported file");
+
+        // Nested layout: label/address + Coordinates submessage in field 3.
+        let mut coords = Buf::new();
+        coords.double(1, 51.5074);
+        coords.double(2, -0.1278);
+        let mut nested = Buf::new();
+        nested.text(1, "London");
+        nested.text(2, "London, UK");
+        nested.msg(3, &coords.0);
+        let dec = decode_location(&nested.0).expect("nested location decoded");
+        assert!((dec.lat - 51.5074).abs() < 1e-6);
+        assert!((dec.lng + 0.1278).abs() < 1e-6);
+        assert_eq!(dec.label, "London");
+        assert_eq!(dec.address, "London, UK");
+
+        // Out-of-range coordinates rejected.
+        let mut bad = Buf::new();
+        bad.double(1, 95.0);
+        bad.double(2, 200.0);
+        assert!(decode_location(&bad.0).is_none());
+    }
+
+    #[test]
+    fn voice_media_part_encodes_audio_format_and_duration() {
+        let key = [7u8; 32];
+        let part = MediaPart {
+            media_id: "voice-1",
+            key: &key,
+            name: "voice.m4a",
+            mime: "audio/mp4",
+            size: 4096,
+            voice: true,
+            duration_secs: Some(12),
+        };
+        let bytes = send_media_request("c-rcs", "", "tmp-v", "me", &[part], None, None);
+        let payload = fields(&field_bytes(&fields(&bytes), 3));
+        let info = payload.iter().find(|f| f.number == 10).expect("media info");
+        let media = fields(&field_bytes(&fields(&info.bytes), 3));
+        assert_eq!(field_int(&media, 1), 16, "AUDIO_MP4 format");
+        assert_eq!(field_text(&media, 2), "voice-1");
+        assert_eq!(field_text(&media, 14), "audio/mp4");
+        assert_eq!(field_int(&media, 18), 12, "duration seconds");
+    }
+
+    #[test]
+    fn photomoji_and_unknown_custom_reactions_are_kept_instead_of_dropped() {
+        // 1. Photomoji reaction with media reference in ReactionData field 3.
+        let mut media = Buf::new();
+        media.text(2, "photomoji-media-1");
+        media.text(4, "photomoji.png");
+        media.text(14, "image/png");
+        let mut data = Buf::new();
+        data.int(2, 13); // EMOTIFY / Photomoji
+        data.msg(3, &media.0);
+        let mut entry = Buf::new();
+        entry.msg(1, &data.0);
+        entry.text(2, "phone-grace");
+
+        // 2. Unknown custom reaction without media reference -> neutral placeholder.
+        let mut data2 = Buf::new();
+        data2.int(2, 99);
+        let mut entry2 = Buf::new();
+        entry2.msg(1, &data2.0);
+        entry2.text(2, "phone-alan");
+
+        let mut msg = Buf::new();
+        msg.text(1, "m-photo-react");
+        msg.text(7, "c1");
+        msg.msg(19, &entry.0);
+        msg.msg(19, &entry2.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].reactions.len(), 2);
+        assert_eq!(notes[0].reactions[0].emoji, ":photomoji:");
+        assert_eq!(
+            notes[0].reactions[0].media.as_ref().map(|p| p.media_id.as_str()),
+            Some("photomoji-media-1")
+        );
+        assert_eq!(notes[0].reactions[1].emoji, "🖼️");
+        assert!(notes[0].reactions[1].media.is_none());
+    }
+
+    #[test]
+    fn phone_scheduled_message_decodes_as_scheduled_pending() {
+        let mut status = Buf::new();
+        status.int(2, 16); // OUTGOING_SCHEDULED
+        let mut words = Buf::new();
+        words.text(1, "Happy birthday!");
+        let mut info = Buf::new();
+        info.msg(2, &words.0);
+        let mut msg = Buf::new();
+        msg.text(1, "m-sched-phone");
+        msg.text(7, "c1");
+        msg.msg(4, &status.0);
+        msg.msg(10, &info.0);
+        msg.int(26, 1_800_000_000_000_000);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].scheduled);
+        assert_eq!(notes[0].sent, 1_800_000_000);
+        assert_eq!(progress(notes[0].status), Progress::Pending);
+    }
+
+    #[test]
+    fn settings_update_decodes_dual_sims_and_send_carries_sim_only_when_chosen() {
+        let mut sim1 = Buf::new();
+        sim1.text(1, "sim-personal");
+        sim1.int(2, 1);
+        sim1.text(3, "T-Mobile");
+        sim1.text(4, "+1 555 010 0001");
+        sim1.int(5, 0x4285F4);
+        sim1.int(6, 1);
+        let mut sim2 = Buf::new();
+        sim2.text(1, "sim-work");
+        sim2.int(2, 2);
+        sim2.text(3, "Work");
+        sim2.text(4, "+1 555 010 0099");
+        sim2.int(5, 0x34A853);
+        sim2.int(6, 0);
+        let mut settings = Buf::new();
+        settings.msg(2, &sim1.0);
+        settings.msg(2, &sim2.0);
+        let sims = decode_settings(&settings.0);
+        assert_eq!(sims.len(), 2);
+        assert_eq!(sims[0].id, "sim-personal");
+        assert_eq!(sims[0].slot, 1);
+        assert_eq!(sims[0].carrier, "T-Mobile");
+        assert_eq!(sims[0].number, "+1 555 010 0001");
+        assert_eq!(sims[0].color, Some(0x4285F4));
+        assert!(sims[0].rcs);
+        assert_eq!(sims[1].id, "sim-work");
+        assert_eq!(sims[1].slot, 2);
+        assert_eq!(sims[1].label(), "Work");
+        assert!(!sims[1].rcs);
+
+        let default_req = fields(&send_request("c1", "hi", "t1", "me", None, None));
+        assert!(field(&default_req, 4).is_none(), "default send must not override SIM");
+
+        let sim2_req = fields(&send_request("c1", "hi", "t2", "me", None, Some("sim-work")));
+        assert_eq!(field_text(&fields(&field_bytes(&sim2_req, 4)), 1), "sim-work");
     }
 }

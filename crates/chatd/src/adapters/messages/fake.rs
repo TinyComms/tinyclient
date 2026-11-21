@@ -40,6 +40,13 @@ struct SentCopy {
     phone_id: String,
 }
 
+static FAKE_CLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub(super) fn clock() -> Option<i64> {
+    let t = FAKE_CLOCK.load(Ordering::Acquire);
+    (t > 0).then_some(t)
+}
+
 pub(super) fn record(line: &str) {
     let path = protocol::support_dir().join("messages.calls");
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -231,6 +238,14 @@ impl Fake {
                         }
                         return true;
                     }
+        if let Some(secs) = line.strip_prefix("clock ") {
+                        if let Ok(t) = secs.trim().parse::<i64>() {
+                            FAKE_CLOCK.store(t, Ordering::Release);
+                            record(&format!("clock {t}"));
+                            let _ = events.send(Event::PhoneBack);
+                        }
+                        return true;
+                    }
                     if line == "hold" {
                         hold.store(true, Ordering::Release);
                         record("hold");
@@ -333,6 +348,7 @@ fn note(
         outgoing: false,
         file,
         pieces,
+        location: None,
         reactions,
         status: 0,
         tmp: String::new(),
@@ -343,6 +359,8 @@ fn note(
         edited: false,
         edited_at: None,
         starred: false,
+        scheduled: false,
+        sim: None,
     }
 }
 
@@ -399,6 +417,10 @@ fn media_note(
         vec![piece],
         Vec::new(),
     ))]
+}
+
+fn sample_vcard() -> Vec<u8> {
+    b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Linnea Sol\r\nORG:Harbor Co\r\nTEL;TYPE=CELL:+1 555 010 0042\r\nEMAIL:linnea@harbor.example\r\nEND:VCARD\r\n".to_vec()
 }
 
 fn png() -> Vec<u8> {
@@ -483,6 +505,56 @@ fn steer(line: &str) -> Vec<Event> {
                 &text,
                 false,
                 vec![photo_piece(true)],
+                Vec::new(),
+            ))]
+        }
+        "location" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let lat: f64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(37.7749);
+            let lng: f64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(-122.4194);
+            let label = rest(4);
+            let mut msg = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-loc"),
+                "",
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            msg.location = Some(crate::adapters::messages::bugle::Location {
+                lat,
+                lng,
+                label,
+                address: String::new(),
+            });
+            vec![Event::Message(msg)]
+        }
+        "vcard" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let remote = words.next() == Some("remote");
+            let raw = sample_vcard();
+            let piece = Piece {
+                name: "linnea.vcf".into(),
+                mime: "text/vcard".into(),
+                media_id: if remote { "fake-vcard".into() } else { String::new() },
+                inline: if remote { Vec::new() } else { raw.clone() },
+                size: raw.len() as u64,
+                ..Piece::default()
+            };
+            vec![Event::Message(note(
+                author,
+                name,
+                author,
+                if remote { "m-vcard-remote" } else { "m-vcard-inline" },
+                "",
+                true,
+                vec![piece],
                 Vec::new(),
             ))]
         }
@@ -576,6 +648,58 @@ fn steer(line: &str) -> Vec<Event> {
             updated.edited_at = Some(crate::hub::now());
             vec![Event::Message(updated)]
         }
+        "dual-sim" => {
+            vec![Event::Settings(vec![
+                crate::adapters::messages::bugle::SimCard {
+                    id: "sim-1".into(),
+                    slot: 1,
+                    carrier: "T-Mobile".into(),
+                    number: "+1 555 010 0001".into(),
+                    color: Some(0x4285F4),
+                    rcs: true,
+                },
+                crate::adapters::messages::bugle::SimCard {
+                    id: "sim-2".into(),
+                    slot: 2,
+                    carrier: "Work".into(),
+                    number: "+1 555 010 0099".into(),
+                    color: Some(0x34A853),
+                    rcs: false,
+                },
+            ])]
+        }
+        "incoming-sim" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let sim_id = words.next().unwrap_or("sim-2").to_owned();
+            let text = rest(3);
+            let mut msg = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-sim-{sim_id}"),
+                &text,
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            msg.sim = Some(sim_id);
+            vec![Event::Message(msg)]
+        }
+        "phone-scheduled" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let at: i64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(1_800_000_000);
+            let text = rest(3);
+            let mut msg = note(ME, "Ada Quill", author, "m-phone-sched", &text, false, Vec::new(), Vec::new());
+            msg.outgoing = true;
+            msg.status = 16;
+            msg.sent = at;
+            msg.scheduled = true;
+            vec![Event::Message(msg)]
+        }
         "starred" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
                 return Vec::new();
@@ -607,12 +731,43 @@ fn steer(line: &str) -> Vec<Event> {
             let mark = Mark {
                 emoji: "👍".into(),
                 who: vec![author.into()],
+                media: None,
             };
             vec![Event::Message(note(
                 author,
                 name,
                 author,
                 &format!("m-{author}-react"),
+                &text,
+                false,
+                Vec::new(),
+                vec![mark],
+            ))]
+        }
+        "photomoji" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let mode = words.next().unwrap_or("inline");
+            let text = rest(3);
+            let mark = if mode == "placeholder" {
+                Mark {
+                    emoji: "🖼️".into(),
+                    who: vec![author.into()],
+                    media: None,
+                }
+            } else {
+                Mark {
+                    emoji: ":photomoji:".into(),
+                    who: vec![author.into()],
+                    media: Some(photo_piece(true)),
+                }
+            };
+            vec![Event::Message(note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-photomoji-{mode}"),
                 &text,
                 false,
                 Vec::new(),
@@ -977,6 +1132,7 @@ impl Drive for Fake {
         conversation: &str,
         text: &str,
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         self.unanswered()?;
@@ -988,6 +1144,9 @@ impl Drive for Fake {
         record(&format!("send {conversation} {text}"));
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
+        }
+        if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+            record(&format!("sim {conversation} {sim_id}"));
         }
         Ok(relay_id)
     }
@@ -1007,6 +1166,7 @@ impl Drive for Fake {
         caption: &str,
         parts: &[MediaPart<'_>],
         reply: Option<&str>,
+        sim: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         self.unanswered()?;
@@ -1020,9 +1180,20 @@ impl Drive for Fake {
                 "file {conversation} {} {} {caption}",
                 part.name, part.size
             ));
+            if part.voice {
+                record(&format!(
+                    "voice {conversation} {} {} {}",
+                    part.name,
+                    part.mime,
+                    part.duration_secs.unwrap_or(0)
+                ));
+            }
         }
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
+        }
+        if let Some(sim_id) = sim.filter(|id| !id.is_empty()) {
+            record(&format!("sim {conversation} {sim_id}"));
         }
         Ok(relay_id)
     }
@@ -1055,6 +1226,9 @@ impl Drive for Fake {
     ) -> Result<Vec<u8>, String> {
         self.unanswered()?;
         record(&format!("fetch {message} {media_id}"));
+        if media_id == "fake-vcard" {
+            return Ok(sample_vcard());
+        }
         Ok(png())
     }
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {

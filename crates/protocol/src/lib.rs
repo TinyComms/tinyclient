@@ -69,6 +69,14 @@ pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
+pub(crate) fn is_true(value: &bool) -> bool {
+    *value
+}
+
+pub(crate) fn yes() -> bool {
+    true
+}
+
 pub(crate) fn is_zero(value: &u32) -> bool {
     *value == 0
 }
@@ -213,6 +221,10 @@ pub struct AccountStatus {
     /// reports them.
     #[serde(default, skip_serializing_if = "Capabilities::is_none")]
     pub can: Capabilities,
+    /// Selectable sending identities or lines on this account (e.g. dual-SIM cards on Messages).
+    /// Empty when the account has only one line or does not offer a chooser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub send_as: Vec<SendAs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,6 +553,9 @@ pub struct Conversation {
     /// This account may pin and unpin messages in this conversation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_pin: bool,
+    /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub joined: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -608,6 +623,7 @@ impl Conversation {
             disappearing: None,
             moderate: false,
             can_pin: false,
+            joined: true,
         }
     }
 
@@ -2353,6 +2369,64 @@ pub enum Request {
     },
     /// Write this process's debug ring to disk. The answer names files, never their text.
     SaveLogs,
+    /// Paged activity feed (mentions, thread replies, reactions, app notifications) for an account.
+    ActivityFeed {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ActivityItemKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Mark one activity feed item (`Some(id)`) or all items (`None`) read on the network.
+    ActivityMarkRead {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
+    /// Add a link bookmark to a channel (Slack `bookmarks.add`).
+    BookmarkAdd {
+        conversation: Key,
+        title: String,
+        link: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        emoji: String,
+    },
+    /// Edit a channel bookmark (Slack `bookmarks.edit`).
+    BookmarkEdit {
+        conversation: Key,
+        bookmark_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+    },
+    /// Remove a channel bookmark (Slack `bookmarks.remove`).
+    BookmarkRemove {
+        conversation: Key,
+        bookmark_id: String,
+    },
+    /// Browse public channels in a Space (paged, optionally filtered by `query`).
+    BrowseChannels {
+        space: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Open an unjoined public channel for read-only preview outside the sidebar.
+    PreviewChannel {
+        conversation: Key,
+    },
+    /// Join a public channel and add it to the sidebar tree.
+    Join {
+        conversation: Key,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -2802,6 +2876,22 @@ pub enum Response {
     /// Paths of debug bundles just written. Empty when export is off.
     LogsSaved {
         paths: Vec<String>,
+    },
+    /// One page of an account's activity feed (`Request::ActivityFeed`).
+    ActivityFeed {
+        items: Vec<ActivityItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// A created or edited channel bookmark (`BookmarkAdd` / `BookmarkEdit`).
+    Bookmark {
+        bookmark: Bookmark,
+    },
+    /// One page of public channels (`Request::BrowseChannels`).
+    BrowsedChannels {
+        channels: Vec<BrowsedChannel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
     },
 }
 

@@ -128,6 +128,8 @@ struct Fake {
     limited: AtomicBool,
     /// Optional override for `dnd.info` response.
     dnd_info: Mutex<Option<Value>>,
+    /// Channel bookmarks keyed by channel_id.
+    bookmarks: Mutex<HashMap<String, Vec<Value>>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -172,6 +174,13 @@ impl Fake {
             reissue: Mutex::default(),
             limited: AtomicBool::new(false),
             dnd_info: Mutex::default(),
+            bookmarks: Mutex::new(HashMap::from([(
+                "C0GEN".to_owned(),
+                vec![
+                    json!({"id": "Bk1", "channel_id": "C0GEN", "title": "Runbook", "link": "https://docs.example.com/runbook", "emoji": ":book:", "type": "link"}),
+                    json!({"id": "Bk2", "channel_id": "C0GEN", "title": "Team Canvas", "link": "https://alpha.slack.com/docs/T01ALPHA/F0CANVAS", "emoji": "", "type": "canvas"}),
+                ],
+            )])),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -474,6 +483,22 @@ impl Fake {
                 Some(json!({"ok": true, "team": {"id": id, "name": name, "domain": domain}}))
             }
             "conversations.info" => {
+                if channel == "C0PUB" {
+                    return ok(json!({
+                        "ok": true,
+                        "channel": {
+                            "id": "C0PUB",
+                            "name": "watercooler",
+                            "is_channel": true,
+                            "is_private": false,
+                            "is_member": false,
+                            "num_members": 42,
+                            "topic": {"value": "Casual chat"},
+                            "purpose": {"value": "Watercooler talk"},
+                            "created": 1700000000
+                        }
+                    }));
+                }
                 let listed = self.fixture(token, "users.conversations").unwrap();
                 let known = listed["channels"].as_array().unwrap().iter().find(|known| known["id"] == channel).cloned();
                 known.map(|mut known| {
@@ -498,6 +523,15 @@ impl Fake {
                 })
             }
             "conversations.history" => {
+                if channel == "C0PUB" {
+                    return ok(json!({
+                        "ok": true,
+                        "messages": [
+                            {"type": "message", "user": "U0ANA", "text": "welcome to watercooler", "ts": "1760000950.000100"}
+                        ],
+                        "has_more": false
+                    }));
+                }
                 let page = match (param("oldest"), param("inclusive"), param("latest")) {
                     ("", "true", _) => ".around",
                     ("", _, "") => "",
@@ -507,6 +541,147 @@ impl Fake {
                 self.fixture(token, &format!("conversations.history.{channel}{page}"))
             }
             "conversations.replies" => self.fixture(token, &format!("conversations.replies.{channel}")),
+            "activity.feed" => {
+                let all = vec![
+                    json!({
+                        "id": "act-1",
+                        "feed_ts": "1760000900.000100",
+                        "is_unread": true,
+                        "item": {
+                            "type": "at_mention",
+                            "message": {
+                                "channel": "C0GEN",
+                                "ts": "1760000900.000100",
+                                "user": "U0ANA",
+                                "text": "hey <@U0ME> check this"
+                            }
+                        }
+                    }),
+                    json!({
+                        "id": "act-2",
+                        "feed_ts": "1760000901.000100",
+                        "is_unread": true,
+                        "item": {
+                            "type": "thread_v2",
+                            "message": {
+                                "channel": "C0GEN",
+                                "ts": "1760000901.000100",
+                                "thread_ts": ROOT,
+                                "user": "U0BEN",
+                                "text": "following up in thread"
+                            }
+                        }
+                    }),
+                    json!({
+                        "id": "act-3",
+                        "feed_ts": "1760000902.000100",
+                        "is_unread": true,
+                        "item": {
+                            "type": "reaction",
+                            "reaction": {
+                                "channel": "C0GEN",
+                                "item_ts": ROOT,
+                                "user": "U0ANA",
+                                "name": "+1"
+                            },
+                            "message": {
+                                "channel": "C0GEN",
+                                "ts": ROOT,
+                                "text": "first message"
+                            }
+                        }
+                    }),
+                ];
+                Some(json!({
+                    "ok": true,
+                    "items": all,
+                    "response_metadata": {"next_cursor": ""}
+                }))
+            }
+            "activity.mark" => Some(json!({"ok": true})),
+            "bookmarks.list" => {
+                let cid = param("channel_id");
+                let list = self.bookmarks.lock().unwrap().get(cid).cloned().unwrap_or_default();
+                Some(json!({"ok": true, "bookmarks": list}))
+            }
+            "bookmarks.add" => {
+                let cid = param("channel_id").to_owned();
+                let mut map = self.bookmarks.lock().unwrap();
+                let entry = map.entry(cid.clone()).or_default();
+                let id = format!("BkNew{}", entry.len() + 1);
+                let bm = json!({
+                    "id": id,
+                    "channel_id": cid,
+                    "title": param("title"),
+                    "link": param("link"),
+                    "emoji": param("emoji"),
+                    "type": "link",
+                });
+                entry.push(bm.clone());
+                Some(json!({"ok": true, "bookmark": bm}))
+            }
+            "bookmarks.edit" => {
+                let cid = param("channel_id");
+                let bid = param("bookmark_id");
+                let mut map = self.bookmarks.lock().unwrap();
+                let found = map.get_mut(cid).and_then(|list| list.iter_mut().find(|b| b["id"] == bid));
+                let Some(bm) = found else {
+                    return refused("not_found");
+                };
+                if !param("title").is_empty() {
+                    bm["title"] = param("title").into();
+                }
+                if !param("link").is_empty() {
+                    bm["link"] = param("link").into();
+                }
+                Some(json!({"ok": true, "bookmark": bm.clone()}))
+            }
+            "bookmarks.remove" => {
+                let cid = param("channel_id");
+                let bid = param("bookmark_id");
+                if let Some(list) = self.bookmarks.lock().unwrap().get_mut(cid) {
+                    list.retain(|b| b["id"] != bid);
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.list" => {
+                let cursor = param("cursor");
+                if cursor.is_empty() {
+                    Some(json!({
+                        "ok": true,
+                        "channels": [
+                            {"id": "C0GEN", "name": "general", "is_channel": true, "is_private": false, "is_member": true, "num_members": 12, "purpose": {"value": "Company wide"}},
+                            {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false, "is_member": false, "num_members": 42, "purpose": {"value": "Watercooler talk"}}
+                        ],
+                        "response_metadata": {"next_cursor": "page2"}
+                    }))
+                } else {
+                    Some(json!({
+                        "ok": true,
+                        "channels": [
+                            {"id": "C0DESIGN", "name": "design-crit", "is_channel": true, "is_private": false, "is_member": false, "num_members": 19, "purpose": {"value": "Design critiques"}}
+                        ],
+                        "response_metadata": {"next_cursor": ""}
+                    }))
+                }
+            }
+            "conversations.join" => {
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({
+                    "ok": true,
+                    "channel": {
+                        "id": channel,
+                        "name": "watercooler",
+                        "is_channel": true,
+                        "is_private": false,
+                        "is_member": true,
+                        "num_members": 43,
+                        "purpose": {"value": "Watercooler talk"}
+                    }
+                }))
+            }
             method => self.fixture(token, method),
         };
         found.map_or_else(|| refused("unknown_method"), ok)
@@ -2260,7 +2435,11 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
     }
     let listed = world.fake.calls(ALPHA, "files.list");
     assert_eq!((listed[0].params["channel"].as_str(), listed[0].params["types"].as_str()), ("C0GEN", "images"));
-    assert!(matches!(shared(protocol::SharedKind::Links, true), Response::Error { code: ErrorCode::Unsupported, .. }));
+    // Links tab is fed from channel bookmarks (bookmarks.list), not files.list.
+    match shared(protocol::SharedKind::Links, true) {
+        Response::Shared { items, .. } => assert!(!items.is_empty()),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(world.fake.calls(ALPHA, "files.list").len(), 1);
 
     // The workspace's emoji, from the list kept a day: asked once, then read from the store.
@@ -2774,4 +2953,364 @@ fn slack_dnd_snooze_sets_presence_dnd_and_dnd_updated_clears_it() {
     world.until("own presence to clear Dnd after dnd_updated", || {
         (world.account("T01ALPHA").presence == Presence::Online).then_some(())
     });
+}
+
+#[test]
+fn slack_thread_broadcast_posts_to_thread_and_channel() {
+    let world = World::start();
+    world.ready();
+
+    // Slack advertises thread_broadcast capability.
+    assert!(world.account("T01ALPHA").can.thread_broadcast, "Slack should advertise thread_broadcast");
+
+    let general = alpha("C0GEN");
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+    // Load general history so the root message is cached for quoting.
+    world.messages(&general);
+    world.until("root message cached", || world.message(&general, ROOT));
+
+    // Plain reply in thread (broadcast: false) must NOT set reply_broadcast and must NOT appear in #general.
+    let plain_cid = "cid-plain-thread";
+    let Response::Sent { .. } = world.ask(Request::Send {
+        conversation: thread.clone(),
+        text: "only in thread".into(),
+        client_id: plain_cid.into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    }) else {
+        panic!("expected Sent");
+    };
+    let plain = world.until("plain thread reply sent", || {
+        world.messages(&thread).into_iter().find(|m| m.client_id.as_deref() == Some(plain_cid) && m.state == SendState::Sent)
+    });
+    let post_plain = world.fake.calls(ALPHA, "chat.postMessage").into_iter().find(|c| c.params.get("text").map(String::as_str) == Some("only in thread")).unwrap();
+    assert_eq!(post_plain.params.get("thread_ts").map(String::as_str), Some(ROOT));
+    assert!(!post_plain.params.contains_key("reply_broadcast"));
+    assert!(world.message(&general, &plain.id).is_none(), "non-broadcast reply should not appear in channel");
+
+    // Broadcast reply in thread (broadcast: true) must set reply_broadcast=true and appear in both thread and #general with a quote.
+    let bc_cid = "cid-broadcast-thread";
+    let Response::Sent { .. } = world.ask(Request::Send {
+        conversation: thread.clone(),
+        text: "also in channel".into(),
+        client_id: bc_cid.into(),
+        reply_to: None,
+        with: protocol::Outgoing { broadcast: true, ..protocol::Outgoing::default() },
+    }) else {
+        panic!("expected Sent");
+    };
+    let bc = world.until("broadcast thread reply sent", || {
+        world.messages(&thread).into_iter().find(|m| m.client_id.as_deref() == Some(bc_cid) && m.state == SendState::Sent)
+    });
+    let post_bc = world.fake.calls(ALPHA, "chat.postMessage").into_iter().find(|c| c.params.get("text").map(String::as_str) == Some("also in channel")).unwrap();
+    assert_eq!(post_bc.params.get("thread_ts").map(String::as_str), Some(ROOT));
+    assert_eq!(post_bc.params.get("reply_broadcast").map(String::as_str), Some("true"));
+
+    let in_channel = world.until("broadcast reply recorded in parent channel", || world.message(&general, &bc.id));
+    assert_eq!(in_channel.text, "also in channel");
+    assert_eq!(in_channel.reply_to.as_ref().map(|q| q.id.as_str()), Some(ROOT));
+}
+
+#[test]
+fn slack_activity_feed_lists_mentions_threads_reactions_and_marks_read() {
+    let world = World::start();
+    world.ready();
+
+    let account = AccountKey { network: Network::Slack, account: "T01ALPHA".into() };
+    assert!(world.account("T01ALPHA").can.activity_feed, "Slack should advertise activity_feed");
+
+    // Fetch unfiltered activity feed: mention, thread reply, and reaction.
+    let Response::ActivityFeed { items, cursor } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) else {
+        panic!("expected Response::ActivityFeed");
+    };
+    assert!(cursor.is_none());
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].kind, protocol::ActivityItemKind::Mention);
+    assert_eq!(items[0].conversation, alpha("C0GEN"));
+    assert_eq!(items[0].message_id, "1760000900.000100");
+    assert_eq!(items[0].actor, "Ana");
+    assert!(items[0].unread);
+
+    assert_eq!(items[1].kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(items[1].thread_id.as_deref(), Some(format!("C0GEN:{ROOT}").as_str()));
+
+    assert_eq!(items[2].kind, protocol::ActivityItemKind::Reaction);
+    assert_eq!(items[2].emoji, "👍");
+    assert_eq!(items[2].message_id, ROOT);
+    assert_eq!(items[2].actor, "Ana");
+
+    // Filter by Reaction returns only the reaction row.
+    let Response::ActivityFeed { items: reactions, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: Some(protocol::ActivityItemKind::Reaction),
+        cursor: None,
+        limit: 20,
+    }) else {
+        panic!("expected Response::ActivityFeed");
+    };
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].id, "act-3");
+
+    // Mark one item read calls activity.mark with item_id.
+    let Response::Ok = world.ask(Request::ActivityMarkRead {
+        account,
+        item_id: Some("act-3".into()),
+    }) else {
+        panic!("expected Response::Ok");
+    };
+    let mark = world.fake.calls(ALPHA, "activity.mark");
+    assert_eq!(mark.len(), 1);
+    assert_eq!(mark[0].params.get("item_id").map(String::as_str), Some("act-3"));
+}
+
+#[test]
+fn slack_bookmarks_list_add_edit_remove_and_socket_invalidation() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.bookmarks, "Slack should advertise bookmarks");
+    let general = alpha("C0GEN");
+
+    // ConversationInfo reads bookmarks.list: one link bookmark and one canvas bookmark.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.bookmarks.len(), 2);
+    assert_eq!(info.bookmarks[0].title, "Runbook");
+    assert_eq!(info.bookmarks[0].link, "https://docs.example.com/runbook");
+    assert_eq!(info.bookmarks[0].kind, protocol::BookmarkKind::Link);
+    assert_eq!(info.bookmarks[1].title, "Team Canvas");
+    assert_eq!(info.bookmarks[1].kind, protocol::BookmarkKind::Canvas);
+
+    // SharedKind::Links is fed from channel bookmarks.
+    let Response::Shared { items, .. } = world.ask(Request::Shared {
+        conversation: general.clone(),
+        kind: protocol::SharedKind::Links,
+        before: None,
+        limit: 20,
+        search: true,
+    }) else {
+        panic!("expected Shared");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].url, "https://docs.example.com/runbook");
+
+    // Add a bookmark via Request::BookmarkAdd.
+    let Response::Bookmark { bookmark: added } = world.ask(Request::BookmarkAdd {
+        conversation: general.clone(),
+        title: "Status Page".into(),
+        link: "https://status.example.com".into(),
+        emoji: String::new(),
+    }) else {
+        panic!("expected Response::Bookmark");
+    };
+    assert_eq!(added.title, "Status Page");
+
+    // Edit it via Request::BookmarkEdit.
+    let Response::Bookmark { bookmark: edited } = world.ask(Request::BookmarkEdit {
+        conversation: general.clone(),
+        bookmark_id: added.id.clone(),
+        title: Some("System Status".into()),
+        link: None,
+        emoji: None,
+    }) else {
+        panic!("expected Response::Bookmark");
+    };
+    assert_eq!(edited.title, "System Status");
+
+    // Remove it via Request::BookmarkRemove.
+    let Response::Ok = world.ask(Request::BookmarkRemove {
+        conversation: general.clone(),
+        bookmark_id: added.id,
+    }) else {
+        panic!("expected Response::Ok");
+    };
+
+    // Simulate a remote bookmark_deleted event: removes Bk2 on server and invalidates cached ConversationInfo.
+    world.fake.bookmarks.lock().unwrap().get_mut("C0GEN").unwrap().retain(|b| b["id"] != "Bk2");
+    world.fake.push(ALPHA, json!({
+        "type": "bookmark_deleted",
+        "channel_id": "C0GEN",
+        "bookmark": {"id": "Bk2", "channel_id": "C0GEN"},
+    }));
+    sleep(Duration::from_millis(200));
+
+    let Response::ConversationInfo { info: refreshed } = world.ask(Request::ConversationInfo { conversation: general }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(refreshed.bookmarks.len(), 1);
+    assert_eq!(refreshed.bookmarks[0].id, "Bk1");
+}
+
+#[test]
+fn slack_browse_preview_and_join_public_channel() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.browse_channels, "Slack should advertise browse_channels");
+    let space = alpha("T01ALPHA");
+
+    // Page 1 of public channels filtered by query "water".
+    let Response::BrowsedChannels { channels, cursor } = world.ask(Request::BrowseChannels {
+        space: space.clone(),
+        query: "water".into(),
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected BrowsedChannels");
+    };
+    assert_eq!(cursor.as_deref(), Some("page2"));
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].key, alpha("C0PUB"));
+    assert_eq!(channels[0].name, "#watercooler");
+    assert_eq!(channels[0].members, 42);
+    assert!(!channels[0].joined);
+
+    // Page 2 using cursor returns #design-crit.
+    let Response::BrowsedChannels { channels: page2, cursor: cursor2 } = world.ask(Request::BrowseChannels {
+        space: space.clone(),
+        query: String::new(),
+        cursor,
+        limit: 50,
+    }) else {
+        panic!("expected BrowsedChannels");
+    };
+    assert!(cursor2.is_none());
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].name, "#design-crit");
+
+    // Preview #watercooler: recorded as joined=false, read_only=true, outside the sidebar, with history loaded.
+    let pub_key = alpha("C0PUB");
+    let Response::Conversation { conversation: preview } = world.ask(Request::PreviewChannel {
+        conversation: pub_key.clone(),
+    }) else {
+        panic!("expected Conversation");
+    };
+    assert!(!preview.joined);
+    assert!(preview.read_only);
+    assert!(preview.space.is_none(), "previewed channel must stay outside the sidebar");
+    let msgs = world.messages(&pub_key);
+    assert!(msgs.iter().any(|m| m.text == "welcome to watercooler"), "preview must load history");
+
+    // Join #watercooler: calls conversations.join, marks joined=true, and places it in the sidebar tree.
+    let Response::Conversation { conversation: joined } = world.ask(Request::Join {
+        conversation: pub_key.clone(),
+    }) else {
+        panic!("expected Conversation after Join");
+    };
+    assert!(joined.joined);
+    assert!(!joined.read_only);
+    assert_eq!(joined.space.as_deref(), Some("T01ALPHA"));
+    assert_eq!(world.fake.calls(ALPHA, "conversations.join").len(), 1);
+}
+
+#[test]
+fn slack_block_kit_images_video_stacked_cards_and_layout() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let ts = "1760000990.000100";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "ts": ts,
+        "text": "Deploy summary",
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "Release v4"}},
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "All green"},
+                "accessory": {
+                    "type": "image",
+                    "image_url": "https://a.slack-edge.com/thumb.png",
+                    "alt_text": "status badge"
+                }
+            },
+            {
+                "type": "image",
+                "title": {"type": "plain_text", "text": "Hosted chart"},
+                "image_url": "https://i0.wp.com/slack-imgs.com/chart.png",
+                "alt_text": "chart"
+            },
+            {
+                "type": "image",
+                "title": {"type": "plain_text", "text": "External img"},
+                "image_url": "https://untrusted.example.org/pic.png",
+                "alt_text": "external"
+            },
+            {
+                "type": "video",
+                "title": {"type": "plain_text", "text": "Demo clip"},
+                "title_url": "https://example.com/demo",
+                "video_url": "https://example.com/demo/embed",
+                "thumbnail_url": "https://a.slack-edge.com/video-thumb.jpg",
+                "provider_name": "Vimeo",
+                "description": {"type": "plain_text", "text": "Walkthrough"}
+            },
+            {
+                "type": "markdown",
+                "text": "*Bold note*"
+            }
+        ],
+        "attachments": [
+            {
+                "color": "#36a64f",
+                "author_name": "BuildBot",
+                "title": "Build #101",
+                "title_link": "https://ci.example.com/101",
+                "text": "Passed in 2m",
+                "fields": [
+                    {"title": "Branch", "value": "main", "short": true},
+                    {"title": "Commit", "value": "abc1234", "short": true}
+                ],
+                "image_url": "https://files.slack.com/files-pri/T01ALPHA-F1/build.png",
+                "footer": "CI"
+            },
+            {
+                "color": "#ff9900",
+                "author_name": "AlertBot",
+                "title": "Staging warning",
+                "text": "Disk at 80%",
+                "fields": [
+                    {"title": "Host", "value": "stage-1", "short": true}
+                ],
+                "footer": "Monitor"
+            }
+        ]
+    }));
+
+    let msg = world.until("block kit message stored", || world.message(&general, ts));
+    // Divider and external image fallback preserved in text; markdown rendered; hosted images attached inline.
+    assert!(msg.text.contains("───"), "divider should render as separator line: {}", msg.text);
+    assert!(msg.text.contains("[image: External img]"), "unhosted external image must stay named, not fetched");
+    assert!(!msg.text.contains("Open in Slack"), "supported video/markdown/divider blocks must not trigger undrawn fallback");
+
+    // Hosted section accessory image attached inline (slack-edge.com).
+    assert!(msg.attachments.iter().any(|a| a.name == "status badge" && a.file.kind == MediaKind::Image));
+
+    // Video block mapped to Preview with link and hosted thumbnail.
+    let vid = msg.previews.iter().find(|p| p.url == "https://example.com/demo").expect("video block preview");
+    assert_eq!(vid.title, "Demo clip");
+    assert_eq!(vid.site, "Vimeo");
+    assert!(vid.image.is_some(), "hosted video thumbnail should be preserved");
+
+    // Two separate stacked cards with author, title_link, fields, and hosted card image.
+    let cards: Vec<_> = msg.all_cards().collect();
+    assert_eq!(cards.len(), 2, "both attachments should become separate cards");
+    assert_eq!(cards[0].author, "BuildBot");
+    assert_eq!(cards[0].title, "Build #101");
+    assert_eq!(cards[0].title_link, "https://ci.example.com/101");
+    assert_eq!(cards[0].fields.len(), 2);
+    assert!(cards[0].image.is_some(), "hosted card image_url should be preserved");
+    assert_eq!(cards[1].author, "AlertBot");
+    assert_eq!(cards[1].title, "Staging warning");
+    assert_eq!(cards[1].fields.len(), 1);
 }

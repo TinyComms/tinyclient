@@ -2284,7 +2284,13 @@ fn serve(account: &Arc<Account>, command: Command) {
                 let res = account
                     .wire
                     .group_join_by_link(url.trim())
-                    .map(|g| Peer::Group(g.id).conversation())
+                    .map(|g| {
+                        let peer = Peer::Group(g.id.clone());
+                        let mut conv = row(&peer, &g.title);
+                        conv.topic = g.description.chars().take(300).collect();
+                        let _ = ctx.conversation(&conv);
+                        peer.conversation()
+                    })
                     .map_err(refused);
                 let _ = reply.send(res);
                 return;

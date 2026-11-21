@@ -25,6 +25,10 @@ pub trait Names {
         false
     }
     fn custom(&self, name: &str) -> Option<Custom>;
+    /// Whether this URL is served by Slack (or its image proxy) and can be attached inline.
+    fn hosted(&self, _url: &str) -> bool {
+        false
+    }
 }
 
 pub struct Rich<'a> {
@@ -195,13 +199,47 @@ impl<'a> Rich<'a> {
                     }
                 }
                 "image" => {
-                    // The picture is at an address Slack does not serve, so it is named, not
-                    // fetched.
-                    let label = [&block["title"]["text"], &block["alt_text"]];
-                    let label = label.into_iter().filter_map(Value::as_str).find(|label| !label.is_empty());
-                    self.text.push_str(&format!("[image: {}]", label.unwrap_or("untitled")));
+                    let url = block["image_url"]
+                        .as_str()
+                        .or_else(|| block["slack_file"]["url_private"].as_str())
+                        .unwrap_or("");
+                    if !url.is_empty() && self.names.hosted(url) {
+                        // Attached inline by message.rs.
+                    } else {
+                        // The picture is at an address Slack does not serve, so it is named, not fetched.
+                        let label = [&block["title"]["text"], &block["alt_text"]];
+                        let label = label.into_iter().filter_map(Value::as_str).find(|label| !label.is_empty());
+                        self.text.push_str(&format!("[image: {}]", label.unwrap_or("untitled")));
+                    }
                 }
-                "divider" => {}
+                "video" => {
+                    // Mapped to a Preview with thumbnail and link by message.rs.
+                }
+                "markdown" => {
+                    if let Some(text) = block["text"].as_str() {
+                        self.mrkdwn(text);
+                    }
+                }
+                "table" => {
+                    for row in block["rows"].as_array().into_iter().flatten() {
+                        self.line();
+                        for (ix, cell) in row.as_array().into_iter().flatten().enumerate() {
+                            if ix > 0 {
+                                self.text.push_str(" | ");
+                            }
+                            if cell["type"] == "rich_text" {
+                                for el in cell["elements"].as_array().into_iter().flatten() {
+                                    self.rich_block(el);
+                                }
+                            } else {
+                                self.text_object(cell);
+                            }
+                        }
+                    }
+                }
+                "divider" => {
+                    self.text.push_str("───");
+                }
                 // A meeting card (`call`). Drawn as a card with a Join link, not as buttons.
                 "call" => {}
                 _ => self.undrawn = true,

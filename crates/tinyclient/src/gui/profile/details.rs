@@ -474,6 +474,42 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
     } else if waiting && late {
         body = body.child(draw::rule().mt(px(16.))).child(div().px(px(theme::PANE_PAD)).pt(px(16.)).child(draw::skeleton()));
     }
+    if let Some(bookmarks) = info.map(|i| i.bookmarks.as_slice()).filter(|b| !b.is_empty()) {
+        let mut chips = div().flex().flex_wrap().gap(px(6.));
+        for (ix, bm) in bookmarks.iter().enumerate() {
+            let label = if bm.emoji.is_empty() {
+                bm.title.clone()
+            } else {
+                format!("{} {}", bm.emoji, bm.title)
+            };
+            let url = bm.link.clone();
+            let chip = div()
+                .id(("details-bookmark", ix))
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .type_small()
+                .text_color(theme::text())
+                .when(!url.is_empty(), |d| {
+                    d.cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                })
+                .child(label);
+            chips = chips.child(chip);
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Bookmarks"))
+                .child(chips),
+        );
+    }
     if !waiting || late {
         body = body.child(draw::rule().mt(px(16.))).child(pane.shared_of(network, window, cx).mt(px(8.)));
     }
