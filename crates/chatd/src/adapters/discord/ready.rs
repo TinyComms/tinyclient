@@ -1051,7 +1051,20 @@ impl Discord {
             }
         }
         self.ctx.presence(id, update.presence(), update.status(), owned);
-        let (emoji, doing) = (update.emoji().to_owned(), update.doing());
+        let mut files = Vec::new();
+        if let Some(emoji_file) = update.emoji_file() {
+            files.push(emoji_file);
+        }
+        let doing = update.doing_with_art().map(|(doing, art)| {
+            if let Some(art) = art {
+                files.push(art);
+            }
+            doing
+        });
+        if !files.is_empty() {
+            let _ = self.ctx.media(&files);
+        }
+        let emoji = update.emoji().to_owned();
         if owned {
             self.state.lock().unwrap().doing.insert(id.to_owned(), (emoji.clone(), doing.clone()));
             self.tell_activity(id);
@@ -1077,10 +1090,12 @@ impl Discord {
             Some((channel, guild, place)) => {
                 let name = self.ctx.known(&channel).ok().flatten().map(|row| row.title).unwrap_or_default();
                 let mut voice = protocol::Activity {
-                    kind: if guild.is_some() { protocol::ActivityKind::InVoice } else { protocol::ActivityKind::InCall },
-                    name,
                     place,
                     conversation: Some(self.ctx.key(&channel)),
+                    ..protocol::Activity::new(
+                        if guild.is_some() { protocol::ActivityKind::InVoice } else { protocol::ActivityKind::InCall },
+                        name,
+                    )
                 };
                 voice.bound();
                 Some(voice)

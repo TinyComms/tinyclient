@@ -387,9 +387,21 @@ impl Hub {
     /// Takes the ephemeral changes; the stored kinds are for whoever holds the list.
     pub fn changed(&self, change: &Change, cx: &mut App) {
         match change {
-            Change::Presence { person, presence, status, .. } => {
+            Change::Presence { person, presence, status, emoji, activity } => {
                 // Stored either way. Only someone on screen repaints the window.
-                if self.set_presence(person, *presence, status) && self.0.borrow().watch.is_watching(person) {
+                let mut changed = self.set_presence(person, *presence, status);
+                {
+                    let mut inner = self.0.borrow_mut();
+                    if let Some(known) = inner.people.get_mut(person) {
+                        let next_activity = activity.clone().map(Box::new);
+                        if known.emoji != *emoji || known.activity != next_activity {
+                            known.emoji = emoji.clone();
+                            known.activity = next_activity;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed && self.0.borrow().watch.is_watching(person) {
                     self.notify(cx);
                 }
             }
@@ -503,6 +515,9 @@ impl Hub {
                     }
                     if !person.emoji.is_empty() {
                         existing.emoji = person.emoji.clone();
+                    }
+                    if person.emoji_file.is_some() {
+                        existing.emoji_file = person.emoji_file.clone();
                     }
                     if person.activity.is_some() {
                         existing.activity = person.activity.clone();

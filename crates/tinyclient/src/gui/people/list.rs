@@ -1356,7 +1356,7 @@ mod tests {
     #[test]
     fn a_meeting_or_a_presentation_is_online_not_in_a_call() {
         let doing = |name: &str, kind: ActivityKind| Person {
-            activity: Some(Box::new(Activity { kind, name: String::new(), place: String::new(), conversation: None })),
+            activity: Some(Box::new(Activity::new(kind, ""))),
             ..(*person(name, Relation::Contact, Presence::Busy)).clone()
         };
         let in_call = vec![doing("Ana", ActivityKind::InMeeting), doing("Farah", ActivityKind::Presenting), doing("Odalys", ActivityKind::InCall)];
@@ -1370,11 +1370,14 @@ mod tests {
     fn line_two_says_where_they_talk_then_their_status_then_what_they_do_never_online() {
         let mut haruto = (*person("Haruto", Relation::Friend, Presence::Online)).clone();
         assert_eq!(around_line(&haruto, "", false, false), "");
-        haruto.activity = Some(Box::new(Activity { kind: ActivityKind::Playing, name: "Outer Ridge".into(), place: String::new(), conversation: None }));
+        haruto.activity = Some(Box::new(Activity::new(ActivityKind::Playing, "Outer Ridge")));
         assert_eq!(around_line(&haruto, "", false, false), "Playing Outer Ridge");
         haruto.emoji = "🌴".into();
         assert_eq!(around_line(&haruto, "Back Monday", false, false), "🌴 Back Monday");
-        haruto.activity = Some(Box::new(Activity { kind: ActivityKind::InVoice, name: "Campfire".into(), place: "Moss & Lichen".into(), conversation: None }));
+        haruto.activity = Some(Box::new(Activity {
+            place: "Moss & Lichen".into(),
+            ..Activity::new(ActivityKind::InVoice, "Campfire")
+        }));
         assert_eq!(around_line(&haruto, "Back Monday", false, false), "Campfire · Moss & Lichen");
         let titled = Person { title: "Designer".into(), ..(*person("Dev", Relation::Contact, Presence::Online)).clone() };
         assert_eq!((around_line(&titled, "", false, true), around_line(&titled, "", false, false)), ("Designer".to_owned(), String::new()));

@@ -763,6 +763,9 @@ pub struct Person {
     /// Their status's emoji, apart from its words (`status`). Live, like presence.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub emoji: String,
+    /// Custom status emoji image (e.g. a Discord guild emoji with an id), fetched via media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_file: Option<MediaFile>,
     /// What they are doing now: playing, listening, in voice, in a meeting. Live. Boxed: few
     /// people in a list are doing anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -791,6 +794,7 @@ impl Person {
             status: String::new(),
             link: String::new(),
             emoji: String::new(),
+            emoji_file: None,
             activity: None,
             title: String::new(),
             utc_offset: None,

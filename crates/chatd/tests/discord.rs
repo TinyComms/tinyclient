@@ -5138,3 +5138,94 @@ fn per_server_avatar_and_server_profile() {
     assert_eq!(global_profile.banner.as_ref().map(|b| b.id.as_str()), Some("banner:2006:glob_ban"));
     assert_eq!((global_profile.bio.as_str(), global_profile.pronouns.as_str(), global_profile.accent), ("Global bio", "he/him", Some(1118481)));
 }
+
+#[test]
+fn member_list_activities_and_custom_status_emoji() {
+    let world = World::start();
+    let _ = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+
+    world.discord.push(
+        "GUILD_MEMBER_LIST_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "id": "everyone",
+            "member_count": 4,
+            "online_count": 4,
+            "groups": [{"id": "online", "count": 4}],
+            "ops": [{"op": "SYNC", "range": [0, 99], "items": [
+                {"group": {"id": "online", "count": 4}},
+                {"member": {
+                    "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2001"},
+                        "status": "online",
+                        "activities": [{
+                            "type": 0, "name": "Hades", "details": "Elysium",
+                            "timestamps": {"start": 1_700_000_000_000i64}
+                        }]
+                    }
+                }},
+                {"member": {
+                    "user": {"id": "2002", "username": "dev", "global_name": "Dev Patel", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2002"},
+                        "status": "online",
+                        "activities": [{
+                            "type": 2, "name": "Spotify", "details": "Clair de Lune", "state": "Debussy",
+                            "assets": {"large_image": "spotify:ab67616d00001111"}
+                        }]
+                    }
+                }},
+                {"member": {
+                    "user": {"id": "2003", "username": "kofi", "global_name": "Kofi", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2003"},
+                        "status": "dnd",
+                        "activities": [{
+                            "type": 1, "name": "Celeste", "url": "https://twitch.tv/kofi"
+                        }]
+                    }
+                }},
+                {"member": {
+                    "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2006"},
+                        "status": "idle",
+                        "activities": [{
+                            "type": 4, "state": "shipping", "emoji": {"id": "5101", "name": "ferris", "animated": false}
+                        }]
+                    }
+                }}
+            ]}]
+        }),
+    );
+
+    let delivered = wait("member list with activities", || {
+        let response = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+        matches!(response, Response::Members { pending: false, ref members, .. } if members.len() == 4).then_some(response)
+    });
+    match delivered {
+        Response::Members { members, .. } => {
+            // 2001: Playing Hades with details & start time (in seconds)
+            let mara = members[0].activity.as_deref().expect("mara activity");
+            assert_eq!((mara.kind, mara.name.as_str(), mara.details.as_str(), mara.started), (protocol::ActivityKind::Playing, "Hades", "Elysium", Some(1_700_000_000)));
+            // 2002: Dev is in voice channel 4201 in READY_SUPPLEMENTAL -> InVoice wins over Spotify, OR Spotify if not in voice yet
+            let dev = members[1].activity.as_deref().expect("dev activity");
+            assert!(
+                dev.kind == protocol::ActivityKind::InVoice || (dev.kind == protocol::ActivityKind::Listening && dev.art.as_ref().map(|a| a.id.as_str()) == Some("actart:spotify:ab67616d00001111")),
+                "unexpected dev activity: {dev:?}"
+            );
+            // 2003: Streaming Celeste with validated https URL
+            let kofi = members[2].activity.as_deref().expect("kofi activity");
+            assert_eq!((kofi.kind, kofi.name.as_str(), kofi.url.as_str()), (protocol::ActivityKind::Streaming, "Celeste", "https://twitch.tv/kofi"));
+            // 2006: Custom status + custom guild emoji file
+            assert_eq!(members[3].status, "shipping");
+            assert_eq!(members[3].emoji_file.as_ref().map(|f| f.id.as_str()), Some("emoji:5101"));
+        }
+        other => panic!("expected Members, got {other:?}"),
+    }
+}

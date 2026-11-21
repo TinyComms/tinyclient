@@ -730,18 +730,78 @@ pub struct GuildSettings {
     pub message_notifications: u8,
 }
 
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ActivityTimestamps {
+    #[serde(default)]
+    pub start: Option<i64>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ActivityAssets {
+    #[serde(default)]
+    pub large_image: Option<String>,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Activity {
     #[serde(rename = "type", default)]
     pub kind: u8,
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub details: Option<String>,
     /// The game, the service, the show.
     #[serde(default, deserialize_with = "nullable")]
     pub name: String,
     /// A custom status's emoji: a Unicode one has no id.
     #[serde(default)]
     pub emoji: Option<Emoji>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub application_id: Option<String>,
+    #[serde(default)]
+    pub timestamps: Option<ActivityTimestamps>,
+    #[serde(default)]
+    pub assets: Option<ActivityAssets>,
+}
+
+fn valid_http_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let ok = trimmed.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+        || trimmed.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"));
+    if ok && trimmed.len() <= 512 && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Some(trimmed.to_owned())
+    } else {
+        None
+    }
+}
+
+fn activity_art(application_id: Option<&str>, large_image: Option<&str>) -> Option<(MediaFile, String)> {
+    let asset = large_image?.trim();
+    if asset.is_empty() {
+        return None;
+    }
+    if let Some(spotify_id) = asset.strip_prefix("spotify:") {
+        if !spotify_id.is_empty() && spotify_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Some((
+                sized(format!("actart:spotify:{spotify_id}"), MediaKind::Image, 64),
+                format!("https://i.scdn.co/image/{spotify_id}"),
+            ));
+        }
+        return None;
+    }
+    let app = application_id?.trim();
+    if !app.is_empty()
+        && app.bytes().all(|b| b.is_ascii_digit())
+        && asset.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Some((
+            sized(format!("actart:{app}:{asset}"), MediaKind::Image, 64),
+            format!("{}/app-assets/{app}/{asset}.png?size=64", cdn()),
+        ));
+    }
+    None
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -786,15 +846,24 @@ impl PresenceUpdate {
         custom.and_then(|activity| activity.state.as_deref()).unwrap_or("")
     }
 
-    /// The custom status's emoji when it is a Unicode one; a server's own has no glyph to show.
+    /// The custom status's emoji when it is a Unicode one.
     pub fn emoji(&self) -> &str {
         let custom = self.activities.iter().find(|activity| activity.kind == 4);
         let emoji = custom.and_then(|activity| activity.emoji.as_ref()).filter(|emoji| emoji.id.is_none());
         emoji.and_then(|emoji| emoji.name.as_deref()).unwrap_or("")
     }
 
-    /// What they are doing, as the first activity that is not the custom status says.
-    pub fn doing(&self) -> Option<protocol::Activity> {
+    /// The custom status's custom emoji image, when it has an `id`.
+    pub fn emoji_file(&self) -> Option<(MediaFile, String)> {
+        let custom = self.activities.iter().find(|activity| activity.kind == 4)?;
+        let e = custom.emoji.as_ref()?;
+        let id = e.id.as_deref().filter(|id| !id.is_empty())?;
+        Some(emoji(id, e.animated))
+    }
+
+    /// What they are doing, as the first activity that is not the custom status says,
+    /// along with its album art / large-image media file when available.
+    pub fn doing_with_art(&self) -> Option<(protocol::Activity, Option<(MediaFile, String)>)> {
         use protocol::ActivityKind::*;
         self.activities.iter().find_map(|activity| {
             let kind = match activity.kind {
@@ -805,15 +874,37 @@ impl PresenceUpdate {
                 5 => Competing,
                 _ => return None,
             };
+            let started = activity
+                .timestamps
+                .as_ref()
+                .and_then(|t| t.start)
+                .filter(|&s| s > 0)
+                .map(|s| if s > 10_000_000_000 { s / 1000 } else { s });
+            let url = if kind == Streaming {
+                activity.url.as_deref().and_then(valid_http_url).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let art = activity_art(
+                activity.application_id.as_deref(),
+                activity.assets.as_ref().and_then(|a| a.large_image.as_deref()),
+            );
             let mut doing = protocol::Activity {
-                kind,
-                name: activity.name.clone(),
-                place: String::new(),
-                conversation: None,
+                details: activity.details.clone().unwrap_or_default(),
+                state: activity.state.clone().unwrap_or_default(),
+                started,
+                url,
+                art: art.as_ref().map(|(file, _)| file.clone()),
+                ..protocol::Activity::new(kind, activity.name.clone())
             };
             doing.bound();
-            Some(doing)
+            Some((doing, art))
         })
+    }
+
+    /// What they are doing, as the first activity that is not the custom status says.
+    pub fn doing(&self) -> Option<protocol::Activity> {
+        self.doing_with_art().map(|(doing, _)| doing)
     }
 }
 
@@ -1221,5 +1312,57 @@ mod tests {
         assert_eq!(member.avatar(Some("4000")).unwrap().0.id, "mavatar:4000:2001:srvhash");
         assert_eq!(member.avatar(None).unwrap().0.id, "avatar:2001:ghash");
         assert_eq!(member.banner.as_deref(), Some("bhash"));
+    }
+
+    #[test]
+    fn presence_parses_activities_details_timestamps_art_urls_and_custom_emoji() {
+        let p: PresenceUpdate = serde_json::from_value(serde_json::json!({
+            "user": {"id": "2001"},
+            "status": "online",
+            "activities": [
+                {"type": 4, "state": "vibing", "emoji": {"id": "9901", "name": "ferris", "animated": true}},
+                {
+                    "type": 2,
+                    "name": "Spotify",
+                    "details": "Clair de Lune",
+                    "state": "Debussy",
+                    "timestamps": {"start": 1_700_000_000_000i64},
+                    "assets": {"large_image": "spotify:ab67616d0000b2731234"}
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(p.status(), "vibing");
+        assert_eq!(p.emoji(), "");
+        let (ef, eurl) = p.emoji_file().expect("custom status emoji");
+        assert_eq!(ef.id, "emoji:9901");
+        assert!(eurl.contains("/emojis/9901.webp") && eurl.contains("animated=true"));
+
+        let (doing, art) = p.doing_with_art().expect("spotify activity");
+        assert_eq!(doing.kind, protocol::ActivityKind::Listening);
+        assert_eq!(doing.name, "Spotify");
+        assert_eq!(doing.details, "Clair de Lune");
+        assert_eq!(doing.state, "Debussy");
+        assert_eq!(doing.started, Some(1_700_000_000));
+        let (art_file, art_url) = art.expect("spotify album art");
+        assert_eq!(art_file.id, "actart:spotify:ab67616d0000b2731234");
+        assert_eq!(art_url, "https://i.scdn.co/image/ab67616d0000b2731234");
+
+        // Streaming URL validation: accepts https://, rejects javascript:.
+        let valid_stream: PresenceUpdate = serde_json::from_value(serde_json::json!({
+            "user": {"id": "2002"},
+            "status": "online",
+            "activities": [{"type": 1, "name": "Hades", "url": "https://twitch.tv/abc"}]
+        }))
+        .unwrap();
+        assert_eq!(valid_stream.doing().unwrap().url, "https://twitch.tv/abc");
+
+        let bad_stream: PresenceUpdate = serde_json::from_value(serde_json::json!({
+            "user": {"id": "2003"},
+            "status": "online",
+            "activities": [{"type": 1, "name": "Hades", "url": "javascript:alert(1)"}]
+        }))
+        .unwrap();
+        assert_eq!(bad_stream.doing().unwrap().url, "");
     }
 }

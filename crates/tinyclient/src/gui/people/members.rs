@@ -20,13 +20,52 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub const SOURCE: &str = "members";
-/// A member row: the desktop's 28, and on a phone 48, as the other pages' person rows.
+/// A member row: compact 36 on desktop to fit name + activity/status, and 48 on a phone.
 fn row() -> f32 {
-    if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE).max(48.) } else { theme::ROW_ONE }
+    if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE).max(48.) } else { 36. }
 }
-/// A member's face: the desktop's 20, and 32 on a phone, beside its larger name.
+/// A member's face: the desktop's 24, and 32 on a phone, beside its name and activity line.
 fn face() -> f32 {
-    if crate::gui::phone::active() { 32. } else { 20. }
+    if crate::gui::phone::active() { 32. } else { 24. }
+}
+
+/// Second line under a member's name: in voice, then activity (playing/listening/watching/
+/// streaming/competing), then custom status. Never details, elapsed time, or artwork.
+/// Returns `(text, is_custom_status)` so custom status emoji files only pair with custom status.
+pub fn member_line(person: &Person, status: &str, in_call: bool) -> (String, bool) {
+    if let Some(activity) = &person.activity {
+        let place = |name: &str| if activity.place.is_empty() { name.to_owned() } else { format!("{name} · {}", activity.place) };
+        match activity.kind {
+            protocol::ActivityKind::InVoice if !activity.name.is_empty() => return (place(&activity.name), false),
+            protocol::ActivityKind::InVoice => return ("In voice".to_owned(), false),
+            protocol::ActivityKind::InCall => return ("In a call".to_owned(), false),
+            protocol::ActivityKind::Huddle => return ("In a huddle".to_owned(), false),
+            protocol::ActivityKind::InMeeting => return ("In a meeting".to_owned(), false),
+            protocol::ActivityKind::Presenting => return ("Presenting".to_owned(), false),
+            _ => {}
+        }
+    }
+    if in_call {
+        return ("In a call".to_owned(), false);
+    }
+    if let Some(activity) = &person.activity {
+        let verb = match activity.kind {
+            protocol::ActivityKind::Playing => "Playing",
+            protocol::ActivityKind::Listening => "Listening to",
+            protocol::ActivityKind::Watching => "Watching",
+            protocol::ActivityKind::Streaming => "Streaming",
+            protocol::ActivityKind::Competing => "Competing in",
+            _ => "",
+        };
+        if !verb.is_empty() && !activity.name.is_empty() {
+            return (format!("{verb} {}", activity.name), false);
+        }
+    }
+    let said = super::presence::status_words(&person.emoji, status);
+    if !said.is_empty() {
+        return (said, true);
+    }
+    (String::new(), person.emoji_file.is_some())
 }
 const PAGE: u32 = 50;
 /// Pages of members held; the ones farthest from the viewport go first.
@@ -413,7 +452,23 @@ impl MemberList {
     fn row(&self, ix: usize, person: &Rc<Person>, cx: &mut Context<Self>) -> Stateful<Div> {
         let away = shown_presence(&self.hub, person) == Presence::Offline;
         let ring = Ring::row(theme::sidebar(), false, "member");
-        let in_call = !person.bot && in_call(&self.hub, &self.scene, &person.key);
+        let talking = person
+            .activity
+            .as_ref()
+            .is_some_and(|a| matches!(a.kind, protocol::ActivityKind::InVoice | protocol::ActivityKind::InCall | protocol::ActivityKind::Huddle));
+        let in_call = !person.bot && (talking || in_call(&self.hub, &self.scene, &person.key));
+        let live_status = self.hub.status_of(&person.key);
+        let status = if live_status.is_empty() { person.status.as_str() } else { live_status.as_str() };
+        let (second, is_custom_status) = if away { (String::new(), false) } else { member_line(person, status, in_call) };
+        let custom_emoji_path = if is_custom_status {
+            person
+                .emoji_file
+                .as_ref()
+                .and_then(|file| self.hub.file(&person.key.account(), file, cx).path)
+        } else {
+            None
+        };
+        let show_second = !second.is_empty() || custom_emoji_path.is_some();
         let (profile, shell) = (person.key.clone(), self.shell.clone());
         let (menu_of, menu_shell) = (person.key.clone(), self.shell.clone());
         let phone = crate::gui::phone::active();
@@ -474,12 +529,42 @@ impl MemberList {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        // A phone's names are the size the other pages' rows are (Details, a
-                        // profile, the sidebar): 16, not the desktop's interface size scaled.
-                        .map(|name| if phone { name.type_body() } else { name.type_ui() })
-                        .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
-                        .child(person.name.clone()),
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                // A phone's names are the size the other pages' rows are (Details, a
+                                // profile, the sidebar): 16, not the desktop's interface size scaled.
+                                .map(|name| if phone { name.type_body() } else { name.type_ui() })
+                                .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
+                                .child(person.name.clone()),
+                        )
+                        .when(show_second, |col| {
+                            col.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .min_w_0()
+                                    .children(custom_emoji_path.map(|path| {
+                                        gpui::img(std::path::PathBuf::from(path))
+                                            .size(px(12.))
+                                            .flex_none()
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                    }))
+                                    .when(!second.is_empty(), |line| {
+                                        line.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .type_micro()
+                                                .text_color(theme::text_faint())
+                                                .child(second),
+                                        )
+                                    }),
+                            )
+                        }),
                 )
                 .when(person.title == "Owner", |row| row.child(div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
                 .when(person.bot, |row| row.child(super::list::bot_tag()))
@@ -819,5 +904,31 @@ mod tests {
         let list = sections(&[40_000, 150_000]);
         assert_eq!(slot(&list, 40_001), Some(Slot::Header(1)));
         assert_eq!(slot(&list, 190_001), Some(Slot::Member(189_999)));
+    }
+
+    #[test]
+    fn member_line_prefers_voice_then_activity_then_custom_status_without_details() {
+        let key = Key { network: protocol::Network::Discord, account: "1".into(), id: "2".into() };
+        let mut p = Person::new(key, "Mara");
+        assert_eq!(member_line(&p, "", false), (String::new(), false));
+
+        // Custom status alone
+        p.emoji = "🌿".into();
+        assert_eq!(member_line(&p, "touching grass", false), ("🌿 touching grass".into(), true));
+
+        // Activity wins over custom status, and omits details/elapsed in list rows.
+        p.activity = Some(Box::new(protocol::Activity {
+            details: "Elysium".into(),
+            started: Some(1_700_000_000),
+            ..protocol::Activity::new(protocol::ActivityKind::Playing, "Hades")
+        }));
+        assert_eq!(member_line(&p, "touching grass", false), ("Playing Hades".into(), false));
+
+        // Voice wins over playing.
+        p.activity = Some(Box::new(protocol::Activity {
+            place: "Rustaceans".into(),
+            ..protocol::Activity::new(protocol::ActivityKind::InVoice, "Lounge")
+        }));
+        assert_eq!(member_line(&p, "touching grass", false), ("Lounge · Rustaceans".into(), false));
     }
 }

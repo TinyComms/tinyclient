@@ -66,6 +66,21 @@ pub struct State {
     side: side::Side,
 }
 
+impl Shell {
+    /// Opens an external `http://`/`https://` link through the conversation pane's link-safety
+    /// confirmation flow, or validates via `Destination::parse` before opening if no pane exists.
+    pub(in crate::gui) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self.conversation_state.pane.get().cloned() {
+            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
+            return;
+        }
+        if let Some(dest) = protocol::link::Destination::parse(url) {
+            let target = dest.target(crate::gui::app::prefs::choices().strip_tracking);
+            cx.open_url(&target);
+        }
+    }
+}
+
 /// How often the network is told how far the user has read, at most.
 const READ_EVERY: Duration = Duration::from_secs(1);
 /// How far from the bottom the jump button appears.

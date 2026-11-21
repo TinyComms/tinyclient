@@ -353,6 +353,42 @@ impl Floating {
         }
         let mut body = div().px(px(16.)).flex().flex_col().gap(px(10.));
         let mut any = false;
+        if !person.bot && person.activity.is_some() && seen.online {
+            let now = crate::view::now();
+            let ours = own_offset(now);
+            for (ix, fact) in facts::right_now(person, profile, &line, now, ours)
+                .into_iter()
+                .filter(|f| f.glyph != "icons/clock.svg")
+                .enumerate()
+            {
+                any = true;
+                let opens = fact.opens.clone();
+                let url = fact.url.clone().filter(|_| opens.is_none());
+                let title = fact.words.clone();
+                let art_path = fact
+                    .art
+                    .as_ref()
+                    .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                let row = match art_path {
+                    Some(path) => draw::fact_inline_art(("card-now", ix), path, fact.words, fact.soft),
+                    None => draw::fact_inline(("card-now", ix), fact.glyph, fact.words, fact.soft),
+                };
+                body = body.child(
+                    row.when_some(opens, |row, key| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, _, cx| {
+                            let (key, title) = (key.clone(), title.clone());
+                            this.shell_do(cx, move |shell, cx| shell.select(key, &title, cx));
+                        }))
+                    })
+                    .when_some(url, |row, url| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, window, cx| {
+                            this.close(cx);
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                        }))
+                    }),
+                );
+            }
+        }
         if let Some(profile) = profile.filter(|_| seen.online) {
             match facts::card_body(person, profile, place) {
                 Some(CardBody::Role(role)) => {

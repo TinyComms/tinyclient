@@ -133,12 +133,7 @@ fn huddling(profile: &Value) -> bool {
 }
 
 fn huddle(on: bool) -> Option<Activity> {
-    on.then(|| Activity {
-        kind: ActivityKind::Huddle,
-        name: String::new(),
-        place: String::new(),
-        conversation: None,
-    })
+    on.then(|| Activity::new(ActivityKind::Huddle, ""))
 }
 
 /// A person as kept in a note, so a restart asks Slack nothing: what is remembered in memory,

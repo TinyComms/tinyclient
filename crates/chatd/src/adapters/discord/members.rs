@@ -456,12 +456,31 @@ impl Discord {
         answer(reply, Ok(Members { pending, sections: self.sections(&guild, &roster), members }));
     }
 
-    fn person(&self, guild: &str, member: &Member, files: &mut Vec<(MediaFile, String)>) -> Option<(Person, Presence, String)> {
+    fn person(
+        &self,
+        guild: &str,
+        member: &Member,
+        voice: &HashMap<String, protocol::Activity>,
+        files: &mut Vec<(MediaFile, String)>,
+    ) -> Option<(Person, Presence, String, String, Option<protocol::Activity>)> {
         let user = member.user.as_ref()?;
         let (avatar, url) = member.avatar(Some(guild)).unwrap_or_else(|| user.avatar());
         files.push((avatar.clone(), url));
         let presence = member.presence.as_ref();
         let (shown, status) = presence.map_or((Presence::Unknown, ""), |presence| (presence.presence(), presence.status()));
+        let emoji = presence.map_or("", |presence| presence.emoji()).to_owned();
+        let emoji_file = presence.and_then(|presence| presence.emoji_file()).map(|(file, url)| {
+            files.push((file.clone(), url));
+            file
+        });
+        let presence_doing = presence.and_then(|presence| presence.doing_with_art()).map(|(doing, art)| {
+            if let Some(art) = art {
+                files.push(art);
+            }
+            doing
+        });
+        // In voice wins over playing/listening, matching Friends.
+        let activity = voice.get(&user.id).cloned().or(presence_doing);
         let person = Person {
             link: super::model::user_link(&user.id),
             key: self.ctx.key(&user.id),
@@ -472,21 +491,48 @@ impl Discord {
             relation: Relation::None,
             presence: shown,
             status: status.to_owned(),
+            emoji: emoji.clone(),
+            emoji_file,
+            activity: activity.clone().map(Box::new),
             ..Person::new(self.ctx.key(&user.id), "")
         };
-        Some((person, shown, status.to_owned()))
+        Some((person, shown, status.to_owned(), emoji, activity))
     }
 
     /// Discord's updates to the list we subscribed to: a window synced, a row inserted, changed
     /// or removed.
     pub(super) fn member_list(&self, update: ListUpdate) {
+        let voice_raw: Vec<(String, String, Option<String>)> = {
+            let state = self.state.lock().unwrap();
+            let place = state.guilds.get(&update.guild_id).map(|g| g.name.clone());
+            state
+                .voice
+                .states
+                .iter()
+                .filter(|(_, heard)| heard.guild.as_deref() == Some(update.guild_id.as_str()))
+                .map(|(uid, heard)| (uid.clone(), heard.channel().to_owned(), place.clone()))
+                .collect()
+        };
+        let voice: HashMap<String, protocol::Activity> = voice_raw
+            .into_iter()
+            .map(|(uid, channel, place)| {
+                let name = self.ctx.known(&channel).ok().flatten().map(|row| row.title).unwrap_or_default();
+                let mut act = protocol::Activity {
+                    place: place.unwrap_or_default(),
+                    conversation: Some(self.ctx.key(&channel)),
+                    ..protocol::Activity::new(protocol::ActivityKind::InVoice, name)
+                };
+                act.bound();
+                (uid, act)
+            })
+            .collect();
         let mut files = Vec::new();
         let mut seen = Vec::new();
         let shown;
         let changed;
-        let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| self.person(&update.guild_id, member, &mut files)) {
-            Some((person, presence, status)) => {
-                seen.push((person.key.id.clone(), presence, status));
+        let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| self.person(&update.guild_id, member, &voice, &mut files)) {
+            Some((person, presence, status, emoji, activity)) => {
+                seen.push((person.key.id.clone(), presence, status, emoji, activity));
                 Entry::Member(Box::new(person))
             }
             None => Entry::Header,
@@ -563,8 +609,9 @@ impl Discord {
             self.log("member list", err);
         }
         // chatd keeps these only for the people the shell is watching.
-        for (id, presence, status) in seen {
+        for (id, presence, status, emoji, activity) in seen {
             self.ctx.presence(&id, presence, &status, false);
+            self.ctx.activity(&id, &emoji, activity, false);
         }
         // Wake cache readers when their subscribed data arrives, as well as on edits.
         if changed || update.ops.iter().any(|op| op.op == "SYNC") {

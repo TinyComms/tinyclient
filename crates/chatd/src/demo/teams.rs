@@ -81,7 +81,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         .collect();
     details[FARAH].1.mark = Some(Mark::External);
     s.store.set_details(&account, &details)?;
-    let doing = |kind| Some(Activity { kind, name: String::new(), place: String::new(), conversation: None });
+    let doing = |kind| Some(Activity::new(kind, ""));
     s.activities.push((Key::new(&account, cast[ANA].id.clone()), String::new(), doing(ActivityKind::InMeeting)));
     s.activities.push((Key::new(&account, cast[FARAH].id.clone()), String::new(), doing(ActivityKind::Presenting)));
     s.activities.push((Key::new(&account, cast[CHLOE].id.clone()), "🌴".to_owned(), None));

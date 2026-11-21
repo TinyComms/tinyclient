@@ -112,7 +112,11 @@ fn registered(s: &mut Seeder, account: &AccountKey, items: &[(&str, &str, &str)]
 }
 
 fn activity(kind: ActivityKind, name: &str, place: &str, conversation: Option<Key>) -> Option<Activity> {
-    Some(Activity { kind, name: name.to_owned(), place: place.to_owned(), conversation })
+    Some(Activity {
+        place: place.to_owned(),
+        conversation,
+        ..Activity::new(kind, name)
+    })
 }
 
 pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {

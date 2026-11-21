@@ -793,6 +793,7 @@ fn person_from(row: &Row) -> rusqlite::Result<Person> {
         utc_offset: row.get(17)?,
         mark: mark_from(row.get(18)?)?,
         emoji: String::new(),
+        emoji_file: None,
         activity: None,
     })
 }

@@ -181,12 +181,44 @@ pub struct Activity {
     /// The conversation to open for it (the voice channel), where there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<Key>,
+    /// Extra detail (e.g. game zone or song title) shown on profiles, never in list rows.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub details: String,
+    /// Secondary detail (e.g. artist or party info) shown on profiles, never in list rows.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    /// Unix seconds when the activity started, for elapsed time on profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<i64>,
+    /// Validated `http://` or `https://` URL for streaming activities.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Album art or activity thumbnail (e.g. Spotify cover), shown on profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub art: Option<MediaFile>,
 }
 
 impl Activity {
+    pub fn new(kind: ActivityKind, name: impl Into<String>) -> Activity {
+        Activity {
+            kind,
+            name: name.into(),
+            place: String::new(),
+            conversation: None,
+            details: String::new(),
+            state: String::new(),
+            started: None,
+            url: String::new(),
+            art: None,
+        }
+    }
+
     pub fn bound(&mut self) {
         crate::clip(&mut self.name, 128);
         crate::clip(&mut self.place, 128);
+        crate::clip(&mut self.details, 128);
+        crate::clip(&mut self.state, 128);
+        crate::clip(&mut self.url, 512);
     }
 }
 

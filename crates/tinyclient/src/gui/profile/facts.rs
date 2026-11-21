@@ -461,10 +461,35 @@ pub struct Fact {
     pub words: String,
     pub soft: String,
     pub opens: Option<protocol::Key>,
+    /// Validated external URL (e.g. a streaming link) opened via `open_external_link`.
+    pub url: Option<String>,
+    /// Optional thumbnail artwork (e.g. Spotify album cover) shown on profile cards/panes.
+    pub art: Option<protocol::MediaFile>,
+}
+
+fn elapsed_words(started: i64, now: i64) -> Option<String> {
+    if started <= 0 || now <= started {
+        return None;
+    }
+    let mins = (now - started) / 60;
+    if mins < 1 {
+        return None;
+    }
+    if mins >= 60 {
+        let hours = mins / 60;
+        let rem = mins % 60;
+        if rem == 0 {
+            Some(format!("{hours} h"))
+        } else {
+            Some(format!("{hours} h {rem} min"))
+        }
+    } else {
+        Some(format!("{mins} min"))
+    }
 }
 
 // CONTRACT: `gamepad-2`, `music` and `calendar` are not in the asset list either.
-fn activity_fact(activity: &Activity) -> Fact {
+fn activity_fact(activity: &Activity, now: i64) -> Fact {
     let name = activity.name.clone();
     let (glyph, words) = match activity.kind {
         ActivityKind::InVoice => ("icons/volume-2.svg", if name.is_empty() { "In voice".to_owned() } else { format!("In voice · {name}") }),
@@ -478,8 +503,37 @@ fn activity_fact(activity: &Activity) -> Fact {
         ActivityKind::Presenting => ("icons/monitor-up.svg", "Presenting".to_owned()),
         ActivityKind::Huddle => ("icons/headphones.svg", if name.is_empty() { "In a huddle".to_owned() } else { format!("In a huddle in {name}") }),
     };
-    let soft = if activity.place.is_empty() { String::new() } else { format!(" · {}", activity.place) };
-    Fact { glyph, words: words.trim().to_owned(), soft, opens: activity.conversation.clone() }
+    let soft = if !activity.place.is_empty() {
+        format!(" · {}", activity.place)
+    } else {
+        let mut parts = Vec::new();
+        let detail = match (activity.details.trim(), activity.state.trim()) {
+            ("", "") => String::new(),
+            (d, "") => d.to_owned(),
+            ("", s) => s.to_owned(),
+            (d, s) => format!("{d} · {s}"),
+        };
+        if !detail.is_empty() {
+            parts.push(detail);
+        }
+        if let Some(elapsed) = activity.started.and_then(|start| elapsed_words(start, now)) {
+            parts.push(elapsed);
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", parts.join(", "))
+        }
+    };
+    let url = (activity.kind == ActivityKind::Streaming && !activity.url.is_empty()).then(|| activity.url.clone());
+    Fact {
+        glyph,
+        words: words.trim().to_owned(),
+        soft,
+        opens: activity.conversation.clone(),
+        url,
+        art: activity.art.clone(),
+    }
 }
 
 /// Right now: what they are doing, and their clock. At most three rows; none for an app.
@@ -492,13 +546,20 @@ pub fn right_now(person: &Person, profile: Option<&Profile>, said: &PresenceLine
     let mut facts: Vec<Fact> = person
         .activity
         .iter()
-        .map(|activity| activity_fact(activity))
+        .map(|activity| activity_fact(activity, now))
         .filter(|fact| !head.contains(&fact.words.split(" · ").next().unwrap_or("").to_lowercase()))
         .collect();
     let offset = profile.and_then(|profile| profile.utc_offset).or(person.utc_offset);
     if let Some(offset) = offset.filter(|offset| *offset != ours) {
         let (clock, apart) = crate::gui::people::card::local_time_parts(now, offset, ours);
-        facts.push(Fact { glyph: "icons/clock.svg", words: format!("{clock} local"), soft: format!(" · {apart}"), opens: None });
+        facts.push(Fact {
+            glyph: "icons/clock.svg",
+            words: format!("{clock} local"),
+            soft: format!(" · {apart}"),
+            opens: None,
+            url: None,
+            art: None,
+        });
     }
     facts.truncate(RIGHT_NOW);
     facts
@@ -1321,7 +1382,32 @@ mod tests {
     }
 
     fn act(kind: ActivityKind) -> Activity {
-        Activity { kind, name: String::new(), place: String::new(), conversation: None }
+        Activity::new(kind, "")
+    }
+
+    #[test]
+    fn activity_fact_formats_details_elapsed_time_and_streaming_url() {
+        let now = 1_760_356_800;
+        let mut p = person(Network::Discord, Relation::Friend);
+        p.activity = Some(Box::new(Activity {
+            details: "Elysium".into(),
+            started: Some(now - 42 * 60),
+            ..Activity::new(ActivityKind::Playing, "Hades")
+        }));
+        let facts = right_now(&p, None, &PresenceLine::default(), now, 0);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].words, "Playing Hades");
+        assert_eq!(facts[0].soft, " — Elysium, 42 min");
+        assert_eq!(facts[0].url, None);
+
+        p.activity = Some(Box::new(Activity {
+            details: "Speedrun".into(),
+            url: "https://twitch.tv/streamer".into(),
+            ..Activity::new(ActivityKind::Streaming, "Hades")
+        }));
+        let stream_facts = right_now(&p, None, &PresenceLine::default(), now, 0);
+        assert_eq!(stream_facts[0].words, "Streaming Hades");
+        assert_eq!(stream_facts[0].url.as_deref(), Some("https://twitch.tv/streamer"));
     }
 
     #[test]
