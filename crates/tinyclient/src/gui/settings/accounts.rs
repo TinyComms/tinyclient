@@ -259,8 +259,59 @@ impl SettingsWindow {
         .detach();
     }
 
+    fn load_telegram_default_ttl(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_default_ttl_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    match crate::client::ask(&protocol::Request::GetDefaultDisappearing { account: acc }) {
+                        Ok(protocol::Response::DefaultDisappearing { seconds }) => Some(seconds),
+                        _ => None,
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(seconds) = loaded {
+                    this.tg_default_ttl.insert(account, seconds);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_telegram_default_ttl(&mut self, account: protocol::AccountKey, seconds: u32, cx: &mut Context<Self>) {
+        if self.tg_default_ttl.get(&account).copied() == Some(seconds) {
+            return;
+        }
+        self.tg_default_ttl.insert(account.clone(), seconds);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&protocol::Request::SetDefaultDisappearing { account: acc, seconds })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if answer.is_err() || matches!(answer, Ok(protocol::Response::Error { .. })) {
+                    this.tg_default_ttl_requested.remove(&account);
+                    this.load_telegram_default_ttl(account, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn telegram_call_privacy_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
         self.load_telegram_privacy(account.key.clone(), cx);
+        self.load_telegram_default_ttl(account.key.clone(), cx);
         let scope = protocol::settings::account_scope(&account.key);
         let always_relay = crate::gui::app::prefs::values()
             .stored(&scope, protocol::settings::TELEGRAM_ALWAYS_RELAY)
@@ -362,6 +413,47 @@ impl SettingsWindow {
                         this.set("tg-always-relay", relay_scope.clone(), protocol::settings::TELEGRAM_ALWAYS_RELAY, stored, cx);
                     })),
                 ),
+        );
+        // Account-wide default auto-delete timer for new Telegram chats.
+        let default_ttl = self.tg_default_ttl.get(&account.key).copied();
+        let ttl_control = if let Some(active) = default_ttl {
+            let mut seg = div().flex().flex_wrap().items_center().gap(px(4.));
+            for (c_ix, &secs) in protocol::disappearing_presets(Network::Telegram).iter().enumerate() {
+                let acc_key = account.key.clone();
+                seg = seg.child(
+                    button(
+                        ("tg-default-ttl", ix * 100 + c_ix),
+                        if active == secs { ButtonKind::Primary } else { ButtonKind::Secondary },
+                        protocol::format_disappearing(secs),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_telegram_default_ttl(acc_key.clone(), secs, cx);
+                    })),
+                );
+            }
+            seg.into_any_element()
+        } else {
+            div().type_small().text_color(theme::text_faint()).child("Loading…").into_any_element()
+        };
+        box_div = box_div.child(rule()).child(
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_ui().text_color(theme::text()).child("Default auto-delete timer"))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Automatically delete messages in new Telegram chats after this period.")),
+                )
+                .child(ttl_control),
         );
         box_div
     }

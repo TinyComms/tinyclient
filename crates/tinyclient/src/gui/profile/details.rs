@@ -84,12 +84,17 @@ fn disappearing_row(
         };
         choices = choices.child(seg);
     }
+    let heading = if row.key.network == Network::Telegram {
+        format!("Auto-delete: {}", protocol::format_disappearing(active))
+    } else {
+        format!("Disappearing messages: {}", protocol::format_disappearing(active))
+    };
     Some(
         div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .child(div().type_ui().child("Disappearing messages"))
+            .child(div().type_ui().child(heading))
             .child(div().flex().flex_wrap().gap(px(4.)).child(choices))
             .child(div().type_small().text_color(theme::text_faint()).child("Auto-deletes on the network (separate from local retention).")),
     )

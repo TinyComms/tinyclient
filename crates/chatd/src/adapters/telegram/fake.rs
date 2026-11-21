@@ -562,6 +562,10 @@ struct World {
     noforwards: HashSet<Who>,
     /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
     saved_gifs: Vec<i64>,
+    /// Per-chat auto-delete timer in seconds (`messages.setHistoryTTL`).
+    ttl_periods: HashMap<Who, i32>,
+    /// Account-wide default auto-delete timer for new chats (`messages.get/setDefaultHistoryTTL`).
+    default_ttl: i32,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -631,6 +635,8 @@ impl World {
             large_broke: false,
             noforwards: HashSet::new(),
             saved_gifs: vec![6_200],
+            ttl_periods: HashMap::new(),
+            default_ttl: 0,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -2190,6 +2196,9 @@ impl World {
                 let mut dialog = dialog.clone();
                 drafted(self, &mut dialog, *who);
                 self.flag_unread(&mut dialog);
+                if let tl::enums::Dialog::Dialog(plain) = &mut dialog {
+                    plain.ttl_period = self.ttl_periods.get(who).copied().filter(|&p| p > 0);
+                }
                 dialog
             }).collect();
             let mut chats = chats();
@@ -2673,6 +2682,7 @@ impl World {
                 &put(settings(None)),
             ]);
             full.about = "Weekend routes.".to_owned();
+            full.ttl_period = self.ttl_periods.get(&Who::Group(request.chat_id)).copied().filter(|&p| p > 0);
             // Its admins allow three reactions.
             let three = ["👍", "❤", "🔥"].map(|emoticon| tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into());
             full.available_reactions = Some(tl::types::ChatReactionsSome { reactions: three.to_vec() }.into());
@@ -2687,6 +2697,7 @@ impl World {
             let peer_settings: tl::types::PeerSettings = blank(&[&put(0u32)]);
             let mut full: tl::types::UserFull = blank(&[&put(0u32), &put(0u32), &put(id), &put(tl::enums::PeerSettings::from(peer_settings)), &put(settings(None)), &put(1i32)]);
             full.about = Some("Maps, mostly.".to_owned());
+            full.ttl_period = self.ttl_periods.get(&Who::User(id)).copied().filter(|&p| p > 0);
             full.blocked = self.blocked.contains(&id);
             let (phone_avail, phone_priv, video_avail) = self.call_flags.get(&id).copied().unwrap_or((true, false, false));
             full.phone_calls_available = phone_avail;
@@ -2789,6 +2800,55 @@ impl World {
             self.privacy.insert(name, mapped.clone());
             let found = tl::types::account::PrivacyRules { rules: mapped, chats: chats(), users: users() };
             return answer(tl::enums::account::PrivacyRules::Rules(found));
+        }
+        if let Some(request) = asked::<f::messages::SetHistoryTtl>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("SetHistoryTtl {} {}", peer.text(), request.period));
+            if request.period > 0 {
+                self.ttl_periods.insert(peer, request.period);
+            } else {
+                self.ttl_periods.remove(&peer);
+            }
+            self.next += 1;
+            let service = tl::types::MessageService {
+                out: true,
+                mentioned: false,
+                media_unread: false,
+                reactions_are_possible: false,
+                silent: false,
+                post: false,
+                legacy: false,
+                id: self.next,
+                from_id: Some(Who::User(ME).peer()),
+                peer_id: peer.peer(),
+                saved_peer_id: None,
+                reply_to: None,
+                date: crate::hub::now() as i32,
+                action: tl::types::MessageActionSetMessagesTtl {
+                    period: request.period,
+                    auto_setting_from: None,
+                }
+                .into(),
+                reactions: None,
+                ttl_period: None,
+            };
+            self.messages.entry(peer.text()).or_default().insert(service.id, service.clone().into());
+            let upd: tl::enums::Update = match peer {
+                Who::Channel(_) => tl::types::UpdateNewChannelMessage { message: service.into(), pts: 0, pts_count: 0 }.into(),
+                _ => tl::types::UpdateNewMessage { message: service.into(), pts: 0, pts_count: 0 }.into(),
+            };
+            return answer(updates(vec![upd]));
+        }
+        if asked::<f::messages::GetDefaultHistoryTtl>(body).is_some() {
+            self.log("GetDefaultHistoryTtl");
+            return answer(tl::enums::DefaultHistoryTtl::Ttl(tl::types::DefaultHistoryTtl {
+                period: self.default_ttl,
+            }));
+        }
+        if let Some(request) = asked::<f::messages::SetDefaultHistoryTtl>(body) {
+            self.log(&format!("SetDefaultHistoryTtl {}", request.period));
+            self.default_ttl = request.period.max(0);
+            return answer(true);
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;
@@ -2990,6 +3050,7 @@ impl World {
                 &put(1i32),
             ]);
             full.about = "Notes from the high country.".to_owned();
+            full.ttl_period = self.ttl_periods.get(&Who::Channel(channel.channel_id)).copied().filter(|&p| p > 0);
             // The channel turned reactions off; the forum allows all of them, two different
             // ones a message.
             if channel.channel_id == NOTES {

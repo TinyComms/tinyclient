@@ -3198,6 +3198,24 @@ impl Chat {
                 }
                 res
             }
+            Request::GetDefaultDisappearing { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::GetDefaultDisappearing { reply }) {
+                    Ok(seconds) => Response::DefaultDisappearing { seconds },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDefaultDisappearing { account, seconds } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetDefaultDisappearing { seconds, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
             Request::LeaveSpace { space } => self.leave_space(space),
             Request::CloseDirect { conversation } => {

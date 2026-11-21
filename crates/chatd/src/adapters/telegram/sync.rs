@@ -805,7 +805,11 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     };
     let mut fresh = row(account, who, &known);
     fresh.filing = Some(filing);
+    fresh.disappearing = dialog.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
     account.ctx.conversation(&fresh)?;
+    if dialog.ttl_period.is_some() {
+        account.ctx.disappearing(&id, fresh.disappearing)?;
+    }
     account.ctx.muted(&id, is_muted)?;
     let mut updated = 0;
     // The dialog list carries each chat's newest message: that is its preview, for free.

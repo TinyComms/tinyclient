@@ -1214,6 +1214,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         },
         Request::Fetch { .. } => Response::Media { files: Vec::new() },
         Request::Settings => Response::Settings { values: Vec::new() },
+        Request::GetDefaultDisappearing { .. } => Response::DefaultDisappearing { seconds: 0 },
         Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200 },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },

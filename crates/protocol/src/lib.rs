@@ -1561,6 +1561,15 @@ pub enum Request {
         conversation: Key,
         seconds: u32,
     },
+    /// Reads the account's default disappearing-messages timer for new chats (Telegram `messages.getDefaultHistoryTTL`).
+    GetDefaultDisappearing {
+        account: AccountKey,
+    },
+    /// Sets the account's default disappearing-messages timer for new chats (`seconds == 0` turns it off).
+    SetDefaultDisappearing {
+        account: AccountKey,
+        seconds: u32,
+    },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
     Leave {
         conversation: Key,
@@ -3107,6 +3116,10 @@ pub enum Response {
     ScheduledMessage {
         message: ScheduledMessage,
     },
+    /// Account's default disappearing-messages timer in seconds (`0` = off).
+    DefaultDisappearing {
+        seconds: u32,
+    },
 }
 
 /// The phone's app-private data directory, set once by the mobile entry (`set_support_dir`).
@@ -3547,6 +3560,14 @@ mod tests {
         assert_eq!(format_disappearing(604_800), "1w");
         assert!(disappearing_presets(Network::Signal).contains(&30));
         assert!(disappearing_presets(Network::Telegram).contains(&86_400));
+
+        let acct = AccountKey { network: Network::Telegram, account: "7001".into() };
+        let get_def = Request::GetDefaultDisappearing { account: acct.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&get_def).unwrap()).unwrap(), get_def);
+        let set_def = Request::SetDefaultDisappearing { account: acct, seconds: 604_800 };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_def).unwrap()).unwrap(), set_def);
+        let resp = Response::DefaultDisappearing { seconds: 604_800 };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
     }
 
     #[test]

@@ -50,6 +50,7 @@ impl Fault {
         match self {
             Fault::Rpc { .. } if self.flood().is_some() => wait_words(self.flood().unwrap_or(0)),
             Fault::Rpc { name, .. } => match name.as_str() {
+                "CHAT_ADMIN_REQUIRED" => "You don't have permission to do that in this chat.".to_owned(),
                 "CHAT_WRITE_FORBIDDEN" | "CHAT_SEND_PLAIN_FORBIDDEN" => "You can't write in this chat.".to_owned(),
                 "USER_IS_BLOCKED" | "YOU_BLOCKED_USER" => "You can't message this person.".to_owned(),
                 "USER_BANNED_IN_CHANNEL" => "You are not allowed to post here.".to_owned(),

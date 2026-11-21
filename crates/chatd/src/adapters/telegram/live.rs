@@ -331,6 +331,11 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
     let Some((conversation, mut mapped)) = placed(account, raw) else {
         return;
     };
+    if let tl::enums::Message::Service(svc) = raw {
+        if let tl::enums::MessageAction::SetMessagesTtl(ttl) = &svc.action {
+            let _ = account.ctx.disappearing(&conversation, (ttl.period > 0).then_some(ttl.period as u32));
+        }
+    }
     let watching = account.ctx.watching();
     let open = watching.conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation);
     let member = sync::member(account, mapped.peer);

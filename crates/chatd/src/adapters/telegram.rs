@@ -708,7 +708,12 @@ fn offline(ctx: &Context, command: Command) {
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SetMute { reply, .. }
+        | Command::SetDisappearing { reply, .. }
+        | Command::SetDefaultDisappearing { reply, .. }
+        | Command::Leave { reply, .. }
+        | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
@@ -824,6 +829,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::SetDisappearing { conversation_id, seconds, reply } => {
             let _ = reply.send(info::set_disappearing(account, &conversation_id, seconds).map_err(refused));
+        }
+        Command::GetDefaultDisappearing { reply } => {
+            let _ = reply.send(info::get_default_disappearing(account).map_err(refused));
+        }
+        Command::SetDefaultDisappearing { seconds, reply } => {
+            let _ = reply.send(info::set_default_disappearing(account, seconds).map_err(refused));
         }
         Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));

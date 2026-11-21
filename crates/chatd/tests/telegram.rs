@@ -3817,3 +3817,65 @@ fn save_and_unsave_gif() {
     };
     assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
 }
+
+#[test]
+fn auto_delete_timer_chat_and_default() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.disappearing, "Telegram must advertise disappearing capability");
+
+    // Set Odalys chat auto-delete to 1 week (604_800s).
+    assert_eq!(
+        world.ask(Request::SetDisappearing { conversation: key("u7002"), seconds: 604_800 }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SetHistoryTtl u7002 604800"),
+        "expected SetHistoryTtl u7002 604800 on wire, got: {:#?}",
+        world.calls()
+    );
+    // Conversation row & ConversationInfo both report the active timer.
+    let row = world.until("conversation disappearing timer", || {
+        world.conversation("u7002").filter(|c| c.disappearing == Some(604_800))
+    });
+    assert_eq!(row.disappearing, Some(604_800));
+    match world.ask(Request::ConversationInfo { conversation: key("u7002") }) {
+        Response::ConversationInfo { info } => assert_eq!(info.disappearing, Some(604_800)),
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    }
+    // Service message in the chat notes the auto-delete timer.
+    let service = world.until("auto-delete service line", || {
+        world.messages("u7002").into_iter().find(|m| m.text.contains("auto-delete after 1 week"))
+    });
+    assert_eq!(service.kind, protocol::MessageKind::System);
+
+    // Turn auto-delete off (0s).
+    assert_eq!(
+        world.ask(Request::SetDisappearing { conversation: key("u7002"), seconds: 0 }),
+        Response::Ok
+    );
+    world.until("conversation disappearing cleared", || {
+        world.conversation("u7002").filter(|c| c.disappearing.is_none())
+    });
+    match world.ask(Request::ConversationInfo { conversation: key("u7002") }) {
+        Response::ConversationInfo { info } => assert_eq!(info.disappearing, None),
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    }
+
+    // Account-wide default auto-delete timer for new chats.
+    assert_eq!(
+        world.ask(Request::GetDefaultDisappearing { account: account() }),
+        Response::DefaultDisappearing { seconds: 0 }
+    );
+    assert_eq!(
+        world.ask(Request::SetDefaultDisappearing { account: account(), seconds: 86_400 }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.ask(Request::GetDefaultDisappearing { account: account() }),
+        Response::DefaultDisappearing { seconds: 86_400 }
+    );
+    assert!(world.calls().iter().any(|c| c == "GetDefaultHistoryTtl"));
+    assert!(world.calls().iter().any(|c| c == "SetDefaultHistoryTtl 86400"));
+}

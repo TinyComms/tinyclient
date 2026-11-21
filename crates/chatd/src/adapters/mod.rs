@@ -550,6 +550,15 @@ pub enum Command {
         seconds: u32,
         reply: Reply<()>,
     },
+    /// Read the account's default disappearing-messages timer for new chats (seconds, 0 = off).
+    GetDefaultDisappearing {
+        reply: Reply<u32>,
+    },
+    /// Set the account's default disappearing-messages timer for new chats (seconds, 0 = off).
+    SetDefaultDisappearing {
+        seconds: u32,
+        reply: Reply<()>,
+    },
     /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
@@ -848,6 +857,7 @@ impl Command {
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
+            | Command::SetDefaultDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
             | Command::CloseDirect { reply, .. }
@@ -860,6 +870,7 @@ impl Command {
             | Command::FollowThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

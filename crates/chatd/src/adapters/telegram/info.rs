@@ -245,18 +245,39 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
 pub(super) fn set_disappearing(account: &Account, conversation: &str, seconds: u32) -> Result<(), Fault> {
     let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     let peer = account.input(who)?;
-    account.ask(&tl::functions::messages::SetHistoryTtl { peer, period: seconds as i32 })?;
+    let answer = account.ask(&tl::functions::messages::SetHistoryTtl { peer, period: seconds as i32 })?;
     let timer = (seconds > 0).then_some(seconds);
     let _ = account.ctx.disappearing(conversation, timer);
-    let line = if seconds == 0 {
-        "Disappearing messages are off".to_owned()
-    } else {
-        format!("Disappearing messages are set to {}", protocol::format_disappearing(seconds))
+    super::live::answered(account, &answer);
+    let has_update = match &answer {
+        tl::enums::Updates::Updates(all) => !all.updates.is_empty(),
+        tl::enums::Updates::Combined(all) => !all.updates.is_empty(),
+        tl::enums::Updates::UpdateShort(_) => true,
+        _ => false,
     };
-    let now = crate::hub::now();
-    let mut msg = Message::plain(format!("tg-ttl-{now}"), String::new(), line, now, false);
-    msg.kind = protocol::MessageKind::System;
-    let _ = account.ctx.message(conversation, &msg);
+    if !has_update {
+        let line = if seconds == 0 {
+            "You turned the auto-delete timer off".to_owned()
+        } else {
+            format!("You set messages to auto-delete after {}", protocol::format_disappearing(seconds))
+        };
+        let now = crate::hub::now();
+        let mut msg = Message::plain(format!("tg-ttl-{now}"), String::new(), line, now, false);
+        msg.kind = protocol::MessageKind::System;
+        let _ = account.ctx.message(conversation, &msg);
+    }
+    Ok(())
+}
+
+/// Reads Telegram's default auto-delete timer for new chats (`messages.getDefaultHistoryTTL`).
+pub(super) fn get_default_disappearing(account: &Account) -> Result<u32, Fault> {
+    let tl::enums::DefaultHistoryTtl::Ttl(ttl) = account.ask(&tl::functions::messages::GetDefaultHistoryTtl {})?;
+    Ok(ttl.period.max(0) as u32)
+}
+
+/// Sets Telegram's default auto-delete timer for new chats (`messages.setDefaultHistoryTTL`).
+pub(super) fn set_default_disappearing(account: &Account, seconds: u32) -> Result<(), Fault> {
+    account.ask(&tl::functions::messages::SetDefaultHistoryTtl { period: seconds as i32 })?;
     Ok(())
 }
 
