@@ -1571,7 +1571,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon
+                    opted_out, icon, max_file_bytes, read_only_reason, spam
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1615,9 +1615,9 @@ impl Store {
                         opted_out: row.get(19)?,
                         icon: row.get(20)?,
                         filing: None,
-                        max_file_bytes: 0,
-                        read_only_reason: String::new(),
-                        spam: false,
+                        max_file_bytes: row.get::<_, i64>(21)?.max(0) as u64,
+                        read_only_reason: row.get(22)?,
+                        spam: row.get(23)?,
                     },
                 ))
             })?

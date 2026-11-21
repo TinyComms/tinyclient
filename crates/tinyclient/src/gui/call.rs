@@ -616,6 +616,7 @@ fn handoff_label(network: Network) -> String {
     match network {
         Network::Slack => "Open huddle in Slack".to_owned(),
         Network::Telegram => "Open chat in Telegram".to_owned(),
+        Network::Messages => "Call in phone app".to_owned(),
         other => format!("Open in {}", other.label()),
     }
 }
@@ -631,13 +632,17 @@ fn handoff_pill_parts(network: Network) -> (Option<&'static str>, String) {
 
 /// Confirmation toast shown after handing a call off to the network's own app.
 fn handoff_toast(network: Network) -> String {
-    format!("Opened in {}", network.label())
+    match network {
+        Network::Messages => "Opened in phone app".to_owned(),
+        other => format!("Opened in {}", other.label()),
+    }
 }
 
 fn handoff_tooltip(network: Network) -> String {
     match network {
         Network::Slack => "Open huddle in Slack".to_owned(),
         Network::Telegram => "Opens this chat in the Telegram app to start a call there. tinyclient doesn't carry Telegram calls.".to_owned(),
+        Network::Messages => "Opens a phone link in your system's phone app. tinyclient doesn't carry phone calls.".to_owned(),
         other => format!("{0} calls open in the {0} app. tinyclient doesn't carry them.", other.label()),
     }
 }

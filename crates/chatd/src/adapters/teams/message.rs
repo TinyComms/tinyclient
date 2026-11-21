@@ -1079,8 +1079,17 @@ impl Teams {
             }
             None => (None, text),
         };
-        let (mut content, mentions_json) = if !mention_spans.is_empty() && kept_subject.is_none() {
-            let (c, m) = html::compose_with_mentions(body_text, mention_spans);
+        let prefix = (text.len().saturating_sub(body_text.len())) as u32;
+        let rebased_mentions: Vec<Span> = mention_spans
+            .iter()
+            .filter_map(|span| {
+                let start = span.start.checked_sub(prefix)?;
+                let end = span.end.checked_sub(prefix)?;
+                (end as usize <= body_text.len()).then(|| Span { start, end, style: span.style.clone() })
+            })
+            .collect();
+        let (mut content, mentions_json) = if !rebased_mentions.is_empty() {
+            let (c, m) = html::compose_with_mentions(body_text, &rebased_mentions);
             (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
         } else {
             let (c, m) = html::compose_rich(body_text);
@@ -1107,8 +1116,8 @@ impl Teams {
         self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
             let (mut shown, mut spans) = html::styled(body_text);
-            if !mention_spans.is_empty() && shown == body_text {
-                spans.extend(mention_spans.iter().cloned());
+            if !rebased_mentions.is_empty() && shown == body_text {
+                spans.extend(rebased_mentions.iter().cloned());
             }
             if let Some(subject) = &kept_subject {
                 let shift = (subject.len() + usize::from(!shown.is_empty())) as u32;

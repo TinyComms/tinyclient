@@ -1966,6 +1966,7 @@ fn capabilities() -> protocol::Capabilities {
         schedule: true,
         suppress_embeds: true,
         search: true,
+        close_direct: true,
         ..protocol::Capabilities::default()
     }
 }
