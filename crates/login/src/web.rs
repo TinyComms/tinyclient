@@ -274,9 +274,9 @@ mod tests {
             ticks: 0,
             log: Arc::default(),
         };
-        let provider = provider(page);
-        sign_in(&provider, "slack", Some("https://acme.slack.com/")).unwrap();
-        assert_eq!(provider.opened.lock().unwrap()[0].1, "https://acme.slack.com/");
+        let workspace = provider(page);
+        sign_in(&workspace, "slack", Some("https://acme.slack.com/")).unwrap();
+        assert_eq!(workspace.opened.lock().unwrap()[0].1, "https://acme.slack.com/");
         let blocked = provider(Scripted { url: String::new(), probe: None, cookie: None, closed: false, close_unprobed: false, ticks: 0, log: Arc::default() });
         assert_eq!(sign_in(&blocked, "slack", Some("https://evil.example/")), Err(USAGE));
         assert_eq!(sign_in(&blocked, "discord", Some("https://acme.slack.com/")), Err(USAGE));
