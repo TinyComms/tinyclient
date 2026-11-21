@@ -1244,6 +1244,17 @@ pub(super) fn create_topic(
     Ok(thread_id(forum, topic_id))
 }
 
+/// Closing, hiding, pinning, or deleting a topic needs the forum's `manage_topics` right.
+/// A title or icon edit does not.
+fn require_manage_topics(account: &Account, forum: Who) -> Result<(), Fault> {
+    let allowed = account.ctx.known(&forum.text()).ok().flatten().is_some_and(|row| row.rights.manage_topics);
+    if allowed {
+        Ok(())
+    } else {
+        Err(Fault::Rpc { code: 400, name: "CHAT_ADMIN_REQUIRED".to_owned(), value: None })
+    }
+}
+
 /// Edits a forum topic (title, icon, closed, hidden, pinned).
 pub(super) fn update_topic(
     account: &Account,
@@ -1257,6 +1268,9 @@ pub(super) fn update_topic(
     let Some((forum, Some(topic_id))) = Who::parse(topic_conv_id) else {
         return Err(Fault::Rpc { code: 400, name: "TOPIC_ID_INVALID".to_owned(), value: None });
     };
+    if closed.is_some() || hidden.is_some() || pinned.is_some() {
+        require_manage_topics(account, forum)?;
+    }
     let peer = account.input(forum)?;
     let emoji_id = parse_emoji_id(icon_emoji_id);
     if title.is_some() || emoji_id.is_some() || closed.is_some() || hidden.is_some() {
@@ -1272,6 +1286,13 @@ pub(super) fn update_topic(
         live::answered(account, &answer);
     }
     if let Some(pin) = pinned {
+        if pin {
+            let pinned_now = account.ctx.pinned_topics(&forum.text()).unwrap_or_default();
+            let mine = thread_id(forum, topic_id);
+            if pinned_now.iter().filter(|row| row.key.id != mine).count() >= 5 {
+                return Err(Fault::Rpc { code: 400, name: "PINNED_TOO_MUCH".to_owned(), value: None });
+            }
+        }
         let answer = account.ask(&tl::functions::messages::UpdatePinnedForumTopic {
             peer,
             topic_id,
@@ -1288,6 +1309,7 @@ pub(super) fn delete_topic(account: &Account, topic_conv_id: &str) -> Result<(),
     let Some((forum, Some(topic_id))) = Who::parse(topic_conv_id) else {
         return Err(Fault::Rpc { code: 400, name: "TOPIC_ID_INVALID".to_owned(), value: None });
     };
+    require_manage_topics(account, forum)?;
     let peer = account.input(forum)?;
     for _ in 0..200 {
         let tl::enums::messages::AffectedHistory::History(affected) =

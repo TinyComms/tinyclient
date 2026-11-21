@@ -1585,10 +1585,11 @@ impl Store {
     pub fn clear_sender_messages(&mut self, conversation: &Key, sender_id: &str) -> rusqlite::Result<Vec<String>> {
         let tx = self.db.transaction()?;
         let net = word(&conversation.network);
-        let prefix = format!("{}_%", conversation.id);
+        let escaped = conversation.id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let prefix = format!("{escaped}\\_%");
         let mut stmt = tx.prepare(
             "SELECT conversation, id, text, body FROM message
-              WHERE network = ?1 AND account = ?2 AND (conversation = ?3 OR conversation LIKE ?4)",
+              WHERE network = ?1 AND account = ?2 AND (conversation = ?3 OR conversation LIKE ?4 ESCAPE '\\')",
         )?;
         let mut to_delete: Vec<(String, String)> = Vec::new();
         for row in stmt.query_map(params![net, conversation.account, conversation.id, prefix], |row| {

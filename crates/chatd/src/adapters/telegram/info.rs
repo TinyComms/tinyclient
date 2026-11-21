@@ -356,6 +356,11 @@ pub(super) fn delete_participant_history(account: &Account, conversation: &str, 
         return Err(invalid("CHANNEL_INVALID"));
     };
     let (person, _) = Who::parse(person_id).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+    let allowed = matches!(person, Who::User(_))
+        && account.ctx.known(&who.text()).ok().flatten().is_some_and(|row| row.rights.delete_others);
+    if !allowed {
+        return Err(invalid("CHAT_ADMIN_REQUIRED"));
+    }
     let channel = account.input_channel(who)?;
     let participant = account.input(person)?;
     for _ in 0..64 {
@@ -368,6 +373,7 @@ pub(super) fn delete_participant_history(account: &Account, conversation: &str, 
             break;
         }
     }
+    let _ = account.ctx.clear_sender_messages(conversation, person_id);
     Ok(())
 }
 
@@ -382,13 +388,27 @@ pub(super) fn report_spam_messages(
         return Err(invalid("CHANNEL_INVALID"));
     };
     let (person, _) = Who::parse(person_id).ok_or_else(|| invalid("USER_ID_INVALID"))?;
-    let ids: Vec<i32> = message_ids.iter().filter_map(|id| id.parse::<i32>().ok()).collect();
-    if ids.is_empty() {
-        return Ok(());
+    if message_ids.is_empty() {
+        return Err(invalid("MESSAGE_ID_INVALID"));
+    }
+    let mut ids = Vec::with_capacity(message_ids.len());
+    for raw in message_ids {
+        ids.push(raw.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?);
+    }
+    let allowed = matches!(person, Who::User(_))
+        && account.ctx.known(&who.text()).ok().flatten().is_some_and(|row| row.rights.delete_others);
+    if !allowed {
+        return Err(invalid("CHAT_ADMIN_REQUIRED"));
     }
     let channel = account.input_channel(who)?;
     let participant = account.input(person)?;
-    account.ask(&tl::functions::channels::ReportSpam { channel, participant, id: ids })?;
+    for chunk in ids.chunks(100) {
+        account.ask(&tl::functions::channels::ReportSpam {
+            channel: channel.clone(),
+            participant: participant.clone(),
+            id: chunk.to_vec(),
+        })?;
+    }
     Ok(())
 }
 
@@ -401,6 +421,13 @@ pub(super) fn reschedule(
     post_at: i64,
 ) -> Result<protocol::ScheduledMessage, Fault> {
     let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    if post_at == protocol::SCHEDULE_WHEN_ONLINE {
+        super::check_schedule_target(
+            account,
+            who,
+            super::Options { schedule: Some(protocol::SCHEDULE_WHEN_ONLINE as i32), ..super::Options::default() },
+        )?;
+    }
     let id = parse_scheduled_id(scheduled_id)?;
     let peer = account.input(who)?;
     let schedule_date = i32::try_from(post_at).map_err(|_| invalid("SCHEDULE_DATE_INVALID"))?;

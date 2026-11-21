@@ -12,7 +12,7 @@ use protocol::{
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Sender, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
@@ -3536,7 +3536,10 @@ impl Chat {
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::DeleteMany { conversation, message_ids, scope } => {
                 if message_ids.is_empty() {
-                    return Response::Ok;
+                    return error(ErrorCode::Invalid, "choose at least one message to delete");
+                }
+                if message_ids.iter().collect::<HashSet<_>>().len() != message_ids.len() {
+                    return error(ErrorCode::Invalid, "the same message was listed more than once");
                 }
                 if message_ids.len() > 1_000 {
                     return error(ErrorCode::Invalid, "at most 1,000 messages may be deleted in one batch");

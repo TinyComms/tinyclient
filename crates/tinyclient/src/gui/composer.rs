@@ -50,7 +50,7 @@ pub use typing::preview as typing_preview;
 use super::components::place::{max_height, placed, Layer, Place};
 use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
-use super::people::{ask_later, Hub};
+use super::people::{ask_later, rough_last_seen, Hub};
 use super::playing;
 use super::state::Shell;
 use super::theme::{self, Type};
@@ -279,6 +279,8 @@ struct Target {
     blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
     bot: bool,
+    /// The direct peer hides an exact last-seen time (Telegram's rough "last seen …" words).
+    hidden_last_seen: bool,
     /// What the account may send.
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
@@ -3542,7 +3544,7 @@ impl Composer {
                         t.key.network,
                         t.kind,
                         t.special != protocol::Special::None || t.bot,
-                        false,
+                        t.hidden_last_seen,
                     )
                 });
                 if can_when_online {
@@ -3995,6 +3997,14 @@ impl Shell {
                 (person.relation == protocol::Relation::Blocked).then_some(person)
             })
             .flatten();
+        let hidden_last_seen = kind == ConversationKind::Direct
+            && open.peer.as_deref().is_some_and(|peer_id| {
+                let peer_key = Key::new(&open.key.account(), peer_id);
+                let hub = self.people_state.hub();
+                let live = hub.status_of(&peer_key);
+                let status = if live.is_empty() { hub.person(&peer_key).map(|person| person.status).unwrap_or_default() } else { live };
+                rough_last_seen(&status)
+            });
         let target = Target {
             key: open.key.clone(),
             title: open.title.clone(),
@@ -4007,6 +4017,7 @@ impl Shell {
             blocked_peer,
             special: open.special,
             bot: open.bot,
+            hidden_last_seen,
             can,
             send_as: self.send_as_of(&open.key),
         };
@@ -4039,6 +4050,7 @@ impl Shell {
             blocked_peer: None,
             special: protocol::Special::None,
             bot: false,
+            hidden_last_seen: false,
             can: self.can_of(thread),
             send_as: self.send_as_of(thread),
         };
@@ -4650,6 +4662,7 @@ mod tests {
             blocked_peer: None,
             special: protocol::Special::None,
             bot: false,
+            hidden_last_seen: false,
             joined: true,
             can: Capabilities::default(),
             send_as: Vec::new(),

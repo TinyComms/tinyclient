@@ -86,6 +86,7 @@ impl Fault {
                 "TOPIC_DELETED" => "This topic was deleted.".to_owned(),
                 "TOPIC_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
                 "TOPIC_ID_INVALID" => "That topic no longer exists.".to_owned(),
+                "PINNED_TOO_MUCH" => "You can pin at most five topics in a forum.".to_owned(),
                 "ICON_EMOJI_INVALID" => "That topic icon isn't valid.".to_owned(),
                 "DATE_INVALID" => "Choose a valid date.".to_owned(),
                 "SCHEDULE_TOO_MUCH" => "You can have at most 100 scheduled messages in one chat.".to_owned(),

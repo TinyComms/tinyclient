@@ -1113,8 +1113,8 @@ fn check_schedule_target(account: &Account, who: Who, opts: Options) -> Result<(
     if opts.schedule == Some(protocol::SCHEDULE_WHEN_ONLINE as i32) {
         match who {
             Who::User(uid) if uid != account.me => {
-                let hidden = account.dir().get(who).is_some_and(|known| !known.seen.is_empty());
-                if hidden {
+                let known = account.dir().get(who);
+                if known.as_ref().is_some_and(|known| known.bot || !known.seen.is_empty()) {
                     return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
                 }
             }
@@ -1212,14 +1212,18 @@ fn delete(account: &Account, conversation: &str, message: &str, scope: protocol:
 
 fn delete_many(account: &Account, conversation: &str, message_ids: &[String], scope: protocol::DeleteScope) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    if message_ids.is_empty() {
+        return Err(invalid());
+    }
     let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
     let mut parsed: Vec<(String, i32)> = Vec::with_capacity(message_ids.len());
+    let mut seen = HashSet::new();
     for raw in message_ids {
         let id = raw.parse::<i32>().map_err(|_| invalid())?;
+        if !seen.insert(id) {
+            return Err(invalid());
+        }
         parsed.push((raw.clone(), id));
-    }
-    if parsed.is_empty() {
-        return Ok(());
     }
     match who {
         Who::Channel(_) => {

@@ -458,9 +458,7 @@ pub(super) fn file(
         let Some(folder_str) = target else {
             continue;
         };
-        let folder_id: i32 = folder_str
-            .parse()
-            .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?;
+        let folder_id = parse_folder_id(folder_str)?;
         let tl::enums::messages::DialogFilters::Filters(found) = account.ask(&tl::functions::messages::GetDialogFilters {})?;
         let mut updated = None;
         for filter in found.filters {
@@ -579,10 +577,15 @@ pub(super) fn save_folder(account: &Account, spec: &protocol::FolderSpec) -> Res
         return Err(Fault::Rpc { code: 400, name: "FILTER_INCLUDE_EMPTY".to_owned(), value: None });
     }
     let editing = spec.id.is_some();
+    let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
     let id = match &spec.id {
         Some(raw) => parse_folder_id(raw)?,
         None => {
             let live = account.live();
+            let cap = if premium { 30 } else { 10 };
+            if live.filed.rules.len() >= cap {
+                return Err(Fault::Rpc { code: 400, name: "FILTERS_TOO_MUCH".to_owned(), value: None });
+            }
             let used: HashSet<i32> = live.filed.rules.iter().map(|r| r.id).collect();
             (2..=255)
                 .find(|cand| !used.contains(cand))
