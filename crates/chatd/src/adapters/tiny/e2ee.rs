@@ -460,6 +460,32 @@ struct Notes {
     revoked_device: Option<String>,
 }
 
+/// One link preview card in an opened sealed message.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OpenedPreview {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub site: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<OpenedFile>,
+}
+
+impl OpenedPreview {
+    pub(crate) fn of(p: &::e2ee::envelope::PreviewRef) -> OpenedPreview {
+        OpenedPreview {
+            url: p.url.clone(),
+            site: p.site.clone(),
+            title: p.title.clone(),
+            description: p.description.clone(),
+            image: p.image.as_ref().map(OpenedFile::of),
+        }
+    }
+}
+
 /// One opened message, as the cache keeps it.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Opened {
@@ -486,6 +512,8 @@ pub(crate) struct Opened {
     pub emoji: Vec<::e2ee::envelope::EmojiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<OpenedPreview>,
     /// An edit: the message it edits. Its text replaces the target's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edits: Option<String>,
@@ -2567,6 +2595,12 @@ impl Device {
             self.files
                 .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
         }
+        for preview in &opened.previews {
+            if let Some(file) = &preview.image {
+                self.files
+                    .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
+            }
+        }
         let Some(key) = self.cache_key.clone() else {
             return;
         };
@@ -2596,6 +2630,12 @@ impl Device {
         for file in &opened.attachments {
             self.files
                 .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
+        }
+        for preview in &opened.previews {
+            if let Some(file) = &preview.image {
+                self.files
+                    .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
+            }
         }
         Ok(())
     }
@@ -2793,6 +2833,7 @@ impl Device {
                 mentions: incoming.envelope.mentions.clone(),
                 emoji: incoming.envelope.emoji.clone(),
                 sticker_id: incoming.envelope.sticker_id.clone(),
+                previews: incoming.envelope.previews.iter().map(OpenedPreview::of).collect(),
                 edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
                 edited_by: None,
                 at: super::messages::unix_of(row.created_at).unwrap_or(0),
@@ -2858,6 +2899,7 @@ impl Device {
             mentions: envelope.mentions.clone(),
             emoji: envelope.emoji.clone(),
             sticker_id: envelope.sticker_id.clone(),
+            previews: envelope.previews.iter().map(OpenedPreview::of).collect(),
             edits: target_id.map(str::to_owned),
             edited_by: None,
             at: std::time::SystemTime::now()

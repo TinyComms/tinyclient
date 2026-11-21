@@ -1610,7 +1610,7 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
 /// encrypted conversation can wait for the people of a new group to join it (`e2ee::send`), so
 /// it has a thread of its own, and does not hold up the plain ones.
 fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
-    send_spans(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), None);
+    send_spans(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), None, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1623,6 +1623,7 @@ fn send_spans(
     reply_to: Option<String>,
     spans: Vec<protocol::Span>,
     sticker_id: Option<String>,
+    suppress_embeds: bool,
 ) {
     if !super::safe_id(&conversation_id) {
         let outcome = Err(super::CHECK.to_owned());
@@ -1635,7 +1636,7 @@ fn send_spans(
     let (posting, saved) = (ctx.clone(), saved.clone());
     in_order(account, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
-            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[], &spans, sticker_id.as_deref());
+            let outcome = post_message_with(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[], &spans, sticker_id.as_deref(), suppress_embeds);
             let sent = outcome.is_ok();
             posting.sent(&conversation_id, &client_id, outcome);
             crate::sendtime::stage("store");
@@ -1777,6 +1778,7 @@ fn mentions_from_spans(text: &str, spans: &[protocol::Span]) -> Vec<e2ee_core::e
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn post_message(
     ctx: &Context,
     saved: &Saved,
@@ -1788,11 +1790,27 @@ fn post_message(
     spans: &[protocol::Span],
     sticker_id: Option<&str>,
 ) -> Result<Message, String> {
+    post_message_with(ctx, saved, conversation_id, client_id, text, reply_to, attachment_ids, spans, sticker_id, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_message_with(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachment_ids: &[String],
+    spans: &[protocol::Span],
+    sticker_id: Option<&str>,
+    suppress_embeds: bool,
+) -> Result<Message, String> {
     if !super::safe_id(conversation_id) {
         return Err(super::CHECK.to_owned());
     }
     if sealed_here(ctx, saved, conversation_id)? {
-        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids, spans, sticker_id);
+        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids, spans, sticker_id, suppress_embeds);
     }
     let mut body = serde_json::Map::new();
     body.insert("body".to_owned(), Value::String(text.to_owned()));
@@ -1816,6 +1834,11 @@ fn post_message(
             body.insert("sticker_id".to_owned(), Value::String(sticker_id.to_owned()));
         }
     }
+    if !suppress_embeds && server_has_feature(saved, protocol::TINY_FEATURE_LINK_PREVIEWS) {
+        if let Some(preview_json) = fetch_plain_preview(saved, text) {
+            body.insert("previews".to_owned(), Value::Array(vec![preview_json]));
+        }
+    }
     let path = format!("/v1/conversations/{conversation_id}/messages");
     let answer = super::asked("POST", saved, &path, Some(Value::Object(body)));
     crate::sendtime::stage("post");
@@ -1824,6 +1847,115 @@ fn post_message(
         Ok((status, value)) => Err(super::explain(status, &value, super::Missing::Plain).to_owned()),
         Err(detail) => Err(detail.to_owned()),
     }
+}
+
+fn upload_media_bytes_plain(saved: &Saved, name: &str, mime: &str, bytes: &[u8]) -> Option<String> {
+    let boundary = format!("----TinyPreview{}", std::process::id());
+    let mut body = Vec::with_capacity(bytes.len() + 256);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: {mime}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let url = super::endpoint(&saved.base_url, "/v1/media");
+    let resp = super::agent()
+        .post(&url)
+        .header("Authorization", &format!("Bearer {}", saved.token))
+        .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .send(body.as_slice())
+        .ok()?;
+    if !(200..300).contains(&resp.status().as_u16()) {
+        return None;
+    }
+    let text = resp.into_body().read_to_string().ok()?;
+    let val: Value = serde_json::from_str(&text).ok()?;
+    let id = val
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| val.pointer("/media/id").and_then(Value::as_str))?;
+    super::safe_id(id).then(|| id.to_owned())
+}
+
+fn fetch_plain_preview(saved: &Saved, text: &str) -> Option<Value> {
+    let url = super::preview::first_https_url(text)?;
+    let fetched = super::preview::fetch_preview(&url)?;
+    let image_id = fetched
+        .image
+        .as_ref()
+        .and_then(|img| upload_media_bytes_plain(saved, "preview.jpg", "image/jpeg", &img.jpeg));
+    let mut obj = serde_json::Map::new();
+    obj.insert("url".to_owned(), Value::String(fetched.url));
+    if !fetched.site.is_empty() {
+        obj.insert("site".to_owned(), Value::String(fetched.site));
+    }
+    if !fetched.title.is_empty() {
+        obj.insert("title".to_owned(), Value::String(fetched.title));
+    }
+    if !fetched.description.is_empty() {
+        obj.insert("description".to_owned(), Value::String(fetched.description));
+    }
+    if let Some(id) = image_id {
+        obj.insert("image_attachment_id".to_owned(), Value::String(id));
+    }
+    Some(Value::Object(obj))
+}
+
+fn fetch_sealed_preview(saved: &Saved, conversation_id: &str, text: &str) -> Option<(e2ee_core::envelope::PreviewRef, Option<String>)> {
+    let url = super::preview::first_https_url(text)?;
+    let fetched = super::preview::fetch_preview(&url)?;
+    let mut img_ref = None;
+    let mut img_id = None;
+    if let Some(img) = fetched.image {
+        if let Ok(mut tmp) = tempfile::NamedTempFile::new() {
+            if std::io::Write::write_all(&mut tmp, &img.jpeg).is_ok() {
+                if let Ok(sealed) = super::sealing::seal(tmp.path(), "preview.jpg", "image/jpeg", true, conversation_id) {
+                    if let Ok(sealed_bytes) = std::fs::read(sealed.file.path()) {
+                        let boundary = format!("----TinySealedPrev{}", std::process::id());
+                        let mut body = Vec::with_capacity(sealed_bytes.len() + 512);
+                        body.extend_from_slice(
+                            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"sealed\"\r\n\r\n1\r\n").as_bytes(),
+                        );
+                        body.extend_from_slice(
+                            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"id\"\r\n\r\n{}\r\n", sealed.entry.id).as_bytes(),
+                        );
+                        body.extend_from_slice(
+                            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sealed.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
+                        );
+                        body.extend_from_slice(&sealed_bytes);
+                        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+                        let endpoint = super::endpoint(&saved.base_url, "/v1/media");
+                        if let Ok(resp) = super::agent()
+                            .post(&endpoint)
+                            .header("Authorization", &format!("Bearer {}", saved.token))
+                            .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+                            .send(body.as_slice())
+                        {
+                            if (200..300).contains(&resp.status().as_u16()) {
+                                let mut entry = sealed.entry;
+                                entry.width = img.width;
+                                entry.height = img.height;
+                                img_id = Some(entry.id.clone());
+                                img_ref = Some(entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some((
+        e2ee_core::envelope::PreviewRef {
+            url: fetched.url,
+            site: fetched.site,
+            title: fetched.title,
+            description: fetched.description,
+            image: img_ref,
+        },
+        img_id,
+    ))
 }
 
 /// Words for an encrypted conversation this device cannot send to yet.
@@ -1847,7 +1979,6 @@ fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bo
 /// An end-to-end encrypted message: the envelope is encrypted by this device and posted as
 /// ciphertext. What the server answers is read back through the cache, which holds the text.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn post_sealed(
     ctx: &Context,
     saved: &Saved,
@@ -1859,23 +1990,36 @@ fn post_sealed(
     attachment_ids: &[String],
     spans: &[protocol::Span],
     sticker_id: Option<&str>,
+    suppress_embeds: bool,
 ) -> Result<Message, String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
+    let mut all_ids = attachment_ids.to_vec();
+    let mut previews = Vec::new();
+    if !suppress_embeds {
+        if let Some((preview, img_id)) = fetch_sealed_preview(saved, conversation_id, text) {
+            if let Some(id) = img_id {
+                all_ids.push(id);
+            }
+            previews.push(preview);
+        }
+    }
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.reply_to = reply_to.filter(|id| super::safe_id(id)).map(str::to_owned);
     envelope.attachments = attachments;
     envelope.mentions = mentions_from_spans(text, spans);
     envelope.emoji = emoji_from_spans(text, spans);
     envelope.sticker_id = sticker_id.filter(|id| super::safe_id(id)).map(str::to_owned);
+    envelope.previews = previews;
     envelope.sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
-    let answer = e2ee::send(&device, conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, attachment_ids)?;
+    let answer = e2ee::send(&device, conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, &all_ids)?;
     accept_message(ctx, saved, conversation_id, &answer)
 }
 
 fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
     let sticker_id = outgoing.pick.as_ref().filter(|p| p.kind == CatalogKind::Stickers).map(|p| strip_emoji_media_id(&p.id).to_owned());
+    let suppress_embeds = outgoing.suppress_embeds;
     if outgoing.files.is_empty() {
-        send_spans(ctx, saved, conversation_id, client_id, text, reply_to, outgoing.spans, sticker_id);
+        send_spans(ctx, saved, conversation_id, client_id, text, reply_to, outgoing.spans, sticker_id, suppress_embeds);
         return;
     }
     if outgoing.files.len() > protocol::ATTACHMENTS_LIMIT {
@@ -1940,7 +2084,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             }
             upload.check()?;
             let ids: Vec<String> = refs.iter().map(|file| file.id.clone()).collect();
-            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans, None)
+            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans, None, suppress_embeds)
         });
         return;
     }
@@ -1964,7 +2108,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             ids.push(id.to_owned());
         }
         upload.check()?;
-        post_message(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids, &spans, None)
+        post_message_with(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids, &spans, None, suppress_embeds)
     });
 }
 
@@ -2306,6 +2450,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         if let Some(sticker_id) = wire.sticker_id.as_deref() {
             apply_sticker(&mut message, saved, sticker_id);
         }
+        apply_wire_previews(&mut message, saved, &wire.previews, media);
     }
     relink(&mut message);
     Some(message)
@@ -2360,6 +2505,77 @@ fn apply_sticker(message: &mut Message, saved: &Saved, sticker_id: &str) {
     let mut attachment = Attachment::new(item.name.clone(), file);
     attachment.sticker = true;
     message.attachments.push(attachment);
+}
+
+fn apply_wire_previews(
+    message: &mut Message,
+    saved: &Saved,
+    previews: &[WirePreview],
+    media: &mut Vec<(MediaFile, String)>,
+) {
+    for p in previews.iter().take(e2ee_core::envelope::MAX_PREVIEWS) {
+        if !(p.url.starts_with("https://") || p.url.starts_with("http://")) {
+            continue;
+        }
+        let site = super::preview::real_host(&p.url);
+        if site.is_empty() {
+            continue;
+        }
+        let image = p
+            .image_attachment_id
+            .as_deref()
+            .filter(|id| super::safe_id(id))
+            .map(|id| {
+                let file = MediaFile::new(id, MediaKind::Image);
+                let url = format!("{}/v1/media/{id}", saved.base_url.trim_end_matches('/'));
+                media.push((file.clone(), url));
+                file
+            });
+        message.previews.push(protocol::Preview {
+            url: p.url.clone(),
+            site,
+            title: super::preview::clean_field(&p.title, 200),
+            description: super::preview::clean_field(&p.description, 500),
+            image,
+        });
+    }
+}
+
+fn apply_sealed_previews(
+    message: &mut Message,
+    saved: &Saved,
+    previews: &[e2ee::OpenedPreview],
+    media: &mut Vec<(MediaFile, String)>,
+) {
+    for p in previews.iter().take(e2ee_core::envelope::MAX_PREVIEWS) {
+        if !(p.url.starts_with("https://") || p.url.starts_with("http://")) {
+            continue;
+        }
+        let site = super::preview::real_host(&p.url);
+        if site.is_empty() {
+            continue;
+        }
+        let image = p
+            .image
+            .as_ref()
+            .filter(|img| super::safe_id(&img.id))
+            .map(|img| {
+                let mut file = MediaFile::new(&img.id, MediaKind::Image);
+                file.width = img.width;
+                file.height = img.height;
+                file.bytes = img.bytes;
+                let url = format!("{}/v1/media/{}", saved.base_url.trim_end_matches('/'), img.id);
+                media.push((file.clone(), url));
+                file
+            });
+        message.previews.push(protocol::Preview {
+            url: p.url.clone(),
+            site,
+            title: super::preview::clean_field(&p.title, 200),
+            description: super::preview::clean_field(&p.description, 500),
+            image,
+        });
+    }
 }
 
 /// Maps structured mentions onto `Style::Mention` spans, validates UTF-8 byte ranges against
@@ -2464,6 +2680,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
                 if let Some(sticker_id) = opened.sticker_id.as_deref() {
                     apply_sticker(&mut message, saved, sticker_id);
                 }
+                apply_sealed_previews(&mut message, saved, &opened.previews, media);
             }
             Some(Read::Edit) => return None,
             Some(Read::Undecryptable) | None => {
@@ -2598,6 +2815,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
             protocol::EmojiScope::None
         },
         stickers: server_caps.has(protocol::TINY_FEATURE_STICKERS),
+        suppress_embeds: server_caps.has(protocol::TINY_FEATURE_LINK_PREVIEWS),
         reply: true,
         edit: true,
         delete: true,
@@ -3276,6 +3494,20 @@ struct WireLast {
 }
 
 #[derive(Deserialize)]
+struct WirePreview {
+    url: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    site: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    image_attachment_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct WireMessage {
     id: String,
     #[serde(default)]
@@ -3302,6 +3534,8 @@ struct WireMessage {
     emoji: Vec<e2ee_core::envelope::EmojiRef>,
     #[serde(default)]
     sticker_id: Option<String>,
+    #[serde(default)]
+    previews: Vec<WirePreview>,
     /// An end-to-end encrypted row: `body` is empty, and these say what it is.
     #[serde(default)]
     e2ee: bool,
@@ -5230,5 +5464,80 @@ mod tests {
         let mut media = Vec::new();
         let fallback = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
         assert!(!fallback.spans.iter().any(|s| matches!(s.style, protocol::Style::Emoji { .. })));
+    }
+
+    #[test]
+    fn link_previews_capability_and_receive_forces_real_host() {
+        let (_adapter, _ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["link_previews"]}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            None
+        });
+        let caps = account_caps(&saved);
+        assert!(caps.suppress_embeds, "link_previews feature should enable composer link chip");
+
+        // Plaintext receive: spoofed site name is overridden with real host of url; image comes from Tiny server.
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-prev-1",
+            "author_id": PEER,
+            "body": "Read https://actual.example.org/story",
+            "created_at": WHEN,
+            "previews": [{
+                "url": "https://actual.example.org/story",
+                "site": "bank-of-trust.com",
+                "title": "Real Story",
+                "description": "Details here",
+                "image_attachment_id": "img-prev-1"
+            }]
+        })).unwrap();
+        let mut media = Vec::new();
+        let msg = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert_eq!(msg.previews.len(), 1);
+        assert_eq!(msg.previews[0].site, "actual.example.org");
+        assert_eq!(msg.previews[0].title, "Real Story");
+        assert_eq!(msg.previews[0].image.as_ref().map(|f| f.id.as_str()), Some("img-prev-1"));
+        assert!(media.iter().any(|(f, url)| f.id == "img-prev-1" && url.ends_with("/v1/media/img-prev-1")));
+
+        // Sealed receive: same host enforcement + Tiny server media registration.
+        let sealed_wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-prev-2",
+            "author_id": PEER,
+            "body": "",
+            "created_at": WHEN,
+            "e2ee": true,
+            "kind": "message",
+            "ciphertext": "AQID"
+        })).unwrap();
+        let opened = e2ee::Opened {
+            text: "See https://docs.example.net/guide".into(),
+            previews: vec![e2ee::OpenedPreview {
+                url: "https://docs.example.net/guide".into(),
+                site: "spoofed.evil".into(),
+                title: "Guide".into(),
+                description: "Docs".into(),
+                image: Some(e2ee::OpenedFile {
+                    id: "img-prev-sealed".into(),
+                    name: "preview.jpg".into(),
+                    mime: "image/jpeg".into(),
+                    bytes: 1234,
+                    width: 640,
+                    height: 360,
+                    ..e2ee::OpenedFile::default()
+                }),
+            }],
+            ..e2ee::Opened::default()
+        };
+        let mut opened_map = HashMap::new();
+        opened_map.insert("m-prev-2".into(), Read::Opened(opened));
+        let mut sealed_media = Vec::new();
+        let smsg = map_message(&saved, &HashMap::new(), &sealed_wire, &opened_map, &mut sealed_media).unwrap();
+        assert_eq!(smsg.previews.len(), 1);
+        assert_eq!(smsg.previews[0].site, "docs.example.net");
+        assert_eq!(smsg.previews[0].image.as_ref().map(|f| f.id.as_str()), Some("img-prev-sealed"));
+        assert!(sealed_media.iter().any(|(f, url)| f.id == "img-prev-sealed" && url.ends_with("/v1/media/img-prev-sealed")));
     }
 }

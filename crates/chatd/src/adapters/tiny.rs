@@ -18,6 +18,7 @@ pub(crate) mod live;
 pub(crate) mod manage;
 mod browser;
 mod messages;
+pub(crate) mod preview;
 mod sealing;
 pub mod signin;
 

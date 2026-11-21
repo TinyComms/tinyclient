@@ -397,6 +397,8 @@ pub const TINY_FEATURE_MENTIONS: &str = "mentions";
 pub const TINY_FEATURE_CUSTOM_EMOJI: &str = "custom_emoji";
 /// Community stickers (`kind=sticker` on `/v1/emoji` and `sticker_id` on messages).
 pub const TINY_FEATURE_STICKERS: &str = "stickers";
+/// Sender-built link preview cards (`previews` on messages).
+pub const TINY_FEATURE_LINK_PREVIEWS: &str = "link_previews";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.

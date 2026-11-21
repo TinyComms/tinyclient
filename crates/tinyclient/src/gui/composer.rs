@@ -976,11 +976,12 @@ impl Composer {
                 return;
             }
         };
+        let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
             silent: silent && controls.silent,
-            suppress_embeds: self.no_preview && controls.link_chip && !hosts.is_empty(),
+            suppress_embeds: (self.no_preview || tiny_previews_off) && controls.link_chip && !hosts.is_empty(),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
@@ -3104,7 +3105,8 @@ impl Composer {
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
         let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
-        let hosts = if self.controls().link_chip && unlocked { niceties::link_hosts(&text) } else { Vec::new() };
+        let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
+        let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
             let suppressed = self.no_preview;
             div()

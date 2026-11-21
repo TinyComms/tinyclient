@@ -353,3 +353,37 @@ fn custom_emoji_and_sticker_roundtrip_in_envelope() {
     assert_eq!(decoded.emoji[0].id, "e-1");
     assert_eq!(decoded.sticker_id.as_deref(), Some("s-1"));
 }
+
+#[test]
+fn link_preview_roundtrip_in_envelope() {
+    let img = AttachmentRef {
+        id: "p-img-1".into(),
+        key: AttachmentKey::from_bytes([7; 32]),
+        name: "preview.jpg".into(),
+        mime: "image/jpeg".into(),
+        bytes: 4096,
+        sha256: [9; 32],
+        width: 640,
+        height: 360,
+        duration: 0,
+        voice: false,
+        waveform: Vec::new(),
+    };
+    let preview = e2ee::envelope::PreviewRef {
+        url: "https://example.com/post".into(),
+        site: "example.com".into(),
+        title: "A Post".into(),
+        description: "Summary".into(),
+        image: Some(img),
+    };
+    let env = Envelope {
+        text: "Look at https://example.com/post".into(),
+        previews: vec![preview.clone()],
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.previews, vec![preview]);
+    let edit_decoded = Envelope::decode(Kind::Edit, &env.encode(Kind::Edit).unwrap()).unwrap();
+    assert!(edit_decoded.previews.is_empty());
+}

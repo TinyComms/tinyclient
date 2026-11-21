@@ -109,6 +109,19 @@ pub struct EmojiRef {
     pub end: u32,
 }
 
+/// At most this many link preview cards in one sealed message.
+pub const MAX_PREVIEWS: usize = 3;
+
+/// A sender-built link preview card carried inside a sealed envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRef {
+    pub url: String,
+    pub site: String,
+    pub title: String,
+    pub description: String,
+    pub image: Option<AttachmentRef>,
+}
+
 /// A message or an edit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Envelope {
@@ -122,6 +135,8 @@ pub struct Envelope {
     pub emoji: Vec<EmojiRef>,
     /// Community sticker id when the message is a sticker. Messages only.
     pub sticker_id: Option<String>,
+    /// Sender-built link preview cards. Messages only.
+    pub previews: Vec<PreviewRef>,
     /// Milliseconds since the Unix epoch, as the sender's clock said. Messages only. Unverified:
     /// the server's `created_at` is the order.
     pub sent_at: Option<i64>,
@@ -151,6 +166,19 @@ struct WireAttachment {
 }
 
 #[derive(Serialize, Deserialize)]
+struct WirePreview {
+    url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    site: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<WireAttachment>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Wire {
     v: u64,
     #[serde(default)]
@@ -165,11 +193,58 @@ struct Wire {
     emoji: Vec<EmojiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sticker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    previews: Vec<WirePreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sent_at: Option<i64>,
     /// Reactions only, and always written there: absent means nothing on a message or an edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     on: Option<bool>,
+}
+
+fn encode_attachment(attachment: &AttachmentRef) -> Result<WireAttachment> {
+    if attachment.id.len() > MAX_ID
+        || attachment.name.len() > MAX_NAME
+        || attachment.mime.len() > MAX_MIME
+    {
+        return Err(Error::TooLarge("attachment field"));
+    }
+    Ok(WireAttachment {
+        id: attachment.id.clone(),
+        key: STANDARD.encode(attachment.key.as_bytes()),
+        name: attachment.name.clone(),
+        mime: attachment.mime.clone(),
+        bytes: attachment.bytes,
+        sha256: STANDARD.encode(attachment.sha256),
+        width: attachment.width,
+        height: attachment.height,
+        duration: attachment.duration,
+        voice: attachment.voice,
+        waveform: attachment.waveform.iter().copied().take(MAX_WAVEFORM).collect(),
+    })
+}
+
+fn decode_attachment(attachment: WireAttachment) -> Result<AttachmentRef> {
+    if attachment.id.is_empty()
+        || attachment.id.len() > MAX_ID
+        || attachment.name.len() > MAX_NAME
+        || attachment.mime.len() > MAX_MIME
+    {
+        return Err(Error::Malformed("attachment"));
+    }
+    Ok(AttachmentRef {
+        key: AttachmentKey::from_bytes(decode_b32(&attachment.key, "attachment key")?),
+        sha256: decode_b32(&attachment.sha256, "attachment hash")?,
+        id: attachment.id,
+        name: attachment.name,
+        mime: attachment.mime,
+        bytes: attachment.bytes,
+        width: attachment.width,
+        height: attachment.height,
+        duration: attachment.duration,
+        voice: attachment.voice,
+        waveform: attachment.waveform.iter().copied().take(MAX_WAVEFORM).collect(),
+    })
 }
 
 fn decode_b32(text: &str, what: &'static str) -> Result<[u8; 32]> {
@@ -204,28 +279,25 @@ impl Envelope {
         let attachments = self
             .attachments
             .iter()
-            .map(|attachment| {
-                if attachment.id.len() > MAX_ID
-                    || attachment.name.len() > MAX_NAME
-                    || attachment.mime.len() > MAX_MIME
-                {
-                    return Err(Error::TooLarge("attachment field"));
-                }
-                Ok(WireAttachment {
-                    id: attachment.id.clone(),
-                    key: STANDARD.encode(attachment.key.as_bytes()),
-                    name: attachment.name.clone(),
-                    mime: attachment.mime.clone(),
-                    bytes: attachment.bytes,
-                    sha256: STANDARD.encode(attachment.sha256),
-                    width: attachment.width,
-                    height: attachment.height,
-                    duration: attachment.duration,
-                    voice: attachment.voice,
-                    waveform: attachment.waveform.iter().copied().take(MAX_WAVEFORM).collect(),
-                })
-            })
+            .map(encode_attachment)
             .collect::<Result<Vec<_>>>()?;
+        let previews = if kind == Kind::Message {
+            self.previews
+                .iter()
+                .take(MAX_PREVIEWS)
+                .map(|preview| {
+                    Ok(WirePreview {
+                        url: preview.url.clone(),
+                        site: preview.site.clone(),
+                        title: preview.title.clone(),
+                        description: preview.description.clone(),
+                        image: preview.image.as_ref().map(encode_attachment).transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let wire = Wire {
             v: VERSION,
             text: self.text.clone(),
@@ -249,6 +321,7 @@ impl Envelope {
             } else {
                 None
             },
+            previews,
             sent_at: if kind == Kind::Message {
                 self.sent_at
             } else {
@@ -289,29 +362,25 @@ impl Envelope {
         let attachments = wire
             .attachments
             .into_iter()
-            .map(|attachment| {
-                if attachment.id.is_empty()
-                    || attachment.id.len() > MAX_ID
-                    || attachment.name.len() > MAX_NAME
-                    || attachment.mime.len() > MAX_MIME
-                {
-                    return Err(Error::Malformed("attachment"));
-                }
-                Ok(AttachmentRef {
-                    key: AttachmentKey::from_bytes(decode_b32(&attachment.key, "attachment key")?),
-                    sha256: decode_b32(&attachment.sha256, "attachment hash")?,
-                    id: attachment.id,
-                    name: attachment.name,
-                    mime: attachment.mime,
-                    bytes: attachment.bytes,
-                    width: attachment.width,
-                    height: attachment.height,
-                    duration: attachment.duration,
-                    voice: attachment.voice,
-                    waveform: attachment.waveform.iter().copied().take(MAX_WAVEFORM).collect(),
-                })
-            })
+            .map(decode_attachment)
             .collect::<Result<Vec<_>>>()?;
+        let previews = if kind == Kind::Message {
+            wire.previews
+                .into_iter()
+                .take(MAX_PREVIEWS)
+                .map(|preview| {
+                    Ok(PreviewRef {
+                        url: preview.url,
+                        site: preview.site,
+                        title: preview.title,
+                        description: preview.description,
+                        image: preview.image.map(decode_attachment).transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let (reply_to, sent_at, on) = match kind {
             Kind::Message => (wire.reply_to, wire.sent_at, false),
             Kind::Edit => (None, None, false),
@@ -339,6 +408,7 @@ impl Envelope {
             mentions,
             emoji,
             sticker_id,
+            previews,
             sent_at,
             on,
         })
