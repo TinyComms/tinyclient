@@ -1031,6 +1031,7 @@ impl Demo {
             Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

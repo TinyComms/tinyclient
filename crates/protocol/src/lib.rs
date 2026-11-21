@@ -262,6 +262,9 @@ pub struct Space {
     /// The user has permission to create channels in this Space (`Request::CreateChannel`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_channels: bool,
+    /// The user has permission to create invite links in at least one channel of this Space (`Request::CreateInvite`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_create_invites: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1731,6 +1734,26 @@ pub enum Request {
     InviteJoin {
         account: AccountKey,
         code: String,
+    },
+    /// Create an invite link for a channel (`conversation`), a Space (`space`, picking the first
+    /// channel that allows invites), or a friend-invite link (`account` alone).
+    /// Answers `Response::Link { url }`.
+    CreateInvite {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        /// Expiry in seconds (`0` = never; Discord default `604_800` = 7 days).
+        #[serde(default)]
+        max_age: u32,
+        /// Maximum uses (`0` = unlimited).
+        #[serde(default)]
+        max_uses: u32,
+        /// Grant temporary membership.
+        #[serde(default, skip_serializing_if = "is_false")]
+        temporary: bool,
     },
     Watch(Watching),
 
@@ -3580,6 +3603,7 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            create_invite: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }

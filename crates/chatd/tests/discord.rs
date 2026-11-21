@@ -5238,3 +5238,151 @@ fn group_dm_start_add_friend_filter_limit_and_1to1_escalation() {
         other => panic!("expected Refused over 10-person cap, got {other:?}"),
     }
 }
+
+#[test]
+fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invites() {
+    // 1. Default READY: @everyone has permissions "36769344" (bit 0 CREATE_INSTANT_INVITE is unset).
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+    let can_friend_invite = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account")
+            .can
+            .create_friend_invite,
+        other => panic!("{other:?}"),
+    };
+    assert!(can_friend_invite);
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let guild = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            assert!(!guild.can_create_invites, "guild without CREATE_INSTANT_INVITE must report false");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!world.conversation("4101").rights.create_invite);
+
+    // Channel and server invite creation are refused locally with zero HTTP calls.
+    match world.ask(Request::CreateInvite {
+        conversation: Some(world.key("4101")),
+        space: None,
+        account: None,
+        max_age: 3600,
+        max_uses: 5,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for channel without CREATE_INSTANT_INVITE, got {other:?}"),
+    }
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        max_age: 604_800,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for server without any invite-capable channel, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4101/invites").is_empty());
+
+    // Friend invite hits POST /users/@me/invites and returns a discord.gg link.
+    world.discord.script("/users/@me/invites", 200, json!({"code": "fr1end"}));
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        max_age: 0,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Link { url } => assert_eq!(url, "https://discord.gg/fr1end"),
+        other => panic!("expected Response::Link for friend invite, got {other:?}"),
+    }
+    let friend_reqs = world.discord.requests_to("POST", "/users/@me/invites");
+    assert_eq!(friend_reqs.len(), 1);
+    assert_eq!(friend_reqs[0].body, json!({}));
+
+    // 2. Guild 4000 grants CREATE_INSTANT_INVITE (bit 0) on @everyone, but denies it on 4105 (#rules, first in sidebar).
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["roles"][0]["permissions"] = json!("36769345");
+    for ch in ready["guilds"][0]["channels"].as_array_mut().unwrap() {
+        if ch["id"] == "4105" {
+            ch["permission_overwrites"] = json!([
+                {"id": "4000", "type": 0, "allow": "0", "deny": "1"}
+            ]);
+        }
+    }
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let guild = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            assert!(guild.can_create_invites, "guild with invite-capable channel must report true");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!world.conversation("4105").rights.create_invite, "denied overwrite must clear create_invite");
+    assert!(world.conversation("4101").rights.create_invite);
+    assert!(world.conversation("4102").rights.create_invite);
+
+    // Denied channel 4105 refuses locally.
+    match world.ask(Request::CreateInvite {
+        conversation: Some(world.key("4105")),
+        space: None,
+        account: None,
+        max_age: 3600,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused on denied channel 4105, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4105/invites").is_empty());
+
+    // Explicit channel invite on 4102 sends max_age, max_uses, temporary, flags: 0.
+    world.discord.script("/channels/4102/invites", 200, json!({"code": "chan4102"}));
+    match world.ask(Request::CreateInvite {
+        conversation: Some(world.key("4102")),
+        space: None,
+        account: None,
+        max_age: 3600,
+        max_uses: 5,
+        temporary: true,
+    }) {
+        Response::Link { url } => assert_eq!(url, "https://discord.gg/chan4102"),
+        other => panic!("expected Response::Link, got {other:?}"),
+    }
+    let ch_reqs = world.discord.requests_to("POST", "/channels/4102/invites");
+    assert_eq!(ch_reqs.len(), 1);
+    assert_eq!(
+        ch_reqs[0].body,
+        json!({"max_age": 3600, "max_uses": 5, "temporary": true, "flags": 0})
+    );
+
+    // Server-level invite on 4000 skips denied 4105 and picks first allowed channel 4101 (#general).
+    world.discord.script("/channels/4101/invites", 200, json!({"code": "srv4000"}));
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        max_age: 604_800,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Link { url } => assert_eq!(url, "https://discord.gg/srv4000"),
+        other => panic!("expected Response::Link for server invite, got {other:?}"),
+    }
+    let srv_reqs = world.discord.requests_to("POST", "/channels/4101/invites");
+    assert_eq!(srv_reqs.len(), 1);
+    assert_eq!(
+        srv_reqs[0].body,
+        json!({"max_age": 604_800, "max_uses": 0, "temporary": false, "flags": 0})
+    );
+}

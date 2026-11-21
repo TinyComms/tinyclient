@@ -534,6 +534,15 @@ pub enum Command {
         code: String,
         reply: Reply<(Option<String>, Option<String>)>,
     },
+    /// Create an invite link for a channel (`conversation_id`), Space (`space_id`), or friend invite (both `None`).
+    CreateInvite {
+        conversation_id: Option<String>,
+        space_id: Option<String>,
+        max_age: u32,
+        max_uses: u32,
+        temporary: bool,
+        reply: Reply<String>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -846,6 +855,7 @@ impl Command {
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
@@ -1045,6 +1055,15 @@ impl Context {
     pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
         let space = self.key(space_id);
         if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sets whether the user can create invite links in `space_id`.
+    pub fn set_space_can_create_invites(&self, space_id: &str, can: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_can_create_invites(&space, can)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())

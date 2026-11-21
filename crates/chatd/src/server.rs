@@ -1707,6 +1707,41 @@ impl Chat {
         }
     }
 
+    fn create_invite(
+        &self,
+        conversation: Option<Key>,
+        space: Option<Key>,
+        account: Option<AccountKey>,
+        max_age: u32,
+        max_uses: u32,
+        temporary: bool,
+    ) -> Response {
+        let Some(account) = conversation
+            .as_ref()
+            .map(Key::account)
+            .or_else(|| space.as_ref().map(Key::account))
+            .or(account)
+        else {
+            return error(ErrorCode::Refused, "Choose a channel, server, or account to create an invite.");
+        };
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.map(|k| k.id);
+        let space_id = space.map(|k| k.id);
+        match self.ask(&account, |reply| Command::CreateInvite {
+            conversation_id,
+            space_id,
+            max_age,
+            max_uses,
+            temporary,
+            reply,
+        }) {
+            Ok(url) => Response::Link { url },
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -3280,6 +3315,9 @@ impl Chat {
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
+            Request::CreateInvite { conversation, space, account, max_age, max_uses, temporary } => {
+                self.create_invite(conversation, space, account, max_age, max_uses, temporary)
+            }
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

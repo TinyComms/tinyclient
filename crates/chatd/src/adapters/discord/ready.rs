@@ -5,7 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    KICK_MEMBERS, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES, SEND_MESSAGES, VIEW_CHANNEL,
+    CREATE_INSTANT_INVITE, KICK_MEMBERS, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES, SEND_MESSAGES,
+    VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -266,6 +267,7 @@ impl GuildInfo {
             pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
             delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
             manage_members: timed_out.is_none() && (perms & (KICK_MEMBERS | BAN_MEMBERS | MANAGE_ROLES) != 0),
+            create_invite: timed_out.is_none() && (perms & CREATE_INSTANT_INVITE != 0),
             ..protocol::ConversationRights::default()
         };
         let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
@@ -350,6 +352,7 @@ impl Discord {
                 format: sticker.format_type,
                 roles: Box::default(),
             }).collect(),
+            can_invite: false,
         }
     }
 
@@ -455,6 +458,7 @@ impl Discord {
             muted: info.quiet.channels.get(&category.id).is_some_and(|until| *until > now),
             ..header(&category.id, category.name.as_deref().unwrap_or(""), category.position)
         });
+        info.can_invite = rows.iter().any(|row| row.rights.create_invite);
         Tree {
             groups: groups.collect(),
             rows,
@@ -566,9 +570,12 @@ impl Discord {
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
-        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted));
-        if let Some((muted, hide)) = flags {
+        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| {
+            (info.quiet.server_muted(now()), info.quiet.hide_muted, info.can_invite)
+        });
+        if let Some((muted, hide, can_invite)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
+            self.ctx.set_space_can_create_invites(guild_id, can_invite)?;
         }
         Ok(())
     }
@@ -635,7 +642,9 @@ impl Discord {
         let mut flags = Vec::new();
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
-            flags.extend(state.guilds.iter().map(|(id, info)| (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted)));
+            flags.extend(state.guilds.iter().map(|(id, info)| {
+                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.can_invite)
+            }));
             let listed = state.guilds.iter().map(|(id, info)| {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
                 let row = SpaceRow {
@@ -651,9 +660,10 @@ impl Discord {
         };
         self.ctx.media(&files)?;
         self.ctx.spaces(&rows)?;
-        // A server's own mute and "hide muted channels", once its Space exists to hold them.
-        for (id, muted, hide) in flags {
+        // A server's own mute, "hide muted channels", and invite permission, once its Space exists.
+        for (id, muted, hide, can_invite) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
+            self.ctx.set_space_can_create_invites(&id, can_invite)?;
         }
         Ok(())
     }
@@ -838,6 +848,7 @@ impl Discord {
             join_space_by_invite: true,
             leave_space: true,
             groups: 9,
+            create_friend_invite: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -1188,7 +1199,7 @@ impl Discord {
             return self.category_changed(&guild, &channel);
         }
         let me = self.me();
-        let (row, muted, heads) = {
+        let (row, muted, heads, invite_became_true) = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(&guild) else {
                 return Ok(());
@@ -1205,11 +1216,20 @@ impl Discord {
             } else {
                 info.channels.retain(|(id, _)| *id != number(&channel.id));
             }
+            let invite_became_true = if row.as_ref().is_some_and(|r| r.rights.create_invite) && !info.can_invite {
+                info.can_invite = true;
+                true
+            } else {
+                false
+            };
             let muted = info.quiet.mutes(&channel.id, channel.parent_id.as_deref(), now());
-            (row, muted, heads)
+            (row, muted, heads, invite_became_true)
         };
         if let Some(head) = heads {
             self.ctx.group(&guild, &head)?;
+        }
+        if invite_became_true {
+            self.ctx.set_space_can_create_invites(&guild, true)?;
         }
         match row {
             Some(mut row) => {
@@ -1383,6 +1403,66 @@ impl Discord {
         let timeouts = state.guilds.values().filter_map(|info| info.timed_out(now));
         let next = ends.chain(timeouts).chain(state.quiet_directs.next_end(now)).min();
         state.next_unmute = next;
+    }
+
+    /// True when the user has `CREATE_INSTANT_INVITE` (bit 0) on `channel` inside `guild`.
+    pub(super) fn can_invite_channel(&self, guild: &str, channel_id: &str) -> bool {
+        let kept: Vec<Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|kept| serde_json::from_str(&kept).ok())
+            .unwrap_or_default();
+        let Some(channel) = kept.into_iter().find(|k| k.id == channel_id).map(Kept::channel) else {
+            return false;
+        };
+        if channel.kind == model::CATEGORY || channel.is_thread() {
+            return false;
+        }
+        let clock = now();
+        let state = self.state.lock().unwrap();
+        let Some(info) = state.guilds.get(guild) else {
+            return false;
+        };
+        info.timed_out(clock).is_none()
+            && info.can_view(guild, &state.me, &channel)
+            && (info.permissions(guild, &state.me, &channel) & CREATE_INSTANT_INVITE) != 0
+    }
+
+    /// Picks the first visible channel in `guild` (in Discord's sidebar order, text before voice)
+    /// where the user has `CREATE_INSTANT_INVITE` (bit 0), matching Discord's server-level action.
+    pub(super) fn invite_channel(&self, guild: &str) -> Option<String> {
+        let kept: Vec<Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|kept| serde_json::from_str(&kept).ok())
+            .unwrap_or_default();
+        let clock = now();
+        let state = self.state.lock().unwrap();
+        let info = state.guilds.get(guild)?;
+        if info.timed_out(clock).is_some() {
+            return None;
+        }
+        let me = &state.me;
+        let mut candidates: Vec<(i32, String)> = kept
+            .into_iter()
+            .map(Kept::channel)
+            .filter(|ch| {
+                kind_of(ch).is_some()
+                    && !ch.is_thread()
+                    && info.can_view(guild, me, ch)
+                    && (info.permissions(guild, me, ch) & CREATE_INSTANT_INVITE) != 0
+            })
+            .map(|ch| {
+                let category = ch
+                    .parent_id
+                    .as_deref()
+                    .and_then(|parent| info.categories.get(parent))
+                    .map(|(position, _)| *position);
+                (place(category, ch.is_voice(), ch.position), ch.id)
+            })
+            .collect();
+        candidates.sort_by_key(|(pos, _)| *pos);
+        candidates.into_iter().next().map(|(_, id)| id)
     }
 
     /// A timed mute or server timeout ran out: update the rows it covered.

@@ -407,6 +407,9 @@ pub struct ConversationRights {
     /// May change this conversation's picture (`Request::ConversationPicture`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit_picture: bool,
+    /// May create an invite link for this conversation (`Request::CreateInvite`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_invite: bool,
 }
 
 impl ConversationRights {
@@ -418,6 +421,7 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
+    const CREATE_INVITE: i64 = 1 << 8;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -453,6 +457,9 @@ impl ConversationRights {
         if self.edit_picture {
             bits |= Self::EDIT_PICTURE;
         }
+        if self.create_invite {
+            bits |= Self::CREATE_INVITE;
+        }
         bits
     }
 
@@ -466,6 +473,7 @@ impl ConversationRights {
             rename: (bits & Self::RENAME) != 0,
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+            create_invite: (bits & Self::CREATE_INVITE) != 0,
         }
     }
 }
@@ -681,6 +689,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports creating a friend-invite link (`Request::CreateInvite` with `account` only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_friend_invite: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

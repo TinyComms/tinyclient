@@ -216,6 +216,8 @@ struct GuildInfo {
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
+    /// True when at least one visible channel in this guild permits `CREATE_INSTANT_INVITE`.
+    can_invite: bool,
 }
 
 /// The gateway session, to resume it after a dropped socket.
@@ -1386,6 +1388,72 @@ impl Discord {
         Ok((space_id, channel_id))
     }
 
+    /// Creates a `discord.gg` invite link for a channel (`POST /channels/{id}/invites`), a
+    /// server (first channel allowing `CREATE_INSTANT_INVITE`), or a friend invite
+    /// (`POST /users/@me/invites`). One-shot per click; permissions are checked locally first.
+    fn create_invite(
+        &self,
+        conversation_id: Option<&str>,
+        space_id: Option<&str>,
+        max_age: u32,
+        max_uses: u32,
+        temporary: bool,
+    ) -> Result<String, Refusal> {
+        let (path, body) = match (conversation_id, space_id) {
+            (Some(channel), _) => {
+                let known = self
+                    .ctx
+                    .known(channel)
+                    .map_err(|err| Refusal::Refused(err.to_string()))?
+                    .ok_or_else(|| Refusal::Refused("This conversation is gone.".to_owned()))?;
+                if let Some(guild) = self.guild_of(&known) {
+                    if !self.can_invite_channel(&guild, channel) {
+                        return Err(Refusal::Refused(
+                            "You do not have permission to create an invite for this channel.".to_owned(),
+                        ));
+                    }
+                } else if known.kind != ConversationKind::Group {
+                    return Err(Refusal::Refused("Only server channels or group DMs can create an invite.".to_owned()));
+                }
+                (
+                    format!("/channels/{channel}/invites"),
+                    json!({
+                        "max_age": max_age,
+                        "max_uses": max_uses,
+                        "temporary": temporary,
+                        "flags": 0,
+                    }),
+                )
+            }
+            (None, Some(guild)) => {
+                let Some(channel) = self.invite_channel(guild) else {
+                    return Err(Refusal::Refused(
+                        "You do not have permission to create an invite for this server.".to_owned(),
+                    ));
+                };
+                (
+                    format!("/channels/{channel}/invites"),
+                    json!({
+                        "max_age": max_age,
+                        "max_uses": max_uses,
+                        "temporary": temporary,
+                        "flags": 0,
+                    }),
+                )
+            }
+            (None, None) => ("/users/@me/invites".to_owned(), json!({})),
+        };
+        let answer = self.call_once("POST", &path, Some(body)).map_err(invite_refusal)?;
+        let parsed: Value = serde_json::from_str(&answer)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let code = parsed
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| Refusal::Refused("Discord did not return an invite code.".to_owned()))?;
+        Ok(format!("https://discord.gg/{code}"))
+    }
+
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
     /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
     /// does this.
@@ -2016,6 +2084,9 @@ impl Discord {
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
             Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
+            Command::CreateInvite { conversation_id, space_id, max_age, max_uses, temporary, reply } => {
+                answer(reply, self.create_invite(conversation_id.as_deref(), space_id.as_deref(), max_age, max_uses, temporary))
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),

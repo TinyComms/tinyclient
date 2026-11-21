@@ -36,6 +36,7 @@ pub const STAGE: u8 = 13;
 pub const FORUM: u8 = 15;
 pub const MEDIA_FORUM: u8 = 16;
 
+pub const CREATE_INSTANT_INVITE: u64 = 1 << 0;
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;

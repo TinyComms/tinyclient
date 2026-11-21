@@ -165,9 +165,29 @@ pub struct State {
     pub spaces_pending: bool,
     pub switcher: Option<switcher::Switcher>,
     pub create_channel: Option<CreateChannelModal>,
+    pub create_invite: Option<CreateInviteModal>,
     pub join_server: Option<JoinServerModal>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CreateInviteTarget {
+    Space(Key, String),
+    Channel(Key, String),
+    Friend(AccountKey),
+}
+
+pub struct CreateInviteModal {
+    pub target: CreateInviteTarget,
+    pub max_age: u32,
+    pub max_uses: u32,
+    pub temporary: bool,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub busy: bool,
+    pub sent: HashSet<Key>,
+    pub epoch: u64,
 }
 
 pub struct JoinServerModal {
@@ -298,6 +318,7 @@ impl State {
             spaces_pending: false,
             switcher: None,
             create_channel: None,
+            create_invite: None,
             join_server: None,
             leave_space: None,
         }
@@ -2177,6 +2198,409 @@ impl Shell {
                 .justify_center()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.sidebar_state.leave_space = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(in crate::gui) fn open_create_invite(&mut self, target: CreateInviteTarget, cx: &mut Context<Self>) {
+        self.sidebar_state.create_invite = Some(CreateInviteModal {
+            target,
+            max_age: 604_800,
+            max_uses: 0,
+            temporary: false,
+            url: None,
+            error: None,
+            busy: false,
+            sent: HashSet::new(),
+            epoch: 0,
+        });
+        self.generate_invite(cx);
+    }
+
+    fn generate_invite(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.create_invite.as_mut() else {
+            return;
+        };
+        modal.epoch = modal.epoch.wrapping_add(1);
+        modal.busy = true;
+        modal.error = None;
+        modal.sent.clear();
+        let epoch = modal.epoch;
+        let req = match &modal.target {
+            CreateInviteTarget::Channel(key, _) => Request::CreateInvite {
+                conversation: Some(key.clone()),
+                space: None,
+                account: None,
+                max_age: modal.max_age,
+                max_uses: modal.max_uses,
+                temporary: modal.temporary,
+            },
+            CreateInviteTarget::Space(key, _) => Request::CreateInvite {
+                conversation: None,
+                space: Some(key.clone()),
+                account: None,
+                max_age: modal.max_age,
+                max_uses: modal.max_uses,
+                temporary: modal.temporary,
+            },
+            CreateInviteTarget::Friend(account) => Request::CreateInvite {
+                conversation: None,
+                space: None,
+                account: Some(account.clone()),
+                max_age: 0,
+                max_uses: 0,
+                temporary: false,
+            },
+        };
+        cx.notify();
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(modal) = this.sidebar_state.create_invite.as_mut() else {
+                    return;
+                };
+                if modal.epoch != epoch {
+                    return;
+                }
+                modal.busy = false;
+                match answer {
+                    Ok(Response::Link { url }) => {
+                        modal.url = Some(url);
+                        modal.error = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        modal.url = None;
+                        modal.error = Some(detail);
+                    }
+                    Ok(_) => {
+                        modal.url = None;
+                        modal.error = Some("Could not create invite link.".to_owned());
+                    }
+                    Err(err) => {
+                        modal.url = None;
+                        modal.error = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn send_invite_to(&mut self, conversation: Key, title: String, cx: &mut Context<Self>) {
+        let Some(url) = self.sidebar_state.create_invite.as_ref().and_then(|m| m.url.clone()) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let req = Request::Send {
+            conversation: conversation.clone(),
+            client_id: format!("invite-{now}"),
+            text: url,
+            reply_to: None,
+            with: protocol::Outgoing::default(),
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Error { detail, .. }) => {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                }
+                Err(err) => {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), err.to_string(), cx);
+                }
+                Ok(_) => {
+                    if let Some(modal) = this.sidebar_state.create_invite.as_mut() {
+                        modal.sent.insert(conversation);
+                    }
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Sent invite to {title}"), cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn create_invite_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.create_invite.as_ref()?;
+        let (heading, is_friend) = match &modal.target {
+            CreateInviteTarget::Space(_, name) => (format!("Invite people to {name}"), false),
+            CreateInviteTarget::Channel(_, name) => (format!("Invite people to #{}", name.trim_start_matches('#')), false),
+            CreateInviteTarget::Friend(_) => ("Create friend invite".to_owned(), true),
+        };
+
+        let link_text = if modal.busy && modal.url.is_none() {
+            "Creating invite…".to_owned()
+        } else {
+            modal.url.clone().unwrap_or_else(|| "No invite link yet".to_owned())
+        };
+        let copy_url = modal.url.clone();
+
+        let mut card = div()
+            .id("create-invite-card")
+            .w(px(420.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child(heading))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(10.))
+                            .py(px(7.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::canvas())
+                            .border_1()
+                            .border_color(theme::border())
+                            .type_code()
+                            .text_color(if modal.url.is_some() { theme::text() } else { theme::text_soft() })
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(link_text),
+                    )
+                    .child(
+                        button("create-invite-copy", ButtonKind::Primary, "Copy").when_some(copy_url, |b, url| {
+                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                                this.toast(Some(("icons/check.svg", theme::text_soft())), "Invite link copied", cx);
+                            }))
+                        }),
+                    ),
+            );
+
+        if is_friend {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child("Anyone with this link can add you as a Discord friend."),
+                    )
+                    .child(
+                        button("create-invite-refresh", ButtonKind::Secondary, if modal.busy { "Creating…" } else { "New link" })
+                            .when(!modal.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.generate_invite(cx)))),
+                    ),
+            );
+        } else {
+            let ages: &[(u32, &str)] = &[
+                (1_800, "30m"),
+                (3_600, "1h"),
+                (21_600, "6h"),
+                (43_200, "12h"),
+                (86_400, "1d"),
+                (604_800, "7d"),
+                (0, "Never"),
+            ];
+            let mut age_row = div().flex().flex_wrap().items_center().gap(px(4.));
+            for &(secs, label) in ages {
+                let selected = modal.max_age == secs;
+                age_row = age_row.child(
+                    div()
+                        .id(("invite-age", secs as usize))
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(theme::R_CONTROL))
+                        .cursor_pointer()
+                        .type_small()
+                        .bg(if selected { theme::accent_soft() } else { theme::canvas() })
+                        .text_color(if selected { theme::accent_text() } else { theme::text_soft() })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(m) = this.sidebar_state.create_invite.as_mut() {
+                                if m.max_age != secs {
+                                    m.max_age = secs;
+                                    this.generate_invite(cx);
+                                }
+                            }
+                        })),
+                );
+            }
+
+            let uses: &[(u32, &str)] = &[
+                (0, "Unlimited"),
+                (1, "1"),
+                (5, "5"),
+                (10, "10"),
+                (25, "25"),
+                (50, "50"),
+                (100, "100"),
+            ];
+            let mut uses_row = div().flex().flex_wrap().items_center().gap(px(4.));
+            for &(limit, label) in uses {
+                let selected = modal.max_uses == limit;
+                uses_row = uses_row.child(
+                    div()
+                        .id(("invite-uses", limit as usize))
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(theme::R_CONTROL))
+                        .cursor_pointer()
+                        .type_small()
+                        .bg(if selected { theme::accent_soft() } else { theme::canvas() })
+                        .text_color(if selected { theme::accent_text() } else { theme::text_soft() })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(m) = this.sidebar_state.create_invite.as_mut() {
+                                if m.max_uses != limit {
+                                    m.max_uses = limit;
+                                    this.generate_invite(cx);
+                                }
+                            }
+                        })),
+                );
+            }
+
+            let temp = modal.temporary;
+            card = card
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Expire after"))
+                        .child(age_row),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Max uses"))
+                        .child(uses_row),
+                )
+                .child(
+                    div()
+                        .id("invite-temporary")
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(m) = this.sidebar_state.create_invite.as_mut() {
+                                m.temporary = !m.temporary;
+                                this.generate_invite(cx);
+                            }
+                        }))
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .h(px(14.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(if temp { theme::accent() } else { theme::border() })
+                                .bg(if temp { theme::accent() } else { theme::canvas() })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(temp, |box_el| box_el.child(glyph("icons/check.svg", 10., theme::on_accent()))),
+                        )
+                        .child(div().type_small().text_color(theme::text()).child("Grant temporary membership")),
+                );
+        }
+
+        if modal.url.is_some() {
+            let mut seen = HashSet::new();
+            let mut targets: Vec<(Key, String)> = Vec::new();
+            for row in self.held_rows() {
+                if matches!(row.kind, ConversationKind::Direct | ConversationKind::Group | ConversationKind::Channel)
+                    && seen.insert(row.key.clone())
+                {
+                    targets.push((row.key.clone(), row.title.clone()));
+                    if targets.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+            if !targets.is_empty() {
+                let mut list = div().flex().flex_col().gap(px(4.));
+                for (ix, (key, title)) in targets.into_iter().enumerate() {
+                    let already = modal.sent.contains(&key);
+                    let send_key = key.clone();
+                    let send_title = title.clone();
+                    list = list.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::canvas())
+                            .child(div().type_small().text_color(theme::text()).truncate().child(title))
+                            .child(
+                                button(
+                                    ("invite-send-to", ix),
+                                    if already { ButtonKind::Ghost } else { ButtonKind::Secondary },
+                                    if already { "Sent" } else { "Send" },
+                                )
+                                .when(!already, |b| {
+                                    b.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_invite_to(send_key.clone(), send_title.clone(), cx);
+                                    }))
+                                }),
+                            ),
+                    );
+                }
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Send to…"))
+                        .child(list),
+                );
+            }
+        }
+
+        card = card
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("create-invite-close", ButtonKind::Secondary, "Done").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.sidebar_state.create_invite = None;
+                            cx.notify();
+                        },
+                    ))),
+            );
+
+        Some(
+            div()
+                .id("create-invite-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.create_invite = None;
                     cx.notify();
                 }))
                 .child(card),

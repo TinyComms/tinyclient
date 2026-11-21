@@ -831,9 +831,31 @@ impl Shell {
             Menu::Space(space) => {
                 let pinned = self.sidebar_state.pins.contains(space);
                 let can_create = self.spaces.iter().any(|s| &s.key == space && s.can_create_channels);
+                let can_invite = self.spaces.iter().any(|s| &s.key == space && s.can_create_invites);
+                let space_name = self
+                    .spaces
+                    .iter()
+                    .find(|s| &s.key == space)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "this server".to_owned());
                 let key = space.clone();
                 let shown = space.clone();
                 let read = space.clone();
+                if can_invite {
+                    let invite_space = space.clone();
+                    let invite_name = space_name.clone();
+                    items.push(
+                        menu_item("space-invite", Some("icons/user-plus.svg"), "Invite people…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_create_invite(
+                                    super::sidebar::CreateInviteTarget::Space(invite_space.clone(), invite_name.clone()),
+                                    cx,
+                                );
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 if can_create {
                     let create_space = space.clone();
                     items.push(
@@ -874,12 +896,7 @@ impl Shell {
                 });
                 if can_leave {
                     let leave_key = space.clone();
-                    let leave_name = self
-                        .spaces
-                        .iter()
-                        .find(|s| &s.key == space)
-                        .map(|s| s.name.clone())
-                        .unwrap_or_else(|| "this server".to_owned());
+                    let leave_name = space_name.clone();
                     items.push(menu_separator().into_any_element());
                     items.push(
                         menu_item_danger("space-leave", Some("icons/log-out.svg"), "Leave server…")
@@ -919,6 +936,21 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                if conversation.rights.create_invite {
+                    let invite_key = conversation.key.clone();
+                    let invite_name = conversation.title.clone();
+                    items.push(
+                        menu_item("row-invite", Some("icons/user-plus.svg"), "Invite people…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_create_invite(
+                                    super::sidebar::CreateInviteTarget::Channel(invite_key.clone(), invite_name.clone()),
+                                    cx,
+                                );
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 if conversation.space.is_some() {
                     items.push(
                         menu_item("reveal", Some("icons/corner-down-right.svg"), "Show in sidebar", None)
@@ -1597,6 +1629,7 @@ impl Render for Shell {
             })
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))
+            .children(self.create_invite_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.tiny_layer(window, cx))
