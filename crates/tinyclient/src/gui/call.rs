@@ -497,6 +497,20 @@ fn handoff_label(network: Network) -> String {
     }
 }
 
+/// The header pill's label and icon for a hand-off call. Slack shows a headphones glyph and
+/// "Huddle" so it reads as a call rather than an unlabelled logo.
+fn handoff_pill_parts(network: Network) -> (Option<&'static str>, String) {
+    match network {
+        Network::Slack => (Some("icons/headphones.svg"), "Huddle".to_owned()),
+        other => (None, handoff_label(other)),
+    }
+}
+
+/// Confirmation toast shown after handing a call off to the network's own app.
+fn handoff_toast(network: Network) -> String {
+    format!("Opened in {}", network.label())
+}
+
 /// Only something with a scheme, never an option.
 fn checked_link(url: &str) -> Result<(), String> {
     if url.starts_with('-') || !url.contains(':') {
@@ -1110,6 +1124,7 @@ impl Shell {
     /// Asks where the official app takes this conversation's call and opens it there. mediad is
     /// never started for this. What the adapter refuses is shown, not swallowed.
     pub(super) fn call_handoff(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        let network = conversation.network;
         self.call_state.error = None;
         cx.spawn(async move |this, cx| {
             // Ok(Some(url)): a phone opens it below, on the UI thread, through GPUI.
@@ -1125,8 +1140,13 @@ impl Shell {
             let outcome = cx.background_executor().spawn(work).await;
             let _ = this.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Some(url)) => cx.open_url(&url),
-                    Ok(None) => {}
+                    Ok(Some(url)) => {
+                        cx.open_url(&url);
+                        this.toast(Some(("icons/external-link.svg", theme::text_soft())), handoff_toast(network), cx);
+                    }
+                    Ok(None) => {
+                        this.toast(Some(("icons/external-link.svg", theme::text_soft())), handoff_toast(network), cx);
+                    }
                     Err(refused) => {
                         this.call_state.error = Some(refused.clone());
                         this.refused = Some(refused);
@@ -1266,30 +1286,28 @@ impl Shell {
                 )
             }
             // Never says "Call": it is a different object, and it starts nothing here.
-            // A Slack huddle stays an icon until something in the model says one is live.
+            // Slack shows a headphones glyph and "Huddle" so it reads as a call, not just a logo.
             CallSupport::Handoff => {
-                let quiet = network == Network::Slack;
-                let hint = if quiet {
+                let (glyph_icon, label) = handoff_pill_parts(network);
+                let hint = if network == Network::Slack {
                     "Open huddle in Slack".to_owned()
                 } else {
                     format!("{0} calls open in the {0} app. tinyclient doesn't carry them.", network.label())
                 };
-                let mut pill = pill
-                    .border_color(theme::border())
-                    .text_color(theme::text_soft())
-                    .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
-                    .tooltip(tip(hint, None))
-                    .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx)))
-                    .child(network_icon(network, glyph(14.)));
-                if quiet {
-                    let side = if phone { 44. } else { 28. };
-                    pill = pill.px(px(7.)).size(px(side)).rounded(px(theme::R_CONTROL)).justify_center();
-                } else {
-                    pill = pill
-                        .children(words(handoff_label(network).into()))
-                        .children((!phone).then(|| icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None)));
-                }
-                Some(pill)
+                let leading = match glyph_icon {
+                    Some(path) => icon(path, glyph(14.), theme::text_soft(), None).into_any_element(),
+                    None => network_icon(network, glyph(14.)).into_any_element(),
+                };
+                Some(
+                    pill.border_color(theme::border())
+                        .text_color(theme::text_soft())
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                        .tooltip(tip(hint, None))
+                        .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx)))
+                        .child(leading)
+                        .children(words(label.into()))
+                        .children((!phone).then(|| icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None))),
+                )
             }
         }
     }
@@ -1328,6 +1346,14 @@ mod tests {
         assert_eq!(drawn(Some(old_failure), None, Some(&asked)).unwrap().conversation, key("lounge"), "a failure on show gives way to the join just asked for");
         assert_eq!(drawn(Some(joined.clone()), None, Some(&asked)).unwrap().state, CallState::Joined, "a live call is never drawn over");
         assert!(drawn(None, None, None).is_none());
+    }
+
+    #[test]
+    fn slack_huddle_pill_uses_headphones_and_huddle_label_and_toasts_opened_in_slack() {
+        assert_eq!(handoff_pill_parts(Network::Slack), (Some("icons/headphones.svg"), "Huddle".to_owned()));
+        assert_eq!(handoff_pill_parts(Network::Teams), (None, "Open in Teams".to_owned()));
+        assert_eq!(handoff_toast(Network::Slack), "Opened in Slack");
+        assert_eq!(handoff_toast(Network::Teams), "Opened in Teams");
     }
 
     #[test]
