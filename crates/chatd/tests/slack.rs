@@ -3773,3 +3773,76 @@ fn slack_edit_channel_topic_and_description() {
         "channel_purpose should invalidate cached ConversationInfo"
     );
 }
+
+#[test]
+fn slack_mark_unread_channel_and_thread() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    // Load #general history so messages are cached, then mark read to the newest.
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (m.len() >= 3).then_some(m)
+    });
+    let newest = msgs.last().unwrap().id.clone();
+    let second_newest = msgs[msgs.len() - 2].id.clone();
+    let third_newest = msgs[msgs.len() - 3].id.clone();
+    assert_eq!(world.ask(Request::MarkRead { conversation: general.clone(), message_id: newest }), Response::Ok);
+    world.until("mark_read conversations.mark sent", || {
+        (!world.fake.calls(ALPHA, "conversations.mark").is_empty()).then_some(())
+    });
+    assert_eq!(world.conversation(&general).unwrap().unread, 0);
+
+    // Mark unread from the second-newest message: Slack receives conversations.mark with the message BEFORE it (third_newest).
+    let marks_before = world.fake.calls(ALPHA, "conversations.mark").len();
+    assert_eq!(
+        world.ask(Request::MarkUnread {
+            conversation: general.clone(),
+            message_id: second_newest,
+        }),
+        Response::Ok
+    );
+    let row = world.conversation(&general).unwrap();
+    assert_eq!(row.unread, 2, "marking unread from 2nd-newest should show 2 unread immediately");
+    assert_eq!(row.last_read.as_deref(), Some(third_newest.as_str()));
+
+    let mark_call = world.until("conversations.mark for mark_unread", || {
+        let calls = world.fake.calls(ALPHA, "conversations.mark");
+        (calls.len() > marks_before).then(|| calls.last().unwrap().clone())
+    });
+    assert_eq!(mark_call.params["channel"], "C0GEN");
+    assert_eq!(mark_call.params["ts"], third_newest);
+
+    // Thread mark-unread: load thread replies, mark read, then mark unread from the newest reply.
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+    let tmsgs = world.until("thread replies loaded", || {
+        let m = world.messages(&thread);
+        (m.len() >= 2).then_some(m)
+    });
+    let t_newest = tmsgs.last().unwrap().id.clone();
+    let t_prev = tmsgs[tmsgs.len() - 2].id.clone();
+    assert_eq!(world.ask(Request::MarkRead { conversation: thread.clone(), message_id: t_newest.clone() }), Response::Ok);
+    world.until("thread mark_read sent", || {
+        (!world.fake.calls(ALPHA, "subscriptions.thread.mark").is_empty()).then_some(())
+    });
+
+    let tmarks_before = world.fake.calls(ALPHA, "subscriptions.thread.mark").len();
+    assert_eq!(
+        world.ask(Request::MarkUnread {
+            conversation: thread.clone(),
+            message_id: t_newest,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&thread).unwrap().unread, 1);
+
+    let tmark = world.until("subscriptions.thread.mark with read=0", || {
+        let calls = world.fake.calls(ALPHA, "subscriptions.thread.mark");
+        (calls.len() > tmarks_before).then(|| calls.last().unwrap().clone())
+    });
+    assert_eq!(tmark.params["channel"], "C0GEN");
+    assert_eq!(tmark.params["thread_ts"], ROOT);
+    assert_eq!(tmark.params["ts"], t_prev);
+    assert_eq!(tmark.params["read"], "0");
+}

@@ -1388,6 +1388,9 @@ impl Slack {
             }
             Command::OpenSpace(_) => self.report(self.open_space()),
             Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id)),
+            Command::MarkUnread { conversation_id, message_id, .. } => {
+                self.report(self.mark_unread(&conversation_id, &message_id))
+            }
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 self.send(&conversation_id, &client_id, &text, reply_to.as_deref(), false)
             }
@@ -1564,6 +1567,32 @@ impl Slack {
                 self.api("conversations.mark", &[("channel", conversation), ("ts", ts)])?;
             }
         };
+        Ok(())
+    }
+
+    /// Moves the read marker back to `ts` (already computed by the store as the message before the
+    /// one the user marked unread, or empty when marking from the oldest cached message).
+    fn mark_unread(&self, conversation: &str, ts: &str) -> Result<(), Failure> {
+        let mark_ts = if ts.is_empty() {
+            "0.000000"
+        } else if ts.contains('.') {
+            ts
+        } else {
+            return Ok(());
+        };
+        match thread_of(conversation) {
+            Some((channel, root)) => {
+                self.api(
+                    "subscriptions.thread.mark",
+                    &[("channel", channel), ("thread_ts", root), ("ts", mark_ts), ("read", "0")],
+                )?;
+                let unread = self.ctx.known(conversation)?.map_or(1, |c| c.unread.max(1));
+                self.thread_unread(channel, root, unread)?;
+            }
+            None => {
+                self.api("conversations.mark", &[("channel", conversation), ("ts", mark_ts)])?;
+            }
+        }
         Ok(())
     }
 
