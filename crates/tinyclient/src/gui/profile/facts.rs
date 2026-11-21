@@ -366,7 +366,14 @@ pub fn role(person: &Person, profile: &Profile, place: Option<&str>) -> Option<R
 
 /// `+44 •••• ••42`: the country code and the last two digits; every other digit a dot.
 pub fn mask(phone: &str) -> String {
-    let code = if phone.starts_with('+') { phone.split_whitespace().next().unwrap_or("").len() } else { 0 };
+    let code = if phone.starts_with('+') {
+        match phone.find(char::is_whitespace) {
+            Some(space) if space <= 5 => space,
+            _ => 0,
+        }
+    } else {
+        0
+    };
     let digits = phone.char_indices().filter(|(ix, ch)| *ix >= code && ch.is_ascii_digit()).count();
     let mut seen = 0;
     phone

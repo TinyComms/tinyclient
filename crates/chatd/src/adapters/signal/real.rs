@@ -750,6 +750,11 @@ impl Session {
                         None
                     };
                     if let Some(aci) = aci {
+                        if contact.blocked {
+                            self.blocked_acis.insert(aci.clone());
+                        } else {
+                            self.blocked_acis.remove(&aci);
+                        }
                         chats.push(ChatState {
                             peer: Peer::Direct(aci),
                             muted_until: contact.muted_until_timestamp,
@@ -764,6 +769,11 @@ impl Session {
                 Some(storage_record::Record::GroupV2(group)) => {
                     if let Ok(key) = <[u8; 32]>::try_from(group.master_key.as_slice()) {
                         let id = group_id(&key);
+                        if group.blocked {
+                            self.blocked_groups.insert(id.clone());
+                        } else {
+                            self.blocked_groups.remove(&id);
+                        }
                         chats.push(ChatState {
                             peer: Peer::Group(id),
                             muted_until: group.muted_until_timestamp,
@@ -1631,17 +1641,18 @@ impl Session {
             }
         }
         let next_rev = stored.as_ref().map_or(1, |g| g.revision.saturating_add(1));
-        let at = now_ms();
-        let update = ContentBody::DataMessage(DataMessage {
-            group_v2: Some(GroupContextV2 {
-                master_key: Some(key.to_vec()),
-                revision: Some(next_rev),
-                group_change: None,
-            }),
-            timestamp: Some(at),
+        let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+        let ops = presage::libsignal_service::groups_v2::GroupOperations::new(params);
+        let me_uuid = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let mut actions = presage::proto::group_change::Actions {
+            source_user_id: Self::encrypt_aci_bytes(&params, Aci::from(me_uuid)),
+            version: next_rev,
             ..Default::default()
-        });
-        let _ = self.manager.send_message_to_group(&key, update, at).await;
+        };
+        actions
+            .delete_members
+            .push(ops.build_remove_member_action(Aci::from(me_uuid)).map_err(|err| Fault::Net(err.to_string()))?);
+        self.patch_group(id, actions).await?;
         if let Some(mut group) = stored {
             group.members.retain(|m| ServiceId::from(m.aci).raw_uuid().to_string() != self.me);
             group.revision = next_rev;

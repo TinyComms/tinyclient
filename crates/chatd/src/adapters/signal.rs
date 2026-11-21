@@ -1306,6 +1306,12 @@ fn apply(account: &Account, event: Event) {
                 } else {
                     known.as_ref().is_some_and(|row| row.read_only)
                 };
+                if let Some(known) = &known {
+                    row.rights = known.rights;
+                    if !rejoined {
+                        row.read_only_reason = known.read_only_reason.clone();
+                    }
+                }
                 row.avatar = ctx.avatar_of(&row.id);
                 let _ = ctx.conversation(&row);
             }
@@ -1432,13 +1438,25 @@ fn apply(account: &Account, event: Event) {
             let _ = ctx.forget_conversation(&peer.conversation());
         }
         Event::Poll { peer, author, name, sent, question, options, multiple, outgoing } => {
+            let conversation = peer.conversation();
+            if !outgoing
+                && (account.live().blocked.contains(&conversation)
+                    || account.live().blocked.contains(&Peer::Direct(author.clone()).conversation()))
+            {
+                return;
+            }
             if !outgoing && !name.is_empty() {
                 let mut live = account.live();
                 if !live.names.contains_key(&author) {
                     live.names.insert(author.clone(), name.clone());
                 }
             }
-            let conversation = peer.conversation();
+            if !outgoing && matches!(peer, Peer::Direct(_)) {
+                let mut live = account.live();
+                if !live.accepted.contains(&conversation) {
+                    live.requests.insert(conversation.clone());
+                }
+            }
             match &peer {
                 Peer::Direct(aci) => {
                     let title = account.live().names.get(aci).cloned().unwrap_or_default();
@@ -1539,6 +1557,9 @@ fn apply(account: &Account, event: Event) {
         }
         Event::TimerChanged { peer, seconds, version } => {
             let conversation = peer.conversation();
+            if account.live().blocked.contains(&conversation) {
+                return;
+            }
             account.live().note_timer(&conversation, seconds, version);
             let _ = ctx.disappearing(&conversation, (seconds > 0).then_some(seconds));
             if let Peer::Direct(aci) = &peer {
@@ -1584,6 +1605,10 @@ fn apply(account: &Account, event: Event) {
                         live.blocked.insert(conv.clone());
                         if let Peer::Direct(aci) = &chat.peer {
                             relation_updates.push((aci.clone(), Relation::Blocked));
+                        }
+                    } else if live.blocked.remove(&conv) {
+                        if let Peer::Direct(aci) = &chat.peer {
+                            relation_updates.push((aci.clone(), Relation::Contact));
                         }
                     }
                     if chat.muted_until > 0 {
@@ -1774,6 +1799,9 @@ fn incoming_call(account: &Account, peer: &Peer, by: &str, name: &str, video: bo
         return;
     }
     let conversation = peer.conversation();
+    if account.live().blocked.contains(&conversation) || account.live().blocked.contains(&Peer::Direct(by.to_owned()).conversation()) {
+        return;
+    }
     let caller = if name.is_empty() { account.live().name(by) } else { name.to_owned() };
     ensure_row(account, peer, &caller);
     // The newest offer takes the one ring slot. An older or replayed one leaves both the slot
