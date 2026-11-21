@@ -1416,15 +1416,16 @@ impl Store {
             key,
         )?;
         drop_orphan_threads(&tx, &account)?;
-        let collapsed: Vec<String> = tx
+        let existing: std::collections::HashMap<String, bool> = tx
             .prepare(
-                "SELECT id FROM section
-                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND collapsed",
+                "SELECT id, collapsed FROM section
+                  WHERE network = ?1 AND account = ?2 AND space = ?3",
             )?
-            .query_map(key, |row| row.get(0))?
+            .query_map(key, |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         tx.execute("DELETE FROM section WHERE network = ?1 AND account = ?2 AND space = ?3", key)?;
         for group in groups {
+            let is_collapsed = existing.get(&group.id).copied().unwrap_or(group.collapsed);
             tx.execute(
                 "INSERT OR REPLACE INTO section
                      (network, account, space, id, name, position, collapsed, kind, muted, unread_only)
@@ -1436,7 +1437,7 @@ impl Store {
                     group.id,
                     group.name,
                     group.position,
-                    collapsed.contains(&group.id),
+                    is_collapsed,
                     word(&group.kind),
                     group.muted,
                     group.unread_only,

@@ -170,6 +170,49 @@ struct Quiet {
     /// categories that set their own.
     level: u8,
     levels: HashMap<String, u8>,
+    /// Categories collapsed in Discord (`channel_overrides[].collapsed == true`).
+    collapsed: HashSet<String>,
+}
+
+/// Coalesces rapid category collapse/expand clicks per guild so a burst is one PATCH.
+const COLLAPSE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+pub(super) struct CollapseQueue {
+    pending: HashMap<String, (HashMap<String, bool>, Instant)>,
+}
+
+impl CollapseQueue {
+    pub(super) fn push(&mut self, guild: &str, category: &str, collapsed: bool, now: Instant) {
+        let entry = self.pending.entry(guild.to_owned()).or_insert_with(|| (HashMap::new(), now));
+        entry.0.insert(category.to_owned(), collapsed);
+        entry.1 = now;
+    }
+
+    pub(super) fn take_due(&mut self, now: Instant) -> Vec<(String, HashMap<String, bool>)> {
+        let due_guilds: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, at))| now.saturating_duration_since(*at) >= COLLAPSE_DEBOUNCE)
+            .map(|(guild, _)| guild.clone())
+            .collect();
+        due_guilds
+            .into_iter()
+            .filter_map(|guild| self.pending.remove(&guild).map(|(map, _)| (guild, map)))
+            .collect()
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
+pub(super) fn collapse_settings_body(overrides: &HashMap<String, bool>) -> Value {
+    let mut map = serde_json::Map::new();
+    for (category, collapsed) in overrides {
+        map.insert(category.clone(), json!({"collapsed": collapsed}));
+    }
+    json!({"channel_overrides": map})
 }
 
 /// One of a server's custom emoji or stickers, kept for the picker: about 40 bytes each.
@@ -362,6 +405,8 @@ struct State {
     /// Per channel, the read acknowledgement last sent and the newest one held back since
     /// (`mark_read`): one per channel per [`ACK_EVERY`].
     acks: HashMap<String, Ack>,
+    /// Debounced category collapse/expand writes waiting to PATCH guild settings.
+    collapses: CollapseQueue,
 }
 
 /// One channel's read acknowledgements.
@@ -1587,6 +1632,39 @@ impl Discord {
         Ok(voice::handoff_link(guild.as_deref(), channel))
     }
 
+    fn queue_collapse(&self, guild: &str, category: &str, collapsed: bool) {
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                if collapsed {
+                    info.quiet.collapsed.insert(category.to_owned());
+                } else {
+                    info.quiet.collapsed.remove(category);
+                }
+            } else {
+                return;
+            }
+            state.collapses.push(guild, category, collapsed, Instant::now());
+        }
+        self.outbox.wake.signal();
+    }
+
+    pub(super) fn collapse_tick(&self) -> bool {
+        let (due, remaining) = {
+            let mut state = crate::hub::lock(&self.state);
+            let due = state.collapses.take_due(Instant::now());
+            (due, state.collapses.has_pending())
+        };
+        for (guild, overrides) in due {
+            let body = collapse_settings_body(&overrides);
+            let path = format!("/users/@me/guilds/{guild}/settings");
+            if let Err(refused) = self.call("PATCH", &path, Some(body)) {
+                self.log("collapse", refused);
+            }
+        }
+        remaining
+    }
+
     fn command(&self, command: Command) {
         // Everything but these is the user doing something, which is what an adapter that
         // stopped asking for a session was waiting for. The screen moving counts when it moved
@@ -1639,6 +1717,9 @@ impl Discord {
                 }
             }
             Command::OpenSpace(space) => self.open_space(&space),
+            Command::Collapse { space_id, group_id, collapsed } => {
+                self.queue_collapse(&space_id, &group_id, collapsed);
+            }
             // Opening a forum asks Discord nothing: its posts arrive on the socket as threads,
             // so the store the landing reads is as current as the link. Telegram needs this
             // ask because it lists a forum's topics only on demand.

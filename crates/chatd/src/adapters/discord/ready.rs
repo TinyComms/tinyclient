@@ -99,6 +99,7 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
     let muted = overrides.iter().filter(|channel| channel.muted);
     let opted = overrides.iter().filter(|channel| channel.flags & model::OPT_IN_ENABLED != 0);
     let levels = overrides.iter().filter(|channel| channel.message_notifications < 3);
+    let collapsed = overrides.iter().filter(|channel| channel.collapsed == Some(true));
     Quiet {
         muted_until: settings.muted.then(|| until(settings.mute_config.as_ref())),
         suppress_everyone: settings.suppress_everyone,
@@ -109,6 +110,7 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
         opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
         level: settings.message_notifications,
         levels: levels.map(|channel| (channel.channel_id.clone(), channel.message_notifications)).collect(),
+        collapsed: collapsed.map(|channel| channel.channel_id.clone()).collect(),
     }
 }
 
@@ -451,7 +453,8 @@ impl Discord {
         let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
         let now = now();
         let groups = categories.filter(|category| used.contains(category.id.as_str())).map(|category| Group {
-            // A muted category starts collapsed. The server's own mute is on the Space.
+            // A muted category starts collapsed; Discord's own collapsed flag stays in step.
+            collapsed: info.quiet.collapsed.contains(&category.id),
             muted: info.quiet.channels.get(&category.id).is_some_and(|until| *until > now),
             ..header(&category.id, category.name.as_deref().unwrap_or(""), category.position)
         });
@@ -468,6 +471,9 @@ impl Discord {
     fn plant(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> rusqlite::Result<()> {
         let tree = self.tree(guild, info, me, read);
         self.ctx.tree(&guild.id, &tree.groups, &tree.rows)?;
+        for group in &tree.groups {
+            self.ctx.set_collapsed(&guild.id, &group.id, group.collapsed)?;
+        }
         // A post is told alone: it holds no place in the tree, so the tree's replacement
         // would not keep it.
         for post in &tree.posts {
@@ -1340,6 +1346,22 @@ impl Discord {
         // What is opted in, hidden or collapsed lives on the tree and the Space.
         if let Some(guild) = &settings.guild_id {
             self.replant(guild)?;
+            let cats: Vec<(String, bool)> = {
+                let state = self.state.lock().unwrap();
+                state
+                    .guilds
+                    .get(guild)
+                    .map(|info| {
+                        info.categories
+                            .keys()
+                            .map(|id| (id.clone(), info.quiet.collapsed.contains(id)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for (cat_id, is_collapsed) in cats {
+                self.ctx.set_collapsed(guild, &cat_id, is_collapsed)?;
+            }
         }
         self.reschedule_unmute();
         Ok(())
@@ -1424,5 +1446,36 @@ mod tests {
         assert!(loose < place(Some(0), false, 0) - 1, "uncategorised channels come before the first header");
         assert!(first_text < first_voice && first_voice < second - 1);
         assert!(place(Some(5000), true, 50_000) > 0, "absurd positions do not overflow");
+    }
+
+    #[test]
+    fn collapsed_category_override_seeds_quiet_and_debounces_writes() {
+        let settings: GuildSettings = serde_json::from_value(serde_json::json!({
+            "guild_id": "4000",
+            "channel_overrides": [
+                { "channel_id": "4100", "collapsed": true, "muted": false },
+                { "channel_id": "4200", "collapsed": false, "muted": false },
+                { "channel_id": "4300", "muted": true }
+            ]
+        }))
+        .unwrap();
+        let parsed = quiet(&settings);
+        assert!(parsed.collapsed.contains("4100"), "collapsed: true must be tracked");
+        assert!(!parsed.collapsed.contains("4200"), "collapsed: false must not be tracked");
+        assert!(!parsed.collapsed.contains("4300"), "missing collapsed defaults to expanded");
+
+        let mut queue = super::super::CollapseQueue::default();
+        let t0 = std::time::Instant::now();
+        queue.push("4000", "4100", true, t0);
+        queue.push("4000", "4100", false, t0 + std::time::Duration::from_millis(100));
+        queue.push("4000", "4200", true, t0 + std::time::Duration::from_millis(150));
+        assert!(queue.take_due(t0 + std::time::Duration::from_millis(300)).is_empty(), "burst must debounce");
+        let due = queue.take_due(t0 + std::time::Duration::from_millis(700));
+        assert_eq!(due.len(), 1, "burst of clicks in one guild coalesces into one PATCH");
+        let (guild, overrides) = &due[0];
+        assert_eq!(guild, "4000");
+        let body = super::super::collapse_settings_body(overrides);
+        assert_eq!(body["channel_overrides"]["4100"]["collapsed"], false);
+        assert_eq!(body["channel_overrides"]["4200"]["collapsed"], true);
     }
 }

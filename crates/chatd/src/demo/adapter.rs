@@ -1033,6 +1033,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::MarkUnread { .. }
             | Command::AckBulk { .. }
+            | Command::Collapse { .. }
             | Command::Typing { .. }
             | Command::FollowLink { .. }
             | Command::Draft { .. }

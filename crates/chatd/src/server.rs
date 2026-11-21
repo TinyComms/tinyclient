@@ -2765,7 +2765,19 @@ impl Chat {
             }
             Request::Collapse { space, group, collapsed } => {
                 match self.hub.store().set_collapsed(&space, &group, collapsed) {
-                    Ok(true) => Response::Ok,
+                    Ok(true) => {
+                        if space.network == Network::Discord && self.hub.link(&space.account()) == Link::Connected {
+                            self.command(
+                                &space.account(),
+                                Command::Collapse {
+                                    space_id: space.id,
+                                    group_id: group,
+                                    collapsed,
+                                },
+                            );
+                        }
+                        Response::Ok
+                    }
                     Ok(false) => error(ErrorCode::NotFound, "no such group"),
                     Err(err) => internal(err),
                 }

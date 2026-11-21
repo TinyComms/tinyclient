@@ -645,6 +645,9 @@ pub struct ChannelOverride {
     /// `OPT_IN_ENABLED` and the like.
     #[serde(default, deserialize_with = "nullable")]
     pub flags: u32,
+    /// Category collapse state synced with Discord.
+    #[serde(default)]
+    pub collapsed: Option<bool>,
 }
 
 fn inherit() -> u8 {
