@@ -42,6 +42,11 @@ fn text<'a>(value: &'a Value, name: &str) -> &'a str {
     value[name].as_str().unwrap_or("")
 }
 
+/// Rejects query-delimiter or control characters in `syncState` cursors before building URLs.
+fn valid_sync_state(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '&' | '#' | '?'))
+}
+
 pub(super) fn is_channel(id: &str) -> bool {
     id.contains("@thread.tacv2") || id.contains("@thread.skype")
 }
@@ -447,6 +452,12 @@ impl Teams {
         if newest_seen_ms > last_seen_ms {
             self.ctx.set_note("activity_cursor", &newest_seen_ms.to_string());
         }
+        if newest_seen_ms > 0 {
+            let mut state = self.state();
+            if newest_seen_ms > state.activity_newest_ms {
+                state.activity_newest_ms = newest_seen_ms;
+            }
+        }
         for (place, messages) in found {
             let Some(row) = self.ctx.known(&place)?.or(self.ctx.known(thread_of(&place))?) else {
                 continue;
@@ -472,11 +483,18 @@ impl Teams {
         limit: u32,
     ) -> Result<ActivityPage, Fault> {
         let count = limit.clamp(1, ACTIVITY_PAGE);
-        let window = match cursor.filter(|c| !c.is_empty()) {
-            Some(sync_state) => format!("startTime=1&syncState={sync_state}"),
+        let mut window = match cursor.filter(|c| !c.is_empty()) {
+            Some(sync_state) => {
+                if !valid_sync_state(sync_state) {
+                    return Err(Fault::Refused {
+                        status: 400,
+                        message: "Invalid activity cursor.".to_owned(),
+                    });
+                }
+                format!("startTime=1&syncState={sync_state}")
+            }
             None => "startTime=1".to_owned(),
         };
-        let (raws, older) = self.page(ACTIVITY, count, &window)?;
         let (horizon_ms, read_ids) = {
             let mut state = self.state();
             if state.activity_read_horizon == 0 {
@@ -486,19 +504,32 @@ impl Teams {
             }
             (state.activity_read_horizon, state.activity_read_ids.clone())
         };
-        let mut items = Vec::with_capacity(raws.len());
+        let mut items = Vec::new();
         let mut targets = Vec::new();
         let mut newest = 0i64;
-        for raw in &raws {
-            let Some(item) = self.parse_activity_item(raw, horizon_ms, &read_ids) else {
-                continue;
-            };
-            newest = newest.max(millis(&item.id));
-            targets.push((item.id.clone(), (thread_of(&item.conversation.id).to_owned(), item.message_id.clone())));
-            if kind.is_some_and(|want| item.kind != want) {
-                continue;
+        let mut next_cursor: Option<String> = None;
+
+        for _ in 0..ACTIVITY_MAX_PAGES {
+            let (raws, older) = self.page(ACTIVITY, count, &window)?;
+            for raw in &raws {
+                let Some(item) = self.parse_activity_item(raw, horizon_ms, &read_ids) else {
+                    continue;
+                };
+                newest = newest.max(millis(&item.id));
+                targets.push((item.id.clone(), (thread_of(&item.conversation.id).to_owned(), item.message_id.clone())));
+                if kind.is_some_and(|want| item.kind != want) {
+                    continue;
+                }
+                items.push(item);
             }
-            items.push(item);
+            let valid_older = (!older.is_empty() && valid_sync_state(&older)).then_some(older);
+            next_cursor = valid_older.clone();
+            if kind.is_none() || !items.is_empty() || valid_older.is_none() {
+                break;
+            }
+            if let Some(sync_state) = valid_older {
+                window = format!("startTime=1&syncState={sync_state}");
+            }
         }
         {
             let mut state = self.state();
@@ -514,7 +545,7 @@ impl Teams {
         }
         Ok(ActivityPage {
             items,
-            cursor: (!older.is_empty()).then_some(older),
+            cursor: next_cursor,
         })
     }
 
@@ -646,8 +677,14 @@ impl Teams {
             }
             None => {
                 let marker = {
-                    let state = self.state();
-                    if state.activity_newest_ms > 0 { state.activity_newest_ms } else { ts }
+                    let mut state = self.state();
+                    if state.activity_read_horizon == 0 {
+                        if let Some(saved) = self.ctx.note("activity_read_horizon").as_deref().map(millis) {
+                            state.activity_read_horizon = saved;
+                        }
+                    }
+                    let known = state.activity_newest_ms.max(state.activity_read_horizon);
+                    if known > 0 { known } else { ts }
                 };
                 let path = format!(
                     "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
@@ -655,8 +692,12 @@ impl Teams {
                 );
                 let body = json!({"consumptionhorizon": format!("{marker};{ts};{marker}")});
                 self.chat("PUT", &path, Body::Json(&body), false)?;
-                self.state().activity_read_horizon = marker;
-                self.ctx.set_note("activity_read_horizon", &marker.to_string());
+                let persisted = {
+                    let mut state = self.state();
+                    state.activity_read_horizon = state.activity_read_horizon.max(marker);
+                    state.activity_read_horizon
+                };
+                self.ctx.set_note("activity_read_horizon", &persisted.to_string());
             }
         }
         Ok(())
@@ -665,6 +706,7 @@ impl Teams {
     /// Marks any tracked activity items matching `(thread, message_id)` read locally and on Teams
     /// when their underlying conversation message is marked read.
     pub(super) fn mark_activity_for_conversation(&self, thread: &str, message_id: &str) {
+        const MAX_ACTIVITY_MARK_BATCH: usize = 10;
         let read_ms = millis(message_id);
         let matching: Vec<String> = {
             let state = self.state();
@@ -677,6 +719,7 @@ impl Teams {
                         && (mid == message_id || (read_ms > 0 && millis(mid) > 0 && millis(mid) <= read_ms))
                 })
                 .map(|(act_id, _)| act_id.clone())
+                .take(MAX_ACTIVITY_MARK_BATCH)
                 .collect()
         };
         for act_id in matching {
@@ -686,29 +729,47 @@ impl Teams {
 
     /// Handles a live `NewMessage` / `MessageUpdate` pushed for `48:notifications` instead of
     /// dropping it: updates mention/reply badges and raises notifications respecting muted state.
-    pub(super) fn heard_activity(&self, raw: &Value) -> Result<(), Fault> {
+    pub(super) fn heard_activity(&self, raw: &Value, new: bool) -> Result<(), Fault> {
         let (horizon_ms, read_ids) = {
-            let state = self.state();
+            let mut state = self.state();
+            if state.activity_read_horizon == 0 {
+                if let Some(saved) = self.ctx.note("activity_read_horizon").as_deref().map(millis) {
+                    state.activity_read_horizon = saved;
+                }
+            }
             (state.activity_read_horizon, state.activity_read_ids.clone())
         };
         let Some(item) = self.parse_activity_item(raw, horizon_ms, &read_ids) else {
             return Ok(());
         };
+        let activity = match &raw["properties"]["activity"] {
+            Value::String(text) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+            other => other.clone(),
+        };
+        let prop_read = raw["properties"]["isRead"] == true
+            || raw["properties"]["isRead"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || activity["isRead"] == true;
         let item_ms = millis(&item.id);
-        {
+        let already_seen = {
             let mut state = self.state();
             if item_ms > state.activity_newest_ms {
                 state.activity_newest_ms = item_ms;
             }
-            state.activity_targets.insert(
-                item.id.clone(),
-                (thread_of(&item.conversation.id).to_owned(), item.message_id.clone()),
-            );
-        }
+            if prop_read {
+                state.activity_read_ids.insert(item.id.clone());
+            }
+            state
+                .activity_targets
+                .insert(
+                    item.id.clone(),
+                    (thread_of(&item.conversation.id).to_owned(), item.message_id.clone()),
+                )
+                .is_some()
+        };
         if item_ms > 0 {
             self.ctx.set_note("activity_cursor", &item_ms.to_string());
         }
-        if !item.unread {
+        if !new || already_seen || prop_read || !item.unread {
             return Ok(());
         }
         let target_thread = thread_of(&item.conversation.id);
@@ -1000,6 +1061,7 @@ impl Teams {
     /// Previews a hidden or unjoined Teams channel: stores it as read-only (`joined: false`) and
     /// fetches one page of history so the user can inspect it before showing or joining.
     pub(super) fn preview_channel(&self, conversation_id: &str) -> Result<(), Fault> {
+        const PREVIEW_REASON: &str = "Show or join this channel to post messages.";
         let thread = thread_of(conversation_id);
         let existing = self.ctx.known(thread)?;
         let described = self
@@ -1014,19 +1076,32 @@ impl Teams {
             .map(str::to_owned)
             .or_else(|| existing.as_ref().map(|r| r.title.clone()))
             .unwrap_or_else(|| "Channel".to_owned());
+        let archived = described["properties"]["isArchived"] == true
+            || described["properties"]["isArchived"]
+                .as_str()
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || existing
+                .as_ref()
+                .is_some_and(|r| r.read_only && r.read_only_reason != PREVIEW_REASON);
         let mut row = ConversationRow {
             space: existing.as_ref().and_then(|r| r.space.clone()),
             position: existing.as_ref().map_or(LAST, |r| r.position),
             call: CallSupport::Handoff,
             private: existing.as_ref().is_some_and(|r| r.private),
             read_only: true,
-            read_only_reason: "Show or join this channel to post messages.".to_owned(),
+            read_only_reason: if archived {
+                "This channel is archived.".to_owned()
+            } else {
+                PREVIEW_REASON.to_owned()
+            },
             opted_out: existing.as_ref().is_some_and(|r| r.opted_out),
             joined: false,
             ..ConversationRow::new(thread, ConversationKind::Channel, title)
         };
         if let Some(prev) = existing {
             row.topic = prev.topic;
+            row.rights = prev.rights;
+            row.can_pin = prev.can_pin;
         }
         self.ctx.conversation(&row)?;
         if let Ok((raws, _)) = self.page(thread, 30, "startTime=1") {
@@ -1041,15 +1116,32 @@ impl Teams {
     /// Shows a hidden channel of a team we are in (`isFavorite = true`), or joins an unjoined
     /// channel / public team (`PUT /v1/threads/{id}/members/{me}`).
     pub(super) fn join_channel_or_team(&self, conversation_id: &str) -> Result<(), Fault> {
+        const PREVIEW_REASON: &str = "Show or join this channel to post messages.";
         let thread = thread_of(conversation_id);
         let existing = self.ctx.known(thread)?;
         let is_hidden_channel = existing
             .as_ref()
-            .is_some_and(|r| r.space.is_some() && (r.opted_out || !r.joined));
+            .is_some_and(|r| r.space.is_some() && r.opted_out);
         if is_hidden_channel {
             let path = format!("/v1/users/ME/conversations/{}/properties?name=isFavorite", escaped(thread));
             self.chat("PUT", &path, Body::Json(&json!({"isFavorite": "true"})), false)?;
             if let Some(known) = existing {
+                let archived = known.read_only && known.read_only_reason != PREVIEW_REASON;
+                let mut rights = known.rights;
+                if !archived {
+                    let is_general = known.title.eq_ignore_ascii_case("general")
+                        || known.space.as_deref() == Some(thread);
+                    rights.pin = true;
+                    if !is_general {
+                        rights.rename = true;
+                        rights.edit_topic = true;
+                        if known.private {
+                            rights.add_members = true;
+                            rights.remove_members = true;
+                            rights.manage_members = true;
+                        }
+                    }
+                }
                 let row = ConversationRow {
                     space: known.space,
                     group: known.group,
@@ -1062,8 +1154,8 @@ impl Teams {
                     topic: known.topic,
                     parent: known.parent,
                     root: known.root,
-                    read_only: false,
-                    read_only_reason: String::new(),
+                    read_only: archived,
+                    read_only_reason: if archived { known.read_only_reason } else { String::new() },
                     private: known.private,
                     encryption: known.encryption,
                     bot: known.bot,
@@ -1071,8 +1163,8 @@ impl Teams {
                     special: known.special,
                     mark: known.mark,
                     opted_out: false,
-                    rights: known.rights,
-                    can_pin: true,
+                    rights,
+                    can_pin: !archived,
                     moderate: known.moderate,
                     joined: true,
                     ..ConversationRow::new(&known.key.id, known.kind, &known.title)
@@ -1125,9 +1217,17 @@ impl Teams {
         .into_iter()
         .flatten()
         .find(|s| !s.is_empty())
-        .or_else(|| answer.location.rsplit('/').next().filter(|s| !s.is_empty()))
-        .ok_or_else(|| Fault::Net("Teams created the channel without returning its id.".to_owned()))?
-        .to_owned();
+        .map(str::to_owned)
+        .or_else(|| {
+            answer
+                .location
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.split('?').next())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"))
+        })
+        .ok_or_else(|| Fault::Net("Teams created the channel without returning its id.".to_owned()))?;
         let display = answer.body["displayName"]
             .as_str()
             .map(str::trim)

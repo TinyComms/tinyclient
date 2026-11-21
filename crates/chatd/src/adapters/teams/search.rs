@@ -2,7 +2,7 @@
 //! supporting account-wide search, team-scoped search, in-conversation search, structured filters
 //! (`from`, `has`, `before`, `after`, `mentions_me`), and jumping into channel reply chains.
 
-use super::{chain_id, escaped, id_of, millis, seconds, thread_of, Auth, Body, Fault, Teams, SUBSTRATE};
+use super::{chain_id, id_of, millis, seconds, thread_of, Auth, Body, Fault, Teams, SUBSTRATE};
 use crate::adapters::SearchScope;
 use protocol::{MessageHit, SearchFilters, SearchHas};
 use serde_json::{json, Value};
@@ -16,6 +16,27 @@ const SEARCH_GAP: Duration = Duration::from_millis(500);
 const SEARCH_MAX_CHARS: usize = 1024;
 /// Maximum hits requested per page.
 const SEARCH_PAGE_SIZE: usize = 25;
+
+/// Strips control characters, trims, and caps free-text search input to [`SEARCH_MAX_CHARS`].
+fn sanitize_search_text(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(SEARCH_MAX_CHARS)
+        .collect()
+}
+
+/// Sanitizes a structured KQL value so quotes, backslashes, or control chars cannot break out of
+/// a quoted filter token.
+fn sanitize_kql_value(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
 
 /// Strips Substrate highlight tags (`<c0>`, `</c0>`, `<ddd/>`) and Teams HTML into plain text.
 pub(super) fn clean_snippet(raw: &str) -> String {
@@ -39,12 +60,12 @@ pub(super) fn build_query_string(
     filters: &SearchFilters,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let trimmed: String = query.trim().chars().take(SEARCH_MAX_CHARS).collect();
+    let trimmed = sanitize_search_text(query);
     if !trimmed.is_empty() {
         parts.push(trimmed);
     }
-    if let Some(from) = from_term.map(str::trim).filter(|s| !s.is_empty()) {
-        parts.push(format!("from:{from}"));
+    if let Some(from) = from_term.map(sanitize_kql_value).filter(|s| !s.is_empty()) {
+        parts.push(format!("from:\"{from}\""));
     }
     match filters.has {
         Some(SearchHas::Files | SearchHas::Images) => parts.push("hasAttachment:true".to_owned()),
@@ -109,10 +130,10 @@ pub(super) struct ParsedHit {
     pub title: String,
     pub space_title: String,
     pub team_id: String,
-    pub has_files: bool,
-    pub has_images: bool,
-    pub has_links: bool,
-    pub mentions_me: bool,
+    pub has_files: Option<bool>,
+    pub has_images: Option<bool>,
+    pub has_links: Option<bool>,
+    pub mentions_me: Option<bool>,
 }
 
 pub(super) fn parse_hit(raw: &Value, me: &str) -> Option<ParsedHit> {
@@ -239,30 +260,64 @@ pub(super) fn parse_hit(raw: &Value, me: &str) -> Option<ParsedHit> {
     let space_title = str_of(&[&src["TeamName"], &src["teamName"], &raw["TeamName"]]);
     let team_id = str_of(&[&src["TeamId"], &src["teamId"], &src["GroupId"], &raw["TeamId"]]);
 
-    let has_files = src["HasAttachments"] == true
+    let has_files = if src["HasAttachments"] == true
         || raw["HasAttachments"] == true
-        || src["Attachments"].as_array().is_some_and(|a| !a.is_empty());
-    let has_images = src["HasImages"] == true
+        || src["Attachments"].as_array().is_some_and(|a| !a.is_empty())
+    {
+        Some(true)
+    } else if src["HasAttachments"] == false
+        || raw["HasAttachments"] == false
+        || src["Attachments"].as_array().is_some_and(|a| a.is_empty())
+    {
+        Some(false)
+    } else {
+        None
+    };
+    let has_images = if src["HasImages"] == true
         || raw["HasImages"] == true
         || raw_text.contains("<img")
         || src["Attachments"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|a| a["ContentType"].as_str().is_some_and(|c| c.starts_with("image/")));
-    let has_links = src["HasLinks"] == true
+            .any(|a| a["ContentType"].as_str().is_some_and(|c| c.starts_with("image/")))
+    {
+        Some(true)
+    } else if src["HasImages"] == false || raw["HasImages"] == false {
+        Some(false)
+    } else {
+        None
+    };
+    let has_links = if src["HasLinks"] == true
         || raw["HasLinks"] == true
         || text.contains("https://")
         || text.contains("http://")
-        || raw_text.contains("<a ");
-    let mentions_me = src["MentionsMe"] == true
+        || raw_text.contains("<a ")
+    {
+        Some(true)
+    } else if src["HasLinks"] == false || raw["HasLinks"] == false {
+        Some(false)
+    } else {
+        None
+    };
+    let mentions_me = if src["MentionsMe"] == true
         || raw["MentionsMe"] == true
         || (!me.is_empty()
             && src["Mentions"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|m| m["Mri"].as_str() == Some(me) || m.as_str() == Some(me)));
+                .any(|m| m["Mri"].as_str() == Some(me) || m.as_str() == Some(me)))
+    {
+        Some(true)
+    } else if src["MentionsMe"] == false
+        || raw["MentionsMe"] == false
+        || (!me.is_empty() && src["Mentions"].as_array().is_some())
+    {
+        Some(false)
+    } else {
+        None
+    };
 
     Some(ParsedHit {
         thread_id,
@@ -289,12 +344,12 @@ fn matches_filters(hit: &ParsedHit, filters: &SearchFilters) -> bool {
         }
     }
     match filters.has {
-        Some(SearchHas::Files) if !hit.has_files => return false,
-        Some(SearchHas::Images) if !hit.has_images && !hit.has_files => return false,
-        Some(SearchHas::Links) if !hit.has_links => return false,
+        Some(SearchHas::Files) if hit.has_files == Some(false) => return false,
+        Some(SearchHas::Images) if hit.has_images == Some(false) && hit.has_files != Some(true) => return false,
+        Some(SearchHas::Links) if hit.has_links == Some(false) => return false,
         _ => {}
     }
-    if filters.mentions_me && !hit.mentions_me {
+    if filters.mentions_me && hit.mentions_me == Some(false) {
         return false;
     }
     if let Some(before) = filters.before.filter(|&t| t > 0) {
@@ -369,13 +424,14 @@ impl Teams {
             SearchScope::Account => {}
         }
 
+        let display_query = sanitize_search_text(query);
         let mut request_obj = json!({
             "EntityRequests": [{
                 "EntityType": "Message",
                 "ContentSources": ["Teams"],
                 "Query": {
                     "QueryString": query_string,
-                    "DisplayQueryString": query.trim(),
+                    "DisplayQueryString": display_query,
                 },
                 "From": offset,
                 "Size": SEARCH_PAGE_SIZE,
@@ -393,6 +449,10 @@ impl Teams {
         let endpoint = self.search_endpoint()?;
         let answer = self.call("POST", &endpoint, Auth::Bearer(SUBSTRATE), Body::Json(&request_obj), true)?.body;
         let me = self.me();
+        let space_group = match scope {
+            SearchScope::Space(space_id) => self.ctx.note(&format!("group:{space_id}")),
+            _ => None,
+        };
 
         let raw_hits = extract_raw_hits(&answer);
         let mut hits = Vec::new();
@@ -407,6 +467,9 @@ impl Teams {
                 SearchScope::Conversation(id) if thread_of(id) != parsed.thread_id => continue,
                 SearchScope::Space(space_id) => {
                     let in_space = parsed.team_id == *space_id
+                        || space_group
+                            .as_deref()
+                            .is_some_and(|g| !g.is_empty() && parsed.team_id.eq_ignore_ascii_case(g))
                         || parsed.thread_id == *space_id
                         || self
                             .ctx
@@ -467,19 +530,17 @@ impl Teams {
             });
         }
 
-        // Also match channel/team names locally when searching whole account or space with no
-        // message-only filters? Message hits come strictly from server results here.
-        let _ = escaped(""); // keep import clear if unused
         Ok(hits)
     }
 
     fn search_endpoint(&self) -> Result<String, Fault> {
         let place = self.place()?;
         if let Some(ref url) = place.search {
-            if url.ends_with("/query") {
+            let base = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
+            if base.ends_with("/query") {
                 return Ok(url.clone());
             }
-            return Ok(format!("{url}/v2/query"));
+            return Ok(format!("{base}/v2/query"));
         }
         if let Some(ref moved) = self.moved {
             return Ok(format!("{moved}/msgsearch/v2/query"));
@@ -505,11 +566,15 @@ mod tests {
         };
         let q = build_query_string("deploy plan", Some("ana@contoso.com"), &filters);
         assert!(q.contains("deploy plan"), "{q}");
-        assert!(q.contains("from:ana@contoso.com"), "{q}");
+        assert!(q.contains("from:\"ana@contoso.com\""), "{q}");
         assert!(q.contains("hasAttachment:true"), "{q}");
         assert!(q.contains("mentionsMe:true"), "{q}");
         assert!(q.contains("sent>="), "{q}");
         assert!(q.contains("sent<="), "{q}");
+
+        // Multi-word display names stay quoted, and quotes/backslashes/control chars cannot inject KQL.
+        let multi = build_query_string("budget\r\n", Some("Ana \"Admin\"\\Ruiz\n"), &SearchFilters::default());
+        assert_eq!(multi, "budget from:\"Ana AdminRuiz\"");
     }
 
     #[test]
@@ -541,6 +606,27 @@ mod tests {
         assert_eq!(hit.message_id, "1760000210210");
         assert_eq!(hit.parent_id.as_deref(), Some("1760000200200"));
         assert_eq!(hit.text, "Check the deploy runbook…");
-        assert!(hit.has_files && hit.mentions_me);
+        assert_eq!(hit.has_files, Some(true));
+        assert_eq!(hit.mentions_me, Some(true));
+
+        // Server hits that omit optional filter fields (HasAttachments, MentionsMe) are not dropped.
+        let sparse = json!({
+            "HitHighlightedSummary": "Server matched this hit",
+            "Source": {
+                "ThreadId": "19:platform0general@thread.tacv2",
+                "MessageId": "1760000210299"
+            }
+        });
+        let sparse_hit = parse_hit(&sparse, "8:orgid:me").expect("sparse hit");
+        assert_eq!(sparse_hit.has_files, None);
+        assert_eq!(sparse_hit.mentions_me, None);
+        assert!(matches_filters(
+            &sparse_hit,
+            &SearchFilters {
+                has: Some(SearchHas::Files),
+                mentions_me: true,
+                ..Default::default()
+            }
+        ));
     }
 }

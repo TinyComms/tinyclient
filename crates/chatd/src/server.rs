@@ -1983,7 +1983,7 @@ impl Chat {
             Err(refused) => return *refused,
         };
         let mut link = about.link.trim().to_owned();
-        if !link.starts_with("https://") && !link.starts_with("http://") {
+        if !link.starts_with("https://") || protocol::link::Destination::parse(&link).is_none() {
             link.clear();
         }
         clip(&mut link, 2_000);

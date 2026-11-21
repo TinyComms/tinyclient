@@ -84,6 +84,8 @@ pub struct InfoPane {
     notify_set: Option<(Key, Notify)>,
     /// Inline conversation management input (rename, topic, add people).
     manage: Option<(Key, ManageKind, Entity<crate::gui::input::TextInput>)>,
+    /// History sharing mode when adding people to a Teams group chat.
+    share_history: protocol::HistoryShare,
     /// Pending confirmation to remove a member: (conversation, person_id, person_name).
     pending_remove: Option<(Key, String, String)>,
     /// The content width, from the pane's.
@@ -137,6 +139,7 @@ impl InfoPane {
             about_open: false,
             notify_set: None,
             manage: None,
+            share_history: protocol::HistoryShare::None,
             pending_remove: None,
             width: 268.,
             spaces: Vec::new(),
@@ -1069,6 +1072,19 @@ impl InfoPane {
         self.manage.as_ref()
     }
 
+    pub(in crate::gui) fn share_history(&self) -> protocol::HistoryShare {
+        self.share_history
+    }
+
+    pub(in crate::gui) fn cycle_share_history(&mut self, cx: &mut Context<Self>) {
+        self.share_history = match self.share_history {
+            protocol::HistoryShare::None => protocol::HistoryShare::Days { days: 7 },
+            protocol::HistoryShare::Days { .. } => protocol::HistoryShare::All,
+            protocol::HistoryShare::All => protocol::HistoryShare::None,
+        };
+        cx.notify();
+    }
+
     pub(in crate::gui) fn pending_remove(&self) -> Option<&(Key, String, String)> {
         self.pending_remove.as_ref()
     }
@@ -1089,12 +1105,14 @@ impl InfoPane {
             }
             field
         });
+        self.share_history = protocol::HistoryShare::None;
         self.manage = Some((conversation, kind, input));
         cx.notify();
     }
 
     pub(in crate::gui) fn cancel_manage(&mut self, cx: &mut Context<Self>) {
         self.manage = None;
+        self.share_history = protocol::HistoryShare::None;
         cx.notify();
     }
 
@@ -1102,6 +1120,8 @@ impl InfoPane {
         let Some((conversation, kind, input)) = self.manage.take() else {
             return;
         };
+        let chosen_history = self.share_history;
+        self.share_history = protocol::HistoryShare::None;
         let value = input.read(cx).text().trim().to_owned();
         let request = match kind {
             ManageKind::Rename if !value.is_empty() => Request::ConversationUpdate {
@@ -1132,7 +1152,10 @@ impl InfoPane {
                     cx.notify();
                     return;
                 }
-                Request::MembersAdd { conversation, people, share_history: None }
+                let share_history = (conversation.network == Network::Teams
+                    && self.row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Group))
+                .then_some(chosen_history);
+                Request::MembersAdd { conversation, people, share_history }
             }
             _ => {
                 cx.notify();

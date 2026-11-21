@@ -1,0 +1,12 @@
+{
+  "id": "teams-wave7b",
+  "title": "Wave 7B Teams pins & saved messages, activity feed, server-side search, group chats, external/federated requests & blocklist, and team/channel management",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 7B Teams enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 7B Teams enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -244,14 +244,12 @@ impl Teams {
             "Shared channel".to_owned()
         } else if let Some(peer) = row.as_ref().and_then(|r| r.peer.as_deref()) {
             self.cached(peer)
-                .filter(|k| k.external || k.guest)
+                .filter(|k| k.external)
                 .map(|k| {
-                    if !k.tenant_name.is_empty() {
+                    if !k.tenant_name.is_empty() && !k.tenant_name.eq_ignore_ascii_case("Shared channel") {
                         k.tenant_name
-                    } else if k.external {
-                        "External".to_owned()
                     } else {
-                        "Guest".to_owned()
+                        "External".to_owned()
                     }
                 })
                 .unwrap_or_default()
@@ -335,6 +333,12 @@ impl Teams {
 
     /// Deletes a non-General Teams channel where allowed and removes it from the local store.
     pub(super) fn delete_channel(&self, conversation: &str) -> Result<(), Fault> {
+        if super::chain_of(conversation).is_some() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Channel reply threads cannot be deleted here.".to_owned(),
+            });
+        }
         let thread = thread_of(conversation);
         let Some(row) = self.ctx.known(thread)? else {
             return Err(Fault::Refused {
@@ -544,7 +548,7 @@ impl Teams {
             }
             Ok(())
         } else {
-            let _ = self.chat("PUT", &path, Body::Json(&json!({"externalChatState": "blocked"})), false);
+            self.chat("PUT", &path, Body::Json(&json!({"externalChatState": "blocked"})), false)?;
             if let Some(peer) = known.and_then(|k| k.peer).filter(|p| p.starts_with("8:")) {
                 self.relate(&peer, protocol::RelateAction::Block)?;
             }
@@ -561,6 +565,12 @@ impl Teams {
         topic: Option<&str>,
         description: Option<&str>,
     ) -> Result<(), Fault> {
+        if super::chain_of(conversation).is_some() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Reply threads cannot be renamed or edited here.".to_owned(),
+            });
+        }
         let thread = thread_of(conversation);
         let row = self.ctx.known(thread)?;
         let is_one_on_one = thread.ends_with("@unq.gbl.spaces")
@@ -572,9 +582,12 @@ impl Teams {
             });
         }
         let is_channel = super::tree::is_channel(thread);
-        let new_name = title.or(topic).map(str::trim).filter(|s| !s.is_empty());
-        if let Some(name) = new_name {
-            if is_channel && row.as_ref().is_some_and(|r| r.title.eq_ignore_ascii_case("general")) {
+        if let Some(name) = title.map(str::trim).filter(|s| !s.is_empty()) {
+            if is_channel
+                && row
+                    .as_ref()
+                    .is_some_and(|r| r.title.eq_ignore_ascii_case("general") || r.space.as_deref() == Some(thread))
+            {
                 return Err(Fault::Refused {
                     status: 400,
                     message: "The General channel cannot be renamed.".to_owned(),
@@ -584,7 +597,7 @@ impl Teams {
             self.chat("PUT", &path, Body::Json(&json!({"topic": name})), false)?;
             self.rename_row(thread, name)?;
         }
-        if let Some(desc) = description.map(str::trim) {
+        if let Some(desc) = description.or(topic).map(str::trim) {
             let path = format!("/v1/threads/{}/properties?name=description", escaped(thread));
             self.chat("PUT", &path, Body::Json(&json!({"description": desc})), false)?;
         }
@@ -754,10 +767,8 @@ impl Teams {
                 message: "Messages cannot be pinned in this conversation.".to_owned(),
             });
         }
-        let mut entries = match self.described(thread) {
-            Ok(described) => parse_pinned_messages(&described["properties"]),
-            Err(_) => self.state().pinned_messages.get(thread).cloned().unwrap_or_default(),
-        };
+        let described = self.described(thread)?;
+        let mut entries = parse_pinned_messages(&described["properties"]);
         let me = self.me();
         let now_secs = now_ms() / 1000;
         if pinned {
@@ -814,10 +825,14 @@ impl Teams {
             self.chat("DELETE", &path, Body::None, false)?;
             self.state().saved_ids.remove(message_id);
         }
-        for conv in [conversation, thread] {
-            if let Ok(Some(mut stored)) = self.ctx.stored_message(conv, message_id) {
+        if let Ok(Some(mut stored)) = self.ctx.stored_message(conversation, message_id) {
+            stored.starred = starred;
+            self.ctx.history(conversation, &[stored])?;
+        }
+        if thread != conversation {
+            if let Ok(Some(mut stored)) = self.ctx.stored_message(thread, message_id) {
                 stored.starred = starred;
-                self.ctx.history(conv, &[stored])?;
+                self.ctx.history(thread, &[stored])?;
             }
         }
         Ok(())
@@ -856,7 +871,7 @@ impl Teams {
             }
             saved_ids.push(src_id.clone());
             if let Some(want) = filter_thread {
-                if !src_conv.is_empty() && thread_of(src_conv) != want {
+                if src_conv.is_empty() || thread_of(src_conv) != want {
                     continue;
                 }
             }
@@ -879,8 +894,12 @@ impl Teams {
         }
         {
             let mut state = self.state();
-            for id in saved_ids {
-                state.saved_ids.insert(id);
+            if filter_thread.is_none() {
+                state.saved_ids = saved_ids.into_iter().collect();
+            } else {
+                for id in saved_ids {
+                    state.saved_ids.insert(id);
+                }
             }
         }
         out.sort_by_key(|m| std::cmp::Reverse(m.sent));

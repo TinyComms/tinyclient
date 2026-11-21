@@ -745,6 +745,7 @@ pub enum ActivityItemKind {
     MissedCall,
     App,
     Invite,
+    #[serde(other)]
     Other,
 }
 
@@ -1228,6 +1229,8 @@ mod tests {
         assert_eq!(wire, "\"missed_call\"");
         let back: ActivityItemKind = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, ActivityItemKind::MissedCall);
+        let unknown: ActivityItemKind = serde_json::from_str("\"future_activity_kind\"").unwrap();
+        assert_eq!(unknown, ActivityItemKind::Other);
     }
 
     #[test]

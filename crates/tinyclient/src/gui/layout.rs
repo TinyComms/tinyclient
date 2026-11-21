@@ -158,6 +158,8 @@ pub struct State {
     toasts: u64,
     /// A newer release is waiting. Stays until the toast is dismissed.
     pub update_alert: bool,
+    /// Shell-level external link confirmation when no conversation pane is mounted.
+    link_ask: Option<super::conversation::links::LinkAsk>,
 }
 
 impl Default for State {
@@ -176,6 +178,7 @@ impl Default for State {
             toast: None,
             toasts: 0,
             update_alert: false,
+            link_ask: None,
         }
     }
 }
@@ -392,6 +395,10 @@ impl Shell {
         // On a phone Escape is back: one pushed page, sheet or switcher at a time.
         if super::phone::active() {
             return self.phone_back(Some(window), cx);
+        }
+        if self.layout_state.link_ask.take().is_some() {
+            cx.notify();
+            return true;
         }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
@@ -1602,6 +1609,7 @@ impl Render for Shell {
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
+            .children(self.link_ask_modal(window, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
@@ -1716,6 +1724,176 @@ fn window_chrome(window: &Window) -> impl Iterator<Item = AnyElement> {
 }
 
 impl Shell {
+    /// Opens an external web link using the mounted conversation pane when one is open, or
+    /// handles confirmation at the shell level when no conversation is open.
+    pub(in crate::gui) fn open_external_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open.is_some() {
+            let pane = self.pane(cx);
+            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
+            return;
+        }
+        if super::conversation::links::is_mailto(url) {
+            cx.open_url(url);
+            return;
+        }
+        let Some(dest) = protocol::link::Destination::parse(url) else {
+            return;
+        };
+        let choices = super::app::prefs::choices();
+        let trusted = super::app::prefs::trusted_links().contains(&dest.domain);
+        if super::conversation::links::opens_at_once(&dest, choices.confirm_links, trusted) {
+            cx.open_url(&dest.target(choices.strip_tracking));
+            return;
+        }
+        self.layout_state.link_ask = Some(super::conversation::links::LinkAsk { dest, remember: false });
+        cx.notify();
+    }
+
+    fn close_link_ask(&mut self, cx: &mut Context<Self>) {
+        if self.layout_state.link_ask.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn go_to_link(&mut self, cx: &mut Context<Self>) {
+        let Some(ask) = self.layout_state.link_ask.take() else {
+            return;
+        };
+        if ask.remember && ask.can_remember() {
+            let mut trusted = super::app::prefs::trusted_links();
+            if trusted.add(&ask.dest.domain) {
+                super::app::prefs::set_trusted_links(trusted);
+                self.save_prefs(cx);
+            }
+        }
+        cx.open_url(&ask.target());
+        cx.notify();
+    }
+
+    fn link_ask_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ask = self.layout_state.link_ask.as_ref()?;
+        let dest = &ask.dest;
+        let target = ask.target();
+
+        let mut body = div().mt(px(12.)).flex().flex_col().gap(px(10.));
+        let mut site = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(div().type_title().font_weight(theme::SEMIBOLD).child(dest.domain_shown.clone()));
+        if dest.host_shown != dest.domain_shown {
+            site = site.child(div().type_ui().text_color(theme::text_soft()).child(dest.host_shown.clone()));
+        }
+        body = body.child(site);
+
+        let note = |warn: bool, words: String| {
+            div()
+                .p(px(10.))
+                .rounded(px(theme::R_CARD))
+                .bg(if warn { theme::warning_soft() } else { theme::raised() })
+                .type_ui()
+                .text_color(if warn { theme::text() } else { theme::text_soft() })
+                .child(words)
+        };
+        match dest.risk {
+            protocol::link::Risk::Lookalike => {
+                body = body.child(note(
+                    true,
+                    format!(
+                        "Careful: this name mixes alphabets, or uses letters that look like Latin ones. It may be pretending to be another site. Its real address is {}.",
+                        dest.host
+                    ),
+                ));
+            }
+            protocol::link::Risk::Idn => {
+                body = body.child(note(
+                    false,
+                    format!("This site's name uses letters outside A to Z. Its address on the internet is {}.", dest.host),
+                ));
+            }
+            protocol::link::Risk::None => {}
+        }
+        if dest.has_userinfo {
+            body = body.child(note(
+                true,
+                "Careful: the part of the address before the @ is a user name, not the site. The site is the one above.".to_owned(),
+            ));
+        }
+        body = body.child(
+            div()
+                .id("shell-link-address")
+                .p(px(10.))
+                .rounded(px(theme::R_CARD))
+                .bg(theme::raised())
+                .line_clamp(4)
+                .type_small()
+                .text_color(theme::text_soft())
+                .child(target.clone()),
+        );
+        if ask.can_remember() {
+            let on = ask.remember;
+            body = body.child(
+                div()
+                    .id("shell-link-remember")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .type_ui()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(16.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if on { theme::accent() } else { theme::border_strong() })
+                            .when(on, |box_| box_.bg(theme::accent()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme::on_accent())
+                            .child(if on { "✓" } else { "" }),
+                    )
+                    .child(format!("Don't ask again for {}", dest.domain_shown))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(ask) = this.layout_state.link_ask.as_mut() {
+                            ask.remember = !ask.remember;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let copy = target.clone();
+        let panel = super::components::modal("Open this link?")
+            .w(px(if super::phone::active() { room.min(440.) } else { 440. }))
+            .child(body)
+            .child(
+                super::components::modal_buttons()
+                    .child(button("shell-link-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close_link_ask(cx))))
+                    .child(button("shell-link-copy", ButtonKind::Secondary, "Copy link").on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                        this.close_link_ask(cx);
+                    })))
+                    .child(button("shell-link-open", ButtonKind::Primary, "Open").on_click(cx.listener(|this, _, _, cx| this.go_to_link(cx)))),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("shell-link-ask")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_link_ask(cx)))
+            .child(fade_in("shell-link-ask-panel", 160, panel));
+        Some(gpui::deferred(gpui::anchored().position(gpui::point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     /// The toasts, 16 from the bottom-right: the crash toast stays until dismissed and sits
     /// above any other.
     fn toast_layer(&self, window_width: f32, cx: &mut Context<Self>) -> Option<Div> {

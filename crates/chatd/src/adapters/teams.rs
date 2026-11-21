@@ -188,7 +188,12 @@ const OURS: &[&str] = &[
     "teams.cloud.microsoft",
     "teams.office.com",
     "graph.microsoft.com",
+];
+/// Hosts a Microsoft Search (Substrate) token may be sent to.
+const SUBSTRATE_HOSTS: &[&str] = &[
     "substrate.office.com",
+    "teams.microsoft.com",
+    "teams.cloud.microsoft",
 ];
 
 /// Messages per page of history, and per opening of a reply chain.
@@ -683,6 +688,12 @@ impl Teams {
             || https_host(url).is_some_and(|host| OURS.iter().any(|domain| within(host, domain)))
     }
 
+    /// True for an address a Microsoft Search (Substrate) bearer token may be sent to.
+    fn substrate_host(&self, url: &str) -> bool {
+        self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str()))
+            || https_host(url).is_some_and(|host| SUBSTRATE_HOSTS.iter().any(|domain| within(host, domain)))
+    }
+
     /// True for an address a picture in a message may be fetched from: the media store.
     fn pictures(&self, url: &str) -> bool {
         let media = |host: &str| within(host, "asm.skype.com") || within(host, "asyncgw.teams.microsoft.com");
@@ -815,7 +826,10 @@ impl Teams {
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
                 urlp: named("urlp"),
-                search: named("search"),
+                search: gtms["search"]
+                    .as_str()
+                    .map(|url| url.trim_end_matches('/').to_owned())
+                    .filter(|url| self.substrate_host(url)),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -884,7 +898,11 @@ impl Teams {
         if let Some(why) = self.state().expired.clone() {
             return Err(Fault::Auth(why));
         }
-        if !self.ours(url) {
+        let allowed = match auth {
+            Auth::Bearer(scope) | Auth::Both(scope) if scope == SUBSTRATE => self.substrate_host(url),
+            _ => self.ours(url),
+        };
+        if !allowed {
             return Err(Fault::Net(format!("{} is not a Teams address", bare(url))));
         }
         let (mut renewed, mut limited, mut wait) = (false, false, 0);

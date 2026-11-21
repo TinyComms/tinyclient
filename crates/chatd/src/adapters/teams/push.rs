@@ -222,6 +222,33 @@ impl Teams {
         let Some(id) = conversation["id"].as_str() else {
             return Ok(());
         };
+        if id == super::tree::ACTIVITY {
+            if let Some(marker) = conversation["properties"]["consumptionhorizon"]
+                .as_str()
+                .and_then(|h| h.split(';').next())
+                .map(super::millis)
+                .filter(|&ms| ms > 0)
+            {
+                let updated = {
+                    let mut state = self.state();
+                    if state.activity_read_horizon == 0 {
+                        if let Some(saved) = self.ctx.note("activity_read_horizon").as_deref().map(super::millis) {
+                            state.activity_read_horizon = saved;
+                        }
+                    }
+                    if marker > state.activity_read_horizon {
+                        state.activity_read_horizon = marker;
+                        Some(marker)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(horizon) = updated {
+                    self.ctx.set_note("activity_read_horizon", &horizon.to_string());
+                }
+            }
+            return Ok(());
+        }
         let Some(row) = self.ctx.known(id)? else {
             return Ok(());
         };

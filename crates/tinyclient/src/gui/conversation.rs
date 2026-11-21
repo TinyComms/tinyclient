@@ -11,7 +11,7 @@ mod emoji;
 mod header;
 mod icons;
 pub(in crate::gui) mod images;
-mod links;
+pub(in crate::gui) mod links;
 mod media;
 mod pages;
 mod player;

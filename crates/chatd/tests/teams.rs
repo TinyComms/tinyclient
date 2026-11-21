@@ -204,6 +204,8 @@ struct Fake {
     extra_channels: Mutex<HashMap<String, Vec<Value>>>,
     /// Team ids left by the user (for #629).
     left_teams: Mutex<Vec<String>>,
+    /// Thread ids for which `GET /v1/threads/{id}` returns 500 (for transient-failure tests).
+    fail_describe: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -240,10 +242,14 @@ impl Fake {
                 }
             })]),
             threads: Mutex::default(),
-            blocked: Mutex::new(vec!["8:orgid:00000000-0000-4000-8000-0000000000bb".to_owned()]),
+            blocked: Mutex::new(vec![
+                "8:orgid:00000000-0000-4000-8000-0000000000bb".to_owned(),
+                "8:live:bare_blocked_user".to_owned(),
+            ]),
             extra_teams: Mutex::default(),
             extra_channels: Mutex::default(),
             left_teams: Mutex::default(),
+            fail_describe: Mutex::default(),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -595,6 +601,9 @@ impl Fake {
                     }
                 }
             }
+            if call.method == "GET" && self.fail_describe.lock().unwrap().iter().any(|t| t == thread) {
+                return answer("500 Internal Server Error", json!({"errorCode": 500, "message": "transient error"}));
+            }
             let mut described = self
                 .threads
                 .lock()
@@ -917,7 +926,7 @@ impl Fake {
                         .iter()
                         .find(|u| u["mri"].as_str() == Some(mri.as_str()))
                         .cloned()
-                        .unwrap_or_else(|| json!({"mri": mri}))
+                        .unwrap_or_else(|| json!(mri))
                 })
                 .collect();
             return ok(json!({"blockedUsers": list}));
@@ -1065,6 +1074,7 @@ impl Fake {
         let query = entity["Query"]["QueryString"].as_str().unwrap_or("").to_lowercase();
         let thread_filter = entity["Filter"]["ThreadId"].as_str().unwrap_or("");
         let team_filter = entity["Filter"]["TeamId"].as_str().unwrap_or("");
+        let group_filter = entity["Filter"]["GroupId"].as_str().unwrap_or("");
 
         let corpus = vec![
             json!({
@@ -1108,6 +1118,17 @@ impl Fake {
                     "MentionsMe": false
                 }
             }),
+            json!({
+                "HitHighlightedSummary": "Quarterly <c0>roadmap</c0> milestone",
+                "Source": {
+                    "ThreadId": "19:platform0unseen@thread.tacv2",
+                    "MessageId": "1760000450450",
+                    "GroupId": "e0873025-0000-4000-8000-00000000beef",
+                    "TeamName": "Platform",
+                    "ChannelName": "Roadmap",
+                    "From": {"Mri": ANA, "Name": "Ana Ruiz"}
+                }
+            }),
         ];
 
         let mut matched = Vec::new();
@@ -1121,8 +1142,12 @@ impl Fake {
             if !thread_filter.is_empty() && src["ThreadId"].as_str() != Some(thread_filter) {
                 continue;
             }
-            if !team_filter.is_empty() && src["TeamId"].as_str() != Some(team_filter) {
-                continue;
+            if !team_filter.is_empty() {
+                let by_team = src["TeamId"].as_str() == Some(team_filter);
+                let by_group = !group_filter.is_empty() && src["GroupId"].as_str() == Some(group_filter);
+                if !by_team && !by_group {
+                    continue;
+                }
             }
             matched.push(item);
         }
@@ -3722,5 +3747,134 @@ fn team_and_channel_browse_join_create_rename_delete_members_leave_and_manage_li
         Response::Error { detail, .. } => assert!(detail.contains("last owner"), "detail: {detail}"),
         other => panic!("expected last owner refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn wave7b_review_regressions_pin_failure_activity_dedup_blocklist_group_search_and_preview_rights() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Bare-MRI blocklist entries (no displayName/email) still surface under Relation::Blocked.
+    let blocked = world.until("bare MRI blocked user loaded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Teams),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. }
+                if people.iter().any(|p| p.key.id == "8:live:bare_blocked_user") =>
+            {
+                Some(people)
+            }
+            _ => None,
+        }
+    });
+    let bare = blocked.iter().find(|p| p.key.id == "8:live:bare_blocked_user").unwrap();
+    assert_eq!(bare.relation, Relation::Blocked);
+    assert_eq!(bare.mark, Some(protocol::Mark::External));
+
+    // 2. pin_message propagates GET /v1/threads/{id} failure and does NOT overwrite existing pins.
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+    world.fake.fail_describe.lock().unwrap().push(CHAT_ANA.to_owned());
+    let pin_put_before = world.fake.calls("PUT", &format!("{CHAT_ANA}/properties")).len();
+    assert!(
+        matches!(
+            world.ask(Request::Pin {
+                conversation: ana.clone(),
+                message_id: "1760000500200".to_owned(),
+                pinned: true,
+                notify: false,
+                me_only: false,
+            }),
+            Response::Error { .. }
+        ),
+        "pin_message must fail when described() fails"
+    );
+    assert_eq!(
+        world.fake.calls("PUT", &format!("{CHAT_ANA}/properties")).len(),
+        pin_put_before,
+        "must not PUT pinnedMessages after describe failure"
+    );
+    world.fake.fail_describe.lock().unwrap().clear();
+    let pins_still = match world.ask(Request::Pinned { conversation: ana.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(pins_still.len(), 1);
+    assert_eq!(pins_still[0].id, "1760000500100");
+
+    // 3. MessageUpdate / duplicate push on 48:notifications does not double-count mentions.
+    let deploys = key(DEPLOYS);
+    let mentions_before = world.conversation(&deploys).unwrap().mentions;
+    let activity_evt = json!({
+        "id": "1760009995001",
+        "type": "Message",
+        "messagetype": "Text",
+        "contenttype": "text",
+        "content": "Dedup mention check",
+        "conversationid": "48:notifications",
+        "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+        "imdisplayname": "Ana Ruiz",
+        "properties": {
+            "activity": json!({
+                "activityType": "mention",
+                "sourceThreadId": DEPLOYS,
+                "sourceMessageId": "1760009995000",
+                "sourceUserId": ANA,
+                "sourceUserImDisplayName": "Ana Ruiz",
+                "messagePreview": "Dedup mention check"
+            }).to_string()
+        }
+    });
+    world.fake.push("NewMessage", activity_evt.clone(), false);
+    let after_first = world.until("first live activity mention increments once", || {
+        world.conversation(&deploys).filter(|r| r.mentions == mentions_before + 1)
+    });
+    assert_eq!(after_first.mentions, mentions_before + 1);
+    // Push MessageUpdate and a duplicate NewMessage for the same activity item, then a barrier message.
+    world.fake.push("MessageUpdate", activity_evt.clone(), false);
+    world.fake.push("NewMessage", activity_evt, false);
+    world.fake.push("NewMessage", message(CHAT_ANA, None, 1_760_009_995_100, ANA, "Ana Ruiz", "<p>barrier</p>"), false);
+    world.until("barrier message processed", || world.message(&ana, "1760009995100"));
+    assert_eq!(
+        world.conversation(&deploys).unwrap().mentions,
+        mentions_before + 1,
+        "MessageUpdate / duplicate NewMessage must not double-count mentions"
+    );
+
+    // 4. GroupId-only team search hits (missing TeamId) match SearchScope::Space via group:{space_id}.
+    let group_hits = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(key(GENERAL)),
+        account: None,
+        network: None,
+        query: "roadmap".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected search: {other:?}"),
+    };
+    assert_eq!(group_hits.len(), 1, "{group_hits:?}");
+    assert_eq!(group_hits[0].conversation, key("19:platform0unseen@thread.tacv2"));
+    assert_eq!(group_hits[0].message_id, "1760000450450");
+
+    // 5. Channel rights (rename, edit_topic, pin) are preserved across PreviewChannel -> Join.
+    let hidden_key = key("19:platform0hidden@thread.tacv2");
+    let previewed = match world.ask(Request::PreviewChannel { conversation: hidden_key.clone() }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected preview: {other:?}"),
+    };
+    assert!(!previewed.joined && previewed.read_only);
+    let shown = match world.ask(Request::Join { conversation: hidden_key }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected join: {other:?}"),
+    };
+    assert!(shown.joined && !shown.opted_out && !shown.read_only);
+    assert!(shown.can_pin && shown.rights.pin && shown.rights.rename && shown.rights.edit_topic);
 }
 

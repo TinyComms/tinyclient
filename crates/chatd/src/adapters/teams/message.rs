@@ -1061,7 +1061,7 @@ impl Teams {
             return Ok(());
         };
         if place == super::tree::ACTIVITY {
-            return self.heard_activity(raw);
+            return self.heard_activity(raw, new);
         }
         if raw["messagetype"].as_str() == Some("ThreadActivity/TopicUpdate") {
             let content = raw["content"].as_str().unwrap_or("");

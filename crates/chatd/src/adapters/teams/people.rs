@@ -79,20 +79,19 @@ pub(super) fn is_external_user(user: &Value, id: &str, home_tenant: &str) -> boo
 
 /// Human-readable organization label for an external or personal account.
 pub(super) fn external_org_name(user: &Value, id: &str) -> String {
+    if is_consumer_mri(id) || user["isTflUser"] == true {
+        return "Personal account".to_owned();
+    }
     let named = [
         user["tenantName"].as_str(),
         user["organizationName"].as_str(),
-        user["companyName"].as_str(),
     ]
     .into_iter()
     .flatten()
     .map(str::trim)
-    .find(|s| !s.is_empty());
+    .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("Shared channel"));
     if let Some(org) = named {
         return org.to_owned();
-    }
-    if is_consumer_mri(id) || user["isTflUser"] == true {
-        return "Personal account".to_owned();
     }
     let mail = user["email"]
         .as_str()
@@ -458,18 +457,57 @@ impl Teams {
         };
         let mut blocked_ids = Vec::new();
         let mut user_objs = Vec::new();
+        let mut with_profile = std::collections::HashSet::new();
         for entry in entries {
             if let Some(mri) = entry.as_str().filter(|s| !s.is_empty()) {
                 blocked_ids.push(mri.to_owned());
             } else if let Some(mri) = entry["mri"].as_str().or_else(|| entry["id"].as_str()).filter(|s| !s.is_empty()) {
                 blocked_ids.push(mri.to_owned());
                 if entry["displayName"].is_string() || entry["email"].is_string() {
-                    user_objs.push(entry.clone());
+                    let mut normalized = entry.clone();
+                    if let Some(obj) = normalized.as_object_mut() {
+                        obj.entry("mri".to_owned()).or_insert_with(|| Value::String(mri.to_owned()));
+                    }
+                    with_profile.insert(mri.to_owned());
+                    user_objs.push(normalized);
                 }
             }
         }
         if !user_objs.is_empty() {
             self.learn(&user_objs);
+        }
+        let missing_ids: Vec<String> = blocked_ids
+            .iter()
+            .filter(|id| !with_profile.contains(id.as_str()) && self.cached(id).is_none())
+            .cloned()
+            .collect();
+        if !missing_ids.is_empty() {
+            self.lookup(&missing_ids);
+        }
+        let mut placeholders = Vec::new();
+        let mut placeholder_details = Vec::new();
+        for id in &blocked_ids {
+            if self.cached(id).is_none() {
+                placeholders.push(PersonRow {
+                    id: id.clone(),
+                    name: id.clone(),
+                    handle: String::new(),
+                    avatar: self.picture(id, id).map(|file| file.id),
+                    bot: id.starts_with("28:"),
+                    status: String::new(),
+                    link: String::new(),
+                });
+                let mark = is_consumer_mri(id).then_some(Mark::External);
+                placeholder_details.push((id.clone(), PersonDetails { mark, ..PersonDetails::default() }));
+            }
+        }
+        if !placeholders.is_empty() {
+            if let Err(err) = self.ctx.people(&placeholders) {
+                tracing::warn!("chatd: Teams: {err}");
+            }
+            if let Err(err) = self.ctx.details(&placeholder_details) {
+                tracing::warn!("chatd: Teams: {err}");
+            }
         }
         {
             let mut state = self.state();
@@ -723,6 +761,13 @@ impl Teams {
 
     /// Removes one person from a Teams group chat, team, or private channel.
     pub(super) fn members_remove(&self, conversation: &str, person: &str) -> Result<(), Fault> {
+        let mri = person.trim();
+        if mri.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Pick a person to remove.".to_owned(),
+            });
+        }
         let thread = super::thread_of(conversation);
         let row = self.ctx.known(thread)?;
         let is_one_on_one = thread.ends_with("@unq.gbl.spaces")
@@ -733,9 +778,29 @@ impl Teams {
                 message: "People cannot be removed from a 1:1 Teams chat.".to_owned(),
             });
         }
-        let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(person.trim()));
-        self.chat("DELETE", &path, Body::None, false)?;
-        if person.trim() == self.me() {
+        let is_channel_or_team = super::tree::is_channel(thread);
+        let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(mri));
+        self.chat("DELETE", &path, Body::None, false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } if is_channel_or_team => Fault::Refused {
+                status: 403,
+                message: "Only team or channel owners can remove members here.".to_owned(),
+            },
+            other => other,
+        })?;
+        if mri == self.me() {
+            let remaining_spaces = {
+                let mut state = self.state();
+                let was_space = state.spaces.iter().any(|s| s.id == thread);
+                if was_space {
+                    state.spaces.retain(|s| s.id != thread);
+                    Some(state.spaces.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(spaces) = remaining_spaces {
+                self.ctx.spaces(&spaces)?;
+            }
             self.ctx.conversation_gone(thread)?;
         }
         self.ctx.info_stale(thread);
@@ -930,9 +995,12 @@ mod tests {
         assert!(is_external_user(&federated, "8:orgid:ext1", home));
         assert_eq!(external_org_name(&federated, "8:orgid:ext1"), "Fabrikam");
 
-        let personal = json!({"email": "sam@outlook.com"});
+        let personal = json!({"email": "sam@outlook.com", "companyName": "Contoso"});
         assert!(is_external_user(&personal, "8:live:sam123", home));
         assert_eq!(external_org_name(&personal, "8:live:sam123"), "Personal account");
+
+        let spoofed_shared = json!({"tenantId": "99999999-9999-4999-8999-999999999999", "tenantName": "Shared channel"});
+        assert_eq!(external_org_name(&spoofed_shared, "8:orgid:ext2"), "External");
 
         assert!(looks_like_email("eva@fabrikam.com"));
         assert!(!looks_like_email("eva"));

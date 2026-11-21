@@ -321,8 +321,17 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         }
         top = top.child(manage_bar);
     }
-    if let Some((mkey, _, input)) = pane.managing() {
+    if let Some((mkey, mkind, input)) = pane.managing() {
         if mkey == &row.key {
+            let show_history = *mkind == ManageKind::AddMembers
+                && row.key.network == Network::Teams
+                && row.kind == ConversationKind::Group;
+            let history_label = match pane.share_history() {
+                protocol::HistoryShare::None => "History: None",
+                protocol::HistoryShare::Days { days: 7 } => "History: 7 days",
+                protocol::HistoryShare::Days { .. } => "History: Recent",
+                protocol::HistoryShare::All => "History: All",
+            };
             top = top.child(
                 div()
                     .mt(px(8.))
@@ -333,6 +342,17 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     .flex_col()
                     .gap(px(6.))
                     .child(input.clone())
+                    .when(show_history, |box_| {
+                        box_.child(
+                            div().flex().items_center().justify_between().child(
+                                button("manage-history", ButtonKind::Secondary, history_label)
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .type_small()
+                                    .on_click(cx.listener(|pane, _, _, cx| pane.cycle_share_history(cx))),
+                            ),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
@@ -712,7 +732,7 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
     let link = info
         .as_ref()
         .map(|i| i.link.as_str())
-        .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+        .filter(|u| u.starts_with("https://") && protocol::link::Destination::parse(u).is_some())
         .map(str::to_owned)
         .or_else(|| facts::space_link(key));
     let shell = pane.shell_weak();
@@ -725,11 +745,8 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
         div().px(px(theme::PANE_PAD)).pt(px(16.)).children(link.map(move |url| {
             let shell = shell.clone();
             draw::open_in_labeled("space-open", key.network, label.clone()).on_click(move |_, window, cx| {
-                if url.starts_with("https://") || url.starts_with("http://") {
-                    let _ = shell.update(cx, |shell, cx| {
-                        let pane = shell.pane(cx);
-                        pane.update(cx, |pane, cx| pane.open_external_link(&url, window, cx));
-                    });
+                if url.starts_with("https://") {
+                    let _ = shell.update(cx, |shell, cx| shell.open_external_url(&url, window, cx));
                 } else {
                     cx.open_url(&url);
                 }

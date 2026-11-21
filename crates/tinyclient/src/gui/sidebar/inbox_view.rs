@@ -372,10 +372,21 @@ impl Shell {
 
         let body: AnyElement = if state.activity_loading && state.activity_items.is_empty() {
             div().pt(px(4.)).children((0..5).map(Self::inbox_placeholder)).into_any_element()
-        } else if state.activity_items.is_empty() {
+        } else if state.activity_items.is_empty() && state.activity_cursor.is_none() {
             self.inbox_empty(cx)
         } else {
             let mut list_box = div().id("activity-feed-list").size_full().overflow_y_scroll().flex().flex_col();
+            if state.activity_items.is_empty() {
+                list_box = list_box.child(
+                    div()
+                        .px(px(16.))
+                        .pt(px(16.))
+                        .pb(px(4.))
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child("No matching activity on this page."),
+                );
+            }
             for (ix, item) in state.activity_items.iter().enumerate() {
                 let kind_word = match item.kind {
                     ActivityItemKind::Mention => "mentioned you".to_owned(),
