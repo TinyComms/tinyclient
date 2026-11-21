@@ -989,6 +989,7 @@ impl Composer {
             importance: if controls.importance { self.importance } else { protocol::Importance::Normal },
             broadcast: controls.broadcast && self.thread && self.broadcast,
             effect: if controls.effects { self.effect.clone() } else { None },
+            contact: None,
         };
         self.importance = protocol::Importance::Normal;
         self.broadcast = false;

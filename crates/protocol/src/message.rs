@@ -392,6 +392,21 @@ pub struct PollBallot {
     pub serial: u32,
 }
 
+/// A contact card shared in a message (Signal, Telegram).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedContact {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phones: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emails: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub organization: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+}
+
 /// A poll on a message: the question, the choices and their counts, which I picked, and whether
 /// it has ended. `ballots` is who voted for what, so a later vote from the same person replaces
 /// theirs.
@@ -615,6 +630,9 @@ pub struct Message {
     /// Optional message effect identifier (Telegram).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<String>,
+    /// Shared contact cards carried on this message (Signal, Telegram).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacts: Vec<SharedContact>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -708,6 +726,7 @@ impl Message {
             can_delete: None,
             importance: crate::Importance::Normal,
             effect: None,
+            contacts: Vec::new(),
         }
     }
 

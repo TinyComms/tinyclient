@@ -879,6 +879,7 @@ impl Pane {
                 }))
                 .children(message.card.as_deref().map(|card| self.app_card(card)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
+                .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
                 .children(self.cards(message, window, cx));
         }
         if pending {
@@ -2059,6 +2060,89 @@ impl Pane {
             .child(div().w(px(3.)).flex_none().bg(bar))
             .child(words);
         div().pt(px(5.)).flex().child(framed).into_any_element()
+    }
+
+    /// Shared contact card: name, organization, masked phone numbers (click to reveal), emails, and copy actions.
+    fn contact_card(&self, message: &Rc<Message>, contact: &protocol::SharedContact, idx: usize, cx: &mut Context<Self>) -> AnyElement {
+        let title = if contact.name.trim().is_empty() { "Shared contact" } else { contact.name.trim() };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (p_idx, phone) in contact.phones.iter().enumerate() {
+            let reveal_key = format!("{}:{idx}:{p_idx}", message.id);
+            let revealed = self.revealed_contacts.contains(&reveal_key);
+            let shown = if revealed { phone.clone() } else { crate::gui::people::mask(phone) };
+            let copy_val = phone.clone();
+            let toggle_key = reveal_key.clone();
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id(name_id(&format!("contact-phone-{}-{idx}-{p_idx}", message.id), ""))
+                            .cursor_pointer()
+                            .type_ui()
+                            .text_color(theme::text_soft())
+                            .hover(|s| s.text_color(theme::text()))
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_contact_reveal(toggle_key.clone(), cx)))
+                            .child(if revealed { shown } else { format!("{shown} · Show") }),
+                    )
+                    .child(
+                        div()
+                            .id(name_id(&format!("contact-phone-copy-{}-{idx}-{p_idx}", message.id), ""))
+                            .cursor_pointer()
+                            .type_micro()
+                            .text_color(theme::accent())
+                            .hover(|s| s.underline())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
+                            }))
+                            .child("Copy"),
+                    )
+                    .into_any_element(),
+            );
+        }
+        for (e_idx, email) in contact.emails.iter().enumerate() {
+            let copy_val = email.clone();
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(div().type_ui().text_color(theme::text_soft()).child(email.clone()))
+                    .child(
+                        div()
+                            .id(name_id(&format!("contact-email-copy-{}-{idx}-{e_idx}", message.id), ""))
+                            .cursor_pointer()
+                            .type_micro()
+                            .text_color(theme::accent())
+                            .hover(|s| s.underline())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
+                            }))
+                            .child("Copy"),
+                    )
+                    .into_any_element(),
+            );
+        }
+        div()
+            .mt(px(4.))
+            .max_w(px(340.))
+            .p(px(10.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(div().type_micro().text_color(theme::text_faint()).child("Contact"))
+            .child(div().type_body().font_weight(theme::SEMIBOLD).child(title.to_owned()))
+            .children((!contact.organization.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(contact.organization.clone())))
+            .children(rows)
+            .into_any_element()
     }
 
     /// Interactive poll card: question, choices with bar & count, my selection, Show results, End poll.

@@ -1631,3 +1631,46 @@ fn message_requests_from_strangers_and_blocking_work_end_to_end() {
     sleep(Duration::from_millis(300));
     assert!(world.messages(ALAN).is_empty(), "messages from phone-blocked sender must be dropped");
 }
+
+#[test]
+fn shared_contact_arrives_as_structured_card_and_can_be_sent() {
+    let world = World::linked();
+    world.connected();
+
+    // Incoming shared contact arrives as a Normal message with structured SharedContact fields, not "Contact" Unsupported.
+    world.steer(&format!("contact grace {} Ada Lovelace | +44 7700 900142 | ada@example.org | Analytical Engine", T0 + 1_000));
+    let msg = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    assert_eq!(msg.kind, MessageKind::Normal, "shared contact must not be Unsupported");
+    assert_eq!(msg.contacts.len(), 1);
+    let card = &msg.contacts[0];
+    assert_eq!(card.name, "Ada Lovelace");
+    assert_eq!(card.phones, vec!["+44 7700 900142"]);
+    assert_eq!(card.emails, vec!["ada@example.org"]);
+    assert_eq!(card.organization, "Analytical Engine");
+    assert_eq!(world.conversation(GRACE).unwrap().preview, "Contact: Ada Lovelace");
+
+    // Sending a shared contact card reaches the wire and stores the card.
+    let shared = protocol::SharedContact {
+        name: "Alan Turing".into(),
+        phones: vec!["+44 7700 900199".into()],
+        emails: vec!["alan@bletchley.example".into()],
+        organization: String::new(),
+        avatar: None,
+    };
+    let asked = Request::Send {
+        conversation: key(GRACE),
+        client_id: "contact-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing { contact: Some(shared.clone()), ..Outgoing::default() },
+    };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    world.heard(&format!("send {GRACE} contact Alan Turing"));
+    let sent = world.until("sent contact card", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("contact-1") && m.id != "contact-1")
+    });
+    assert_eq!(sent.contacts, vec![shared]);
+}

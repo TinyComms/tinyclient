@@ -494,6 +494,33 @@ fn steer(line: &str) -> Vec<Event> {
             }
             vec![Event::Folders(list)]
         }
+        "contact" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let spec = rest(line, 3);
+            let mut parts = spec.split('|').map(|p| p.trim().to_owned());
+            let card_name = parts.next().unwrap_or_default();
+            let phone = parts.next().unwrap_or_default();
+            let email = parts.next().unwrap_or_default();
+            let org = parts.next().unwrap_or_default();
+            let contact = protocol::SharedContact {
+                name: card_name,
+                phones: if phone.is_empty() { Vec::new() } else { vec![phone] },
+                emails: if email.is_empty() { Vec::new() } else { vec![email] },
+                organization: org,
+                avatar: None,
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                contacts: vec![contact],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
         "stranger" => {
             let sent = next().parse().unwrap_or(T0);
             let text = Text {
@@ -607,6 +634,7 @@ impl Wire for Fake {
                 format!("send {} vote {target}-{author} {picked} serial={serial}", describe(to))
             }
             Body::PollEnd { target } => format!("send {} endpoll {target}", describe(to)),
+            Body::Contact { contact, timer } => format!("send {} contact {}{}", describe(to), contact.name, exp(*timer)),
         };
         record(&line);
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {

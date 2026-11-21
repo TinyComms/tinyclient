@@ -313,6 +313,8 @@ pub struct Pane {
     shown: HashSet<String>,
     /// Polls where the user toggled "Show results" before voting, by message id.
     poll_results: HashSet<String>,
+    /// Shared-contact phone numbers revealed by clicking them, keyed by "{msg_id}:{phone}".
+    revealed_contacts: HashSet<String>,
     /// Long code blocks opened, by message and block.
     expanded: HashSet<(String, usize)>,
     /// Coloured code, by message and block, so a scroll does not colour the same block again.
@@ -427,6 +429,7 @@ impl Pane {
             revealed: HashSet::new(),
             shown: HashSet::new(),
             poll_results: HashSet::new(),
+            revealed_contacts: HashSet::new(),
             expanded: HashSet::new(),
             code_colors: HashMap::new(),
             code_coloring: HashSet::new(),
@@ -472,6 +475,13 @@ impl Pane {
     pub(super) fn toggle_poll_results(&mut self, message_id: String, cx: &mut Context<Self>) {
         if !self.poll_results.remove(&message_id) {
             self.poll_results.insert(message_id);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_contact_reveal(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.revealed_contacts.remove(&key) {
+            self.revealed_contacts.insert(key);
         }
         cx.notify();
     }

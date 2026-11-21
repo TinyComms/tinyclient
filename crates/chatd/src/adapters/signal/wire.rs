@@ -159,6 +159,8 @@ pub struct Text {
     pub expire_timer: u32,
     /// Timer version carried on this message. 0 when unset.
     pub expire_timer_version: u32,
+    /// Shared contact cards attached to this message.
+    pub contacts: Vec<protocol::SharedContact>,
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -321,6 +323,8 @@ pub enum Body {
     PollVote { author: String, target: u64, indexes: Vec<u32>, serial: u32 },
     /// End our own poll.
     PollEnd { target: u64 },
+    /// Share a contact card.
+    Contact { contact: protocol::SharedContact, timer: Timer },
 }
 
 /// Why something failed.

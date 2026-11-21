@@ -275,9 +275,6 @@ fn unsupported_label(message: &DataMessage) -> Option<String> {
     if message.sticker.is_some() {
         return Some("Sticker".to_owned());
     }
-    if !message.contact.is_empty() {
-        return Some("Contact".to_owned());
-    }
     if let Some(payment) = message.payment.as_ref() {
         return Some(payment_label(payment_note(payment)));
     }
@@ -877,6 +874,7 @@ impl Session {
             None => None,
         };
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
+        let contacts = message.contact.iter().map(shared_contact_of).collect();
         Text {
             author: author.to_owned(),
             name,
@@ -888,6 +886,7 @@ impl Session {
             spans,
             expire_timer: message.expire_timer.unwrap_or(0),
             expire_timer_version: message.expire_timer_version.unwrap_or(0),
+            contacts,
         }
     }
 
@@ -1491,6 +1490,14 @@ impl Session {
                 group_v2,
                 ..Default::default()
             }),
+            Body::Contact { contact, timer } => ContentBody::DataMessage(DataMessage {
+                contact: vec![proto_contact(&contact)],
+                timestamp: Some(at),
+                group_v2,
+                expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                expire_timer_version: (timer.version > 0).then_some(timer.version),
+                ..Default::default()
+            }),
         };
         self.deliver(to, content, at).await?;
         Ok(at)
@@ -1591,6 +1598,65 @@ fn mark_of(style: i32) -> Option<Mark> {
 fn aci_of(bytes: &[u8]) -> Option<String> {
     let bytes: [u8; 16] = bytes.try_into().ok()?;
     Some(Uuid::from_bytes(bytes).to_string())
+}
+
+fn shared_contact_of(contact: &data_message::Contact) -> protocol::SharedContact {
+    let name = contact
+        .name
+        .as_ref()
+        .map(|n| {
+            let parts: Vec<&str> = [
+                n.prefix.as_deref(),
+                n.given_name.as_deref(),
+                n.middle_name.as_deref(),
+                n.family_name.as_deref(),
+                n.suffix.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+            if !parts.is_empty() {
+                parts.join(" ")
+            } else {
+                n.nickname.as_deref().map(str::trim).unwrap_or("").to_owned()
+            }
+        })
+        .unwrap_or_default();
+    let phones = contact
+        .number
+        .iter()
+        .filter_map(|p| p.value.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+        .collect();
+    let emails = contact
+        .email
+        .iter()
+        .filter_map(|e| e.value.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+        .collect();
+    let organization = contact.organization.as_deref().map(str::trim).unwrap_or("").to_owned();
+    protocol::SharedContact { name, phones, emails, organization, avatar: None }
+}
+
+fn proto_contact(contact: &protocol::SharedContact) -> data_message::Contact {
+    data_message::Contact {
+        name: (!contact.name.is_empty()).then(|| data_message::contact::Name {
+            given_name: Some(contact.name.clone()),
+            ..Default::default()
+        }),
+        number: contact
+            .phones
+            .iter()
+            .map(|value| data_message::contact::Phone { value: Some(value.clone()), ..Default::default() })
+            .collect(),
+        email: contact
+            .emails
+            .iter()
+            .map(|value| data_message::contact::Email { value: Some(value.clone()), ..Default::default() })
+            .collect(),
+        organization: (!contact.organization.is_empty()).then(|| contact.organization.clone()),
+        ..Default::default()
+    }
 }
 
 fn quoted(quote: Option<super::wire::Quote>) -> Option<data_message::Quote> {

@@ -1042,6 +1042,7 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
     if text.unsupported.is_some() {
         message.kind = MessageKind::Unsupported { link: String::new() };
     }
+    message.contacts = text.contacts.clone();
     message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, quote));
     message
 }
@@ -1877,6 +1878,9 @@ fn serve(account: &Arc<Account>, command: Command) {
                     let outcome = send_poll(account, &conversation_id, &draft, reply_to.as_deref());
                     ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
                 }
+            } else if let Some(contact) = with.contact.clone() {
+                let outcome = send_contact(account, &conversation_id, contact);
+                ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
             } else {
                 send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
             }
@@ -2558,6 +2562,22 @@ fn chosen(poll: &Poll, indexes: &[u32]) -> Result<Vec<u32>, Fault> {
         return Err(Fault::Refused("This poll takes one choice.".into()));
     }
     Ok(indexes)
+}
+
+fn send_contact(account: &Account, conversation: &str, contact: protocol::SharedContact) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    if contact.name.trim().is_empty() && contact.phones.is_empty() && contact.emails.is_empty() {
+        return Err(Fault::Refused("A shared contact needs a name, phone number, or email.".to_owned()));
+    }
+    let timer = account.live().timer_of(conversation);
+    let sent = account.wire.send(&to, Body::Contact { contact: contact.clone(), timer })?;
+    account.live().sent(sent, conversation);
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, contacts: vec![contact], ..Text::default() };
+    let mut message = message(account, &words, true);
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
+    Ok(message)
 }
 
 fn send_poll(account: &Account, conversation: &str, draft: &PollDraft, _reply_to: Option<&str>) -> Result<Message, Fault> {

@@ -909,6 +909,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         can_delete: None,
         importance: protocol::Importance::Normal,
         effect: None,
+        contacts: Vec::new(),
     };
     (message, rich.files)
 }

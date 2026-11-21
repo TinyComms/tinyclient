@@ -793,6 +793,9 @@ pub struct Outgoing {
     /// Optional message effect identifier from the account's catalog (Telegram).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<String>,
+    /// Optional contact card to share (Signal, Telegram).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<crate::SharedContact>,
 }
 
 impl Default for Outgoing {
@@ -810,6 +813,7 @@ impl Default for Outgoing {
             importance: Importance::Normal,
             broadcast: false,
             effect: None,
+            contact: None,
         }
     }
 }
