@@ -4211,3 +4211,79 @@ fn slack_permalinks_and_in_app_link_resolution() {
     };
     assert_eq!(other_conv, None);
 }
+
+#[test]
+fn slack_notification_prefs_keywords_and_live_pref_change() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    // Live pref_change for `all_notifications_prefs`: C0GEN -> mentions_dms + suppress_at_channel.
+    world.fake.push(ALPHA, json!({
+        "type": "pref_change",
+        "name": "all_notifications_prefs",
+        "value": json!({
+            "global": {"desktop": "all"},
+            "channels": {
+                "C0GEN": {
+                    "desktop": "mentions_dms",
+                    "muted": false,
+                    "suppress_at_channel": true
+                }
+            }
+        }).to_string()
+    }));
+    // Live pref_change for `highlight_words`.
+    world.fake.push(ALPHA, json!({
+        "type": "pref_change",
+        "name": "highlight_words",
+        "value": "deploy, incident"
+    }));
+
+    // Details pane surfaces Mentions level for C0GEN.
+    world.until("C0GEN notify becomes Mentions", || {
+        let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+            return None;
+        };
+        (info.notify == protocol::Notify::Mentions).then_some(())
+    });
+
+    // @channel broadcast is suppressed because suppress_at_channel is true.
+    let ts_bc = "1760000801.000801";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "<!channel> heads up",
+        "ts": ts_bc,
+        "event_ts": ts_bc,
+    }));
+    let bc = world.until("broadcast message stored", || world.message(&general, ts_bc));
+    assert!(!bc.mentions_me, "suppress_at_channel should suppress @channel mention");
+
+    // Keyword match (case-insensitive word boundary) triggers mentions_me.
+    let ts_kw = "1760000802.000802";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Ready to DEPLOY now!",
+        "ts": ts_kw,
+        "event_ts": ts_kw,
+    }));
+    let kw = world.until("keyword message stored", || world.message(&general, ts_kw));
+    assert!(kw.mentions_me, "highlight_words match should set mentions_me");
+
+    // Substring match without word boundary does NOT trigger mentions_me.
+    let ts_non = "1760000803.000803";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "deployment finished cleanly",
+        "ts": ts_non,
+        "event_ts": ts_non,
+    }));
+    let non = world.until("non-boundary message stored", || world.message(&general, ts_non));
+    assert!(!non.mentions_me, "substring without word boundary should not set mentions_me");
+}

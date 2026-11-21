@@ -229,6 +229,16 @@ struct State {
     users: HashMap<String, User>,
     muted: HashSet<String>,
     mutes_read: bool,
+    /// Workspace default desktop notification level from `all_notifications_prefs.global.desktop`.
+    global_notify: protocol::Notify,
+    /// Per-channel notification level from `all_notifications_prefs.channels`.
+    channel_notify: HashMap<String, protocol::Notify>,
+    /// Channels with `suppress_at_channel: true` in `all_notifications_prefs`.
+    suppress_at_channel: HashSet<String>,
+    /// Lowercased workspace keywords from `highlight_words` pref.
+    highlight_words: Vec<String>,
+    /// Whether thread reply alerts (`threads_everything`) are enabled.
+    thread_replies_notify: bool,
     /// Who the user has a direct conversation with, and which conversation it is.
     partners: HashMap<String, String>,
     /// Our own handle, to leave out of a group DM's title.
@@ -967,7 +977,7 @@ impl Slack {
                 self.dnd_updated(event);
                 Ok(())
             }
-            "pref_change" => self.muted(event["name"].as_str().unwrap_or(""), &event["value"]),
+            "pref_change" => self.pref_changed(event["name"].as_str().unwrap_or(""), &event["value"]),
             // A conversation star. A message, file, or comment star is not the row's.
             "star_added" | "star_removed" => self.star_heard(event),
             "pin_added" | "pin_removed" => self.pin_heard(event),
@@ -2596,5 +2606,35 @@ mod tests {
         );
         assert_eq!(reason(Fault::Limited(7)), "Slack is rate limiting you. Try again in 7 s.");
         assert_eq!(reason(Fault::Slack("fatal_error".into())), "Slack refused (fatal_error).");
+    }
+
+    #[test]
+    fn notification_prefs_and_keyword_matching() {
+        let doc = json!({
+            "global": {"desktop": "mentions_dms"},
+            "channels": {
+                "C1": {"desktop": "all", "muted": false, "suppress_at_channel": false},
+                "C2": {"desktop": "mentions_dms", "muted": false, "suppress_at_channel": true},
+                "C3": {"desktop": "nothing", "muted": true},
+            }
+        });
+        let parsed = tree::parse_notification_prefs(&Value::String(doc.to_string())).expect("parsed prefs");
+        assert_eq!(parsed.global, protocol::Notify::Mentions);
+        assert_eq!(parsed.channel_notify.get("C1"), Some(&protocol::Notify::All));
+        assert_eq!(parsed.channel_notify.get("C2"), Some(&protocol::Notify::Mentions));
+        assert_eq!(parsed.channel_notify.get("C3"), Some(&protocol::Notify::Nothing));
+        assert!(parsed.muted.contains("C3"));
+        assert!(!parsed.muted.contains("C2"));
+        assert!(parsed.suppress_at_channel.contains("C2"));
+        assert!(!parsed.suppress_at_channel.contains("C1"));
+
+        let words = tree::parse_highlight_words("Deploy, urgent fix , , P0");
+        assert_eq!(words, vec!["deploy", "urgent fix", "p0"]);
+        assert!(tree::matches_keyword("Ready to DEPLOY now!", &words));
+        assert!(tree::matches_keyword("Need an Urgent Fix asap", &words));
+        assert!(tree::matches_keyword("P0 outage", &words));
+        assert!(!tree::matches_keyword("deployment finished", &words));
+        assert!(!tree::matches_keyword("redeploy", &words));
+        assert!(!tree::matches_keyword("hello world", &words));
     }
 }

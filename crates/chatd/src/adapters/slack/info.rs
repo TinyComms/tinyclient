@@ -126,10 +126,16 @@ impl Slack {
     /// conversation is two people and is not asked about.
     pub(super) fn conversation_info(&self, conversation: &str) -> Result<ConversationAbout, Fault> {
         let channel = channel_of(conversation);
-        let muted = self.state().muted.contains(channel);
-        // Unverified: a channel set to mentions only is not told apart from one that is not;
-        // `all_notifications_prefs` would say, and is not read for this.
-        let notify = if muted { Notify::Nothing } else { Notify::All };
+        let notify = {
+            let state = self.state();
+            if state.muted.contains(channel) {
+                Notify::Nothing
+            } else if let Some(&level) = state.channel_notify.get(channel) {
+                level
+            } else {
+                state.global_notify
+            }
+        };
         let known = self.ctx.known(channel).map_err(|err| Fault::Net(err.to_string()))?;
         if known.as_ref().is_some_and(|known| known.kind == ConversationKind::Direct) {
             return Ok(ConversationAbout { members: Some(2), notify, ..ConversationAbout::default() });
@@ -238,6 +244,7 @@ impl Slack {
         let muted = notify == Notify::Nothing;
         let list = {
             let mut state = self.state();
+            state.channel_notify.insert(channel.to_owned(), notify);
             if muted {
                 state.muted.insert(channel.to_owned());
             } else {

@@ -1128,8 +1128,14 @@ impl Slack {
         });
 
         let mut message = Message::plain(ts, "", "", seconds(ts), outgoing);
-        let muted = self.state().muted.contains(channel);
-        message.mentions_me = !outgoing && (rich.mentioned || (rich.broadcast && !muted));
+        let (suppress_broadcast, keyword_hit) = {
+            let state = self.state();
+            let muted = state.muted.contains(channel);
+            let suppress = muted || state.suppress_at_channel.contains(channel);
+            let kw = !muted && !outgoing && super::tree::matches_keyword(&rich.text, &state.highlight_words);
+            (suppress, kw)
+        };
+        message.mentions_me = !outgoing && (rich.mentioned || (rich.broadcast && !suppress_broadcast) || keyword_hit);
         let empty = rich.text.is_empty() && attachments.is_empty() && previews.is_empty() && framed.is_none();
         // What Slack leaves of a deleted message that a thread still hangs off.
         let tombstone = subtype == Some("tombstone");
