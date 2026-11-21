@@ -41,11 +41,11 @@ pub mod signin;
 mod vault;
 mod wire;
 
-use super::{keep_connected, serve_commands, About, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
+use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{Attachment, Contact, ContactKind, ConversationKind, ConversationRights, Delivery, Link, MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
+use protocol::{Attachment, CatalogItem, CatalogKind, Contact, ContactKind, ConversationKind, ConversationRights, Delivery, Link, MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -635,6 +635,8 @@ struct Live {
     timers: HashMap<String, wire::Timer>,
     /// Incoming unread messages that carry a disappearing-messages timer, keyed by (conversation, message_id).
     expiring: HashMap<(String, String), u32>,
+    /// Recently searched GIF entries keyed by catalog item id, bounded to 256 entries.
+    gifs: HashMap<String, wire::GifEntry>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -1524,6 +1526,7 @@ fn offline(ctx: &Context, command: Command) {
         | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -1548,6 +1551,7 @@ fn capabilities() -> protocol::Capabilities {
         edit_window: (SEND_WINDOW_MS / 1_000) as u32,
         max_file_bytes: files.max_file_bytes,
         max_files: files.max_files,
+        gifs: true,
         reply: true,
         edit: true,
         delete: true,
@@ -1662,6 +1666,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ConversationPicture { conversation_id, path, reply } => {
             let _ = reply.send(group_picture(account, &conversation_id, &path));
+        }
+        Command::Catalog { kind, query, cursor, reply, .. } => {
+            let _ = reply.send(catalog(account, kind, &query, cursor.as_deref()));
         }
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
@@ -2044,6 +2051,85 @@ fn group_picture(account: &Account, conversation_id: &str, path: &str) -> Result
     account.wire.group_set_avatar(&group_id, bytes).map_err(refused)
 }
 
+fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
+    if kind != CatalogKind::Gifs {
+        return Err(Refusal::Unsupported);
+    }
+    let offset = cursor.and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+    let (entries, next_offset) = account.wire.search_gifs(query, offset).map_err(refused)?;
+    let mut items = Vec::with_capacity(entries.len());
+    let mut media = Vec::with_capacity(entries.len());
+    {
+        let mut live = account.live();
+        if live.gifs.len() > 256 {
+            live.gifs.clear();
+        }
+        for entry in entries {
+            let mut file = MediaFile::new(format!("signal:gif:{}", entry.id), MediaKind::Gif);
+            file.width = entry.width;
+            file.height = entry.height;
+            if !entry.preview_url.is_empty() {
+                media.push((file.clone(), entry.preview_url.clone()));
+            }
+            items.push(CatalogItem {
+                id: entry.id.clone(),
+                name: entry.title.clone(),
+                file: Some(file),
+                pack: String::new(),
+                animated: true,
+            });
+            live.gifs.insert(entry.id.clone(), entry);
+        }
+    }
+    if !media.is_empty() {
+        let _ = account.ctx.media(&media);
+    }
+    Ok(CatalogPage { items, cursor: next_offset.map(|n| n.to_string()) })
+}
+
+fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick_id: &str) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let entry = account.live().gifs.get(pick_id).cloned();
+    let (mp4_url, width, height) = match entry {
+        Some(entry) => (entry.mp4_url, entry.width, entry.height),
+        None if pick_id.starts_with("https://") => (pick_id.to_owned(), 0, 0),
+        None => return Err(Fault::Refused("That GIF is no longer in the picker. Search again.".into())),
+    };
+    let bytes = account.wire.fetch_gif(&mp4_url)?;
+    if let Some(why) = files::too_big("giphy.mp4", bytes.len() as u64) {
+        return Err(Fault::Refused(why));
+    }
+    let gif_file = wire::File {
+        name: "giphy.mp4".to_owned(),
+        mime: "video/mp4".to_owned(),
+        bytes,
+        width,
+        height,
+        thumb: Vec::new(),
+        blurhash: None,
+        gif: true,
+    };
+    let quote = quote_of(account, conversation, reply_to)?;
+    let attachment = show_file(account, client_id, 0, &gif_file);
+    let timer = account.live().timer_of(conversation);
+    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: vec![gif_file], timer }) {
+        Ok(sent) => sent,
+        Err(fault) => {
+            forget_landed(&[attachment]);
+            return Err(fault);
+        }
+    };
+    account.live().echoed(sent);
+    account.live().sent(sent, conversation);
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let mut message = message(account, &words, true);
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
+    message.attachments = vec![attachment];
+    Ok(message)
+}
+
 /// The pictures of the people and groups on screen (rows, people, the open conversation): each
 /// asked of Signal once a connection, one after another, off the command thread since each is a
 /// trip to Signal's CDN. What lands is the row's and the person's avatar.
@@ -2158,6 +2244,11 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
         return;
     }
     if with.files.is_empty() {
+        if let Some(pick) = with.pick.filter(|p| p.kind == CatalogKind::Gifs) {
+            let outcome = send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words());
+            account.ctx.sent(conversation, client_id, outcome);
+            return;
+        }
         let outcome = send_text(account, conversation, text, reply_to, &with.spans).map_err(|fault| fault.words());
         account.ctx.sent(conversation, client_id, outcome);
         return;
@@ -2224,7 +2315,8 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
 /// The id is the shell's client id, known before Signal names the message, so the bytes can
 /// be written once and then moved to the wire.
 fn show_file(account: &Account, client_id: &str, index: usize, file: &wire::File) -> Attachment {
-    let mut media = MediaFile::new(format!("signal:{client_id}:{index}"), files::kind(&file.mime));
+    let media_kind = if file.gif { MediaKind::Gif } else { files::kind(&file.mime) };
+    let mut media = MediaFile::new(format!("signal:{client_id}:{index}"), media_kind);
     media.width = file.width;
     media.height = file.height;
     media.bytes = file.bytes.len() as u64;

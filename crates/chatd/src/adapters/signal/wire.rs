@@ -409,6 +409,17 @@ pub enum Event {
     Ended(String),
 }
 
+/// One GIF returned by Signal's Giphy proxy search/trending endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GifEntry {
+    pub id: String,
+    pub title: String,
+    pub preview_url: String,
+    pub mp4_url: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// One file on a message we send. The bytes are what Signal is given: a still picture has already
 /// had its metadata removed, unless the person asked for the file as it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +432,8 @@ pub struct File {
     /// A small JPEG a conversation can show while the file arrives. Empty when there is none.
     pub thumb: Vec<u8>,
     pub blurhash: Option<String>,
+    /// True for animated GIFs (including looping MP4 GIFs from the GIF picker).
+    pub gif: bool,
 }
 
 /// What is sent.
@@ -549,6 +562,14 @@ pub trait Wire: Send + Sync {
     /// Accepts or declines a pending invite to a group for our own account.
     fn group_pending_invite(&self, _group_id: &str, _accept: bool) -> Result<(), Fault> {
         Err(Fault::Refused("Answering group invites is not available.".to_owned()))
+    }
+    /// Searches Giphy (or trending when `query` is empty) through Signal's content proxy.
+    fn search_gifs(&self, _query: &str, _offset: u32) -> Result<(Vec<GifEntry>, Option<u32>), Fault> {
+        Err(Fault::Refused("GIF search is not available.".to_owned()))
+    }
+    /// Downloads a GIF MP4 rendition through Signal's content proxy.
+    fn fetch_gif(&self, _url: &str) -> Result<Vec<u8>, Fault> {
+        Err(Fault::Refused("Downloading GIFs is not available.".to_owned()))
     }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);

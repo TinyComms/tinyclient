@@ -101,6 +101,11 @@ mod tests {
         assert!(t.gif && t.silent && !t.ping && !t.custom_emoji);
         assert_eq!(t.tabs, [Tab::Emoji, Tab::Gifs, Tab::Stickers]);
 
+        let signal = Capabilities { max_file_bytes: 100 << 20, max_files: 32, gifs: true, ..Capabilities::default() };
+        let sg = controls(&signal, false);
+        assert!(sg.attach && sg.gif && sg.emoji && !sg.custom_emoji);
+        assert_eq!(sg.tabs, [Tab::Emoji, Tab::Gifs]);
+
         let teams = Capabilities { max_file_bytes: 250 << 20, max_files: 10, ..Capabilities::default() };
         let m = controls(&teams, false);
         assert!(m.attach && !m.gif && !m.silent && !m.link_chip);

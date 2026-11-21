@@ -1692,3 +1692,54 @@ fn group_join_requests_and_pending_invites_can_be_approved_or_declined() {
     );
     world.heard(&format!("group-invite {CLUB} decline"));
 }
+
+#[test]
+fn searching_and_sending_gifs_from_the_composer() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|a| a.key == account()).unwrap();
+    assert!(signal.can.gifs, "Signal advertises GIF picker capability");
+
+    // Search GIFs via Catalog.
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: "cat".into(),
+        cursor: None,
+    }) else {
+        panic!("expected Catalog response");
+    };
+    world.heard("gif-search offset=0 query=cat");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, "gif-cat");
+    assert!(items[0].animated);
+    assert_eq!(items[0].file.as_ref().map(|f| f.kind), Some(protocol::MediaKind::Gif));
+
+    // Send the picked GIF: fetches MP4 and sends as looping GIF attachment.
+    let Response::Sent { .. } = world.ask(Request::Send {
+        conversation: key(CLUB),
+        client_id: "gif-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            pick: Some(protocol::Pick { kind: protocol::CatalogKind::Gifs, id: "gif-cat".into() }),
+            ..Outgoing::default()
+        },
+    }) else {
+        panic!("expected Sent");
+    };
+    world.heard("gif-fetch https://media.giphy.com/media/cat/200w.mp4");
+    world.heard(&format!("send {CLUB} files giphy.mp4"));
+    let sent = world.until("sent GIF message", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("gif-1") && m.id != "gif-1")
+    });
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, protocol::MediaKind::Gif);
+    assert_eq!(sent.attachments[0].mime, "video/mp4");
+}

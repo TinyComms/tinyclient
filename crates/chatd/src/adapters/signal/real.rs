@@ -7,7 +7,7 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -282,6 +282,9 @@ fn unsupported_label(message: &DataMessage) -> Option<String> {
         return None;
     }
     if let Some(attachment) = message.attachments.first() {
+        if attachment.flags.unwrap_or(0) & 8 != 0 {
+            return Some("GIF".to_owned());
+        }
         let kind = attachment.content_type.as_deref().unwrap_or("");
         return Some(
             match kind.split('/').next() {
@@ -477,6 +480,67 @@ impl Wire for Real {
 
     fn group_pending_invite(&self, group_id: &str, accept: bool) -> Result<(), Fault> {
         self.ask(|answer| Ask::GroupPendingInvite { group_id: group_id.to_owned(), accept, answer })
+    }
+
+    fn search_gifs(&self, query: &str, offset: u32) -> Result<(Vec<GifEntry>, Option<u32>), Fault> {
+        let base = std::env::var("TINYCLIENT_SIGNAL_GIPHY_PROXY")
+            .unwrap_or_else(|_| "https://giphy-proxy-production.whispersystems.org".to_owned());
+        let base = base.trim_end_matches('/');
+        let q = query.trim();
+        let url = if q.is_empty() {
+            format!("{base}/v1/gifs/trending?api_key=37SiWz384431444&limit=25&offset={offset}&rating=pg-13")
+        } else {
+            let encoded: String = q
+                .bytes()
+                .map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') { (b as char).to_string() } else { format!("%{b:02X}") })
+                .collect();
+            format!("{base}/v1/gifs/search?api_key=37SiWz384431444&q={encoded}&limit=25&offset={offset}&rating=pg-13")
+        };
+        let mut resp = ureq::get(&url)
+            .header("User-Agent", "Signal-Desktop")
+            .call()
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let json: serde_json::Value = resp.body_mut().read_json().map_err(|err| Fault::Net(err.to_string()))?;
+        let data = json.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let Some(id) = item.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            let images = item.get("images");
+            let fixed = images.and_then(|i| i.get("fixed_width"));
+            let preview_url = images
+                .and_then(|i| i.get("fixed_width_small_still"))
+                .or(fixed)
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let mp4_url = fixed
+                .and_then(|v| v.get("mp4"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&preview_url)
+                .to_owned();
+            if mp4_url.is_empty() {
+                continue;
+            }
+            let width = fixed.and_then(|v| v.get("width")).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let height = fixed.and_then(|v| v.get("height")).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0);
+            out.push(GifEntry { id: id.to_owned(), title, preview_url, mp4_url, width, height });
+        }
+        let next = if out.len() >= 25 { Some(offset + out.len() as u32) } else { None };
+        Ok((out, next))
+    }
+
+    fn fetch_gif(&self, url: &str) -> Result<Vec<u8>, Fault> {
+        let mut resp = ureq::get(url)
+            .header("User-Agent", "Signal-Desktop")
+            .call()
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let bytes = resp.body_mut().read_to_vec().map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(bytes)
     }
 
     fn close(&self) {
@@ -1649,7 +1713,7 @@ impl Session {
                 let mut attachments = Vec::with_capacity(files.len());
                 for file in files {
                     let name = file.name.clone();
-                    let gif = file.mime == "image/gif";
+                    let gif = file.gif || file.mime == "image/gif";
                     let thumb = file.thumb;
                     let spec = AttachmentSpec {
                         content_type: file.mime,

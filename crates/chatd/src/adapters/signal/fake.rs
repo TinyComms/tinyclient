@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -907,6 +907,32 @@ impl Wire for Fake {
         g.sync_info();
         let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
         Ok(())
+    }
+
+    fn search_gifs(&self, query: &str, offset: u32) -> Result<(Vec<GifEntry>, Option<u32>), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("gif-search offset={offset} query={query}"));
+        let q = query.trim();
+        let entry = GifEntry {
+            id: if q.is_empty() { "trending-1".into() } else { format!("gif-{q}") },
+            title: if q.is_empty() { "Trending wave".into() } else { format!("{q} reaction") },
+            preview_url: format!("https://media.giphy.com/media/{}/200w_s.gif", if q.is_empty() { "trending-1" } else { q }),
+            mp4_url: format!("https://media.giphy.com/media/{}/200w.mp4", if q.is_empty() { "trending-1" } else { q }),
+            width: 200,
+            height: 150,
+        };
+        Ok((vec![entry], None))
+    }
+
+    fn fetch_gif(&self, url: &str) -> Result<Vec<u8>, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("gif-fetch {url}"));
+        // Minimal valid ISO-BMFF/MP4 header bytes.
+        Ok(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom".to_vec())
     }
 
     fn close(&self) {
