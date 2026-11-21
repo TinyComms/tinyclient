@@ -507,6 +507,64 @@ impl Fake {
                 self.fixture(token, &format!("conversations.history.{channel}{page}"))
             }
             "conversations.replies" => self.fixture(token, &format!("conversations.replies.{channel}")),
+            "activity.feed" => {
+                let all = vec![
+                    json!({
+                        "id": "act-1",
+                        "feed_ts": "1760000900.000100",
+                        "is_unread": true,
+                        "item": {
+                            "type": "at_mention",
+                            "message": {
+                                "channel": "C0GEN",
+                                "ts": "1760000900.000100",
+                                "user": "U0ANA",
+                                "text": "hey <@U0ME> check this"
+                            }
+                        }
+                    }),
+                    json!({
+                        "id": "act-2",
+                        "feed_ts": "1760000901.000100",
+                        "is_unread": true,
+                        "item": {
+                            "type": "thread_v2",
+                            "message": {
+                                "channel": "C0GEN",
+                                "ts": "1760000901.000100",
+                                "thread_ts": ROOT,
+                                "user": "U0BEN",
+                                "text": "following up in thread"
+                            }
+                        }
+                    }),
+                    json!({
+                        "id": "act-3",
+                        "feed_ts": "1760000902.000100",
+                        "is_unread": true,
+                        "item": {
+                            "type": "reaction",
+                            "reaction": {
+                                "channel": "C0GEN",
+                                "item_ts": ROOT,
+                                "user": "U0ANA",
+                                "name": "+1"
+                            },
+                            "message": {
+                                "channel": "C0GEN",
+                                "ts": ROOT,
+                                "text": "first message"
+                            }
+                        }
+                    }),
+                ];
+                Some(json!({
+                    "ok": true,
+                    "items": all,
+                    "response_metadata": {"next_cursor": ""}
+                }))
+            }
+            "activity.mark" => Some(json!({"ok": true})),
             method => self.fixture(token, method),
         };
         found.map_or_else(|| refused("unknown_method"), ok)
@@ -2830,4 +2888,61 @@ fn slack_thread_broadcast_posts_to_thread_and_channel() {
     let in_channel = world.until("broadcast reply recorded in parent channel", || world.message(&general, &bc.id));
     assert_eq!(in_channel.text, "also in channel");
     assert_eq!(in_channel.reply_to.as_ref().map(|q| q.id.as_str()), Some(ROOT));
+}
+
+#[test]
+fn slack_activity_feed_lists_mentions_threads_reactions_and_marks_read() {
+    let world = World::start();
+    world.ready();
+
+    let account = AccountKey { network: Network::Slack, account: "T01ALPHA".into() };
+    assert!(world.account("T01ALPHA").can.activity_feed, "Slack should advertise activity_feed");
+
+    // Fetch unfiltered activity feed: mention, thread reply, and reaction.
+    let Response::ActivityFeed { items, cursor } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) else {
+        panic!("expected Response::ActivityFeed");
+    };
+    assert!(cursor.is_none());
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].kind, protocol::ActivityItemKind::Mention);
+    assert_eq!(items[0].conversation, alpha("C0GEN"));
+    assert_eq!(items[0].message_id, "1760000900.000100");
+    assert_eq!(items[0].actor, "Ana");
+    assert!(items[0].unread);
+
+    assert_eq!(items[1].kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(items[1].thread_id.as_deref(), Some(format!("C0GEN:{ROOT}").as_str()));
+
+    assert_eq!(items[2].kind, protocol::ActivityItemKind::Reaction);
+    assert_eq!(items[2].emoji, "👍");
+    assert_eq!(items[2].message_id, ROOT);
+    assert_eq!(items[2].actor, "Ana");
+
+    // Filter by Reaction returns only the reaction row.
+    let Response::ActivityFeed { items: reactions, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: Some(protocol::ActivityItemKind::Reaction),
+        cursor: None,
+        limit: 20,
+    }) else {
+        panic!("expected Response::ActivityFeed");
+    };
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].id, "act-3");
+
+    // Mark one item read calls activity.mark with item_id.
+    let Response::Ok = world.ask(Request::ActivityMarkRead {
+        account,
+        item_id: Some("act-3".into()),
+    }) else {
+        panic!("expected Response::Ok");
+    };
+    let mark = world.fake.calls(ALPHA, "activity.mark");
+    assert_eq!(mark.len(), 1);
+    assert_eq!(mark[0].params.get("item_id").map(String::as_str), Some("act-3"));
 }

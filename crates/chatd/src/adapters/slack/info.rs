@@ -3,10 +3,10 @@
 //! threads the user follows, and the newest message of rows on screen. Each runs because the
 //! user opened or clicked something, or (previews) because the rows are on screen, paced.
 
-use super::{fnv, seconds, thread_id, thread_of, Fault, Slack};
-use crate::adapters::{CatalogPage, ConversationAbout, Failure, SharedPage};
+use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
+use crate::adapters::{ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
 use crate::store::Filing;
-use protocol::{CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
+use protocol::{ActivityItem, ActivityItemKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -441,6 +441,167 @@ impl Slack {
         self.authors(entries);
         let messages: Vec<Message> = entries.iter().filter_map(|entry| self.message(channel, entry)).collect();
         self.ctx.history(channel, &messages)?;
+        Ok(())
+    }
+
+    /// Reads one page of Slack's activity feed (`activity.feed`, web client call).
+    /// Maps mentions, thread replies, reactions, app notifications, and channel invites
+    /// into [`ActivityItem`] rows without rebuilding from message history.
+    pub(super) fn activity_feed(
+        &self,
+        kind: Option<ActivityItemKind>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<ActivityPage, Fault> {
+        let count = limit.clamp(1, 50).to_string();
+        let mut params = vec![("limit", count.as_str())];
+        if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
+            params.push(("cursor", cursor));
+        }
+        let types_filter = kind.and_then(|k| match k {
+            ActivityItemKind::Mention => Some("at_mention,broadcast,keyword,usergroup_mention"),
+            ActivityItemKind::ThreadReply => Some("thread_v2,thread"),
+            ActivityItemKind::Reaction => Some("reaction"),
+            ActivityItemKind::App => Some("app_mention,bot_dm,workflow"),
+            ActivityItemKind::Invite => Some("channel_invite"),
+            ActivityItemKind::Other => None,
+        });
+        if let Some(types) = types_filter {
+            params.push(("types", types));
+        }
+        let feed = self.api("activity.feed", &params)?;
+        let raw_items = feed["items"].as_array().map_or(&[][..], Vec::as_slice);
+        let mut items = Vec::with_capacity(raw_items.len());
+        for entry in raw_items {
+            let Some(mapped) = self.map_activity_item(entry) else {
+                continue;
+            };
+            if kind.is_some_and(|want| mapped.kind != want) {
+                continue;
+            }
+            items.push(mapped);
+        }
+        let next = feed["response_metadata"]["next_cursor"]
+            .as_str()
+            .or_else(|| feed["next_cursor"].as_str())
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
+        Ok(ActivityPage { items, cursor: next })
+    }
+
+    fn map_activity_item(&self, entry: &Value) -> Option<ActivityItem> {
+        let inner = if entry["item"].is_object() { &entry["item"] } else { entry };
+        let raw_type = inner["type"]
+            .as_str()
+            .or_else(|| entry["type"].as_str())
+            .unwrap_or("");
+        let kind = match raw_type {
+            "at_mention" | "mention" | "broadcast" | "keyword" | "at_channel" | "at_here" | "at_everyone" | "usergroup_mention" => {
+                ActivityItemKind::Mention
+            }
+            "thread_v2" | "thread" | "thread_reply" => ActivityItemKind::ThreadReply,
+            "reaction" | "reaction_added" => ActivityItemKind::Reaction,
+            "app_mention" | "app_home" | "bot_dm" | "workflow" | "app" => ActivityItemKind::App,
+            "channel_invite" | "invite" => ActivityItemKind::Invite,
+            _ => ActivityItemKind::Other,
+        };
+        let msg = &inner["message"];
+        let react = &inner["reaction"];
+        let channel = msg["channel"]
+            .as_str()
+            .or_else(|| react["channel"].as_str())
+            .or_else(|| inner["channel"].as_str())
+            .or_else(|| entry["channel"].as_str())
+            .filter(|c| !c.is_empty())?;
+        let message_id = msg["ts"]
+            .as_str()
+            .or_else(|| react["item_ts"].as_str())
+            .or_else(|| react["ts"].as_str())
+            .or_else(|| inner["message_ts"].as_str())
+            .or_else(|| inner["ts"].as_str())
+            .or_else(|| entry["ts"].as_str())
+            .unwrap_or("")
+            .to_owned();
+        let thread_ts = msg["thread_ts"]
+            .as_str()
+            .or_else(|| inner["thread_ts"].as_str())
+            .or_else(|| entry["thread_ts"].as_str())
+            .filter(|t| !t.is_empty() && *t != message_id.as_str());
+        let thread_id = thread_ts.map(|root| thread_id(channel, root));
+        let actor_id = react["user"]
+            .as_str()
+            .or_else(|| msg["author_user_id"].as_str())
+            .or_else(|| msg["user"].as_str())
+            .or_else(|| inner["user"].as_str())
+            .or_else(|| entry["user"].as_str())
+            .unwrap_or("")
+            .to_owned();
+        let actor = if !actor_id.is_empty() {
+            self.user(&actor_id).name
+        } else {
+            entry["actor"]
+                .as_str()
+                .or_else(|| inner["actor"].as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
+        let raw_emoji = react["name"]
+            .as_str()
+            .or_else(|| inner["reaction"].as_str())
+            .or_else(|| entry["reaction"].as_str())
+            .unwrap_or("");
+        let emoji_str = if raw_emoji.is_empty() {
+            String::new()
+        } else {
+            emoji::standard(raw_emoji).unwrap_or_else(|| format!(":{raw_emoji}:"))
+        };
+        let text = msg["text"]
+            .as_str()
+            .or_else(|| inner["text"].as_str())
+            .or_else(|| entry["text"].as_str())
+            .unwrap_or("")
+            .to_owned();
+        let feed_ts = entry["feed_ts"]
+            .as_str()
+            .or_else(|| entry["id"].as_str())
+            .or_else(|| (!message_id.is_empty()).then_some(message_id.as_str()))
+            .unwrap_or("");
+        let time = entry["time"]
+            .as_i64()
+            .filter(|t| *t > 0)
+            .unwrap_or_else(|| seconds(feed_ts));
+        let id = entry["id"]
+            .as_str()
+            .or_else(|| entry["feed_ts"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{channel}:{message_id}:{raw_type}"));
+        let unread = entry["is_unread"] == true || entry["unread"] == true;
+        Some(ActivityItem {
+            id,
+            kind,
+            conversation: self.ctx.key(channel),
+            message_id,
+            thread_id,
+            actor,
+            actor_id,
+            emoji: emoji_str,
+            text,
+            time,
+            unread,
+        })
+    }
+
+    /// Marks one activity feed item or the whole feed read (`activity.mark`).
+    pub(super) fn activity_mark_read(&self, item_id: Option<&str>) -> Result<(), Fault> {
+        match item_id.filter(|id| !id.is_empty()) {
+            Some(id) => {
+                self.api("activity.mark", &[("item_id", id)])?;
+            }
+            None => {
+                self.api("activity.mark", &[("all", "true")])?;
+            }
+        }
         Ok(())
     }
 }

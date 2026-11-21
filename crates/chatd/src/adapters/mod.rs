@@ -219,6 +219,13 @@ pub struct CatalogPage {
     pub cursor: Option<String>,
 }
 
+/// A page of an account's activity feed, and where the next one starts.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityPage {
+    pub items: Vec<protocol::ActivityItem>,
+    pub cursor: Option<String>,
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -408,6 +415,18 @@ pub enum Command {
     ProfileIn { person_id: String, space_id: String, reply: Reply<About> },
     /// A conversation's info pane: one request, because the user opened it.
     ConversationInfo { conversation_id: String, reply: Reply<ConversationAbout> },
+    /// Paged activity feed (mentions, thread replies, reactions, apps) for this account.
+    ActivityFeed {
+        kind: Option<protocol::ActivityItemKind>,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<ActivityPage>,
+    },
+    /// Mark one activity feed item (`Some(id)`) or all items (`None`) read.
+    ActivityMarkRead {
+        item_id: Option<String>,
+        reply: Reply<()>,
+    },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
@@ -632,6 +651,8 @@ impl Command {
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());

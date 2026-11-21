@@ -270,6 +270,9 @@ impl Shell {
 
     pub(super) fn inbox_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.sidebar_state;
+        if state.filter == InboxFilter::Activity && (!state.activity_items.is_empty() || state.activity_loading || self.has_activity_feed()) {
+            return self.activity_feed_view(cx);
+        }
         if state.inbox.fresh {
             return div().pt(px(4.)).children((0..6).map(Self::inbox_placeholder)).into_any_element();
         }
@@ -328,5 +331,122 @@ impl Shell {
             .child(crate::gui::components::scroll_frame("inbox-scroll-frame", state.inbox_list.clone(), list(state.inbox_list.clone(), cx.processor(|this: &mut Shell, ix: usize, window, cx| this.inbox_item(ix, window, cx))).size_full()).keyboard(false))
             .children(pill)
             .into_any_element()
+    }
+
+    fn has_activity_feed(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.accounts.iter().any(|a| a.can.activity_feed))
+    }
+
+    fn activity_feed_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        use protocol::ActivityItemKind;
+        let state = &self.sidebar_state;
+        let current = state.activity_filter;
+        let chips: [(&str, Option<ActivityItemKind>); 5] = [
+            ("All", None),
+            ("Mentions", Some(ActivityItemKind::Mention)),
+            ("Threads", Some(ActivityItemKind::ThreadReply)),
+            ("Reactions", Some(ActivityItemKind::Reaction)),
+            ("Apps", Some(ActivityItemKind::App)),
+        ];
+        let mut bar = div().flex_none().px(px(12.)).py(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
+        for (ix, (label, kind)) in chips.into_iter().enumerate() {
+            let active = current == kind;
+            bar = bar.child(
+                div()
+                    .id(("act-chip", ix))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(if active { theme::selected() } else { theme::raised() })
+                    .type_small()
+                    .text_color(if active { theme::text() } else { theme::text_soft() })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_activity_filter(kind, cx)))
+                    .child(label),
+            );
+        }
+
+        let body: AnyElement = if state.activity_loading && state.activity_items.is_empty() {
+            div().pt(px(4.)).children((0..5).map(Self::inbox_placeholder)).into_any_element()
+        } else if state.activity_items.is_empty() {
+            self.inbox_empty(cx)
+        } else {
+            let mut list_box = div().id("activity-feed-list").size_full().overflow_y_scroll().flex().flex_col();
+            for (ix, item) in state.activity_items.iter().enumerate() {
+                let kind_word = match item.kind {
+                    ActivityItemKind::Mention => "mentioned you".to_owned(),
+                    ActivityItemKind::ThreadReply => "replied in a thread".to_owned(),
+                    ActivityItemKind::Reaction => {
+                        if item.emoji.is_empty() {
+                            "reacted to your message".to_owned()
+                        } else {
+                            format!("reacted {}", item.emoji)
+                        }
+                    }
+                    ActivityItemKind::App => "app notification".to_owned(),
+                    ActivityItemKind::Invite => "invited you".to_owned(),
+                    ActivityItemKind::Other => "activity".to_owned(),
+                };
+                let who = if item.actor.is_empty() { kind_word } else { format!("{} {kind_word}", item.actor) };
+                let snippet = super::chat::one_line(&item.text).into_owned();
+                let picked = item.clone();
+                let content = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .type_ui()
+                                    .font_weight(if item.unread { theme::SEMIBOLD } else { theme::REGULAR })
+                                    .text_color(theme::text())
+                                    .child(who),
+                            )
+                            .child(div().type_micro().text_color(theme::text_faint()).child(row_time(now(), item.time)))
+                            .children(item.unread.then(|| badge_dot(7., theme::accent()))),
+                    )
+                    .when(!snippet.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .truncate()
+                                .type_small()
+                                .text_color(if item.unread { theme::text() } else { theme::text_soft() })
+                                .child(snippet),
+                        )
+                    });
+                list_box = list_box.child(
+                    list_row(("activity-row", ix), theme::row_height(theme::ROW_TWO), false, false, content)
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_activity_item(picked.clone(), cx))),
+                );
+            }
+            if state.activity_cursor.is_some() {
+                list_box = list_box.child(
+                    div()
+                        .py(px(8.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            button("activity-more", ButtonKind::Secondary, "Load more")
+                                .h(px(28.))
+                                .on_click(cx.listener(|this, _, _, cx| this.load_more_activity(cx))),
+                        ),
+                );
+            }
+            crate::gui::components::scroll::scroll_page("activity-scroll-frame", list_box).into_any_element()
+        };
+
+        div().size_full().flex().flex_col().child(bar).child(div().flex_1().min_h_0().child(body)).into_any_element()
     }
 }

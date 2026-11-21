@@ -1386,6 +1386,12 @@ impl Slack {
             Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
                 answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
             }
+            Command::ActivityFeed { kind, cursor, limit, reply } => {
+                answer(reply, self.activity_feed(kind, cursor.as_deref(), limit))
+            }
+            Command::ActivityMarkRead { item_id, reply } => {
+                answer(reply, self.activity_mark_read(item_id.as_deref()))
+            }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
@@ -2041,6 +2047,7 @@ fn capabilities() -> protocol::Capabilities {
         reactions: true,
         mention_format: protocol::MentionFormat::Slack,
         mention_spans: false,
+        activity_feed: true,
         ..protocol::Capabilities::default()
     }
 }

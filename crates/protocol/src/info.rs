@@ -560,6 +560,55 @@ pub struct Capabilities {
     /// This account supports blocking and unblocking people (`Request::Relate` with Block/Unblock).
     #[serde(default, skip_serializing_if = "is_false")]
     pub blocks: bool,
+    /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub activity_feed: bool,
+}
+
+/// What kind of event an [`ActivityItem`] represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityItemKind {
+    Mention,
+    ThreadReply,
+    Reaction,
+    App,
+    Invite,
+    Other,
+}
+
+/// One row of an account's activity feed (mentions, thread replies, reactions to my messages, apps).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityItem {
+    /// Stable identifier from the network (used for mark-read and keying).
+    pub id: String,
+    pub kind: ActivityItemKind,
+    /// Conversation where the activity occurred.
+    pub conversation: Key,
+    /// Target message id to jump to when clicked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message_id: String,
+    /// Thread conversation id when the activity is inside a thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// Display name of the person or app who triggered the activity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    /// Network user/app id of the actor.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor_id: String,
+    /// Emoji for a reaction item (Unicode or `:name:`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Short preview text of the message or notification.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Unix seconds when the activity happened.
+    #[serde(default)]
+    pub time: i64,
+    /// Whether the network considers this item unread.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread: bool,
 }
 
 /// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.

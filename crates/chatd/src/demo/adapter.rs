@@ -992,6 +992,8 @@ impl Demo {
                 let _ = reply.send(outcome);
             }
             // Nothing is behind these: what is stored is all there is.
+            Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

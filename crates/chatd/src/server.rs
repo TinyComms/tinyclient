@@ -3429,6 +3429,32 @@ impl Chat {
                 }
                 Response::LogsSaved { paths }
             }
+            Request::ActivityFeed { account, kind, cursor, limit } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 20 } else { limit.min(50) };
+                match self.ask(&account, |reply| Command::ActivityFeed { kind, cursor, limit, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.actor, 120);
+                            clip(&mut item.text, 500);
+                            clip(&mut item.emoji, 64);
+                        }
+                        Response::ActivityFeed { items: page.items, cursor: page.cursor }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ActivityMarkRead { account, item_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::ActivityMarkRead { item_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

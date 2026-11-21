@@ -2353,6 +2353,22 @@ pub enum Request {
     },
     /// Write this process's debug ring to disk. The answer names files, never their text.
     SaveLogs,
+    /// Paged activity feed (mentions, thread replies, reactions, app notifications) for an account.
+    ActivityFeed {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ActivityItemKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Mark one activity feed item (`Some(id)`) or all items (`None`) read on the network.
+    ActivityMarkRead {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -2802,6 +2818,12 @@ pub enum Response {
     /// Paths of debug bundles just written. Empty when export is off.
     LogsSaved {
         paths: Vec<String>,
+    },
+    /// One page of an account's activity feed (`Request::ActivityFeed`).
+    ActivityFeed {
+        items: Vec<ActivityItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
     },
 }
 
