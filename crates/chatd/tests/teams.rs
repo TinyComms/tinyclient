@@ -1906,3 +1906,68 @@ fn forwarded_messages_are_read_with_origin_metadata_and_forwarded_to_multiple_ch
         assert_eq!(files[0]["fileName"].as_str(), Some("Q4 plan.xlsx"));
     }
 }
+
+#[test]
+fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises importance capability.
+    assert!(world.account(HOME).can.importance);
+
+    // 2. Receive Normal, Important (`high`), and Urgent (`urgent`) fixtures.
+    let fixtures = world.fake.fixture("importance").expect("importance fixture");
+    for kind in ["normal", "important", "urgent"] {
+        world.fake.push("NewMessage", fixtures[kind].clone(), false);
+    }
+    world.until("all three importance fixtures", || {
+        let msgs = world.messages(&ana);
+        ["1760000830001", "1760000830002", "1760000830003"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+    assert_eq!(world.message(&ana, "1760000830001").unwrap().importance, protocol::Importance::Normal);
+    assert_eq!(world.message(&ana, "1760000830002").unwrap().importance, protocol::Importance::Important);
+    assert_eq!(world.message(&ana, "1760000830003").unwrap().importance, protocol::Importance::Urgent);
+
+    // 3. Send Important and Urgent messages and verify properties.importance on the wire.
+    let send_with_imp = |client_id: &str, text: &str, importance: protocol::Importance| {
+        let req = Request::Send {
+            conversation: ana.clone(),
+            client_id: client_id.to_owned(),
+            text: text.to_owned(),
+            reply_to: None,
+            with: protocol::Outgoing { importance, ..protocol::Outgoing::default() },
+        };
+        assert!(matches!(world.ask(req), Response::Sent { .. }));
+        world.until("sent message accepted", || {
+            world
+                .messages(&ana)
+                .into_iter()
+                .find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+        })
+    };
+
+    let imp_msg = send_with_imp("1760000999000627", "Review before EOD", protocol::Importance::Important);
+    assert_eq!(imp_msg.importance, protocol::Importance::Important);
+    let imp_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000627")
+        .expect("important POST");
+    assert_eq!(imp_call.json()["properties"]["importance"].as_str(), Some("high"));
+
+    let urg_msg = send_with_imp("1760000999000628", "Site down!", protocol::Importance::Urgent);
+    assert_eq!(urg_msg.importance, protocol::Importance::Urgent);
+    let urg_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000628")
+        .expect("urgent POST");
+    assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
+}

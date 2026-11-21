@@ -820,7 +820,13 @@ impl Pane {
         let editing = !self.is_thread() && editing.as_deref() == Some(message.id.as_str());
         let selecting = self.multi_select.active;
         let ticked = selecting && self.multi_select.contains(&message.id);
-        let bar = if editing || ticked { Some(theme::accent()) } else { bar };
+        let bar = if editing || ticked {
+            Some(theme::accent())
+        } else if message.importance != protocol::Importance::Normal {
+            Some(theme::danger())
+        } else {
+            bar
+        };
         let owns = self.owns_overlay(&message.id);
 
         let gutter: Option<AnyElement> = Some(if head {
@@ -928,7 +934,7 @@ impl Pane {
                 .children((message.importance != protocol::Importance::Normal).then(|| {
                     let (label, color) = match message.importance {
                         protocol::Importance::Urgent => ("URGENT", theme::danger()),
-                        protocol::Importance::Important => ("IMPORTANT", theme::warning()),
+                        protocol::Importance::Important => ("IMPORTANT", theme::danger()),
                         protocol::Importance::Normal => ("", theme::text_faint()),
                     };
                     div()

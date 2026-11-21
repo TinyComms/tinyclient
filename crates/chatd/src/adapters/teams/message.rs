@@ -115,6 +115,24 @@ fn set(value: &Value) -> bool {
     }
 }
 
+/// Maps Teams' `properties.importance` (`high` / `urgent`) into [`protocol::Importance`].
+fn importance_of(value: &Value) -> protocol::Importance {
+    match value.as_str().map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
+        "urgent" => protocol::Importance::Urgent,
+        "high" | "important" => protocol::Importance::Important,
+        _ => protocol::Importance::Normal,
+    }
+}
+
+/// Wire value for Teams' `properties.importance` when sending.
+fn importance_wire(importance: protocol::Importance) -> Option<&'static str> {
+    match importance {
+        protocol::Importance::Normal => None,
+        protocol::Importance::Important => Some("high"),
+        protocol::Importance::Urgent => Some("urgent"),
+    }
+}
+
 /// A property that holds JSON as text, or the JSON itself.
 fn listed(value: &Value) -> Vec<Value> {
     match value {
@@ -507,6 +525,7 @@ impl Teams {
         message.sender.id = from;
         message.edited = set(&props["edittime"]);
         message.edited_at = props["edittime"].as_str().filter(|_| message.edited).map(seconds).filter(|at| *at > 0);
+        message.importance = importance_of(&props["importance"]);
         let content = raw["content"].as_str().unwrap_or("");
         match kind {
             "Event/Call" => {
@@ -1251,6 +1270,12 @@ impl Teams {
                 map.insert("subject".to_owned(), Value::String(subject.clone()));
             }
         }
+        if let Some(level) = importance_wire(with.importance) {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("importance".to_owned(), Value::String(level.to_owned()));
+            }
+        }
         match (reply_to, &quote) {
             (Some(original), _) if channel => target = chain_id(conversation, original),
             (_, Some(quote)) => content = format!("{}{content}", quote_markup(quote)),
@@ -1298,6 +1323,7 @@ impl Teams {
         }
         let mut message = Message::plain(id, name.clone(), shown, sent, true);
         message.spans = spans;
+        message.importance = with.importance;
         message.sender.avatar = self.picture(&me, &name);
         message.sender.id = me;
         if let Some((channel, root)) = chain_of(&target) {
@@ -1728,5 +1754,17 @@ mod tests {
         assert_eq!(super::super::links::parse_share(&desktop).map(|found| (found.kind, found.conversation)), Some((super::super::links::ShareKind::Chat, chat.to_owned())));
         assert!(super::super::links::parse_share("https://ex.com/plan").is_none());
         assert!(super::super::links::parse_share("https://teams.microsoft.com/l/chat/0/0?users=a@contoso.com").is_none());
+    }
+
+    #[test]
+    fn importance_maps_to_and_from_teams_wire_values() {
+        assert_eq!(importance_of(&Value::Null), protocol::Importance::Normal);
+        assert_eq!(importance_of(&json!("standard")), protocol::Importance::Normal);
+        assert_eq!(importance_of(&json!("high")), protocol::Importance::Important);
+        assert_eq!(importance_of(&json!("HIGH")), protocol::Importance::Important);
+        assert_eq!(importance_of(&json!("urgent")), protocol::Importance::Urgent);
+        assert_eq!(importance_wire(protocol::Importance::Normal), None);
+        assert_eq!(importance_wire(protocol::Importance::Important), Some("high"));
+        assert_eq!(importance_wire(protocol::Importance::Urgent), Some("urgent"));
     }
 }

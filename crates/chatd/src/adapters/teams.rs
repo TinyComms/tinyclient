@@ -902,6 +902,7 @@ impl Teams {
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
+            importance: true,
             channel_subject: true,
             ..protocol::Capabilities::default()
         });
