@@ -3048,6 +3048,8 @@ impl Chat {
                     Err(refused) => return *refused,
                 };
                 if message.waiting {
+                    let conversation_id = conversation.id.clone();
+                    self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id: client_id.clone() });
                     return self.drop_unsent(conversation, &client_id, &message);
                 }
                 let conversation_id = conversation.id.clone();
@@ -3068,6 +3070,10 @@ impl Chat {
                     Ok(message) => message,
                     Err(refused) => return *refused,
                 };
+                if message.waiting {
+                    let conversation_id = conversation.id.clone();
+                    self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id: client_id.clone() });
+                }
                 self.drop_unsent(conversation, &client_id, &message)
             }
             Request::Typing { conversation, activity } => {

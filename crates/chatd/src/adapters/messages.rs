@@ -618,7 +618,7 @@ struct Account {
     contacts: Mutex<Vec<bugle::ContactEntry>>,
     contacts_loaded: std::sync::atomic::AtomicBool,
     /// Locally scheduled texts waiting for their send time while chatd runs.
-    scheduled: Mutex<Vec<ScheduledSend>>,
+    scheduled: Arc<Mutex<Vec<ScheduledSend>>>,
     /// SIM cards reported by the phone's settings update for this session.
     sims: Mutex<Vec<bugle::SimCard>>,
 }
@@ -629,13 +629,15 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         return Err("the Messages session is for another account".to_owned());
     }
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
-    let (socket_ctx, held, socket_saved) = (ctx.clone(), current.clone(), saved.clone());
+    let scheduled: Arc<Mutex<Vec<ScheduledSend>>> = Arc::default();
+    let (socket_ctx, held, socket_saved, socket_scheduled) =
+        (ctx.clone(), current.clone(), saved.clone(), scheduled.clone());
     std::thread::Builder::new()
         .name("messages-link".into())
         .spawn(move || {
             let mut gate = bugle::Gate::default();
             keep_connected(&socket_ctx, || {
-                connect(&socket_ctx, &socket_saved, &held, &mut gate)
+                connect(&socket_ctx, &socket_saved, &held, &socket_scheduled, &mut gate)
             });
             held.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -662,6 +664,12 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                 },
                 |command| match (account(), command) {
                     (Some(account), command) => serve(&account, command),
+                    (None, Command::CancelSend { client_id, .. }) => {
+                        scheduled
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .retain(|item| item.client_id != client_id);
+                    }
                     (None, Command::SignOut(reply)) => {
                         if scripted() {
                             fake::record(STILL_LISTED);
@@ -684,6 +692,7 @@ fn connect(
     ctx: &Context,
     saved: &Saved,
     current: &Mutex<Option<Arc<Account>>>,
+    scheduled: &Arc<Mutex<Vec<ScheduledSend>>>,
     gate: &mut bugle::Gate,
 ) -> Failure {
     let drive = match open(saved) {
@@ -709,7 +718,7 @@ fn connect(
         newest: Mutex::default(),
         contacts: Mutex::default(),
         contacts_loaded: std::sync::atomic::AtomicBool::new(false),
-        scheduled: Mutex::default(),
+        scheduled: scheduled.clone(),
         sims: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
@@ -1637,7 +1646,10 @@ fn location_card(loc: &bugle::Location) -> protocol::Card {
 
 pub(crate) fn mask_phone(phone: &str) -> String {
     let code = if phone.starts_with('+') {
-        phone.split_whitespace().next().unwrap_or("").len()
+        match phone.find(|ch: char| ch.is_whitespace() || ch == '-') {
+            Some(sep) if sep <= 4 && phone[1..sep].chars().all(|c| c.is_ascii_digit()) => sep,
+            _ => 0,
+        }
     } else {
         0
     };
