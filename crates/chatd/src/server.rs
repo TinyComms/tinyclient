@@ -1475,6 +1475,40 @@ impl Chat {
         }
     }
 
+    fn reactors(
+        &self,
+        conversation: Key,
+        message_id: String,
+        emoji: String,
+        burst: bool,
+        after: Option<String>,
+        limit: u32,
+    ) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let asked = self.ask(&account, |reply| Command::Reactors {
+            conversation_id: conversation.id.clone(),
+            message_id: message_id.clone(),
+            emoji: emoji.clone(),
+            burst,
+            after,
+            limit,
+            reply,
+        });
+        match asked {
+            Ok(page) => Response::Reactors {
+                conversation,
+                message_id,
+                emoji,
+                reactors: page.reactors,
+                more: page.more,
+            },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Our reaction, shown at once and taken back if the network refuses it. One the
     /// conversation's rules refuse is refused here and never sent; one that replaces mine (a
     /// network with one reaction a person) takes mine off at once too. A custom emoji that is
@@ -1606,6 +1640,78 @@ impl Chat {
         }
         let person_id = person.id;
         match self.ask(&account, |reply| Command::Relate { person_id, action, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn add_friend(&self, account: AccountKey, username: String) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let username = username.trim().to_owned();
+        if username.is_empty() {
+            return error(ErrorCode::Refused, "Enter a username.");
+        }
+        match self.ask(&account, |reply| Command::AddFriend { username, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_friend_nickname(&self, person: Key, nickname: Option<String>) -> Response {
+        let account = person.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let nickname = nickname.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        match self.ask(&account, |reply| Command::SetFriendNickname {
+            person_id: person.id,
+            nickname,
+            reply,
+        }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn invite_preview(&self, account: AccountKey, code: String) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            return error(ErrorCode::Refused, "Enter an invite link or code.");
+        }
+        match self.ask(&account, |reply| Command::InvitePreview { code, reply }) {
+            Ok(preview) => Response::InvitePreview { preview },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn invite_join(&self, account: AccountKey, code: String) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            return error(ErrorCode::Refused, "Enter an invite link or code.");
+        }
+        match self.ask(&account, |reply| Command::InviteJoin { code, reply }) {
+            Ok((space_id, channel_id)) => Response::InviteJoined {
+                space: space_id.map(|id| Key::new(&account, id)),
+                conversation: channel_id.map(|id| Key::new(&account, id)),
+            },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn leave_space(&self, space: Key) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::LeaveSpace { space_id: space.id.clone(), reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
@@ -3030,6 +3136,7 @@ impl Chat {
                 res
             }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
+            Request::LeaveSpace { space } => self.leave_space(space),
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }
@@ -3098,6 +3205,7 @@ impl Chat {
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::Relate { person, action } => self.relate(person, action),
+            Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
@@ -3106,6 +3214,9 @@ impl Chat {
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
+            Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
+            Request::InvitePreview { account, code } => self.invite_preview(account, code),
+            Request::InviteJoin { account, code } => self.invite_join(account, code),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
@@ -3181,6 +3292,9 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
+            Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
+                self.reactors(conversation, message_id, emoji, burst, after, limit)
+            }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),

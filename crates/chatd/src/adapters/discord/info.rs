@@ -296,6 +296,34 @@ impl Discord {
         self.ctx.conversation_gone(channel).map_err(refused)
     }
 
+    /// Leaves a Discord server (`DELETE /users/@me/guilds/{guild}` with `{"lurking": false}`).
+    /// Refuses locally if we own the server, since Discord requires transferring ownership or
+    /// deleting the server first.
+    pub(super) fn leave_space(&self, guild: &str) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if info.owner {
+                return Err(refused(
+                    "You own this server. Transfer ownership or delete it in Discord before leaving.",
+                ));
+            }
+        }
+        self.call("DELETE", &format!("/users/@me/guilds/{guild}"), Some(json!({"lurking": false})))
+            .map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.voice.states.retain(|_, voice| voice.guild.as_deref() != Some(guild));
+            if state.members.on_screen.as_deref() == Some(guild) {
+                state.members = Default::default();
+            }
+            state.guilds.remove(guild);
+        }
+        self.spaces().map_err(refused)
+    }
+
     /// The pinned messages, newest pin first, from the route the web client uses now; the older
     /// one answers where that one is not known. Both are the community's documentation,
     /// unconfirmed against a real account.

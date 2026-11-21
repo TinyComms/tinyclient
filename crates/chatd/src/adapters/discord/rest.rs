@@ -369,7 +369,8 @@ impl Rest {
         }
         match (method, body) {
             ("GET", _) => dressed!(agent.get(url)).call(),
-            ("DELETE", _) => dressed!(agent.delete(url)).call(),
+            ("DELETE", Some(body)) => dressed!(agent.delete(url).force_send_body()).send_json(body),
+            ("DELETE", None) => dressed!(agent.delete(url)).call(),
             ("PUT", Some(body)) => dressed!(agent.put(url)).send_json(body),
             ("PUT", None) => dressed!(agent.put(url)).send_empty(),
             ("PATCH", Some(body)) => dressed!(agent.patch(url)).send_json(body),

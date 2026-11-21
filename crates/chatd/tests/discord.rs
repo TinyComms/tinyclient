@@ -4717,3 +4717,331 @@ fn discord_call_add_people_group_dm_and_1to1_escalation_with_rollback() {
         ring_3099.iter().map(|r| &r.body).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn reactors_fetches_unicode_and_custom_emoji_with_paging() {
+    let world = World::start();
+    // Open channel 4101 so message 1300000000000000501 (with custom emoji reaction) is cached.
+    let _ = world.messages("4101");
+    wait("messages in 4101 to backfill", || {
+        (!world.messages("4101").is_empty()).then_some(())
+    });
+    let message_id = world.messages("4101")[0].id.clone();
+
+    // 1. Standard unicode emoji (👍 -> %F0%9F%91%8D), with paging (limit=2 -> more=true, then after=9002 -> more=false).
+    let unicode_path = format!("/channels/4101/messages/{message_id}/reactions/%F0%9F%91%8D");
+    world.discord.script(
+        &unicode_path,
+        200,
+        json!([
+            {"id": "9001", "username": "alice", "global_name": "Alice", "discriminator": "0", "avatar": "a1"},
+            {"id": "9002", "username": "bob", "global_name": "Bob", "discriminator": "0", "avatar": null}
+        ]),
+    );
+    world.discord.script(
+        &unicode_path,
+        200,
+        json!([
+            {"id": "9003", "username": "carol", "global_name": null, "discriminator": "0", "avatar": null}
+        ]),
+    );
+
+    match world.ask(Request::Reactors {
+        conversation: world.key("4101"),
+        message_id: message_id.clone(),
+        emoji: "👍".into(),
+        burst: false,
+        after: None,
+        limit: 2,
+    }) {
+        Response::Reactors { reactors, more, .. } => {
+            assert_eq!(reactors.len(), 2);
+            assert_eq!(reactors[0].key.id, "9001");
+            assert_eq!(reactors[0].name, "Alice");
+            assert_eq!(reactors[1].key.id, "9002");
+            assert_eq!(reactors[1].name, "Bob");
+            assert!(more, "full page should report more=true");
+        }
+        other => panic!("expected Response::Reactors, got {other:?}"),
+    }
+
+    match world.ask(Request::Reactors {
+        conversation: world.key("4101"),
+        message_id: message_id.clone(),
+        emoji: "👍".into(),
+        burst: false,
+        after: Some("9002".into()),
+        limit: 2,
+    }) {
+        Response::Reactors { reactors, more, .. } => {
+            assert_eq!(reactors.len(), 1);
+            assert_eq!(reactors[0].key.id, "9003");
+            assert_eq!(reactors[0].name, "carol");
+            assert!(!more, "partial page should report more=false");
+        }
+        other => panic!("expected Response::Reactors, got {other:?}"),
+    }
+
+    let reqs = world.discord.requests_to("GET", &unicode_path);
+    assert_eq!(reqs.len(), 2);
+    assert!(reqs[0].path.contains("limit=2") && reqs[0].path.contains("type=0"));
+    assert!(reqs[1].path.contains("after=9002") && reqs[1].path.contains("limit=2"));
+
+    // 2. Custom emoji passed as name:id (encoded as ferris%3A7001).
+    let custom_path = format!("/channels/4101/messages/{message_id}/reactions/ferris%3A7001");
+    world.discord.script(
+        &custom_path,
+        200,
+        json!([
+            {"id": "2001", "username": "alice", "global_name": "Alice", "discriminator": "0", "avatar": null}
+        ]),
+    );
+    match world.ask(Request::Reactors {
+        conversation: world.key("4101"),
+        message_id: message_id.clone(),
+        emoji: "ferris:7001".into(),
+        burst: true,
+        after: None,
+        limit: 100,
+    }) {
+        Response::Reactors { reactors, more, .. } => {
+            assert_eq!(reactors.len(), 1);
+            assert_eq!(reactors[0].key.id, "2001");
+            assert!(!more);
+        }
+        other => panic!("expected Response::Reactors, got {other:?}"),
+    }
+    let custom_reqs = world.discord.requests_to("GET", &custom_path);
+    assert_eq!(custom_reqs.len(), 1);
+    assert!(custom_reqs[0].path.contains("type=1"), "burst=true must pass type=1, got {}", custom_reqs[0].path);
+}
+
+#[test]
+fn add_friend_by_username_sends_request_and_translates_refusals() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // 1. Pomelo username (with leading @ stripped) sends POST /users/@me/relationships with discriminator: null
+    world.discord.script("/users/@me/relationships", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::AddFriend { account: account.clone(), username: " @newfriend ".into() }),
+        Response::Ok
+    );
+    let reqs = world.discord.requests_to("POST", "/users/@me/relationships");
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].body, json!({"username": "newfriend", "discriminator": null}));
+    assert!(reqs[0].headers.contains_key("x-context-properties"), "must send X-Context-Properties");
+
+    // 2. Legacy username#1234 sends numeric discriminator
+    world.discord.script("/users/@me/relationships", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::AddFriend { account: account.clone(), username: "legacy#1234".into() }),
+        Response::Ok
+    );
+    let reqs = world.discord.requests_to("POST", "/users/@me/relationships");
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1].body, json!({"username": "legacy", "discriminator": 1234}));
+
+    // 3. Error translations: user not found (80004), already friends (80007), blocked (80002), disabled (80008)
+    for (code, expected) in [
+        (80004, "No Discord user"),
+        (80007, "already your friend"),
+        (80002, "blocked"),
+        (80008, "does not accept friend requests"),
+    ] {
+        world.discord.script("/users/@me/relationships", 400, json!({"code": code, "message": "err"}));
+        match world.ask(Request::AddFriend { account: account.clone(), username: "someone".into() }) {
+            Response::Error { detail, .. } => {
+                assert!(detail.contains(expected), "code {code} expected '{expected}', got '{detail}'");
+            }
+            other => panic!("expected error for code {code}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn set_and_clear_friend_nickname_updates_relationship_and_refuses_non_friends() {
+    let world = World::start();
+
+    // 1. Non-friend (2006 is not a friend in READY) is refused locally before hitting Discord.
+    match world.ask(Request::SetFriendNickname {
+        person: world.key("2006"),
+        nickname: Some("Pal".into()),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Only friends"), "got: {detail}"),
+        other => panic!("expected refusal for non-friend, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PATCH", "/users/@me/relationships/2006").is_empty());
+
+    // 2. Setting a friend nickname on friend 2001 sends PATCH /users/@me/relationships/2001 with {"nickname": "M"}
+    world.discord.script("/users/@me/relationships/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetFriendNickname {
+            person: world.key("2001"),
+            nickname: Some("  Bestie  ".into()),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/relationships/2001");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body, json!({"nickname": "Bestie"}));
+
+    // Gateway RELATIONSHIP_UPDATE updates local person display name live
+    world.discord.push(
+        "RELATIONSHIP_UPDATE",
+        json!({
+            "id": "2001",
+            "type": 1,
+            "nickname": "Bestie",
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null}
+        }),
+    );
+    wait("friend nickname to update to Bestie", || {
+        world.people(Some(Relation::Friend), None).into_iter().find(|p| p.key.id == "2001" && p.name == "Bestie")
+    });
+
+    // 3. Clearing the nickname (empty or None) sends {"nickname": null} and RELATIONSHIP_UPDATE restores real name
+    world.discord.script("/users/@me/relationships/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetFriendNickname {
+            person: world.key("2001"),
+            nickname: Some("   ".into()),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/relationships/2001");
+    assert_eq!(patches.len(), 2);
+    assert_eq!(patches[1].body, json!({"nickname": null}));
+
+    world.discord.push(
+        "RELATIONSHIP_UPDATE",
+        json!({
+            "id": "2001",
+            "type": 1,
+            "nickname": null,
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null}
+        }),
+    );
+    wait("friend nickname to clear back to Mara", || {
+        world.people(Some(Relation::Friend), None).into_iter().find(|p| p.key.id == "2001" && p.name == "Mara")
+    });
+}
+
+#[test]
+fn invite_preview_join_and_error_translation() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // 1. Preview from full URL https://discord.gg/rustlang?foo=1
+    world.discord.script(
+        "/invites/rustlang",
+        200,
+        json!({
+            "code": "rustlang",
+            "guild": {"id": "9900", "name": "Rust Community", "description": "All things Rust", "icon": null},
+            "channel": {"id": "9901", "name": "welcome"},
+            "approximate_member_count": 4200,
+            "approximate_presence_count": 350
+        }),
+    );
+    match world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://discord.gg/rustlang?foo=1".into(),
+    }) {
+        Response::InvitePreview { preview } => {
+            assert_eq!(preview.code, "rustlang");
+            assert_eq!(preview.name, "Rust Community");
+            assert_eq!(preview.description, "All things Rust");
+            assert_eq!(preview.members, Some(4200));
+            assert_eq!(preview.online, Some(350));
+            assert_eq!(preview.space_id.as_deref(), Some("9900"));
+            assert_eq!(preview.channel_id.as_deref(), Some("9901"));
+        }
+        other => panic!("expected Response::InvitePreview, got {other:?}"),
+    }
+    let preview_reqs = world.discord.requests_to("GET", "/invites/rustlang");
+    assert_eq!(preview_reqs.len(), 1);
+    assert!(preview_reqs[0].path.contains("with_counts=true"));
+
+    // 2. Join from discord.com/invite/rustlang
+    world.discord.script(
+        "/invites/rustlang",
+        200,
+        json!({
+            "code": "rustlang",
+            "guild": {"id": "9900", "name": "Rust Community"},
+            "channel": {"id": "9901"}
+        }),
+    );
+    match world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://discord.com/invite/rustlang".into(),
+    }) {
+        Response::InviteJoined { space, conversation } => {
+            assert_eq!(space.map(|k| k.id), Some("9900".into()));
+            assert_eq!(conversation.map(|k| k.id), Some("9901".into()));
+        }
+        other => panic!("expected Response::InviteJoined, got {other:?}"),
+    }
+    let join_reqs = world.discord.requests_to("POST", "/invites/rustlang");
+    assert_eq!(join_reqs.len(), 1);
+    assert!(join_reqs[0].headers.contains_key("x-context-properties"));
+
+    // 3. Error translations: expired/invalid (10006), banned (40007), server limit (30001)
+    for (status, code, expected) in [
+        (404, 10006, "invalid or has expired"),
+        (403, 40007, "banned"),
+        (400, 30001, "server limit"),
+    ] {
+        world.discord.script("/invites/badcode", status, json!({"code": code, "message": "err"}));
+        match world.ask(Request::InviteJoin { account: account.clone(), code: "badcode".into() }) {
+            Response::Error { detail, .. } => {
+                assert!(detail.contains(expected), "code {code} expected '{expected}', got '{detail}'");
+            }
+            other => panic!("expected error for code {code}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add an owned guild 4999 (owner_id == "1000") alongside non-owned guild 4000.
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4999",
+        "properties": {"id": "4999", "name": "My Owned Server", "owner_id": "1000", "icon": null},
+        "roles": [{"id": "4999", "name": "@everyone", "permissions": "1071698529857"}],
+        "channels": [{"id": "4991", "type": 0, "name": "general", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Owned server 4999 is refused locally with clear owner explanation and no HTTP DELETE.
+    match world.ask(Request::LeaveSpace { space: world.key("4999") }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.contains("own this server") || detail.contains("Transfer ownership"), "got: {detail}");
+        }
+        other => panic!("expected refusal for owned server, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("DELETE", "/users/@me/guilds/4999").is_empty());
+
+    // 2. Non-owned server 4000 sends DELETE /users/@me/guilds/4000 with {"lurking": false} and drops from Spaces.
+    world.discord.script("/users/@me/guilds/4000", 204, json!(null));
+    assert_eq!(world.ask(Request::LeaveSpace { space: world.key("4000") }), Response::Ok);
+    let deletes = world.discord.requests_to("DELETE", "/users/@me/guilds/4000");
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].body, json!({"lurking": false}));
+
+    // Space 4000 is gone from Spaces list immediately.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            assert!(spaces.iter().all(|s| s.key.id != "4000"), "left server 4000 should be removed from Spaces");
+            assert!(spaces.iter().any(|s| s.key.id == "4999"), "other server 4999 should remain");
+        }
+        other => panic!("expected Response::Spaces, got {other:?}"),
+    }
+}

@@ -1021,16 +1021,11 @@ impl Discord {
         }
     }
 
-    /// Adds or takes back our reaction. `emoji` is the emoji itself, or a custom one: as the
-    /// message spells it (`:name:`) when it is already there, or as the id of its registered
-    /// file (`emoji:<id>`). Discord wants a custom one as `name:id`.
-    ///
-    /// The query is what the web client adds; it is from the community documentation and
-    /// unconfirmed against a real account. So is sending a placeholder name with an id whose
-    /// name is not known here (Discord is said to go by the id).
-    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool) -> Result<(), Refusal> {
+    /// Resolves `emoji` to the path segment Discord expects (either the unicode emoji,
+    /// `name:id` for a custom emoji already in that form, or looked up from `:name:` / `emoji:<id>`).
+    fn reaction_emoji(&self, channel: &str, message: &str, emoji: &str) -> Result<String, Refusal> {
         let spelled = emoji.len() > 2 && emoji.starts_with(':') && emoji.ends_with(':');
-        let named = if spelled || emoji.starts_with("emoji:") {
+        if spelled || emoji.starts_with("emoji:") {
             let stored = self.ctx.stored_message(channel, message).ok().flatten();
             let reactions = stored.map(|stored| stored.reactions).unwrap_or_default();
             let known = reactions.into_iter().find(|reaction| match &reaction.file {
@@ -1045,16 +1040,79 @@ impl Discord {
                 return Err(Refusal::Refused("That emoji is not on the message, so tinyclient cannot tell Discord which one it is.".to_owned()));
             };
             let name = known.map_or_else(|| "emoji".to_owned(), |reaction| reaction.emoji.trim_matches(':').to_owned());
-            format!("{name}:{id}")
+            Ok(format!("{name}:{id}"))
         } else {
-            emoji.to_owned()
-        };
+            Ok(emoji.to_owned())
+        }
+    }
+
+    /// Adds or takes back our reaction. `emoji` is the emoji itself, or a custom one: as the
+    /// message spells it (`:name:`) when it is already there, or as the id of its registered
+    /// file (`emoji:<id>`). Discord wants a custom one as `name:id`.
+    ///
+    /// The query is what the web client adds; it is from the community documentation and
+    /// unconfirmed against a real account. So is sending a placeholder name with an id whose
+    /// name is not known here (Discord is said to go by the id).
+    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool) -> Result<(), Refusal> {
+        let named = self.reaction_emoji(channel, message, emoji)?;
         let reaction = format!("/channels/{channel}/messages/{message}/reactions/{}", escaped(&named));
         let asked = match on {
             true => self.call("PUT", &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type=0"), None),
             false => self.call("DELETE", &format!("{reaction}/0/%40me?location=Message%20Inline%20Button&burst=false"), None),
         };
         asked.map(drop).map_err(refusal)
+    }
+
+    /// Fetches one page of users who reacted to `message` with `emoji`.
+    fn reactors(
+        &self,
+        channel: &str,
+        message: &str,
+        emoji: &str,
+        burst: bool,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<super::ReactorsPage, Refusal> {
+        let named = self.reaction_emoji(channel, message, emoji)?;
+        let limit = if limit == 0 { 100 } else { limit.clamp(1, 100) };
+        let rtype = if burst { 1 } else { 0 };
+        let mut path = format!(
+            "/channels/{channel}/messages/{message}/reactions/{}?limit={limit}&type={rtype}",
+            escaped(&named)
+        );
+        if let Some(after) = after.filter(|a| !a.is_empty()) {
+            path.push_str(&format!("&after={}", escaped(after)));
+        }
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let users: Vec<User> = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let more = users.len() as u32 >= limit;
+        let mut files = Vec::with_capacity(users.len());
+        let mut reactors = Vec::with_capacity(users.len());
+        let known_names = {
+            let state = crate::hub::lock(&self.state);
+            users
+                .iter()
+                .map(|u| (u.id.clone(), state.users.get(&u.id).cloned()))
+                .collect::<HashMap<_, _>>()
+        };
+        for user in users {
+            let (avatar, url) = user.avatar();
+            let name = known_names
+                .get(&user.id)
+                .and_then(|n| n.as_deref())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| user.name())
+                .to_owned();
+            files.push((avatar.clone(), url));
+            reactors.push(protocol::Reactor {
+                key: self.ctx.key(&user.id),
+                name,
+                avatar: Some(avatar),
+            });
+        }
+        let _ = self.ctx.media(&files);
+        Ok(super::ReactorsPage { reactors, more })
     }
 
     /// Replaces the text of one of our messages. The store changes with Discord's answer.
@@ -1198,6 +1256,122 @@ impl Discord {
             }
         }
         self.ctx.relation(person, becomes).map_err(|err| Refusal::Refused(err.to_string()))
+    }
+
+    /// Sends a friend request by username (`POST /users/@me/relationships`). Never retried
+    /// automatically; Discord's anti-abuse system watches friend requests closely.
+    fn add_friend(&self, raw: &str) -> Result<(), Refusal> {
+        let (username, discriminator) = parse_discord_username(raw).map_err(Refusal::Refused)?;
+        let body = match discriminator {
+            Some(disc) => json!({ "username": username, "discriminator": disc }),
+            None => json!({ "username": username, "discriminator": Value::Null }),
+        };
+        let context = base64::engine::general_purpose::STANDARD.encode(json!({"location": "Add Friend"}).to_string());
+        self.rest
+            .call_with("POST", "/users/@me/relationships", Some(body), &[("X-Context-Properties", &context)])
+            .map(drop)
+            .map_err(add_friend_refusal)
+    }
+
+    /// Sets or clears a private nickname for a friend (`PATCH /users/@me/relationships/{id}`).
+    /// Only allowed when the person is currently a friend.
+    fn set_friend_nickname(&self, person: &str, nickname: Option<String>) -> Result<(), Refusal> {
+        let is_friend = crate::hub::lock(&self.state).relations.get(person) == Some(&Relation::Friend);
+        if !is_friend {
+            return Err(Refusal::Refused("Only friends can be given a nickname.".to_owned()));
+        }
+        let nick = nickname.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        if nick.as_deref().is_some_and(|n| n.chars().count() > 32) {
+            return Err(Refusal::Refused("Friend nickname must be 32 characters or fewer.".to_owned()));
+        }
+        let body = json!({ "nickname": nick });
+        self.call("PATCH", &format!("/users/@me/relationships/{person}"), Some(body)).map_err(refusal)?;
+        if let Some(nick) = nick {
+            let updated = {
+                let mut state = crate::hub::lock(&self.state);
+                state.users.insert(person.to_owned(), nick.clone());
+                state.rows.get_mut(person).map(|row| {
+                    row.name = nick;
+                    row.clone()
+                })
+            };
+            if let Some(row) = updated {
+                let _ = self.ctx.people(&[row]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Previews a Discord server invite (`GET /invites/{code}?with_counts=true&with_expiration=true`).
+    fn invite_preview(&self, raw: &str) -> Result<protocol::InvitePreview, Refusal> {
+        let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
+        let path = format!("/invites/{}?with_counts=true&with_expiration=true", escaped(&code));
+        let body = self.call("GET", &path, None).map_err(invite_refusal)?;
+        let parsed: Value = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let guild = parsed.get("guild").filter(|v| v.is_object());
+        let space_id = guild
+            .and_then(|g| g.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let name = guild
+            .and_then(|g| g.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| parsed.get("channel").and_then(|c| c.get("name")).and_then(Value::as_str))
+            .unwrap_or(&code)
+            .to_owned();
+        let description = guild
+            .and_then(|g| g.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let icon = space_id
+            .as_deref()
+            .zip(guild.and_then(|g| g.get("icon")).and_then(Value::as_str))
+            .map(|(gid, hash)| {
+                let (file, url) = model::guild_icon(gid, hash);
+                let _ = self.ctx.media(&[(file.clone(), url)]);
+                file
+            });
+        let channel_id = parsed
+            .get("channel")
+            .and_then(|c| c.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(protocol::InvitePreview {
+            code: parsed.get("code").and_then(Value::as_str).unwrap_or(&code).to_owned(),
+            name,
+            description,
+            icon,
+            members: parsed.get("approximate_member_count").and_then(Value::as_u64).map(|n| n as u32),
+            online: parsed.get("approximate_presence_count").and_then(Value::as_u64).map(|n| n as u32),
+            space_id,
+            channel_id,
+        })
+    }
+
+    /// Joins a Discord server from an invite code (`POST /invites/{code}`). Never retries on
+    /// captcha or refusal; `GUILD_CREATE` on the gateway plants the server tree.
+    fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>), Refusal> {
+        let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
+        let context = base64::engine::general_purpose::STANDARD.encode(json!({"location": "Join Guild"}).to_string());
+        let path = format!("/invites/{}", escaped(&code));
+        let body = self
+            .rest
+            .call_with("POST", &path, Some(json!({})), &[("X-Context-Properties", &context)])
+            .map_err(invite_refusal)?;
+        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let space_id = parsed
+            .get("guild")
+            .and_then(|g| g.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let channel_id = parsed
+            .get("channel")
+            .and_then(|c| c.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok((space_id, channel_id))
     }
 
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
@@ -1657,6 +1831,9 @@ impl Discord {
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
             }
+            Command::Reactors { conversation_id, message_id, emoji, burst, after, limit, reply } => {
+                answer(reply, self.reactors(&conversation_id, &message_id, &emoji, burst, after.as_deref(), limit))
+            }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text))
             }
@@ -1671,13 +1848,20 @@ impl Discord {
                 }
             }
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
+            Command::AddFriend { username, reply } => answer(reply, self.add_friend(&username)),
+            Command::SetFriendNickname { person_id, nickname, reply } => {
+                answer(reply, self.set_friend_nickname(&person_id, nickname))
+            }
             Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
+            Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
+            Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
+            Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {
                 answer(reply, self.answer_message_request(&conversation_id, accept))
@@ -1757,6 +1941,129 @@ fn ack_refused(refused: &Refused) -> bool {
     matches!(refused, Refused::Status { code: 50007 | 50001 | 50003, .. } | Refused::Status { status: 403, .. })
 }
 
+/// Parses a user-typed Discord username (`name`, `@name`, or legacy `name#1234`).
+fn parse_discord_username(raw: &str) -> Result<(String, Option<u16>), String> {
+    let trimmed = raw.trim().trim_start_matches('@').trim();
+    if trimmed.is_empty() {
+        return Err("Enter a Discord username.".to_owned());
+    }
+    if let Some((name, disc)) = trimmed.split_once('#') {
+        let name = name.trim();
+        let disc = disc.trim();
+        if name.is_empty() {
+            return Err("Enter a username like name or name#1234.".to_owned());
+        }
+        if disc == "0" || disc == "0000" {
+            return Ok((name.to_owned(), None));
+        }
+        if disc.len() == 4 && disc.bytes().all(|b| b.is_ascii_digit()) {
+            let parsed = disc.parse::<u16>().map_err(|_| "Enter a username like name or name#1234.".to_owned())?;
+            return Ok((name.to_owned(), Some(parsed)));
+        }
+        return Err("Enter a username like name or name#1234.".to_owned());
+    }
+    Ok((trimmed.to_owned(), None))
+}
+
+/// Translates Discord's refusal codes on `POST /users/@me/relationships` into clear words.
+fn add_friend_refusal(err: Refused) -> Refusal {
+    match err {
+        Refused::Challenge => Refusal::Refused(
+            "Discord asked for a captcha check tinyclient cannot complete. Send this friend request in Discord.".to_owned(),
+        ),
+        Refused::Limited(_) | Refused::Paused(_) | Refused::Status { status: 429, .. } => {
+            Refusal::Refused("Too many friend requests. Wait a moment and try again.".to_owned())
+        }
+        Refused::Status { code: 80000 | 80003, .. } => {
+            Refusal::Refused("You cannot send a friend request to yourself.".to_owned())
+        }
+        Refused::Status { code: 80001 | 80004, .. } => {
+            Refusal::Refused("No Discord user was found with that username. Check the spelling and try again.".to_owned())
+        }
+        Refused::Status { code: 80002, .. } => {
+            Refusal::Refused("You have blocked this user, or they have blocked you.".to_owned())
+        }
+        Refused::Status { code: 80007, .. } => Refusal::Refused("This person is already your friend.".to_owned()),
+        Refused::Status { code: 50007 | 80008, .. } => {
+            Refusal::Refused("This person does not accept friend requests.".to_owned())
+        }
+        Refused::Status { code: 30001 | 30002 | 80006, .. } => {
+            Refusal::Refused("You have reached Discord's friend limit.".to_owned())
+        }
+        Refused::Status { status: 400, ref message, .. } if message.to_ascii_lowercase().contains("captcha") => {
+            Refusal::Refused(
+                "Discord asked for a captcha check tinyclient cannot complete. Send this friend request in Discord.".to_owned(),
+            )
+        }
+        other => refusal(other),
+    }
+}
+
+/// Extracts a Discord invite code from `discord.gg/<code>`, `discord.com/invite/<code>`,
+/// `discordapp.com/invite/<code>`, or a bare invite code.
+fn parse_discord_invite_code(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches(|c| matches!(c, '<' | '>' | '"' | '\''));
+    if trimmed.is_empty() {
+        return Err("Enter a valid Discord invite link or code.".to_owned());
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let without_www = without_scheme.strip_prefix("www.").unwrap_or(without_scheme);
+    let candidate = if let Some(rest) = without_www.strip_prefix("discord.gg/") {
+        rest
+    } else if let Some(rest) = without_www.strip_prefix("discord.com/invite/") {
+        rest
+    } else if let Some(rest) = without_www.strip_prefix("discordapp.com/invite/") {
+        rest
+    } else if without_www.contains('/') || without_www.contains('.') {
+        return Err("Enter a valid Discord invite link or code.".to_owned());
+    } else {
+        without_www
+    };
+    let code = candidate
+        .split(['?', '#', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if code.len() < 2
+        || code.len() > 64
+        || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Enter a valid Discord invite link or code.".to_owned());
+    }
+    Ok(code.to_owned())
+}
+
+/// Translates Discord's refusal codes on `/invites/{code}` into clear words.
+fn invite_refusal(err: Refused) -> Refusal {
+    match err {
+        Refused::Challenge => Refusal::Refused(
+            "Discord asked for a captcha check tinyclient cannot complete. Join this server in Discord.".to_owned(),
+        ),
+        Refused::Limited(_) | Refused::Paused(_) | Refused::Status { status: 429, .. } => {
+            Refusal::Refused("Too many invite requests. Wait a moment and try again.".to_owned())
+        }
+        Refused::Status { code: 10006, .. } | Refused::Status { status: 404, .. } => {
+            Refusal::Refused("This invite is invalid or has expired.".to_owned())
+        }
+        Refused::Status { code: 40007, .. } => Refusal::Refused("You are banned from this server.".to_owned()),
+        Refused::Status { code: 30001, .. } => {
+            Refusal::Refused("You have reached Discord's server limit (100 servers, or 200 with Nitro).".to_owned())
+        }
+        Refused::Status { code: 50013 | 50001, .. } => {
+            Refusal::Refused("You do not have permission to join this server.".to_owned())
+        }
+        Refused::Status { status: 400, ref message, .. } if message.to_ascii_lowercase().contains("captcha") => {
+            Refusal::Refused(
+                "Discord asked for a captcha check tinyclient cannot complete. Join this server in Discord.".to_owned(),
+            )
+        }
+        other => refusal(other),
+    }
+}
+
 /// Sends the answer to a command the shell is waiting on.
 fn answer<T>(reply: Reply<T>, outcome: Result<T, Refusal>) {
     let _ = reply.send(outcome);
@@ -1773,5 +2080,54 @@ mod tests {
         assert_eq!(found[0].account, "1000");
         // A token that does not start with an id still signs in.
         assert_eq!(accounts(r#"{"token":"opaque"}"#).unwrap()[0].account, "main");
+    }
+
+    #[test]
+    fn parse_discord_username_handles_pomelo_and_legacy_forms() {
+        assert_eq!(parse_discord_username("alice").unwrap(), ("alice".into(), None));
+        assert_eq!(parse_discord_username("  @alice  ").unwrap(), ("alice".into(), None));
+        assert_eq!(parse_discord_username("alice#0").unwrap(), ("alice".into(), None));
+        assert_eq!(parse_discord_username("alice#1234").unwrap(), ("alice".into(), Some(1234)));
+        assert!(parse_discord_username("   ").is_err());
+        assert!(parse_discord_username("alice#12").is_err());
+        assert!(parse_discord_username("#1234").is_err());
+    }
+
+    #[test]
+    fn add_friend_refusal_translates_discord_codes() {
+        let msg = |r: Refused| match add_friend_refusal(r) {
+            Refusal::Refused(m) => m,
+            Refusal::Unsupported => panic!("unexpected unsupported"),
+        };
+        assert!(msg(Refused::Status { status: 400, code: 80004, message: String::new(), retry_after: None }).contains("No Discord user"));
+        assert!(msg(Refused::Status { status: 400, code: 80007, message: String::new(), retry_after: None }).contains("already your friend"));
+        assert!(msg(Refused::Status { status: 400, code: 80002, message: String::new(), retry_after: None }).contains("blocked"));
+        assert!(msg(Refused::Status { status: 400, code: 80008, message: String::new(), retry_after: None }).contains("does not accept friend requests"));
+        assert!(msg(Refused::Challenge).contains("captcha"));
+        assert!(msg(Refused::Limited(10.0)).contains("Too many friend requests"));
+    }
+
+    #[test]
+    fn parse_discord_invite_code_extracts_urls_and_bare_codes() {
+        assert_eq!(parse_discord_invite_code("rustlang").unwrap(), "rustlang");
+        assert_eq!(parse_discord_invite_code("https://discord.gg/AbC-123_x?event=1").unwrap(), "AbC-123_x");
+        assert_eq!(parse_discord_invite_code("discord.gg/rust").unwrap(), "rust");
+        assert_eq!(parse_discord_invite_code("https://discord.com/invite/rustlang").unwrap(), "rustlang");
+        assert_eq!(parse_discord_invite_code("http://www.discordapp.com/invite/rustlang/").unwrap(), "rustlang");
+        assert!(parse_discord_invite_code("").is_err());
+        assert!(parse_discord_invite_code("https://example.com/invite/abc").is_err());
+        assert!(parse_discord_invite_code("https://discord.gg/").is_err());
+    }
+
+    #[test]
+    fn invite_refusal_translates_discord_codes() {
+        let msg = |r: Refused| match invite_refusal(r) {
+            Refusal::Refused(m) => m,
+            Refusal::Unsupported => panic!("unexpected unsupported"),
+        };
+        assert!(msg(Refused::Status { status: 404, code: 10006, message: String::new(), retry_after: None }).contains("invalid or has expired"));
+        assert!(msg(Refused::Status { status: 403, code: 40007, message: String::new(), retry_after: None }).contains("banned"));
+        assert!(msg(Refused::Status { status: 400, code: 30001, message: String::new(), retry_after: None }).contains("server limit"));
+        assert!(msg(Refused::Challenge).contains("captcha"));
     }
 }

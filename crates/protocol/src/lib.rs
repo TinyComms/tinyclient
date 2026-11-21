@@ -1629,6 +1629,12 @@ pub enum Request {
         person: Key,
         action: RelateAction,
     },
+    /// Send a friend request by typing a username (`username` or legacy `username#1234`).
+    /// The outgoing request arrives via `Change::People` once the network accepts it.
+    AddFriend {
+        account: AccountKey,
+        username: String,
+    },
     /// Report a message, person, or conversation to the network. Never sent without a confirm sheet.
     Report {
         target: ReportTarget,
@@ -1685,6 +1691,26 @@ pub enum Request {
         space: Key,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nickname: Option<String>,
+    },
+    /// Sets (or clears, when `None` or empty) a private nickname for a friend (Discord).
+    SetFriendNickname {
+        person: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nickname: Option<String>,
+    },
+    /// Leaves a Space (e.g. a Discord server). Never sent without a confirm dialog.
+    LeaveSpace {
+        space: Key,
+    },
+    /// Preview a Space invite link or code before joining (e.g. Discord `GET /invites/{code}`).
+    InvitePreview {
+        account: AccountKey,
+        code: String,
+    },
+    /// Join a Space from an invite link or code (e.g. Discord `POST /invites/{code}`).
+    InviteJoin {
+        account: AccountKey,
+        code: String,
     },
     Watch(Watching),
 
@@ -1807,6 +1833,19 @@ pub enum Request {
     /// five minutes. chatd refuses a `React` these rules refuse, before the network hears of it.
     Reactions {
         conversation: Key,
+    },
+    /// Who reacted to a message with `emoji`, paged. Fetched only on demand (clicking or
+    /// opening the reactors list), never prefetched.
+    Reactors {
+        conversation: Key,
+        message_id: String,
+        emoji: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        burst: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        #[serde(default)]
+        limit: u32,
     },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
     /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
@@ -2820,6 +2859,17 @@ pub enum Response {
     SpaceInfo {
         info: Box<SpaceInfo>,
     },
+    /// Answers `InvitePreview`: metadata and member counts for an invite code.
+    InvitePreview {
+        preview: InvitePreview,
+    },
+    /// Answers `InviteJoin`: the joined Space and landing conversation, when reported.
+    InviteJoined {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+    },
     Pinned {
         conversation: Key,
         messages: Vec<Message>,
@@ -2827,6 +2877,15 @@ pub enum Response {
     Reactions {
         conversation: Key,
         rules: ReactionRules,
+    },
+    /// Answers `Reactors`: one page of people who reacted with `emoji`.
+    Reactors {
+        conversation: Key,
+        message_id: String,
+        emoji: String,
+        reactors: Vec<Reactor>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
     Catalog {
         items: Vec<CatalogItem>,

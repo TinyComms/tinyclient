@@ -1020,13 +1020,53 @@ impl Pane {
         cx.notify();
     }
 
-    /// The people behind one reaction, where the pointer was. A reaction the network kept to
-    /// a count has no list, and its chip never asks for one.
+    /// The people behind one reaction, where the pointer was. When the message payload did not
+    /// carry names and the account supports `Capabilities::reactors`, fetches them on demand and
+    /// caches them for the session.
     pub(super) fn open_reactors(&mut self, message: Rc<Message>, reaction: usize, at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(cx);
         self.revisions = None;
         self.hover = Some(message.id.clone());
+        let needs_fetch = message.reactions.get(reaction).and_then(|r| {
+            if r.who.is_empty() && self.caps.reactors {
+                let emoji = r.file.as_ref().map_or_else(|| r.emoji.clone(), |file| file.id.clone());
+                Some((message.id.clone(), emoji))
+            } else {
+                None
+            }
+        });
+        if let Some((msg_id, emoji)) = needs_fetch {
+            let cache_key = (msg_id.clone(), emoji.clone());
+            if !self.fetched_reactors.contains_key(&cache_key) && self.reactors_loading.as_ref() != Some(&cache_key) {
+                if let Some(conversation) = self.key().cloned() {
+                    self.reactors_loading = Some(cache_key.clone());
+                    let request = Request::Reactors {
+                        conversation: conversation.clone(),
+                        message_id: msg_id,
+                        emoji,
+                        burst: false,
+                        after: None,
+                        limit: 100,
+                    };
+                    cx.spawn(async move |this, cx| {
+                        let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.reactors_loading.as_ref() == Some(&cache_key) {
+                                this.reactors_loading = None;
+                            }
+                            if this.key() == Some(&conversation) {
+                                if let Ok(Response::Reactors { reactors, more, .. }) = answer {
+                                    this.fetched_reactors.insert(cache_key, (reactors, more));
+                                }
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                }
+            }
+        }
         self.menu = Some(Menu { message, at,
             cursor: 0, reactor: Some(reaction) });
         window.focus(&self.focus, cx);
@@ -1711,32 +1751,67 @@ impl Pane {
         window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let reaction = message.reactions.get(reactor)?;
         let mut list = menu().w(px(248.));
-        for (ix, id) in reaction.who.iter().enumerate() {
-            if ix == REACTORS_SHOWN {
-                list = list.child(menu_separator()).child(menu_item(
-                    "reactors-more",
-                    None,
-                    format!("and {} more", reaction.who.len() - ix),
-                    None,
-                ));
-                break;
+        if !reaction.who.is_empty() {
+            for (ix, id) in reaction.who.iter().enumerate() {
+                if ix == REACTORS_SHOWN {
+                    list = list.child(menu_separator()).child(menu_item(
+                        "reactors-more",
+                        None,
+                        format!("and {} more", reaction.who.len() - ix),
+                        None,
+                    ));
+                    break;
+                }
+                let one = match self.person(id) {
+                    Some(person) => self.who(&person, cx).0,
+                    None => String::new(),
+                };
+                let (label, person) = if one.is_empty() { ("Someone".to_owned(), None) } else { (one, self.person(id)) };
+                // Their card, where this person is known by name.
+                let open = person.map(|person| {
+                    cx.listener(move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
+                        this.close_menu(cx);
+                        let at = window.mouse_position();
+                        let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person.clone(), at, cx));
+                    })
+                });
+                list = list.child(
+                    menu_item(("reactor", ix), None, label, None).when_some(open, |row, open| row.on_click(open)),
+                );
             }
-            let one = match self.person(id) {
-                Some(person) => self.who(&person, cx).0,
-                None => String::new(),
-            };
-            let (label, person) = if one.is_empty() { ("Someone".to_owned(), None) } else { (one, self.person(id)) };
-            // Their card, where this person is known by name.
-            let open = person.map(|person| {
-                cx.listener(move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
-                    this.close_menu(cx);
-                    let at = window.mouse_position();
-                    let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person.clone(), at, cx));
-                })
-            });
-            list = list.child(
-                menu_item(("reactor", ix), None, label, None).when_some(open, |row, open| row.on_click(open)),
-            );
+        } else {
+            let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
+            let cache_key = (message.id.clone(), emoji_key);
+            if let Some((reactors, more)) = self.fetched_reactors.get(&cache_key) {
+                if reactors.is_empty() {
+                    list = list.child(menu_item("reactors-empty", None, "No reactions found", None));
+                } else {
+                    for (ix, person) in reactors.iter().enumerate() {
+                        if ix == REACTORS_SHOWN {
+                            let extra = reactors.len() - ix;
+                            let suffix = if *more { format!("and {extra}+ more") } else { format!("and {extra} more") };
+                            list = list.child(menu_separator()).child(menu_item("reactors-more", None, suffix, None));
+                            break;
+                        }
+                        let label = if person.name.is_empty() { "Someone".to_owned() } else { person.name.clone() };
+                        let key = person.key.clone();
+                        list = list.child(menu_item(("reactor", ix), None, label, None).on_click(cx.listener(
+                            move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
+                                this.close_menu(cx);
+                                let at = window.mouse_position();
+                                let _ = this.shell.update(cx, |shell, cx| shell.open_profile(key.clone(), at, cx));
+                            },
+                        )));
+                    }
+                    if reactors.len() <= REACTORS_SHOWN && *more {
+                        list = list.child(menu_separator()).child(menu_item("reactors-more", None, "and more…", None));
+                    }
+                }
+            } else if self.reactors_loading.as_ref() == Some(&cache_key) {
+                list = list.child(menu_item("reactors-loading", None, "Loading…", None));
+            } else {
+                list = list.child(menu_item("reactors-empty", None, "No reactions found", None));
+            }
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
         Some(placed(

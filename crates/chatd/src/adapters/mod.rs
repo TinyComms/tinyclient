@@ -242,6 +242,13 @@ pub struct BrowsedPage {
     pub cursor: Option<String>,
 }
 
+/// A page of people who reacted to a message (`Command::Reactors`).
+#[derive(Debug, Clone, Default)]
+pub struct ReactorsPage {
+    pub reactors: Vec<protocol::Reactor>,
+    pub more: bool,
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -313,6 +320,16 @@ pub enum Command {
     /// opened it; chatd keeps the answer five minutes. `Unsupported` leaves every reaction to the
     /// network to judge.
     ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
+    /// Who reacted to a message with `emoji`, paged.
+    Reactors {
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        burst: bool,
+        after: Option<String>,
+        limit: u32,
+        reply: Reply<ReactorsPage>,
+    },
     /// Replace the text of one of our messages. Report the edited message through
     /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
     /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
@@ -486,6 +503,16 @@ pub enum Command {
     },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
+    /// Preview a Space invite link or code.
+    InvitePreview {
+        code: String,
+        reply: Reply<protocol::InvitePreview>,
+    },
+    /// Join a Space from an invite link or code; returns `(space_id, channel_id)`.
+    InviteJoin {
+        code: String,
+        reply: Reply<(Option<String>, Option<String>)>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -540,6 +567,8 @@ pub enum Command {
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
     Leave { conversation_id: String, reply: Reply<()> },
+    /// Leave a Space (e.g. Discord server `DELETE /users/@me/guilds/{id}`).
+    LeaveSpace { space_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
     CloseDirect { conversation_id: String, reply: Reply<()> },
@@ -627,6 +656,11 @@ pub enum Command {
         action: RelateAction,
         reply: Reply<()>,
     },
+    /// Send a friend request by username (e.g. Discord `POST /users/@me/relationships`).
+    AddFriend {
+        username: String,
+        reply: Reply<()>,
+    },
     /// Report a message, person, or conversation to the network.
     Report {
         target: protocol::ReportTarget,
@@ -664,6 +698,12 @@ pub enum Command {
     /// Set (or clear, when `None` or empty) our per-space nickname.
     SetNickname {
         space_id: String,
+        nickname: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set (or clear, when `None` or empty) a private nickname for a friend.
+    SetFriendNickname {
+        person_id: String,
         nickname: Option<String>,
         reply: Reply<()>,
     },
@@ -741,9 +781,12 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
+            | Command::LeaveSpace { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
@@ -771,6 +814,7 @@ impl Command {
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
                 ctx.sent(&conversation_id, &client_id, Err(why));
@@ -780,11 +824,13 @@ impl Command {
             | Command::Delete { reply, .. }
             | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
+            | Command::AddFriend { reply, .. }
             | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }
+            | Command::SetFriendNickname { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
