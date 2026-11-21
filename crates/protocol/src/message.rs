@@ -830,6 +830,11 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Voice or round video message has not been listened to / played yet (Telegram `media_unread`).
+    /// On incoming messages, cleared once played here or on another device; on outgoing messages,
+    /// stays set until the recipient plays it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub media_unread: bool,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -939,6 +944,7 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            media_unread: false,
         }
     }
 
@@ -1094,6 +1100,7 @@ impl Message {
         self.receipt_note.clear();
         self.pinned = false;
         self.mentions_me = false;
+        self.media_unread = false;
         self.deleted = true;
     }
 
@@ -1300,5 +1307,17 @@ mod tests {
         msg.announcement = true;
         let wire = serde_json::to_string(&msg).unwrap();
         assert!(serde_json::from_str::<Message>(&wire).unwrap().announcement);
+    }
+
+    #[test]
+    fn media_unread_stays_off_wire_when_false_and_round_trips() {
+        let mut msg = Message::plain("m4", "Odalys", "", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("media_unread"));
+        msg.media_unread = true;
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(wire.contains(r#""media_unread":true"#), "{wire}");
+        assert!(serde_json::from_str::<Message>(&wire).unwrap().media_unread);
+        msg.tombstone();
+        assert!(!msg.media_unread);
     }
 }

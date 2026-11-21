@@ -2099,8 +2099,8 @@ impl Pane {
         // plays here in its tile, and opens in the viewer like a picture.
         let id = message.id.clone();
         let tile = match shape {
-            MediaShape::Video => self.moving(attachment, tile, cx),
-            MediaShape::Gif if media::is_video(attachment) => self.moving(attachment, tile, cx),
+            MediaShape::Video => self.moving(message, attachment, tile, cx),
+            MediaShape::Gif if media::is_video(attachment) => self.moving(message, attachment, tile, cx),
             _ => {
                 // A GIF says so where it does not play by itself. One held still (the setting
                 // is Never, the network sent a still, or there was no room) shows that a click

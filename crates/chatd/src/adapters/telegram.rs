@@ -277,6 +277,10 @@ struct Live {
     /// Photo albums still arriving or open, so a later item, edit, reaction or deletion
     /// finds the row they share.
     albums: VecDeque<live::HeldAlbum>,
+    /// Voice/round messages we already sent `readMessageContents` for on this connection.
+    played_sent: VecDeque<(String, i32)>,
+    /// Messages whose `readMessageContents` mention consumption has already been accounted for.
+    contents_read: VecDeque<(String, i32)>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -778,6 +782,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
+        Command::MarkPlayed { conversation_id, message_id } => mark_played(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
             let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
@@ -950,6 +955,50 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     if let (true, who @ Who::Channel(_), Some(root)) = (read, who, topic) {
         if account.dir().get(who).is_some_and(|known| known.broadcast) {
             sync::comment_unread(account, who, root, 0);
+        }
+    }
+}
+
+/// Tells Telegram a voice or round video message's contents were listened to, once per message.
+/// Follows the same rule as `mark_read`: reported when playback starts, with no opt-out switch.
+fn mark_played(account: &Account, conversation: &str, message: &str) {
+    let (Some((who, _topic)), Ok(id)) = (Who::parse(conversation), message.parse::<i32>()) else {
+        return;
+    };
+    let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) else {
+        return;
+    };
+    if stored.outgoing || !stored.media_unread || stored.attachments.iter().any(|a| a.view_once) {
+        return;
+    }
+    let key = (conversation.to_owned(), id);
+    {
+        let mut live = account.live();
+        if live.played_sent.contains(&key) {
+            return;
+        }
+        if live.played_sent.len() >= 512 {
+            live.played_sent.pop_front();
+        }
+        live.played_sent.push_back(key.clone());
+    }
+    let target = sync::comment_target(account, conversation)
+        .ok()
+        .flatten()
+        .map(|(group, _)| group)
+        .unwrap_or(who);
+    account.here();
+    let told = match target {
+        Who::Channel(_) => account
+            .input_channel(target)
+            .and_then(|channel| account.ask(&tl::functions::channels::ReadMessageContents { channel, id: vec![id] }).map(drop)),
+        _ => account.ask(&tl::functions::messages::ReadMessageContents { id: vec![id] }).map(drop),
+    };
+    match told {
+        Ok(()) => live::mark_contents_read(account, conversation, id),
+        Err(fault) => {
+            account.live().played_sent.retain(|entry| entry != &key);
+            tracing::warn!("chatd: Telegram: readMessageContents: {fault}");
         }
     }
 }

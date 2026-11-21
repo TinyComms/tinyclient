@@ -3817,3 +3817,93 @@ fn save_and_unsave_gif() {
     };
     assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
 }
+
+#[test]
+fn voice_and_round_video_messages_track_listened_state_and_send_read_contents() {
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Incoming voice message with media_unread arrives flagged unplayed.
+    world.steer("voice-unread");
+    let voice = world.arrived("u7002", "61");
+    assert!(voice.media_unread, "unplayed incoming voice message must carry media_unread");
+    assert!(!voice.outgoing);
+
+    // Playing it sends messages.readMessageContents once and clears media_unread.
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "61".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on voice 61", || {
+        world.message("u7002", "61").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("ReadMessageContents 61"), 1, "expected exactly one ReadMessageContents call");
+
+    // Asking MarkPlayed a second time sends nothing further.
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "61".into() }),
+        Response::Ok
+    ));
+    assert_eq!(world.called("ReadMessageContents 61"), 1, "must not send ReadMessageContents twice");
+
+    // 2. Incoming round video message with media_unread arrives flagged and clears on MarkPlayed.
+    world.steer("round-unread");
+    let round = world.arrived("u7002", "65");
+    assert!(round.media_unread, "unplayed round video must carry media_unread");
+    assert!(round.attachments.first().is_some_and(|a| a.round));
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "65".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on round 65", || {
+        world.message("u7002", "65").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("ReadMessageContents 65"), 1);
+
+    // 3. Channel voice message sends channels.readMessageContents and clears on update too.
+    world.steer("channel-voice-unread");
+    let ch_voice = world.arrived("c9001", "64");
+    assert!(ch_voice.media_unread);
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("c9001"), message_id: "64".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on channel voice 64", || {
+        world.message("c9001", "64").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("channels.ReadMessageContents c9001 64"), 1);
+
+    // 4. Outgoing unplayed voice message: playing it locally does NOT send readMessageContents
+    //    or clear the dot; UpdateReadMessagesContents from the recipient clears it.
+    world.steer("voice-out-unread");
+    let mine = world.arrived("u7002", "63");
+    assert!(mine.outgoing && mine.media_unread);
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "63".into() }),
+        Response::Ok
+    ));
+    assert_eq!(world.called("ReadMessageContents 63"), 0, "must not mark own outgoing message played");
+    assert!(world.message("u7002", "63").unwrap().media_unread);
+    world.steer("read-contents 63");
+    world.until("UpdateReadMessagesContents clears outgoing voice 63", || {
+        world.message("u7002", "63").filter(|m| !m.media_unread)
+    });
+
+    // 5. Unplayed voice message with a mention decrements the conversation's mention count once.
+    world.steer("voice-unread-mention");
+    let mentioned = world.arrived("g8001", "62");
+    assert!(mentioned.media_unread && mentioned.mentions_me);
+    let before_mentions = world.conversation("g8001").unwrap().mentions;
+    assert!(before_mentions >= 1, "expected mention count >= 1, got {before_mentions}");
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("g8001"), message_id: "62".into() }),
+        Response::Ok
+    ));
+    world.until("mention count decremented after readMessageContents", || {
+        let now_mentions = world.conversation("g8001")?.mentions;
+        (now_mentions == before_mentions - 1).then_some(now_mentions)
+    });
+    // Echoed UpdateReadMessagesContents must not double-decrement mentions.
+    world.steer("read-contents 62");
+    assert_eq!(world.conversation("g8001").unwrap().mentions, before_mentions - 1);
+}

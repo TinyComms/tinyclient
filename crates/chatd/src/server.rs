@@ -1182,6 +1182,25 @@ impl Chat {
         Response::Ok
     }
 
+    fn mark_played(&self, conversation: Key, message_id: String) {
+        if message_id.is_empty() {
+            return;
+        }
+        let Ok(Some(stored)) = self.hub.store().message(&conversation, &message_id) else {
+            return;
+        };
+        if stored.outgoing || !stored.media_unread {
+            return;
+        }
+        if stored.attachments.iter().any(|attachment| attachment.view_once) {
+            return;
+        }
+        let account = conversation.account();
+        if self.hub.link(&account) == Link::Connected {
+            self.command(&account, Command::MarkPlayed { conversation_id: conversation.id, message_id });
+        }
+    }
+
     fn forget_conversation(&self, conversation: Key) -> Response {
         match self.hub.store().forget_conversation(&conversation) {
             Ok(true) => {
@@ -3352,6 +3371,10 @@ impl Chat {
                 }
                 Response::Ok
             }
+            Request::MarkPlayed { conversation, message_id } => {
+                self.mark_played(conversation, message_id);
+                Response::Ok
+            }
 
             Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
@@ -3654,10 +3677,21 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::Play(request) => match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
-                Ok(()) => Response::Ok,
-                Err(detail) => error(ErrorCode::Media, detail),
-            },
+            Request::Play(request) => {
+                let played = match &request {
+                    protocol::PlayRequest::Start { conversation, message, .. } => Some((conversation.clone(), message.clone())),
+                    _ => None,
+                };
+                match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
+                    Ok(()) => {
+                        if let Some((conversation, message_id)) = played {
+                            self.mark_played(conversation, message_id);
+                        }
+                        Response::Ok
+                    }
+                    Err(detail) => error(ErrorCode::Media, detail),
+                }
+            }
             // Answered `Ok` whatever became of it: the recording's own word is `Change::Recording`.
             Request::Record(request) => {
                 self.hub.recorder.request(&self.hub, request);

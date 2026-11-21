@@ -1816,7 +1816,228 @@ impl World {
                 self.store(None, message.clone());
                 vec![new(message)]
             }
-            // A small file Telegram keeps on a CDN. The redirect names no checksum; the home
+            "voice-unread" => {
+                let voice = tl::types::Document {
+                    id: 6_101,
+                    access_hash: 6_102,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 9,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100, 0b1111_0000]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(odalys, 61, ODALYS, t0() + 61, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "voice-unread-mention" => {
+                let voice = tl::types::Document {
+                    id: 6_102,
+                    access_hash: 6_103,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 5,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(Who::Group(CREW), 62, TOBIN, t0() + 62, "");
+                msg.media_unread = true;
+                msg.mentioned = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "voice-out-unread" => {
+                let voice = tl::types::Document {
+                    id: 6_103,
+                    access_hash: 6_104,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 6,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(odalys, 63, ME, t0() + 63, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "channel-voice-unread" => {
+                let voice = tl::types::Document {
+                    id: 6_104,
+                    access_hash: 6_105,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 11,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(Who::Channel(NOTES), 64, 0, t0() + 64, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![update(tl::types::UpdateNewChannelMessage { message: msg.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "round-unread" => {
+                let round = tl::types::Document {
+                    id: 6_105,
+                    access_hash: 6_106,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "video/mp4".to_owned(),
+                    size: 42_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeVideo {
+                        round_message: true,
+                        supports_streaming: true,
+                        nosound: false,
+                        duration: 8.0,
+                        w: 240,
+                        h: 240,
+                        preload_prefix_size: None,
+                        video_start_ts: None,
+                        video_codec: None,
+                    }
+                    .into()],
+                };
+                let mut msg = message(odalys, 65, ODALYS, t0() + 65, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: true,
+                        round: true,
+                        voice: false,
+                        document: Some(round.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "read-contents" => {
+                let ids: Vec<i32> = words.filter_map(|w| w.parse::<i32>().ok()).collect();
+                vec![update(tl::types::UpdateReadMessagesContents { messages: ids, pts: 5, pts_count: 1, date: None }.into())]
+            }
+            "channel-read-contents" => {
+                let channel_id = words.next().and_then(|w| w.parse::<i64>().ok()).unwrap_or(NOTES);
+                let ids: Vec<i32> = words.filter_map(|w| w.parse::<i32>().ok()).collect();
+                vec![update(
+                    tl::types::UpdateChannelReadMessagesContents {
+                        channel_id,
+                        top_msg_id: None,
+                        saved_peer_id: None,
+                        messages: ids,
+                    }
+                    .into(),
+                )]
+            }
             // datacenter does, and the first CDN read asks for the file to be sent again.
             "cdn-file" => {
                 let document = plain_document(9_300, CDN_PLAIN.len() as i64, "ridge.bin");
@@ -2570,6 +2791,19 @@ impl World {
                 return Err(rpc(400, "CHANNEL_INVALID", None));
             };
             self.log(&format!("channels.ReadHistory c{} {}", channel.channel_id, request.max_id));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::ReadMessageContents>(body) {
+            let ids: Vec<String> = request.id.iter().map(i32::to_string).collect();
+            self.log(&format!("ReadMessageContents {}", ids.join(",")));
+            return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 4, pts_count: 1 }));
+        }
+        if let Some(request) = asked::<f::channels::ReadMessageContents>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            let ids: Vec<String> = request.id.iter().map(i32::to_string).collect();
+            self.log(&format!("channels.ReadMessageContents c{} {}", channel.channel_id, ids.join(",")));
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::ReadDiscussion>(body) {

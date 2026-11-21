@@ -475,6 +475,34 @@ fn reactions(account: &Account, conversation: &str, message: i32, update: &tl::e
     }
 }
 
+/// Clears `media_unread` on a stored message (for both ours and theirs) and keeps the
+/// conversation's unread mention count in sync when `readMessageContents` also consumed a mention.
+pub(super) fn mark_contents_read(account: &Account, conversation: &str, id: i32) {
+    let id_str = id.to_string();
+    let stored = account.ctx.stored_message(conversation, &id_str).ok().flatten();
+    let _ = account.ctx.mark_media_played(conversation, &id_str);
+    let key = (conversation.to_owned(), id);
+    let first_time = {
+        let mut live = account.live();
+        if live.contents_read.contains(&key) {
+            false
+        } else {
+            if live.contents_read.len() >= 512 {
+                live.contents_read.pop_front();
+            }
+            live.contents_read.push_back(key);
+            true
+        }
+    };
+    if first_time {
+        if let Some(msg) = stored {
+            if !msg.outgoing && msg.mentions_me {
+                let _ = account.ctx.consume_mention(conversation);
+            }
+        }
+    }
+}
+
 pub(super) fn apply(account: &Account, update: &Update) {
     // A pin or a folder: told row by row from what is held, never by reading every chat.
     if filing::apply(account, update) {
@@ -591,6 +619,32 @@ pub(super) fn apply(account: &Account, update: &Update) {
             let who = Who::Channel(seen.channel_id);
             if !account.dir().get(who).is_some_and(|known| known.broadcast || known.forum) {
                 let _ = account.ctx.seen(&who.text(), &seen.max_id.to_string());
+            }
+        }
+        // Voice / round video messages listened to (or unread mentions/reactions consumed):
+        // clears the unplayed dot for both outgoing and incoming messages.
+        Update::ReadMessagesContents(read) => {
+            for &id in &read.messages {
+                let conversation = account
+                    .placed(None, id)
+                    .or_else(|| account.ctx.conversation_of_message(&id.to_string()).ok().flatten());
+                if let Some(conversation) = conversation {
+                    mark_contents_read(account, &conversation, id);
+                }
+            }
+        }
+        Update::ChannelReadMessagesContents(read) => {
+            let who = Who::Channel(read.channel_id);
+            let forum = account.dir().get(who).is_some_and(|known| known.forum);
+            for &id in &read.messages {
+                let conversation = if read.top_msg_id.is_some() {
+                    place(account, who, read.top_msg_id)
+                } else if forum {
+                    account.placed(Some(who), id).unwrap_or_else(|| place(account, who, None))
+                } else {
+                    who.text()
+                };
+                mark_contents_read(account, &conversation, id);
             }
         }
         // A scheduled message went, or was dropped: its placeholder goes.

@@ -375,6 +375,9 @@ pub enum Command {
     /// The user followed a link out of this message (the shell is opening it). Telegram's terms
     /// want a sponsored message's follow told; nothing waits on it.
     FollowLink { conversation_id: String, message_id: String },
+    /// The user started playing a voice or round video message; tell the network its contents
+    /// were listened to (Telegram `readMessageContents`).
+    MarkPlayed { conversation_id: String, message_id: String },
     /// A conversation's cloud draft here changed to `text` (empty clears it). The shell has
     /// already waited out the pauses between the keys, so this is one settled draft and there
     /// is nothing to answer.
@@ -1397,6 +1400,27 @@ impl Context {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_pinned(&conversation, message_id, pinned)? {
             self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// Clears `media_unread` on a stored message after it is listened to / played.
+    /// Returns true when the flag changed from true to false.
+    pub fn mark_media_played(&self, conversation_id: &str, message_id: &str) -> rusqlite::Result<bool> {
+        let conversation = self.key(conversation_id);
+        let changed = self.hub.store().clear_media_unread(&conversation, message_id)?;
+        if changed {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(changed)
+    }
+
+    /// Consumes one unread mention in a conversation when a message's contents are marked read.
+    pub fn consume_mention(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().consume_mention(&conversation)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
         }
         Ok(())
     }

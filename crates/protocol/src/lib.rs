@@ -1837,6 +1837,12 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// The user started playing a voice or round video message: tells the network its contents
+    /// were listened to (`messages.readMessageContents` / `channels.readMessageContents`), once.
+    MarkPlayed {
+        conversation: Key,
+        message_id: String,
+    },
     /// Adds (`on`) or takes back our reaction. `emoji` is the emoji itself, or a custom one's
     /// `:name:` as `Reaction::emoji` spells it. Shown at once; what the network then says is
     /// what stays.

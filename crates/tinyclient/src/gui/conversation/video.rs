@@ -13,15 +13,17 @@
 use super::draw::{badge, play_disc};
 use super::media::{self, Shape};
 use super::{Pane, Then};
+use crate::client::ask;
 use crate::gui::components::tip;
-use gpui::{prelude::*, px, Context, Stateful, Div};
-use protocol::Attachment;
+use crate::gui::theme;
+use gpui::{div, prelude::*, px, Context, Div, Stateful};
+use protocol::{Attachment, Message, Request};
 
 impl Pane {
     /// A video or GIF tile: the play disc over its still, a badge ("GIF", or the length, or
-    /// "Loading…" while the file is fetched), a circle for a round video message, and a click
-    /// that plays it.
-    pub(super) fn moving(&mut self, attachment: &Attachment, tile: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// "Loading…" while the file is fetched), a circle for a round video message, an unplayed dot
+    /// when `message.media_unread` is set on a round video, and a click that plays it.
+    pub(super) fn moving(&mut self, message: &Message, attachment: &Attachment, tile: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
         let fetching = self.then.contains_key(&attachment.file.id);
         let tile = match media::shape(attachment) {
             Shape::Gif => {
@@ -36,9 +38,28 @@ impl Pane {
                 tile.child(play_disc()).children(words.map(|words| badge(words).right(px(6.))))
             }
         };
+        let unplayed_dot = (attachment.round && message.media_unread).then(|| {
+            div()
+                .absolute()
+                .bottom(px(8.))
+                .left(px(8.))
+                .size(px(8.))
+                .rounded_full()
+                .bg(theme::accent())
+        });
         let tile = if attachment.round { tile.rounded_full() } else { tile };
+        let tile = tile.children(unplayed_dot);
         let attached = attachment.clone();
+        let mark_id = (attachment.round && message.media_unread && !message.outgoing).then(|| message.id.clone());
         tile.tooltip(tip("Play in your video player", None))
-            .on_click(cx.listener(move |this, _, _, cx| this.fetch_then(&attached, Then::Open, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(message_id) = &mark_id {
+                    if let Some(conversation) = this.key().cloned() {
+                        let request = Request::MarkPlayed { conversation, message_id: message_id.clone() };
+                        cx.background_executor().spawn(async move { ask(&request) }).detach();
+                    }
+                }
+                this.fetch_then(&attached, Then::Open, cx);
+            }))
     }
 }
