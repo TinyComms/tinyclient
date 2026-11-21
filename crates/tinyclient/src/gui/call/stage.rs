@@ -340,6 +340,8 @@ pub(in crate::gui) enum Trouble {
     Slow,
     /// Waiting more than 10 s with no picture yet.
     Failed,
+    /// Excluded by mediad's concurrent decode budget.
+    BudgetFull,
 }
 
 /// Diagnoses why watching `user_id` has not yielded a frame after `since`.
@@ -353,9 +355,14 @@ pub(in crate::gui) fn watch_trouble(
     if call.deafened {
         return Some(Trouble::Deafened);
     }
-    if let Some((other_id, kind)) = &call.picture_source {
-        if other_id != user_id {
-            return Some(Trouble::OtherSource { name: owner_name(other_id), kind: *kind });
+    if call.watch_refused.iter().any(|(uid, _)| uid == user_id) {
+        return Some(Trouble::BudgetFull);
+    }
+    if call.pictures.is_empty() {
+        if let Some((other_id, kind)) = &call.picture_source {
+            if other_id != user_id {
+                return Some(Trouble::OtherSource { name: owner_name(other_id), kind: *kind });
+            }
         }
     }
     if since >= Duration::from_secs(10) {

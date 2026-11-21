@@ -29,16 +29,32 @@ impl Meter {
     }
 
     pub fn received(&mut self, bytes: usize, now: Instant) {
+        self.received_slot(bytes, true, now);
+    }
+
+    /// One received video access unit. Bytes count across all watched slots, while frame rate
+    /// tracks the primary slot so multi-stream receive does not double-count FPS.
+    pub fn received_slot(&mut self, bytes: usize, primary: bool, now: Instant) {
         self.since.get_or_insert(now);
         self.received.0 += bytes as u64;
-        self.received.1 += 1;
+        if primary {
+            self.received.1 += 1;
+        }
     }
 
     pub fn rendered(&mut self, width: u32, height: u32, now: Instant) {
+        self.rendered_slot(width, height, true, now);
+    }
+
+    /// One painted image. The primary slot owns reported resolution and rendered FPS; small tiles
+    /// only update them when no primary picture is painted yet.
+    pub fn rendered_slot(&mut self, width: u32, height: u32, primary: bool, now: Instant) {
         self.since.get_or_insert(now);
-        self.rendered += 1;
-        self.last = Some(now);
-        self.size = (width, height);
+        if primary || self.size == (0, 0) {
+            self.rendered += 1;
+            self.last = Some(now);
+            self.size = (width, height);
+        }
     }
 
     pub fn clear(&mut self) {

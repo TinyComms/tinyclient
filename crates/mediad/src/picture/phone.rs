@@ -185,8 +185,13 @@ impl Incoming {
         let Some(tag) = paint.filter(|_| decoded.width != 0 && decoded.height != 0) else {
             return Ok(());
         };
-        let (width, height) = (decoded.width & !1, decoded.height & !1);
-        let colors = rgb(&planes(&decoded, width, height));
+        let (mut width, mut height) = (decoded.width & !1, decoded.height & !1);
+        let mut colors = rgb(&planes(&decoded, width, height));
+        if tag.small && (width > SMALL_TILE.0 || height > SMALL_TILE.1) {
+            let (tw, th) = fit(width, height, SMALL_TILE.0, SMALL_TILE.1);
+            colors = scale_rgb(&colors, width, height, tw, th);
+            (width, height) = (tw, th);
+        }
         self.generation = self.generation.wrapping_add(1);
         if let Some(painted) = self.canvas.paint(&colors, width, height, self.generation) {
             self.pending.push((tag, painted));
@@ -267,7 +272,7 @@ mod tests {
         assert!(fake.camera_on());
 
         // What a peer sends back decodes, through the platform's decoder, into a JPEG.
-        let tag = Tag { user: "ada".into(), kind: protocol::PictureKind::Camera };
+        let tag = Tag { user: "ada".into(), kind: protocol::PictureKind::Camera, small: false };
         incoming.decode(&high.bytes, Some(tag.clone())).expect("the high layer decodes");
         let (_, painted) = incoming.painted().pop().expect("painted");
         assert_eq!((painted.width, painted.height), (640, 360));

@@ -1526,6 +1526,8 @@ mod tests {
             camera_id: String::new(),
             security: None,
             picture: None,
+            pictures: Vec::new(),
+            watch_refused: Vec::new(),
             self_view: None,
             share_view: None,
             picture_source: None,

@@ -137,6 +137,27 @@ impl Call {
                 self.video.share_decode = source.clone();
                 if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_watch(source.is_some());
+                    self.controls.set_watch_sources(
+                        source
+                            .map(|user_id| protocol::WatchSource {
+                                user_id,
+                                kind: protocol::PictureKind::Share,
+                                size: protocol::WatchSize::Large,
+                            })
+                            .into_iter()
+                            .collect(),
+                    );
+                }
+            }
+            MediaRequest::Watch { sources } => {
+                let (max_large, max_small) = crate::video::default_budget();
+                let (accepted, refused) = crate::video::apply_watch_budget(&sources, max_large, max_small);
+                tracing::info!(accepted = accepted.len(), refused = refused.len(), "watch list");
+                self.video.share_decode = accepted.first().map(|s| s.user_id.clone());
+                if self.voice.is_some() || self.tiny.is_some() {
+                    self.controls.set_watch(!accepted.is_empty());
+                    self.controls.set_watch_sources(accepted);
+                    out::send(&MediaResponse::WatchRefused { refused });
                 }
             }
             // A Tiny room's SFU already follows the active speaker. The bookkeeping stays for a
@@ -293,6 +314,10 @@ impl Call {
             }
             MediaRequest::TinyPicture { picture } => {
                 self.controls.set_picture(picture);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyPictures { pictures } => {
+                self.controls.set_pictures(pictures);
                 return MediaResponse::Done;
             }
             MediaRequest::TinyE2ee { frame } => {

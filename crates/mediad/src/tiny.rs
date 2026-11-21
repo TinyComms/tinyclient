@@ -323,8 +323,8 @@ pub struct Link {
     camera: Mid,
     /// The one share, off until a renegotiation turns it sendonly. No rids.
     share: Mid,
-    /// The one picture the room forwards: a share, or else the active speaker's camera.
-    screen: Mid,
+    /// Receive-only video slots offered to the SFU (slot 0 is primary, 1..N are tile slots).
+    screens: Vec<Mid>,
     /// A renegotiation offer that has not been answered. The join's offer lives on [`Offer`].
     pending: Option<SdpPendingOffer>,
     /// The m-line and direction the pending offer changed from, so a refusal can undo it.
@@ -365,7 +365,8 @@ impl Offer {
         // str0m checks a new mid against the session's, not the others in this change. So many
         // random mids of three characters collide about once in 2,000 offers, and two m-lines on
         // one mid break the next offer. An unapplied change leaves `rtc` as it was.
-        let (change, microphone, camera, share, screen) = loop {
+        let video_slots = usize::from(spec.video_slots.max(1).min(16));
+        let (change, microphone, camera, share, screens) = loop {
             let mut change = rtc.sdp_api();
             let mut mids = HashSet::new();
             let mut add = |direction, kind, layers| {
@@ -382,9 +383,12 @@ impl Offer {
             layers.add_send_layer(SimulcastLayer::new("l"));
             let camera = add(Direction::Inactive, MediaKind::Video, Some(layers));
             let share = add(Direction::Inactive, MediaKind::Video, None);
-            let screen = add(Direction::RecvOnly, MediaKind::Video, None);
-            if mids.len() == spec.slots as usize + 4 {
-                break (change, microphone, camera, share, screen);
+            let mut screens = Vec::with_capacity(video_slots);
+            for _ in 0..video_slots {
+                screens.push(add(Direction::RecvOnly, MediaKind::Video, None));
+            }
+            if mids.len() == spec.slots as usize + 3 + video_slots {
+                break (change, microphone, camera, share, screens);
             }
         };
         let (offer, pending) = change.apply().ok_or_else(|| io::Error::other("nothing to offer"))?;
@@ -397,7 +401,7 @@ impl Offer {
             microphone,
             camera,
             share,
-            screen,
+            screens,
             pending: None,
             flipped: None,
             answered: Instant::now(),
@@ -427,7 +431,15 @@ impl Link {
     }
 
     pub fn screen_mid(&self) -> Mid {
-        self.screen
+        self.screens[0]
+    }
+
+    pub fn screen_mids(&self) -> &[Mid] {
+        &self.screens
+    }
+
+    pub fn screen_index(&self, mid: Mid) -> Option<usize> {
+        self.screens.iter().position(|&m| m == mid)
     }
 
     pub fn camera_mid(&self) -> Mid {
@@ -440,7 +452,7 @@ impl Link {
 
     /// A camera, share, or picture m-line. Those are not voice slots.
     pub fn is_picture(&self, mid: Mid) -> bool {
-        mid == self.camera || mid == self.share || mid == self.screen
+        mid == self.camera || mid == self.share || self.screens.contains(&mid)
     }
 
     /// A renegotiation offer is out and has not been answered.
@@ -785,8 +797,8 @@ struct Call {
     sending_camera: bool,
     /// `Some(true)` is a share offer still out; `Some(false)` is a camera offer.
     offered: Option<bool>,
-    pli_at: Option<Instant>,
-    shown: Option<TinyPicture>,
+    pli_at: HashMap<Mid, Instant>,
+    shown: HashMap<Mid, TinyPicture>,
     watching: bool,
     share_noted: bool,
     camera_noted: bool,
@@ -867,8 +879,9 @@ impl Call {
         self.desired = 0;
         self.padding_dropped = None;
         self.path_said = None;
-        self.video.reset();
-        self.shown = None;
+        self.video.reset_all();
+        self.shown.clear();
+        self.pli_at.clear();
         // The new link has not been announced dead. A death of the one we just left already was.
         self.announced = false;
         for (_, slot) in self.slots.drain() {
@@ -944,7 +957,7 @@ impl Call {
                 let pair = stats.selected_candidate_pair.as_ref();
                 self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
                 let egress = egress_loss(stats.egress_loss_fraction, self.padding_dropped, Instant::now());
-                let ingress = ingress_loss(stats.ingress_loss_fraction, self.watching && self.shown.is_some());
+                let ingress = ingress_loss(stats.ingress_loss_fraction, self.watching && !self.shown.is_empty());
                 self.meter.path_loss(egress, ingress);
                 let sent = video::Sent { media: stats.bytes_tx, video: self.video_bytes, estimate: self.estimate, loss: egress, rtt: stats.rtt };
                 self.uplink.heard(sent, Instant::now());
@@ -1319,18 +1332,39 @@ impl Call {
             }
             out::send(&MediaResponse::Sending { share: self.sending_share, camera: self.sending_camera });
         }
-        if let Some(slot) = self.controls.take_picture() {
-            let changed = slot.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind)) != self.shown.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind));
-            self.shown = slot;
-            if changed {
-                match &self.shown {
-                    Some(pictured) => tracing::info!(user_id = %pictured.user_id, kind = ?pictured.kind, "picture slot"),
-                    None => tracing::info!(user_id = "", kind = "none", "picture slot"),
+        if let Some(slots) = self.controls.take_pictures() {
+            let mut next_shown: HashMap<Mid, TinyPicture> = HashMap::new();
+            for pic in slots {
+                let mid = Mid::from(pic.mid.as_str());
+                if self.link.screen_index(mid).is_some() {
+                    next_shown.insert(mid, pic);
                 }
-                self.first_key_received_for = None;
-                self.video.reset();
-                self.ask_keyframe();
             }
+            let mids: Vec<Mid> = self.link.screen_mids().to_vec();
+            for (slot_idx, mid) in mids.into_iter().enumerate() {
+                let prev = self.shown.get(&mid);
+                let next = next_shown.get(&mid);
+                let prev_key = prev.map(|p| (p.user_id.as_str(), p.kind));
+                let next_key = next.map(|p| (p.user_id.as_str(), p.kind));
+                if prev_key != next_key {
+                    match (prev, next) {
+                        (Some(old), None) => {
+                            tracing::info!(slot = slot_idx, user_id = "", kind = "none", "picture slot");
+                            self.video.clear_slot(slot_idx, old.user_id.clone(), old.kind);
+                        }
+                        (_, Some(pictured)) => {
+                            tracing::info!(slot = slot_idx, user_id = %pictured.user_id, kind = ?pictured.kind, "picture slot");
+                            if slot_idx == 0 {
+                                self.first_key_received_for = None;
+                            }
+                            self.video.reset_slot(slot_idx);
+                            self.ask_keyframe_mid(mid);
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+            self.shown = next_shown;
         }
         let watching = self.controls.watch();
         if !self.watching && watching {
@@ -1343,10 +1377,21 @@ impl Call {
             self.video.clear();
         }
         if watching {
-            self.video.watch();
+            let watch_sources = self.controls.watch_sources();
+            let mids: Vec<Mid> = self.link.screen_mids().to_vec();
+            self.video.watch_slot(0, false);
+            for (slot_idx, mid) in mids.iter().enumerate().skip(1) {
+                if let Some(pictured) = self.shown.get(mid) {
+                    let small = watch_sources
+                        .iter()
+                        .find(|s| s.user_id == pictured.user_id && s.kind == pictured.kind)
+                        .is_none_or(|s| s.size == protocol::WatchSize::Small);
+                    self.video.watch_slot(slot_idx, small);
+                }
+            }
         }
         self.watching = watching;
-        self.controls.video_stats.lock().unwrap().expect(watching && self.shown.is_some(), Instant::now());
+        self.controls.video_stats.lock().unwrap().expect(watching && !self.shown.is_empty(), Instant::now());
         if self.offered.is_none() && !self.link.pending() {
             let (want_share, want_camera) = (self.controls.share(), self.controls.camera());
             if want_share != self.sending_share {
@@ -1421,8 +1466,14 @@ impl Call {
                 }
             }
         }
-        if self.video.key_wanted() && watching {
-            self.ask_keyframe();
+        if watching {
+            for slot_idx in self.video.keys_wanted() {
+                if let Some(&mid) = self.link.screen_mids().get(slot_idx) {
+                    if slot_idx == 0 || self.shown.contains_key(&mid) {
+                        self.ask_keyframe_mid(mid);
+                    }
+                }
+            }
         }
     }
 
@@ -1483,9 +1534,9 @@ impl Call {
     }
 
     fn picture_in(&mut self, data: MediaData) {
-        if data.mid != self.link.screen_mid() {
+        let Some(slot_idx) = self.link.screen_index(data.mid) else {
             return;
-        }
+        };
         if !self.controls.watch() {
             self.unwatched_count += 1;
             self.unwatched_bytes += data.data.len() as u64;
@@ -1498,30 +1549,32 @@ impl Call {
             }
             return;
         }
-        let user = self.shown.as_ref().map(|pictured| pictured.user_id.clone()).unwrap_or_default();
-        let kind = self.shown.as_ref().map(|pictured| pictured.kind).unwrap_or_default();
+        let Some(pictured) = self.shown.get(&data.mid) else {
+            return;
+        };
+        let user = pictured.user_id.clone();
+        let kind = pictured.kind;
         let key = data.is_keyframe();
         let now = Instant::now();
-        if key && self.first_key_received_for.as_deref() != Some(user.as_str()) {
+        if slot_idx == 0 && key && self.first_key_received_for.as_deref() != Some(user.as_str()) {
             self.first_key_received_for = Some(user.clone());
             let ms = self.watch_started_at.map_or(0, |s| now.saturating_duration_since(s).as_millis() as u64);
             tracing::info!(user_id = %user, kind = ?kind, ms_since_watch = ms, "first keyframe received");
         }
-        self.controls.video_stats.lock().unwrap().received(data.data.len(), now);
+        self.controls.video_stats.lock().unwrap().received_slot(data.data.len(), slot_idx == 0, now);
         let frame = Received { key, contiguous: data.contiguous, data: data.data, user, kind };
-        if !self.video.picture(frame) {
-            self.ask_keyframe();
+        if !self.video.picture_slot(slot_idx, frame) {
+            self.ask_keyframe_mid(data.mid);
         }
     }
 
-    fn ask_keyframe(&mut self) {
+    fn ask_keyframe_mid(&mut self, mid: Mid) {
         let now = Instant::now();
-        if self.pli_at.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_millis(300)) {
+        if self.pli_at.get(&mid).is_some_and(|at| now.saturating_duration_since(*at) < Duration::from_millis(300)) {
             return;
         }
-        self.pli_at = Some(now);
-        let screen = self.link.screen_mid();
-        if let Some(stream) = self.link.rtc.direct_api().stream_rx_by_mid(screen, None) {
+        self.pli_at.insert(mid, now);
+        if let Some(stream) = self.link.rtc.direct_api().stream_rx_by_mid(mid, None) {
             stream.request_keyframe(KeyframeRequestKind::Pli);
             self.pli_count += 1;
             if self.pli_logged.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1)) {
@@ -1833,8 +1886,8 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         sending_share: false,
         sending_camera: false,
         offered: None,
-        pli_at: None,
-        shown: None,
+        pli_at: HashMap::new(),
+        shown: HashMap::new(),
         watching: false,
         share_noted: false,
         camera_noted: false,
@@ -2077,7 +2130,7 @@ mod tests {
     }
 
     fn spec(slots: u16) -> TinyOffer {
-        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots, muted: false, deafened: false, e2ee: None }
+        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots, muted: false, deafened: false, e2ee: None, video_slots: 0 }
     }
 
     /// One microphone and `slots` receive slots, Opus on every audio line, then the three
@@ -2225,7 +2278,7 @@ mod tests {
     /// A connection and a peer standing in for the SFU, connected.
     fn connected() -> (Link, Rtc, Wire) {
         let theirs = SocketAddr::from(([127, 0, 0, 1], 40_000));
-        let offer = Offer::new(&TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1, muted: false, deafened: false, e2ee: None }).unwrap();
+        let offer = Offer::new(&TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1, muted: false, deafened: false, e2ee: None, video_slots: 0 }).unwrap();
         let ours = offer.link.local_udp.unwrap();
         let mut peer = rtc_config().build(Instant::now());
         peer.add_local_candidate(Candidate::host(theirs, "udp").unwrap());
@@ -2306,7 +2359,7 @@ mod tests {
         let received = wire.pictures.len();
         let mut images = Vec::new();
         for data in wire.pictures {
-            screen.decode(&data.data, Some(Tag { user: "proof".into(), kind: protocol::PictureKind::Share })).expect("every received frame decodes");
+            screen.decode(&data.data, Some(Tag { user: "proof".into(), kind: protocol::PictureKind::Share, small: false })).expect("every received frame decodes");
             images.extend(screen.painted());
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2443,5 +2496,22 @@ mod tests {
         assert_eq!(link.direction(false), Direction::Inactive);
         assert!(link.is_picture(link.screen_mid()));
         assert!(!link.is_picture(link.microphone_mid()));
+    }
+
+    #[test]
+    fn multi_video_offer_adds_the_requested_number_of_receive_video_lines() {
+        let mut spec = spec(2);
+        spec.video_slots = 5;
+        let offer = Offer::new(&spec).unwrap();
+        assert_eq!(offer.link.screen_mids().len(), 5);
+        let sections = video_sections(offer.sdp());
+        // 1 camera (inactive) + 1 share (inactive) + 5 recvonly video slots = 7 video m-lines.
+        assert_eq!(sections.len(), 7, "{}", offer.sdp());
+        let recvonly = sections.iter().filter(|s| s.contains("a=recvonly")).count();
+        assert_eq!(recvonly, 5);
+        for (idx, &mid) in offer.link.screen_mids().iter().enumerate() {
+            assert_eq!(offer.link.screen_index(mid), Some(idx));
+            assert!(offer.link.is_picture(mid));
+        }
     }
 }

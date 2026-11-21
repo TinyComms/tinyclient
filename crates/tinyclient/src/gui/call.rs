@@ -237,6 +237,8 @@ pub(super) struct Confirm {
 pub struct State {
     /// The frames of the picture being watched.
     pub(in crate::gui) feed: super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>,
+    /// Per-source frames for multi-stream video receive, keyed by `(user_id, kind)`.
+    pub(in crate::gui) feeds: HashMap<(String, protocol::PictureKind), super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>>,
     /// The frames of my own camera, for my tile.
     pub(in crate::gui) self_feed: super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>,
     /// The frames of my own share, for my stream's tile and the stage.
@@ -326,6 +328,8 @@ pub struct State {
     /// The sharer currently offered on the dock's notice strip (cleared on Watch, dismiss, stop,
     /// or call end).
     pub(super) share_prompt: Option<String>,
+    /// Last multi-stream watch list sent to chatd/mediad for this call (avoid duplicate sends).
+    pub(in crate::gui) watched: Vec<protocol::WatchSource>,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -373,9 +377,73 @@ pub(in crate::gui) fn watching(call: &Call, user_id: &str) -> bool {
             && stream.content == protocol::Content::Share
             && stream.source == user_id
     }) || call
-        .picture
-        .as_ref()
-        .is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+        .pictures
+        .iter()
+        .any(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+        || call
+            .picture
+            .as_ref()
+            .is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+}
+
+/// Derives the desired multi-stream watch list from the joined Tiny call and current stage focus:
+/// focused stream or person is `Large`, and visible remote cameras up to `budget_small` are `Small`.
+fn desired_watch_sources(
+    call: &Call,
+    focus: Option<&stage::Focus>,
+    budget_small: usize,
+) -> Vec<protocol::WatchSource> {
+    use protocol::{PictureKind, WatchSize, WatchSource};
+    if call.state != CallState::Joined || call.deafened || call.conversation.network != Network::Tiny {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut push = |user_id: &str, kind: PictureKind, size: WatchSize| {
+        if !out.iter().any(|s: &WatchSource| s.user_id == user_id && s.kind == kind) {
+            out.push(WatchSource { user_id: user_id.to_owned(), kind, size });
+        }
+    };
+    match focus {
+        Some(stage::Focus::Stream(uid)) => {
+            if let Some(p) = call.participants.iter().find(|p| !p.ringing && p.id == *uid) {
+                if p.sharing {
+                    push(&p.id, PictureKind::Share, WatchSize::Large);
+                } else if p.camera {
+                    push(&p.id, PictureKind::Camera, WatchSize::Large);
+                }
+            }
+        }
+        Some(stage::Focus::Person(uid)) => {
+            if let Some(p) = call.participants.iter().find(|p| !p.ringing && p.id == *uid && p.camera) {
+                push(&p.id, PictureKind::Camera, WatchSize::Large);
+            }
+        }
+        None => {
+            // In a 1:1 call, give the peer's screen or camera the primary Large slot.
+            if call.participants.len() == 1 {
+                let p = &call.participants[0];
+                if !p.ringing {
+                    if p.sharing {
+                        push(&p.id, PictureKind::Share, WatchSize::Large);
+                    } else if p.camera {
+                        push(&p.id, PictureKind::Camera, WatchSize::Large);
+                    }
+                }
+            }
+        }
+    }
+    let mut small = 0usize;
+    for p in call.participants.iter().filter(|p| !p.ringing && p.camera) {
+        if small >= budget_small {
+            break;
+        }
+        if out.iter().any(|s| s.user_id == p.id && s.kind == PictureKind::Camera) {
+            continue;
+        }
+        push(&p.id, PictureKind::Camera, WatchSize::Small);
+        small += 1;
+    }
+    out
 }
 
 /// Pure auto-watch decision for a 1:1 Tiny direct call.
@@ -549,6 +617,8 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         camera_id: String::new(),
         security: None,
         picture: None,
+        pictures: Vec::new(),
+        watch_refused: Vec::new(),
         self_view: None,
         share_view: None,
         picture_source: None,
@@ -852,6 +922,7 @@ impl Shell {
                 state.full = None;
                 state.sharer = None;
                 state.share_prompt = None;
+                state.watched.clear();
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -883,6 +954,7 @@ impl Shell {
                 self.call_watch_muted_talk(call, cx);
                 self.call_cue_join(call, cx);
                 self.call_share_notice(call, cx);
+                self.call_sync_watch(call, cx);
                 self.call_auto_watch(call, cx);
                 self.call_discord_speaker(call, cx);
                 if let Some((asked_id, _)) = &self.call_state.watch_asked {
@@ -1717,6 +1789,27 @@ impl Shell {
         }
     }
 
+    /// Synchronizes multi-stream `MediaRequest::Watch` when the joined Tiny call's visible
+    /// cameras or focused stream change.
+    pub(in crate::gui) fn call_sync_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
+        if call.conversation.network != Network::Tiny {
+            return;
+        }
+        let budget_small = if super::phone::active() { 2 } else { 4 };
+        let next = desired_watch_sources(call, self.call_state.focus.as_ref(), budget_small);
+        if next != self.call_state.watched {
+            self.call_state.watched = next.clone();
+            self.call_ask(Request::Media(protocol::MediaRequest::Watch { sources: next }), cx);
+        }
+    }
+
+    /// Re-evaluates multi-stream watch subscriptions for the currently active call (e.g. after focus changes).
+    pub(in crate::gui) fn call_sync_watch_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(call) = self.snapshot.as_ref().and_then(|s| s.call.clone()) {
+            self.call_sync_watch(&call, cx);
+        }
+    }
+
     /// The received video frame on screen, when it belongs to `(user_id, kind)`.
     pub(in crate::gui) fn call_frame(
         &self,
@@ -1724,7 +1817,22 @@ impl Shell {
         user_id: &str,
         kind: protocol::PictureKind,
     ) -> Option<std::sync::Arc<gpui::RenderImage>> {
-        call?.picture
+        let call = call?;
+        if call
+            .pictures
+            .iter()
+            .any(|p| !p.path.is_empty() && p.user_id == user_id && p.kind == kind)
+        {
+            if let Some(img) = self
+                .call_state
+                .feeds
+                .get(&(user_id.to_owned(), kind))
+                .and_then(|feed| feed.shown().cloned())
+            {
+                return Some(img);
+            }
+        }
+        call.picture
             .as_ref()
             .filter(|picture| !picture.path.is_empty() && picture.user_id == user_id && picture.kind == kind)?;
         self.call_state.feed.shown().cloned()
@@ -2903,5 +3011,29 @@ mod tests {
         assert!(!should_auto_watch_share(false, true, false));
         assert!(!should_auto_watch_share(true, false, false));
         assert!(!should_auto_watch_share(true, true, true));
+    }
+
+    #[test]
+    fn desired_watch_sources_prioritizes_focused_share_and_fills_small_camera_tiles() {
+        let mut call = bare_call(key("lounge"), CallState::Joined, false, false);
+        call.participants = vec![
+            protocol::Participant { id: "ada".into(), name: "Ada".into(), sharing: true, camera: true, ..Default::default() },
+            protocol::Participant { id: "bea".into(), name: "Bea".into(), camera: true, ..Default::default() },
+            protocol::Participant { id: "cy".into(), name: "Cy".into(), camera: true, ..Default::default() },
+            protocol::Participant { id: "dev".into(), name: "Dev".into(), camera: true, ..Default::default() },
+            protocol::Participant { id: "eli".into(), name: "Eli".into(), camera: true, ..Default::default() },
+        ];
+        // Focused on Ada's share -> Large share + 4 small cameras (Ada's camera + Bea, Cy, Dev).
+        let sources = desired_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), 4);
+        assert_eq!(sources.len(), 5);
+        assert_eq!(sources[0], protocol::WatchSource { user_id: "ada".into(), kind: protocol::PictureKind::Share, size: protocol::WatchSize::Large });
+        assert_eq!(sources[1], protocol::WatchSource { user_id: "ada".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small });
+        assert_eq!(sources[4].user_id, "dev");
+        // Phone budget: 2 small cameras beside focused share.
+        let phone = desired_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), 2);
+        assert_eq!(phone.len(), 3);
+        // Deafened -> nothing watched.
+        call.deafened = true;
+        assert!(desired_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), 4).is_empty());
     }
 }

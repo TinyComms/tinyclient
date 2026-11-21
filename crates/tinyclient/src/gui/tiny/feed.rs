@@ -8,7 +8,8 @@
 use crate::gui::state::Shell;
 use gpui::{Context, RenderImage};
 use image::RgbaImage;
-use protocol::Call;
+use protocol::{Call, PictureKind};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -140,6 +141,82 @@ impl Shell {
                 self.feed_read(which, read, cx);
             }
         }
+        // Multi-stream pictures keyed by `(user_id, kind)`.
+        let mut active: HashSet<(String, PictureKind)> = HashSet::new();
+        let mut to_read: Vec<((String, PictureKind), (u64, String))> = Vec::new();
+        let mut dropped: Vec<Arc<RenderImage>> = Vec::new();
+        if let Some(call) = call {
+            for pic in &call.pictures {
+                if pic.path.is_empty() {
+                    continue;
+                }
+                let key = (pic.user_id.clone(), pic.kind);
+                active.insert(key.clone());
+                let feed = self.call_state.feeds.entry(key.clone()).or_default();
+                let (read, gone) = feed.offer(Some((pic.generation, pic.path.clone())));
+                if let Some(gone) = gone {
+                    dropped.push(gone);
+                }
+                if let Some(read) = read {
+                    to_read.push((key, read));
+                }
+            }
+        }
+        let stale: Vec<(String, PictureKind)> = self
+            .call_state
+            .feeds
+            .keys()
+            .filter(|key| !active.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(mut feed) = self.call_state.feeds.remove(&key) {
+                let (_, gone) = feed.offer(None);
+                if let Some(gone) = gone {
+                    dropped.push(gone);
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            for gone in dropped {
+                cx.drop_image(gone, None);
+            }
+            cx.notify();
+        }
+        for (key, read) in to_read {
+            self.feed_read_key(key, read, cx);
+        }
+    }
+
+    fn feed_read_key(
+        &mut self,
+        key: (String, PictureKind),
+        (generation, path): (u64, String),
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_executor()
+                .spawn(async move { frame(Path::new(&path)) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(feed) = this.call_state.feeds.get_mut(&key) else {
+                    if let Some(image) = image {
+                        cx.drop_image(image, None);
+                    }
+                    return;
+                };
+                let (gone, next) = feed.landed(generation, image);
+                if let Some(gone) = gone {
+                    cx.drop_image(gone, None);
+                }
+                cx.notify();
+                if let Some(next) = next {
+                    this.feed_read_key(key, next, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn feed_read(&mut self, which: Which, (generation, path): (u64, String), cx: &mut Context<Self>) {

@@ -191,6 +191,10 @@ pub enum Ask {
     Offer {
         sdp: String,
     },
+    /// Multi-stream watch selection for `call.watch` (sent only when server advertises `multi_video`).
+    Watch {
+        sources: Vec<protocol::WatchSource>,
+    },
     /// mediad lost the link, and the call is still up. Join again after the resume pause. Not
     /// kept while the socket is down: the call's state says it, and `ready` reads that.
     Resume,
@@ -223,6 +227,7 @@ impl Ask {
             | Ask::Priority { .. }
             | Ask::E2ee { .. }
             | Ask::Offer { .. }
+            | Ask::Watch { .. }
             | Ask::Resume
             | Ask::Settled => None,
         }
@@ -402,6 +407,10 @@ struct Seat {
     ducking: Vec<String>,
     /// The server encrypts calls end to end (`e2ee_calls`), read at each fresh `ready`.
     e2ee: bool,
+    /// Receive-only video slots negotiated for this server (1 when `multi_video` is absent).
+    video_slots: u8,
+    /// Receive-only video mids from our last SDP offer, in offer order (`mids[0]` = primary).
+    video_mids: Vec<String>,
     /// Everyone in our room's call, as mediad was last told: whom its MLS group may hold.
     rostered: Vec<String>,
     /// Resumes spent since media last held for [`MEDIA_HELD`]. Same budget as a Discord call.
@@ -559,6 +568,8 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         priority: false,
         ducking: Vec::new(),
         e2ee: false,
+        video_slots: 1,
+        video_mids: Vec::new(),
         rostered: Vec::new(),
         resumes: 0,
         up_at: None,
@@ -755,6 +766,8 @@ enum Asked {
     Moderate,
     /// A `call.offer`. The answer is `call.answer`, or `share_taken`.
     Offer,
+    /// A `call.watch` subscription update.
+    Watch,
     /// `call.cancel`, `call.decline`, or `call.leave` of a direct. A room seat is left alone.
     Direct,
 }
@@ -995,6 +1008,17 @@ fn serve(
                         )
                     }
                     Ask::Offer { .. } => Ok(()),
+                    Ask::Watch { sources } if seat.call_id.is_some() && seat.video_slots > 1 && !seat.video_mids.is_empty() => {
+                        let reference = refs.to_string();
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Watch,
+                            until: Instant::now() + timing.answer,
+                            reply: None,
+                        });
+                        wire.send(build_watch_frame(&reference, &seat.video_mids, &sources).to_string())
+                    }
+                    Ask::Watch { .. } => Ok(()),
                     Ask::Moderate {
                         room_id,
                         user_id,
@@ -1276,6 +1300,85 @@ fn server_host(saved: &Saved) -> String {
         .unwrap_or_default()
 }
 
+/// Maximum concurrent receive video slots this device will ask for (desktop: 5, phone: 3).
+fn local_video_budget() -> u8 {
+    if cfg!(any(target_os = "android", target_os = "ios")) { 3 } else { 5 }
+}
+
+/// Extracts `a=mid:<mid>` values for every `a=recvonly` `m=video` section in an SDP offer, in order.
+fn parse_offer_video_mids(sdp: &str) -> Vec<String> {
+    let mut mids = Vec::new();
+    let mut in_video = false;
+    let mut recvonly = false;
+    let mut cur_mid: Option<String> = None;
+    let flush = |in_video: bool, recvonly: bool, cur_mid: &mut Option<String>, mids: &mut Vec<String>| {
+        if in_video && recvonly {
+            if let Some(mid) = cur_mid.take() {
+                mids.push(mid);
+            }
+        } else {
+            *cur_mid = None;
+        }
+    };
+    for raw in sdp.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("m=") {
+            flush(in_video, recvonly, &mut cur_mid, &mut mids);
+            in_video = rest.starts_with("video ");
+            recvonly = false;
+        } else if in_video {
+            if line == "a=recvonly" {
+                recvonly = true;
+            } else if let Some(mid) = line.strip_prefix("a=mid:") {
+                if !mid.is_empty() {
+                    cur_mid = Some(mid.to_owned());
+                }
+            }
+        }
+    }
+    flush(in_video, recvonly, &mut cur_mid, &mut mids);
+    mids
+}
+
+/// Builds a `call.watch` JSON frame matching tinyserver's PR #84 protocol:
+/// `Large` maps to `"high"` on slot 0, `Small` maps to `"low"` on subsequent slots.
+fn build_watch_frame(reference: &str, mids: &[String], sources: &[protocol::WatchSource]) -> Value {
+    let mut ordered: Vec<&protocol::WatchSource> = sources
+        .iter()
+        .filter(|s| !s.user_id.is_empty() && s.size == protocol::WatchSize::Large)
+        .collect();
+    ordered.extend(
+        sources
+            .iter()
+            .filter(|s| !s.user_id.is_empty() && s.size == protocol::WatchSize::Small),
+    );
+    let entries: Vec<Value> = mids
+        .iter()
+        .zip(ordered.into_iter())
+        .map(|(mid, src)| {
+            let kind = match src.kind {
+                PictureKind::Share => "share",
+                PictureKind::Camera => "camera",
+            };
+            let max = match src.size {
+                protocol::WatchSize::Large => "high",
+                protocol::WatchSize::Small => "low",
+            };
+            json!({
+                "mid": mid,
+                "user_id": src.user_id,
+                "kind": kind,
+                "max": max,
+            })
+        })
+        .collect();
+    json!({
+        "type": "call.watch",
+        "ref": reference,
+        "video": entries,
+    })
+}
+
 fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Offered, String> {
     let host = server_host(saved);
     let required = must_encrypt(
@@ -1301,8 +1404,10 @@ fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Of
         muted: false,
         deafened: false,
         e2ee,
+        video_slots: seat.video_slots,
     };
     let sdp = ctx.tiny_offer(room, offer)?;
+    seat.video_mids = parse_offer_video_mids(&sdp);
     Ok((sdp, offered))
 }
 
@@ -1713,8 +1818,7 @@ fn heard_frame(
                     })
                 });
                 ctx.tiny_slots(&room, audio.collect());
-                let video = frame.get("video").filter(|video| !video.is_null());
-                let picture = video.and_then(|video| {
+                let parse_pic = |video: &Value| -> Option<TinyPicture> {
                     Some(TinyPicture {
                         mid: text(video, "mid")?.to_owned(),
                         user_id: text(video, "user_id")?.to_owned(),
@@ -1724,8 +1828,15 @@ fn heard_frame(
                             PictureKind::Camera
                         },
                     })
-                });
-                ctx.tell_media(&room, MediaRequest::TinyPicture { picture });
+                };
+                if let Some(videos) = frame.get("videos").and_then(Value::as_array) {
+                    let pictures: Vec<TinyPicture> = videos.iter().take(16).filter_map(parse_pic).collect();
+                    ctx.tell_media(&room, MediaRequest::TinyPictures { pictures });
+                } else {
+                    let video = frame.get("video").filter(|video| !video.is_null());
+                    let picture = video.and_then(parse_pic);
+                    ctx.tell_media(&room, MediaRequest::TinyPicture { picture });
+                }
             }
         }
         "call.speaking" => {
@@ -1810,7 +1921,9 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     let fresh = seat.since.is_none();
     if fresh {
         live.set_media(super::media_of(&saved.base_url));
-        seat.e2ee = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_E2EE_CALLS);
+        let caps = super::manage::capabilities_of(saved);
+        seat.e2ee = caps.has(protocol::TINY_FEATURE_E2EE_CALLS);
+        seat.video_slots = caps.multi_video_slots().min(local_video_budget());
     }
     seat.since = Some(heard.seq);
     if heard.me.role != seat.role && matches!(heard.me.role.as_str(), "owner" | "admin" | "member")
@@ -3037,8 +3150,10 @@ fn offer_direct(ctx: &Context, saved: &Saved, seat: &mut Seat) -> Result<Offered
         muted: seat.muted,
         deafened: seat.deafened,
         e2ee,
+        video_slots: seat.video_slots,
     };
     let sdp = ctx.tiny_direct_offer(&direct.direct_id, proposal, direct.intent.ok_or("That call is gone.")?)?;
+    seat.video_mids = parse_offer_video_mids(&sdp);
     if seat.muted || seat.deafened {
         let _ = ctx.hub.calls.set_audio(&ctx.hub, seat.muted, seat.deafened);
     }
@@ -3138,7 +3253,8 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             | Asked::Moderate
             | Asked::Ring(_, _)
             | Asked::Accept(_, _)
-            | Asked::Direct => {}
+            | Asked::Direct
+            | Asked::Watch => {}
             Asked::Offer => {
                 if let (Some(sdp), Some(room)) = (text(frame, "sdp"), seat.wanted.clone()) {
                     ctx.tell_media(
@@ -3206,8 +3322,8 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             }
         }
         // A rejoin nobody asked for that fails is not tried again. A refused renegotiation
-        // leaves the seat where it is.
-        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct) {
+        // or watch update leaves the seat where it is.
+        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct | Asked::Watch) {
             seat.wanted = None;
         }
         Err(Refusal::Refused(said.to_owned()))

@@ -3670,6 +3670,10 @@ impl Chat {
                     MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
                     _ => None,
                 };
+                let tiny_watch = match &request {
+                    MediaRequest::Watch { sources } => Some(sources.clone()),
+                    _ => None,
+                };
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
                     MediaRequest::Join(_) | MediaRequest::Rejoin(_) => {
@@ -3680,10 +3684,18 @@ impl Chat {
                 };
                 // A refusal never tells Discord we are sending. Other networks ignore the command.
                 if asked.is_ok() {
-                    if let Some(picture) = picture {
-                        if let (Some(call), true) = self.hub.calls.describe() {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if let Some(picture) = picture {
                             if call.conversation.network == Network::Discord {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
+                            }
+                        }
+                        if let Some(sources) = tiny_watch {
+                            if call.conversation.network == Network::Tiny {
+                                self.command(
+                                    &call.conversation.account(),
+                                    Command::Tiny(adapters::tiny::live::Ask::Watch { sources }),
+                                );
                             }
                         }
                     }

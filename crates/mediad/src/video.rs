@@ -17,8 +17,8 @@ use crate::picture::{
 };
 use crate::session::Controls;
 use crate::{out, rt};
-use protocol::{MediaResponse, PictureKind};
-use std::collections::VecDeque;
+use protocol::{MediaResponse, PictureKind, WatchSize, WatchSource};
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -45,9 +45,60 @@ const RECEIVED: usize = 45;
 /// the frame is decoded and not painted, which is the real bound (about 20 to 30 a second at
 /// 1080p on a desktop).
 const PAINT_EVERY: Duration = Duration::from_millis(16);
+/// Small multi-stream tiles paint at most ten frames a second so four tiles do not crowd the main
+/// stream's painters or the GUI thread.
+const PAINT_EVERY_SMALL: Duration = Duration::from_millis(100);
 /// How long a hang-up waits for each thread to finish what it is doing. A camera read is the
 /// longest of it. The process is exiting anyway: this is so a file is not left behind.
 const STOP_WITHIN: Duration = Duration::from_millis(300);
+
+/// Default concurrent decode budget `(max_large, max_small)`: 1 large + 4 small on desktop,
+/// 1 large + 2 small on phones.
+pub const fn default_budget() -> (usize, usize) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        (1, 2)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        (1, 4)
+    }
+}
+
+/// Applies the hard decode budget `(max_large, max_small)` to a requested watch list.
+/// Returns `(accepted, refused)` with duplicates removed and excess sources named in `refused`.
+pub fn apply_watch_budget(
+    sources: &[WatchSource],
+    max_large: usize,
+    max_small: usize,
+) -> (Vec<WatchSource>, Vec<(String, PictureKind)>) {
+    let mut seen = HashSet::new();
+    let mut accepted = Vec::new();
+    let mut refused = Vec::new();
+    let mut large = 0usize;
+    let mut small = 0usize;
+    for source in sources {
+        if source.user_id.is_empty() {
+            continue;
+        }
+        let key = (source.user_id.clone(), source.kind);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        match source.size {
+            WatchSize::Large if large < max_large => {
+                large += 1;
+                accepted.push(source.clone());
+            }
+            WatchSize::Small if small < max_small => {
+                small += 1;
+                accepted.push(source.clone());
+            }
+            _ => refused.push(key),
+        }
+    }
+    (accepted, refused)
+}
 
 /// The three things that can be sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -697,6 +748,8 @@ enum In {
     Reset,
     /// Nobody is watching: the picture comes off the screen.
     Clear,
+    /// One specific source stopped on this slot: clear only that source from the GUI.
+    ClearSource { user_id: String, kind: PictureKind },
 }
 
 #[derive(Default)]
@@ -709,10 +762,20 @@ impl Queue {
     /// `word` in place of everything queued, but for a clear not yet done: the picture on the
     /// screen would stay there. A clear is a reset as well, except that it asks for no keyframe.
     fn replace(&mut self, word: In) {
-        let clearing = self.frames.iter().any(|next| matches!(next, In::Clear));
+        let clearing = self
+            .frames
+            .iter()
+            .find(|next| matches!(next, In::Clear | In::ClearSource { .. }))
+            .map(|c| match c {
+                In::Clear => In::Clear,
+                In::ClearSource { user_id, kind } => In::ClearSource { user_id: user_id.clone(), kind: *kind },
+                _ => unreachable!(),
+            });
         self.frames.clear();
-        if clearing && word != In::Clear {
-            self.frames.push_back(In::Clear);
+        if let Some(clear) = clearing {
+            if !matches!(word, In::Clear | In::ClearSource { .. }) {
+                self.frames.push_back(clear);
+            }
         }
         self.frames.push_back(word);
     }
@@ -812,6 +875,8 @@ struct Decode<P, F> {
     controls: Arc<Controls>,
     inbox: Arc<Inbox>,
     show: F,
+    /// Small multi-stream tile: capped at 320×180 and painted at most 10 fps.
+    small: bool,
     wait_key: bool,
     painted: Option<Instant>,
     cost: DecodeCost,
@@ -892,7 +957,11 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
         if frame.key {
             self.wait_key = false;
         }
-        let paint = self.painted.is_none_or(|at| at.elapsed() >= PAINT_EVERY).then(|| Tag { user: frame.user.clone(), kind: frame.kind });
+        let interval = if self.small { PAINT_EVERY_SMALL } else { PAINT_EVERY };
+        let paint = self
+            .painted
+            .is_none_or(|at| at.elapsed() >= interval)
+            .then(|| Tag { user: frame.user.clone(), kind: frame.kind, small: self.small });
         let painting = paint.is_some();
         let began = Instant::now();
         let decoded = self.screen.decode(&opened, paint);
@@ -911,7 +980,11 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
     /// Every picture painted since last asked goes to the window.
     fn flush(&mut self) {
         for (tag, painted) in self.screen.painted() {
-            self.controls.video_stats.lock().unwrap().rendered(painted.width, painted.height, Instant::now());
+            self.controls
+                .video_stats
+                .lock()
+                .unwrap()
+                .rendered_slot(painted.width, painted.height, !self.small, Instant::now());
             (self.show)(MediaResponse::Picture {
                 path: painted.path.display().to_string(),
                 width: painted.width,
@@ -948,7 +1021,9 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
                     self.inbox.want_key.store(true, Ordering::Relaxed);
                 }
                 Take::Next(In::Clear) => {
-                    self.controls.video_stats.lock().unwrap().clear();
+                    if !self.small {
+                        self.controls.video_stats.lock().unwrap().clear();
+                    }
                     self.screen.reset();
                     self.screen.forget();
                     self.wait_key = true;
@@ -960,6 +1035,23 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
                         generation: 0,
                         user_id: String::new(),
                         kind: PictureKind::Camera,
+                    });
+                }
+                Take::Next(In::ClearSource { user_id, kind }) => {
+                    if !self.small {
+                        self.controls.video_stats.lock().unwrap().clear();
+                    }
+                    self.screen.reset();
+                    self.screen.forget();
+                    self.wait_key = true;
+                    self.painted = None;
+                    (self.show)(MediaResponse::Picture {
+                        path: String::new(),
+                        width: 0,
+                        height: 0,
+                        generation: 0,
+                        user_id,
+                        kind,
                     });
                 }
             }
@@ -1014,6 +1106,15 @@ fn start_decode<P: Screen>(
     controls: Arc<Controls>,
     show: impl FnMut(MediaResponse) + std::marker::Send + 'static,
 ) -> std::io::Result<Watcher> {
+    start_decode_slot(make, controls, false, show)
+}
+
+fn start_decode_slot<P: Screen>(
+    make: impl FnOnce() -> P + std::marker::Send + 'static,
+    controls: Arc<Controls>,
+    small: bool,
+    show: impl FnMut(MediaResponse) + std::marker::Send + 'static,
+) -> std::io::Result<Watcher> {
     let inbox = Arc::new(Inbox::default());
     inbox.want_key.store(true, Ordering::Relaxed);
     let (ended, done) = channel::<()>();
@@ -1027,6 +1128,7 @@ fn start_decode<P: Screen>(
                 controls,
                 inbox: theirs,
                 show,
+                small,
                 wait_key: true,
                 painted: None,
                 cost: DecodeCost::default(),
@@ -1046,11 +1148,12 @@ fn ended(done: &Receiver<()>) {
     }
 }
 
-/// The call's two picture threads, as the tick drives them.
+/// The call's picture threads, as the tick drives them: one capture thread and up to N decode
+/// threads (one per active receive video slot).
 pub struct Video {
     controls: Arc<Controls>,
     sender: Option<Capturing>,
-    watcher: Option<Watcher>,
+    watchers: Vec<Option<Watcher>>,
     wants: Wants,
     /// A thread that could not start is not tried again on every turn of the loop.
     refused: bool,
@@ -1063,7 +1166,7 @@ impl Video {
         Video {
             controls,
             sender: None,
-            watcher: None,
+            watchers: Vec::new(),
             wants: Wants::default(),
             refused: false,
             owed: Vec::new(),
@@ -1129,46 +1232,97 @@ impl Video {
         }
     }
 
-    /// Someone may be about to show a picture: the decode thread starts, and the codec with it.
+    /// Someone may be about to show a picture on the primary slot: the decode thread starts.
     pub fn watch(&mut self) {
-        if self.watcher.is_none() && !self.refused {
-            let started = start_decode(Incoming::default, self.controls.clone(), |frame| {
+        self.watch_slot(0, false);
+    }
+
+    /// Starts the decode thread for receive video `slot` if not yet running.
+    pub fn watch_slot(&mut self, slot: usize, small: bool) {
+        if self.refused {
+            return;
+        }
+        if self.watchers.len() <= slot {
+            self.watchers.resize_with(slot + 1, || None);
+        }
+        if self.watchers[slot].is_none() {
+            let started = start_decode_slot(Incoming::default, self.controls.clone(), small, |frame| {
                 out::send(&frame)
             });
-            let started = started.map(|watcher| self.watcher = Some(watcher));
+            let started = started.map(|watcher| self.watchers[slot] = Some(watcher));
             self.start(started);
         }
     }
 
-    /// One received frame for the decoder. False when the queue overflowed.
+    /// One received frame for the primary decoder. False when the queue overflowed.
     pub fn picture(&self, frame: Received) -> bool {
-        self.watcher
-            .as_ref()
+        self.picture_slot(0, frame)
+    }
+
+    /// One received frame for receive video `slot`. False when that slot's queue overflowed.
+    pub fn picture_slot(&self, slot: usize, frame: Received) -> bool {
+        self.watchers
+            .get(slot)
+            .and_then(Option::as_ref)
             .is_none_or(|watcher| watcher.inbox.put(frame))
     }
 
-    /// The picture changed hands, or the connection did.
+    /// The primary picture changed hands, or the connection did.
     pub fn reset(&self) {
-        if let Some(watcher) = &self.watcher {
+        self.reset_slot(0);
+    }
+
+    /// Receive video `slot` changed hands: reset only that decoder.
+    pub fn reset_slot(&self, slot: usize) {
+        if let Some(Some(watcher)) = self.watchers.get(slot) {
+            watcher.inbox.replace(In::Reset);
+        }
+    }
+
+    /// Reset every active decoder (e.g. after reconnect).
+    pub fn reset_all(&self) {
+        for watcher in self.watchers.iter().flatten() {
             watcher.inbox.replace(In::Reset);
         }
     }
 
     /// Nobody is watching any more.
     pub fn clear(&self) {
-        if let Some(watcher) = &self.watcher {
+        for watcher in self.watchers.iter().flatten() {
             watcher.inbox.replace(In::Clear);
         }
     }
 
-    /// The decoder asked for a keyframe since this was last asked.
+    /// One receive slot stopped carrying `(user_id, kind)`.
+    pub fn clear_slot(&self, slot: usize, user_id: String, kind: PictureKind) {
+        if let Some(Some(watcher)) = self.watchers.get(slot) {
+            watcher.inbox.replace(In::ClearSource { user_id, kind });
+        }
+    }
+
+    /// The primary decoder asked for a keyframe since this was last asked.
     pub fn key_wanted(&self) -> bool {
-        self.watcher
-            .as_ref()
+        self.watchers
+            .first()
+            .and_then(Option::as_ref)
             .is_some_and(|watcher| watcher.inbox.want_key.swap(false, Ordering::Relaxed))
     }
 
-    /// The call is over: both threads finish what they hold and end.
+    /// Every slot whose decoder asked for a keyframe since this was last asked.
+    pub fn keys_wanted(&self) -> Vec<usize> {
+        self.watchers
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, watcher)| {
+                watcher
+                    .as_ref()
+                    .filter(|w| w.inbox.want_key.swap(false, Ordering::Relaxed))
+                    .map(|_| slot)
+            })
+            .collect()
+    }
+
+    /// The call is over: every thread finishes what it holds and ends.
     pub fn stop(self) {
         let sender = self.sender.map(|sender| {
             sender.orders.order.lock().unwrap().stop = true;
@@ -1177,12 +1331,17 @@ impl Video {
             drop(sender.words);
             sender.done
         });
-        let watcher = self.watcher.map(|watcher| {
-            watcher.inbox.queue.lock().unwrap().stop = true;
-            watcher.inbox.arrived.notify_all();
-            watcher.done
-        });
-        for done in sender.iter().chain(&watcher) {
+        let watchers: Vec<Receiver<()>> = self
+            .watchers
+            .into_iter()
+            .flatten()
+            .map(|watcher| {
+                watcher.inbox.queue.lock().unwrap().stop = true;
+                watcher.inbox.arrived.notify_all();
+                watcher.done
+            })
+            .collect();
+        for done in sender.iter().chain(&watchers) {
             ended(done);
         }
     }
@@ -1884,6 +2043,7 @@ mod tests {
             controls: Arc::default(),
             inbox: Arc::default(),
             show: move |frame| sink.lock().unwrap().push(frame),
+            small: false,
             wait_key: true,
             painted: None,
             cost: DecodeCost::default(),
@@ -2175,26 +2335,29 @@ mod tests {
         let mut video = Video::new(Arc::default());
         // Nothing wanted: no thread at all.
         video.want(Wants::default());
-        assert!(video.sender.is_none() && video.watcher.is_none());
+        assert!(video.sender.is_none() && video.watchers.is_empty());
         video.watch();
         let first = video
-            .watcher
-            .as_ref()
+            .watchers
+            .first()
+            .and_then(Option::as_ref)
             .map(|watcher| Arc::as_ptr(&watcher.inbox));
         // What a reconnect does.
         video.reset();
         video.watch();
         assert_eq!(
             video
-                .watcher
-                .as_ref()
+                .watchers
+                .first()
+                .and_then(Option::as_ref)
                 .map(|watcher| Arc::as_ptr(&watcher.inbox)),
             first,
             "the same thread"
         );
         let done = video
-            .watcher
-            .as_ref()
+            .watchers
+            .first()
+            .and_then(Option::as_ref)
             .map(|watcher| Arc::clone(&watcher.inbox))
             .unwrap();
         video.stop();
@@ -2204,5 +2367,42 @@ mod tests {
             1,
             "the thread let go of it: it ended"
         );
+    }
+
+    #[test]
+    fn watch_budget_caps_large_and_small_streams_and_names_refused_sources() {
+        let src = |user: &str, kind, size| WatchSource { user_id: user.into(), kind, size };
+        let wanted = vec![
+            src("ada", PictureKind::Share, WatchSize::Large),
+            src("bea", PictureKind::Share, WatchSize::Large),
+            src("ada", PictureKind::Camera, WatchSize::Small),
+            src("bea", PictureKind::Camera, WatchSize::Small),
+            src("cy", PictureKind::Camera, WatchSize::Small),
+            src("dev", PictureKind::Camera, WatchSize::Small),
+            src("eli", PictureKind::Camera, WatchSize::Small),
+            // Duplicate ignored rather than refused.
+            src("ada", PictureKind::Camera, WatchSize::Small),
+        ];
+        // Desktop: 1 large + 4 small = 5 accepted, 2 refused (2nd large + 5th small).
+        let (accepted, refused) = apply_watch_budget(&wanted, 1, 4);
+        assert_eq!(accepted.len(), 5);
+        assert_eq!(refused, vec![("bea".into(), PictureKind::Share), ("eli".into(), PictureKind::Camera)]);
+        // Phone: 1 large + 2 small = 3 accepted, 4 refused.
+        let (accepted_phone, refused_phone) = apply_watch_budget(&wanted, 1, 2);
+        assert_eq!(accepted_phone.len(), 3);
+        assert_eq!(refused_phone.len(), 4);
+    }
+
+    #[test]
+    fn multi_slot_decoders_reset_and_clear_independently() {
+        let mut video = Video::new(Arc::default());
+        video.watch_slot(0, false);
+        video.watch_slot(1, true);
+        assert_eq!(video.watchers.len(), 2);
+        video.reset_slot(1);
+        let slot0 = video.watchers[0].as_ref().unwrap().inbox.queue.lock().unwrap().frames.len();
+        assert_eq!(slot0, 0);
+        video.clear_slot(1, "bea".into(), PictureKind::Camera);
+        video.stop();
     }
 }

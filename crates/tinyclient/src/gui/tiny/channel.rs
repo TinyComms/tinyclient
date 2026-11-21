@@ -252,6 +252,8 @@ mod tests {
             device_stuck: false,
             security: None,
             picture: None,
+            pictures: Vec::new(),
+            watch_refused: Vec::new(),
             self_view: None,
             share_view: None,
             picture_source: None,

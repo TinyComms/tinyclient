@@ -411,7 +411,7 @@ impl Mediad {
     }
 
     fn offer_with(&mut self, user_id: &str, e2ee: Option<TinyE2ee>) -> String {
-        let spec = TinyOffer { user_id: user_id.into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee };
+        let spec = TinyOffer { user_id: user_id.into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee, video_slots: 0 };
         match self.ask(MediaRequest::TinyOffer(spec)) {
             MediaResponse::Offer { sdp } => sdp,
             other => panic!("no offer: {other:?}"),

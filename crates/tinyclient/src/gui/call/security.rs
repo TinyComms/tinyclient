@@ -644,6 +644,8 @@ mod tests {
             device_stuck: false,
             security: Some(security),
             picture: None,
+            pictures: Vec::new(),
+            watch_refused: Vec::new(),
             self_view: None,
             share_view: None,
             picture_source: None,

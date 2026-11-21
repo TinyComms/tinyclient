@@ -397,7 +397,20 @@ pub struct TinyCapabilities {
     pub version: String,
     #[serde(default, deserialize_with = "or_default")]
     pub features: Vec<String>,
+    /// Multi-stream video receive capability advertised alongside the `multi_video` feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_video: Option<TinyMultiVideoCapabilities>,
 }
+
+/// Multi-stream video receive limits advertised by `GET /v1/capabilities`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyMultiVideoCapabilities {
+    #[serde(default)]
+    pub max_slots: u16,
+}
+
+/// The server supports receiving multiple concurrent video streams via `call.watch` and `call.slots.videos`.
+pub const TINY_FEATURE_MULTI_VIDEO: &str = "multi_video";
 
 /// The features a server may list. Each gates its part of the page and its requests.
 pub const TINY_FEATURE_SERVER: &str = "server";
@@ -465,6 +478,15 @@ impl TinyCapabilities {
 
     pub fn is_empty(&self) -> bool {
         self.features.is_empty() && self.version.is_empty()
+    }
+
+    /// Receive video slots this server supports (`1` when `multi_video` is absent).
+    pub fn multi_video_slots(&self) -> u8 {
+        if !self.has(TINY_FEATURE_MULTI_VIDEO) {
+            return 1;
+        }
+        let max = self.multi_video.as_ref().map_or(5, |m| m.max_slots);
+        max.clamp(1, 16) as u8
     }
 }
 
@@ -2483,5 +2505,18 @@ mod tests {
         assert!(member.has_in_channel(&granted, TINY_MANAGE_CHANNELS));
         assert!(member.has_in_channel(&legacy, TINY_MANAGE_CHANNELS));
         assert!(!member.has_in_channel(&legacy, TINY_BAN_MEMBERS));
+    }
+
+    #[test]
+    fn capabilities_parse_multi_video_max_slots_and_default_to_one_when_absent() {
+        let legacy: TinyCapabilities = serde_json::from_str(r#"{"version":"0.4.0","features":["e2ee_calls"]}"#).unwrap();
+        assert_eq!(legacy.multi_video_slots(), 1);
+
+        let modern: TinyCapabilities = serde_json::from_str(
+            r#"{"version":"0.5.0","features":["e2ee_calls","multi_video"],"multi_video":{"max_slots":5}}"#,
+        )
+        .unwrap();
+        assert!(modern.has(TINY_FEATURE_MULTI_VIDEO));
+        assert_eq!(modern.multi_video_slots(), 5);
     }
 }

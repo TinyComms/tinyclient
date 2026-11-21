@@ -997,6 +997,7 @@ impl Shell {
                 stage::Trouble::Deafened => "Undeafen to watch.".to_owned(),
                 stage::Trouble::Slow => format!("Waiting for {name}'s picture… Your connection may be too slow for video."),
                 stage::Trouble::Failed => format!("Couldn't get {name}'s picture."),
+                stage::Trouble::BudgetFull => "Too many videos".to_owned(),
             };
             let retry_id = stream.user_id.clone();
             let retry = matches!(trouble, stage::Trouble::Slow | stage::Trouble::Failed).then(|| {
@@ -1432,7 +1433,22 @@ impl Shell {
         } else {
             theme::hairline()
         };
-        div()
+        let camera_frame = seat.camera.then(|| {
+            if me {
+                self.call_self_frame(call, false)
+            } else {
+                self.call_frame(call, &seat.id, PictureKind::Camera)
+            }
+        }).flatten();
+        let camera_refused = !me
+            && seat.camera
+            && camera_frame.is_none()
+            && call.is_some_and(|c| {
+                c.watch_refused
+                    .iter()
+                    .any(|(uid, kind)| uid == &seat.id && *kind == PictureKind::Camera)
+            });
+        let base_tile = div()
             .id(SharedString::from(format!("tiny-tile-{}", seat.id)))
             .group(group)
             .relative()
@@ -1440,7 +1456,8 @@ impl Shell {
             .w(px(w))
             .h(px(h))
             .rounded(px(theme::R_CARD + 4.))
-            .bg(theme::raised())
+            .bg(if camera_frame.is_some() { gpui::rgb(0x0b0b0d) } else { theme::raised() })
+            .overflow_hidden()
             .border_2()
             .border_color(ring)
             .when(speaking, |tile| {
@@ -1485,35 +1502,45 @@ impl Shell {
                         );
                     }
                 }),
-            )
-            .child(Avatar::new(&people.key(&seat.id), &name, avatar).image_at(people.picture(&seat.id)).build())
-            .child(
-                div()
-                    .max_w(px(w - 24.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .map(|name| {
-                                if big {
-                                    name.type_title()
-                                } else if small {
-                                    name.type_small()
-                                } else {
-                                    name.type_ui()
-                                }
-                            })
-                            .font_weight(theme::SEMIBOLD)
-                            .text_color(color)
-                            .child(name),
-                    )
-                    .when(me && !small, |row| row.child(chip("You", theme::text_soft(), theme::hover()))),
-            )
-            .when(!small, |tile| tile.child(state_row))
-            .children(link)
+            );
+        let tile = if let Some(frame) = camera_frame {
+            base_tile
+                .child(img(frame).size_full().object_fit(ObjectFit::Cover))
+                .child(caption(if me { format!("{name} (You)") } else { name }, small))
+        } else {
+            base_tile
+                .child(Avatar::new(&people.key(&seat.id), &name, avatar).image_at(people.picture(&seat.id)).build())
+                .child(
+                    div()
+                        .max_w(px(w - 24.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .map(|name| {
+                                    if big {
+                                        name.type_title()
+                                    } else if small {
+                                        name.type_small()
+                                    } else {
+                                        name.type_ui()
+                                    }
+                                })
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(color)
+                                .child(name),
+                        )
+                        .when(me && !small, |row| row.child(chip("You", theme::text_soft(), theme::hover()))),
+                )
+                .when(camera_refused, |tile| {
+                    tile.child(chip("Too many videos", theme::text_soft(), theme::hover()))
+                })
+                .when(!small, |tile| tile.child(state_row))
+        };
+        tile.children(link)
             .child(
                 div()
                     .absolute()
@@ -1892,6 +1919,7 @@ impl Shell {
     pub(in crate::gui) fn call_toggle_focus(&mut self, user_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.call_keep_keys(window, cx);
         self.call_state.focus = stage::toggle(self.call_state.focus.as_ref(), Focus::Person(user_id.to_owned()));
+        self.call_sync_watch_now(cx);
         cx.notify();
     }
 
@@ -1910,6 +1938,7 @@ impl Shell {
             self.call_watch(user_id.to_owned(), cx);
         }
         self.call_state.focus = focus;
+        self.call_sync_watch_now(cx);
         cx.notify();
     }
 
@@ -1919,6 +1948,7 @@ impl Shell {
             self.call_state.focus = None;
         }
         self.call_unwatch(cx);
+        self.call_sync_watch_now(cx);
     }
 
     /// The people under the focused stream, over it, or gone.
@@ -1958,6 +1988,7 @@ impl Shell {
     /// Steps Escape back out of the call view: first clear stage focus, then leave the call view.
     pub(in crate::gui) fn call_escape(&mut self, cx: &mut Context<Self>) -> bool {
         if self.call_state.focus.take().is_some() {
+            self.call_sync_watch_now(cx);
             cx.notify();
             return true;
         }

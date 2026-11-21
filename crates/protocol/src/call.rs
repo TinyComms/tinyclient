@@ -280,9 +280,16 @@ pub struct Call {
     /// that says nothing about it (every network but a Tiny server today).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<CallSecurity>,
-    /// The one picture being watched. `None` while nothing is on screen.
+    /// The one picture being watched. `None` while nothing is on screen. Mirrors the primary
+    /// entry of [`Call::pictures`] for single-stream callers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<CallPicture>,
+    /// All active received pictures being decoded and painted (multi-stream video).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pictures: Vec<CallPicture>,
+    /// Sources refused by mediad's decode budget (too many concurrent videos).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_refused: Vec<(String, PictureKind)>,
     /// My own camera as it is sent, for my tile. `None` while it is off. Its `user_id` is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_view: Option<CallPicture>,
@@ -306,6 +313,10 @@ fn video_allowed_default() -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
 
 /// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
@@ -470,6 +481,28 @@ pub struct TinyOffer {
     /// server, and the call is encrypted to the server only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e2ee: Option<TinyE2ee>,
+    /// Number of receive-only video m-lines to offer (0 or 1 = legacy single video slot).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub video_slots: u8,
+}
+
+/// Desired display size for a watched video stream (`Large` requests `"high"`, `Small` requests `"low"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchSize {
+    #[default]
+    Large,
+    Small,
+}
+
+/// One video stream the shell wants decoded and painted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WatchSource {
+    pub user_id: String,
+    #[serde(default)]
+    pub kind: PictureKind,
+    #[serde(default)]
+    pub size: WatchSize,
 }
 
 /// Whose voice one receive slot carries, as the server's `call.slots` says.
@@ -512,6 +545,8 @@ pub enum MediaRequest {
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
+    /// Watch zero or more video streams at once (multi-stream video). Replaces the watch list.
+    Watch { sources: Vec<WatchSource> },
     /// The active speaker changed. Replaces the previous speaker's decode.
     Speaker { source: Option<String> },
     /// Connect the voice session. Progress and the outcome arrive as events.
@@ -563,6 +598,8 @@ pub enum MediaRequest {
     CameraPreview { on: bool },
     /// Who the one video slot carries now. `None` when the server sends `video: null`.
     TinyPicture { picture: Option<TinyPicture> },
+    /// Who each active video receive slot carries now, from `call.slots.videos`.
+    TinyPictures { pictures: Vec<TinyPicture> },
     /// One `call.e2ee` frame from the server, as its JSON text, in the order it arrived.
     TinyE2ee { frame: String },
     /// Everyone in the room's call, us included, whenever it changes: whom the MLS group may
@@ -1007,6 +1044,8 @@ pub enum MediaResponse {
     },
     /// A picture that could not be captured, in words. The voice call stays.
     Notice { detail: String },
+    /// Sources dropped because the requested watch list exceeded this device's decode budget.
+    WatchRefused { refused: Vec<(String, PictureKind)> },
 }
 
 impl MediaResponse {
@@ -1036,6 +1075,7 @@ impl MediaResponse {
             MediaResponse::Sending { .. } => "Sending",
             MediaResponse::SelfView { .. } => "SelfView",
             MediaResponse::Notice { .. } => "Notice",
+            MediaResponse::WatchRefused { .. } => "WatchRefused",
         }
     }
 
@@ -1142,5 +1182,31 @@ mod tests {
         let wire = serde_json::to_string(&with_cams).unwrap();
         assert!(wire.contains(r#""cameras""#), "{wire}");
         assert_eq!(serde_json::from_str::<MediaResponse>(&wire).unwrap(), with_cams);
+    }
+
+    #[test]
+    fn multi_stream_watch_tiny_pictures_and_watch_refused_round_trip() {
+        let watch = MediaRequest::Watch {
+            sources: vec![
+                WatchSource { user_id: "ada".into(), kind: PictureKind::Share, size: WatchSize::Large },
+                WatchSource { user_id: "bea".into(), kind: PictureKind::Camera, size: WatchSize::Small },
+            ],
+        };
+        let wire = serde_json::to_string(&watch).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&wire).unwrap(), watch);
+
+        let pics = MediaRequest::TinyPictures {
+            pictures: vec![
+                TinyPicture { mid: "2".into(), user_id: "ada".into(), kind: PictureKind::Share },
+                TinyPicture { mid: "3".into(), user_id: "bea".into(), kind: PictureKind::Camera },
+            ],
+        };
+        let wire = serde_json::to_string(&pics).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&wire).unwrap(), pics);
+
+        let refused = MediaResponse::WatchRefused { refused: vec![("cy".into(), PictureKind::Camera)] };
+        assert_eq!(refused.name(), "WatchRefused");
+        let wire = serde_json::to_string(&refused).unwrap();
+        assert_eq!(serde_json::from_str::<MediaResponse>(&wire).unwrap(), refused);
     }
 }

@@ -536,7 +536,13 @@ impl Incoming {
         let mut colors = vec![0u8; width * height * 3];
         // This honours the decoder's strides, which are wider than the picture.
         decoded.write_rgb8(&mut colors);
-        self.painters.paint(colors, width as u32, height as u32, tag);
+        let (mut w, mut h) = (width as u32, height as u32);
+        if tag.small && (w > SMALL_TILE.0 || h > SMALL_TILE.1) {
+            let (tw, th) = fit(w, h, SMALL_TILE.0, SMALL_TILE.1);
+            colors = scale_rgb(&colors, w, h, tw, th);
+            (w, h) = (tw, th);
+        }
+        self.painters.paint(colors, w, h, tag);
         Ok(())
     }
 
@@ -1461,7 +1467,7 @@ mod tests {
                 bytes_low += encoded.bytes.len();
             }
             if !encoded.bytes.is_empty() {
-                let tag = (n == 0).then(|| Tag { user: "ada".into(), kind: protocol::PictureKind::Share });
+                let tag = (n == 0).then(|| Tag { user: "ada".into(), kind: protocol::PictureKind::Share, small: false });
                 incoming.decode(&encoded.bytes, tag).expect("every frame decodes");
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut painted = incoming.painted();

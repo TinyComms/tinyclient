@@ -284,6 +284,8 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         camera_id: String::new(),
         security: None,
         picture: None,
+        pictures: Vec::new(),
+        watch_refused: Vec::new(),
         self_view: None,
         share_view: None,
         picture_source: None,
@@ -540,11 +542,62 @@ impl Live {
             }
             MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } | MediaResponse::TinyRenegotiate { .. } => return false,
             MediaResponse::Picture { path, width, height, generation, user_id, kind } => {
-                let picture = (!path.is_empty()).then(|| CallPicture { path, width, height, generation, user_id, kind });
-                if self.call.picture == picture {
+                let mut changed = false;
+                if path.is_empty() {
+                    if user_id.is_empty() {
+                        if !self.call.pictures.is_empty() || self.call.picture.is_some() {
+                            self.call.pictures.clear();
+                            self.call.picture = None;
+                            changed = true;
+                        }
+                    } else {
+                        let before = self.call.pictures.len();
+                        self.call.pictures.retain(|p| !(p.user_id == user_id && p.kind == kind));
+                        if self.call.pictures.len() != before {
+                            changed = true;
+                        }
+                        if self.call.picture.as_ref().is_some_and(|p| p.user_id == user_id && p.kind == kind) {
+                            self.call.picture = self.call.pictures.first().cloned();
+                            changed = true;
+                        }
+                    }
+                } else {
+                    let picture = CallPicture { path, width, height, generation, user_id, kind };
+                    if let Some(existing) = self
+                        .call
+                        .pictures
+                        .iter_mut()
+                        .find(|p| p.user_id == picture.user_id && p.kind == picture.kind)
+                    {
+                        if *existing != picture {
+                            *existing = picture.clone();
+                            changed = true;
+                        }
+                    } else {
+                        self.call.pictures.push(picture.clone());
+                        changed = true;
+                    }
+                    let primary = self
+                        .call
+                        .pictures
+                        .iter()
+                        .find(|p| p.kind == PictureKind::Share)
+                        .or_else(|| self.call.pictures.first())
+                        .cloned();
+                    if self.call.picture != primary {
+                        self.call.picture = primary;
+                        changed = true;
+                    }
+                }
+                if !changed {
                     return false;
                 }
-                self.call.picture = picture;
+            }
+            MediaResponse::WatchRefused { refused } => {
+                if self.call.watch_refused == refused {
+                    return false;
+                }
+                self.call.watch_refused = refused;
             }
             MediaResponse::SelfView { path, width, height, generation, share } => {
                 let kind = if share { PictureKind::Share } else { PictureKind::Camera };
@@ -2302,7 +2355,7 @@ mod tests {
             let next = hub.calls.place(&hub, key.clone()).unwrap();
             assert_ne!(old, next);
             let offer = TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1,
-                muted: false, deafened: false, e2ee: None };
+                muted: false, deafened: false, e2ee: None, video_slots: 0 };
             assert!(hub.calls.tiny_direct_offer(&hub, &key, offer, old).is_err());
             hub.calls.fail_ring_attempt(&hub, &key, old, CallFailure::Refused, "old refusal");
             hub.calls.end_intent(&hub, &key, old);
@@ -2465,7 +2518,7 @@ mod tests {
     }
 
     fn tiny_offer(e2ee: Option<protocol::TinyE2ee>) -> TinyOffer {
-        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee }
+        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee, video_slots: 0 }
     }
 
     fn sealed_offer() -> TinyOffer {
