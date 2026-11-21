@@ -7,7 +7,7 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLogKind, CallOutcome, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -1033,6 +1033,75 @@ impl Session {
         if let Some(delete) = sync.delete_for_me {
             self.deleted_for_me(delete);
         }
+        if let Some(call_event) = sync.call_event {
+            self.call_event_sync(call_event);
+        }
+        if let Some(call_log) = sync.call_log_event {
+            self.call_log_sync(call_log);
+        }
+    }
+
+    fn call_peer_of(bytes: &[u8], is_group: bool) -> Option<Peer> {
+        if is_group || bytes.len() == 32 {
+            return Some(Peer::Group(hex(bytes)));
+        }
+        if let Some(aci) = aci_bytes(bytes) {
+            return Some(Peer::Direct(aci));
+        }
+        if bytes.len() == 17 && bytes[0] == 0 {
+            if let Some(aci) = aci_bytes(&bytes[1..]) {
+                return Some(Peer::Direct(aci));
+            }
+        }
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if super::wire::is_aci(text) {
+                return Some(Peer::Direct(text.to_owned()));
+            }
+        }
+        None
+    }
+
+    fn call_event_sync(&self, ev: sync_message::CallEvent) {
+        let kind = match ev.r#type.and_then(|v| sync_message::call_event::Type::try_from(v).ok()) {
+            Some(sync_message::call_event::Type::VideoCall) => CallKind::Video,
+            Some(sync_message::call_event::Type::GroupCall) => CallKind::Group,
+            Some(sync_message::call_event::Type::AdHocCall) => CallKind::AdHoc,
+            _ => CallKind::Voice,
+        };
+        let Some(conv_bytes) = ev.conversation_id.as_deref() else {
+            return;
+        };
+        let Some(peer) = Self::call_peer_of(conv_bytes, kind == CallKind::Group) else {
+            return;
+        };
+        let incoming = ev.direction != Some(sync_message::call_event::Direction::Outgoing.into());
+        let outcome = match ev.event.and_then(|v| sync_message::call_event::Event::try_from(v).ok()) {
+            Some(sync_message::call_event::Event::Accepted) => CallOutcome::Accepted,
+            Some(sync_message::call_event::Event::NotAccepted) => CallOutcome::NotAccepted,
+            Some(sync_message::call_event::Event::Delete) => CallOutcome::Deleted,
+            Some(sync_message::call_event::Event::Observed) => CallOutcome::Observed,
+            _ => return,
+        };
+        let call_id = ev.call_id.unwrap_or_else(|| ev.timestamp.unwrap_or_else(now_ms));
+        let timestamp = ev.timestamp.unwrap_or_else(now_ms);
+        self.tell(Event::CallEvent { peer, call_id, timestamp, kind, incoming, outcome });
+    }
+
+    fn call_log_sync(&self, ev: sync_message::CallLogEvent) {
+        let kind = match ev.r#type.and_then(|v| sync_message::call_log_event::Type::try_from(v).ok()) {
+            Some(sync_message::call_log_event::Type::Clear) => CallLogKind::Clear,
+            Some(sync_message::call_log_event::Type::MarkedAsRead) => CallLogKind::MarkedAsRead,
+            Some(sync_message::call_log_event::Type::MarkedAsReadInConversation) => CallLogKind::MarkedAsReadInConversation,
+            Some(sync_message::call_log_event::Type::ClearInConversation) => CallLogKind::ClearInConversation,
+            None => return,
+        };
+        let peer = ev.conversation_id.as_deref().and_then(|b| Self::call_peer_of(b, false));
+        self.tell(Event::CallLogEvent {
+            kind,
+            peer,
+            call_id: ev.call_id,
+            timestamp: ev.timestamp.unwrap_or_else(now_ms),
+        });
     }
 
     /// A delete made on another of the user's devices, for this account only.

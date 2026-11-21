@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLogKind, CallOutcome, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -484,6 +484,47 @@ fn steer(line: &str) -> Vec<Event> {
         "hangup" | "hangup-accepted" | "busy" => {
             let id = next().parse().unwrap_or(T0);
             vec![Event::CallEnded { id, answered: command == "hangup-accepted" }]
+        }
+        "call-event" => {
+            let target = next();
+            let peer = if target == "club" {
+                club()
+            } else if let Some((id, _)) = who(target) {
+                direct(id)
+            } else {
+                return Vec::new();
+            };
+            let call_id = next().parse().unwrap_or(T0);
+            let kind = match next() {
+                "video" => CallKind::Video,
+                "group" => CallKind::Group,
+                "adhoc" => CallKind::AdHoc,
+                _ => CallKind::Voice,
+            };
+            let incoming = next() != "outgoing";
+            let outcome = match next() {
+                "missed" => CallOutcome::NotAccepted,
+                "deleted" => CallOutcome::Deleted,
+                "observed" => CallOutcome::Observed,
+                _ => CallOutcome::Accepted,
+            };
+            let timestamp = next().parse().unwrap_or(call_id);
+            vec![Event::CallEvent { peer, call_id, timestamp, kind, incoming, outcome }]
+        }
+        "call-log" => {
+            let kind = match next() {
+                "clear" => CallLogKind::Clear,
+                "read" => CallLogKind::MarkedAsRead,
+                "clear-chat" => CallLogKind::ClearInConversation,
+                "read-chat" => CallLogKind::MarkedAsReadInConversation,
+                _ => return Vec::new(),
+            };
+            let peer = match next() {
+                "" => None,
+                "club" => Some(club()),
+                other => who(other).map(|(id, _)| direct(id)),
+            };
+            vec![Event::CallLogEvent { kind, peer, call_id: None, timestamp: T0 }]
         }
         "group-title" => {
             let title = rest(line, 1);

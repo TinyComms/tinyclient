@@ -397,6 +397,22 @@ pub enum Event {
     /// A call we heard of is over: its hangup, or the other side telling us it was busy.
     /// `answered` says someone took it on another device; nobody did when it is false.
     CallEnded { id: u64, answered: bool },
+    /// A call synced from the user's phone (`SyncMessage.callEvent`).
+    CallEvent {
+        peer: Peer,
+        call_id: u64,
+        timestamp: u64,
+        kind: CallKind,
+        incoming: bool,
+        outcome: CallOutcome,
+    },
+    /// A call log action synced from the user's phone (`SyncMessage.callLogEvent`).
+    CallLogEvent {
+        kind: CallLogKind,
+        peer: Option<Peer>,
+        call_id: Option<u64>,
+        timestamp: u64,
+    },
     /// The user's own settings, as the phone shares them.
     Settings { read_receipts: bool, typing: bool },
     /// A conversation's disappearing-messages timer changed (0 turns it off).
@@ -407,6 +423,33 @@ pub enum Event {
     Closed(String),
     /// The phone removed this device, or the account is gone. Signing in again links anew.
     Ended(String),
+}
+
+/// Kind of call in a synced `CallEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    Voice,
+    Video,
+    Group,
+    AdHoc,
+}
+
+/// Outcome of a synced `CallEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    Accepted,
+    NotAccepted,
+    Deleted,
+    Observed,
+}
+
+/// Action in a synced `CallLogEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallLogKind {
+    Clear,
+    MarkedAsRead,
+    MarkedAsReadInConversation,
+    ClearInConversation,
 }
 
 /// One GIF returned by Signal's Giphy proxy search/trending endpoint.

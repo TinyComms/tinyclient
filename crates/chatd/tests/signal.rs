@@ -1743,3 +1743,46 @@ fn searching_and_sending_gifs_from_the_composer() {
     assert_eq!(sent.attachments[0].file.kind, protocol::MediaKind::Gif);
     assert_eq!(sent.attachments[0].mime, "video/mp4");
 }
+
+#[test]
+fn synced_call_events_and_call_log_events_record_and_clear_call_history() {
+    let world = World::linked();
+    world.connected();
+
+    // Accepted incoming video call -> "Incoming video call", not missed (0 unread).
+    world.steer(&format!("call-event grace 9001 video incoming accepted {}", T0 + 10_000));
+    let call_msg = world.arrived(GRACE, "signal-call-9001");
+    assert_eq!((&call_msg.kind, call_msg.text.as_str(), call_msg.outgoing), (&MessageKind::System, "Incoming video call", false));
+    assert_eq!(world.conversation(GRACE).unwrap().unread, 0);
+
+    // Outgoing accepted voice call -> "Outgoing voice call".
+    world.steer(&format!("call-event grace 9002 audio outgoing accepted {}", T0 + 20_000));
+    let out_msg = world.arrived(GRACE, "signal-call-9002");
+    assert_eq!((&out_msg.kind, out_msg.text.as_str(), out_msg.outgoing), (&MessageKind::System, "Outgoing voice call", true));
+
+    // Missed incoming voice call -> unread increments; then call-log read-chat clears unread.
+    world.steer(&format!("call-event grace 9003 audio incoming missed {}", T0 + 30_000));
+    let missed = world.arrived(GRACE, "signal-call-9003");
+    assert_eq!(missed.text, "Missed voice call");
+    world.until("missed call unread", || (world.conversation(GRACE)?.unread >= 1).then_some(()));
+    world.steer("call-log read-chat grace");
+    world.until("call-log read clears unread", || (world.conversation(GRACE)?.unread == 0).then_some(()));
+
+    // Group call event in CLUB.
+    world.steer(&format!("call-event club 9004 group incoming accepted {}", T0 + 40_000));
+    let group_call = world.arrived(CLUB, "signal-call-9004");
+    assert_eq!(group_call.text, "Group call");
+
+    // Deleting a single call event removes it.
+    world.steer(&format!("call-event grace 9002 audio outgoing deleted {}", T0 + 45_000));
+    world.until("call 9002 deleted", || {
+        (!world.messages(GRACE).iter().any(|m| m.id == "signal-call-9002")).then_some(())
+    });
+
+    // Clearing call history in Grace's conversation removes remaining call rows there, leaving CLUB untouched.
+    world.steer("call-log clear-chat grace");
+    world.until("grace call history cleared", || {
+        (!world.messages(GRACE).iter().any(|m| m.id.starts_with("signal-call-"))).then_some(())
+    });
+    assert!(world.messages(CLUB).iter().any(|m| m.id == "signal-call-9004"));
+}

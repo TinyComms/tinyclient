@@ -637,6 +637,8 @@ struct Live {
     expiring: HashMap<(String, String), u32>,
     /// Recently searched GIF entries keyed by catalog item id, bounded to 256 entries.
     gifs: HashMap<String, wire::GifEntry>,
+    /// Synced call history rows (`(conversation_id, call_id)`), bounded to 500 entries.
+    call_history: VecDeque<(String, u64)>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -1297,6 +1299,12 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Call { peer, by, name, video, id, sent } => incoming_call(account, &peer, &by, &name, video, id, sent),
         Event::CallEnded { id, answered } => ended_call(account, id, answered),
+        Event::CallEvent { peer, call_id, timestamp, kind, incoming, outcome } => {
+            apply_call_event(account, &peer, call_id, timestamp, kind, incoming, outcome);
+        }
+        Event::CallLogEvent { kind, peer, call_id, timestamp } => {
+            apply_call_log_event(account, kind, peer.as_ref(), call_id, timestamp);
+        }
         Event::Settings { read_receipts, typing } => {
             let mut live = account.live();
             live.read_receipts = read_receipts;
@@ -1420,6 +1428,149 @@ fn ended_call(account: &Account, id: u64, answered: bool) {
     line.kind = MessageKind::System;
     line.sender.id = ring.author;
     let _ = account.ctx.quiet_line(&ring.conversation, &line, true);
+}
+
+fn call_event_label(kind: wire::CallKind, incoming: bool, outcome: wire::CallOutcome) -> &'static str {
+    match (outcome, kind, incoming) {
+        (wire::CallOutcome::Observed, _, _) => "Answered on another device",
+        (wire::CallOutcome::Accepted, wire::CallKind::Voice, true) => "Incoming voice call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Video, true) => "Incoming video call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Voice, false) => "Outgoing voice call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Video, false) => "Outgoing video call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Group, _) => "Group call",
+        (wire::CallOutcome::Accepted, wire::CallKind::AdHoc, _) => "Call link",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Voice, true) => "Missed voice call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Video, true) => "Missed video call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Voice, false) => "Cancelled voice call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Video, false) => "Cancelled video call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Group, _) => "Missed group call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::AdHoc, _) => "Missed call",
+        (wire::CallOutcome::Deleted, _, _) => "",
+    }
+}
+
+fn apply_call_event(
+    account: &Account,
+    peer: &Peer,
+    call_id: u64,
+    timestamp: u64,
+    kind: wire::CallKind,
+    incoming: bool,
+    outcome: wire::CallOutcome,
+) {
+    let conversation = peer.conversation();
+    let msg_id = format!("signal-call-{call_id}");
+    if outcome == wire::CallOutcome::Deleted {
+        account.live().call_history.retain(|(c, id)| !(c == &conversation && *id == call_id));
+        let _ = account.ctx.deleted(&conversation, &msg_id);
+        return;
+    }
+    // If an incoming ring is active for this call/peer and it was accepted/observed elsewhere, stop ringing.
+    if matches!(outcome, wire::CallOutcome::Accepted | wire::CallOutcome::Observed) {
+        let stop = {
+            let mut live = account.live();
+            if live.ring.as_ref().is_some_and(|r| r.id == call_id || r.conversation == conversation) {
+                live.ring.take()
+            } else {
+                None
+            }
+        };
+        if let Some(ring) = stop {
+            account.ctx.phone_ring_stopped(&ring.conversation);
+        }
+    }
+    match peer {
+        Peer::Direct(aci) => {
+            let title = account.live().names.get(aci).cloned().unwrap_or_default();
+            ensure_row(account, peer, &title);
+        }
+        Peer::Group(_) => {
+            if let Ok(None) = account.ctx.known(&conversation) {
+                let _ = account.ctx.conversation(&row(peer, ""));
+            }
+        }
+    }
+    let label = call_event_label(kind, incoming, outcome);
+    let author_id = if incoming {
+        match peer {
+            Peer::Direct(aci) => aci.clone(),
+            Peer::Group(_) => String::new(),
+        }
+    } else {
+        account.me.clone()
+    };
+    let author_name = if author_id == account.me {
+        account.name.clone()
+    } else if author_id.is_empty() {
+        String::new()
+    } else {
+        account.live().name(&author_id)
+    };
+    let mut line = Message::plain(msg_id, author_name, label, i64::try_from(timestamp / 1_000).unwrap_or(0), !incoming);
+    line.kind = MessageKind::System;
+    line.sender.id = author_id;
+    {
+        let mut live = account.live();
+        if !live.call_history.iter().any(|(c, id)| c == &conversation && *id == call_id) {
+            if live.call_history.len() >= 500 {
+                live.call_history.pop_front();
+            }
+            live.call_history.push_back((conversation.clone(), call_id));
+        }
+    }
+    let unread = incoming && outcome == wire::CallOutcome::NotAccepted;
+    let _ = account.ctx.quiet_line(&conversation, &line, unread);
+}
+
+fn apply_call_log_event(account: &Account, kind: wire::CallLogKind, peer: Option<&Peer>, _call_id: Option<u64>, _timestamp: u64) {
+    match kind {
+        wire::CallLogKind::Clear => {
+            let entries: Vec<(String, u64)> = account.live().call_history.drain(..).collect();
+            for (conv, cid) in entries {
+                let _ = account.ctx.deleted(&conv, &format!("signal-call-{cid}"));
+            }
+        }
+        wire::CallLogKind::ClearInConversation => {
+            let Some(conv) = peer.map(Peer::conversation) else {
+                return;
+            };
+            let mut removed = Vec::new();
+            account.live().call_history.retain(|(c, cid)| {
+                if c == &conv {
+                    removed.push(*cid);
+                    false
+                } else {
+                    true
+                }
+            });
+            for cid in removed {
+                let _ = account.ctx.deleted(&conv, &format!("signal-call-{cid}"));
+            }
+        }
+        wire::CallLogKind::MarkedAsRead => {
+            let mut latest: HashMap<String, u64> = HashMap::new();
+            for (conv, cid) in account.live().call_history.iter() {
+                latest.insert(conv.clone(), *cid);
+            }
+            for (conv, cid) in latest {
+                let updated = account.ctx.known(&conv).ok().flatten().map_or(0, |row| row.updated);
+                let _ = account.ctx.counts(&conv, 0, 0, Some(&format!("signal-call-{cid}")), updated);
+            }
+        }
+        wire::CallLogKind::MarkedAsReadInConversation => {
+            if let Some(conv) = peer.map(Peer::conversation) {
+                let last_cid = account
+                    .live()
+                    .call_history
+                    .iter()
+                    .rev()
+                    .find(|(c, _)| c == &conv)
+                    .map(|(_, cid)| format!("signal-call-{cid}"));
+                let updated = account.ctx.known(&conv).ok().flatten().map_or(0, |row| row.updated);
+                let _ = account.ctx.counts(&conv, 0, 0, last_cid.as_deref(), updated);
+            }
+        }
+    }
 }
 
 /// A Signal username as libsignal's `Username::new` accepts one: `nickname.42`, optionally with
