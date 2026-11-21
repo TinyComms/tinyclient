@@ -91,6 +91,46 @@ const POLL_END: &str = "\u{1}signal-poll-end\u{1}";
 /// or `\u{1}member\u{1}<aci>`). An ACI never starts with `\u{1}`.
 const GROUP_ADMIN_PROMOTE: &str = "\u{1}signal-admin-promote\u{1}";
 const GROUP_ADMIN_REVOKE: &str = "\u{1}signal-admin-revoke\u{1}";
+/// Group permissions edit packed into `ConversationUpdate.description`:
+/// `\u{1}signal-group-perms\u{1}members=admin|member;attributes=admin|member;announcements=on|off`.
+const GROUP_PERMS_PREFIX: &str = "\u{1}signal-group-perms\u{1}";
+
+/// Packs a Signal group permissions edit so `Request::ConversationUpdate` carries it.
+pub fn group_permissions_command(
+    member_access: Option<bool>,
+    attributes_access: Option<bool>,
+    announcements_only: Option<bool>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(admins_only) = member_access {
+        parts.push(format!("members={}", if admins_only { "admin" } else { "member" }));
+    }
+    if let Some(admins_only) = attributes_access {
+        parts.push(format!("attributes={}", if admins_only { "admin" } else { "member" }));
+    }
+    if let Some(on) = announcements_only {
+        parts.push(format!("announcements={}", if on { "on" } else { "off" }));
+    }
+    format!("{GROUP_PERMS_PREFIX}{}", parts.join(";"))
+}
+
+fn parse_group_permissions(text: &str) -> Option<wire::GroupEdit> {
+    let rest = text.strip_prefix(GROUP_PERMS_PREFIX)?;
+    let mut edit = wire::GroupEdit::default();
+    for pair in rest.split(';').filter(|s| !s.is_empty()) {
+        let (k, v) = pair.split_once('=')?;
+        match (k, v) {
+            ("members", "admin") => edit.member_access = Some(wire::GroupAccess::Administrator),
+            ("members", "member") => edit.member_access = Some(wire::GroupAccess::Member),
+            ("attributes", "admin") => edit.attributes_access = Some(wire::GroupAccess::Administrator),
+            ("attributes", "member") => edit.attributes_access = Some(wire::GroupAccess::Member),
+            ("announcements", "on") => edit.announcements_only = Some(true),
+            ("announcements", "off") => edit.announcements_only = Some(false),
+            _ => return None,
+        }
+    }
+    Some(edit)
+}
 
 /// Packs a Signal group admin role change so the existing member-management channel carries it.
 pub fn group_admin_command(person: &str, admin: bool) -> String {
@@ -1443,7 +1483,9 @@ fn offline(ctx: &Context, command: Command) {
         | Command::Edit { reply, .. }
         | Command::Delete { reply, .. }
         | Command::MembersAdd { reply, .. }
-        | Command::MembersRemove { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::MembersRemove { reply, .. }
+        | Command::ConversationUpdate { reply, .. }
+        | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
@@ -1563,6 +1605,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::MembersRemove { conversation_id, person, reply } => {
             let _ = reply.send(members_remove(account, &conversation_id, &person));
         }
+        Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+            let _ = reply.send(group_update(account, &conversation_id, title, topic.or(description)));
+        }
+        Command::ConversationPicture { conversation_id, path, reply } => {
+            let _ = reply.send(group_picture(account, &conversation_id, &path));
+        }
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
@@ -1581,6 +1629,21 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(set_own(account, name, about, emoji));
         }
         Command::SetDisappearing { conversation_id, seconds, reply } => {
+            if let Some(Peer::Group(group_id)) = Peer::parse(&conversation_id) {
+                let allowed = account
+                    .live()
+                    .group_info
+                    .get(&conversation_id)
+                    .is_some_and(|g| group_rights(g, &account.me).edit_topic);
+                if !allowed {
+                    let _ = reply.send(Err(Refusal::Refused("Only group admins can change the disappearing messages timer.".into())));
+                    return;
+                }
+                if let Err(fault) = account.wire.group_set_timer(&group_id, seconds) {
+                    let _ = reply.send(Err(refused(fault)));
+                    return;
+                }
+            }
             let next_version = {
                 let mut live = account.live();
                 let current = live.timer_of(&conversation_id);
@@ -1837,6 +1900,61 @@ fn members_remove(account: &Account, conversation_id: &str, person: &str) -> Res
         return Err(Refusal::Refused("Only group admins can remove members.".into()));
     }
     account.wire.group_remove_member(&group_id, person).map_err(refused)
+}
+
+fn group_update(account: &Account, conversation_id: &str, title: Option<String>, description: Option<String>) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    if let Some(desc) = description.as_deref() {
+        if let Some(edit) = parse_group_permissions(desc) {
+            let is_admin = account
+                .live()
+                .group_info
+                .get(conversation_id)
+                .is_some_and(|g| group_rights(g, &account.me).manage_members);
+            if !is_admin {
+                return Err(Refusal::Refused("Only group admins can change group permissions.".into()));
+            }
+            return account.wire.group_update(&group_id, edit).map_err(refused);
+        }
+    }
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| {
+            let r = group_rights(g, &account.me);
+            (title.is_none() || r.rename) && (description.is_none() || r.edit_topic)
+        });
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can edit group details.".into()));
+    }
+    if title.as_ref().is_some_and(|t| t.trim().is_empty()) {
+        return Err(Refusal::Refused("A group name can't be empty.".into()));
+    }
+    let edit = wire::GroupEdit { title, description, ..wire::GroupEdit::default() };
+    account.wire.group_update(&group_id, edit).map_err(refused)
+}
+
+fn group_picture(account: &Account, conversation_id: &str, path: &str) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| group_rights(g, &account.me).edit_picture);
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can change the group photo.".into()));
+    }
+    let bytes = if path.trim().is_empty() {
+        Vec::new()
+    } else {
+        std::fs::read(path).map_err(|_| Refusal::Refused("The photo file could not be read.".into()))?
+    };
+    account.wire.group_set_avatar(&group_id, bytes).map_err(refused)
 }
 
 /// The pictures of the people and groups on screen (rows, people, the open conversation): each

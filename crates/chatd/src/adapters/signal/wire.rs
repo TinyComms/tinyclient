@@ -87,6 +87,16 @@ pub struct GroupMember {
     pub admin: bool,
 }
 
+/// Group attribute and permission edits sent to Signal Groups v2.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupEdit {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub member_access: Option<GroupAccess>,
+    pub attributes_access: Option<GroupAccess>,
+    pub announcements_only: Option<bool>,
+}
+
 /// Full membership lists for a Signal group, read from the decrypted group state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupMembers {
@@ -386,6 +396,18 @@ pub trait Wire: Send + Sync {
     /// Promotes a member to admin or revokes their admin role.
     fn group_set_admin(&self, _group_id: &str, _person: &str, _admin: bool) -> Result<(), Fault> {
         Err(Fault::Refused("Changing group admin roles is not available.".to_owned()))
+    }
+    /// Updates a group's title, description, or permissions.
+    fn group_update(&self, _group_id: &str, _edit: GroupEdit) -> Result<(), Fault> {
+        Err(Fault::Refused("Editing group settings is not available.".to_owned()))
+    }
+    /// Sets (or clears when `bytes` is empty) a group's avatar.
+    fn group_set_avatar(&self, _group_id: &str, _bytes: Vec<u8>) -> Result<(), Fault> {
+        Err(Fault::Refused("Changing the group photo is not available.".to_owned()))
+    }
+    /// Sets a group's disappearing-messages timer (0 turns it off).
+    fn group_set_timer(&self, _group_id: &str, _seconds: u32) -> Result<(), Fault> {
+        Err(Fault::Refused("Changing the group timer is not available.".to_owned()))
     }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);

@@ -1483,3 +1483,99 @@ fn adding_and_removing_group_members_respects_permissions() {
     let rem_err = world.ask(Request::MembersRemove { conversation: key(CLUB), person: GRACE.into() });
     assert!(matches!(rem_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {rem_err:?}");
 }
+
+#[test]
+fn an_announcement_only_group_is_read_only_for_non_admins() {
+    let world = World::linked();
+    world.connected();
+
+    world.steer("group-role me member");
+    world.steer("group-access announcements=on");
+    let row = world.until("announcement-only read_only row", || {
+        let row = world.conversation(CLUB)?;
+        row.read_only.then_some(row)
+    });
+    assert_eq!(row.read_only_reason, "Only admins can send messages");
+
+    // Sending is refused while read-only.
+    let err = world.ask(Request::Send {
+        conversation: key(CLUB),
+        client_id: "ann-1".into(),
+        text: "Hello?".into(),
+        reply_to: None,
+        with: Default::default(),
+    });
+    assert!(matches!(err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {err:?}");
+
+    // Promoting back to admin re-enables posting.
+    world.steer("group-role me admin");
+    world.until("admin can post again", || {
+        let row = world.conversation(CLUB)?;
+        (!row.read_only).then_some(())
+    });
+    let sent = world.send(CLUB, "ann-2", "Admin announcement", None);
+    assert_eq!(sent.text, "Admin announcement");
+}
+
+#[test]
+fn editing_group_name_description_avatar_and_permissions() {
+    let world = World::linked();
+    world.connected();
+
+    let long_desc = "Bridge night details: ".to_owned() + &"a".repeat(350);
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: Some("Wednesday Bridge".into()),
+            topic: None,
+            description: Some(long_desc.clone()),
+        }),
+        Response::Ok
+    );
+    let updated = world.until("updated group title", || {
+        let row = world.conversation(CLUB)?;
+        (row.title == "Wednesday Bridge").then_some(row)
+    });
+    assert_eq!(updated.topic.chars().count(), 300, "row topic is capped at 300 chars");
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(CLUB) }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.description, long_desc, "ConversationInfo carries the full description");
+
+    // Change group photo.
+    let img = world.dir.join("group.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake").unwrap();
+    assert_eq!(
+        world.ask(Request::ConversationPicture { conversation: key(CLUB), path: img.to_string_lossy().into_owned() }),
+        Response::Ok
+    );
+    world.heard(&format!("group-avatar {CLUB} 12bytes"));
+
+    // Change permissions (attributes=admin, announcements=on).
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: None,
+            topic: None,
+            description: Some("\u{1}signal-group-perms\u{1}attributes=admin;announcements=on".into()),
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("group-update {CLUB} attributes=Administrator announcements=true"));
+
+    // Demote Ada: editing title/description/photo/permissions is now refused.
+    world.steer("group-role me member");
+    world.until("edit rights revoked for non-admin", || {
+        let row = world.conversation(CLUB)?;
+        (!row.rights.rename && !row.rights.edit_topic && !row.rights.edit_picture).then_some(())
+    });
+    let edit_err = world.ask(Request::ConversationUpdate {
+        conversation: key(CLUB),
+        title: Some("Blocked rename".into()),
+        topic: None,
+        description: None,
+    });
+    assert!(matches!(edit_err, Response::Error { code: ErrorCode::Refused, .. }));
+    let pic_err = world.ask(Request::ConversationPicture { conversation: key(CLUB), path: String::new() });
+    assert!(matches!(pic_err, Response::Error { code: ErrorCode::Refused, .. }));
+}

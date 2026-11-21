@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupInfo, GroupMember, GroupMembers, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -719,6 +719,84 @@ impl Wire for Fake {
             m.admin = admin;
         }
         g.sync_info();
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(())
+    }
+
+    fn group_update(&self, group_id: &str, edit: GroupEdit) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        let conv = Peer::Group(group_id.to_owned()).conversation();
+        let mut parts = Vec::new();
+        if let Some(t) = &edit.title {
+            parts.push(format!("title={t}"));
+        }
+        if let Some(d) = &edit.description {
+            parts.push(format!("description={}", d.chars().take(40).collect::<String>()));
+        }
+        if let Some(ma) = edit.member_access {
+            parts.push(format!("members={ma:?}"));
+        }
+        if let Some(aa) = edit.attributes_access {
+            parts.push(format!("attributes={aa:?}"));
+        }
+        if let Some(ao) = edit.announcements_only {
+            parts.push(format!("announcements={ao}"));
+        }
+        record(&format!("group-update {conv} {}", parts.join(" ")));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(title) = edit.title {
+            g.info.title = title;
+        }
+        if let Some(desc) = edit.description {
+            g.info.description = desc;
+        }
+        if let Some(ma) = edit.member_access {
+            g.info.member_access = ma;
+        }
+        if let Some(aa) = edit.attributes_access {
+            g.info.attributes_access = aa;
+        }
+        if let Some(ao) = edit.announcements_only {
+            g.info.announcements_only = ao;
+        }
+        let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
+        Ok(())
+    }
+
+    fn group_set_avatar(&self, group_id: &str, bytes: Vec<u8>) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        let conv = Peer::Group(group_id.to_owned()).conversation();
+        record(&format!("group-avatar {conv} {}", if bytes.is_empty() { "clear".to_owned() } else { format!("{}bytes", bytes.len()) }));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        Ok(())
+    }
+
+    fn group_set_timer(&self, group_id: &str, seconds: u32) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if group_id != CLUB {
+            return Err(Fault::Refused("This group isn't one Signal still knows for you.".into()));
+        }
+        let conv = Peer::Group(group_id.to_owned()).conversation();
+        record(&format!("group-timer {conv} {seconds}"));
+        let mut g = self.club.lock().unwrap_or_else(|p| p.into_inner());
+        g.info.timer_secs = seconds;
         let _ = self.events.send(Event::Groups(vec![g.info.clone()]));
         Ok(())
     }
