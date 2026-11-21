@@ -330,6 +330,8 @@ fn note(
         wire: 0,
         phones: None,
         reply: String::new(),
+        edited: false,
+        edited_at: None,
     }
 }
 
@@ -551,6 +553,30 @@ fn steer(line: &str) -> Vec<Event> {
             );
             sent.reply = original;
             vec![Event::Message(sent)]
+        }
+        "edited" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let id = words.next().unwrap_or("").to_owned();
+            let text = rest(3);
+            let mut updated = note(author, name, author, &id, &text, false, Vec::new(), Vec::new());
+            updated.edited = true;
+            updated.edited_at = Some(crate::hub::now());
+            vec![Event::Message(updated)]
+        }
+        "old-mine" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let id = words.next().unwrap_or("m-old").to_owned();
+            let age: i64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(1800);
+            let text = rest(4);
+            let mut old = note(ME, "Ada Quill", author, &id, &text, false, Vec::new(), Vec::new());
+            old.outgoing = true;
+            old.status = 2;
+            old.sent = crate::hub::now() - age;
+            vec![Event::Message(old)]
         }
         "react" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
@@ -980,6 +1006,14 @@ impl Drive for Fake {
     }
     fn delete_message(&self, message: &str) -> Result<(), String> {
         record(&format!("delete {message}"));
+        Ok(())
+    }
+    fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        record(&format!("edit {conversation} {message} {text}"));
         Ok(())
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {

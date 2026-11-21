@@ -158,6 +158,7 @@ trait Drive: Send + Sync {
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String>;
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn delete_message(&self, message: &str) -> Result<(), String>;
+    fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String>;
     fn delete_conversation(&self, conversation: &str) -> Result<(), String>;
     fn unpair(&self) -> Result<(), String>;
     fn block(&self, conversation: &str) -> Result<(), String>;
@@ -236,6 +237,9 @@ impl Drive for LiveDrive {
     }
     fn delete_message(&self, message: &str) -> Result<(), String> {
         self.inner.delete_message(message)
+    }
+    fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String> {
+        self.inner.edit_message(conversation, message, text)
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         self.inner.delete_conversation(conversation)
@@ -640,6 +644,7 @@ fn connect(
     ctx.capabilities(Capabilities {
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
+        edit_window: bugle::EDIT_WINDOW_SECS,
         close_direct: true,
         ..Capabilities::default()
     });
@@ -1116,6 +1121,8 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
         outgoing,
     );
     message.sender.id = author.to_owned();
+    message.edited = note.edited;
+    message.edited_at = note.edited_at;
     if !note.reply.is_empty() {
         message.reply_to = Some(quoted(account, &note.conversation, &note.reply, page));
     }
@@ -1682,6 +1689,16 @@ fn serve(account: &Arc<Account>, command: Command) {
                 let _ = account.drive.typing(&conversation_id);
             }
         }
+        Command::Edit {
+            conversation_id,
+            message_id,
+            text,
+            spans: _,
+            reply,
+        } => {
+            let answer = edit_message(account, &conversation_id, &message_id, text);
+            let _ = reply.send(answer);
+        }
         Command::Delete {
             conversation_id,
             message_id,
@@ -1770,6 +1787,37 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         other => other.unsupported(ctx),
     }
+}
+
+fn edit_message(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    text: String,
+) -> Result<(), Refusal> {
+    if !bugle::allows_edit(carrier_of(account, conversation)) {
+        return Err(Refusal::Refused("Only RCS messages can be edited.".into()));
+    }
+    let Some(mut stored) = account.ctx.stored_message(conversation, message_id).ok().flatten() else {
+        return Err(Refusal::Refused("Messages could not find that message.".into()));
+    };
+    if !stored.outgoing {
+        return Err(Refusal::Refused("You can only edit your own messages.".into()));
+    }
+    let now = crate::hub::now();
+    if now.saturating_sub(stored.sent) > i64::from(bugle::EDIT_WINDOW_SECS) {
+        return Err(Refusal::Refused("This message can no longer be edited.".into()));
+    }
+    let remote_id = phone_copy(account, message_id).unwrap_or_else(|| message_id.to_owned());
+    account
+        .drive
+        .edit_message(conversation, &remote_id, &text)
+        .map_err(Refusal::Refused)?;
+    stored.text = text;
+    stored.edited = true;
+    stored.edited_at = Some(now);
+    let _ = account.ctx.message(conversation, &stored);
+    Ok(())
 }
 
 fn warn_mms(account: &Account, conversation: &str, client_id: &str) {

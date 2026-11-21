@@ -1199,6 +1199,10 @@ pub struct Note {
     pub phones: Option<bool>,
     /// `ReplyMessage.messageID`, field 21.1. Empty when this message is not a reply.
     pub reply: String,
+    /// True when the phone marked this RCS message as edited.
+    pub edited: bool,
+    /// Unix seconds when the message was edited, if reported by the phone.
+    pub edited_at: Option<i64>,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -1348,6 +1352,14 @@ pub fn wire_tag(wire: u64, carrier: u64) -> &'static str {
         4 => "RCS",
         _ => "",
     }
+}
+
+/// Google Messages lets a person edit an RCS message for 15 minutes after sending.
+pub const EDIT_WINDOW_SECS: u32 = 15 * 60;
+
+/// Editing is only allowed in an RCS conversation (`Conversation.type` 2), never SMS/MMS.
+pub fn allows_edit(carrier: u64) -> bool {
+    carrier == 2
 }
 
 /// A reply reference is only sent in an RCS conversation (`Conversation.type` 2). SMS, MMS,
@@ -2098,6 +2110,11 @@ impl Session {
             return Err("Messages didn't delete that. Keep the phone online.".into());
         }
         Ok(())
+    }
+
+    pub fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String> {
+        let bytes = self.rpc(47, &edit_message_request(conversation, message, text), 2)?;
+        refused(&bytes)
     }
 
     pub fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
@@ -2880,6 +2897,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         let reply = field(&msg, 21)
             .map(|field| field_text(&fields(&field.bytes), 1))
             .unwrap_or_default();
+        let (edited, edited_at) = decode_edit_status(&msg);
         if text.is_empty()
             && file
             && pieces
@@ -2913,9 +2931,53 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             wire,
             phones: None,
             reply,
+            edited,
+            edited_at,
         });
     }
     notes
+}
+
+/// Decodes RCS edit metadata from a Bugle `Message`:
+/// - field 27 as submessage (edit status with timestamp in field 1 or 2) or varint != 0
+/// - field 28 as boolean `isEdited`
+fn decode_edit_status(msg: &[Field]) -> (bool, Option<i64>) {
+    if let Some(f) = field(msg, 27) {
+        if let Some(v) = f.varint {
+            if v != 0 {
+                return (true, None);
+            }
+        } else if !f.bytes.is_empty() {
+            let inner = fields(&f.bytes);
+            let ts = field_int(&inner, 2).max(field_int(&inner, 1)) as i64;
+            let at = if ts > 1_000_000_000_000_000 {
+                Some(ts / 1_000_000)
+            } else if ts > 1_000_000_000_000 {
+                Some(ts / 1_000)
+            } else if ts > 0 {
+                Some(ts)
+            } else {
+                None
+            };
+            return (true, at);
+        }
+    }
+    if field_int(msg, 28) != 0 {
+        return (true, None);
+    }
+    (false, None)
+}
+
+fn edit_message_request(conversation: &str, message: &str, text: &str) -> Vec<u8> {
+    let mut content = Buf::new();
+    content.text(1, text);
+    let mut info = Buf::new();
+    info.msg(2, &content.0);
+    let mut req = Buf::new();
+    req.text(1, conversation);
+    req.text(2, message);
+    req.msg(3, &info.0);
+    req.0
 }
 
 /// The lab sets `TINYCLIENT_PROVE=messages-reply`. A build from before this ignores that
@@ -3538,5 +3600,37 @@ mod tests {
         assert_eq!(chats.len(), 1);
         assert!(chats[0].read_only);
         assert!(chats[0].verified);
+    }
+
+    #[test]
+    fn rcs_edit_flag_decodes_and_edit_request_encodes() {
+        assert!(allows_edit(2));
+        assert!(!allows_edit(1));
+        assert!(!allows_edit(0));
+
+        let mut edit_info = Buf::new();
+        edit_info.int(2, 1_791_893_000_000_000);
+        let mut msg = Buf::new();
+        msg.text(1, "m-edit");
+        msg.text(7, "c-rcs");
+        msg.msg(27, &edit_info.0);
+        let mut words = Buf::new();
+        words.text(1, "corrected");
+        let mut info = Buf::new();
+        info.msg(2, &words.0);
+        msg.msg(10, &info.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].edited);
+        assert_eq!(notes[0].edited_at, Some(1_791_893_000));
+        assert_eq!(notes[0].text, "corrected");
+
+        let req = fields(&edit_message_request("c-rcs", "m-edit", "updated text"));
+        assert_eq!(field_text(&req, 1), "c-rcs");
+        assert_eq!(field_text(&req, 2), "m-edit");
+        let inner = fields(&field_bytes(&req, 3));
+        assert_eq!(field_text(&fields(&field_bytes(&inner, 2)), 1), "updated text");
     }
 }

@@ -150,19 +150,32 @@ pub(super) fn starts_thread(message: &Message, network: Network, kind: Conversat
 
 /// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
 pub fn can(message: &Message, network: Network, kind: ConversationKind, in_thread: bool) -> Can {
+    can_in(message, network, kind, in_thread, "", 0, 0)
+}
+
+/// Same as [`can`], with the conversation's topic (used to tell RCS from SMS on Messages) and
+/// the account's `edit_window` in seconds (0 = no limit).
+pub fn can_in(
+    message: &Message,
+    network: Network,
+    kind: ConversationKind,
+    in_thread: bool,
+    topic: &str,
+    edit_window: u32,
+    now: i64,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
     let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
+    let in_window = edit_window == 0 || now == 0 || now.saturating_sub(message.sent) <= i64::from(edit_window);
+    let messages_rcs = network != Network::Messages || topic.starts_with("RCS message");
     Can {
         act,
         // Slack has no inline reply: its reply is the thread.
         reply: act && network != Network::Slack,
         thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, network, kind)),
-        // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
-        // on every message of mine and a refusal is the network's answer. Messages never edits
-        // or deletes, so those items stay off.
-        edit: sent && own && !message.saved_history && network != Network::Messages,
+        edit: sent && own && !message.saved_history && messages_rcs && in_window,
         delete: own && network != Network::Messages,
         unsent: !sent && message.outgoing,
     }
@@ -307,7 +320,13 @@ impl Pane {
     pub(super) fn can(&self, message: &Message) -> Can {
         // No open conversation is not a place a thread can be started from.
         let kind = self.open.as_ref().map(|open| open.kind).unwrap_or(ConversationKind::Thread);
-        can(message, self.network(), kind, self.is_thread())
+        let topic = self.open.as_ref().map(|open| open.topic.as_str()).unwrap_or("");
+        let edit_window = if self.network() == Network::Messages { 15 * 60 } else { 0 };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        can_in(message, self.network(), kind, self.is_thread(), topic, edit_window, now)
     }
 
     // Reactions.
@@ -1714,5 +1733,20 @@ mod tests {
         saved.outgoing = false;
         let neutral = can(&saved, Network::Tiny, ConversationKind::Direct, false);
         assert!(!neutral.edit && !neutral.delete);
+    }
+
+    #[test]
+    fn messages_edit_is_only_offered_for_own_rcs_messages_inside_the_window() {
+        let now = 1_791_893_000;
+        let mine = Message::plain("m1", "Ada", "hi", now - 60, true);
+        let theirs = Message::plain("m2", "Grace", "hi", now - 60, false);
+        let old = Message::plain("m3", "Ada", "old", now - 1200, true);
+
+        assert!(can_in(&mine, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
+        assert!(can_in(&mine, Network::Messages, ConversationKind::Direct, false, "RCS message · Encrypted between phones", 900, now).edit);
+        assert!(!can_in(&theirs, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
+        assert!(!can_in(&old, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
+        assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "Text message", 900, now).edit);
+        assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "", 900, now).edit);
     }
 }

@@ -1710,3 +1710,95 @@ fn alphanumeric_senders_are_read_only_short_codes_stay_replyable_and_emergency_i
     assert_eq!(em.call, CallSupport::None);
     assert!(em.read_only_reason.contains("phone"), "{}", em.read_only_reason);
 }
+
+#[test]
+fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let mine = accounts
+        .iter()
+        .find(|status| status.key == account())
+        .expect("Messages account");
+    assert_eq!(mine.can.edit_window, 15 * 60);
+
+    // Switch Grace to RCS.
+    world.steer("rcs grace");
+    world.until("RCS topic", || {
+        world
+            .conversation(GRACE)
+            .filter(|row| row.topic.contains("RCS message"))
+    });
+
+    // Incoming message edited by Grace is marked edited.
+    world.steer("incoming grace Typo here");
+    let incoming = world.arrived(GRACE, "Typo here");
+    assert!(!incoming.edited);
+    world.steer(&format!("edited grace {} Fixed text", incoming.id));
+    let updated = world.until("incoming edit", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == incoming.id && m.edited)
+    });
+    assert_eq!(updated.text, "Fixed text");
+    assert!(updated.edited);
+
+    // Outgoing RCS message inside window can be edited.
+    let sent = world.send(GRACE, "edit-1", "Original text");
+    world.heard(&format!("send {GRACE} Original text"));
+    world.until("sent settled", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == sent.id && m.state == SendState::Sent)
+    });
+    match world.ask(Request::Edit {
+        conversation: key(GRACE),
+        message_id: sent.id.clone(),
+        text: "Edited text".into(),
+        spans: Vec::new(),
+    }) {
+        Response::Ok => {}
+        other => panic!("expected Edit Ok, got {other:?}"),
+    }
+    let edited = world.until("own edited message", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == sent.id && m.edited && m.text == "Edited text")
+    });
+    assert!(edited.edited);
+    assert!(world.calls().iter().any(|c| c.starts_with(&format!("edit {GRACE} ")) && c.ends_with(" Edited text")));
+
+    // Outgoing RCS message outside the 15-minute window is refused.
+    world.steer("old-mine grace m-too-old 1800 Way too old");
+    let old = world.arrived(GRACE, "Way too old");
+    match world.ask(Request::Edit {
+        conversation: key(GRACE),
+        message_id: old.id.clone(),
+        text: "Cannot edit".into(),
+        spans: Vec::new(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("no longer be edited"), "{detail}"),
+        other => panic!("expected stale edit refusal, got {other:?}"),
+    }
+
+    // SMS chat refuses edits.
+    world.steer("sms grace");
+    world.until("SMS topic", || {
+        world
+            .conversation(GRACE)
+            .filter(|row| row.topic == "Text message")
+    });
+    match world.ask(Request::Edit {
+        conversation: key(GRACE),
+        message_id: sent.id.clone(),
+        text: "SMS edit".into(),
+        spans: Vec::new(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("RCS"), "{detail}"),
+        other => panic!("expected SMS edit refusal, got {other:?}"),
+    }
+}

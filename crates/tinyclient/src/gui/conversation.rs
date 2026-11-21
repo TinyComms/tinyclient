@@ -147,6 +147,8 @@ struct Open {
     reactions: Option<protocol::ReactionRules>,
     /// What became of my newest message, from the conversation's row.
     receipt: Option<protocol::Receipt>,
+    /// Conversation topic (e.g. "RCS message" / "Text message" for Google Messages).
+    topic: String,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -462,10 +464,11 @@ impl Pane {
     fn show(&mut self, conversation: &Conversation, me: &str, picture: Option<MediaFile>, typing: bool, cx: &mut Context<Self>) {
         let receipt = conversation.receipt();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
-            if open.title != conversation.title || open.picture != picture || open.receipt != receipt {
+            if open.title != conversation.title || open.picture != picture || open.receipt != receipt || open.topic != conversation.topic {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
                 open.receipt = receipt;
+                open.topic.clone_from(&conversation.topic);
                 cx.notify();
             }
             return;
@@ -481,6 +484,7 @@ impl Pane {
         if let Some(open) = self.open.as_mut() {
             open.picture = picture;
             open.receipt = receipt;
+            open.topic.clone_from(&conversation.topic);
         }
     }
 
@@ -517,6 +521,7 @@ impl Pane {
             root,
             reactions: None,
             receipt: None,
+            topic: String::new(),
             started: Instant::now(),
         });
         self.window = pages::Window::default();
