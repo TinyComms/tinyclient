@@ -499,6 +499,7 @@ impl Shell {
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;
             }
+            self.sync_popout_composers(cx);
         }
 
         let (inbox_changed, home_changed) = self.sidebar_state.without_signed_out(&keep);
@@ -1071,6 +1072,7 @@ impl Shell {
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;
             }
+            self.sync_popout_composers(cx);
         }
         let request = Request::SignOut { account, erase };
         self.off_thread(cx, move || ask(&request), |this, _, cx| {

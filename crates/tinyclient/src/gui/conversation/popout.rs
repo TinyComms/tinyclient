@@ -44,9 +44,19 @@ pub(in crate::gui) fn modifier_opens_window(click_count: usize, modified: bool) 
     click_count == 2 && modified
 }
 
+pub(in crate::gui) fn modifier_held(modifiers: gpui::Modifiers) -> bool {
+    modifiers.shift || modifiers.alt || crate::gui::shortcuts::primary(modifiers)
+}
+
 pub(in crate::gui) fn modifier_click(click_count: usize, modifiers: gpui::Modifiers) -> bool {
-    let modified = modifiers.shift || modifiers.alt || crate::gui::shortcuts::primary(modifiers);
-    modifier_opens_window(click_count, modified)
+    modifier_opens_window(click_count, modifier_held(modifiers))
+}
+
+/// A modifier press is the pop-out gesture. It does not also open the row,
+/// including the first press of the double-click. That press would aim the
+/// main window at the conversation, and the new window would have no composer.
+pub(in crate::gui) fn press_opens_row(modified: bool) -> bool {
+    !modified
 }
 
 /// The conversation `Watch` names. The focused pop-out wins; otherwise the main window's,
@@ -529,12 +539,24 @@ impl Shell {
         let Some(handle) = self.conversation_state.windows.handle(key) else {
             return;
         };
+        // A window opened on a thread follows the main thread, not the open conversation.
+        let as_thread = self
+            .conversation_state
+            .windows
+            .open
+            .iter()
+            .find(|live| live.key == *key)
+            .is_some_and(|live| live.pane.read(cx).is_thread());
+        let aimed = if as_thread { self.main_thread_key(cx) } else { self.open.clone() };
         let row = self.conversation_row(key);
-        let want = row.as_ref().is_some_and(|row| row.special != Special::Service) && composer_for_popout(self.open.as_ref(), key);
+        // No list row: a thread window still types. A conversation window does not.
+        let allowed = row.as_ref().map(|row| row.special != Special::Service).unwrap_or(as_thread);
+        let want = allowed && composer_for_popout(aimed.as_ref(), key);
         let has = self.conversation_state.windows.open.iter().any(|live| live.key == *key && live.composer.is_some());
+        let open_row = row.clone().or_else(|| as_thread.then(|| bare_thread(key)));
         if want && !has {
-            if let Some(row) = row {
-                let composer = self.window_composer(&row, false, cx);
+            if let Some(row) = open_row.clone() {
+                let composer = self.window_composer(&row, as_thread, cx);
                 if let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *key) {
                     live.composer = Some(composer.clone());
                 }
@@ -544,13 +566,13 @@ impl Shell {
                 });
             }
         } else if !want && has {
-            self.drop_window_composer(key, false);
+            self.drop_window_composer(key, false, cx);
             let _ = handle.update(cx, |view, _, cx| {
                 view.composer = None;
                 cx.notify();
             });
         } else if want {
-            if let Some(row) = row {
+            if let Some(row) = open_row {
                 if let Some(composer) = self
                     .conversation_state
                     .windows
@@ -559,10 +581,70 @@ impl Shell {
                     .find(|live| live.key == *key)
                     .and_then(|live| live.composer.clone())
                 {
-                    self.reaim_window_composer(&composer, &row, false, cx);
+                    self.reaim_window_composer(&composer, &row, as_thread, cx);
                 }
             }
         }
+        self.sync_window_thread(key, cx);
+    }
+
+    /// The thread pane in a conversation window. One composer owns its draft:
+    /// this window's while the main window's thread is closed, the main
+    /// window's while that thread is open.
+    fn sync_window_thread(&mut self, window_key: &Key, cx: &mut Context<Self>) {
+        let Some(handle) = self.conversation_state.windows.handle(window_key) else {
+            return;
+        };
+        let thread_key = self
+            .conversation_state
+            .windows
+            .open
+            .iter()
+            .find(|live| live.key == *window_key)
+            .and_then(|live| live.thread.as_ref())
+            .and_then(|pane| pane.read(cx).key().cloned());
+        let Some(thread_key) = thread_key else {
+            return;
+        };
+        let want = composer_for_popout(self.main_thread_key(cx).as_ref(), &thread_key);
+        let has = self.conversation_state.windows.open.iter().any(|live| live.key == *window_key && live.thread_composer.is_some());
+        if want && !has {
+            let bare = self.thread_row(window_key, thread_key);
+            let composer = self.window_composer(&bare, true, cx);
+            if let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *window_key) {
+                live.thread_composer = Some(composer.clone());
+            }
+            let _ = handle.update(cx, |view, _, cx| {
+                view.thread_composer = Some(composer);
+                cx.notify();
+            });
+        } else if !want && has {
+            self.drop_window_composer(window_key, true, cx);
+            let _ = handle.update(cx, |view, _, cx| {
+                view.thread_composer = None;
+                cx.notify();
+            });
+        } else if want {
+            let bare = self.thread_row(window_key, thread_key);
+            if let Some(composer) = self
+                .conversation_state
+                .windows
+                .open
+                .iter()
+                .find(|live| live.key == *window_key)
+                .and_then(|live| live.thread_composer.clone())
+            {
+                self.reaim_window_composer(&composer, &bare, true, cx);
+            }
+        }
+    }
+
+    fn thread_row(&self, window_key: &Key, thread_key: Key) -> Conversation {
+        let parent = self.conversation_row(window_key);
+        let title = parent.as_ref().map(|row| row.title.clone()).unwrap_or_else(|| "Thread".to_owned());
+        let mut bare = Conversation::new(thread_key, ConversationKind::Thread, title);
+        bare.read_only = parent.is_some_and(|row| row.read_only);
+        bare
     }
 
     /// A listed row changed: the open window picks up its title and what it can do.
@@ -670,7 +752,7 @@ impl Shell {
         if let Some(frame) = prepared.restore_pending {
             self.conversation_state.windows.pending.push((prepared.key, frame));
         }
-        self.drop_composers(&prepared.composer.into_iter().collect::<Vec<_>>());
+        self.drop_one_composer(prepared.composer, cx);
         cx.notify();
     }
 
@@ -681,7 +763,9 @@ impl Shell {
         let mut composers = Vec::new();
         composers.extend(live.composer);
         composers.extend(live.thread_composer);
-        self.drop_composers(&composers);
+        for composer in composers {
+            self.drop_one_composer(Some(composer), cx);
+        }
         self.sync_watch(cx);
         self.save_prefs(cx);
         cx.notify();
@@ -750,14 +834,6 @@ impl Shell {
             pane.show_thread(key.clone(), &title, &me, can, rights, root, cx);
             pane
         });
-        let main_thread = self.main_thread_key(cx);
-        let composer = if composer_for_popout(main_thread.as_ref(), &key) {
-            let mut bare = Conversation::new(key.clone(), ConversationKind::Thread, title);
-            bare.read_only = parent.as_ref().is_some_and(|row| row.read_only);
-            Some(self.window_composer(&bare, true, cx))
-        } else {
-            None
-        };
         let previous = self
             .conversation_state
             .windows
@@ -765,16 +841,19 @@ impl Shell {
             .iter_mut()
             .find(|live| live.key == *window_key)
             .and_then(|live| live.thread_composer.take());
-        self.drop_one_composer(previous);
+        self.drop_one_composer(previous, cx);
         if let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *window_key) {
             live.thread = Some(pane.clone());
-            live.thread_composer = composer.clone();
+            live.thread_composer = None;
         }
         let _ = handle.update(cx, |view, _, cx| {
             view.thread = Some(pane);
-            view.thread_composer = composer;
+            view.thread_composer = None;
             cx.notify();
         });
+        // The main thread may already own this draft, or it may take it later.
+        // Sync decides, and decides again when the main thread opens or closes.
+        self.sync_window_thread(window_key, cx);
     }
 
     fn clear_window_thread(&mut self, window_key: &Key, cx: &mut Context<Self>) {
@@ -784,24 +863,27 @@ impl Shell {
         live.thread = None;
         let composer = live.thread_composer.take();
         drop(live);
-        self.drop_one_composer(composer);
+        self.drop_one_composer(composer, cx);
         cx.notify();
     }
 
-    fn drop_window_composer(&mut self, key: &Key, thread: bool) {
+    fn drop_window_composer(&mut self, key: &Key, thread: bool, cx: &mut Context<Self>) {
         let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *key) else {
             return;
         };
         let composer = if thread { live.thread_composer.take() } else { live.composer.take() };
         drop(live);
-        self.drop_one_composer(composer);
+        self.drop_one_composer(composer, cx);
     }
 
-    fn drop_one_composer(&mut self, composer: Option<Entity<Composer>>) {
-        if let Some(composer) = composer {
-            self.drop_composers(&[composer]);
-        }
+    fn drop_one_composer(&mut self, composer: Option<Entity<Composer>>, cx: &mut Context<Self>) {
+        self.release_window_composer(composer, cx);
     }
+}
+
+/// A thread that is not a list row. The window still types in it.
+fn bare_thread(key: &Key) -> Conversation {
+    Conversation::new(key.clone(), ConversationKind::Thread, "Thread")
 }
 
 #[cfg(test)]
@@ -833,6 +915,14 @@ mod tests {
         assert!(!modifier_opens_window(1, true));
         assert!(!modifier_opens_window(2, false));
         assert!(!modifier_opens_window(3, true));
+    }
+
+    #[test]
+    fn the_first_press_of_a_modifier_double_click_does_not_open_the_row() {
+        assert!(!press_opens_row(true));
+        assert!(press_opens_row(false));
+        assert!(modifier_opens_window(2, true));
+        assert!(!modifier_opens_window(1, true));
     }
 
     #[test]

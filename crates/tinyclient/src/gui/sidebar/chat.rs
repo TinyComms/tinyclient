@@ -434,6 +434,10 @@ impl Shell {
                         this.pop_out_conversation(open.key.clone(), cx);
                         return;
                     }
+                    // The first press of that double-click must not open the row.
+                    if !crate::gui::conversation::press_opens_row(crate::gui::conversation::modifier_held(event.modifiers)) {
+                        return;
+                    }
                     this.pick_row(&open, cx);
                 }),
             )

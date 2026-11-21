@@ -345,6 +345,14 @@ impl Draft {
     }
 }
 
+/// What the field shows when a composer is aimed here. A draft handed over
+/// from the composer that just owned the conversation wins, including an
+/// empty one. What this composer remembered when it left is next. The row
+/// is only the fallback.
+fn draft_on_open(handed: Option<Draft>, remembered: Option<Draft>, stored: &str) -> Draft {
+    handed.or(remembered).unwrap_or_else(|| Draft { text: stored.to_owned(), ..Draft::default() })
+}
+
 /// The parked text is still the message that went. A follow-up typed before the
 /// answer arrived is a different draft and stays.
 fn parked_text_is_the_send(parked: &str, sent_field: &str) -> bool {
@@ -519,6 +527,9 @@ pub struct Composer {
     thread: bool,
     target: Option<Target>,
     drafts: HashMap<Key, Draft>,
+    /// A draft handed over by the composer that owned this conversation. The
+    /// next aim at that key shows it, ahead of what this composer remembered.
+    incoming: Option<(Key, Draft)>,
     draft_order: VecDeque<Key>,
     /// The draft chatd holds for this conversation, as far as this window knows.
     saved: String,
@@ -658,6 +669,7 @@ impl Composer {
             thread,
             target: None,
             drafts: HashMap::new(),
+            incoming: None,
             draft_order: VecDeque::new(),
             saved: String::new(),
             offered: String::new(),
@@ -738,7 +750,10 @@ impl Composer {
         let renamed = self.target.as_ref().map(|old| &old.title) != Some(&target.title);
         if moved {
             self.leave(cx);
-            let draft = self.drafts.get(&target.key).cloned().unwrap_or_else(|| Draft { text: stored.to_owned(), ..Draft::default() });
+            // Typing in the composer that just owned this conversation wins.
+            // What this one parked when it left is the fallback, then the row.
+            let handed = self.take_incoming(&target.key);
+            let draft = draft_on_open(handed, self.drafts.get(&target.key).cloned(), stored);
             self.saved = draft_text(&draft.text);
             self.set_field(&draft, cx);
             let note = draft.note.clone();
@@ -797,6 +812,81 @@ impl Composer {
         let draft = Draft { text: draft_text(self.input.read(cx).text()), subject: self.subject.read(cx).text().trim().to_owned(), tokens: self.tokens.clone(), files,
             note: self.caption.clone(), reply: self.reply.take(), };
         self.remember(old, draft);
+    }
+
+    /// The draft this composer holds for `key`. The field, when it is aimed
+    /// there, including keystrokes the quiet timer has not saved yet.
+    fn held_draft(&self, key: &Key, cx: &App) -> Option<Draft> {
+        if self.target.as_ref().is_some_and(|target| target.key == *key) {
+            if let Some(editing) = &self.editing {
+                return Some(editing.stash.clone());
+            }
+            return Some(Draft {
+                text: draft_text(self.input.read(cx).text()),
+                subject: self.subject.read(cx).text().trim().to_owned(),
+                tokens: self.tokens.clone(),
+                files: self.tray.clone(),
+                note: self.caption.clone(),
+                reply: self.reply.clone(),
+            });
+        }
+        self.drafts.get(key).cloned()
+    }
+
+    /// Writes the field to chatd when this composer is aimed at `key`, and
+    /// drops the quiet timer so a later drop cannot cancel the save.
+    fn flush_aimed(&mut self, key: &Key, cx: &mut Context<Self>) {
+        if self.editing.is_some() || self.target.as_ref().is_none_or(|target| target.key != *key) {
+            return;
+        }
+        self.save_draft(cx);
+        self.draft_timer = None;
+    }
+
+    fn take_incoming(&mut self, key: &Key) -> Option<Draft> {
+        match self.incoming.take() {
+            Some((incoming, draft)) if incoming == *key => Some(draft),
+            other => {
+                self.incoming = other;
+                None
+            }
+        }
+    }
+
+    /// Parks `draft` as what the next aim shows. A draft this composer
+    /// remembered when it left loses.
+    fn offer_draft(&mut self, key: Key, draft: Draft) {
+        self.remember(key.clone(), draft.clone());
+        self.incoming = Some((key, draft));
+    }
+
+    /// The composer that owns `key` now shows `draft`, in the field when it
+    /// is already aimed there.
+    fn accept_draft(&mut self, key: Key, draft: Draft, cx: &mut Context<Self>) {
+        let showing = self.editing.is_none() && self.target.as_ref().is_some_and(|target| target.key == key);
+        if !showing {
+            self.offer_draft(key, draft);
+            return;
+        }
+        self.remember(key, draft.clone());
+        self.incoming = None;
+        self.saved = draft_text(&draft.text);
+        self.offered = self.saved.clone();
+        self.set_field(&draft, cx);
+        self.tray = draft.files;
+        self.reply = draft.reply;
+        self.caption = draft.note;
+        self.touched = true;
+        self.draft_timer = None;
+        cx.notify();
+    }
+
+    /// Saves the field and returns the draft, files and reply included, so
+    /// another composer can show it after this one is dropped.
+    fn release_draft(&mut self, cx: &mut Context<Self>) -> Option<(Key, Draft)> {
+        let key = self.target.as_ref().map(|target| target.key.clone())?;
+        self.leave(cx);
+        self.drafts.get(&key).cloned().map(|draft| (key, draft))
     }
 
     fn remember(&mut self, key: Key, draft: Draft) {
@@ -4043,14 +4133,59 @@ impl Shell {
         div().flex_none().child(composer)
     }
 
-    /// A composer for a conversation window. It owns the draft only while the main window is
-    /// aimed somewhere else; the caller decides that before asking.
+    /// A composer for a conversation window. It opens on the draft the main
+    /// composer holds now, including keystrokes the quiet timer has not saved.
+    /// It owns that draft only while the main window is aimed somewhere else;
+    /// the caller decides that before asking.
     pub(in crate::gui) fn window_composer(&mut self, open: &Conversation, thread: bool, cx: &mut Context<Self>) -> Entity<Composer> {
         let (shell, hub) = (cx.weak_entity(), self.people_state.hub());
         let composer = cx.new(|cx| Composer::new(shell, hub, thread, cx));
+        self.give_live_draft(&composer, &open.key, thread, cx);
         self.reaim_window_composer(&composer, open, thread, cx);
         self.composer_state.extra.push(composer.clone());
         composer
+    }
+
+    /// Copies the draft the main composer holds for `key` onto a window composer
+    /// before that window aims, so the row's older text does not win.
+    fn give_live_draft(&mut self, composer: &Entity<Composer>, key: &Key, thread: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.composer_made(thread) else {
+            return;
+        };
+        if source.entity_id() == composer.entity_id() {
+            return;
+        }
+        source.update(cx, |source, cx| source.flush_aimed(key, cx));
+        let Some(draft) = source.read(cx).held_draft(key, cx) else {
+            return;
+        };
+        composer.update(cx, |composer, _| composer.offer_draft(key.clone(), draft));
+    }
+
+    fn composer_made(&self, thread: bool) -> Option<Entity<Composer>> {
+        let slot = if thread { &self.composer_state.thread } else { &self.composer_state.main };
+        slot.get().cloned()
+    }
+
+    /// Saves the window composer's draft, gives it to the main composer, and
+    /// drops the window composer. The quiet timer is cancelled by the save.
+    pub(in crate::gui) fn release_window_composer(&mut self, composer: Option<Entity<Composer>>, cx: &mut Context<Self>) {
+        let Some(composer) = composer else {
+            return;
+        };
+        let thread = composer.read(cx).thread;
+        if self.composer_made(thread).as_ref().map(Entity::entity_id) == Some(composer.entity_id()) {
+            self.drop_composers(&[composer]);
+            return;
+        }
+        let released = composer.update(cx, |composer, cx| composer.release_draft(cx));
+        if let Some((key, draft)) = released {
+            let dest = self.composer_in(thread, cx);
+            if dest.entity_id() != composer.entity_id() {
+                dest.update(cx, |dest, cx| dest.accept_draft(key, draft, cx));
+            }
+        }
+        self.drop_composers(&[composer]);
     }
 
     pub(in crate::gui) fn reaim_window_composer(&mut self, composer: &Entity<Composer>, open: &Conversation, thread: bool, cx: &mut Context<Self>) {
@@ -4618,6 +4753,20 @@ mod tests {
 
     fn mention(range: std::ops::Range<usize>, label: &str) -> Token {
         Token { range, label: label.into(), kind: mention::Kind::Role, id: "41".into() }
+    }
+
+    #[test]
+    fn a_handed_draft_wins_over_what_this_composer_remembered() {
+        let handed = Draft { text: "typed in the window".into(), reply: reply("m9"), ..Draft::default() };
+        let remembered = Draft { text: "typed before it left".into(), reply: reply("m1"), ..Draft::default() };
+        let won = draft_on_open(Some(handed), Some(remembered.clone()), "stored on the row");
+        assert_eq!(won.text, "typed in the window");
+        assert_eq!(won.reply.as_ref().map(|reply| reply.id.as_str()), Some("m9"));
+        // Clearing the window is a draft too: the old memory does not come back.
+        let cleared = draft_on_open(Some(Draft::default()), Some(remembered.clone()), "stored on the row");
+        assert!(cleared.text.is_empty());
+        assert_eq!(draft_on_open(None, Some(remembered), "stored on the row").text, "typed before it left");
+        assert_eq!(draft_on_open(None, None, "stored on the row").text, "stored on the row");
     }
 
     #[test]

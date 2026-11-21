@@ -423,6 +423,8 @@ impl Shell {
                 }
             }
         }
+        // Opening or closing the main thread moves that thread's draft.
+        self.sync_popout_composers(cx);
     }
 
     /// Another view changed the slot: the ✕, `cmd-.`, a member row's profile, the members
@@ -448,6 +450,7 @@ impl Shell {
             self.dismiss_search(cx);
             return;
         }
+        let mut thread_closed = false;
         let side = &mut self.conversation_state.side;
         match slot {
             // In a narrow window the pane stood in for the conversation, and "‹ #channel" or ✕
@@ -468,6 +471,7 @@ impl Shell {
                 side.search = None;
                 side.search_input = None;
                 self.conversation_state.thread.borrow_mut().take();
+                thread_closed = true;
             }
             Some(RightKind::Info) => {
                 if let Some(shown) = shown {
@@ -490,7 +494,11 @@ impl Shell {
                 pane::keep_thread(&side.stack, &Stack::default(), &mut side.threads);
                 side.stack = Stack::default();
                 side.installed = None;
+                thread_closed = true;
             }
+        }
+        if thread_closed {
+            self.sync_popout_composers(cx);
         }
     }
 

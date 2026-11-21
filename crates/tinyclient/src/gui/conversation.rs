@@ -30,7 +30,7 @@ mod wiki;
 use protocol::highlight;
 
 pub(in crate::gui) use player::glyph as player_glyph;
-pub(in crate::gui) use popout::modifier_click;
+pub(in crate::gui) use popout::{modifier_click, modifier_held, press_opens_row};
 
 
 use super::components::empty_state;
