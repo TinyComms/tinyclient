@@ -990,6 +990,7 @@ mod tests {
             limit: 0,
             read_only: false,
             private: false,
+            shared: false,
             encryption: protocol::Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(),

@@ -479,6 +479,9 @@ pub struct Conversation {
     /// Only invited people see it: drawn with a lock.
     #[serde(default, skip_serializing_if = "is_false")]
     pub private: bool,
+    /// Shared channel across teams or organizations (Teams `channelType == 2`): drawn with a link icon.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
     /// End-to-end encrypted or not, where the network says (a Tiny server). A plaintext
     /// conversation can be upgraded once; messages from before that stay readable by the server.
     #[serde(default, skip_serializing_if = "Encryption::is_unknown")]
@@ -615,6 +618,7 @@ impl Conversation {
             limit: 0,
             read_only: false,
             private: false,
+            shared: false,
             encryption: Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(),
@@ -775,6 +779,15 @@ pub struct Person {
     pub utc_offset: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<Mark>,
+    /// Highest coloured role's RGB (`0xRRGGBB`) in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_color: Option<u32>,
+    /// Highest role icon image in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_icon: Option<MediaFile>,
+    /// Highest role unicode emoji badge in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_emoji: Option<String>,
 }
 
 impl Person {
@@ -795,6 +808,9 @@ impl Person {
             title: String::new(),
             utc_offset: None,
             mark: None,
+            role_color: None,
+            role_icon: None,
+            role_emoji: None,
         }
     }
 }
@@ -944,6 +960,27 @@ pub struct SharedItem {
     pub url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+}
+
+/// Member moderation actions in a Space (`Request::Moderate`, Discord).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModerateAction {
+    Kick,
+    Ban {
+        #[serde(default, skip_serializing_if = "is_zero")]
+        delete_seconds: u32,
+    },
+    Timeout {
+        /// Unix seconds until the timeout expires.
+        until: i64,
+    },
+    Untimeout,
+    Nick {
+        /// New nickname; empty clears it.
+        #[serde(default)]
+        nick: String,
+    },
 }
 
 /// What the user does about a person. Never automated: only on a shell request.
@@ -1684,6 +1721,22 @@ pub enum Request {
         account: AccountKey,
         username: String,
     },
+    /// Moderate a member inside a Space (kick, ban, timeout, untimeout, or change nickname).
+    /// Gated by computed permissions and role hierarchy; never sent without confirmation.
+    Moderate {
+        space: Key,
+        person: Key,
+        action: ModerateAction,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Lift a ban on a person in a Space.
+    Unban {
+        space: Key,
+        person: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
     /// Report a message, person, or conversation to the network. Never sent without a confirm sheet.
     Report {
         target: ReportTarget,
@@ -1803,8 +1856,8 @@ pub enum Request {
         message_id: String,
     },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
-    /// one; `space` to one Space's conversations; both `None` is the whole Inbox. Message
-    /// requests are read here only.
+    /// one; `space` to one Space's conversations; `folder` to one folder's conversations/Spaces;
+    /// all `None` is the whole Inbox. Message requests are read here only.
     MarkAllRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
@@ -1812,6 +1865,9 @@ pub enum Request {
         /// peer that does not know the field ignores it and hears the wider request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<Key>,
+        /// The folder to read out (e.g. a Discord server folder or Telegram chat folder).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<Key>,
     },
     /// Drops this conversation's cached messages and its badge. A direct or group conversation
     /// leaves the Inbox until a newer message arrives. The network is not asked to delete
@@ -2623,6 +2679,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         values: Vec<String>,
     },
+    /// Who has read a given message in a chat (`Capabilities::read_by`).
+    ReadBy {
+        conversation: Key,
+        message_id: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3142,6 +3203,10 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Members who have read a given message (`Request::ReadBy`).
+    ReadBy {
+        readers: Vec<ReadBy>,
     },
 }
 
