@@ -39,6 +39,7 @@ mod mention;
 mod niceties;
 mod rec;
 mod schedule;
+mod slash;
 // The picker is the composer's and the reactions'; it lives in `gui/picker`.
 #[path = "picker/mod.rs"]
 pub(in crate::gui) mod picker;
@@ -600,6 +601,12 @@ pub struct Composer {
     importance: protocol::Importance,
     broadcast: bool,
     effect: Option<String>,
+    /// Slash command completion popover (`/` at start of composer) and cached commands per conversation.
+    slash: Option<slash::List>,
+    slash_commands: HashMap<Key, Vec<protocol::AppCommand>>,
+    slash_loaded: HashSet<Key>,
+    slash_dismissed: bool,
+    slash_lookup: Option<Task<()>>,
 }
 
 impl Composer {
@@ -704,6 +711,11 @@ impl Composer {
             importance: protocol::Importance::Normal,
             broadcast: false,
             effect: None,
+            slash: None,
+            slash_commands: HashMap::new(),
+            slash_loaded: HashSet::new(),
+            slash_dismissed: false,
+            slash_lookup: None,
         }
     }
 
@@ -898,11 +910,14 @@ impl Composer {
 
     /// Escape: the first that applies. It never clears what was typed.
     fn escape(&mut self, cx: &mut Context<Self>) {
+        let slash = self.slash.take();
         let list = self.list.take();
         let colon = self.colon.take();
         self.close_list(cx);
         // A list with no row was never on screen, so Escape is not spent on it.
-        if let Some(list) = list.filter(|list| !list.rows.is_empty()) {
+        if slash.is_some_and(|s| !s.is_empty()) {
+            self.slash_dismissed = true;
+        } else if let Some(list) = list.filter(|list| !list.rows.is_empty()) {
             self.dismissed = Some(list.trigger.start);
         } else if let Some(colon) = colon.filter(|colon| !colon.cells.is_empty()) {
             self.colon_dismissed = Some(colon.trigger.start);
@@ -973,6 +988,18 @@ impl Composer {
         if !live() {
             self.schedule_at = None;
             return;
+        }
+        if field.trim_start().starts_with('/') {
+            let matched = self
+                .slash_commands
+                .get(&target.key)
+                .and_then(|cmds| slash::parse_invocation(&field, cmds))
+                .map(|(cmd, args)| (cmd.clone(), args));
+            if let Some((cmd, arguments)) = matched {
+                self.schedule_at = None;
+                self.run_slash_command(target.key.clone(), cmd, arguments, cx);
+                return;
+            }
         }
         let network = target.key.network;
         let emoticons = super::app::prefs::choices().emoticons;
@@ -2358,7 +2385,9 @@ impl Composer {
     fn close_list(&mut self, cx: &mut Context<Self>) {
         self.list = None;
         self.colon = None;
+        self.slash = None;
         self.lookup = None;
+        self.slash_lookup = None;
         self.input.update(cx, |input, _| input.set_list_open(false));
     }
 
@@ -2367,7 +2396,245 @@ impl Composer {
         let open = !list.rows.is_empty();
         self.list = Some(list);
         self.colon = None;
+        self.slash = None;
         self.input.update(cx, |input, _| input.set_list_open(open));
+    }
+
+    /// Runs a slash command via `Request::RunCommand`, clearing the composer on acceptance.
+    fn run_slash_command(
+        &mut self,
+        conversation: Key,
+        cmd: protocol::AppCommand,
+        arguments: Vec<protocol::CommandArg>,
+        cx: &mut Context<Self>,
+    ) {
+        let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
+        let request = Request::RunCommand {
+            conversation: conversation.clone(),
+            command_id: cmd.id,
+            application_id: cmd.application_id,
+            version: cmd.version,
+            kind: cmd.kind,
+            name: cmd.name.clone(),
+            arguments,
+            target_id: None,
+            files,
+        };
+        self.sending = true;
+        self.close_list(cx);
+        self.slash_dismissed = false;
+        cx.notify();
+        let this = cx.weak_entity();
+        ask_later(cx, request, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.sending = false;
+                match answer {
+                    Ok(Response::Ok) => {
+                        if this.target.as_ref().is_some_and(|t| t.key == conversation) {
+                            this.input.update(cx, |input, cx| input.clear(cx));
+                            this.tokens.clear();
+                            this.seen.clear();
+                            this.tray.clear();
+                            this.reply = None;
+                            this.caption = None;
+                            this.store_draft(conversation, String::new(), cx);
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.caption = Some((detail, Tone::Refused));
+                    }
+                    Err(_) => {
+                        this.caption = Some((NOT_ANSWERING.to_owned(), Tone::Refused));
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Lazily fetches the conversation's slash commands once per conversation.
+    fn ask_slash_commands(&mut self, key: &Key, cx: &mut Context<Self>) {
+        if self.slash_loaded.contains(key) || !live() {
+            return;
+        }
+        self.slash_loaded.insert(key.clone());
+        let key = key.clone();
+        let request = Request::Commands {
+            conversation: key.clone(),
+            query: String::new(),
+            kind: Some(protocol::CommandKind::ChatInput),
+        };
+        let this = cx.weak_entity();
+        ask_later(cx, request, move |answer, cx| {
+            let Ok(Response::Commands { commands }) = answer else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.slash_commands.insert(key.clone(), commands);
+                if this.target.as_ref().is_some_and(|t| t.key == key) {
+                    this.look_up(cx);
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Fills the composer with `/name ` and opens command completion/options.
+    fn fill_command(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim().trim_start_matches('/');
+        if name.is_empty() {
+            return;
+        }
+        let filled = format!("/{name} ");
+        self.slash_dismissed = false;
+        self.input.update(cx, |input, cx| input.set_text(&filled, cx));
+        self.follow_text(cx);
+        self.look_up(cx);
+        cx.notify();
+    }
+
+    fn look_up_slash(&mut self, target: &Target, text: &str, caret: usize, cx: &mut Context<Self>) -> bool {
+        if self.editing.is_some() || !text.starts_with('/') {
+            self.slash_dismissed = false;
+            self.slash = None;
+            self.slash_lookup = None;
+            return false;
+        }
+        self.ask_slash_commands(&target.key, cx);
+        if self.slash_dismissed {
+            self.close_list(cx);
+            return true;
+        }
+        let commands = self.slash_commands.get(&target.key).cloned().unwrap_or_default();
+        if let Some(query) = slash::command_trigger(text, caret) {
+            let matched = slash::filter(&commands, query);
+            let open = !matched.is_empty();
+            self.list = None;
+            self.colon = None;
+            self.lookup = None;
+            self.slash_lookup = None;
+            self.slash = open.then_some(slash::List { mode: slash::Mode::Commands(matched), selected: 0 });
+            self.input.update(cx, |input, _| input.set_list_open(open));
+            return true;
+        }
+        if let Some(active) = slash::active_option(text, caret, &commands) {
+            if !active.option.autocomplete {
+                let choices = slash::filter_choices(&active.option.choices, &active.typed);
+                let open = !choices.is_empty();
+                self.list = None;
+                self.colon = None;
+                self.lookup = None;
+                self.slash_lookup = None;
+                self.slash = open.then_some(slash::List {
+                    mode: slash::Mode::Choices {
+                        command: active.command,
+                        option: active.option.name,
+                        replace_start: active.replace_start,
+                        choices,
+                    },
+                    selected: 0,
+                });
+                self.input.update(cx, |input, _| input.set_list_open(open));
+                return true;
+            }
+            if live() {
+                let conversation = target.key.clone();
+                let command = active.command.clone();
+                let option_name = active.option.name.clone();
+                let replace_start = active.replace_start;
+                let mut options = active.filled.clone();
+                if let Some(existing) = options.iter_mut().find(|a| a.name == option_name) {
+                    existing.value = active.typed.clone();
+                } else {
+                    options.push(protocol::CommandArg {
+                        name: option_name.clone(),
+                        value: active.typed.clone(),
+                        kind: active.option.kind,
+                    });
+                }
+                let request = Request::CommandAutocomplete {
+                    conversation: conversation.clone(),
+                    command_id: command.id.clone(),
+                    application_id: command.application_id.clone(),
+                    version: command.version.clone(),
+                    name: command.name.clone(),
+                    options,
+                    focused: option_name.clone(),
+                };
+                self.slash_lookup = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(LOOKUP_QUIET).await;
+                    let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.target.as_ref().is_none_or(|t| t.key != conversation) {
+                            return;
+                        }
+                        if let Ok(Response::CommandChoices { choices }) = answer {
+                            let open = !choices.is_empty();
+                            this.slash = open.then_some(slash::List {
+                                mode: slash::Mode::Choices {
+                                    command,
+                                    option: option_name,
+                                    replace_start,
+                                    choices,
+                                },
+                                selected: 0,
+                            });
+                            this.input.update(cx, |input, _| input.set_list_open(open));
+                            cx.notify();
+                        }
+                    });
+                }));
+                return true;
+            }
+        }
+        self.slash = None;
+        self.slash_lookup = None;
+        false
+    }
+
+    fn complete_slash(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(list) = self.slash.take() else {
+            return;
+        };
+        self.close_list(cx);
+        self.follow_text(cx);
+        let (caret, text_len) = {
+            let input = self.input.read(cx);
+            (input.cursor(), input.text().len())
+        };
+        match list.mode {
+            slash::Mode::Commands(commands) => {
+                let Some(cmd) = commands.get(row) else {
+                    return;
+                };
+                let replacement = if cmd.options.is_empty() {
+                    format!("/{}", cmd.name)
+                } else {
+                    format!("/{} ", cmd.name)
+                };
+                let end = caret.min(text_len);
+                self.input.update(cx, |input, cx| input.replace(0..end, &replacement, cx));
+                self.follow_text(cx);
+                self.look_up(cx);
+            }
+            slash::Mode::Choices { replace_start, choices, .. } => {
+                let Some(choice) = choices.get(row) else {
+                    return;
+                };
+                let start = replace_start.min(caret).min(text_len);
+                let end = caret.min(text_len);
+                let val = if choice.value.contains(char::is_whitespace) {
+                    format!("\"{}\" ", choice.value)
+                } else {
+                    format!("{} ", choice.value)
+                };
+                self.input.update(cx, |input, cx| input.replace(start..end, &val, cx));
+                self.follow_text(cx);
+                self.look_up(cx);
+            }
+        }
+        cx.notify();
     }
 
     /// The people the shell already holds who could be meant: those typing here.
@@ -2386,6 +2653,9 @@ impl Composer {
             let input = self.input.read(cx);
             (input.text().to_owned(), input.cursor())
         };
+        if self.look_up_slash(&target, &text, caret, cx) {
+            return;
+        }
         if let Some(found) = colon::trigger(&text, caret) {
             if self.colon_dismissed == Some(found.start) {
                 self.close_list(cx);
@@ -2539,7 +2809,9 @@ impl Composer {
     }
 
     fn step(&mut self, down: bool, cx: &mut Context<Self>) {
-        if let Some(colon) = &mut self.colon {
+        if let Some(slash) = &mut self.slash {
+            slash.step(down);
+        } else if let Some(colon) = &mut self.colon {
             colon.step(down);
         } else if let Some(list) = &mut self.list {
             list.step(down);
@@ -2548,7 +2820,9 @@ impl Composer {
     }
 
     fn complete_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(selected) = self.colon.as_ref().map(|colon| colon.selected) {
+        if let Some(selected) = self.slash.as_ref().map(|slash| slash.selected) {
+            self.complete_slash(selected, cx);
+        } else if let Some(selected) = self.colon.as_ref().map(|colon| colon.selected) {
             self.complete_colon(selected, cx);
         } else {
             let selected = self.list.as_ref().map_or(0, |list| list.selected);
@@ -3428,6 +3702,14 @@ impl Composer {
             let drawn = colon::draw(colon, customs, tone, image, pick);
             return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
+        if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.is_empty()) {
+            let this = cx.weak_entity();
+            let pick = move |row: usize, _: &mut Window, cx: &mut App| {
+                let _ = this.update(cx, |this, cx| this.complete_slash(row, cx));
+            };
+            let drawn = slash::draw(slash, pick);
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
+        }
         let list = self.list.as_ref().filter(|list| !list.rows.is_empty())?;
         let this = cx.weak_entity();
         let pick = move |row: usize, _: &mut Window, cx: &mut App| {
@@ -4074,6 +4356,16 @@ impl Shell {
         };
         window.focus(&composer.focus_handle(cx), cx);
         composer.update(cx, |composer, cx| composer.type_text(text, cx));
+    }
+
+    /// Pre-fills `/name ` in the open conversation's composer (e.g. when clicking a `</name:id>` mention).
+    #[allow(dead_code)]
+    pub(super) fn composer_fill_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(composer) = self.composer_state.main.get().filter(|composer| composer.read(cx).can_type()).cloned() else {
+            return;
+        };
+        window.focus(&composer.focus_handle(cx), cx);
+        composer.update(cx, |composer, cx| composer.fill_command(name, cx));
     }
 
     /// How far a pending message's files have gone: (bytes sent, bytes in all), from the last

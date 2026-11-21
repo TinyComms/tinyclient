@@ -585,6 +585,10 @@ impl Poll {
     }
 }
 
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 /// Visual tone for an interactive message button.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -592,6 +596,7 @@ pub enum ControlStyle {
     #[default]
     Default,
     Primary,
+    Success,
     Danger,
 }
 
@@ -619,6 +624,8 @@ pub struct ConfirmDialog {
 pub struct ControlOption {
     pub label: String,
     pub value: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 /// What kind of interactive widget a [`MessageControl`] draws and submits.
@@ -670,13 +677,13 @@ pub enum ControlKind {
     },
 }
 
-/// One interactive Block Kit control attached to a bot/app message (button, menu, picker, etc.).
+/// One interactive control attached to a bot/app message (button, menu, picker, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageControl {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub block_id: String,
     pub action_id: String,
-    /// Network element type (e.g. `"button"`, `"static_select"`, `"datepicker"`, `"overflow"`).
+    /// Network element type (e.g. `"button"`, `"static_select"`, `"discord_button"`, `"discord_string_select"`).
     pub element_type: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
@@ -685,6 +692,144 @@ pub struct MessageControl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm: Option<ConfirmDialog>,
     pub kind: ControlKind,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Visual row index (0-based) for grouping controls into action rows.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub row: u8,
+    /// Minimum selections for multi-select controls (0 means unspecified / single).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub min_values: u8,
+    /// Maximum selections for multi-select controls (0 or 1 means single-select).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub max_values: u8,
+}
+
+/// Most application commands returned in a single list answer.
+pub const COMMANDS_LIMIT: usize = 200;
+/// Most options carried by one command.
+pub const COMMAND_OPTIONS_LIMIT: usize = 25;
+/// Most autocomplete choices returned for one option.
+pub const COMMAND_CHOICES_LIMIT: usize = 25;
+/// Most text fields carried by one interaction modal.
+pub const MODAL_FIELDS_LIMIT: usize = 5;
+
+/// Whether a command runs from `/` in the composer, a person's menu, or a message's menu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    #[default]
+    ChatInput,
+    User,
+    Message,
+}
+
+/// The value type of one slash-command option.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOptionKind {
+    #[default]
+    String,
+    Integer,
+    Boolean,
+    User,
+    Channel,
+    Role,
+    Mentionable,
+    Number,
+    Attachment,
+    SubCommand,
+    SubCommandGroup,
+}
+
+/// One static or autocomplete choice for a slash-command option.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandChoice {
+    pub name: String,
+    pub value: String,
+}
+
+/// One option or subcommand of a slash command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOption {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default)]
+    pub kind: CommandOptionKind,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub autocomplete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<CommandChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<CommandOption>,
+}
+
+/// One slash command or context-menu command offered in a conversation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppCommand {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub application_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default)]
+    pub kind: CommandKind,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<CommandOption>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub built_in: bool,
+}
+
+/// One filled argument supplied when running a slash command or requesting autocomplete.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandArg {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub kind: CommandOptionKind,
+}
+
+/// One text field inside an interaction modal form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModalField {
+    pub custom_id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub placeholder: String,
+    #[serde(default = "crate::yes", skip_serializing_if = "crate::is_true")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiline: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u16>,
+}
+
+/// A form popped up by a bot/app in response to a button, select menu, or command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionModal {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub application_id: String,
+    pub custom_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ModalField>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nonce: String,
 }
 
 /// One message. Which conversation it is in comes from the answer that carries it.
@@ -1022,6 +1167,7 @@ impl Message {
             clip(&mut control.element_type, 64);
             clip(&mut control.label, 256);
             clip(&mut control.value, 2_000);
+            clip(&mut control.emoji, 64);
             if let Some(confirm) = &mut control.confirm {
                 clip(&mut confirm.title, 200);
                 clip(&mut confirm.text, 1_000);
@@ -1036,6 +1182,7 @@ impl Message {
                     for opt in options {
                         clip(&mut opt.label, 200);
                         clip(&mut opt.value, 2_000);
+                        clip(&mut opt.description, 200);
                     }
                     if let Some(sel) = selected {
                         clip(sel, 2_000);
@@ -1052,6 +1199,7 @@ impl Message {
                     for opt in options {
                         clip(&mut opt.label, 200);
                         clip(&mut opt.value, 2_000);
+                        clip(&mut opt.description, 200);
                     }
                     selected.truncate(CONTROL_OPTIONS_LIMIT);
                     for val in selected {
@@ -1063,6 +1211,7 @@ impl Message {
                     for opt in options {
                         clip(&mut opt.label, 200);
                         clip(&mut opt.value, 2_000);
+                        clip(&mut opt.description, 200);
                     }
                     if let Some(sel) = selected {
                         clip(sel, 2_000);
@@ -1251,6 +1400,11 @@ mod tests {
                     deny: "Cancel".into(),
                 }),
                 kind: ControlKind::Button { url: String::new(), style: ControlStyle::Primary },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             });
         }
         msg.bound();
@@ -1261,8 +1415,61 @@ mod tests {
         let back: Message = serde_json::from_str(&wire).unwrap();
         assert_eq!(back.controls, msg.controls);
 
+        // Older control payload without disabled/emoji/row/min_values/max_values/description still reads.
+        let legacy: MessageControl = serde_json::from_str(
+            r#"{"action_id":"a1","element_type":"button","label":"Go","kind":{"kind":"button","style":"success"}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.disabled && legacy.emoji.is_empty() && legacy.row == 0);
+        assert_eq!(legacy.kind, ControlKind::Button { url: String::new(), style: ControlStyle::Success });
+
         msg.tombstone();
         assert!(msg.controls.is_empty());
+    }
+
+    #[test]
+    fn app_commands_and_interaction_modals_round_trip() {
+        let cmd = AppCommand {
+            id: "100".into(),
+            application_id: "200".into(),
+            version: "300".into(),
+            kind: CommandKind::ChatInput,
+            name: "deploy".into(),
+            description: "Deploy a service".into(),
+            app_name: "DeployBot".into(),
+            options: vec![CommandOption {
+                name: "env".into(),
+                description: "Target environment".into(),
+                kind: CommandOptionKind::String,
+                required: true,
+                autocomplete: true,
+                choices: vec![CommandChoice { name: "Staging".into(), value: "staging".into() }],
+                options: Vec::new(),
+            }],
+            built_in: false,
+        };
+        let wire = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<AppCommand>(&wire).unwrap(), cmd);
+
+        let modal = InteractionModal {
+            id: "m1".into(),
+            application_id: "200".into(),
+            custom_id: "feedback_form".into(),
+            title: "Send feedback".into(),
+            fields: vec![ModalField {
+                custom_id: "reason".into(),
+                label: "Reason".into(),
+                value: String::new(),
+                placeholder: "Tell us why".into(),
+                required: true,
+                multiline: true,
+                min_length: Some(5),
+                max_length: Some(400),
+            }],
+            nonce: "n1".into(),
+        };
+        let mwire = serde_json::to_string(&modal).unwrap();
+        assert_eq!(serde_json::from_str::<InteractionModal>(&mwire).unwrap(), modal);
     }
 
     #[test]

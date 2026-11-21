@@ -312,9 +312,16 @@ fn parse_options(el: &Value) -> Vec<ControlOption> {
             .trim();
         let value = opt["value"].as_str().unwrap_or(label).trim();
         if !label.is_empty() || !value.is_empty() {
+            let description = opt["description"]["text"]
+                .as_str()
+                .or_else(|| opt["description"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
             out.push(ControlOption {
                 label: if label.is_empty() { value.to_owned() } else { label.to_owned() },
                 value: value.to_owned(),
+                description,
             });
         }
     };
@@ -370,6 +377,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value,
                 confirm,
                 kind: ControlKind::Button { url, style },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "static_select"
@@ -415,6 +427,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: selected.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::Select { placeholder, options, selected, external },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: if kind.starts_with("multi_") { 25 } else { 0 },
             })
         }
         "overflow" => {
@@ -435,6 +452,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                     selected: None,
                     external: false,
                 },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "datepicker" => {
@@ -453,6 +475,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: initial.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::DatePicker { placeholder, initial },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "timepicker" => {
@@ -471,6 +498,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: initial.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::TimePicker { placeholder, initial },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "checkboxes" => {
@@ -492,6 +524,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: String::new(),
                 confirm,
                 kind: ControlKind::Checkboxes { options, selected },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "radio_buttons" => {
@@ -508,6 +545,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: selected.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::RadioButtons { options, selected },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         _ => None,

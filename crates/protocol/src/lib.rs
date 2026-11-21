@@ -2580,8 +2580,9 @@ pub enum Request {
         account: AccountKey,
         file_id: String,
     },
-    /// Execute an interactive control on a message (Slack Block Kit `blocks.actions`).
-    /// Answers `Response::Ok` when accepted; message updates arrive asynchronously.
+    /// Execute an interactive control on a message (Slack Block Kit `blocks.actions`,
+    /// Discord message component interactions).
+    /// Answers `Response::Ok` when accepted; message updates or modals arrive asynchronously.
     MessageAction {
         conversation: Key,
         message_id: String,
@@ -2593,6 +2594,59 @@ pub enum Request {
         value: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         values: Vec<String>,
+    },
+    /// Lists slash or context-menu commands available in `conversation`, optionally filtered by
+    /// `query` and `kind`. Answers `Response::Commands`.
+    Commands {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<CommandKind>,
+    },
+    /// Asks the network for live autocomplete choices on `focused` option of a slash command.
+    /// Answers `Response::CommandChoices`.
+    CommandAutocomplete {
+        conversation: Key,
+        command_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        application_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        version: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<CommandArg>,
+        focused: String,
+    },
+    /// Runs a slash command or context-menu command (`kind`, `target_id`).
+    /// Answers `Response::Ok` when accepted; replies or modals arrive asynchronously.
+    RunCommand {
+        conversation: Key,
+        command_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        application_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        version: String,
+        #[serde(default)]
+        kind: CommandKind,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        arguments: Vec<CommandArg>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<OutgoingFile>,
+    },
+    /// Submits a bot's interaction modal form (`Change::InteractionModal`).
+    /// Answers `Response::Ok` when accepted.
+    ModalSubmit {
+        conversation: Key,
+        modal_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        application_id: String,
+        custom_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        values: Vec<(String, String)>,
     },
 }
 
@@ -2664,6 +2718,20 @@ pub enum Change {
     /// A Tiny server's people, roles, invites or rooms changed: ask `TinyCommunity`. Who is in
     /// a room's call is `Occupants`, and who is online `Presence`.
     Tiny { account: AccountKey },
+    /// Ephemeral. A bot/app opened a modal form in response to a control or command.
+    InteractionModal {
+        conversation: Key,
+        modal: InteractionModal,
+    },
+    /// Ephemeral. An asynchronous interaction (button, select, slash command, modal) failed.
+    InteractionFailed {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        action_id: String,
+        reason: String,
+    },
 }
 
 impl Change {
@@ -2696,6 +2764,13 @@ impl Change {
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
             }
+            (Change::InteractionModal { conversation: a, modal: x }, Change::InteractionModal { conversation: b, modal: y }) => {
+                a == b && x.id == y.id
+            }
+            (
+                Change::InteractionFailed { conversation: a, message_id: ma, action_id: aa, .. },
+                Change::InteractionFailed { conversation: b, message_id: mb, action_id: ab, .. },
+            ) => a == b && ma == mb && aa == ab,
             _ => false,
         }
     }
@@ -2716,6 +2791,8 @@ impl Change {
                 | Change::Recording { .. }
                 | Change::Meter { .. }
                 | Change::Open { .. }
+                | Change::InteractionModal { .. }
+                | Change::InteractionFailed { .. }
         )
     }
 }
@@ -3106,6 +3183,14 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Slash or context-menu commands available in a conversation (`Request::Commands`).
+    Commands {
+        commands: Vec<AppCommand>,
+    },
+    /// Autocomplete choices for one slash-command option (`Request::CommandAutocomplete`).
+    CommandChoices {
+        choices: Vec<CommandChoice>,
     },
 }
 
@@ -3665,5 +3750,66 @@ mod sock_path_tests {
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert!(!old.follow_threads);
         assert!(!old.dnd_snooze);
+    }
+
+    #[test]
+    fn command_and_modal_frames_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4101");
+        let reqs = [
+            Request::Commands { conversation: conv.clone(), query: "dep".into(), kind: Some(CommandKind::ChatInput) },
+            Request::CommandAutocomplete {
+                conversation: conv.clone(),
+                command_id: "c1".into(),
+                application_id: "a1".into(),
+                version: "v1".into(),
+                name: "deploy".into(),
+                options: vec![CommandArg { name: "env".into(), value: "st".into(), kind: CommandOptionKind::String }],
+                focused: "env".into(),
+            },
+            Request::RunCommand {
+                conversation: conv.clone(),
+                command_id: "c1".into(),
+                application_id: "a1".into(),
+                version: "v1".into(),
+                kind: CommandKind::ChatInput,
+                name: "deploy".into(),
+                arguments: vec![CommandArg { name: "env".into(), value: "staging".into(), kind: CommandOptionKind::String }],
+                target_id: None,
+                files: Vec::new(),
+            },
+            Request::ModalSubmit {
+                conversation: conv.clone(),
+                modal_id: "m1".into(),
+                application_id: "a1".into(),
+                custom_id: "feedback".into(),
+                values: vec![("note".into(), "looks good".into())],
+            },
+        ];
+        for req in reqs {
+            let wire = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), req);
+        }
+        let modal_change = Change::InteractionModal {
+            conversation: conv.clone(),
+            modal: InteractionModal {
+                id: "m1".into(),
+                application_id: "a1".into(),
+                custom_id: "feedback".into(),
+                title: "Feedback".into(),
+                fields: Vec::new(),
+                nonce: "n1".into(),
+            },
+        };
+        assert!(modal_change.is_ephemeral());
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&modal_change).unwrap()).unwrap(), modal_change);
+
+        let fail_change = Change::InteractionFailed {
+            conversation: conv,
+            message_id: "msg1".into(),
+            action_id: "btn1".into(),
+            reason: "Interaction failed.".into(),
+        };
+        assert!(fail_change.is_ephemeral());
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&fail_change).unwrap()).unwrap(), fail_change);
     }
 }

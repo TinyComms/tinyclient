@@ -2446,30 +2446,48 @@ impl Pane {
         div().pt(px(5.)).flex().child(framed).into_any_element()
     }
 
-    /// Interactive Block Kit controls attached to a message (buttons, menus, pickers, radios, checkboxes).
+    /// Interactive controls attached to a message (buttons, menus, pickers, radios, checkboxes).
     fn message_controls(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         if message.controls.is_empty() {
             return None;
         }
         let conversation = self.key()?.clone();
-        let mut row = div().pt(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
+        let mut container = div().pt(px(6.)).flex().flex_col().gap(px(6.));
+        let mut current_row_id: Option<u8> = None;
+        let mut row = div().flex().flex_wrap().items_center().gap(px(6.));
         for (idx, control) in message.controls.iter().enumerate() {
+            if let Some(prev) = current_row_id {
+                if prev != control.row {
+                    container = container.child(row);
+                    row = div().flex().flex_wrap().items_center().gap(px(6.));
+                }
+            }
+            current_row_id = Some(control.row);
             let pending = self
                 .pending_actions
                 .get(&(message.id.clone(), control.action_id.clone()))
                 .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(10));
+            let disabled = control.disabled;
             let el_id = SharedString::from(format!("ctrl-{}-{idx}", message.id));
             match &control.kind {
                 protocol::ControlKind::Button { url, style } => {
-                    let label = if pending {
-                        format!("{}…", control.label)
-                    } else if !url.is_empty() {
-                        format!("{} ↗", control.label)
-                    } else {
+                    let base = if control.emoji.is_empty() {
                         control.label.clone()
+                    } else if control.label.is_empty() {
+                        control.emoji.clone()
+                    } else {
+                        format!("{} {}", control.emoji, control.label)
+                    };
+                    let label = if pending {
+                        format!("{base}…")
+                    } else if !url.is_empty() {
+                        format!("{base} ↗")
+                    } else {
+                        base
                     };
                     let (bg, fg, border, hover_bg) = match style {
                         protocol::ControlStyle::Primary => (theme::accent(), theme::on_accent(), theme::accent(), theme::accent()),
+                        protocol::ControlStyle::Success => (theme::online(), theme::on_accent(), theme::online(), theme::online()),
                         protocol::ControlStyle::Danger => (theme::danger(), theme::on_accent(), theme::danger(), theme::danger()),
                         protocol::ControlStyle::Default => (tokens::card(), theme::text(), tokens::border_strong(), theme::hover()),
                     };
@@ -2486,12 +2504,14 @@ impl Pane {
                         .type_small()
                         .font_weight(theme::MEDIUM)
                         .text_color(fg)
-                        .cursor_pointer()
-                        .when(pending, |d| d.opacity(0.6))
-                        .hover(move |s| s.bg(hover_bg))
+                        .when(!disabled, |d| d.cursor_pointer().hover(move |s| s.bg(hover_bg)))
+                        .when(disabled, |d| d.cursor_default().opacity(0.45))
+                        .when(pending && !disabled, |d| d.opacity(0.6))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(label);
-                    if !url.is_empty() {
+                    if disabled {
+                        // Disabled button: drawn dimmed and inert.
+                    } else if !url.is_empty() {
                         let conv = conversation.clone();
                         let msg_id = message.id.clone();
                         let target = url.clone();
@@ -2547,12 +2567,15 @@ impl Pane {
                         .items_center()
                         .type_small()
                         .text_color(theme::text())
-                        .cursor_pointer()
-                        .when(pending, |d| d.opacity(0.6))
-                        .hover(|s| s.bg(theme::hover()))
+                        .when(!disabled, |d| d.cursor_pointer().hover(|s| s.bg(theme::hover())))
+                        .when(disabled, |d| d.cursor_default().opacity(0.45))
+                        .when(pending && !disabled, |d| d.opacity(0.6))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(shown);
-                    if !options.is_empty() && !pending {
+                    if disabled {
+                        // Disabled select: inert.
+                    } else if !options.is_empty() && !pending {
+                        let initial_multi = selected.iter().cloned().collect();
                         let open = super::OpenSelect {
                             conversation: conversation.clone(),
                             message_id: message.id.clone(),
@@ -2561,6 +2584,9 @@ impl Pane {
                             element_type: control.element_type.clone(),
                             options: options.clone(),
                             selected: selected.clone(),
+                            multi_selected: initial_multi,
+                            min_values: control.min_values,
+                            max_values: control.max_values,
                             confirm: control.confirm.clone(),
                             at: gpui::Point::default(),
                         };
@@ -2589,12 +2615,20 @@ impl Pane {
                     let now = crate::view::now();
                     let mut opts = Vec::new();
                     if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
-                        opts.push(protocol::ControlOption { label: format!("Keep ({init})"), value: init.clone() });
+                        opts.push(protocol::ControlOption {
+                            label: format!("Keep ({init})"),
+                            value: init.clone(),
+                            description: String::new(),
+                        });
                     }
                     for (name, days) in [("Today", 0i64), ("Tomorrow", 1), ("In 3 days", 3), ("In 7 days", 7)] {
                         let ymd = format_ymd(now + days * 86_400);
                         if !opts.iter().any(|o| o.value == ymd) {
-                            opts.push(protocol::ControlOption { label: format!("{name} ({ymd})"), value: ymd });
+                            opts.push(protocol::ControlOption {
+                                label: format!("{name} ({ymd})"),
+                                value: ymd,
+                                description: String::new(),
+                            });
                         }
                     }
                     let open = super::OpenSelect {
@@ -2605,6 +2639,9 @@ impl Pane {
                         element_type: control.element_type.clone(),
                         options: opts,
                         selected: initial.clone(),
+                        multi_selected: Vec::new(),
+                        min_values: 0,
+                        max_values: 0,
                         confirm: control.confirm.clone(),
                         at: gpui::Point::default(),
                     };
@@ -2642,11 +2679,19 @@ impl Pane {
                     let shown = if pending { format!("🕒 {label}…") } else { format!("🕒 {label} ▾") };
                     let mut opts = Vec::new();
                     if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
-                        opts.push(protocol::ControlOption { label: init.clone(), value: init.clone() });
+                        opts.push(protocol::ControlOption {
+                            label: init.clone(),
+                            value: init.clone(),
+                            description: String::new(),
+                        });
                     }
                     for slot in ["09:00", "12:00", "14:00", "17:00"] {
                         if !opts.iter().any(|o| o.value == slot) {
-                            opts.push(protocol::ControlOption { label: slot.to_owned(), value: slot.to_owned() });
+                            opts.push(protocol::ControlOption {
+                                label: slot.to_owned(),
+                                value: slot.to_owned(),
+                                description: String::new(),
+                            });
                         }
                     }
                     let open = super::OpenSelect {
@@ -2657,6 +2702,9 @@ impl Pane {
                         element_type: control.element_type.clone(),
                         options: opts,
                         selected: initial.clone(),
+                        multi_selected: Vec::new(),
+                        min_values: 0,
+                        max_values: 0,
                         confirm: control.confirm.clone(),
                         at: gpui::Point::default(),
                     };
@@ -2779,7 +2827,7 @@ impl Pane {
                 }
             }
         }
-        Some(row.into_any_element())
+        Some(container.child(row).into_any_element())
     }
 
     /// Shared contact card: name, organization, masked phone numbers (click to reveal), emails, and copy actions.

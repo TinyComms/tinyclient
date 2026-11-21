@@ -687,6 +687,7 @@ impl Pane {
             || self.confirm.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
+            || self.interaction_modal.is_some()
             || self.link_ask.is_some()
             || self.viewer.is_some()
         {
@@ -718,6 +719,7 @@ impl Pane {
             || self.confirm.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
+            || self.interaction_modal.is_some()
             || self.link_ask.is_some()
             || self.viewer.is_some();
         own || self.shell.upgrade().is_some_and(|shell| {
@@ -781,6 +783,9 @@ impl Pane {
             self.close_viewer(cx);
         } else if self.confirm.is_some() {
             self.confirm = None;
+            cx.notify();
+        } else if self.interaction_modal.is_some() {
+            self.interaction_modal = None;
             cx.notify();
         } else if self.action_confirm.is_some() {
             self.action_confirm = None;
@@ -2311,34 +2316,113 @@ impl Pane {
 
     fn select_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = self.open_select.as_ref()?;
-        let mut list = menu().w(px(240.));
+        let multi = open.max_values > 1 || open.element_type.starts_with("multi_");
+        let mut list = menu().w(px(260.));
         for (ix, opt) in open.options.iter().enumerate() {
-            let active = open.selected.as_deref() == Some(opt.value.as_str());
+            let active = if multi {
+                open.multi_selected.iter().any(|v| v == &opt.value)
+            } else {
+                open.selected.as_deref() == Some(opt.value.as_str())
+            };
             let conversation = open.conversation.clone();
             let msg_id = open.message_id.clone();
             let block_id = open.block_id.clone();
             let action_id = open.action_id.clone();
             let element_type = open.element_type.clone();
             let val = opt.value.clone();
-            let values = if element_type.starts_with("multi_") { vec![val.clone()] } else { Vec::new() };
             let confirm = open.confirm.clone();
             let label = if active { format!("✓ {}", opt.label) } else { opt.label.clone() };
-            list = list.child(
-                menu_item(("ctrl-opt", ix), None, label, None)
-                    .when(active, |row| row.bg(theme::selected()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.trigger_control(
-                            conversation.clone(),
-                            msg_id.clone(),
-                            block_id.clone(),
-                            action_id.clone(),
-                            element_type.clone(),
-                            val.clone(),
-                            values.clone(),
-                            confirm.clone(),
-                            cx,
-                        );
-                    })),
+            let mut row = div()
+                .id(SharedString::from(format!("ctrl-opt-{ix}")))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_small().text_color(theme::text()).child(label));
+            if !opt.description.is_empty() {
+                row = row.child(
+                    div()
+                        .type_micro()
+                        .text_color(theme::text_soft())
+                        .child(opt.description.clone()),
+                );
+            }
+            if multi {
+                let max = if open.max_values > 0 { open.max_values as usize } else { usize::MAX };
+                row = row.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(open) = this.open_select.as_mut() {
+                        if open.multi_selected.iter().any(|v| v == &val) {
+                            open.multi_selected.retain(|v| v != &val);
+                        } else if open.multi_selected.len() < max {
+                            open.multi_selected.push(val.clone());
+                        }
+                        cx.notify();
+                    }
+                }));
+            } else {
+                row = row.on_click(cx.listener(move |this, _, _, cx| {
+                    this.trigger_control(
+                        conversation.clone(),
+                        msg_id.clone(),
+                        block_id.clone(),
+                        action_id.clone(),
+                        element_type.clone(),
+                        val.clone(),
+                        vec![val.clone()],
+                        confirm.clone(),
+                        cx,
+                    );
+                }));
+            }
+            list = list.child(row);
+        }
+        if multi {
+            let min = open.min_values as usize;
+            let count = open.multi_selected.len();
+            let can_submit = count >= min && (min == 0 || count > 0);
+            let conversation = open.conversation.clone();
+            let msg_id = open.message_id.clone();
+            let block_id = open.block_id.clone();
+            let action_id = open.action_id.clone();
+            let element_type = open.element_type.clone();
+            let values = open.multi_selected.clone();
+            let confirm = open.confirm.clone();
+            list = list.child(menu_separator()).child(
+                div()
+                    .px(px(6.))
+                    .py(px(4.))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        button(
+                            "ctrl-multi-apply",
+                            ButtonKind::Primary,
+                            if count == 0 { "Apply".to_owned() } else { format!("Apply ({count})") },
+                        )
+                        .when(!can_submit, |b| b.opacity(0.5))
+                        .when(can_submit, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                let first = values.first().cloned().unwrap_or_default();
+                                this.trigger_control(
+                                    conversation.clone(),
+                                    msg_id.clone(),
+                                    block_id.clone(),
+                                    action_id.clone(),
+                                    element_type.clone(),
+                                    first,
+                                    values.clone(),
+                                    confirm.clone(),
+                                    cx,
+                                );
+                            }))
+                        }),
+                    ),
             );
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2352,6 +2436,93 @@ impl Pane {
             window,
             fade_in("control-select", 120, list),
         ))
+    }
+
+    fn interaction_modal_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active = self.interaction_modal.as_ref()?;
+        let title = if active.modal.title.is_empty() {
+            "Form".to_owned()
+        } else {
+            active.modal.title.clone()
+        };
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let mut fields_col = div().flex().flex_col().gap(px(10.)).pt(px(4.));
+        for (field, input) in active.modal.fields.iter().zip(&active.inputs) {
+            let label = if field.required {
+                format!("{} *", field.label)
+            } else {
+                field.label.clone()
+            };
+            let box_el = div()
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(super::tokens::border_strong())
+                .px(px(8.))
+                .py(px(6.))
+                .when(field.multiline, |d| d.min_h(px(72.)))
+                .child(input.clone());
+            fields_col = fields_col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(label))
+                    .child(box_el),
+            );
+        }
+        let error_line = active.error.as_ref().map(|err| {
+            div()
+                .pt(px(6.))
+                .type_small()
+                .text_color(theme::danger())
+                .child(err.clone())
+        });
+        let submitting = active.submitting;
+        let panel = modal(title)
+            .w(px(if crate::gui::phone::active() { room.min(440.) } else { 440. }))
+            .child(fields_col)
+            .children(error_line)
+            .child(
+                modal_buttons()
+                    .child(button("interaction-modal-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.interaction_modal = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "interaction-modal-submit",
+                            ButtonKind::Primary,
+                            if submitting { "Submitting…" } else { "Submit" },
+                        )
+                        .when(submitting, |b| b.opacity(0.6))
+                        .when(!submitting, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_modal(cx);
+                            }))
+                        }),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("interaction-modal-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.interaction_modal = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("interaction-modal-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
     fn action_confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2427,6 +2598,7 @@ impl Pane {
                 self.picker_sheet(window, cx),
                 self.confirm_layer(window, cx),
                 self.action_confirm_layer(window, cx),
+                self.interaction_modal_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
                 self.link_layer(window, cx),
@@ -2442,6 +2614,7 @@ impl Pane {
             self.picker_layer(window, cx),
             self.confirm_layer(window, cx),
             self.action_confirm_layer(window, cx),
+            self.interaction_modal_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),
             self.link_layer(window, cx),
@@ -2644,6 +2817,11 @@ impl Pane {
         }
         if key == "escape" && self.open_select.is_some() {
             self.open_select = None;
+            cx.notify();
+            return true;
+        }
+        if key == "escape" && self.interaction_modal.is_some() {
+            self.interaction_modal = None;
             cx.notify();
             return true;
         }

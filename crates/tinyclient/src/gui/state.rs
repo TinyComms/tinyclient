@@ -186,7 +186,9 @@ impl Dirty {
             | Change::Settings
             | Change::Meter { .. }
             | Change::Open { .. }
-            | Change::Tiny { .. } => {}
+            | Change::Tiny { .. }
+            | Change::InteractionModal { .. }
+            | Change::InteractionFailed { .. } => {}
             Change::Folders { .. } => self.spaces = true,
         }
     }
