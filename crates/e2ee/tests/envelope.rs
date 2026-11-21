@@ -387,3 +387,16 @@ fn link_preview_roundtrip_in_envelope() {
     let edit_decoded = Envelope::decode(Kind::Edit, &env.encode(Kind::Edit).unwrap()).unwrap();
     assert!(edit_decoded.previews.is_empty());
 }
+
+#[test]
+fn thread_id_roundtrips_in_message_envelope_only() {
+    let env = Envelope {
+        text: "thread reply".into(),
+        thread_id: Some("root-99".into()),
+        ..Envelope::default()
+    };
+    let decoded = Envelope::decode(Kind::Message, &env.encode(Kind::Message).unwrap()).unwrap();
+    assert_eq!(decoded.thread_id.as_deref(), Some("root-99"));
+    let edit_decoded = Envelope::decode(Kind::Edit, &env.encode(Kind::Edit).unwrap()).unwrap();
+    assert!(edit_decoded.thread_id.is_none());
+}

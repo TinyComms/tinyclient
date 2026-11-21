@@ -399,6 +399,8 @@ pub const TINY_FEATURE_CUSTOM_EMOJI: &str = "custom_emoji";
 pub const TINY_FEATURE_STICKERS: &str = "stickers";
 /// Sender-built link preview cards (`previews` on messages).
 pub const TINY_FEATURE_LINK_PREVIEWS: &str = "link_previews";
+/// Channel message threads (`thread_id`, `/v1/messages/{id}/thread`, `/v1/threads`).
+pub const TINY_FEATURE_THREADS: &str = "threads";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.

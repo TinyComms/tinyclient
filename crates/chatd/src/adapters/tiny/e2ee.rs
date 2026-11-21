@@ -500,6 +500,8 @@ pub(crate) struct Opened {
     pub saved_attribution: Option<cache_auth::SavedAttribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     /// Sender's Unix milliseconds, authenticated inside the encrypted envelope. Absent in
     /// older caches; never copied to server-visible message metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2823,6 +2825,7 @@ impl Device {
                 )),
                 saved_attribution: None,
                 reply_to: incoming.envelope.reply_to.clone(),
+                thread_id: incoming.envelope.thread_id.clone(),
                 sent_at: incoming.envelope.sent_at,
                 attachments: incoming
                     .envelope
@@ -2894,6 +2897,7 @@ impl Device {
             auth: None,
             saved_attribution: None,
             reply_to: envelope.reply_to.clone(),
+            thread_id: envelope.thread_id.clone(),
             sent_at: envelope.sent_at,
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
             mentions: envelope.mentions.clone(),

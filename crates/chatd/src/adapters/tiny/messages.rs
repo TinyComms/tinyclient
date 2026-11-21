@@ -333,6 +333,7 @@ pub(crate) fn on_live(
             }
         }
         "read.updated" => read_updated(ctx, saved, frame),
+        "thread.updated" => thread_updated(ctx, saved, frame),
         "emoji.updated" => { let _ = sync_emoji(ctx, saved); }
         "server.updated" => ctx.capabilities(account_caps(saved)),
         // The group of an encrypted conversation changed, this device's key packages ran low, or
@@ -369,6 +370,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "reaction.updated"
             | "e2ee.reaction"
             | "read.updated"
+            | "thread.updated"
             | "emoji.updated"
             | "e2ee.handshake"
             | "e2ee.keys_low"
@@ -417,6 +419,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             }
         }
         Command::OpenSpace(_) | Command::OpenHome => refresh(ctx, saved),
+        Command::OpenThreads(_) => open_threads(ctx, saved),
         Command::MarkRead { conversation_id, message_id } => mark_read(saved, &conversation_id, &message_id),
         Command::Send { conversation_id, client_id, text, reply_to } => send(ctx, saved, conversation_id, client_id, text, reply_to),
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -738,13 +741,24 @@ fn deliver(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, conver
         refold(ctx, saved, names, conversation_id, &opened);
         return;
     }
-    let Some(message) = map_message(saved, names, wire, &opened, &mut media) else {
+    let Some(mut message) = map_message(saved, names, wire, &opened, &mut media) else {
         return;
     };
+    apply_thread_summary(ctx, conversation_id, wire, &mut message);
     if !media.is_empty() {
         let _ = ctx.media(&media);
     }
-    let _ = ctx.message(conversation_id, &message);
+    let sealed_thread = match opened.get(&wire.id) {
+        Some(Read::Opened(o) | Read::Legacy(o)) => o.thread_id.as_deref(),
+        _ => None,
+    };
+    let target_thread = wire.thread_id.as_deref().or(sealed_thread).filter(|id| super::safe_id(id));
+    if let Some(root_id) = target_thread {
+        let tid = thread_known(ctx, conversation_id, root_id);
+        let _ = ctx.message(&tid, &message);
+    } else {
+        let _ = ctx.message(conversation_id, &message);
+    }
 }
 
 /// An encrypted edit came: each target it folded into is shown again with its new text.
@@ -1557,18 +1571,171 @@ fn load_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option
     }
 }
 
+fn split_thread_id(id: &str) -> Option<(&str, &str)> {
+    let (channel, root) = id.split_once(':')?;
+    if super::safe_id(channel) && super::safe_id(root) {
+        Some((channel, root))
+    } else {
+        None
+    }
+}
+
+fn thread_conv_id(channel_id: &str, root_id: &str) -> String {
+    format!("{channel_id}:{root_id}")
+}
+
+fn thread_known(ctx: &Context, channel_id: &str, root_id: &str) -> String {
+    let id = thread_conv_id(channel_id, root_id);
+    if ctx.known(&id).ok().flatten().is_none() {
+        let parent = ctx.known(channel_id).ok().flatten();
+        let title = parent
+            .as_ref()
+            .map(|p| p.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Thread".to_owned());
+        let mut row = ConversationRow::new(&id, ConversationKind::Thread, title);
+        row.space = Some(SPACE.to_owned());
+        row.parent = Some(channel_id.to_owned());
+        row.root = Some(root_id.to_owned());
+        if let Some(p) = parent {
+            row.encryption = p.encryption;
+        }
+        let _ = ctx.conversation(&row);
+    }
+    id
+}
+
+fn map_thread_summary(ctx: &Context, channel_id: &str, root_id: &str, wire: &WireThreadSummary) -> protocol::ThreadSummary {
+    let last = wire.last_reply_at.as_deref().and_then(rfc3339).unwrap_or(0);
+    let participants = wire
+        .participants
+        .iter()
+        .take(protocol::THREAD_FACES)
+        .filter(|id| !id.is_empty())
+        .map(|id| ctx.key(id))
+        .collect();
+    protocol::ThreadSummary {
+        id: thread_conv_id(channel_id, root_id),
+        replies: wire.replies,
+        last,
+        participants,
+        unread: wire.unread,
+    }
+}
+
+fn apply_thread_summary(ctx: &Context, channel_id: &str, wire: &WireMessage, message: &mut Message) {
+    if let Some(summary) = wire.thread.as_ref().filter(|s| s.replies > 0) {
+        message.thread = Some(map_thread_summary(ctx, channel_id, &wire.id, summary));
+    }
+}
+
+fn thread_updated(ctx: &Context, _saved: &Saved, frame: &Value) {
+    let channel_id = field(frame, "conversation_id");
+    let root_id = field(frame, "message_id");
+    if !super::safe_id(channel_id) || !super::safe_id(root_id) {
+        return;
+    }
+    let summary = frame
+        .get("thread")
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<WireThreadSummary>(v.clone()).ok())
+        .filter(|s| s.replies > 0)
+        .map(|s| map_thread_summary(ctx, channel_id, root_id, &s));
+    if let Ok(Some(mut root)) = ctx.stored_message(channel_id, root_id) {
+        root.thread = summary.clone();
+        let _ = ctx.message(channel_id, &root);
+    }
+    if let Some(summary) = summary {
+        let tid = thread_known(ctx, channel_id, root_id);
+        let _ = ctx.counts(&tid, summary.unread, 0, None, summary.last);
+    }
+}
+
+fn open_threads(ctx: &Context, saved: &Saved) {
+    if !server_has_feature(saved, protocol::TINY_FEATURE_THREADS) {
+        return;
+    }
+    let Ok((200, body)) = super::asked("GET", saved, "/v1/threads", None) else {
+        return;
+    };
+    let Ok(items) = serde_json::from_value::<Vec<WireFollowedThread>>(body) else {
+        return;
+    };
+    let names = member_names(saved);
+    for item in items {
+        if !super::safe_id(&item.channel_id) || !super::safe_id(&item.message_id) {
+            continue;
+        }
+        let tid = thread_known(ctx, &item.channel_id, &item.message_id);
+        let _ = ctx.filing(&tid, &crate::store::Filing { followed: true, ..crate::store::Filing::default() });
+        if let Some(wire) = item.message.as_ref() {
+            let mut media = Vec::new();
+            let opened = open_rows(ctx, saved, &item.channel_id, &[wire]);
+            if let Some(mut msg) = map_message(saved, &names, wire, &opened, &mut media) {
+                if let Some(summary) = item.thread.as_ref().filter(|s| s.replies > 0) {
+                    msg.thread = Some(map_thread_summary(ctx, &item.channel_id, &item.message_id, summary));
+                }
+                if !media.is_empty() {
+                    let _ = ctx.media(&media);
+                }
+                let _ = ctx.history(&tid, &[msg]);
+            }
+        }
+        if let Some(summary) = item.thread.as_ref() {
+            let last = summary.last_reply_at.as_deref().and_then(rfc3339).unwrap_or(0);
+            let _ = ctx.counts(&tid, summary.unread, 0, None, last);
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn follow_thread(saved: &Saved, root_id: &str, follow: bool) -> Result<(), String> {
+    if !super::safe_id(root_id) {
+        return Err(super::CHECK.to_owned());
+    }
+    let method = if follow { "PUT" } else { "DELETE" };
+    let path = format!("/v1/messages/{root_id}/thread/follow");
+    match super::asked(method, saved, &path, None) {
+        Ok((200 | 204, _)) => Ok(()),
+        Ok((status, body)) => Err(super::explain(status, &body, super::Missing::Plain).to_owned()),
+        Err(detail) => Err(detail.to_owned()),
+    }
+}
+
 fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option<&str>, limit: u32) -> Result<(), String> {
-    let path = match before {
-        Some(before) => format!("/v1/conversations/{conversation_id}/messages?before={before}&limit={limit}"),
-        None => format!("/v1/conversations/{conversation_id}/messages?limit={limit}"),
+    let thread = split_thread_id(conversation_id);
+    let (path, e2ee_conv) = if let Some((channel_id, root_id)) = thread {
+        thread_known(ctx, channel_id, root_id);
+        let p = match before {
+            Some(before) => format!("/v1/messages/{root_id}/thread?before={before}&limit={limit}"),
+            None => format!("/v1/messages/{root_id}/thread?limit={limit}"),
+        };
+        (p, channel_id)
+    } else {
+        let threads_q = if server_has_feature(saved, protocol::TINY_FEATURE_THREADS) { "&threads=1" } else { "" };
+        let p = match before {
+            Some(before) => format!("/v1/conversations/{conversation_id}/messages?before={before}&limit={limit}{threads_q}"),
+            None => format!("/v1/conversations/{conversation_id}/messages?limit={limit}{threads_q}"),
+        };
+        (p, conversation_id)
     };
     match super::asked("GET", saved, &path, None) {
         Ok((200, body)) => {
             let wires: Vec<WireMessage> = list_of(body, "messages").map_err(|()| super::UNREADABLE.to_owned())?;
             let names = member_names(saved);
             let mut media = Vec::new();
-            let opened = open_rows(ctx, saved, conversation_id, &wires.iter().collect::<Vec<_>>());
-            let messages: Vec<Message> = wires.iter().filter(|wire| wire.kind.as_deref() != Some("edit")).filter_map(|wire| map_message(saved, &names, wire, &opened, &mut media)).collect();
+            let opened = open_rows(ctx, saved, e2ee_conv, &wires.iter().collect::<Vec<_>>());
+            let messages: Vec<Message> = wires
+                .iter()
+                .filter(|wire| wire.kind.as_deref() != Some("edit"))
+                .filter_map(|wire| {
+                    let mut msg = map_message(saved, &names, wire, &opened, &mut media)?;
+                    if thread.is_none() {
+                        apply_thread_summary(ctx, conversation_id, wire, &mut msg);
+                    }
+                    Some(msg)
+                })
+                .collect();
             if !media.is_empty() {
                 let _ = ctx.media(&media);
             }
@@ -1579,21 +1746,21 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             // ones that changed while this device was away are asked for now, with anything a
             // page before this one still owed. The list is paged without the device mutex,
             // so the network holds up no other user of this device.
-            if sealed_here(ctx, saved, conversation_id) == Ok(true) {
+            if thread.is_none() && sealed_here(ctx, saved, e2ee_conv) == Ok(true) {
                 if let Some(device) = e2ee::started(saved) {
-                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, conversation_id);
+                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, e2ee_conv);
                     let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
-                    landed.extend(device.owed_reactions(conversation_id));
+                    landed.extend(device.owed_reactions(e2ee_conv));
                     let (mut applied, mut owed) = (Vec::new(), Vec::new());
                     for reaction in &landed {
                         let pair = (reaction.message.clone(), reaction.emoji.clone());
-                        if apply_reaction(ctx, conversation_id, reaction) {
+                        if apply_reaction(ctx, e2ee_conv, reaction) {
                             applied.push(pair);
                         } else {
                             owed.push(pair);
                         }
                     }
-                    device.settle_reactions(conversation_id, &applied, &owed);
+                    device.settle_reactions(e2ee_conv, &applied, &owed);
                 }
             }
             Ok(())
@@ -1625,14 +1792,15 @@ fn send_spans(
     sticker_id: Option<String>,
     suppress_embeds: bool,
 ) {
-    if !super::safe_id(&conversation_id) {
+    if !super::safe_id(&conversation_id) && split_thread_id(&conversation_id).is_none() {
         let outcome = Err(super::CHECK.to_owned());
         ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
+    let check_conv = split_thread_id(&conversation_id).map_or(conversation_id.as_str(), |(ch, _)| ch);
     // The same question the post asks, so a conversation the device knows is encrypted but the
     // list has not labelled yet still goes to the sealed queue and never holds up the plain one.
-    let account = send_account(saved, sealed_here(ctx, saved, &conversation_id) == Ok(true));
+    let account = send_account(saved, sealed_here(ctx, saved, check_conv) == Ok(true));
     let (posting, saved) = (ctx.clone(), saved.clone());
     in_order(account, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
@@ -1806,10 +1974,19 @@ fn post_message_with(
     sticker_id: Option<&str>,
     suppress_embeds: bool,
 ) -> Result<Message, String> {
-    if !super::safe_id(conversation_id) {
-        return Err(super::CHECK.to_owned());
-    }
-    if sealed_here(ctx, saved, conversation_id)? {
+    let (target_conv, thread_root) = match split_thread_id(conversation_id) {
+        Some((ch, root)) => {
+            thread_known(ctx, ch, root);
+            (ch, Some(root))
+        }
+        None => {
+            if !super::safe_id(conversation_id) {
+                return Err(super::CHECK.to_owned());
+            }
+            (conversation_id, None)
+        }
+    };
+    if sealed_here(ctx, saved, target_conv)? {
         return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids, spans, sticker_id, suppress_embeds);
     }
     let mut body = serde_json::Map::new();
@@ -1817,6 +1994,9 @@ fn post_message_with(
     body.insert("client_id".to_owned(), Value::String(client_id.to_owned()));
     if let Some(reply_to) = reply_to.filter(|id| super::safe_id(id)) {
         body.insert("reply_to".to_owned(), Value::String(reply_to.to_owned()));
+    }
+    if let Some(root_id) = thread_root {
+        body.insert("thread_id".to_owned(), Value::String(root_id.to_owned()));
     }
     if !attachment_ids.is_empty() {
         body.insert("attachment_ids".to_owned(), json!(attachment_ids));
@@ -1839,11 +2019,11 @@ fn post_message_with(
             body.insert("previews".to_owned(), Value::Array(vec![preview_json]));
         }
     }
-    let path = format!("/v1/conversations/{conversation_id}/messages");
+    let path = format!("/v1/conversations/{target_conv}/messages");
     let answer = super::asked("POST", saved, &path, Some(Value::Object(body)));
     crate::sendtime::stage("post");
     match answer {
-        Ok((200 | 201, value)) => accept_message(ctx, saved, conversation_id, &value),
+        Ok((200 | 201, value)) => accept_message(ctx, saved, target_conv, &value),
         Ok((status, value)) => Err(super::explain(status, &value, super::Missing::Plain).to_owned()),
         Err(detail) => Err(detail.to_owned()),
     }
@@ -1992,11 +2172,18 @@ fn post_sealed(
     sticker_id: Option<&str>,
     suppress_embeds: bool,
 ) -> Result<Message, String> {
+    let (target_conv, thread_root) = match split_thread_id(conversation_id) {
+        Some((ch, root)) => {
+            thread_known(ctx, ch, root);
+            (ch, Some(root))
+        }
+        None => (conversation_id, None),
+    };
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut all_ids = attachment_ids.to_vec();
     let mut previews = Vec::new();
     if !suppress_embeds {
-        if let Some((preview, img_id)) = fetch_sealed_preview(saved, conversation_id, text) {
+        if let Some((preview, img_id)) = fetch_sealed_preview(saved, target_conv, text) {
             if let Some(id) = img_id {
                 all_ids.push(id);
             }
@@ -2005,14 +2192,15 @@ fn post_sealed(
     }
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.reply_to = reply_to.filter(|id| super::safe_id(id)).map(str::to_owned);
+    envelope.thread_id = thread_root.map(str::to_owned);
     envelope.attachments = attachments;
     envelope.mentions = mentions_from_spans(text, spans);
     envelope.emoji = emoji_from_spans(text, spans);
     envelope.sticker_id = sticker_id.filter(|id| super::safe_id(id)).map(str::to_owned);
     envelope.previews = previews;
     envelope.sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
-    let answer = e2ee::send(&device, conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, &all_ids)?;
-    accept_message(ctx, saved, conversation_id, &answer)
+    let answer = e2ee::send(&device, target_conv, client_id, e2ee_core::Kind::Message, None, &envelope, &all_ids)?;
+    accept_message(ctx, saved, target_conv, &answer)
 }
 
 fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
@@ -2035,7 +2223,8 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             return;
         }
     }
-    let sealed = match sealed_here(ctx, saved, &conversation_id) {
+    let e2ee_conv = split_thread_id(&conversation_id).map_or(conversation_id.as_str(), |(ch, _)| ch).to_owned();
+    let sealed = match sealed_here(ctx, saved, &e2ee_conv) {
         Ok(sealed) => sealed,
         Err(why) => {
             ctx.sent(&conversation_id, &client_id, Err(why));
@@ -2255,10 +2444,16 @@ fn delete(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str,
 }
 
 fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
-    if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
+    if !super::safe_id(message_id) {
         return;
     }
-    let path = format!("/v1/conversations/{conversation_id}/read");
+    let path = if let Some((_, root_id)) = split_thread_id(conversation_id) {
+        format!("/v1/messages/{root_id}/thread/read")
+    } else if super::safe_id(conversation_id) {
+        format!("/v1/conversations/{conversation_id}/read")
+    } else {
+        return;
+    };
     match super::asked("POST", saved, &path, Some(json!({ "message_id": message_id }))) {
         Ok((200 | 204, _)) => {}
         Ok((status, _)) => tracing::warn!("chatd: Tiny server: read answered {status}"),
@@ -2816,6 +3011,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
         },
         stickers: server_caps.has(protocol::TINY_FEATURE_STICKERS),
         suppress_embeds: server_caps.has(protocol::TINY_FEATURE_LINK_PREVIEWS),
+        threads: server_caps.has(protocol::TINY_FEATURE_THREADS),
         reply: true,
         edit: true,
         delete: true,
@@ -3494,6 +3690,28 @@ struct WireLast {
 }
 
 #[derive(Deserialize)]
+struct WireThreadSummary {
+    #[serde(default)]
+    replies: u32,
+    #[serde(default)]
+    last_reply_at: Option<String>,
+    #[serde(default)]
+    participants: Vec<String>,
+    #[serde(default)]
+    unread: u32,
+}
+
+#[derive(Deserialize)]
+struct WireFollowedThread {
+    channel_id: String,
+    message_id: String,
+    #[serde(default)]
+    message: Option<WireMessage>,
+    #[serde(default)]
+    thread: Option<WireThreadSummary>,
+}
+
+#[derive(Deserialize)]
 struct WirePreview {
     url: String,
     #[serde(default)]
@@ -3516,6 +3734,10 @@ struct WireMessage {
     body: String,
     #[serde(default)]
     reply_to: Option<Value>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    thread: Option<WireThreadSummary>,
     #[serde(default)]
     client_id: Option<String>,
     #[serde(default)]
@@ -5539,5 +5761,145 @@ mod tests {
         assert_eq!(smsg.previews[0].site, "docs.example.net");
         assert_eq!(smsg.previews[0].image.as_ref().map(|f| f.id.as_str()), Some("img-prev-sealed"));
         assert!(sealed_media.iter().any(|(f, url)| f.id == "img-prev-sealed" && url.ends_with("/v1/media/img-prev-sealed")));
+    }
+
+    #[test]
+    fn threads_capability_history_send_read_live_and_open_threads() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log_srv = log.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            log_srv.lock().unwrap().push(request.to_owned());
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["threads"]}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            if request.starts_with("GET /v1/conversations/chan-1/messages?limit=50&threads=1 ") {
+                return Some(http(200, "OK", &json!({
+                    "messages": [{
+                        "id": "root-1",
+                        "author_id": PEER,
+                        "body": "Main topic",
+                        "created_at": WHEN,
+                        "thread": {
+                            "replies": 1,
+                            "last_reply_at": WHEN,
+                            "participants": [ME],
+                            "unread": 0
+                        }
+                    }]
+                }).to_string()));
+            }
+            if request.starts_with("GET /v1/messages/root-1/thread?limit=50 ") {
+                return Some(http(200, "OK", &json!({
+                    "messages": [{
+                        "id": "rep-1",
+                        "author_id": PEER,
+                        "body": "First reply",
+                        "thread_id": "root-1",
+                        "created_at": WHEN
+                    }]
+                }).to_string()));
+            }
+            if request.starts_with("POST /v1/conversations/chan-1/messages ") {
+                return Some(http(201, "Created", &json!({
+                    "id": "rep-2",
+                    "author_id": ME,
+                    "body": "Second reply",
+                    "thread_id": "root-1",
+                    "created_at": WHEN
+                }).to_string()));
+            }
+            if request.starts_with("POST /v1/messages/root-1/thread/read ") {
+                return Some(http(204, "No Content", ""));
+            }
+            if request.starts_with("PUT /v1/messages/root-1/thread/follow ")
+                || request.starts_with("DELETE /v1/messages/root-1/thread/follow ")
+            {
+                return Some(http(204, "No Content", ""));
+            }
+            if request.starts_with("GET /v1/threads ") {
+                return Some(http(200, "OK", &json!([{
+                    "channel_id": "chan-1",
+                    "message_id": "root-1",
+                    "message": {
+                        "id": "root-1",
+                        "author_id": PEER,
+                        "body": "Main topic",
+                        "created_at": WHEN
+                    },
+                    "thread": {
+                        "replies": 4,
+                        "last_reply_at": WHEN,
+                        "participants": [PEER, ME],
+                        "unread": 4
+                    }
+                }]).to_string()));
+            }
+            None
+        });
+
+        let caps = account_caps(&saved);
+        assert!(caps.threads, "threads feature must set Capabilities::threads");
+
+        // Channel history uses ?threads=1 and attaches ThreadSummary to root.
+        let mut ch = ConversationRow::new("chan-1", ConversationKind::Channel, "general");
+        ch.space = Some(SPACE.to_owned());
+        ctx.conversation(&ch).unwrap();
+        fetch_page(&ctx, &saved, "chan-1", None, 50).unwrap();
+        let root = ctx.stored_message("chan-1", "root-1").unwrap().unwrap();
+        let summary = root.thread.as_ref().expect("root has thread summary");
+        assert_eq!(summary.id, "chan-1:root-1");
+        assert_eq!(summary.replies, 1);
+
+        // Thread history reads GET /v1/messages/root-1/thread.
+        fetch_page(&ctx, &saved, "chan-1:root-1", None, 50).unwrap();
+        assert!(ctx.stored_message("chan-1:root-1", "rep-1").unwrap().is_some());
+
+        // Sending in thread conversation posts to parent channel with thread_id.
+        let sent = post_message(&ctx, &saved, "chan-1:root-1", "c-t1", "Second reply", None, &[], &[], None).unwrap();
+        assert_eq!(sent.id, "rep-2");
+        let post_req = log.lock().unwrap().iter().find(|r| r.starts_with("POST /v1/conversations/chan-1/messages ")).cloned().unwrap();
+        let post_body: Value = serde_json::from_str(post_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(post_body["thread_id"], "root-1");
+
+        // MarkRead on thread posts to /v1/messages/{root}/thread/read.
+        mark_read(&saved, "chan-1:root-1", "rep-2");
+        assert!(log.lock().unwrap().iter().any(|r| r.starts_with("POST /v1/messages/root-1/thread/read ")));
+
+        // Follow & unfollow helpers hit PUT/DELETE /v1/messages/{root}/thread/follow.
+        follow_thread(&saved, "root-1", true).unwrap();
+        follow_thread(&saved, "root-1", false).unwrap();
+
+        // Live thread.updated refreshes root's ThreadSummary.
+        on_live(&ctx, &saved, &HashMap::new(), "thread.updated", &json!({
+            "conversation_id": "chan-1",
+            "kind": "channel",
+            "message_id": "root-1",
+            "thread": { "replies": 3, "last_reply_at": WHEN, "participants": [PEER, ME], "unread": 2 }
+        }));
+        let updated = ctx.stored_message("chan-1", "root-1").unwrap().unwrap();
+        assert_eq!(updated.thread.as_ref().unwrap().replies, 3);
+        assert_eq!(updated.thread.as_ref().unwrap().unread, 2);
+
+        // Live reply with thread_id routes to thread conversation, not channel.
+        let reply_wire: WireMessage = serde_json::from_value(json!({
+            "id": "rep-3",
+            "author_id": PEER,
+            "body": "Live thread reply",
+            "thread_id": "root-1",
+            "created_at": WHEN
+        })).unwrap();
+        deliver(&ctx, &saved, &HashMap::new(), "chan-1", &reply_wire);
+        assert!(ctx.stored_message("chan-1:root-1", "rep-3").unwrap().is_some());
+        assert!(ctx.stored_message("chan-1", "rep-3").unwrap().is_none());
+
+        // OpenThreads loads GET /v1/threads and marks followed.
+        open_threads(&ctx, &saved);
+        let thread_row = ctx.known("chan-1:root-1").unwrap().unwrap();
+        assert!(thread_row.followed);
+        assert_eq!(thread_row.unread, 4);
     }
 }

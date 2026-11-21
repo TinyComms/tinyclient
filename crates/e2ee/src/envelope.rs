@@ -128,6 +128,8 @@ pub struct Envelope {
     pub text: String,
     /// The id of the message this one answers. Messages only.
     pub reply_to: Option<String>,
+    /// The root message id when this message is a thread reply. Messages only.
+    pub thread_id: Option<String>,
     pub attachments: Vec<AttachmentRef>,
     /// Structured @mentions in `text` (UTF-8 byte offsets). Messages and edits.
     pub mentions: Vec<MentionRef>,
@@ -185,6 +187,8 @@ struct Wire {
     text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
     #[serde(default)]
     attachments: Vec<WireAttachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -305,6 +309,11 @@ impl Envelope {
                 Kind::Message | Kind::Reaction => self.reply_to.clone(),
                 Kind::Edit => None,
             },
+            thread_id: if kind == Kind::Message {
+                self.thread_id.clone()
+            } else {
+                None
+            },
             attachments,
             mentions: if kind == Kind::Reaction {
                 Vec::new()
@@ -401,9 +410,15 @@ impl Envelope {
         } else {
             None
         };
+        let thread_id = if kind == Kind::Message {
+            wire.thread_id.filter(|id| !id.is_empty() && id.len() <= MAX_ID)
+        } else {
+            None
+        };
         Ok(Envelope {
             text: wire.text,
             reply_to,
+            thread_id,
             attachments,
             mentions,
             emoji,

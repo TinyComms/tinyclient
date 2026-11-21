@@ -304,7 +304,7 @@ fn pane_open(open: &protocol::Conversation) -> pane::Open {
 /// first reply. Discord's does not exist until the thread channel is created.
 fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Option<Key> {
     let caps = Capabilities {
-        threads: matches!(conversation.network, Network::Slack | Network::Teams | Network::Discord),
+        threads: matches!(conversation.network, Network::Slack | Network::Teams | Network::Discord | Network::Tiny),
         direct_threads: conversation.network == Network::Slack,
         ..Capabilities::default()
     };
@@ -312,7 +312,7 @@ fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Opt
         thread.id.clone()
     } else if super::actions::starts_thread(root, &caps, kind) {
         match conversation.network {
-            Network::Slack if !conversation.id.contains(':') && !root.id.contains(':') => {
+            Network::Slack | Network::Tiny if !conversation.id.contains(':') && !root.id.contains(':') => {
                 format!("{}:{}", conversation.id, root.id)
             }
             Network::Teams if !conversation.id.contains(";messageid=") && !root.id.contains(";messageid=") => {
