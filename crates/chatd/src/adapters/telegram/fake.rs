@@ -21,8 +21,9 @@
 //! unread). Workshop's member list is its owner, two admins and its bot. A search there for
 //! Nia Pell (7012) names her; she is not otherwise in the account. The phone +1 555 010 0142
 //! signs in with the code 24680; +1 555 010 0199 also wants the password "correct horse".
-//! Username resolution serves only `gif` and `forest_wren`; `flood_wait` returns a flood wait,
-//! and every other name returns USERNAME_NOT_OCCUPIED.
+//! Username resolution serves `gif`, `forest_wren`, and the public chats a search can preview
+//! (`larchpress`, `larchtrail`, `closedridge`, `fullshelf`, `similarpeaks`). `flood_wait` returns
+//! a flood wait, and every other name returns USERNAME_NOT_OCCUPIED.
 
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
@@ -50,6 +51,12 @@ const LEFT_BROADCAST: i64 = 9004;
 const INVALID_CHANNEL: i64 = 9005;
 const OFF_PAGE_GROUP: i64 = 9006;
 const OFF_PAGE_HANDLE: &str = "weatherdesk";
+/// Public chats a search can preview. None of them is in the dialog list until joined.
+const LARCH: i64 = 9010;
+const CLOSED: i64 = 9011;
+const FULL: i64 = 9012;
+const SIMILAR: i64 = 9013;
+const LARCH_TRAIL: i64 = 9014;
 /// The post's echo in the discussion group: the message a send answers, and the id the echo
 /// test looks for (`GetDiscussionMessage` names it for the open, the send for its reply).
 const ECHO: i32 = 60;
@@ -170,6 +177,47 @@ fn a_channel(id: i64, title: &str, broadcast: bool, forum: bool, username: &str)
     channel.forum = forum;
     channel.username = (!username.is_empty()).then(|| username.to_owned());
     channel
+}
+
+/// A public channel or megagroup a search can name. `joinable` is false when joining is refused.
+struct PublicChat {
+    id: i64,
+    title: &'static str,
+    broadcast: bool,
+    username: &'static str,
+    joinable: bool,
+}
+
+fn public_catalog() -> &'static [PublicChat] {
+    &[
+        PublicChat { id: LARCH, title: "Larch Press", broadcast: true, username: "larchpress", joinable: true },
+        PublicChat { id: LARCH_TRAIL, title: "Larch Trail", broadcast: false, username: "larchtrail", joinable: true },
+        PublicChat { id: CLOSED, title: "Closed Ridge", broadcast: false, username: "closedridge", joinable: false },
+        PublicChat { id: FULL, title: "Full Shelf", broadcast: true, username: "fullshelf", joinable: false },
+        PublicChat { id: SIMILAR, title: "Similar Peaks", broadcast: true, username: "similarpeaks", joinable: true },
+    ]
+}
+
+/// Not a member yet: `left` stays set until `channels.joinChannel` answers.
+fn public_chat(spec: &PublicChat) -> tl::enums::Chat {
+    let mut channel = a_channel(spec.id, spec.title, spec.broadcast, false, spec.username);
+    channel.left = true;
+    tl::enums::Chat::Channel(channel)
+}
+
+/// Channels and groups this query names. Wren stays in every search answer on her own.
+#[inline(never)]
+fn searched_public(query: &str) -> Vec<tl::enums::Chat> {
+    let query = query.to_ascii_lowercase();
+    public_catalog()
+        .iter()
+        .filter(|spec| {
+            (query.contains("larch") && (spec.id == LARCH || spec.id == LARCH_TRAIL))
+                || (query.contains("closed") && spec.id == CLOSED)
+                || (query.contains("shelf") && spec.id == FULL)
+        })
+        .map(public_chat)
+        .collect()
 }
 
 fn chats() -> Vec<tl::enums::Chat> {
@@ -697,6 +745,11 @@ impl World {
         world.store(None, message(odalys, 12, ODALYS, t0() - 60, "Good. Trailhead at seven."));
         world.store(None, message(Who::Group(CREW), 20, TOBIN, t0() - 3_600, "Maps are in the shared folder."));
         world.store(None, message(Who::Channel(NOTES), 5, 0, t0() - 7_200, "Snow line is at 1,900 m this week."));
+        let mut larch = message(Who::Channel(LARCH), 8, 0, t0() - 50, "The ridge is clear.");
+        larch.from_id = None;
+        larch.post = true;
+        world.store(None, larch);
+        world.store(None, message(Who::Channel(LARCH_TRAIL), 9, TOBIN, t0() - 40, "Meet at the larch."));
         let mut tools = message(Who::Channel(WORKSHOP), 41, TOBIN, t0() - 500, "Who has the torque wrench?");
         if held_at_wire("TINYCLIENT_TELEGRAM_FORUM_TTL") {
             tools.date = crate::hub::now() as i32;
@@ -959,6 +1012,14 @@ fn answer<T: Serializable>(value: T) -> Result<Vec<u8>, Fault> {
 fn resolve_username(username: &str) -> Result<Vec<u8>, Fault> {
     if username == "flood_wait" {
         return Err(rpc(420, "FLOOD_WAIT", Some(60)));
+    }
+    if let Some(spec) = public_catalog().iter().find(|spec| spec.username.eq_ignore_ascii_case(username)) {
+        let found = tl::types::contacts::ResolvedPeer {
+            peer: Who::Channel(spec.id).peer(),
+            chats: vec![public_chat(spec)],
+            users: Vec::new(),
+        };
+        return answer(tl::enums::contacts::ResolvedPeer::Peer(found));
     }
     let (id, first, last, handle) = if username.eq_ignore_ascii_case("forest_wren") {
         (7_011, "Robin", "Vale", "forest_wren")
@@ -2421,10 +2482,16 @@ impl World {
         }
         if let Some(request) = asked::<f::contacts::Search>(body) {
             self.log(&format!("contacts.Search {}", request.q));
+            let chats = searched_public(&request.q);
+            let mut results = vec![Who::User(7_010).peer()];
+            results.extend(chats.iter().filter_map(|chat| match chat {
+                tl::enums::Chat::Channel(channel) => Some(Who::Channel(channel.id).peer()),
+                _ => None,
+            }));
             let found = tl::types::contacts::Found {
                 my_results: Vec::new(),
-                results: vec![Who::User(7_010).peer()],
-                chats: Vec::new(),
+                results,
+                chats,
                 users: vec![user(7_010, "Wren", "Halloran", "wren").into()],
             };
             return answer(tl::enums::contacts::Found::Found(found));
@@ -3566,6 +3633,47 @@ impl World {
             let tl::enums::InputPeerNotifySettings::Settings(settings) = &request.settings;
             self.log(&format!("UpdateNotifySettings {peer} {}", settings.mute_until.unwrap_or(-1)));
             return Some(answer(true));
+        }
+        if let Some(request) = asked::<f::channels::JoinChannel>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Some(Err(rpc(400, "CHANNEL_INVALID", None)));
+            };
+            let id = channel.channel_id;
+            self.log(&format!("JoinChannel c{id}"));
+            if id == CLOSED {
+                return Some(Err(rpc(400, "INVITE_REQUEST_SENT", None)));
+            }
+            if id == FULL {
+                return Some(Err(rpc(400, "CHANNELS_TOO_MUCH", None)));
+            }
+            let Some(spec) = public_catalog().iter().find(|spec| spec.id == id && spec.joinable) else {
+                return Some(Err(rpc(400, "CHANNEL_PRIVATE", None)));
+            };
+            let mut joined = a_channel(spec.id, spec.title, spec.broadcast, false, spec.username);
+            joined.left = false;
+            let upd = tl::types::Updates {
+                updates: Vec::new(),
+                users: users(),
+                chats: vec![tl::enums::Chat::Channel(joined)],
+                date: t0(),
+                seq: 0,
+            };
+            return Some(answer(tl::enums::messages::ChatInviteJoinResult::Ok(tl::types::messages::ChatInviteJoinResultOk {
+                updates: tl::enums::Updates::Updates(upd),
+            })));
+        }
+        if let Some(request) = asked::<f::channels::GetChannelRecommendations>(body) {
+            let id = match &request.channel {
+                Some(tl::enums::InputChannel::Channel(channel)) => channel.channel_id,
+                _ => 0,
+            };
+            self.log(&format!("GetChannelRecommendations c{id}"));
+            let chats = if id == LARCH {
+                vec![public_chat(&PublicChat { id: SIMILAR, title: "Similar Peaks", broadcast: true, username: "similarpeaks", joinable: true })]
+            } else {
+                Vec::new()
+            };
+            return Some(answer(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats })));
         }
         if let Some(request) = asked::<f::channels::LeaveChannel>(body) {
             let tl::enums::InputChannel::Channel(channel) = &request.channel else {

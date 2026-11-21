@@ -537,6 +537,10 @@ pub struct Composer {
     /// One line under the card, until the text changes: why something did not happen.
     caption: Option<(String, Tone)>,
     sending: bool,
+    /// A join is already on its way. Another click does not send a second one.
+    joining: bool,
+    /// The conversation just joined, until the user leaves it or undoes the join.
+    undo_join: Option<Key>,
     /// The conversation the network was last told we are typing in, and when.
     told_typing: Option<(Key, Instant)>,
     list: Option<List>,
@@ -670,6 +674,8 @@ impl Composer {
             editing: None,
             caption: None,
             sending: false,
+            joining: false,
+            undo_join: None,
             told_typing: None,
             list: None,
             dismissed: None,
@@ -755,6 +761,7 @@ impl Composer {
             self.reply = draft.reply;
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
+            self.undo_join = None;
             self.no_preview = false;
             self.broadcast = false;
             self.armed = None;
@@ -2657,11 +2664,68 @@ impl Composer {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
     }
 
+    /// Subscribe on a Telegram channel. Join on a Telegram group. Other networks keep the old label.
+    fn join_label(network: Network, kind: ConversationKind) -> &'static str {
+        match (network, kind) {
+            (Network::Telegram, ConversationKind::Channel | ConversationKind::Announcement) => "Subscribe",
+            (Network::Telegram, _) => "Join",
+            _ => "Join channel",
+        }
+    }
+
+    /// A join finished. Success offers one Undo, which leaves. A refusal stays on the preview.
+    fn note_join(&mut self, conversation: Key, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+        if self.target.as_ref().is_none_or(|target| target.key != conversation) {
+            return;
+        }
+        match answer {
+            Ok(Response::Ok | Response::Conversation { .. }) => self.undo_join = Some(conversation),
+            Ok(Response::Error { detail, .. }) => self.caption = Some((detail, Tone::Refused)),
+            _ => self.caption = Some(("Telegram did not confirm the join.".to_owned(), Tone::Refused)),
+        }
+        cx.notify();
+    }
+
+    /// One click undoes a join that just succeeded. Moving to another conversation clears it.
+    fn undo_join_bar(&self, target: &Target, cx: &mut Context<Self>) -> Option<Div> {
+        let key = self.undo_join.clone().filter(|key| key == &target.key)?;
+        let word = match target.kind {
+            ConversationKind::Channel | ConversationKind::Announcement => "Subscribed",
+            _ => "Joined",
+        };
+        Some(
+            div()
+                .h(px(28.))
+                .mb(px(6.))
+                .px(px(12.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(div().flex_1().child(word))
+                .child(button("undo-join", ButtonKind::Secondary, "Undo").on_click(cx.listener(move |this, _, _, cx| {
+                    if this.undo_join.as_ref() != Some(&key) {
+                        return;
+                    }
+                    this.undo_join = None;
+                    let conversation = key.clone();
+                    ask_later(cx, Request::Leave { conversation }, |_, _| {});
+                    cx.notify();
+                }))),
+        )
+    }
+
     /// The 40 pt bar that stands where the card would be.
     fn bar(&self, locked: Locked, network: Network, cx: &mut Context<Self>) -> Div {
         if matches!(locked, Locked::NotJoined) {
             let key = self.target.as_ref().map(|t| t.key.clone());
+            let kind = self.target.as_ref().map(|t| t.kind).unwrap_or(ConversationKind::Channel);
             let title = self.target.as_ref().map(|t| t.title.clone()).unwrap_or_else(|| "this channel".to_owned());
+            let label = Self::join_label(network, kind);
             return div()
                 .h(px(card_height()))
                 .pl(px(12.))
@@ -2677,10 +2741,20 @@ impl Composer {
                 .child(glyph("icons/hash.svg", 16., theme::text_faint()))
                 .child(div().flex_1().min_w_0().truncate().child(format!("Previewing {title}")))
                 .child(
-                    button("join-channel", ButtonKind::Primary, "Join channel").on_click(cx.listener(move |_, _, _, cx| {
-                        if let Some(conversation) = key.clone() {
-                            ask_later(cx, Request::Join { conversation }, |_, _| {});
+                    button("join-channel", ButtonKind::Primary, label).on_click(cx.listener(move |this, _, _, cx| {
+                        if this.joining {
+                            return;
                         }
+                        let Some(conversation) = key.clone() else { return };
+                        this.joining = true;
+                        let joined = conversation.clone();
+                        let entity = cx.weak_entity();
+                        ask_later(cx, Request::Join { conversation }, move |answer, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.joining = false;
+                                this.note_join(joined, answer, cx);
+                            });
+                        });
                     })),
                 );
         }
@@ -3964,6 +4038,7 @@ impl Render for Composer {
         let Some(target) = self.target.clone() else {
             return dock;
         };
+        let undo = self.undo_join_bar(&target, cx);
         let body = match target.locked() {
             Some(locked) => self.bar(locked, target.key.network, cx),
             None => self.card(focus.is_focused(window), window, cx),
@@ -3973,7 +4048,7 @@ impl Render for Composer {
         dock.child(div().pl(px(13.)).child(self.typing.clone()))
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
-            .child(div().relative().child(body).children(self.popover(cx)))
+            .child(div().relative().children(undo).child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))
             .children(self.picker_layer(window, cx))
             .children(self.send_menu_layer(window, cx))

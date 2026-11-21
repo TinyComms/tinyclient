@@ -813,7 +813,10 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
         ),
         Act::Leave => (
             format!("Leave {name} on {net}?"),
-            "You'll stop getting its messages. To come back, someone in it has to add you.".to_owned(),
+            match network {
+                Network::Telegram => "You'll stop getting its messages. A public one can be found and joined again. A private one needs someone in it to add you.".to_owned(),
+                _ => "You'll stop getting its messages. To come back, someone in it has to add you.".to_owned(),
+            },
             "Leave",
         ),
     }

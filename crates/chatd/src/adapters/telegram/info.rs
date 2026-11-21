@@ -407,6 +407,81 @@ pub(super) fn invite_join(account: &Account, raw: &str) -> Result<(Option<String
     }
 }
 
+/// A stored conversation id for a channel or megagroup. A URL, a person, or a basic group is not one.
+fn public_who(conversation: &str) -> Result<Who, Fault> {
+    match Who::parse(conversation) {
+        Some((who @ Who::Channel(_), None)) => Ok(who),
+        _ => Err(invalid("PEER_ID_INVALID")),
+    }
+}
+
+/// Shows a public channel or group the account has not joined. Reads one page and does not subscribe.
+pub(super) fn preview_public(account: &Account, conversation: &str) -> Result<(), Fault> {
+    let who = public_who(conversation)?;
+    let recorded = if sync::member(account, who) {
+        sync::ensure_row(account, who, None)
+    } else {
+        sync::ensure_preview_row(account, who)
+    };
+    if !recorded {
+        return Err(invalid("CHANNEL_PRIVATE"));
+    }
+    sync::history(account, conversation, sync::Around::Newest);
+    Ok(())
+}
+
+/// Joins one public channel or megagroup (`channels.joinChannel`). A search result stays a preview until this.
+pub(super) fn join_public(account: &Account, conversation: &str) -> Result<(), Fault> {
+    let who = public_who(conversation)?;
+    if sync::member(account, who) {
+        return sync::ensure_row(account, who, None).then_some(()).ok_or_else(|| invalid("CHANNEL_PRIVATE"));
+    }
+    let channel = account.input_channel(who)?;
+    match account.ask(&tl::functions::channels::JoinChannel { channel: channel.clone() }) {
+        Ok(tl::enums::messages::ChatInviteJoinResult::Ok(joined)) => {
+            super::learn_updates(account, &joined.updates);
+            super::live::answered(account, &joined.updates);
+            if !sync::ensure_row(account, who, None) {
+                return Err(invalid("CHANNEL_PRIVATE"));
+            }
+            similar(account, channel);
+            Ok(())
+        }
+        Ok(tl::enums::messages::ChatInviteJoinResult::WebView(_)) => {
+            Err(Fault::Net("This channel requires confirmation in Telegram's official app.".to_owned()))
+        }
+        Err(fault) if fault.is("INVITE_REQUEST_SENT") => Err(fault),
+        Err(fault) if fault.is("USER_ALREADY_PARTICIPANT") => {
+            if let Ok(found) = account.ask(&tl::functions::channels::GetChannels { id: vec![channel] }) {
+                account.learn(&[], &found.chats());
+            }
+            if sync::ensure_row(account, who, None) { Ok(()) } else { Err(fault) }
+        }
+        Err(fault) => Err(fault),
+    }
+}
+
+/// Channels Telegram suggests after a join. Each one is a preview until the user joins it.
+fn similar(account: &Account, channel: tl::enums::InputChannel) {
+    let found = match account.ask(&tl::functions::channels::GetChannelRecommendations { channel: Some(channel) }) {
+        Ok(found) => found,
+        Err(fault) => {
+            tracing::warn!("chatd: Telegram: similar channels: {fault}");
+            return;
+        }
+    };
+    let chats = found.chats();
+    account.learn(&[], &chats);
+    for chat in &chats {
+        let Some((who, ..)) = chat_peer_and_title(chat) else { continue };
+        if sync::member(account, who) {
+            sync::ensure_row(account, who, None);
+        } else {
+            sync::ensure_preview_row(account, who);
+        }
+    }
+}
+
 /// Lists exported invite links for a chat (`messages.getExportedChatInvites`).
 pub(super) fn chat_invites(account: &Account, conversation: &str, revoked: bool) -> Result<Vec<protocol::ChatInviteLink>, Fault> {
     let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;

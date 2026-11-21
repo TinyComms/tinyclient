@@ -747,6 +747,7 @@ fn offline(ctx: &Context, command: Command) {
         }
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
         Command::ResolveUsername { reply, .. } => drop(reply.send(Err(down()))),
+        Command::PreviewChannel { reply, .. } | Command::Join { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -806,9 +807,13 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
-            let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
+            // `broadcasts` asks for public channels. Bots stay out: the shell hides them.
+            let request = tl::functions::contacts::Search { broadcasts: true, bots: false, q: query.clone(), limit: 25 };
             if let Ok(tl::enums::contacts::Found::Found(found)) = account.ask(&request) {
-                account.learn(&found.users, &[]);
+                account.learn(&found.users, &found.chats);
+                // Learn runs first. A non-member has no preview yet, so refresh drops it; the row is recorded after.
+                keep_found(account, &found.my_results);
+                keep_found(account, &found.results);
             }
             // Resolving is tightly flood-limited: only an explicit, complete @username asks
             // for it, after ranked search. Never hold queued sends up waiting out a flood.
@@ -818,7 +823,8 @@ fn serve(account: &Arc<Account>, command: Command) {
             }) {
                 let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
                 if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) = wire::call(account.wire.as_ref(), &request) {
-                    account.learn(&found.users, &[]);
+                    account.learn(&found.users, &found.chats);
+                    keep_found(account, std::slice::from_ref(&found.peer));
                 }
             }
             // A channel on screen is searched too. The contact search above already stands.
@@ -883,6 +889,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::InviteJoin { code, reply } => {
             let _ = reply.send(info::invite_join(account, &code).map_err(refused));
+        }
+        Command::PreviewChannel { conversation_id, reply } => {
+            let _ = reply.send(info::preview_public(account, &conversation_id).map_err(refused));
+        }
+        Command::Join { conversation_id, reply } => {
+            let _ = reply.send(info::join_public(account, &conversation_id).map_err(refused));
         }
         Command::ChatInvites { conversation_id, revoked, reply } => {
             let _ = reply.send(info::chat_invites(account, &conversation_id, revoked).map_err(refused));
@@ -1008,6 +1020,21 @@ fn serve(account: &Arc<Account>, command: Command) {
 }
 
 const RESOLVED_CACHE: usize = 256;
+
+/// A chat named by search. A member is a normal row. Anyone else is a preview, and is not joined.
+fn keep_found(account: &Account, peers: &[tl::enums::Peer]) {
+    for peer in peers {
+        let who = Who::of(peer);
+        if matches!(who, Who::User(_)) {
+            continue;
+        }
+        if sync::member(account, who) {
+            sync::ensure_row(account, who, None);
+        } else {
+            sync::ensure_preview_row(account, who);
+        }
+    }
+}
 
 /// Resolves a public Telegram `@username` on click, checking the local directory and
 /// in-connection cache before issuing `contacts.resolveUsername`. Never joins a channel.

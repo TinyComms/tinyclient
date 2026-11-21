@@ -4286,3 +4286,67 @@ fn invite_links_join_preview_revoke_and_join_requests() {
     };
     assert!(after.is_empty());
 }
+
+#[test]
+fn a_search_previews_a_public_channel_until_it_is_joined() {
+    let world = World::signed_in();
+    world.connected();
+
+    // A link is not a join target. The private-invite path is separate, and this must not subscribe.
+    let joins = world.called("JoinChannel");
+    let link = world.ask(Request::Join { conversation: key("https://t.me/larchpress") });
+    assert!(matches!(link, Response::Error { code: ErrorCode::Refused, .. }), "{link:?}");
+    assert_eq!(world.called("JoinChannel"), joins);
+
+    let search = |query: &str| Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some(query.into()), offset: 0, limit: 20,
+    };
+    world.ask(search("larch"));
+    world.until("the channel search", || world.calls().contains(&"contacts.Search larch".to_owned()).then_some(()));
+    let larch = world.until("the channel preview", || {
+        world.conversation("c9010").filter(|row| row.title == "Larch Press" && !row.joined)
+    });
+    assert_eq!(larch.kind, ConversationKind::Channel);
+    let trail = world.until("the group preview", || {
+        world.conversation("c9014").filter(|row| row.title == "Larch Trail" && row.kind == ConversationKind::Group && !row.joined)
+    });
+    assert_eq!(trail.title, "Larch Trail");
+
+    let Response::Conversation { conversation: preview } = world.ask(Request::PreviewChannel { conversation: key("c9010") }) else {
+        panic!("expected a preview");
+    };
+    assert!(!preview.joined);
+    assert!(world.messages("c9010").iter().any(|message| message.text == "The ridge is clear."));
+    assert!(world.calls().iter().any(|call| call.starts_with("GetHistory c9010")));
+
+    let Response::Conversation { conversation: joined } = world.ask(Request::Join { conversation: key("c9010") }) else {
+        panic!("expected the joined channel");
+    };
+    assert!(joined.joined);
+    assert_eq!(joined.title, "Larch Press");
+    assert_eq!(world.called("JoinChannel c9010"), 1);
+    assert!(world.calls().iter().any(|call| call == "GetChannelRecommendations c9010"));
+    let similar = world.conversation("c9013").expect("a similar channel stays a preview");
+    assert_eq!((similar.title.as_str(), similar.joined), ("Similar Peaks", false));
+    assert!(!world.conversation("c9014").expect("the group was not joined").joined);
+
+    world.ask(search("shelf"));
+    world.until("the full channel search", || world.calls().contains(&"contacts.Search shelf".to_owned()).then_some(()));
+    world.until("the full channel preview", || world.conversation("c9012").filter(|row| row.title == "Full Shelf" && !row.joined).map(drop));
+    let full = world.ask(Request::Join { conversation: key("c9012") });
+    assert!(
+        matches!(full, Response::Error { code: ErrorCode::Refused, ref detail } if detail == "This account can't join any more channels."),
+        "{full:?}"
+    );
+    assert!(!world.conversation("c9012").expect("still a preview").joined);
+
+    world.ask(search("closed"));
+    world.until("the closed group search", || world.calls().contains(&"contacts.Search closed".to_owned()).then_some(()));
+    world.until("the closed group preview", || world.conversation("c9011").filter(|row| row.title == "Closed Ridge" && !row.joined).map(drop));
+    let closed = world.ask(Request::Join { conversation: key("c9011") });
+    assert!(
+        matches!(closed, Response::Error { code: ErrorCode::Refused, ref detail } if detail == "Request sent."),
+        "{closed:?}"
+    );
+    assert!(!world.conversation("c9011").expect("a request does not join").joined);
+}

@@ -73,6 +73,9 @@ impl Fault {
                 "CALL_PROTOCOL_COMPAT_LAYER_INVALID" => "This call protocol version isn't supported.".to_owned(),
                 "PARTICIPANT_VERSION_OUTDATED" => "The other person's Telegram app needs an update for this call.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
+                "INVITE_REQUEST_SENT" => "Request sent.".to_owned(),
+                // A channel cap, not a length past the free plan. Named before the `_TOO_MUCH` rule.
+                "CHANNELS_TOO_MUCH" | "USER_CHANNELS_TOO_MUCH" => "This account can't join any more channels.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.
                 name if name.ends_with("_TOO_MUCH") => "This needs Telegram Premium.".to_owned(),
