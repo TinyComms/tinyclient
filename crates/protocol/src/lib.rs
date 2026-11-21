@@ -1363,6 +1363,12 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// Raw source text of a message as the network stores it (for lossless editing of markdown,
+    /// code blocks, quotes, lists, masked links, and custom emoji).
+    Source {
+        conversation: Key,
+        message_id: String,
+    },
     /// The user saw the conversation up to this message: the window is active, the conversation is
     /// open and the message is on screen. Read here and on the network. An empty `message_id`
     /// means the newest message chatd knows, for "mark as read" before any message is on screen.
@@ -2183,6 +2189,10 @@ pub enum Response {
         conversation: Key,
         message_id: String,
         revisions: Vec<Revision>,
+    },
+    /// Answers `Source`: the raw source text of the message as the network holds it.
+    Source {
+        text: String,
     },
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {

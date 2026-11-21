@@ -1816,6 +1816,18 @@ impl Chat {
         }
     }
 
+    fn source(&self, conversation: Key, message_id: String) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id;
+        match self.ask(&account, |reply| Command::Source { conversation_id, message_id, reply }) {
+            Ok(text) => Response::Source { text },
+            Err(refused) => *refused,
+        }
+    }
+
     fn catalog(&self, account: AccountKey, kind: CatalogKind, space: Option<Key>, query: String, cursor: Option<String>) -> Response {
         let mut query = query.trim().to_owned();
         clip(&mut query, 100);
@@ -2553,6 +2565,7 @@ impl Chat {
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
             Request::Revisions { conversation, message_id } => self.revisions(conversation, message_id),
+            Request::Source { conversation, message_id } => self.source(conversation, message_id),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
             Request::MarkAllRead { network, space } => self.mark_all_read(network, space),

@@ -1075,6 +1075,16 @@ impl Discord {
         })
     }
 
+    /// Fetches the raw markdown source of a single message for lossless editing.
+    fn source(&self, channel: &str, message: &str) -> Result<String, Refusal> {
+        let path = format!("/channels/{channel}/messages?around={message}&limit=1");
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let found: Vec<Posted> =
+            serde_json::from_str(&body).map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let posted = found.into_iter().find(|p| p.id == message).ok_or_else(|| Refusal::Refused("That message is gone.".to_owned()))?;
+        Ok(posted.content.unwrap_or_default())
+    }
+
     fn delete(&self, channel: &str, message: &str) -> Result<(), Refusal> {
         self.call("DELETE", &format!("/channels/{channel}/messages/{message}"), None).map_err(refusal)?;
         self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))
@@ -1602,6 +1612,9 @@ impl Discord {
             }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text))
+            }
+            Command::Source { conversation_id, message_id, reply } => {
+                answer(reply, self.source(&conversation_id, &message_id))
             }
             Command::Delete { conversation_id, message_id, reply } => answer(reply, self.delete(&conversation_id, &message_id)),
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),

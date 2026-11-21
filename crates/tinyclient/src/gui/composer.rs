@@ -1817,6 +1817,31 @@ impl Composer {
         self.caption = None;
         self.armed = None;
         self.focus_next = true;
+        if live() {
+            if let Some(target) = self.target.as_ref().filter(|t| t.key.network == Network::Discord) {
+                let key = target.key.clone();
+                let id = message.id.clone();
+                let msg = message.clone();
+                let this = cx.weak_entity();
+                ask_later(cx, Request::Source { conversation: key.clone(), message_id: id.clone() }, move |answer, cx| {
+                    let Ok(Response::Source { text: raw }) = answer else {
+                        return;
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        let same_target = this.target.as_ref().is_some_and(|t| t.key == key);
+                        let unchanged = this.editing.as_ref().is_some_and(|e| e.id == id && this.input.read(cx).text() == e.original);
+                        if same_target && unchanged {
+                            let (field, tokens) = mention::from_source(&raw, &msg);
+                            if let Some(editing) = this.editing.as_mut() {
+                                editing.original = field.clone();
+                            }
+                            this.set_field(&Draft { text: field, tokens, files: Vec::new(), note: None, reply: None }, cx);
+                            cx.notify();
+                        }
+                    });
+                });
+            }
+        }
         cx.notify();
     }
 

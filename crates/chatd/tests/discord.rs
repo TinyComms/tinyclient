@@ -4278,3 +4278,40 @@ fn message_request_accept_decline_and_spam_flag() {
         Response::Error { code: ErrorCode::NotFound, .. }
     ));
 }
+
+#[test]
+fn source_fetches_raw_markdown_for_editing() {
+    let world = World::start();
+    let raw = "> quote\n- item\n```rust\nfn main() {}\n```\nsee [docs](https://example.com) <:ferris:7001>";
+    let posted = json!({
+        "id": "1300000000000000777",
+        "channel_id": "4101",
+        "type": 0,
+        "author": me(),
+        "content": raw,
+        "timestamp": "2026-10-13T08:15:00.000000+00:00",
+        "edited_timestamp": null,
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "attachments": [],
+        "embeds": [],
+        "pinned": false,
+        "tts": false,
+        "flags": 0
+    });
+    world.discord.script("/channels/4101/messages", 200, json!([posted]));
+    match world.ask(Request::Source {
+        conversation: world.key("4101"),
+        message_id: "1300000000000000777".into(),
+    }) {
+        Response::Source { text } => assert_eq!(text, raw),
+        other => panic!("expected Response::Source, got {other:?}"),
+    }
+    let asked = world.discord.requests_to("GET", "/channels/4101/messages");
+    assert!(
+        asked.iter().any(|r| r.path.contains("around=1300000000000000777")),
+        "Source must query around the target message id, got {:?}",
+        asked.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}

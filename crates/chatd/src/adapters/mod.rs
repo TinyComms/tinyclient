@@ -297,6 +297,12 @@ pub enum Command {
         spans: Vec<protocol::Span>,
         reply: Reply<()>,
     },
+    /// Fetch the raw source text of a message for lossless editing.
+    Source {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<String>,
+    },
     /// Delete a message for everyone. Report it through [`Context::deleted`] before answering.
     Delete {
         conversation_id: String,
@@ -486,6 +492,7 @@ impl Command {
             | Command::SetPresence { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
