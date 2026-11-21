@@ -1398,6 +1398,7 @@ impl Discord {
         }
         self.ctx.conversation(&row)?;
         self.release_slowmode(&thread.id, row.slowmode_seconds, row.rights.slowmode_exempt);
+        self.note_thread_update(&thread)?;
         Ok(())
     }
 
@@ -1461,13 +1462,16 @@ impl Discord {
             let mut row = super::renamed(&child, &child.title);
             let mut rights = parent.rights;
             rights.add_members = open && (rights.send_in_threads || rights.manage_threads);
-            rights.rename = open && (rights.manage_threads || child.rights.rename);
+            // A stored rename from MANAGE_THREADS does not survive losing that role. An owner rename does.
+            rights.rename = open && (rights.manage_threads || (child.rights.rename && !child.rights.manage_threads));
             rights.slowmode_exempt = exempt;
             let (read_only, read_only_reason) = thread_read_only(timed_out, clock, child.locked, &rights);
             row.rights = rights;
             row.read_only = read_only;
             row.read_only_reason = read_only_reason;
             self.ctx.conversation(&row)?;
+            // A zero mask is left untouched by the upsert, so write the computed bits on their own.
+            self.ctx.rights(&row.id, row.rights)?;
             self.release_slowmode(&child.key.id, child.slowmode_seconds, exempt);
         }
         Ok(())

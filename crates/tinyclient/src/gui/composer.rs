@@ -9,7 +9,7 @@
 //!
 //! For the other views, all on `Shell`:
 //! - `composer(open, link, cx)` is the whole dock: the 20 pt typing row, the card, and the line
-//!   under it. Nothing else needs to reserve the typing slot. `thread_composer(open, link, cx)`
+//!   under it. Nothing else needs to reserve the typing slot. `thread_composer(key, title, rights, link, cx)`
 //!   is the same for the thread pane; it sends to the thread's key and follows that thread's
 //!   slowmode, lock, and archive.
 //! - `composer_edit(message, cx)` and `composer_reply(message, cx)` put the open conversation's
@@ -70,8 +70,8 @@ use picker::emoji::Custom;
 use picker::images::Images;
 use picker::{Picker, PickerEvent, Setup, Tab};
 use protocol::{
-    AccountKey, Capabilities, CatalogKind, Change, Conversation, ConversationKind, EmojiScope, ErrorCode, Key, Link, Message, MessageKind,
-    Network, OutgoingFile, Page, Person, Pick, RecordRequest, RecordState, Request, Response, SendState, DRAFT_LIMIT,
+    AccountKey, Capabilities, CatalogKind, Change, Conversation, ConversationKind, ConversationRights, EmojiScope, ErrorCode, Key, Link,
+    Message, MessageKind, Network, OutgoingFile, Page, Person, Pick, RecordRequest, RecordState, Request, Response, SendState, DRAFT_LIMIT,
 };
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -4609,20 +4609,20 @@ impl Shell {
     /// The same dock for the thread pane. A message typed here goes to the thread.
     /// The pane's `Open` has no slowmode or lock, so those come from the held row when one exists.
     #[allow(dead_code)]
-    pub(super) fn thread_composer(&self, open: &super::conversation::Open, link: Link, cx: &mut Context<Self>) -> Div {
-        let held = self.held_rows().find(|row| row.key == open.key).cloned();
-        let title = held.as_ref().map(|row| row.title.clone()).unwrap_or_else(|| open.title.clone());
-        let rights = held.as_ref().map(|row| row.rights).unwrap_or(open.rights);
+    pub(super) fn thread_composer(&self, key: &Key, title: &str, rights: ConversationRights, link: Link, cx: &mut Context<Self>) -> Div {
+        let held = self.held_rows().find(|row| row.key == *key).cloned();
+        let title = held.as_ref().map(|row| row.title.clone()).unwrap_or_else(|| title.to_owned());
+        let rights = held.as_ref().map(|row| row.rights).unwrap_or(rights);
         let slowmode_seconds = held.as_ref().map(|row| row.slowmode_seconds).unwrap_or(0);
         let slowmode_until = held.as_ref().and_then(|row| {
             (row.slowmode_seconds > 0 && !row.rights.slowmode_exempt).then_some(row.slowmode_until).flatten()
         });
-        let mut can = self.can_of(&open.key);
+        let mut can = self.can_of(key);
         if let Some(bytes) = held.as_ref().map(|row| row.max_file_bytes).filter(|bytes| *bytes > 0) {
             can.max_file_bytes = can.max_file_bytes.max(bytes);
         }
         let target = Target {
-            key: open.key.clone(),
+            key: key.clone(),
             title,
             kind: ConversationKind::Thread,
             link,
@@ -4633,7 +4633,7 @@ impl Shell {
             blocked_peer: None,
             special: held.as_ref().map(|row| row.special).unwrap_or(protocol::Special::None),
             can,
-            send_as: self.send_as_of(&open.key),
+            send_as: self.send_as_of(key),
             slowmode_seconds,
             slowmode_until,
             rights,
