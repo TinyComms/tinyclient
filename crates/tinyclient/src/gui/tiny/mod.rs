@@ -1439,6 +1439,22 @@ impl Shell {
         self.open_person(&person, cx);
     }
 
+    /// Rings someone on this server directly from the person menu.
+    pub(super) fn tiny_call_person(&mut self, user_id: String, cx: &mut Context<Self>) {
+        let Some(page) = self.tiny_page_facts() else {
+            return;
+        };
+        if user_id == page.me {
+            return;
+        }
+        let name = page.community.member(&user_id).map(model::name_of).unwrap_or_else(|| "Someone".to_owned());
+        let person = protocol::Person::new(page.key(&user_id), name);
+        drop(page);
+        self.close_modal(cx);
+        self.tiny_close_float(cx);
+        self.call_person(&person, cx);
+    }
+
     /// The system's file panel. The picture chosen becomes this account's avatar.
     pub(super) fn tiny_pick_avatar(&mut self, cx: &mut Context<Self>) {
         let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Use as your picture".into()) });

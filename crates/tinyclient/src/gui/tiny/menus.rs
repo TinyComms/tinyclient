@@ -153,6 +153,13 @@ impl Shell {
         } else {
             let message_id = user_id.to_owned();
             items = items.child(self.plain(menu_item("tiny-person-message", Some("icons/message-square.svg"), "Message", None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_message(message_id.clone(), cx))));
+            if facts.call && !model::in_call_with(self.tiny_call().as_ref(), &page.account, user_id) {
+                let call_id = user_id.to_owned();
+                items = items.child(
+                    self.plain(menu_item("tiny-person-call", Some("icons/phone.svg"), "Call", None), cx)
+                        .on_click(cx.listener(move |this, _, _, cx| this.tiny_call_person(call_id.clone(), cx))),
+                );
+            }
         }
         if facts.local {
             items = items

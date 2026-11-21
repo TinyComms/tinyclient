@@ -7,9 +7,10 @@
 //! nothing that needs a newer server is offered.
 
 use protocol::{
-    TinyCommunity, TinyLayoutGroup, TinyMember, TinyRole, TinyRoom, TinySeat, TINY_FEATURE_BANS, TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES,
-    TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS, TINY_FEATURE_VOICE_MODERATION, TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS, TINY_MOVE_MEMBERS,
-    TINY_MUTE_MEMBERS,
+    AccountKey, Call, TinyCommunity, TinyLayoutGroup, TinyMember, TinyRole, TinyRoom, TinySeat,
+    TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS, TINY_FEATURE_BANS, TINY_FEATURE_CATEGORIES,
+    TINY_FEATURE_DIRECT_CALLS, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER,
+    TINY_FEATURE_TIMEOUTS, TINY_FEATURE_VOICE_MODERATION, TINY_MOVE_MEMBERS, TINY_MUTE_MEMBERS,
 };
 use std::collections::HashSet;
 
@@ -447,6 +448,8 @@ pub struct RoleChoice {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PersonMenu {
     pub me: bool,
+    /// Direct call from the person menu: server advertises `direct_calls`, not me, not a bot.
+    pub call: bool,
     /// Volume and Mute for me: anyone but ourselves.
     pub local: bool,
     /// Where they sit, if they do.
@@ -493,6 +496,14 @@ fn legacy_role_change(caller: &str, target: &str, next: &str, owners: usize) -> 
     same(caller, "admin") && same(target, "member") && same(next, "admin")
 }
 
+/// True while this account is already in a call with `user_id`.
+pub fn in_call_with(call: Option<&Call>, account: &AccountKey, user_id: &str) -> bool {
+    call.is_some_and(|call| {
+        call.conversation.account() == *account
+            && call.participants.iter().any(|who| who.id == user_id)
+    })
+}
+
 /// The person menu for `user_id`, from where this account stands.
 pub fn person_menu(community: &TinyCommunity, user_id: &str) -> PersonMenu {
     let Some(target) = community.member(user_id) else {
@@ -504,7 +515,8 @@ pub fn person_menu(community: &TinyCommunity, user_id: &str) -> PersonMenu {
     let seated = seat_of(community, user_id);
     let moderation = community.has(TINY_FEATURE_VOICE_MODERATION);
     let in_room = |room: &TinyRoom, bits: u64| community.access.as_ref().is_some_and(|access| access.has_in(room, bits));
-    let mut menu = PersonMenu { me, local: !me, room: seated.map(|(room, _)| room.id.clone()), ..PersonMenu::default() };
+    let call = !me && !target.role.eq_ignore_ascii_case("bot") && community.has(TINY_FEATURE_DIRECT_CALLS);
+    let mut menu = PersonMenu { me, call, local: !me, room: seated.map(|(room, _)| room.id.clone()), ..PersonMenu::default() };
     if let Some((room, seat)) = seated.filter(|_| above) {
         if moderation && in_room(room, TINY_MUTE_MEMBERS) {
             menu.server_mute = Some(seat.server_muted);
@@ -876,5 +888,32 @@ mod tests {
         assert_eq!(channel_occupancy(&busy), "3 in call");
         busy.user_limit = 12;
         assert_eq!(channel_occupancy(&busy), "3 of 12");
+    }
+
+    #[test]
+    fn person_menu_offers_call_only_with_direct_calls_for_non_bot_others() {
+        let mut c = modern();
+        assert!(!person_menu(&c, "mem").call, "no direct_calls feature yet");
+        c.capabilities.features.push(TINY_FEATURE_DIRECT_CALLS.into());
+        assert!(person_menu(&c, "mem").call, "other member on capable server");
+        assert!(!person_menu(&c, "me").call, "never self");
+        c.members.push(member("bot1", "Helper", "bot", &[]));
+        assert!(!person_menu(&c, "bot1").call, "never a bot");
+
+        let account = AccountKey { network: protocol::Network::Tiny, account: "srv".into() };
+        let call: Call = serde_json::from_value(serde_json::json!({
+            "conversation": protocol::Key::new(&account, "d1"),
+            "state": "joined",
+            "participants": [{"id": "mem", "name": "Member", "muted": false, "deafened": false, "speaking": false}],
+            "muted": false,
+            "deafened": false,
+            "joined": 0,
+            "engine_linked": false,
+            "video": []
+        }))
+        .expect("call");
+        assert!(in_call_with(Some(&call), &account, "mem"));
+        assert!(!in_call_with(Some(&call), &account, "other"));
+        assert!(!in_call_with(None, &account, "mem"));
     }
 }

@@ -558,7 +558,7 @@ impl Shell {
     }
 
     /// The same, and then rings them.
-    fn call_person(&mut self, person: &Person, cx: &mut Context<Self>) {
+    pub(super) fn call_person(&mut self, person: &Person, cx: &mut Context<Self>) {
         self.open_person_then(person, true, cx);
     }
 
