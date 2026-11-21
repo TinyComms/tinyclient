@@ -1,0 +1,12 @@
+{
+  "id": "wave-3-tiny-complete",
+  "title": "Wave 3D Tiny Server rich messaging and admin enhancements",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 3D Tiny Server rich messaging and admin enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 3D Tiny Server rich messaging and admin enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

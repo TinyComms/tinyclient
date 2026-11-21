@@ -943,7 +943,7 @@ mod tests {
                 Line::Category { name, channels, .. } => Some(format!("[{name}:{channels}]")),
                 Line::Channel { id } => Some(format!("#{id}")),
                 Line::Room { id } => Some(id.clone()),
-                Line::Seat { .. } => None,
+                Line::Seat { .. } | Line::MoreSeats { .. } => None,
             })
             .collect();
         // Loose: ch-loose (pos 0, text) before loose (pos 0, room), then ch-orphan (pos 5, unknown cat).

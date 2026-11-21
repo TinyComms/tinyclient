@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 /// The permissions a channel's override can change, in the order the editor lists them.
-pub(in crate::gui) const SCOPED: [u64; 13] = [
+pub(in crate::gui) const SCOPED: [u64; 14] = [
     TINY_VIEW_CHANNEL,
     TINY_CONNECT,
     TINY_SPEAK,
@@ -40,6 +40,7 @@ pub(in crate::gui) const SCOPED: [u64; 13] = [
     TINY_DISCONNECT_MEMBERS,
     TINY_MANAGE_CHANNELS,
     TINY_MANAGE_MESSAGES,
+    TINY_MENTION_EVERYONE,
 ];
 
 /// The permissions a text channel's override can change, in the order the editor lists them.

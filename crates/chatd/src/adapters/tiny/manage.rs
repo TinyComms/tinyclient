@@ -1362,8 +1362,6 @@ pub(crate) fn audit(account: AccountKey, filter: TinyAuditFilter) -> Response {
 }
 
 const REPORT_STATUSES: [&str; 4] = ["open", "reviewing", "actioned", "dismissed"];
-const REPORT_KINDS: [&str; 3] = ["message", "member", "channel"];
-const REPORT_NOTE_MAX: usize = 2000;
 const REPORT_GONE: &str = "That report isn't available.";
 const REPORT_FORBIDDEN: &str = "You don't have permission to manage reports.";
 

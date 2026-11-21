@@ -438,7 +438,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
+            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, send_link_previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,

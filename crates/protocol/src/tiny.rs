@@ -515,7 +515,7 @@ pub const TINY_EVERYONE_DEFAULT: u64 = TINY_VIEW_CHANNEL | TINY_CONNECT | TINY_S
 
 /// Every permission, in the server's order, with its wire name: for the settings page's
 /// toggles. Bit `n` is `1 << n`.
-pub const TINY_PERMISSIONS: [(u64, &str); 22] = [
+pub const TINY_PERMISSIONS: [(u64, &str); 23] = [
     (TINY_VIEW_CHANNEL, "view_channel"),
     (TINY_CONNECT, "connect"),
     (TINY_SPEAK, "speak"),
@@ -538,6 +538,7 @@ pub const TINY_PERMISSIONS: [(u64, &str); 22] = [
     (TINY_MANAGE_SERVER, "manage_server"),
     (TINY_MANAGE_REPORTS, "manage_reports"),
     (TINY_MANAGE_MESSAGES, "manage_messages"),
+    (TINY_MENTION_EVERYONE, "mention_everyone"),
 ];
 
 /// The server's identity and settings, from `GET /v1/server`.
@@ -2197,7 +2198,7 @@ mod tests {
         let options = TinyInviteOptions { max_uses: Some(5), ..TinyInviteOptions::default() };
         assert_eq!(serde_json::to_string(&options).unwrap(), r#"{"max_uses":5}"#);
         let names: Vec<&str> = TINY_PERMISSIONS.iter().map(|(_, name)| *name).collect();
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 23);
         assert!(TINY_PERMISSIONS.iter().enumerate().all(|(n, (bit, _))| *bit == 1 << n));
     }
 
