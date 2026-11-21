@@ -2245,7 +2245,7 @@ impl Composer {
                             if let Some(editing) = this.editing.as_mut() {
                                 editing.original = field.clone();
                             }
-                            this.set_field(&Draft { text: field, tokens, files: Vec::new(), note: None, reply: None }, cx);
+                            this.set_field(&Draft { text: field, subject: String::new(), tokens, files: Vec::new(), note: None, reply: None }, cx);
                             cx.notify();
                         }
                     });
@@ -3626,8 +3626,14 @@ impl Composer {
     /// The states `--composer` names. Nothing here asks chatd for anything that changes it.
     #[cfg(feature = "gui-shot")]
     fn stage_flag(&mut self, cx: &mut Context<Self>) {
-        let field = |text: &str, tokens: Vec<Token>| Draft { text: text.to_owned(), tokens, files: Vec::new(),
-            note: None, reply: None, };
+        let field = |text: &str, tokens: Vec<Token>| Draft {
+            text: text.to_owned(),
+            subject: String::new(),
+            tokens,
+            files: Vec::new(),
+            note: None,
+            reply: None,
+        };
         let Some(target) = self.target.clone() else {
             return;
         };
