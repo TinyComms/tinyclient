@@ -733,8 +733,19 @@ impl Demo {
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));
             }
-            // The demo's words are all in the cache: its network is not asked.
-            Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Search { query, scope, filters, reply, .. } => {
+                let (conv, space) = match &scope {
+                    crate::adapters::SearchScope::Conversation(id) => (Some(id.as_str()), None),
+                    crate::adapters::SearchScope::Space(id) => (None, Some(id.as_str())),
+                    crate::adapters::SearchScope::Account => (None, None),
+                };
+                let found = demo
+                    .hub
+                    .store()
+                    .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
+                    .map_err(|err| Refusal::Refused(err.to_string()));
+                let _ = reply.send(found);
+            }
             Command::Catalog { kind, query, cursor, reply, .. } => drop(reply.send(Ok(demo.catalog(kind, &query, cursor.as_deref())))),
             Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(demo.reaction_rules(&conversation_id)))),
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {

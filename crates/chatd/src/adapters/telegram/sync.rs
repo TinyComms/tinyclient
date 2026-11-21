@@ -321,6 +321,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gifs: true,
         stickers: true,
         search: true,
+        search_global: true,
         custom_emoji: EmojiScope::All,
         silent: true,
         schedule: true,

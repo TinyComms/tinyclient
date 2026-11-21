@@ -476,7 +476,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             // A search can wait on Discord's tight search limits: it runs on a thread of its
             // own, so the sends and reactions behind it are not held up, and one queued past
             // the shell's patience does not ask at all.
-            Command::Search { query, scope, at, reply } => {
+            Command::Search { query, scope, at, reply, .. } => {
                 discord.asked();
                 if at.elapsed() < SEARCH_PATIENCE {
                     Discord::search_queued(&discord, query, scope, at, reply);

@@ -1099,9 +1099,9 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::Topics { .. } | Request::InVoice { .. } => conversations(Vec::new(), 0, 1),
         Request::Folders { .. } => Response::Folders { folders: Vec::new() },
         Request::SearchMessages { conversation, query, limit, .. } => {
-            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect() }
+            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new() }
         }
-        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()) },
+        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new() },
         Request::Messages { conversation, page: at, limit } => page(conversation, at, *limit),
         Request::Pinned { conversation } => Response::Pinned {
             conversation: conversation.clone(),

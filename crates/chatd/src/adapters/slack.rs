@@ -1362,7 +1362,7 @@ impl Slack {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
-            Command::Search { query, scope, at, reply } => {
+            Command::Search { query, scope, at, reply, .. } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {

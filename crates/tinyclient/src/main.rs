@@ -96,7 +96,7 @@ fn print_status() -> io::Result<()> {
 fn print_search(query: &str) -> io::Result<()> {
     let request = Request::SearchMessages { conversation: None, network: None, space: None, query: query.to_owned(), limit: PAGE_LIMIT };
     let hits = match ask(&request)? {
-        Response::MessageHits { hits } => hits,
+        Response::MessageHits { hits, .. } => hits,
         other => return Err(unexpected(other)),
     };
     let now = view::now();

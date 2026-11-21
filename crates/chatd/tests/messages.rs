@@ -1541,7 +1541,7 @@ fn an_older_line_is_found_without_opening_the_chat() {
         query: query.into(),
         limit: 10,
     }) {
-        Response::MessageHits { hits } => hits.into_iter().any(|hit| hit.message_id == "m-0011"),
+        Response::MessageHits { hits, .. } => hits.into_iter().any(|hit| hit.message_id == "m-0011"),
         _ => false,
     };
     world.until("the 90th-newest line", || {

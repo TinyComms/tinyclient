@@ -116,11 +116,12 @@ impl std::fmt::Debug for SealedFile {
     }
 }
 
-/// What the search's ask names: a Space's own search, or one conversation's.
+/// What the search's ask names: a Space's own search, one conversation's, or the whole account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Space(String),
     Conversation(String),
+    Account,
 }
 
 /// One window of a member list.
@@ -452,6 +453,8 @@ pub enum Command {
     Search {
         query: String,
         scope: SearchScope,
+        filters: protocol::SearchFilters,
+        cursor: Option<String>,
         at: Instant,
         reply: Reply<Vec<MessageHit>>,
     },

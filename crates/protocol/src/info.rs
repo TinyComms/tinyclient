@@ -311,9 +311,13 @@ pub struct Capabilities {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stickers: bool,
     /// The network searches its own messages (`SearchNetwork`), which the search pane's Enter
-    /// asks. Everywhere stays the cache alone.
+    /// asks. Everywhere stays the cache alone unless `search_global` is also set.
     #[serde(default, skip_serializing_if = "is_false")]
     pub search: bool,
+    /// The network supports account-wide search (Slack `search.messages`, Telegram
+    /// `messages.searchGlobal`), so Search Everywhere fans out to this account on Enter.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub search_global: bool,
     #[serde(default)]
     pub custom_emoji: EmojiScope,
     /// `Outgoing::silent`, `Outgoing::schedule`, `Outgoing::suppress_embeds` and
@@ -372,6 +376,36 @@ pub struct Capabilities {
     /// This account supports super / burst reactions (`Request::React { burst: true }`, Discord Nitro).
     #[serde(default, skip_serializing_if = "is_false")]
     pub burst_reactions: bool,
+}
+
+/// Content-type filter for network message search (`SearchFilters::has`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchHas {
+    Files,
+    Links,
+    Images,
+}
+
+/// Optional filters on `Request::SearchNetwork`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has: Option<SearchHas>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_me: bool,
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        *self == SearchFilters::default()
+    }
 }
 
 /// Message urgency level (Teams: Normal, Important, Urgent).

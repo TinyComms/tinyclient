@@ -3723,8 +3723,8 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
 fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_index_still_building() {
     let world = polished();
     // A Space's own search: the server's, one request, the hits mapped like the cache's.
-    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into() }) {
-        Response::MessageHits { hits } => hits,
+    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  }) {
+        Response::MessageHits { hits, .. } => hits,
         other => panic!("{other:?}"),
     };
     assert_eq!(hits.len(), 1);
@@ -3742,7 +3742,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A server channel as the conversation: the server's search narrowed to the channel.
     let before = world.discord.requests_to("GET", "/guilds/4000/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into() });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/guilds/4000/messages/search");
     assert_eq!(asked.len(), before + 1, "the channel search is asked");
@@ -3751,7 +3751,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
     // One conversation: the DM's own channel search.
     sleep(Duration::from_millis(400));
     let before = world.discord.requests_to("GET", "/channels/3001/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into() });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/channels/3001/messages/search");
     assert_eq!(asked.len(), before + 1, "the DM's channel search is asked");
@@ -3759,11 +3759,11 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A 202: the index is still building, and the words say so.
     sleep(Duration::from_millis(400));
-    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into() });
+    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(&not_ready, Response::Error { detail, .. } if detail.contains("isn't ready")), "{not_ready:?}");
 
     // Paced: Enter again at once is refused in words, so no client can turn it into a burst.
-    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into() });
+    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(&paced, Response::Error { detail, .. } if detail.contains("paced")), "{paced:?}");
 }
 

@@ -155,6 +155,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         silent: true,
         suppress_embeds: true,
         reply_ping: true,
+        search: true,
         polls: demo_polls.clone(),
         groups: 10,
         burst_reactions: true,
@@ -167,6 +168,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
             custom_emoji: EmojiScope::All,
             schedule: true,
             suppress_embeds: true,
+            search: true,
+            search_global: true,
             groups: 8,
             thread_broadcast: true,
             ..Capabilities::default()
@@ -183,6 +186,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         silent: true,
         schedule: true,
         suppress_embeds: true,
+        search: true,
+        search_global: true,
         edit_window: 48 * 3_600,
         voice_notes: true,
         polls: Some(protocol::PollCapabilities {

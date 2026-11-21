@@ -2353,30 +2353,83 @@ impl Chat {
                 match found {
                     Ok(hits) => {
                         let hits: Vec<_> = hits.into_iter().filter(|hit| self.shows(&hit.conversation.account())).collect();
-                        Response::MessageHits { hits }
+                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new() }
                     }
                     Err(err) => internal(err),
                 }
             }
-            Request::SearchNetwork { conversation, space, query } => {
+            Request::SearchNetwork { conversation, space, account, network, query, filters, cursor } => {
                 let query = query.trim().to_owned();
-                if query.is_empty() {
-                    Response::MessageHits { hits: Vec::new() }
-                } else {
-                    let (account, scope) = match (&conversation, &space) {
+                if query.is_empty() && filters.is_empty() {
+                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() }
+                } else if conversation.is_some() || space.is_some() {
+                    let (target_account, scope) = match (&conversation, &space) {
                         (Some(key), _) => (key.account(), SearchScope::Conversation(key.id.clone())),
                         (None, Some(key)) => (key.account(), SearchScope::Space(key.id.clone())),
-                        (None, None) => {
-                            return error(ErrorCode::Unsupported, "a search on the network names a conversation or a Space")
-                        }
+                        (None, None) => unreachable!(),
                     };
-                    if !self.shows(&account) {
-                        return Response::MessageHits { hits: Vec::new() };
+                    if !self.shows(&target_account) {
+                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() };
                     }
-                    match self.ask(&account, |reply| Command::Search { query, scope, at: std::time::Instant::now(), reply }) {
-                        Ok(hits) => Response::MessageHits { hits },
+                    match self.ask(&target_account, |reply| Command::Search {
+                        query,
+                        scope,
+                        filters,
+                        cursor,
+                        at: std::time::Instant::now(),
+                        reply,
+                    }) {
+                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
                         Err(refused) => *refused,
                     }
+                } else {
+                    // Everywhere, or scoped to one account or one network: fan out once to each
+                    // connected account whose adapter supports account-wide search, merge by time,
+                    // and honestly list connected networks that were not asked.
+                    const PAGE: usize = 25;
+                    let offset: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+                    let accounts: Vec<AccountKey> = match self.hub.store().accounts() {
+                        Ok(rows) => rows
+                            .into_iter()
+                            .map(|row| row.key)
+                            .filter(|k| self.shows(k))
+                            .filter(|k| account.as_ref().is_none_or(|a| a == k))
+                            .filter(|k| network.is_none_or(|n| n == k.network))
+                            .collect(),
+                        Err(err) => return internal(err),
+                    };
+                    let mut merged: Vec<protocol::MessageHit> = Vec::new();
+                    let mut not_searched: Vec<Network> = Vec::new();
+                    let mut asked_networks: Vec<Network> = Vec::new();
+                    for acct in accounts {
+                        let can = self.hub.capabilities(&acct);
+                        if self.hub.link(&acct) == Link::Connected && can.search_global {
+                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
+                                query: query.clone(),
+                                scope: SearchScope::Account,
+                                filters: filters.clone(),
+                                cursor: None,
+                                at: std::time::Instant::now(),
+                                reply,
+                            }) {
+                                if !asked_networks.contains(&acct.network) {
+                                    asked_networks.push(acct.network);
+                                }
+                                merged.extend(hits);
+                                continue;
+                            }
+                        }
+                        if !not_searched.contains(&acct.network) {
+                            not_searched.push(acct.network);
+                        }
+                    }
+                    not_searched.retain(|n| !asked_networks.contains(n));
+                    merged.sort_by(|a, b| b.sent.cmp(&a.sent).then_with(|| b.message_id.cmp(&a.message_id)));
+                    let mut seen = std::collections::HashSet::new();
+                    merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
+                    let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
+                    let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
+                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
                 }
             }
             Request::SetDraft { conversation, text } => {

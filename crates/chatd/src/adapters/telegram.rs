@@ -826,7 +826,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Search { query, scope, reply, .. } => {
             let result = match scope {
                 super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
-                super::SearchScope::Space(_) => Err(Refusal::Unsupported),
+                super::SearchScope::Space(_) | super::SearchScope::Account => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result);
         }

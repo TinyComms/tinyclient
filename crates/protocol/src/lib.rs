@@ -1160,15 +1160,22 @@ pub enum Request {
         limit: u32,
     },
     /// Ask the network itself for messages, as the pane's Enter does: a server's own search
-    /// when a Space is the scope, the channel's when one conversation is. The hits are mapped
-    /// like the cache's, so the pane can merge the two lists and tell them apart; a network
-    /// that cannot search here answers why.
+    /// when a Space is the scope, the channel's when one conversation is, one account/network, or
+    /// everywhere across every connected account that supports global search.
     SearchNetwork {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network: Option<Network>,
         query: String,
+        #[serde(default, skip_serializing_if = "SearchFilters::is_empty")]
+        filters: SearchFilters,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
     },
     /// Keeps what the user typed and did not send. Empty text forgets it. Local: no network
     /// hears of it and no change is announced.
@@ -2231,6 +2238,10 @@ pub enum Response {
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {
         hits: Vec<MessageHit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        not_searched: Vec<Network>,
     },
     /// Answers `Reminders`: what is still waiting in the conversation, due first.
     Reminders {
@@ -2647,19 +2658,23 @@ mod tests {
             outgoing: false,
         };
         assert_eq!(
-            serde_json::to_string(&Response::MessageHits { hits: vec![hit] }).unwrap(),
+            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),
             r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
         );
-        // The network's own ask: the scope is a conversation or a Space, the words ride along.
+        // The network's own ask: the scope is a conversation, Space, account, network, or everywhere.
         let ask: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen"}"#).unwrap();
-        let Request::SearchNetwork { conversation, space, query } = &ask else {
+        let Request::SearchNetwork { conversation, space, query, filters, cursor, .. } = &ask else {
             panic!("not a network search")
         };
-        assert!(conversation.is_none() && space.is_none() && query == "lichen");
+        assert!(conversation.is_none() && space.is_none() && query == "lichen" && filters.is_empty() && cursor.is_none());
         let asked = Request::SearchNetwork {
             conversation: Some(Key { network: Network::Discord, account: "1".into(), id: "C2".into() }),
             space: None,
+            account: None,
+            network: None,
             query: "lichen".into(),
+            filters: SearchFilters::default(),
+            cursor: None,
         };
         assert_eq!(
             serde_json::to_string(&asked).unwrap(),
