@@ -794,6 +794,9 @@ fn person_from(row: &Row) -> rusqlite::Result<Person> {
         mark: mark_from(row.get(18)?)?,
         emoji: String::new(),
         activity: None,
+        role_color: None,
+        role_icon: None,
+        role_emoji: None,
     })
 }
 

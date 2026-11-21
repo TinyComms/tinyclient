@@ -226,22 +226,31 @@ struct Pickable {
     roles: Box<[u64]>,
 }
 
-struct RoleInfo {
-    name: String,
-    permissions: u64,
+#[derive(Clone, Debug, Default)]
+pub(super) struct RoleInfo {
+    pub name: String,
+    pub permissions: u64,
+    pub position: i32,
+    pub color: u32,
+    pub icon: Option<String>,
+    pub unicode_emoji: Option<String>,
 }
 
 /// What is kept of a server once its tree is in the store.
+#[derive(Default)]
 struct GuildInfo {
     name: String,
     icon: Option<String>,
     owner: bool,
+    owner_id: String,
     /// Where it sits in the user's own order.
     position: i32,
     /// Unix seconds. A channel never read is unread only for what came after this.
     joined: i64,
     roles: HashMap<u64, RoleInfo>,
     my_roles: Vec<u64>,
+    /// Cached member role IDs (user_id -> role IDs) for role colors/icons & moderation hierarchy.
+    member_roles: HashMap<String, Vec<u64>>,
     /// Category id to its position and name, to place a channel created later and to write
     /// its header when the first channel we may see appears under it.
     categories: HashMap<String, (i32, String)>,
@@ -257,6 +266,53 @@ struct GuildInfo {
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
+}
+
+impl GuildInfo {
+    /// Stores a member's role IDs (bounded so huge servers never grow unbounded).
+    pub(super) fn set_member_roles(&mut self, user_id: &str, roles: Vec<u64>) {
+        if self.member_roles.len() >= 2048 && !self.member_roles.contains_key(user_id) {
+            self.member_roles.clear();
+        }
+        self.member_roles.insert(user_id.to_owned(), roles);
+    }
+
+    /// Resolves the top colored role (highest `(position, id)` with non-zero `color`) and
+    /// top role icon/emoji (highest `(position, id)` with `icon` or non-empty `unicode_emoji`).
+    pub(super) fn resolve_role_style(&self, role_ids: &[u64]) -> (Option<u32>, Option<(protocol::MediaFile, String)>, Option<String>) {
+        let color = role_ids
+            .iter()
+            .filter_map(|id| self.roles.get(id).filter(|r| r.color != 0).map(|r| ((r.position, *id), r.color)))
+            .max_by_key(|(rank, _)| *rank)
+            .map(|(_, color)| color);
+        let top_badge = role_ids
+            .iter()
+            .filter_map(|id| {
+                let r = self.roles.get(id)?;
+                let has_icon = r.icon.as_deref().is_some_and(|h| !h.is_empty());
+                let has_emoji = r.unicode_emoji.as_deref().is_some_and(|e| !e.is_empty());
+                (has_icon || has_emoji).then_some(((r.position, *id), *id, r))
+            })
+            .max_by_key(|(rank, _, _)| *rank);
+        let (icon, emoji) = match top_badge {
+            Some((_, role_id, role)) => {
+                if let Some(hash) = role.icon.as_deref().filter(|h| !h.is_empty()) {
+                    (Some(model::role_icon(&role_id.to_string(), hash)), None)
+                } else {
+                    (None, role.unicode_emoji.clone().filter(|e| !e.is_empty()))
+                }
+            }
+            None => (None, None),
+        };
+        (color, icon, emoji)
+    }
+
+    pub(super) fn member_role_style(&self, user_id: &str) -> (Option<u32>, Option<(protocol::MediaFile, String)>, Option<String>) {
+        let Some(roles) = self.member_roles.get(user_id) else {
+            return (None, None, None);
+        };
+        self.resolve_role_style(roles)
+    }
 }
 
 /// The gateway session, to resume it after a dropped socket.
@@ -706,7 +762,28 @@ impl Discord {
             names: &lookup,
             author,
         };
-        let (mut message, files) = content::message(posted, &place);
+        let (mut message, mut files) = content::message(posted, &place);
+        if let (Some(guild_id), None) = (guild, posted.webhook_id.as_ref()) {
+            let author_id = &message.sender.id;
+            if !author_id.is_empty() {
+                let mut state = crate::hub::lock(&self.state);
+                if let Some(info) = state.guilds.get_mut(guild_id) {
+                    let (color, icon, emoji) = if let Some(member) = posted.member.as_ref().filter(|m| !m.roles.is_empty()) {
+                        let role_ids: Vec<u64> = member.roles.iter().map(|r| number(r)).collect();
+                        info.set_member_roles(author_id, role_ids.clone());
+                        info.resolve_role_style(&role_ids)
+                    } else {
+                        info.member_role_style(author_id)
+                    };
+                    message.sender.role_color = color;
+                    message.sender.role_emoji = emoji;
+                    if let Some((file, url)) = icon {
+                        message.sender.role_icon = Some(file.clone());
+                        files.files.push((file, url));
+                    }
+                }
+            }
+        }
         message.mentions_me = self.mentions_me(posted, guild, kind, &me);
         (message, files)
     }

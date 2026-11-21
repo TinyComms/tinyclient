@@ -1576,6 +1576,7 @@ fn sender(dir: &Directory, who: Who) -> Sender {
         name: dir.name(who),
         avatar: known.and_then(|known| known.avatar()).map(|id| MediaFile::new(id, MediaKind::Avatar)),
         bot: known.is_some_and(|known| known.bot),
+        ..Sender::default()
     }
 }
 

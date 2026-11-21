@@ -4368,7 +4368,7 @@ fn pending_self_sender(store: &Store, conversation: &Key) -> Sender {
         .and_then(|sender| sender.avatar)
         .or_else(|| person.and_then(|person| person.avatar))
         .or(row.avatar);
-    Sender { id: me, name, avatar, bot: false }
+    Sender { id: me, name, avatar, bot: false, ..Sender::default() }
 }
 
 /// Seeds one account's self person with a picture already on the media row.

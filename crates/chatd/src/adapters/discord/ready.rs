@@ -317,19 +317,32 @@ impl Discord {
             let info = RoleInfo {
                 name: role.name.clone(),
                 permissions: role.permissions,
+                position: role.position,
+                color: role.color,
+                icon: role.icon.clone(),
+                unicode_emoji: role.unicode_emoji.clone(),
             };
             (number(&role.id), info)
         });
+        let mut member_roles = HashMap::new();
+        for m in &guild.members {
+            let uid = m.id();
+            if !uid.is_empty() && !m.roles.is_empty() {
+                member_roles.insert(uid.to_owned(), m.roles.iter().map(|r| number(r)).collect());
+            }
+        }
         let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
         let categories = categories.map(|category| (category.id.clone(), (category.position, category.name.clone().unwrap_or_default())));
         GuildInfo {
             name: guild.name().to_owned(),
             icon: guild.icon().map(str::to_owned),
             owner: guild.owner() == me,
+            owner_id: guild.owner().to_owned(),
             position,
             joined: guild.joined_at.as_deref().and_then(model::iso_seconds).unwrap_or(0),
             roles: roles.collect(),
             my_roles: member.map_or_else(Vec::new, |member| member.roles.iter().map(|role| number(role)).collect()),
+            member_roles,
             categories: categories.collect(),
             channels: Vec::new(),
             quiet,
@@ -591,6 +604,10 @@ impl Discord {
                     let fresh = RoleInfo {
                         name: role.name.clone(),
                         permissions: role.permissions,
+                        position: role.position,
+                        color: role.color,
+                        icon: role.icon.clone(),
+                        unicode_emoji: role.unicode_emoji.clone(),
                     };
                     let before = info.roles.insert(number(&role.id), fresh);
                     // Everyone holds the server's own role; any other counts only if we do.
@@ -607,25 +624,62 @@ impl Discord {
         Ok(())
     }
 
-    /// Our own membership of a server changed: with other roles we may see other channels,
-    /// or a server timeout may have been set or lifted.
+    /// A server member changed: refresh cached roles/colors/icons, and if it is us,
+    /// recompute channel visibility and server timeout state.
     pub(super) fn member_changed(&self, guild: &str, member: &Member) -> Result<(), Failure> {
-        if member.id() != self.me() {
-            return Ok(());
-        }
+        let uid = member.id();
         let mut roles: Vec<u64> = member.roles.iter().map(|role| number(role)).collect();
         roles.sort_unstable();
+        let is_me = uid == self.me();
         let timeout_until = member.communication_disabled_until.as_deref().and_then(model::iso_seconds);
-        let (moved, timeout_changed) = {
+        let (moved, timeout_changed, roster_refresh, icon_file) = {
             let mut state = self.state.lock().unwrap();
+            let state = &mut *state;
             let Some(info) = state.guilds.get_mut(guild) else {
                 return Ok(());
             };
-            let mut before = std::mem::replace(&mut info.my_roles, roles.clone());
-            before.sort_unstable();
-            let prev_timeout = std::mem::replace(&mut info.timeout_until, timeout_until);
-            (before != roles, prev_timeout != timeout_until)
+            if !uid.is_empty() {
+                info.set_member_roles(uid, roles.clone());
+            }
+            let (color, icon, emoji) = info.resolve_role_style(&roles);
+            let icon_file = icon.clone();
+            let mut roster_refresh: Option<String> = None;
+            if state.members.on_screen.as_deref() == Some(guild) {
+                if let Some(roster) = state.members.roster.as_mut() {
+                    let mut touched = false;
+                    for entry in roster.rows.values_mut() {
+                        if let super::members::Entry::Member(person) = entry {
+                            if person.key.id == uid {
+                                person.role_color = color;
+                                person.role_icon = icon.as_ref().map(|(f, _)| f.clone());
+                                person.role_emoji = emoji.clone();
+                                if let Some(nick) = member.nick.as_deref().filter(|n| !n.is_empty()) {
+                                    person.name = nick.to_owned();
+                                }
+                                touched = true;
+                            }
+                        }
+                    }
+                    if touched {
+                        roster_refresh = Some(roster.channel.clone());
+                    }
+                }
+            }
+            if !is_me {
+                (false, false, roster_refresh, icon_file)
+            } else {
+                let mut before = std::mem::replace(&mut info.my_roles, roles.clone());
+                before.sort_unstable();
+                let prev_timeout = std::mem::replace(&mut info.timeout_until, timeout_until);
+                (before != roles, prev_timeout != timeout_until, roster_refresh, icon_file)
+            }
         };
+        if let Some(file) = icon_file {
+            let _ = self.ctx.media(&[file]);
+        }
+        if let Some(channel) = roster_refresh {
+            self.ctx.members_changed(&channel);
+        }
         if moved || timeout_changed {
             self.replant(guild)?;
         }
@@ -1477,5 +1531,62 @@ mod tests {
         let body = super::super::collapse_settings_body(overrides);
         assert_eq!(body["channel_overrides"]["4100"]["collapsed"], false);
         assert_eq!(body["channel_overrides"]["4200"]["collapsed"], true);
+    }
+
+    #[test]
+    fn resolves_highest_nonzero_role_color_and_role_icon_and_updates_on_member_change() {
+        let mut guild = GuildInfo::default();
+        // Low role with color + emoji
+        guild.roles.insert(
+            1,
+            RoleInfo {
+                name: "Member".into(),
+                permissions: 0,
+                position: 1,
+                color: 0x112233,
+                icon: None,
+                unicode_emoji: Some("⭐".into()),
+            },
+        );
+        // High role with color == 0 (transparent) and icon hash
+        guild.roles.insert(
+            2,
+            RoleInfo {
+                name: "Booster".into(),
+                permissions: 0,
+                position: 10,
+                color: 0,
+                icon: Some("hash_abc".into()),
+                unicode_emoji: None,
+            },
+        );
+        // Mid role with non-zero color
+        guild.roles.insert(
+            3,
+            RoleInfo {
+                name: "Mod".into(),
+                permissions: 0,
+                position: 5,
+                color: 0xe74c3c,
+                icon: None,
+                unicode_emoji: None,
+            },
+        );
+
+        let (color, icon, emoji) = guild.resolve_role_style(&[1, 2, 3]);
+        assert_eq!(color, Some(0xe74c3c), "highest position role with non-zero color wins");
+        assert_eq!(
+            icon.as_ref().map(|(f, _)| f.id.as_str()),
+            Some("roleicon:2:hash_abc"),
+            "highest position role with icon wins"
+        );
+        assert_eq!(emoji, None, "icon hash takes precedence on highest icon role");
+
+        // When member loses roles 2 and 3 (e.g. GUILD_MEMBER_UPDATE), style falls back to role 1
+        guild.set_member_roles("u1", vec![1]);
+        let (color2, icon2, emoji2) = guild.member_role_style("u1");
+        assert_eq!(color2, Some(0x112233));
+        assert!(icon2.is_none());
+        assert_eq!(emoji2.as_deref(), Some("⭐"));
     }
 }

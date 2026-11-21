@@ -778,6 +778,15 @@ pub struct Person {
     pub utc_offset: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<Mark>,
+    /// Highest coloured role's RGB (`0xRRGGBB`) in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_color: Option<u32>,
+    /// Highest role icon image in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_icon: Option<MediaFile>,
+    /// Highest role unicode emoji badge in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_emoji: Option<String>,
 }
 
 impl Person {
@@ -798,6 +807,9 @@ impl Person {
             title: String::new(),
             utc_offset: None,
             mark: None,
+            role_color: None,
+            role_icon: None,
+            role_emoji: None,
         }
     }
 }

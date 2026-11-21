@@ -219,6 +219,13 @@ pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
     )
 }
 
+pub fn role_icon(role: &str, hash: &str) -> (MediaFile, String) {
+    (
+        sized(format!("roleicon:{role}:{hash}"), MediaKind::Icon, 48),
+        format!("{}/role-icons/{role}/{hash}.webp?size=48", cdn()),
+    )
+}
+
 /// A group direct message's own picture. The address is from the community documentation and
 /// unconfirmed against a real account.
 pub fn group_icon(channel: &str, hash: &str) -> (MediaFile, String) {
@@ -432,6 +439,16 @@ pub struct Role {
     pub name: String,
     #[serde(default, deserialize_with = "lenient_u64")]
     pub permissions: u64,
+    #[serde(default, deserialize_with = "nullable")]
+    pub position: i32,
+    #[serde(default, deserialize_with = "nullable")]
+    pub color: u32,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub unicode_emoji: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub hoist: bool,
 }
 
 /// What newer sessions wrap a guild's own fields in.
