@@ -357,6 +357,19 @@ impl Fake {
             },
             _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
             _ if path.starts_with("/upload/") => self.upload(call),
+            _ if path.starts_with("/ams/v1/objects") && (call.method == "POST" || call.method == "PUT") => {
+                if header("authorization") != format!("skype_token {skype}") {
+                    return unauthorized();
+                }
+                if call.method == "POST" && path == "/ams/v1/objects" {
+                    let n = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
+                    return answer("201 Created", json!({"id": format!("0-neu-d1-img{n}")}));
+                }
+                if call.method == "PUT" && path.ends_with("/content/imgpsh") {
+                    return answer("201 Created", json!({}));
+                }
+                answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
+            }
             _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") => Reply {
                 status: "200 OK",
                 headers: Vec::new(),
@@ -2162,4 +2175,122 @@ fn activity_feed_lists_mentions_replies_reactions_missed_calls_and_marks_read() 
         panic!("expected Response::ActivityFeed after mark-all");
     };
     assert!(after_all.iter().all(|i| !i.unread), "all activity items should be read");
+}
+
+#[test]
+fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises image-only attachment capability.
+    let can = world.account(HOME).can;
+    assert!(can.max_file_bytes > 0, "Teams should allow image attachments");
+    assert!(can.max_files > 0);
+    assert!(can.images_only, "Teams should advertise images_only while OneDrive docs stay off");
+
+    // 2. Stage a valid PNG screenshot (with a real IHDR header for 320x200) and a non-image file.
+    let staged = std::path::absolute(format!("/tmp/tinyclient-teams-ams-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&staged).unwrap();
+    let img_path = staged.join("screenshot.png");
+    let mut png_bytes = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
+    png_bytes.extend_from_slice(&320u32.to_be_bytes());
+    png_bytes.extend_from_slice(&200u32.to_be_bytes());
+    png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    std::fs::write(&img_path, &png_bytes).unwrap();
+
+    let doc_path = staged.join("spec.txt");
+    std::fs::write(&doc_path, b"not an image").unwrap();
+
+    // Non-image files are still refused.
+    let doc_send = world.ask(Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000646".into(),
+        text: "doc".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: doc_path.to_string_lossy().into_owned(),
+                name: "spec.txt".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            ..Default::default()
+        },
+    });
+    assert!(!matches!(doc_send, Response::Sent { .. }), "non-image must be refused: {doc_send:?}");
+
+    // 3. Send the pasted PNG screenshot with caption text.
+    let client_id = "1760000999000647";
+    let sent_resp = world.ask(Request::Send {
+        conversation: ana.clone(),
+        client_id: client_id.into(),
+        text: "See attached screenshot".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: img_path.to_string_lossy().into_owned(),
+                name: "screenshot.png".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            ..Default::default()
+        },
+    });
+    assert!(matches!(sent_resp, Response::Sent { .. }), "image send should be accepted: {sent_resp:?}");
+
+    let sent_msg = world.until("image message sent", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+    });
+    assert!(sent_msg.text.contains("See attached screenshot"));
+    assert_eq!(sent_msg.attachments.len(), 1);
+    assert_eq!(sent_msg.attachments[0].file.kind, MediaKind::Image);
+
+    // 4. Verify AMS object creation (POST /ams/v1/objects) and image upload (PUT .../content/imgpsh).
+    let create_call = world
+        .fake
+        .calls("POST", "/ams/v1/objects")
+        .pop()
+        .expect("POST /ams/v1/objects");
+    let create_json = create_call.json();
+    assert_eq!(create_json["type"].as_str(), Some("pish/image"));
+    assert_eq!(create_json["filename"].as_str(), Some("screenshot.png"));
+    assert!(create_json["permissions"][CHAT_ANA].is_array());
+
+    let put_call = world
+        .fake
+        .calls("PUT", "/content/imgpsh")
+        .pop()
+        .expect("PUT /ams/v1/objects/{id}/content/imgpsh");
+    assert!(
+        put_call.headers.get("authorization").is_some_and(|v| v.starts_with("skype_token ")),
+        "AMS PUT must carry Authorization: skype_token ..."
+    );
+
+    // 5. Verify posted RichText/Html carries the inline AMS <img> tag with dimensions.
+    let post_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == client_id)
+        .expect("chat POST with inline image");
+    let post_body = post_call.json();
+    let html = post_body["content"].as_str().unwrap_or("");
+    assert!(html.contains("See attached screenshot"), "{html}");
+    assert!(html.contains("http://schema.skype.com/AMSImage"), "{html}");
+    assert!(html.contains("/ams/v1/objects/"), "{html}");
+    assert!(html.contains("/views/imgo"), "{html}");
+    assert!(html.contains("width=\"320\"") && html.contains("height=\"200\""), "{html}");
+
+    let _ = std::fs::remove_dir_all(&staged);
 }

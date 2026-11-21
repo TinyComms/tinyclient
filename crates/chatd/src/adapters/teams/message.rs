@@ -1240,7 +1240,23 @@ impl Teams {
     }
 
     /// The same, with `properties` (the files or links a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], suppress_embeds: bool, mut properties: Option<Value>) -> Result<Message, Fault> {
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], suppress_embeds: bool, properties: Option<Value>) -> Result<Message, Fault> {
+        self.posted_with_html(conversation, client_id, text, reply_to, mention_spans, suppress_embeds, properties, None)
+    }
+
+    /// Posts a message with optional extra HTML (e.g. inline AMS `<img>` tags) appended to the body.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn posted_with_html(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        mention_spans: &[Span],
+        suppress_embeds: bool,
+        mut properties: Option<Value>,
+        extra_html: Option<&str>,
+    ) -> Result<Message, Fault> {
         let mut sent_previews = Vec::new();
         let allow_previews = !suppress_embeds && self.ctx.hub.settings().on(protocol::settings::LINK_PREVIEWS);
         if allow_previews {
@@ -1261,6 +1277,9 @@ impl Teams {
             let (c, m) = html::compose_rich(text);
             (c, (!m.is_empty()).then(|| html::mentions_property(&m)))
         };
+        if let Some(extra) = extra_html.filter(|s| !s.is_empty()) {
+            content.push_str(extra);
+        }
         if let Some(encoded) = mentions_json {
             let props = properties.get_or_insert_with(|| json!({}));
             if let Some(map) = props.as_object_mut() {

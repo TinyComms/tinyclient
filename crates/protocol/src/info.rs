@@ -482,6 +482,9 @@ pub struct Capabilities {
     /// Most files in one message.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_files: u32,
+    /// Only image files (e.g. pasted screenshots) may be attached; other documents are refused.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub images_only: bool,
     /// Longest caption under files, in characters. 0: the text limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub caption_limit: u32,

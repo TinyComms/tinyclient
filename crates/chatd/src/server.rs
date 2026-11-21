@@ -1387,6 +1387,9 @@ impl Chat {
         }
         for file in &with.files {
             let named = file_name(file);
+            if can.images_only && !crate::blobs::upload::mime_of(&named).starts_with("image/") {
+                return refuse(format!("{name} only supports sending images from tinyclient right now."));
+            }
             // The same rule the upload reads by: never chatd's own files, a device, a secret, or
             // a link in `outbox/`.
             let real = match crate::blobs::upload::allowed(&file.path) {

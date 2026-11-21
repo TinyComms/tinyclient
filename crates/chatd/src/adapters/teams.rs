@@ -282,6 +282,7 @@ struct Place {
     chat: String,
     middle: String,
     presence: String,
+    ams: Option<String>,
 }
 
 struct Token {
@@ -346,6 +347,8 @@ enum Auth {
     Both(&'static str),
     /// The skype token as trouter takes it.
     Push,
+    /// The skype token as the AMS media store takes it (`Authorization: skype_token ...`).
+    Ams,
 }
 
 enum Body<'a> {
@@ -709,7 +712,7 @@ impl Teams {
     fn forget(&self, auth: Auth) {
         let mut state = self.state();
         match auth {
-            Auth::Skype | Auth::Push => state.skype = None,
+            Auth::Skype | Auth::Push | Auth::Ams => state.skype = None,
             Auth::Bearer(scope) => drop(state.access.remove(scope)),
             Auth::Both(scope) => {
                 state.access.remove(scope);
@@ -771,6 +774,7 @@ impl Teams {
                 chat,
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
+                ams: named("ams"),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -800,6 +804,7 @@ impl Teams {
         Ok(match auth {
             Auth::Skype => vec![("Authentication", format!("skypetoken={}", self.skype()?.0))],
             Auth::Push => vec![("X-Skypetoken", self.skype()?.0)],
+            Auth::Ams => vec![("Authorization", format!("skype_token {}", self.skype()?.0))],
             Auth::Bearer(scope) => vec![("Authorization", format!("Bearer {}", self.token(scope)?))],
             Auth::Both(scope) => {
                 vec![("Authorization", format!("Bearer {}", self.token(scope)?)), ("X-Skypetoken", self.skype()?.0)]
@@ -907,12 +912,13 @@ impl Teams {
         self.ctx.describe(&self.session.name, &self.me())?;
         let mut push = self.open()?;
         self.ctx.link(Link::Connected);
-        // Files are off until they can be shared with the chat's members only. The OneDrive path
-        // below made an organization-wide link, which is not what the Teams app does and shows
-        // up in a company's audit logs.
+        // Pasted/attached images go inline through Teams' AMS media store (scoped to the
+        // conversation). Non-image documents stay off (`images_only: true`) until OneDrive
+        // sharing can be scoped to the conversation's members.
         self.ctx.capabilities(protocol::Capabilities {
-            max_file_bytes: 0,
-            max_files: 0,
+            max_file_bytes: 20 * 1024 * 1024,
+            max_files: 10,
+            images_only: true,
             reply: true,
             edit: true,
             delete: true,

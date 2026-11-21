@@ -69,6 +69,9 @@ impl Teams {
     }
 
     fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[protocol::Span], suppress_embeds: bool, up: &mut Upload) -> Result<Message, String> {
+        if up.files().iter().all(|f| f.mime.starts_with("image/")) {
+            return self.with_inline_images(conversation, client_id, text, reply_to, spans, suppress_embeds, up);
+        }
         let mut named = Vec::new();
         let mut attachments = Vec::new();
         for at in 0..up.files().len() {
@@ -81,6 +84,109 @@ impl Teams {
         let mut message = self.posted_with(conversation, client_id, text, reply_to, spans, suppress_embeds, Some(properties)).map_err(super::reason)?;
         message.attachments = attachments;
         Ok(message)
+    }
+
+    /// Uploads one or more images to Teams' AMS media store and sends them inline in `RichText/Html`.
+    fn with_inline_images(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        spans: &[protocol::Span],
+        suppress_embeds: bool,
+        up: &mut Upload,
+    ) -> Result<Message, String> {
+        let (skype, place) = self.skype().map_err(super::reason)?;
+        let Some(ams) = place.ams.as_deref() else {
+            return Err("Teams did not provide a media store address for images.".to_owned());
+        };
+        let thread = super::thread_of(conversation);
+        let mut images_html = String::new();
+        let mut attachments = Vec::new();
+        for at in 0..up.files().len() {
+            let (img_html, attachment) = self.one_ams_image(up, at, ams, &skype, thread)?;
+            images_html.push_str(&img_html);
+            attachments.push(attachment);
+        }
+        up.check()?;
+        let mut message = self
+            .posted_with_html(conversation, client_id, text, reply_to, spans, suppress_embeds, None, Some(&images_html))
+            .map_err(super::reason)?;
+        message.attachments = attachments;
+        if !images_html.is_empty() {
+            let mut state = self.state();
+            if state.own_meta.len() >= super::REMEMBERED {
+                state.own_meta.clear();
+            }
+            state.own_meta.insert(
+                (conversation.to_owned(), message.id.clone()),
+                super::message::OwnMeta { subject: None, images_html },
+            );
+        }
+        Ok(message)
+    }
+
+    /// Creates one AMS object, uploads the image bytes to `/content/imgpsh`, and returns its
+    /// inline `<img itemtype="http://schema.skype.com/AMSImage">` HTML plus the local attachment.
+    fn one_ams_image(&self, up: &mut Upload, at: usize, ams: &str, skype: &str, thread: &str) -> Result<(String, Attachment), String> {
+        let (name, bytes, mime, path, media_dims) = {
+            let src = &up.files()[at];
+            let dims = src.media.as_ref().map(|m| (m.width.unwrap_or(0), m.height.unwrap_or(0))).unwrap_or((0, 0));
+            (src.name.clone(), src.bytes, src.mime, src.path.clone(), dims)
+        };
+        let failed = |fault: Fault| format!("{name} could not be sent: {}", super::reason(fault));
+        if bytes == 0 {
+            return Err(format!("{name} is empty."));
+        }
+        let (width, height) = if media_dims.0 > 0 && media_dims.1 > 0 {
+            media_dims
+        } else {
+            image_dimensions(&path).unwrap_or((0, 0))
+        };
+        let create_url = format!("{ams}/v1/objects");
+        let create_body = json!({
+            "type": "pish/image",
+            "permissions": { thread: ["read"] },
+            "filename": name,
+        });
+        let created = self
+            .call("POST", &create_url, Auth::Ams, Body::Json(&create_body), true)
+            .map_err(failed)?;
+        let Some(id) = created.body["id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned) else {
+            return Err(format!("{name} could not be sent: Teams media store returned no object id."));
+        };
+        let upload_url = format!("{ams}/v1/objects/{}/content/imgpsh", escaped(&id));
+        let target = Target::put(upload_url)
+            .header("Authorization", &format!("skype_token {skype}"))
+            .header("Content-Type", mime);
+        up.send(at, &target)?;
+
+        let view_url = format!("{ams}/v1/objects/{}/views/imgo", escaped(&id));
+        let escaped_alt = super::html::escape_plain(&name);
+        let dims_attr = if width > 0 && height > 0 {
+            format!(" width=\"{width}\" height=\"{height}\"")
+        } else {
+            String::new()
+        };
+        let img_html = format!(
+            "<p><img itemscope=\"\" itemtype=\"http://schema.skype.com/AMSImage\" src=\"{view_url}\" alt=\"{escaped_alt}\"{dims_attr}></p>"
+        );
+        let file = MediaFile {
+            width,
+            height,
+            bytes,
+            ..MediaFile::new(format!("img:{}", escaped(&id)), MediaKind::Image)
+        };
+        if let Err(err) = self.ctx.media(&[(file.clone(), view_url)]) {
+            tracing::warn!("chatd: Teams: {err}");
+        }
+        let attachment = Attachment {
+            thumb: Some(file.clone()),
+            mime: mime.to_owned(),
+            ..Attachment::new(name, file)
+        };
+        Ok((img_html, attachment))
     }
 
     /// One file to OneDrive, in an upload session, and the entry the message names it by.
@@ -129,6 +235,27 @@ impl Teams {
         }
         Ok((entry, Attachment::new(name, file)))
     }
+}
+
+/// Reads pixel dimensions from a PNG, GIF, or JPEG header without decoding the image.
+fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 32];
+    let n = file.read(&mut head).ok()?;
+    // PNG: 8-byte signature + 4-byte length + "IHDR" + 4-byte width + 4-byte height.
+    if n >= 24 && &head[0..8] == b"\x89PNG\r\n\x1a\n" && &head[12..16] == b"IHDR" {
+        let w = u32::from_be_bytes([head[16], head[17], head[18], head[19]]);
+        let h = u32::from_be_bytes([head[20], head[21], head[22], head[23]]);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    // GIF: "GIF87a" / "GIF89a" + little-endian u16 width + u16 height.
+    if n >= 10 && (&head[0..6] == b"GIF87a" || &head[0..6] == b"GIF89a") {
+        let w = u32::from(u16::from_le_bytes([head[6], head[7]]));
+        let h = u32::from(u16::from_le_bytes([head[8], head[9]]));
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    None
 }
 
 #[cfg(test)]
