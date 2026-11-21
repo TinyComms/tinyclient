@@ -1926,6 +1926,18 @@ pub enum Request {
         unsave: bool,
     },
 
+    /// Translates one message on demand into `to` (a BCP-47 / ISO 639-1 tag such as `"en"`,
+    /// or `"system"` to use the local system locale).
+    ///
+    /// Never dispatched for end-to-end encrypted conversations (Signal or Tiny E2EE): chatd
+    /// refuses those locally without contacting any network service.
+    Translate {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        to: String,
+    },
+
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
     /// later is a `Media` change. Ask only for what is on screen.
     Fetch {
@@ -2720,6 +2732,65 @@ impl Change {
     }
 }
 
+/// An on-demand translation of one message (`Request::Translate` / `Response::Translated`).
+/// Never written into stored message history; kept in UI state only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Translation {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_lang: Option<String>,
+    pub target_lang: String,
+}
+
+/// Normalizes a locale or BCP-47 tag (such as `"en_US.UTF-8"`, `"zh-Hans"`, `"FR"`) into a
+/// lowercase primary ISO 639-1 / 639-3 subtag suitable for translation APIs.
+/// Falls back to `"en"` when empty or malformed.
+pub fn normalize_language_tag(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") || trimmed.eq_ignore_ascii_case("system") {
+        return "en".to_owned();
+    }
+    let primary = trimmed
+        .split(['.', '@', '-', '_'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if (2..=5).contains(&primary.len()) && primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+        primary.to_ascii_lowercase()
+    } else {
+        "en".to_owned()
+    }
+}
+
+/// Human-readable display name for a language tag (e.g. `"es"` -> `"Spanish"`).
+pub fn language_name(tag: &str) -> String {
+    let norm = tag.trim().to_ascii_lowercase();
+    let primary = norm.split(['-', '_', '.']).next().unwrap_or("");
+    match primary {
+        "" | "auto" => "detected language".to_owned(),
+        "en" => "English".to_owned(),
+        "es" => "Spanish".to_owned(),
+        "fr" => "French".to_owned(),
+        "de" => "German".to_owned(),
+        "it" => "Italian".to_owned(),
+        "pt" => "Portuguese".to_owned(),
+        "ru" => "Russian".to_owned(),
+        "ja" => "Japanese".to_owned(),
+        "ko" => "Korean".to_owned(),
+        "zh" => "Chinese".to_owned(),
+        "ar" => "Arabic".to_owned(),
+        "hi" => "Hindi".to_owned(),
+        "nl" => "Dutch".to_owned(),
+        "pl" => "Polish".to_owned(),
+        "tr" => "Turkish".to_owned(),
+        "uk" => "Ukrainian".to_owned(),
+        "sv" => "Swedish".to_owned(),
+        "vi" => "Vietnamese".to_owned(),
+        "id" => "Indonesian".to_owned(),
+        other => other.to_ascii_uppercase(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
@@ -2946,6 +3017,12 @@ pub enum Response {
         reactors: Vec<Reactor>,
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
+    },
+    /// Answers `Translate`: translated message text kept transiently beside the original.
+    Translated {
+        conversation: Key,
+        message_id: String,
+        translation: Translation,
     },
     Catalog {
         items: Vec<CatalogItem>,
@@ -3665,5 +3742,39 @@ mod sock_path_tests {
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert!(!old.follow_threads);
         assert!(!old.dnd_snooze);
+        assert!(!old.translate);
+    }
+
+    #[test]
+    fn translate_request_response_and_language_helpers_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Telegram, account: "42".into() }, "u7");
+        let req = Request::Translate {
+            conversation: conv.clone(),
+            message_id: "105".into(),
+            to: "en".into(),
+        };
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), req);
+
+        let translation = Translation {
+            text: "Hello world".into(),
+            source_lang: Some("es".into()),
+            target_lang: "en".into(),
+        };
+        let resp = Response::Translated {
+            conversation: conv,
+            message_id: "105".into(),
+            translation: translation.clone(),
+        };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+
+        assert_eq!(normalize_language_tag("en_US.UTF-8"), "en");
+        assert_eq!(normalize_language_tag("pt-BR"), "pt");
+        assert_eq!(normalize_language_tag("JA"), "ja");
+        assert_eq!(normalize_language_tag(""), "en");
+        assert_eq!(normalize_language_tag("123"), "en");
+        assert_eq!(language_name("es"), "Spanish");
+        assert_eq!(language_name("zh-Hans"), "Chinese");
+        assert_eq!(language_name("auto"), "detected language");
     }
 }

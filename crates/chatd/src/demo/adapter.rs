@@ -1005,6 +1005,26 @@ impl Demo {
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { conversation_id, message_id, to, reply } => {
+                let original = demo
+                    .ctx
+                    .stored_message(&conversation_id, &message_id)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.text)
+                    .unwrap_or_default();
+                let target_lang = protocol::normalize_language_tag(&to);
+                let outcome = if original.trim().is_empty() {
+                    Err(Refusal::Refused("Nothing to translate.".to_owned()))
+                } else {
+                    Ok(protocol::Translation {
+                        text: format!("[{target_lang}] {original}"),
+                        source_lang: Some("auto".to_owned()),
+                        target_lang,
+                    })
+                };
+                let _ = reply.send(outcome);
+            }
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
             | Command::DeleteFile { reply, .. }

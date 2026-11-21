@@ -222,6 +222,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         groups: 200,
         effects: true,
         view_once: true,
+        translate: true,
         ..Capabilities::default()
     }));
     s.capabilities.push((teams::account(), Capabilities {

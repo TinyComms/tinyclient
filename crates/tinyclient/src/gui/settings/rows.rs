@@ -77,6 +77,14 @@ pub const ROWS: &[Row] = &[
     row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
     row("M6", Messages, "", "Check spelling", &[], &["spell", "spelling", "spellcheck", "dictionary", "underline"]),
     row("M7", Messages, "", "Show a preview for links I send", &[], &["link", "links", "preview", "previews", "card", "embed", "url", "tiny"]),
+    row(
+        "M8",
+        Messages,
+        "",
+        "Translate messages to",
+        &["System default", "English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Japanese", "Korean", "Chinese", "Arabic", "Hindi"],
+        &["translate", "translation", "locale"],
+    ),
     row("LK", Privacy, "Lock", "Lock tinyclient", &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], &["touch id", "windows hello", "fingerprint", "face", "passcode", "pin", "biometric", "lock"]),
     row("LS", Privacy, "Lock", "When the screen locks", &[], &["screen lock", "away"]),
     row("LP", Privacy, "Lock", "Passphrase", &[], &["passphrase", "password", "linux"]),
@@ -244,6 +252,7 @@ pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
+            | "M8"
             | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V23" | "V24" | "V25" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }

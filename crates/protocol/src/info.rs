@@ -681,6 +681,10 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account has a native message translation source (`Request::Translate`).
+    /// Never enabled for end-to-end encrypted conversations (Signal, Tiny E2EE).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub translate: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

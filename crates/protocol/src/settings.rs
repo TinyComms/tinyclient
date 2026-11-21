@@ -118,6 +118,11 @@ pub const TYPING: &str = "typing";
 pub const RECEIPTS: &str = "receipts";
 /// P4. Days messages are kept on this Mac: 7, 30 or 90.
 pub const KEEP_DAYS: &str = "keep_days";
+/// M8. Target language for inline message translation (`"auto"` follows system locale).
+pub const TRANSLATE_TO: &str = "translate_to";
+pub const TRANSLATE_TO_CHOICES: [&str; 13] = [
+    "auto", "en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh", "ar", "hi",
+];
 /// Client-side link preview cards (e.g. Google Messages). On for known contacts by default.
 pub const LINK_PREVIEWS: &str = "link_previews";
 /// Client-side link preview cards for numbers not in contacts. Off by default to avoid
@@ -292,6 +297,7 @@ fn kind(key: &str) -> Option<Kind> {
         PTT_KEY | PRIORITY_KEY | MUTE_KEY | DEAFEN_KEY => Kind::Hotkey,
         _ if gain_user(key).is_some() => Kind::Gain,
         KEEP_DAYS => Kind::Choice(&KEEP_DAYS_CHOICES, 90),
+        TRANSLATE_TO => Kind::Word(&TRANSLATE_TO_CHOICES, "auto"),
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
         TYPING | RECEIPTS => Kind::Switch(true),
@@ -664,6 +670,23 @@ impl Values {
             mirror: self.on(CAMERA_MIRROR),
             blur: self.on(CAMERA_BLUR),
         }
+    }
+
+    /// M8: target ISO-639-1 language code for message translation (`"auto"` resolves system locale).
+    pub fn translate_target(&self) -> String {
+        let word = self.word(GLOBAL, TRANSLATE_TO);
+        if word != "auto" && !word.is_empty() {
+            return crate::normalize_language_tag(word);
+        }
+        for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Ok(val) = std::env::var(var) {
+                let norm = crate::normalize_language_tag(&val);
+                if !val.trim().is_empty() && !val.eq_ignore_ascii_case("C") && !val.to_ascii_uppercase().starts_with("POSIX") {
+                    return norm;
+                }
+            }
+        }
+        "en".to_owned()
     }
 
     /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
@@ -1292,5 +1315,21 @@ mod tests {
             mirror: false,
             blur: true,
         });
+    }
+
+    #[test]
+    fn translate_target_setting_validates_and_resolves() {
+        let mut values = Values::default();
+        for code in TRANSLATE_TO_CHOICES {
+            assert!(valid(GLOBAL, TRANSLATE_TO, code), "{code}");
+        }
+        assert!(!valid(GLOBAL, TRANSLATE_TO, "klingon"));
+        assert!(!valid(&account_scope(&account(Network::Telegram)), TRANSLATE_TO, "es"));
+        assert!(!values.translate_target().is_empty());
+
+        values.set(GLOBAL, TRANSLATE_TO, Some("ja".into()));
+        assert_eq!(values.translate_target(), "ja");
+        values.set(GLOBAL, TRANSLATE_TO, Some("fr".into()));
+        assert_eq!(values.translate_target(), "fr");
     }
 }

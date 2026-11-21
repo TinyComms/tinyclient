@@ -721,6 +721,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -881,6 +882,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
         }
+        Command::Translate { conversation_id, message_id, to, reply } => {
+            let _ = reply.send(translate_message(account, &conversation_id, &message_id, &to).map_err(refused));
+        }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
                 let handle = account.dir().get(who).map(|known| known.handle.clone()).unwrap_or_default();
@@ -972,6 +976,40 @@ fn mark_dialog_unread(account: &Account, conversation: &str, unread: bool) {
         tracing::warn!("chatd: Telegram: unread mark: {fault}");
     }
     filing::facts_changed(account, who, |facts| facts.read = !unread);
+}
+
+/// `messages.translateText`: native Telegram server-side translation for one message.
+fn translate_message(account: &Account, conversation: &str, message_id: &str, to: &str) -> Result<protocol::Translation, Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
+    let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
+    let (who, _) = sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
+    let peer = account.input(who)?;
+    let id = message_id
+        .parse::<i32>()
+        .map_err(|_| Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None })?;
+    let target_lang = protocol::normalize_language_tag(to);
+    let request = tl::functions::messages::TranslateText {
+        peer: Some(peer),
+        id: Some(vec![id]),
+        text: None,
+        to_lang: target_lang.clone(),
+        tone: None,
+    };
+    let tl::enums::messages::TranslatedText::TranslateResult(answer) = account.ask(&request)?;
+    let text = answer
+        .result
+        .into_iter()
+        .next()
+        .map(|tl::enums::TextWithEntities::Entities(t)| t.text)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Err(Fault::Net("Telegram returned an empty translation".to_owned()));
+    }
+    Ok(protocol::Translation {
+        text,
+        source_lang: None,
+        target_lang,
+    })
 }
 
 /// The nonce Telegram dedupes a send by, from the shell's client id.

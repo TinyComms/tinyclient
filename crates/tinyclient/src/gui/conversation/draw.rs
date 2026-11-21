@@ -974,6 +974,61 @@ impl Pane {
                 ),
                 None => sent.children(said).children(attached),
             };
+            if self.translating.contains(&message.id) {
+                sent = sent.child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(10.))
+                        .border_l_2()
+                        .border_color(tokens::border_strong())
+                        .type_small()
+                        .italic()
+                        .text_color(theme::text_faint())
+                        .child("Translating…"),
+                );
+            } else if let Some(translated) = self.translations.get(&message.id).cloned() {
+                let clear_id = message.id.clone();
+                let attribution = match translated.source_lang.as_deref() {
+                    Some(src) if !src.is_empty() && !src.eq_ignore_ascii_case("auto") => {
+                        format!("Translated from {}", protocol::language_name(src))
+                    }
+                    _ => format!("Translated to {}", protocol::language_name(&translated.target_lang)),
+                };
+                sent = sent.child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(10.))
+                        .border_l_2()
+                        .border_color(theme::accent())
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_body().text_color(theme::text()).child(translated.text))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child(attribution)
+                                .child("·")
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("translation-clear-{}", message.id)))
+                                        .cursor_pointer()
+                                        .text_color(theme::text_soft())
+                                        .hover(|style| style.underline())
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.translations.remove(&clear_id);
+                                            cx.notify();
+                                        }))
+                                        .child("Show original"),
+                                ),
+                        ),
+                );
+            }
             sent = sent
                 .children(message.announcement.then(|| {
                     div()

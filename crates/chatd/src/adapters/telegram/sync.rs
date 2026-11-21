@@ -379,6 +379,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         blocks: true,
         share_contact: true,
         save_gif: true,
+        translate: true,
         ..Capabilities::default()
     }
 }

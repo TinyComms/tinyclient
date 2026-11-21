@@ -18,14 +18,19 @@ use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CAMERA_BLUR, CAMERA_MIRROR, CAMERA_QUALITY, CAMERA_QUALITY_CHOICES,
     CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS,
     KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, QUALITY_CHOICES,
-    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY, VOICE_VOLUME,
+    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
 
+/// Labels for [`TRANSLATE_TO_CHOICES`], in the same order. `"auto"` is the system language.
+const TRANSLATE_LABELS: [&str; 13] = [
+    "System default", "English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Japanese", "Korean", "Chinese", "Arabic", "Hindi",
+];
+
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
 pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8" | "V11" | "V21" | "V23")
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "M8" | "P4" | "D2" | "V8" | "V11" | "V21" | "V23")
 }
 
 /// `--settings-choice` names one of these.
@@ -40,6 +45,7 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "N6" => "N6",
         "N7" => "N7",
         "M5" => "M5",
+        "M8" => "M8",
         "P4" => "P4",
         "D2" => "D2",
         "V8" => "V8",
@@ -62,6 +68,7 @@ fn choice_slot(id: &str) -> usize {
         "N6" => 16,
         "N7" => 17,
         "M5" => 25,
+        "M8" => 52,
         "P4" => 34,
         "D2" => 42,
         "V8" => 48,
@@ -114,6 +121,10 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
         "V23" => {
             let at = CAMERA_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, CAMERA_QUALITY)).unwrap_or(0);
             (CAMERA_QUALITY_CHOICES.iter().zip(["Auto", "HD (720p)", "Standard (360p)", "Data saver"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
+        }
+        "M8" => {
+            let at = TRANSLATE_TO_CHOICES.iter().position(|w| *w == values.word(GLOBAL, TRANSLATE_TO)).unwrap_or(0);
+            (TRANSLATE_TO_CHOICES.iter().zip(TRANSLATE_LABELS).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
         }
         "N7" => (pairs(&["1 hour", "Until tomorrow", "Until I resume"]), 0, 0),
         _ => return None,
@@ -393,7 +404,7 @@ impl SettingsWindow {
                     .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
             // A phone has no Return key to choose: its keyboard's own key sends.
-            Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6", "M7"] } else { &["M1", "M2", "M3", "M4", "M5", "M6", "M7"] }, None, window, cx)],
+            Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6", "M7", "M8"] } else { &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"] }, None, window, cx)],
             Section::Privacy => {
                 let lock_rows: &[&str] = if cfg!(target_os = "linux") { &["LK", "LS", "LP"] } else { &["LK", "LS"] };
                 let mut groups = vec![self.group(lock_rows, Some("Lock"), window, cx).child(caption(crate::gui::lock::CAPTION))];
@@ -771,6 +782,11 @@ impl SettingsWindow {
             "M7" => {
                 let second = "Tiny fetches the page from this device before sending.".to_owned();
                 self.switch_row(id, choices.send_link_previews, true, Some(second), |this, on, cx| this.choose(|c| c.send_link_previews = on, cx), cx)
+            }
+            "M8" => {
+                let at = TRANSLATE_TO_CHOICES.iter().position(|w| *w == values.word(GLOBAL, TRANSLATE_TO)).unwrap_or(0);
+                let second = Some("On demand, for one message. End-to-end encrypted chats are never sent out to be translated.".to_owned());
+                self.menu_choice_row(id, &TRANSLATE_LABELS, at, 0, second, None, cx)
             }
             // A finger never hovers: a phone plays them or it does not.
             "M5" if phone::active() => {
@@ -1271,6 +1287,11 @@ impl SettingsWindow {
                 let word = CAMERA_QUALITY_CHOICES[ix.min(CAMERA_QUALITY_CHOICES.len() - 1)];
                 let stored = (word != "auto").then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), CAMERA_QUALITY, stored, cx);
+            }
+            "M8" => {
+                let word = TRANSLATE_TO_CHOICES[ix.min(TRANSLATE_TO_CHOICES.len() - 1)];
+                let stored = (word != "auto").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), TRANSLATE_TO, stored, cx);
             }
             "N7" => {
                 let now = crate::view::now();
@@ -2530,9 +2551,10 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8", "V11", "V21", "V23"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "M8", "P4", "D2", "V8", "V11", "V21", "V23"] {
             assert!(menu_choice(id), "{id}");
         }
+        assert_eq!(TRANSLATE_LABELS.len(), TRANSLATE_TO_CHOICES.len());
         for id in ["A3", "M1", "M2", "N5", "N7"] {
             assert!(!menu_choice(id), "{id}");
         }

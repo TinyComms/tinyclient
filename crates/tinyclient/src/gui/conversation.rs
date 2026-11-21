@@ -158,6 +158,8 @@ struct Open {
     call: protocol::CallSupport,
     /// Conversation topic (e.g. "RCS message" / "Text message" for Google Messages).
     topic: String,
+    /// True when the conversation is end-to-end encrypted (`Encryption::is_sealed()`).
+    encrypted: bool,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -397,6 +399,11 @@ pub struct Pane {
     fetched_reactors: HashMap<(String, String), (Vec<protocol::Reactor>, bool)>,
     /// Reactor fetch currently in flight, keyed by `(message_id, emoji)`.
     reactors_loading: Option<(String, String)>,
+    /// On-demand inline translations for messages in the open conversation, keyed by `message_id`.
+    /// Never written to stored message history; cleared when switching conversations.
+    translations: HashMap<String, protocol::Translation>,
+    /// Messages currently waiting for an inline translation response.
+    translating: HashSet<String>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -502,6 +509,8 @@ impl Pane {
             open_select: None,
             fetched_reactors: HashMap::new(),
             reactors_loading: None,
+            translations: HashMap::new(),
+            translating: HashSet::new(),
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -577,6 +586,7 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let receipt = conversation.receipt();
+        let encrypted = conversation.encryption.is_sealed();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
             if open.title != conversation.title
                 || open.picture != picture
@@ -587,6 +597,7 @@ impl Pane {
                 || open.can_pin != conversation.can_pin
                 || open.call != conversation.call
                 || open.topic != conversation.topic
+                || open.encrypted != encrypted
             {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
@@ -595,8 +606,9 @@ impl Pane {
                 open.rights = conversation.rights;
                 open.moderate = conversation.moderate;
                 open.can_pin = conversation.can_pin;
-            open.call = conversation.call;
+                open.call = conversation.call;
                 open.topic.clone_from(&conversation.topic);
+                open.encrypted = encrypted;
                 cx.notify();
             }
             return;
@@ -617,6 +629,7 @@ impl Pane {
             open.can_pin = conversation.can_pin;
             open.call = conversation.call;
             open.topic.clone_from(&conversation.topic);
+            open.encrypted = encrypted;
         }
     }
 
@@ -650,6 +663,8 @@ impl Pane {
         self.revisions = None;
         self.fetched_reactors.clear();
         self.reactors_loading = None;
+        self.translations.clear();
+        self.translating.clear();
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
@@ -672,6 +687,7 @@ impl Pane {
             can_pin: false,
             call: protocol::CallSupport::None,
             topic: String::new(),
+            encrypted: false,
             started: Instant::now(),
         });
         self.window = pages::Window::default();

@@ -656,6 +656,14 @@ pub enum Command {
         unsave: bool,
         reply: Reply<()>,
     },
+    /// Translate one message on demand into `to` (normalized ISO 639-1 language tag).
+    /// Never called for end-to-end encrypted conversations.
+    Translate {
+        conversation_id: String,
+        message_id: String,
+        to: String,
+        reply: Reply<protocol::Translation>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -868,6 +876,7 @@ impl Command {
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
