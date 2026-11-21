@@ -2310,7 +2310,7 @@ fn post_sealed(
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut all_ids = attachment_ids.to_vec();
     let mut previews = Vec::new();
-    if !suppress_embeds {
+    if !suppress_embeds && server_has_feature(saved, protocol::TINY_FEATURE_LINK_PREVIEWS) {
         if let Some((preview, img_id)) = fetch_sealed_preview(saved, target_conv, text) {
             if let Some(id) = img_id {
                 all_ids.push(id);
@@ -2393,7 +2393,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
     let posting_client = client_id.clone();
     if sealed {
         upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
-            let mut refs = super::sealing::upload_sealed(upload, &saved, &posting_id)?;
+            let mut refs = super::sealing::upload_sealed(upload, &saved, &e2ee_conv)?;
             if let (Some(voice), Some(last)) = (voice.as_ref(), refs.last_mut()) {
                 last.duration = voice_duration_secs.unwrap_or(0);
                 last.voice = true;
@@ -2445,7 +2445,8 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
     }
-    match sealed_here(ctx, saved, conversation_id) {
+    let e2ee_conv = split_thread_id(conversation_id).map_or(conversation_id, |(ch, _)| ch);
+    match sealed_here(ctx, saved, e2ee_conv) {
         Ok(true) => {
             let result = e2ee::started(saved)
                 .ok_or(NOT_SET_UP.to_owned())
@@ -2453,7 +2454,7 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
                     let landed = shared
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
-                        .react(conversation_id, message_id, emoji, on)?;
+                        .react(e2ee_conv, message_id, emoji, on)?;
                     Ok((shared, landed))
                 });
             match result {
@@ -2469,7 +2470,7 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
                                 owed.push((landed.message.clone(), landed.emoji.clone()));
                             }
                         }
-                        locked.settle_reactions(conversation_id, &[], &owed);
+                        locked.settle_reactions(e2ee_conv, &[], &owed);
                     }
                     drop(device);
                     let _ = reply.send(Ok(()));
@@ -2498,9 +2499,10 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
     }
-    match sealed_here(ctx, saved, conversation_id) {
+    let e2ee_conv = split_thread_id(conversation_id).map_or(conversation_id, |(ch, _)| ch);
+    match sealed_here(ctx, saved, e2ee_conv) {
         Ok(true) => {
-            let _ = reply.send(edit_sealed(ctx, saved, conversation_id, message_id, text, spans).map_err(Refusal::Refused));
+            let _ = reply.send(edit_sealed(ctx, saved, conversation_id, e2ee_conv, message_id, text, spans).map_err(Refusal::Refused));
             return;
         }
         Ok(false) => {}
@@ -2535,14 +2537,14 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
 
 /// An edit of an encrypted message: a ciphertext of kind `edit` that names it. It keeps the
 /// message's attachments; every member's device folds it in.
-fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str, spans: &[protocol::Span]) -> Result<(), String> {
+fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, e2ee_conv: &str, message_id: &str, text: &str, spans: &[protocol::Span]) -> Result<(), String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut envelope = e2ee_core::Envelope::message(text);
-    envelope.attachments = device.editable_attachments(conversation_id, message_id)?;
+    envelope.attachments = device.editable_attachments(e2ee_conv, message_id)?;
     envelope.mentions = mentions_from_spans(text, spans);
     let client_id = format!("edit-{message_id}-{}", crate::hub::now());
-    device.post(conversation_id, &client_id, e2ee_core::Kind::Edit, Some(message_id), &envelope, &[])?;
+    device.post(e2ee_conv, &client_id, e2ee_core::Kind::Edit, Some(message_id), &envelope, &[])?;
     drop(device);
     if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
         message.text = text.to_owned();

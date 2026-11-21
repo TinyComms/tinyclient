@@ -985,7 +985,7 @@ impl Composer {
             files,
             voice: voice.clone(),
             silent: silent && controls.silent,
-            suppress_embeds: (self.no_preview || tiny_previews_off) && controls.link_chip && !hosts.is_empty(),
+            suppress_embeds: tiny_previews_off || (self.no_preview && controls.link_chip && !hosts.is_empty()),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
