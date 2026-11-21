@@ -230,29 +230,36 @@ impl Discord {
             .take(protocol::MUTUAL_SPACES)
             .collect();
         let mutual_spaces: Vec<String> = mutual_space_items.iter().map(|s| s.name.clone()).collect();
+        // An unknown id is not a friend. Inventing Friend here lets the card's learn
+        // replace a blocked or ignored person. Anyone who is not already Friend is left out.
         let mutual_people: Vec<protocol::Person> = profile
             .mutual_friends
             .iter()
             .take(25)
-            .map(|friend| {
+            .filter_map(|friend| {
+                let relation = state.relations.get(&friend.id).copied().unwrap_or(protocol::Relation::None);
+                if relation != protocol::Relation::Friend {
+                    return None;
+                }
                 let (avatar, _) = friend.avatar();
                 let name = state.users.get(&friend.id).cloned().unwrap_or_else(|| friend.name().to_owned());
-                protocol::Person {
+                Some(protocol::Person {
                     key: self.ctx.key(&friend.id),
                     name,
                     handle: friend.username.clone(),
                     avatar: Some(avatar),
                     bot: friend.bot,
-                    relation: state.relations.get(&friend.id).copied().unwrap_or(protocol::Relation::Friend),
+                    relation,
                     link: model::user_link(&friend.id),
                     ..protocol::Person::new(self.ctx.key(&friend.id), "")
-                }
+                })
             })
             .collect();
         let mutual_friends = profile
             .mutual_friends_count
             .unwrap_or(profile.mutual_friends.len() as u32)
             .max(mutual_people.len() as u32);
+        let mutual_total = mutual_space_items.len() as u32;
         let text = profile.user_profile.as_ref();
         let bio = match member_profile.map(|p| p.bio.as_str()).filter(|b| !b.is_empty()) {
             Some(server_bio) => {
@@ -285,7 +292,7 @@ impl Discord {
             mutual_space_items,
             mutual_people,
             mutual_friends,
-            mutual_total: profile.mutual_guilds.len() as u32,
+            mutual_total,
             pronouns,
             accent,
             banner,
@@ -861,6 +868,13 @@ fn profile_refusal(failed: Refused) -> Refusal {
 /// Reads a local image file, validates its magic bytes and size, and encodes it as a
 /// `data:image/{png,jpeg,webp,gif};base64,...` URI for Discord's profile endpoints.
 fn image_data_uri(path: &str, allow_gif: bool) -> Result<String, Refusal> {
+    let len = std::fs::metadata(path).map_err(|err| refused(format!("Could not read image: {err}")))?.len();
+    if len == 0 {
+        return Err(refused("The chosen image file is empty."));
+    }
+    if len > MAX_PROFILE_IMAGE_BYTES as u64 {
+        return Err(refused("Profile images must be 10 MB or smaller."));
+    }
     let bytes = std::fs::read(path).map_err(|err| refused(format!("Could not read image: {err}")))?;
     if bytes.is_empty() {
         return Err(refused("The chosen image file is empty."));
@@ -916,6 +930,14 @@ mod profile_tests {
         let txt = dir.join("a.txt");
         std::fs::write(&txt, b"not an image").unwrap();
         assert!(image_data_uri(txt.to_str().unwrap(), true).is_err());
+
+        let huge = dir.join("huge.png");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len((10 << 20) + 1).unwrap();
+        drop(file);
+        let err = image_data_uri(huge.to_str().unwrap(), true).unwrap_err();
+        let words = format!("{err:?}");
+        assert!(words.contains("10 MB"), "{words}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -144,6 +144,11 @@ impl SettingsWindow {
                         let acc = account.clone();
                         touch(button(("edit-profile", ix + 10 * network as usize), ButtonKind::Secondary, "Edit profile…"))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.profile_space = None;
+                                this.profile_accent.update(cx, |input, cx| input.set_text("", cx));
+                                this.profile_server_about.update(cx, |input, cx| input.set_text("", cx));
+                                this.profile_server_pronouns.update(cx, |input, cx| input.set_text("", cx));
+                                this.profile_server_accent.update(cx, |input, cx| input.set_text("", cx));
                                 this.confirm = Some(Confirm::EditProfile(Box::new(acc.clone())));
                                 cx.notify();
                             }))
@@ -424,6 +429,16 @@ impl SettingsWindow {
         if can.profile_pronouns {
             fields = fields.child(field_box("Pronouns", self.profile_pronouns.clone()));
         }
+        if can.profile_accent {
+            fields = fields.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(field_box("Accent colour", self.profile_accent.clone()))
+                    .child(div().type_small().text_color(theme::text_faint()).child("Hex, like 5865F2. Leave blank to keep the current colour.")),
+            );
+        }
         if can.profile_avatar {
             let avatar_key = key.clone();
             fields = fields.child(
@@ -499,6 +514,133 @@ impl SettingsWindow {
                     ))),
             );
         }
+        if can.profile_server {
+            let account_key = key.clone();
+            let guilds: Vec<(protocol::Key, String)> = self
+                .shell
+                .upgrade()
+                .map(|shell| {
+                    shell
+                        .read(cx)
+                        .spaces
+                        .iter()
+                        .filter(|space| space.key.account() == account_key)
+                        .map(|space| (space.key.clone(), space.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let selected = self.profile_space.clone().filter(|space| space.account() == key);
+            let mut section = div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .pt(px(8.))
+                .child(div().type_small().text_color(theme::text_soft()).child("Server profile"));
+            if guilds.is_empty() {
+                section = section.child(div().type_small().text_color(theme::text_faint()).child("No servers on this account."));
+            } else {
+                let mut list = div().id("profile-server-list").max_h(px(140.)).overflow_y_scroll().flex().flex_col().gap(px(2.));
+                for (ix, (guild, name)) in guilds.iter().enumerate() {
+                    let on = selected.as_ref() == Some(guild);
+                    let pick = guild.clone();
+                    list = list.child(
+                        div()
+                            .id(("profile-server", ix))
+                            .px(px(8.))
+                            .h(px(28.))
+                            .rounded(px(theme::R_CONTROL))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .when(on, |row| row.bg(theme::selected()))
+                            .hover(|row| row.bg(theme::hover()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.profile_space = Some(pick.clone());
+                                cx.notify();
+                            }))
+                            .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(name.clone())),
+                    );
+                }
+                section = section.child(list);
+            }
+            if let Some(guild) = selected.clone() {
+                let banner_account = key.clone();
+                let banner_space = guild.clone();
+                section = section
+                    .child(field_box("Server about", self.profile_server_about.clone()))
+                    .child(field_box("Server pronouns", self.profile_server_pronouns.clone()))
+                    .child(field_box("Server accent colour", self.profile_server_accent.clone()))
+                    .child(div().type_small().text_color(theme::text_faint()).child("Blank fields stay as they are. Hex, like 5865F2."))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().type_small().text_color(theme::text_soft()).child("Server banner"))
+                            .child(button("profile-server-banner", ButtonKind::Secondary, "Choose banner…").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let account = banner_account.clone();
+                                    let space = banner_space.clone();
+                                    let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                        files: true,
+                                        directories: false,
+                                        multiple: false,
+                                        prompt: Some("Choose server banner".into()),
+                                    });
+                                    cx.spawn(async move |this, cx| {
+                                        if let Ok(Ok(Some(paths))) = asked.await {
+                                            if let Some(path) = paths.into_iter().next() {
+                                                let req = protocol::Request::SetProfile {
+                                                    account,
+                                                    name: None,
+                                                    about: None,
+                                                    pronouns: None,
+                                                    emoji: None,
+                                                    username: None,
+                                                    photo: false,
+                                                    accent: None,
+                                                    banner: Some(path.to_string_lossy().into_owned()),
+                                                    space: Some(space),
+                                                };
+                                                let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                                                let _ = this.update(cx, |_, cx| cx.notify());
+                                            }
+                                        }
+                                    })
+                                    .detach();
+                                },
+                            ))),
+                    );
+                let save_account = key.clone();
+                let save_space = guild;
+                section = section.child(
+                    div().flex().justify_end().child(
+                        button("profile-save-server", ButtonKind::Primary, "Save server profile").on_click(cx.listener(move |this, _, _, cx| {
+                            let about = this.profile_server_about.read(cx).text().trim().to_owned();
+                            let pronouns = this.profile_server_pronouns.read(cx).text().trim().to_owned();
+                            let accent = accent_u32(&this.profile_server_accent.read(cx).text());
+                            if about.is_empty() && pronouns.is_empty() && accent.is_none() {
+                                return;
+                            }
+                            let req = protocol::Request::SetProfile {
+                                account: save_account.clone(),
+                                name: None,
+                                about: (!about.is_empty()).then_some(about),
+                                pronouns: (!pronouns.is_empty()).then_some(pronouns),
+                                emoji: None,
+                                username: None,
+                                photo: false,
+                                accent,
+                                banner: None,
+                                space: Some(save_space.clone()),
+                            };
+                            this.off_thread(cx, move || crate::client::ask(&req), |_, _, cx| cx.notify());
+                        })),
+                    ),
+                );
+            }
+            fields = fields.child(section);
+        }
         if account.key.network == Network::Discord {
             fields = fields.child(
                 div()
@@ -519,6 +661,7 @@ impl SettingsWindow {
             let name = can.profile_name.then(|| this.profile_name.read(cx).text().trim().to_owned()).filter(|s| !s.is_empty());
             let about = can.profile_about.then(|| this.profile_about.read(cx).text().trim().to_owned());
             let pronouns = can.profile_pronouns.then(|| this.profile_pronouns.read(cx).text().trim().to_owned());
+            let accent = can.profile_accent.then(|| accent_u32(&this.profile_accent.read(cx).text())).flatten();
             let req = protocol::Request::SetProfile {
                 account: save_key.clone(),
                 name,
@@ -527,7 +670,7 @@ impl SettingsWindow {
                 emoji: None,
                 username: None,
                 photo: false,
-                accent: None,
+                accent,
                 banner: None,
                 space: None,
             };
@@ -542,4 +685,13 @@ impl SettingsWindow {
             .child(fields)
             .child(crate::gui::components::modal_buttons().child(cancel).child(save))
     }
+}
+
+/// Six hex digits, with or without a leading `#`. Empty and anything else are left unset.
+fn accent_u32(text: &str) -> Option<u32> {
+    let text = text.trim().trim_start_matches('#');
+    if text.len() != 6 || !text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(text, 16).ok().map(|color| color & 0x00FF_FFFF)
 }

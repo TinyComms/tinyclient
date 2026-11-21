@@ -959,9 +959,15 @@ impl Capabilities {
         *self == Capabilities::default()
     }
 
-    /// True if any own-profile field (name, about, pronouns, avatar) can be edited on this network.
+    /// True if any own-profile field can be edited on this network.
     pub fn can_edit_profile(&self) -> bool {
-        self.profile_name || self.profile_about || self.profile_pronouns || self.profile_avatar
+        self.profile_name
+            || self.profile_about
+            || self.profile_pronouns
+            || self.profile_avatar
+            || self.profile_accent
+            || self.profile_banner
+            || self.profile_server
     }
 }
 

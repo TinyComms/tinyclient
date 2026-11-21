@@ -128,7 +128,12 @@ pub enum Menu {
     Space(Key),
     /// A conversation row's context menu, where the pointer was.
     Row(Rc<Conversation>, Point<Pixels>),
+    /// A Discord server folder, where the pointer was. The key is that account's folder.
+    Folder(Key, Point<Pixels>),
 }
+
+/// Discord folder colours, `0xRRGGBB`.
+const FOLDER_COLOURS: [u32; 8] = [0x5865F2, 0x57F287, 0xFEE75C, 0xEB459E, 0xED4245, 0xE67E22, 0x3498DB, 0x99AAB5];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
@@ -750,6 +755,10 @@ impl Shell {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
             }
+            Menu::Folder(_, position) => {
+                let items = menu().w(px(240.)).children(self.menu_items(open, snapshot, cx));
+                placed("menu-folder-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-folder", 120, items))
+            }
         };
         Some(
             div()
@@ -1061,6 +1070,61 @@ impl Shell {
                     );
                 }
             }
+            Menu::Folder(folder, _) => {
+                let stored = self.sidebar_state.home.folders.iter().find(|known| &known.key == folder).cloned();
+                let can = self.manages_space_folders(&folder.account());
+                if can {
+                    let rename = folder.clone();
+                    items.push(
+                        menu_item("folder-rename", Some("icons/pencil.svg"), "Rename…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_folder_rename(rename.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                    let mut swatches = div().px(px(8.)).py(px(4.)).flex().flex_wrap().items_center().gap(px(6.));
+                    for (ix, color) in FOLDER_COLOURS.iter().copied().enumerate() {
+                        let on = stored.as_ref().and_then(|known| known.color) == Some(color);
+                        let paint = folder.clone();
+                        swatches = swatches.child(
+                            div()
+                                .id(("folder-colour", ix))
+                                .size(px(18.))
+                                .rounded(px(9.))
+                                .bg(gpui::rgb(color))
+                                .when(on, |dot| dot.border_2().border_color(theme::text()))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.set_discord_folder(paint.clone(), None, Some(Some(color)), cx);
+                                })),
+                        );
+                    }
+                    items.push(swatches.into_any_element());
+                    if stored.as_ref().is_some_and(|known| known.color.is_some()) {
+                        let clear = folder.clone();
+                        items.push(
+                            menu_item("folder-clear-colour", Some("icons/x.svg"), "Clear colour", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.set_discord_folder(clear.clone(), None, Some(None), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    items.push(menu_separator().into_any_element());
+                }
+                let read = folder.clone();
+                items.push(
+                    menu_item("folder-read", Some("icons/check.svg"), "Mark folder as read", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.mark_folder_read(read.clone(), cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
         }
         items
     }
@@ -1123,6 +1187,19 @@ impl Shell {
                             ),
                     );
                 column().child(head).child(menu_separator()).children(self.phone_row_items(conversation, cx)).into_any_element()
+            }
+            Menu::Folder(folder, _) => {
+                let name = self
+                    .sidebar_state
+                    .home
+                    .folders
+                    .iter()
+                    .find(|known| &known.key == folder)
+                    .map(|known| known.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "Folder".to_owned());
+                let head = div().flex().items_center().px(px(8.)).h(px(44.)).child(div().phone_title().child(name));
+                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
             }
         };
         Some(super::phone::sheet("phone-menu", tall, body, close))
@@ -1597,6 +1674,7 @@ impl Render for Shell {
             })
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))
+            .children(self.folder_edit_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.tiny_layer(window, cx))

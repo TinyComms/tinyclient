@@ -96,7 +96,7 @@ pub enum Item {
     Action { act: Act, icon: &'static str, words: String, after: String, dot: Option<bool> },
     /// A server or team. `child`: inside a folder, on its spine.
     Space { index: usize, child: Option<u32>, open: Option<bool> },
-    Folder { id: String, name: String, color: Option<u32>, open: bool, lit: bool, mention: bool },
+    Folder { key: Key, name: String, color: Option<u32>, open: bool, lit: bool, mention: bool },
     /// A team's channel under its row.
     Channel(Rc<Conversation>),
 }
@@ -121,7 +121,7 @@ impl Item {
         match self {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => Some(format!("c/{}", c.key.id)),
             Item::Call(c) => Some(format!("call/{}", c.latest.message_id)),
-            Item::Folder { id, .. } => Some(format!("f/{id}")),
+            Item::Folder { key, .. } => Some(format!("f/{}", key.id)),
             Item::Header { label, .. } => Some(format!("h/{label}")),
             _ => None,
         }
@@ -309,7 +309,7 @@ pub fn servers(spaces: &[Space], folders: &[Folder], opened: &HashSet<String>, o
             folder.name.clone()
         };
         let mention = members.iter().any(|(_, s)| s.attention > 0) && hidden_news;
-        out.push(Item::Folder { id: folder.key.id.clone(), name, color: folder.color, open, lit: hidden_news, mention });
+        out.push(Item::Folder { key: folder.key.clone(), name, color: folder.color, open, lit: hidden_news, mention });
         let color = folder.color.unwrap_or(0);
         out.extend(children.into_iter().map(|(index, _)| Item::Space { index, child: Some(color), open: None }));
     }

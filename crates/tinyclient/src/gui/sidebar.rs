@@ -78,6 +78,11 @@ pub struct Location {
     tiny_channel: Option<String>,
 }
 
+pub struct FolderEdit {
+    pub key: Key,
+    pub name: gpui::Entity<crate::gui::input::TextInput>,
+}
+
 pub struct CreateChannelModal {
     pub space: Key,
     pub group: Option<String>,
@@ -116,7 +121,8 @@ pub struct State {
     activity_epoch: u64,
     /// Recent mentions fetched from the network on demand (`Request::Mentions`, Discord).
     pub(super) mentions_items: Vec<protocol::MentionHit>,
-    pub(super) mentions_more: Option<(AccountKey, String)>,
+    /// One cursor per account that still has another page.
+    pub(super) mentions_more: Vec<(AccountKey, String)>,
     pub(super) mentions_loading: bool,
     pub(super) mentions_everyone: bool,
     pub(super) mentions_roles: bool,
@@ -172,6 +178,8 @@ pub struct State {
     pub spaces_pending: bool,
     pub switcher: Option<switcher::Switcher>,
     pub create_channel: Option<CreateChannelModal>,
+    /// Rename of a Discord server folder.
+    pub folder_edit: Option<FolderEdit>,
     pub join_server: Option<JoinServerModal>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
@@ -272,7 +280,7 @@ impl State {
             activity_loading: false,
             activity_epoch: 0,
             mentions_items: Vec::new(),
-            mentions_more: None,
+            mentions_more: Vec::new(),
             mentions_loading: false,
             mentions_everyone: true,
             mentions_roles: true,
@@ -311,6 +319,7 @@ impl State {
             spaces_pending: false,
             switcher: None,
             create_channel: None,
+            folder_edit: None,
             join_server: None,
             leave_space: None,
         }
@@ -796,6 +805,148 @@ impl Shell {
         });
     }
 
+    /// Discord lets this account move and rename server folders.
+    pub(super) fn manages_space_folders(&self, account: &AccountKey) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.accounts.iter().any(|row| row.key == *account && row.link == Link::Connected && row.can.manage_space_folders)
+        })
+    }
+
+    fn known_discord_folder(&self, folder: &Key) -> bool {
+        self.sidebar_state.home.folders.iter().any(|known| &known.key == folder)
+    }
+
+    /// Moves `dragged` into `folder` (the end of that folder). Same account only.
+    fn drop_discord_on_folder(&mut self, folder: Key, dragged: &home_view::MovedSpace, cx: &mut Context<Self>) {
+        if dragged.key.account() != folder.account() || !self.manages_space_folders(&folder.account()) || !self.known_discord_folder(&folder) {
+            return;
+        }
+        self.send_move_space(
+            Request::MoveSpace { space: dragged.key.clone(), before: None, folder: Some(folder.id.clone()), into_space: None },
+            cx,
+        );
+    }
+
+    /// Drops `dragged` onto a server row: into that server's folder, ahead of it, or onto the
+    /// server itself to make a folder of the two.
+    fn drop_discord_space(&mut self, target: Key, dragged: &home_view::MovedSpace, cx: &mut Context<Self>) {
+        if dragged.key == target || dragged.key.account() != target.account() || !self.manages_space_folders(&target.account()) {
+            return;
+        }
+        let account = target.account();
+        let folder_id = self.spaces.iter().find(|space| space.key == target).and_then(|space| space.folder.clone());
+        let grouped = folder_id.as_ref().is_some_and(|id| {
+            self.sidebar_state.home.folders.iter().any(|folder| {
+                folder.key.account() == account && folder.key.id == *id && folder.spaces.len() > 1
+            })
+        });
+        let request = if grouped {
+            Request::MoveSpace {
+                space: dragged.key.clone(),
+                before: Some(target.id.clone()),
+                folder: folder_id,
+                into_space: None,
+            }
+        } else {
+            Request::MoveSpace {
+                space: dragged.key.clone(),
+                before: None,
+                folder: None,
+                into_space: Some(target.id.clone()),
+            }
+        };
+        self.send_move_space(request, cx);
+    }
+
+    fn send_move_space(&mut self, request: Request, cx: &mut Context<Self>) {
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+                return;
+            }
+            this.load_home(cx);
+        });
+    }
+
+    /// Renames or recolors a Discord server folder. `name` absent leaves it; empty clears it.
+    /// `color` absent leaves it; `Some(None)` clears it.
+    pub(super) fn set_discord_folder(&mut self, folder: Key, name: Option<String>, color: Option<Option<u32>>, cx: &mut Context<Self>) {
+        if !self.manages_space_folders(&folder.account()) || !self.known_discord_folder(&folder) {
+            return;
+        }
+        let request = Request::SetFolder { folder, name, color };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+                return;
+            }
+            this.load_home(cx);
+        });
+    }
+
+    pub(super) fn open_folder_rename(&mut self, folder: Key, cx: &mut Context<Self>) {
+        if !self.manages_space_folders(&folder.account()) || !self.known_discord_folder(&folder) {
+            return;
+        }
+        let current = self.sidebar_state.home.folders.iter().find(|known| known.key == folder).map(|known| known.name.clone()).unwrap_or_default();
+        let name = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("Folder name", cx);
+            if !current.is_empty() {
+                input.set_text(&current, cx);
+            }
+            input
+        });
+        self.sidebar_state.folder_edit = Some(FolderEdit { key: folder, name });
+        cx.notify();
+    }
+
+    fn submit_folder_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.sidebar_state.folder_edit.take() else {
+            return;
+        };
+        let name = edit.name.read(cx).text().trim().to_owned();
+        cx.notify();
+        self.set_discord_folder(edit.key, Some(name), None, cx);
+    }
+
+    /// Marks every server in the folder that still has news. One toast for the whole folder.
+    pub(super) fn mark_folder_read(&mut self, folder: Key, cx: &mut Context<Self>) {
+        let spaces: Vec<Key> = self
+            .spaces
+            .iter()
+            .filter(|space| {
+                space.key.account() == folder.account()
+                    && space.folder.as_deref() == Some(folder.id.as_str())
+                    && (space.attention > 0 || space.unread)
+            })
+            .map(|space| space.key.clone())
+            .collect();
+        if spaces.is_empty() {
+            self.toast(Some(("icons/check.svg", theme::text_soft())), "Marked as read", cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let mut failure: Option<String> = None;
+            for space in spaces {
+                let request = Request::MarkAllRead { network: Some(space.network), space: Some(space) };
+                let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                if let Some(words) = refused(&answer) {
+                    failure = Some(words);
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                match failure {
+                    None => this.toast(Some(("icons/check.svg", theme::text_soft())), "Marked as read", cx),
+                    Some(words) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx),
+                }
+                let pages = this.sidebar_state.inbox.stale();
+                this.load_inbox(pages, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Removes a direct or group conversation from this Inbox. The network keeps the messages.
     pub(super) fn forget_conversation(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
         let title = conversation.title.clone();
@@ -912,7 +1063,7 @@ impl Shell {
         self.sidebar_state.mentions_epoch += 1;
         let epoch = self.sidebar_state.mentions_epoch;
         self.sidebar_state.mentions_items.clear();
-        self.sidebar_state.mentions_more = None;
+        self.sidebar_state.mentions_more.clear();
         if accounts.is_empty() {
             self.sidebar_state.mentions_loading = false;
             return;
@@ -925,7 +1076,7 @@ impl Shell {
                 .background_executor()
                 .spawn(async move {
                     let mut merged = Vec::new();
-                    let mut more = None;
+                    let mut more = Vec::new();
                     for account in accounts {
                         let req = Request::Mentions {
                             account: account.clone(),
@@ -936,9 +1087,9 @@ impl Shell {
                             limit: 25,
                         };
                         if let Ok(Response::Mentions { items, more: has_more }) = ask(&req) {
-                            if has_more && more.is_none() {
+                            if has_more {
                                 if let Some(last) = items.last() {
-                                    more = Some((account, last.message_id.clone()));
+                                    more.push((account, last.message_id.clone()));
                                 }
                             }
                             merged.extend(items);
@@ -962,36 +1113,54 @@ impl Shell {
     }
 
     pub(super) fn load_more_mentions(&mut self, cx: &mut Context<Self>) {
-        let Some((account, before)) = self.sidebar_state.mentions_more.take() else {
+        let pending = std::mem::take(&mut self.sidebar_state.mentions_more);
+        if pending.is_empty() {
             return;
-        };
+        }
         let epoch = self.sidebar_state.mentions_epoch;
         let everyone = self.sidebar_state.mentions_everyone;
         let roles = self.sidebar_state.mentions_roles;
         self.sidebar_state.mentions_loading = true;
         cx.spawn(async move |this, cx| {
-            let req = Request::Mentions {
-                account: account.clone(),
-                before: Some(before),
-                everyone,
-                roles,
-                space: None,
-                limit: 25,
-            };
-            let got = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let (extra, next) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut extra = Vec::new();
+                    let mut next = Vec::new();
+                    for (account, before) in pending {
+                        let req = Request::Mentions {
+                            account: account.clone(),
+                            before: Some(before.clone()),
+                            everyone,
+                            roles,
+                            space: None,
+                            limit: 25,
+                        };
+                        match ask(&req) {
+                            Ok(Response::Mentions { items, more }) => {
+                                if more {
+                                    if let Some(last) = items.last() {
+                                        next.push((account, last.message_id.clone()));
+                                    } else {
+                                        next.push((account, before));
+                                    }
+                                }
+                                extra.extend(items);
+                            }
+                            _ => next.push((account, before)),
+                        }
+                    }
+                    (extra, next)
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 if this.sidebar_state.mentions_epoch != epoch {
                     return;
                 }
                 this.sidebar_state.mentions_loading = false;
-                if let Ok(Response::Mentions { items, more }) = got {
-                    if more {
-                        if let Some(last) = items.last() {
-                            this.sidebar_state.mentions_more = Some((account, last.message_id.clone()));
-                        }
-                    }
-                    this.sidebar_state.mentions_items.extend(items);
-                }
+                this.sidebar_state.mentions_items.extend(extra);
+                this.sidebar_state.mentions_items.sort_by_key(|item| std::cmp::Reverse(item.sent));
+                this.sidebar_state.mentions_more = next;
                 cx.notify();
             });
         })
@@ -1015,10 +1184,19 @@ impl Shell {
     }
 
     pub(super) fn dismiss_mention_hit(&mut self, account: AccountKey, message_id: String, cx: &mut Context<Self>) {
-        self.sidebar_state.mentions_items.retain(|m| m.message_id != message_id);
-        let req = Request::DismissMention { account, message_id };
-        cx.background_executor().spawn(async move { let _ = ask(&req); }).detach();
-        cx.notify();
+        let req = Request::DismissMention { account: account.clone(), message_id: message_id.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if matches!(answer, Ok(Response::Ok)) {
+                    this.sidebar_state.mentions_items.retain(|hit| {
+                        hit.conversation.account() != account || hit.message_id != message_id
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn set_activity_filter(&mut self, kind: Option<protocol::ActivityItemKind>, cx: &mut Context<Self>) {
@@ -2687,6 +2865,69 @@ impl Shell {
                 .justify_center()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.sidebar_state.create_channel = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(in crate::gui) fn folder_edit_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.folder_edit.as_ref()?;
+        let card = div()
+            .id("folder-edit-card")
+            .w(px(360.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Rename folder"))
+            .child(div().type_small().text_color(theme::text_faint()).child("An empty name clears the folder name."))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.name.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        crate::gui::components::button("folder-edit-cancel", crate::gui::components::ButtonKind::Ghost, "Cancel").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.sidebar_state.folder_edit = None;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        crate::gui::components::button("folder-edit-save", crate::gui::components::ButtonKind::Primary, "Save")
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_folder_rename(cx))),
+                    ),
+            );
+        Some(
+            div()
+                .id("folder-edit-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.folder_edit = None;
                     cx.notify();
                 }))
                 .child(card),

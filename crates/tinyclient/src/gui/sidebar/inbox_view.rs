@@ -461,7 +461,7 @@ impl Shell {
                     );
                 }
             }
-            if state.mentions_more.is_some() {
+            if !state.mentions_more.is_empty() {
                 list_box = list_box.child(
                     div()
                         .py(px(8.))

@@ -29,7 +29,7 @@ use gpui::{
     div, point, prelude::*, px, size, App, Bounds, Context, Div, Entity, FocusHandle, Focusable, Global, KeyBinding, Pixels,
     SharedString, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
 };
-use protocol::{AccountStatus, Request, Response};
+use protocol::{AccountStatus, Key, Request, Response};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -444,6 +444,13 @@ pub struct SettingsWindow {
     pub(super) profile_name: Entity<TextInput>,
     pub(super) profile_about: Entity<TextInput>,
     pub(super) profile_pronouns: Entity<TextInput>,
+    /// Accent colour as hex (`5865F2`). Empty leaves the current colour.
+    pub(super) profile_accent: Entity<TextInput>,
+    /// Per-server profile, sent only for the signed-in account when a server is chosen.
+    pub(super) profile_space: Option<Key>,
+    pub(super) profile_server_about: Entity<TextInput>,
+    pub(super) profile_server_pronouns: Entity<TextInput>,
+    pub(super) profile_server_accent: Entity<TextInput>,
     /// The Linux passphrase for the screen lock. Other systems use the device prompt.
     #[cfg(target_os = "linux")]
     lock_phrase: Entity<TextInput>,
@@ -489,6 +496,10 @@ impl SettingsWindow {
         let profile_name = cx.new(|cx| TextInput::new("Display name", cx));
         let profile_about = cx.new(|cx| TextInput::new("About me", cx));
         let profile_pronouns = cx.new(|cx| TextInput::new("Pronouns", cx));
+        let profile_accent = cx.new(|cx| TextInput::new("5865F2", cx));
+        let profile_server_about = cx.new(|cx| TextInput::new("About me on this server", cx));
+        let profile_server_pronouns = cx.new(|cx| TextInput::new("Pronouns on this server", cx));
+        let profile_server_accent = cx.new(|cx| TextInput::new("5865F2", cx));
         #[cfg(target_os = "linux")]
         let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
@@ -575,6 +586,11 @@ impl SettingsWindow {
             profile_name,
             profile_about,
             profile_pronouns,
+            profile_accent,
+            profile_space: None,
+            profile_server_about,
+            profile_server_pronouns,
+            profile_server_accent,
             #[cfg(target_os = "linux")]
             lock_phrase,
             _subscriptions: subscriptions,

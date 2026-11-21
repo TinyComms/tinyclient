@@ -5274,7 +5274,7 @@ fn profile_returns_mutual_friends_and_mutual_spaces_with_nicknames() {
 
     // Only known server 4000 appears in mutual_space_items with its nickname; unknown 7777 is omitted.
     assert_eq!(profile.mutual_spaces, vec!["Rustaceans".to_owned()]);
-    assert_eq!(profile.mutual_total, 2);
+    assert_eq!(profile.mutual_total, 1);
     assert_eq!(profile.mutual_space_items.len(), 1);
     assert_eq!(profile.mutual_space_items[0].key, world.key("4000"));
     assert_eq!(profile.mutual_space_items[0].name, "Rustaceans");

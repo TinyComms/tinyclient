@@ -504,8 +504,9 @@ impl Hub {
             let mut inner = self.0.borrow_mut();
             let scoped_avatar = person.avatar.as_ref().is_some_and(|a| a.id.starts_with("mavatar:"));
             if scoped_avatar {
-                // Keep People, DMs, and the quick switcher on the global avatar & name
-                // when a server-scoped member row or server profile arrives.
+                // A server avatar and nickname stay on that server. People, DMs, and the
+                // quick switcher keep the global picture and name, including when this
+                // person was not in the hub yet.
                 if let Some(existing) = inner.people.get_mut(&person.key) {
                     if person.presence != Presence::Unknown {
                         existing.presence = person.presence;
@@ -524,6 +525,18 @@ impl Hub {
                     }
                     continue;
                 }
+                let mut row = person.clone();
+                row.avatar = None;
+                row.name.clear();
+                if inner.people.insert(person.key.clone(), row).is_none() {
+                    inner.people_order.push_back(person.key.clone());
+                    if inner.people_order.len() > PEOPLE_LIMIT {
+                        if let Some(old) = inner.people_order.pop_front() {
+                            inner.people.remove(&old);
+                        }
+                    }
+                }
+                continue;
             }
             if inner.people.insert(person.key.clone(), person.clone()).is_none() {
                 inner.people_order.push_back(person.key.clone());
