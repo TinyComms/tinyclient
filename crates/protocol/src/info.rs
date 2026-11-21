@@ -30,6 +30,8 @@ pub const PINNED_LIMIT: usize = 50;
 pub const AROUND_LIMIT: usize = 100;
 /// Most channel or chat tabs listed in [`ConversationInfo::tabs`].
 pub const TABS_LIMIT: usize = 32;
+/// Most meetings one `Meetings` answer carries. Today's list, soonest first.
+pub const MEETINGS_LIMIT: usize = 32;
 
 fn is_true(value: &bool) -> bool {
     *value
@@ -296,6 +298,10 @@ pub struct ConversationInfo {
     /// Pinned channel/chat tabs and apps (Teams: Files, Notes, Planner, websites, apps).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<ConversationTab>,
+    /// The meeting this chat is for, when Teams gave a start time. Join is a link until calls
+    /// exist here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting: Option<MeetingEvent>,
 }
 
 /// One tab or pinned app on a channel or chat (`ConversationInfo::tabs`).
@@ -315,6 +321,51 @@ pub struct ConversationTab {
     /// Underlying content URL when provided by the tab configuration.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_url: String,
+}
+
+/// How I answered a calendar event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingResponse {
+    #[default]
+    None,
+    Accepted,
+    Tentative,
+    Declined,
+    Organizer,
+}
+
+impl MeetingResponse {
+    /// The word Details and Upcoming show beside the time.
+    pub fn label(self) -> &'static str {
+        match self {
+            MeetingResponse::None => "",
+            MeetingResponse::Accepted => "Accepted",
+            MeetingResponse::Tentative => "Tentative",
+            MeetingResponse::Declined => "Declined",
+            MeetingResponse::Organizer => "Organizer",
+        }
+    }
+}
+
+/// One calendar event: today's meetings, and the meeting a chat is for.
+///
+/// `start` and `end` are Unix seconds. `join_url` is `https://` or `http://` only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingEvent {
+    pub id: String,
+    pub title: String,
+    pub start: i64,
+    pub end: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub organizer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub join_url: String,
+    #[serde(default)]
+    pub response: MeetingResponse,
+    /// Teams thread id when the meeting has a chat (`19:meeting_…`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub conversation: String,
 }
 
 /// Kind of a channel bookmark.

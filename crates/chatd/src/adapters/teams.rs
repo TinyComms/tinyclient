@@ -350,6 +350,8 @@ struct State {
     translation_disabled: bool,
     /// Dimensions and alt titles remembered for GIFs and stickers from the picker catalog.
     catalog_meta: HashMap<String, (u32, u32, String)>,
+    /// Meeting chats and calendar events remembered this run, by id.
+    meetings: HashMap<String, protocol::MeetingEvent>,
 }
 
 /// What a call presents.
@@ -1100,6 +1102,12 @@ impl Teams {
             }
             Command::Translate { conversation_id, message_id, to, reply } => {
                 let _ = reply.send(self.translate(&conversation_id, &message_id, &to).map_err(refuse));
+            }
+            Command::Meetings { reply } => {
+                let _ = reply.send(self.meetings().map_err(refuse));
+            }
+            Command::MeetingRsvp { id, response, propose, reply } => {
+                let _ = reply.send(self.meeting_rsvp(&id, response, propose).map_err(refuse));
             }
             // The refresh token is Microsoft's to revoke, from the account's own security
             // page; no client read ends it from here. Signing out forgets it.

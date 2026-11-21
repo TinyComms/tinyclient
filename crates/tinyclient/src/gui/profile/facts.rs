@@ -1261,6 +1261,7 @@ mod tests {
             disappearing: None,
             bookmarks: Vec::new(),
             tabs: Vec::new(),
+            meeting: None,
         };
         let channel = info.conversation.clone();
         assert_eq!(conversation_line(&channel, Some(&info)), "@riverbend_news · Channel · 12,408 subscribers");

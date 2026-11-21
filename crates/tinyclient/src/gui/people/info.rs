@@ -1025,6 +1025,15 @@ impl InfoPane {
         (&self.hub, &self.scene, self.info.got(), self.space_info.got(), self.space.as_ref(), &self.members)
     }
 
+    /// Draws the new RSVP before the next info read. The request itself is fire-and-forget.
+    pub(in crate::gui) fn note_meeting_response(&mut self, response: protocol::MeetingResponse) {
+        if let Answer::Got(info) = &mut self.info {
+            if let Some(meeting) = info.meeting.as_mut() {
+                meeting.response = response;
+            }
+        }
+    }
+
     pub(in crate::gui) fn waiting(&self) -> (bool, bool, bool) {
         let waiting = match self.subject {
             Some(Subject::Space(_)) => matches!(self.space_info, Answer::Waiting),

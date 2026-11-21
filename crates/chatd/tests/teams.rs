@@ -13,7 +13,7 @@
 use base64::Engine;
 use protocol::{
     read_frame, write_frame, Badge, CallSupport, Change, Conversation, ConversationKind, Group,
-    Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation,
+    Key, Link, MediaKind, MeetingResponse, MentionKind, Message, MessageKind, Network, Page, Presence, Relation,
     Request, Response, SendState, Style, Watching,
 };
 use serde_json::{json, Value};
@@ -462,6 +462,11 @@ impl Fake {
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
                 "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
+                "19:meeting_NzQ2YjE@thread.v2" => Some(json!({
+                    "id": thread,
+                    "properties": {"threadType": "meeting", "meetingInformation": {"subject": "Weekly sync"}},
+                    "members": [{}, {}]
+                })),
                 _ => None,
             };
             return described.map_or_else(|| answer("404 Not Found", json!({"errorCode": 404, "message": "no such thread"})), ok);
@@ -541,6 +546,12 @@ impl Fake {
 
     /// Microsoft Graph's OneDrive: an upload session for a file, and a link to share it.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "GET" && path.contains("/v1.0/me/calendarView") {
+            return ok(calendar_view(&call.query));
+        }
+        if call.method == "POST" && path.contains("/v1.0/me/events/") {
+            return ok(json!({}));
+        }
         if call.method == "POST" && path.starts_with("/v1.0/me/drive/root:/Microsoft Teams Chat Files/") && path.ends_with(":/createUploadSession") {
             return ok(json!({"uploadUrl": format!("{}/upload/session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
         }
@@ -2842,6 +2853,183 @@ fn channel_and_chat_tabs_are_listed_and_tab_added_activity_is_readable() {
     assert_eq!(added.kind, MessageKind::System);
     assert!(added.text.contains("Sprint Board"), "{}", added.text);
     assert!(!added.text.contains("Card"), "{}", added.text);
+}
+
+/// Calendar rows relative to the view's `startDateTime`, kept on the machine's local today.
+fn calendar_view(query: &str) -> Value {
+    let start_raw = query.split('&').find_map(|pair| pair.strip_prefix("startDateTime=")).map(unescape).unwrap_or_default();
+    let anchor = unix_of_iso(&start_raw);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|since| since.as_secs() as i64).unwrap_or(anchor);
+    let hour = anchor.rem_euclid(86_400) / 3600;
+    let (early, late) = if hour <= 20 { (60_i64, 180) } else { (-180, -60) };
+    let mut first = anchor + early * 60;
+    let mut second = anchor + late * 60;
+    if !same_local_day(first, now) || !same_local_day(second, now) {
+        let (early, late) = if hour <= 20 { (-180_i64, -60) } else { (60, 180) };
+        first = anchor + early * 60;
+        second = anchor + late * 60;
+    }
+    if !same_local_day(first, now) || !same_local_day(second, now) {
+        let step = if local_hour(now) >= 22 { -1 } else { 1 };
+        first = now + step * 20 * 60;
+        second = now + step * 50 * 60;
+    }
+    if first > second {
+        std::mem::swap(&mut first, &mut second);
+    }
+    let middle = first + (second - first) / 2;
+    let thread = "19:meeting_NzQ2YjE@thread.v2";
+    json!({
+        "value": [
+            {
+                "id": "AAMkAGI2/stand=up",
+                "subject": "Standup",
+                "start": {"dateTime": iso_utc(first), "timeZone": "UTC"},
+                "end": {"dateTime": iso_utc(first + 1800), "timeZone": "UTC"},
+                "organizer": {"emailAddress": {"name": "Ada Lovelace"}},
+                "onlineMeeting": {"joinUrl": format!("https://teams.microsoft.com/l/meetup-join/{thread}/0")},
+                "responseStatus": {"response": "notResponded"}
+            },
+            {
+                "id": "bad-link",
+                "subject": "Bad link",
+                "start": iso_utc(middle),
+                "end": iso_utc(middle + 1800),
+                "joinUrl": "javascript:alert(1)"
+            },
+            {
+                "id": "design-review",
+                "title": "Design review",
+                "start": second,
+                "end": second + 1800,
+                "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/19:meeting_design@thread.v2/0",
+                "organizerName": "Grace Hopper"
+            }
+        ]
+    })
+}
+
+fn unix_of_iso(iso: &str) -> i64 {
+    let number = |range: std::ops::Range<usize>| iso.get(range).and_then(|part| part.parse::<i64>().ok());
+    let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10)) else {
+        return 0;
+    };
+    let (Some(hour), Some(minute), Some(second)) = (number(11..13), number(14..16), number(17..19)) else {
+        return 0;
+    };
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year.rem_euclid(400);
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
+    days * 86_400 + hour * 3600 + minute * 60 + second
+}
+
+fn iso_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400) + 719_468;
+    let secs = unix_secs.rem_euclid(86_400);
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.000Z")
+}
+
+fn same_local_day(a: i64, b: i64) -> bool {
+    match (local_yday(a), local_yday(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn local_hour(unix: i64) -> i64 {
+    unsafe {
+        let mut local: libc::tm = std::mem::zeroed();
+        let unix = unix as libc::time_t;
+        #[cfg(unix)]
+        libc::localtime_r(&unix, &mut local);
+        #[cfg(windows)]
+        if libc::localtime_s(&mut local, &unix) != 0 {
+            return 0;
+        }
+        local.tm_hour as i64
+    }
+}
+
+fn local_yday(unix: i64) -> Option<(i32, i32)> {
+    unsafe {
+        let mut local: libc::tm = std::mem::zeroed();
+        let unix = unix as libc::time_t;
+        #[cfg(unix)]
+        libc::localtime_r(&unix, &mut local);
+        #[cfg(windows)]
+        if libc::localtime_s(&mut local, &unix) != 0 {
+            return None;
+        }
+        Some((local.tm_year, local.tm_yday))
+    }
+}
+
+#[test]
+fn todays_meetings_are_soonest_first_with_join_and_rsvp() {
+    let world = World::start();
+    world.ready();
+    let account = key(HOME).account();
+    let Response::Meetings { events } = world.ask(Request::Meetings { account: account.clone() }) else {
+        panic!("expected today's meetings");
+    };
+    assert_eq!(events.iter().map(|event| event.title.as_str()).collect::<Vec<_>>(), ["Standup", "Bad link", "Design review"]);
+    assert!(events.windows(2).all(|pair| pair[0].start <= pair[1].start));
+    assert!(events.iter().all(|event| !event.join_url.to_ascii_lowercase().contains("javascript")));
+    assert!(events.iter().all(|event| event.join_url.is_empty() || event.join_url.starts_with("https://")));
+    let standup = events.iter().find(|event| event.title == "Standup").unwrap();
+    assert_eq!(standup.conversation, "19:meeting_NzQ2YjE@thread.v2");
+    assert!(standup.join_url.contains("meetup-join"), "{}", standup.join_url);
+    assert_eq!(standup.organizer, "Ada Lovelace");
+    assert!(standup.id.contains('=') && standup.id.contains('/'));
+    assert!(events.iter().find(|event| event.title == "Bad link").unwrap().join_url.is_empty());
+
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key("19:meeting_NzQ2YjE@thread.v2") }) else {
+        panic!("expected the meeting chat's info");
+    };
+    let meeting = info.meeting.expect("the calendar row is attached to the meeting chat");
+    assert_eq!(meeting.title, "Standup");
+    assert!(meeting.join_url.starts_with("https://"));
+    assert!(meeting.start > 0);
+
+    let id = standup.id.clone();
+    assert!(matches!(
+        world.ask(Request::MeetingRsvp { account: account.clone(), id: id.clone(), response: MeetingResponse::Accepted, propose: None }),
+        Response::Ok
+    ));
+    assert!(!world.fake.calls("POST", "/accept").is_empty(), "accept is posted");
+    assert!(matches!(
+        world.ask(Request::MeetingRsvp {
+            account: account.clone(),
+            id: id.clone(),
+            response: MeetingResponse::Tentative,
+            propose: Some(standup.start + 15 * 60),
+        }),
+        Response::Ok
+    ));
+    let proposed = world.fake.calls("POST", "/tentativelyAccept");
+    assert_eq!(proposed.len(), 1);
+    assert_eq!(proposed[0].json()["sendResponse"], true);
+    assert!(proposed[0].json()["proposedNewTime"]["start"]["dateTime"].as_str().unwrap_or("").contains('T'));
+    assert_eq!(proposed[0].json()["proposedNewTime"]["start"]["timeZone"], "UTC");
+    assert!(matches!(
+        world.ask(Request::MeetingRsvp { account, id, response: MeetingResponse::Declined, propose: None }),
+        Response::Ok
+    ));
+    assert_eq!(world.fake.calls("POST", "/decline").len(), 1);
 }
 
 

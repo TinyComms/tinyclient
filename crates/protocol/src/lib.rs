@@ -1542,6 +1542,20 @@ pub enum Request {
     ConversationInfo {
         conversation: Key,
     },
+    /// Today's meetings for one account, soonest first. Teams reads its calendar; Join is a
+    /// link until a call can be placed here.
+    Meetings {
+        account: AccountKey,
+    },
+    /// Accept, decline, or tentatively accept one meeting. `propose` is a new start, Unix
+    /// seconds, sent with a tentative answer.
+    MeetingRsvp {
+        account: AccountKey,
+        id: String,
+        response: MeetingResponse,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        propose: Option<i64>,
+    },
     /// A Space's own info, opened from its name.
     SpaceInfo {
         space: Key,
@@ -2923,6 +2937,10 @@ pub enum Response {
     /// Boxed, as `Profile` is: few answers are one, and every answer would carry its size.
     ConversationInfo {
         info: Box<ConversationInfo>,
+    },
+    /// Answers `Meetings`.
+    Meetings {
+        events: Vec<MeetingEvent>,
     },
     SpaceInfo {
         info: Box<SpaceInfo>,

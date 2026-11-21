@@ -4,7 +4,7 @@
 //! Meetings and teams. Slack's home is its workspace's tree (`tree.rs`). Rows are 48 and 28
 //! mixed, so the list is a GPUI `list` whose heights are known from each item's kind.
 
-use protocol::{Badge, Conversation, Folder, Key, Network, Space, Special};
+use protocol::{Badge, Conversation, Folder, Key, MeetingEvent, Network, Space, Special};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -99,13 +99,15 @@ pub enum Item {
     Folder { id: String, name: String, color: Option<u32>, open: bool, lit: bool, mention: bool },
     /// A team's channel under its row.
     Channel(Rc<Conversation>),
+    /// One of today's meetings, soonest first under Upcoming.
+    Meeting(MeetingEvent),
 }
 
 impl Item {
     pub fn height(&self) -> f32 {
         match self {
             Item::Header { first: true, .. } => 24.,
-            Item::Chat(_) | Item::Voice(_) | Item::Call(_) => 48.,
+            Item::Chat(_) | Item::Voice(_) | Item::Call(_) | Item::Meeting(_) => 48.,
             _ => 28.,
         }
     }
@@ -121,6 +123,7 @@ impl Item {
         match self {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => Some(format!("c/{}", c.key.id)),
             Item::Call(c) => Some(format!("call/{}", c.latest.message_id)),
+            Item::Meeting(event) => Some(format!("m/{}", event.id)),
             Item::Folder { id, .. } => Some(format!("f/{id}")),
             Item::Header { label, .. } => Some(format!("h/{label}")),
             _ => None,
@@ -165,6 +168,9 @@ pub struct Home {
     pub opened: HashSet<String>,
     /// Teams whose hidden channels are listed, by team id.
     pub hidden_shown: HashSet<String>,
+    /// Today's meetings for `upcoming_account`, soonest first.
+    pub upcoming: Vec<MeetingEvent>,
+    pub upcoming_account: String,
 }
 
 impl Home {
@@ -359,6 +365,12 @@ pub fn signal(home: &Home) -> Vec<Item> {
 /// teams, collapsed, each showing the channels that need me (rule 3) or all when opened.
 pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Conversation>>, open: Option<&Key>, now: i64) -> Vec<Item> {
     let mut out = Vec::new();
+    let mut upcoming: Vec<&MeetingEvent> = home.upcoming.iter().filter(|event| event.start > 0 && crate::gui::time::same_day(event.start, now)).collect();
+    upcoming.sort_by_key(|event| event.start);
+    if !upcoming.is_empty() {
+        header(&mut out, "Upcoming");
+        out.extend(upcoming.into_iter().cloned().map(Item::Meeting));
+    }
     let pinned: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| c.starred || c.pin.is_some()).collect();
     if !pinned.is_empty() {
         header(&mut out, "Pinned");
@@ -447,6 +459,7 @@ mod tests {
                 Item::Space { index, child, .. } => format!("{}{}", if child.is_some() { "." } else { "" }, spaces[*index].name),
                 Item::Folder { name, open, lit, .. } => format!("{}{name}{}", if *open { "v" } else { ">" }, if *lit { "*" } else { "" }),
                 Item::Call(c) => format!("call:{}", c.latest.name),
+                Item::Meeting(event) => format!("meet:{}", event.title),
             })
             .collect()
     }
@@ -611,6 +624,34 @@ mod tests {
         let home = Home { chats: vec![Rc::new(notes), Rc::new(ana)], ..Home::for_network(Network::Teams) };
         let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
         assert_eq!(got, ["[Chats]", "ana", "notes"]);
+    }
+
+    fn local_noon() -> i64 {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|since| since.as_secs() as i64).unwrap_or(0);
+        let clock = crate::gui::time::local(now);
+        now - clock.hour as i64 * 3600 - clock.minute as i64 * 60 - now.rem_euclid(60) + 12 * 3600
+    }
+
+    #[test]
+    fn teams_lists_todays_meetings_soonest_first() {
+        let noon = local_noon();
+        let event = |id: &str, title: &str, start: i64| MeetingEvent {
+            id: id.into(),
+            title: title.into(),
+            start,
+            end: start + 1800,
+            ..MeetingEvent::default()
+        };
+        let home = Home {
+            upcoming: vec![
+                event("later", "Design review", noon + 3 * 3600),
+                event("soon", "Standup", noon + 3600),
+                event("old", "Yesterday sync", noon - 20 * 3600),
+            ],
+            ..Home::for_network(Network::Teams)
+        };
+        let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, noon), &[]);
+        assert_eq!(got, ["[Upcoming]", "meet:Standup", "meet:Design review"]);
     }
 
     #[test]

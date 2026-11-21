@@ -1934,6 +1934,45 @@ impl Chat {
         Response::Profile { profile: Box::new(profile) }
     }
 
+    /// Today's meetings, soonest first. A calendar failure is the adapter's to soften.
+    fn meetings(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::Meetings { reply }) {
+            Ok(mut events) => {
+                for event in &mut events {
+                    clip_meeting(event);
+                }
+                events.retain(|event| event.start > 0 && !event.title.is_empty());
+                events.sort_by_key(|event| event.start);
+                events.truncate(protocol::MEETINGS_LIMIT);
+                Response::Meetings { events }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    /// Accept, decline, or tentatively accept one meeting. Forgets cached conversation info so
+    /// the next Details open reads the new answer.
+    fn meeting_rsvp(&self, account: AccountKey, id: String, response: protocol::MeetingResponse, propose: Option<i64>) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let mut id = id;
+        clip(&mut id, 256);
+        if id.is_empty() {
+            return error(ErrorCode::NotFound, "no such meeting");
+        }
+        match self.ask(&account, |reply| Command::MeetingRsvp { id, response, propose, reply }) {
+            Ok(()) => {
+                self.hub.infos.forget_where(|key| key.account() == account);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     /// A conversation's info: its row, and what the network says beyond it, kept five minutes.
     fn conversation_info(&self, conversation: Key) -> Response {
         let row = match self.hub.store().conversation(&conversation) {
@@ -1964,6 +2003,7 @@ impl Chat {
             link: about.link,
             bookmarks: about.bookmarks,
             tabs: about.tabs,
+            meeting: about.meeting,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
@@ -1982,6 +2022,12 @@ impl Chat {
             }
             if !tab.content_url.starts_with("https://") && !tab.content_url.starts_with("http://") {
                 tab.content_url.clear();
+            }
+        }
+        if let Some(meeting) = info.meeting.as_mut() {
+            clip_meeting(meeting);
+            if meeting.start <= 0 {
+                info.meeting = None;
             }
         }
         self.hub.infos.keep(conversation, info.clone());
@@ -3968,6 +4014,8 @@ impl Chat {
                 values,
                 reply,
             }),
+            Request::Meetings { account } => self.meetings(account),
+            Request::MeetingRsvp { account, id, response, propose } => self.meeting_rsvp(account, id, response, propose),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
@@ -3985,6 +4033,28 @@ impl Chat {
 
 /// Tiny keeps every server in the one item. A second sign-in is folded in before anything is
 /// saved, so it does not replace the server already there. Other networks still replace.
+/// Keeps a meeting row inside the sizes the shell draws, and drops a join target that is not
+/// `https://` or `http://`.
+fn clip_meeting(event: &mut protocol::MeetingEvent) {
+    clip(&mut event.id, 256);
+    clip(&mut event.title, 200);
+    clip(&mut event.organizer, 120);
+    clip(&mut event.join_url, 1_024);
+    clip(&mut event.conversation, 256);
+    if event.start < 0 {
+        event.start = 0;
+    }
+    if event.end < event.start {
+        event.end = event.start;
+    }
+    if !event.join_url.starts_with("https://") && !event.join_url.starts_with("http://") {
+        event.join_url.clear();
+    }
+    if event.title.is_empty() {
+        event.title = "Meeting".to_owned();
+    }
+}
+
 fn merged(network: Network, session: &str) -> Result<String, String> {
     if network != Network::Tiny || !session::enabled() {
         return Ok(session.to_owned());

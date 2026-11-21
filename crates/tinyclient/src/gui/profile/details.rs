@@ -9,7 +9,7 @@ use crate::gui::people::info::{InfoPane, ManageKind};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
-use protocol::{CallSupport, Conversation, ConversationKind, Key, Network, Notify, Presence, Request};
+use protocol::{CallSupport, Conversation, ConversationKind, Key, MeetingResponse, Network, Notify, Presence, Request};
 
 /// S6: this conversation's own notification sound, kept here only (the network never sees it),
 /// over its account's and the global one. Picking one plays it.
@@ -516,6 +516,46 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .gap(px(8.))
                 .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Bookmarks"))
                 .child(chips),
+        );
+    }
+    if let Some(meeting) = info.and_then(|info| info.meeting.clone()) {
+        let line = crate::gui::time::meeting_display(&meeting, crate::view::now());
+        let can_join = meeting.join_url.starts_with("https://") || meeting.join_url.starts_with("http://");
+        let join = meeting.join_url.clone();
+        let show_rsvp = meeting.response != MeetingResponse::Organizer && !meeting.id.is_empty();
+        let mut actions = div().flex().flex_wrap().gap(px(6.));
+        if can_join {
+            actions = actions.child(button("details-meeting-join", ButtonKind::Secondary, "Join").on_click(move |_, _, cx| cx.open_url(&join)));
+        }
+        if show_rsvp {
+            let account = row.key.account();
+            let id = meeting.id.clone();
+            let propose_at = meeting.start + 15 * 60;
+            let choices = [
+                ("Accept", MeetingResponse::Accepted, None),
+                ("Tentative", MeetingResponse::Tentative, None),
+                ("Decline", MeetingResponse::Declined, None),
+                ("Propose 15 min later", MeetingResponse::Tentative, Some(propose_at)),
+            ];
+            for (slot, (label, response, propose)) in choices.into_iter().enumerate() {
+                let account = account.clone();
+                let id = id.clone();
+                actions = actions.child(button(("details-meeting-rsvp", slot), ButtonKind::Ghost, label).on_click(cx.listener(move |pane, _, _, cx| {
+                    pane.note_meeting_response(response);
+                    crate::gui::people::ask_later(cx, Request::MeetingRsvp { account, id, response, propose }, |_, _| {});
+                })));
+            }
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Meeting"))
+                .child(div().type_small().text_color(theme::text_soft()).child(line))
+                .child(actions),
         );
     }
     if let Some(tabs) = info.map(|i| i.tabs.as_slice()).filter(|t| !t.is_empty()) {

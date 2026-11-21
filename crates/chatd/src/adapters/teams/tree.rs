@@ -267,6 +267,9 @@ impl Teams {
             let mut row = self.chat_row(id, &title_of(chat), &people, partner.map(String::as_str));
             row.position = position as i32;
             row.meeting = is_meeting(chat);
+            if let Some(event) = super::info::meeting_from_chat(self.cloud.endpoints().teams, chat) {
+                super::info::remember(&mut self.state().meetings, event);
+            }
             let pin = pinned_order.iter().position(|pinned_id| pinned_id == id).map(|ix| ix as i32);
             row.filing = Some(Filing { hidden: chat["hidden"] == true, pin, ..Filing::default() });
             if row.title.is_empty() {
