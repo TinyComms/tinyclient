@@ -1831,6 +1831,20 @@ pub enum Request {
         space: Key,
         event_id: String,
     },
+    /// List active invite links for a Space (e.g. Discord `GET /guilds/{id}/invites`).
+    SpaceInvites {
+        space: Key,
+    },
+    /// Revoke one invite link (e.g. Discord `DELETE /invites/{code}`).
+    RevokeInvite {
+        space: Key,
+        code: String,
+    },
+    /// Pause or resume invites on a Space (e.g. Discord `INVITES_DISABLED` feature).
+    SetInvitesPaused {
+        space: Key,
+        paused: bool,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
@@ -3046,6 +3060,13 @@ pub enum Response {
     /// Answers `CreateEvent` / `EditEvent`: the created or updated event.
     Event {
         event: SpaceEvent,
+    },
+    /// Answers `SpaceInvites`: active invite links (with optional vanity URL first) and pause state.
+    SpaceInvites {
+        space: Key,
+        invites: Vec<SpaceInvite>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        paused: bool,
     },
     Pinned {
         conversation: Key,

@@ -1038,7 +1038,10 @@ impl Demo {
             | Command::EditSpace { reply, .. }
             | Command::DeleteSpace { reply, .. }
             | Command::TransferSpace { reply, .. }
-            | Command::DeleteEvent { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::DeleteEvent { reply, .. }
+            | Command::RevokeInvite { reply, .. }
+            | Command::SetInvitesPaused { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }

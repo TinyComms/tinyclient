@@ -1837,6 +1837,49 @@ impl Chat {
         }
     }
 
+    fn space_invites(&self, space: Key) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SpaceInvites { space_id, reply }) {
+            Ok((invites, paused)) => Response::SpaceInvites { space, invites, paused },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn revoke_invite(&self, space: Key, code: String) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            return error(ErrorCode::Refused, "Missing invite code.");
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::RevokeInvite { space_id, code, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_invites_paused(&self, space: Key, paused: bool) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SetInvitesPaused { space_id, paused, reply }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -3429,6 +3472,9 @@ impl Chat {
             Request::CreateEvent { space, event } => self.create_event(space, event),
             Request::EditEvent { space, event_id, event } => self.edit_event(space, event_id, event),
             Request::DeleteEvent { space, event_id } => self.delete_event(space, event_id),
+            Request::SpaceInvites { space } => self.space_invites(space),
+            Request::RevokeInvite { space, code } => self.revoke_invite(space, code),
+            Request::SetInvitesPaused { space, paused } => self.set_invites_paused(space, paused),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

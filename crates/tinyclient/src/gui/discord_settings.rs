@@ -8,17 +8,18 @@ use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Div, Entity, MouseButton, PathPromptOptions,
-    Stateful, Window,
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Entity, MouseButton,
+    PathPromptOptions, Stateful, Window,
 };
 use protocol::{
     ConversationKind, EventPlaceKind, Key, Network, Notify, Request, Response, SpaceEdit,
-    SpaceEvent, SpaceEventEdit, SpaceInfo, SpaceRights,
+    SpaceEvent, SpaceEventEdit, SpaceInfo, SpaceInvite, SpaceRights,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::gui) enum Tab {
     Overview,
+    Invites,
     Events,
 }
 
@@ -63,6 +64,11 @@ pub(in crate::gui) struct Open {
     pub event_hours_ahead: i64,
     pub event_duration_hours: i64,
     pub event_image: Option<String>,
+
+    // Invites tab
+    pub invites: Vec<SpaceInvite>,
+    pub invites_paused: bool,
+    pub invites_loaded: bool,
 }
 
 fn field_box(input: Entity<TextInput>) -> Div {
@@ -133,12 +139,118 @@ impl Shell {
             event_hours_ahead: 1,
             event_duration_hours: 1,
             event_image: None,
+            invites: Vec::new(),
+            invites_paused: false,
+            invites_loaded: false,
         });
         self.load_discord_settings_info(space.clone(), cx);
+        if rights.manage_space {
+            self.load_discord_invites(space.clone(), cx);
+        }
         if rights.manage_events {
             self.load_space_events(space, cx);
         }
         cx.notify();
+    }
+
+    fn load_discord_invites(&mut self, space: Key, cx: &mut Context<Self>) {
+        let req = Request::SpaceInvites { space: space.clone() };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(open) = this.discord_settings.open.as_mut() else {
+                    return;
+                };
+                if open.space != space {
+                    return;
+                }
+                open.invites_loaded = true;
+                match answer {
+                    Ok(Response::SpaceInvites { invites, paused, .. }) => {
+                        open.invites = invites;
+                        open.invites_paused = paused;
+                    }
+                    Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                    Err(err) => open.error = Some(err.to_string()),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn revoke_discord_invite(&mut self, space: Key, code: String, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::RevokeInvite {
+            space: space.clone(),
+            code: code.clone(),
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Ok) => {
+                            open.invites.retain(|inv| inv.vanity || inv.code != code);
+                            open.notice = Some(format!("Revoked invite {code}."));
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_discord_invites_paused(&mut self, space: Key, paused: bool, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::SetInvitesPaused { space, paused };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Ok) => {
+                            open.invites_paused = paused;
+                            open.notice = Some(if paused {
+                                "Invites paused.".to_owned()
+                            } else {
+                                "Invites resumed.".to_owned()
+                            });
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(in crate::gui) fn close_discord_settings(&mut self, cx: &mut Context<Self>) {
@@ -539,12 +651,16 @@ impl Shell {
         if open.rights.manage_space || open.rights.owner {
             tabs = tabs.child(tab_btn("ds-tab-overview", "icons/settings.svg", "Overview", Tab::Overview, open.tab == Tab::Overview, cx));
         }
+        if open.rights.manage_space {
+            tabs = tabs.child(tab_btn("ds-tab-invites", "icons/link.svg", "Invites", Tab::Invites, open.tab == Tab::Invites, cx));
+        }
         if open.rights.manage_events {
             tabs = tabs.child(tab_btn("ds-tab-events", "icons/calendar.svg", "Events", Tab::Events, open.tab == Tab::Events, cx));
         }
 
         let content: AnyElement = match open.tab {
             Tab::Overview => self.discord_overview_tab(open, cx).into_any_element(),
+            Tab::Invites => self.discord_invites_tab(open, cx).into_any_element(),
             Tab::Events => self.discord_events_tab(open, cx).into_any_element(),
         };
 
@@ -580,6 +696,7 @@ impl Shell {
                             .justify_between()
                             .child(div().type_title().text_color(theme::text()).child(match open.tab {
                                 Tab::Overview => "Server overview",
+                                Tab::Invites => "Invite links",
                                 Tab::Events => "Scheduled events",
                             }))
                             .child(icon_button("ds-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
@@ -833,6 +950,152 @@ impl Shell {
                             .child(button("ds-open-discord", ButtonKind::Ghost, "Open in Discord").on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_external_url(&discord_url, window, cx);
                             }))),
+                    ),
+            );
+        }
+        col
+    }
+
+    fn discord_invites_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+        let pause_space = open.space.clone();
+        let next_paused = !open.invites_paused;
+        let refresh_space = open.space.clone();
+        let now = crate::view::now();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .p(px(10.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Pause invites"))
+                            .child(div().type_small().text_color(theme::text_soft()).child(if open.invites_paused {
+                                "New members cannot join via invite links while paused."
+                            } else {
+                                "Temporarily stop anyone from joining through invite links."
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                button(
+                                    "ds-invites-pause",
+                                    if open.invites_paused { ButtonKind::Primary } else { ButtonKind::Secondary },
+                                    if open.invites_paused { "Resume invites" } else { "Pause invites" },
+                                )
+                                .when(!open.busy, |b| {
+                                    b.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_discord_invites_paused(pause_space.clone(), next_paused, cx);
+                                    }))
+                                }),
+                            )
+                            .child(icon_button("ds-invites-refresh", "icons/refresh-cw.svg", false).on_click(cx.listener(move |this, _, _, cx| {
+                                this.load_discord_invites(refresh_space.clone(), cx);
+                            }))),
+                    ),
+            );
+
+        if !open.invites_loaded {
+            col = col.child(div().type_small().text_color(theme::text_soft()).child("Loading invites…"));
+            return col;
+        }
+        if open.invites.is_empty() {
+            col = col.child(div().type_ui().text_color(theme::text_soft()).child("No active invite links."));
+            return col;
+        }
+        for (ix, inv) in open.invites.iter().enumerate() {
+            let copy_url = inv.url.clone();
+            let revoke_space = open.space.clone();
+            let revoke_code = inv.code.clone();
+            let uses_text = if inv.max_uses > 0 {
+                format!("{}/{} uses", inv.uses, inv.max_uses)
+            } else if inv.uses > 0 {
+                format!("{} uses", inv.uses)
+            } else {
+                "0 uses".to_owned()
+            };
+            let expiry_text = match inv.expires_at {
+                Some(ts) => format!("Expires {} {}", super::time::day(now, ts), super::time::clock(ts)),
+                None => "Never expires".to_owned(),
+            };
+            let meta = if inv.vanity {
+                "Custom vanity URL (read-only)".to_owned()
+            } else {
+                let mut parts = Vec::new();
+                if !inv.channel_name.is_empty() {
+                    parts.push(format!("#{}", inv.channel_name.trim_start_matches('#')));
+                }
+                if !inv.inviter.is_empty() {
+                    parts.push(format!("by {}", inv.inviter));
+                }
+                parts.push(uses_text);
+                parts.push(expiry_text);
+                parts.join(" · ")
+            };
+            col = col.child(
+                div()
+                    .p(px(10.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(inv.url.clone()))
+                            .child(div().truncate().type_small().text_color(theme::text_soft()).child(meta)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                button(("ds-inv-copy", ix), ButtonKind::Secondary, "Copy")
+                                    .h(px(26.))
+                                    .px(px(8.))
+                                    .type_small()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                                        this.toast(Some(("icons/copy.svg", theme::text_soft())), "Invite link copied", cx);
+                                    })),
+                            )
+                            .when(!inv.vanity, |bar| {
+                                bar.child(
+                                    button(("ds-inv-revoke", ix), ButtonKind::Danger, "Revoke")
+                                        .h(px(26.))
+                                        .px(px(8.))
+                                        .type_small()
+                                        .when(!open.busy, |b| {
+                                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.revoke_discord_invite(revoke_space.clone(), revoke_code.clone(), cx);
+                                            }))
+                                        }),
+                                )
+                            }),
                     ),
             );
         }

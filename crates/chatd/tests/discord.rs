@@ -5485,3 +5485,97 @@ fn server_overview_edit_delete_transfer_and_event_admin_enforce_permissions() {
     let dels = world.discord.requests_to("POST", "/guilds/4999/delete");
     assert_eq!(dels.last().unwrap().body["code"], "123456");
 }
+
+#[test]
+fn space_invites_list_vanity_revoke_pause_and_permission_guards() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4888",
+        "properties": {
+            "id": "4888",
+            "name": "Managed Guild",
+            "owner_id": "1000",
+            "icon": null,
+            "vanity_url_code": "rustclub",
+            "features": ["COMMUNITY", "VANITY_URL"]
+        },
+        "roles": [{"id": "4888", "name": "@everyone", "permissions": "1071698529857"}],
+        "channels": [{"id": "4881", "type": 0, "name": "welcome", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Non-manager on guild 4000 is refused locally without hitting Discord.
+    match world.ask(Request::SpaceInvites { space: world.key("4000") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Manage Server"), "got: {detail}"),
+        other => panic!("expected Manage Server refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4000/invites").is_empty());
+
+    // 2. Listing invites on managed guild 4888 prepends read-only vanity URL first.
+    world.discord.script(
+        "/guilds/4888/invites",
+        200,
+        json!([
+            {
+                "code": "k9x2ab",
+                "inviter": {"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0"},
+                "channel": {"id": "4881", "name": "welcome"},
+                "uses": 3,
+                "max_uses": 10,
+                "expires_at": "2026-11-10T12:00:00+00:00"
+            }
+        ]),
+    );
+    match world.ask(Request::SpaceInvites { space: world.key("4888") }) {
+        Response::SpaceInvites { invites, paused, .. } => {
+            assert!(!paused);
+            assert_eq!(invites.len(), 2);
+            assert!(invites[0].vanity);
+            assert_eq!(invites[0].code, "rustclub");
+            assert_eq!(invites[0].url, "https://discord.gg/rustclub");
+            assert!(!invites[1].vanity);
+            assert_eq!(invites[1].code, "k9x2ab");
+            assert_eq!(invites[1].inviter, "Justin");
+            assert_eq!(invites[1].channel_name, "welcome");
+            assert_eq!((invites[1].uses, invites[1].max_uses), (3, 10));
+        }
+        other => panic!("expected Response::SpaceInvites, got {other:?}"),
+    }
+
+    // 3. Revoking vanity code is refused locally; revoking normal invite sends DELETE /invites/k9x2ab.
+    match world.ask(Request::RevokeInvite { space: world.key("4888"), code: "rustclub".into() }) {
+        Response::Error { detail, .. } => assert!(detail.contains("vanity URL"), "got: {detail}"),
+        other => panic!("expected vanity refusal, got {other:?}"),
+    }
+    world.discord.script("/invites/k9x2ab", 200, json!({"code": "k9x2ab"}));
+    assert_eq!(
+        world.ask(Request::RevokeInvite { space: world.key("4888"), code: "k9x2ab".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/invites/k9x2ab").len(), 1);
+
+    // 4. Pausing invites toggles INVITES_DISABLED feature via PATCH /guilds/4888.
+    world.discord.script(
+        "/guilds/4888",
+        200,
+        json!({"id": "4888", "name": "Managed Guild", "features": ["COMMUNITY", "VANITY_URL", "INVITES_DISABLED"]}),
+    );
+    assert_eq!(
+        world.ask(Request::SetInvitesPaused { space: world.key("4888"), paused: true }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/guilds/4888");
+    assert_eq!(patches.len(), 1);
+    assert!(
+        patches[0].body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "INVITES_DISABLED")
+    );
+}

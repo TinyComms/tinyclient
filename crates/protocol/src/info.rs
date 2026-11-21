@@ -414,6 +414,31 @@ pub struct SpaceEventEdit {
     pub image: Option<String>,
 }
 
+/// One active invite link in a Space (`Request::SpaceInvites`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceInvite {
+    pub code: String,
+    /// Full shareable invite URL (e.g. `https://discord.gg/<code>`).
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inviter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel_name: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uses: u32,
+    /// 0 means unlimited uses.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_uses: u32,
+    /// Unix seconds when this invite expires (`None` = never expires).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// True for the server's read-only vanity URL row.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vanity: bool,
+}
+
 /// Lifecycle status of a Space's scheduled event (Discord `guild_scheduled_events`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1501,5 +1526,51 @@ mod tests {
             let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
             assert_eq!(back, req);
         }
+    }
+
+    #[test]
+    fn space_invites_requests_and_response_round_trip() {
+        use crate::Response;
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4000");
+        let reqs = [
+            Request::SpaceInvites { space: space.clone() },
+            Request::RevokeInvite { space: space.clone(), code: "abc123".into() },
+            Request::SetInvitesPaused { space: space.clone(), paused: true },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let resp = Response::SpaceInvites {
+            space,
+            paused: true,
+            invites: vec![
+                SpaceInvite {
+                    code: "rust".into(),
+                    url: "https://discord.gg/rust".into(),
+                    inviter: String::new(),
+                    channel_id: None,
+                    channel_name: String::new(),
+                    uses: 0,
+                    max_uses: 0,
+                    expires_at: None,
+                    vanity: true,
+                },
+                SpaceInvite {
+                    code: "abc123".into(),
+                    url: "https://discord.gg/abc123".into(),
+                    inviter: "Justin".into(),
+                    channel_id: Some("4101".into()),
+                    channel_name: "general".into(),
+                    uses: 4,
+                    max_uses: 10,
+                    expires_at: Some(1_760_100_000),
+                    vanity: false,
+                },
+            ],
+        };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
     }
 }

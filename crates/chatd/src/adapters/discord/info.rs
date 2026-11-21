@@ -121,6 +121,38 @@ fn build_event_body(edit: &protocol::SpaceEventEdit) -> Result<serde_json::Value
     Ok(serde_json::Value::Object(body))
 }
 
+/// Returns a new guild feature list with `"INVITES_DISABLED"` present iff `paused` is true.
+fn toggle_invites_disabled_feature(features: &[String], paused: bool) -> Vec<String> {
+    let mut out: Vec<String> = features
+        .iter()
+        .filter(|f| f.as_str() != "INVITES_DISABLED")
+        .cloned()
+        .collect();
+    if paused {
+        out.push("INVITES_DISABLED".to_owned());
+    }
+    out
+}
+
+#[cfg(test)]
+mod invite_tests {
+    use super::*;
+
+    #[test]
+    fn toggle_invites_disabled_adds_and_removes_idempotently() {
+        let base = vec!["COMMUNITY".to_owned(), "VANITY_URL".to_owned()];
+        let paused = toggle_invites_disabled_feature(&base, true);
+        assert!(paused.iter().any(|f| f == "INVITES_DISABLED"));
+        assert_eq!(paused.iter().filter(|f| f.as_str() == "INVITES_DISABLED").count(), 1);
+        // Pausing twice never duplicates the feature flag.
+        let paused_again = toggle_invites_disabled_feature(&paused, true);
+        assert_eq!(paused_again, paused);
+        // Resuming removes it while preserving other features.
+        let resumed = toggle_invites_disabled_feature(&paused, false);
+        assert_eq!(resumed, base);
+    }
+}
+
 #[derive(Deserialize)]
 struct GuildCounts {
     #[serde(default)]
@@ -964,6 +996,161 @@ impl Discord {
             }
         }
         self.ctx.events_changed(guild);
+        Ok(())
+    }
+
+    /// Lists a Discord server's active invites (`GET /guilds/{guild}/invites`), prepending the
+    /// server's read-only vanity URL when present, along with the `INVITES_DISABLED` pause flag.
+    pub(super) fn space_invites(&self, guild: &str) -> Result<(Vec<protocol::SpaceInvite>, bool), Refusal> {
+        let (vanity_known, has_vanity_feature, paused) = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild).manage_space {
+                return Err(refused("You need the Manage Server permission to view server invites."));
+            }
+            (
+                info.vanity_url_code.clone(),
+                info.features.iter().any(|f| f == "VANITY_URL"),
+                info.features.iter().any(|f| f == "INVITES_DISABLED"),
+            )
+        };
+
+        #[derive(Deserialize)]
+        struct InviteChannel {
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct GuildInviteRow {
+            code: String,
+            #[serde(default)]
+            inviter: Option<model::User>,
+            #[serde(default)]
+            channel: Option<InviteChannel>,
+            #[serde(default)]
+            uses: u32,
+            #[serde(default)]
+            max_uses: u32,
+            #[serde(default)]
+            expires_at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct VanityResponse {
+            #[serde(default)]
+            code: Option<String>,
+            #[serde(default)]
+            uses: u32,
+        }
+
+        let answer = self.call("GET", &format!("/guilds/{guild}/invites"), None).map_err(refusal)?;
+        let rows: Vec<GuildInviteRow> = serde_json::from_str(&answer).map_err(refused)?;
+
+        let mut invites = Vec::with_capacity(rows.len() + 1);
+        let vanity_pair: Option<(String, u32)> = if let Some(code) = vanity_known.filter(|c| !c.is_empty()) {
+            Some((code, 0))
+        } else if has_vanity_feature {
+            self.call("GET", &format!("/guilds/{guild}/vanity-url"), None)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<VanityResponse>(&raw).ok())
+                .and_then(|v| v.code.filter(|c| !c.is_empty()).map(|c| (c, v.uses)))
+        } else {
+            None
+        };
+        if let Some((code, uses)) = vanity_pair {
+            invites.push(protocol::SpaceInvite {
+                url: format!("https://discord.gg/{code}"),
+                code,
+                inviter: String::new(),
+                channel_id: None,
+                channel_name: String::new(),
+                uses,
+                max_uses: 0,
+                expires_at: None,
+                vanity: true,
+            });
+        }
+
+        for row in rows {
+            let (channel_id, channel_name) = match row.channel {
+                Some(ch) => (
+                    (!ch.id.is_empty()).then_some(ch.id),
+                    ch.name.unwrap_or_default(),
+                ),
+                None => (None, String::new()),
+            };
+            invites.push(protocol::SpaceInvite {
+                url: format!("https://discord.gg/{}", row.code),
+                code: row.code,
+                inviter: row.inviter.map(|u| u.name().to_owned()).unwrap_or_default(),
+                channel_id,
+                channel_name,
+                uses: row.uses,
+                max_uses: row.max_uses,
+                expires_at: row.expires_at.as_deref().and_then(model::iso_seconds),
+                vanity: false,
+            });
+        }
+        Ok((invites, paused))
+    }
+
+    /// Revokes one invite link (`DELETE /invites/{code}`). Refuses locally without `MANAGE_GUILD`
+    /// or if the code matches the server's vanity URL.
+    pub(super) fn revoke_invite(&self, guild: &str, code: &str) -> Result<(), Refusal> {
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(refused("Missing invite code."));
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild).manage_space {
+                return Err(refused("You need the Manage Server permission to revoke invites."));
+            }
+            if info.vanity_url_code.as_deref() == Some(code) {
+                return Err(refused("The server's vanity URL cannot be revoked here."));
+            }
+        }
+        self.call("DELETE", &format!("/invites/{}", escaped(code)), None)
+            .map_err(refusal)?;
+        Ok(())
+    }
+
+    /// Pauses or resumes server invites by toggling Discord's `INVITES_DISABLED` guild feature.
+    pub(super) fn set_invites_paused(&self, guild: &str, paused: bool) -> Result<(), Refusal> {
+        let updated_features = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild).manage_space {
+                return Err(refused("You need the Manage Server permission to pause or resume invites."));
+            }
+            toggle_invites_disabled_feature(&info.features, paused)
+        };
+        let raw = self
+            .call("PATCH", &format!("/guilds/{guild}"), Some(json!({"features": updated_features})))
+            .map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                if let Ok(updated) = serde_json::from_str::<model::Guild>(&raw) {
+                    if !updated.features().is_empty() || !paused {
+                        info.features = updated.features().to_vec();
+                    } else {
+                        info.features = updated_features;
+                    }
+                } else {
+                    info.features = updated_features;
+                }
+            }
+        }
+        self.ctx.space_info_stale(guild);
         Ok(())
     }
 

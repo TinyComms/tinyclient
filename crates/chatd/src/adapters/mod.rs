@@ -601,6 +601,23 @@ pub enum Command {
         event_id: String,
         reply: Reply<()>,
     },
+    /// List active invite links for a Space; returns `(invites, paused)`.
+    SpaceInvites {
+        space_id: String,
+        reply: Reply<(Vec<protocol::SpaceInvite>, bool)>,
+    },
+    /// Revoke one invite link in a Space.
+    RevokeInvite {
+        space_id: String,
+        code: String,
+        reply: Reply<()>,
+    },
+    /// Pause or resume invites for a Space (`INVITES_DISABLED`).
+    SetInvitesPaused {
+        space_id: String,
+        paused: bool,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -919,7 +936,10 @@ impl Command {
             | Command::EditSpace { reply, .. }
             | Command::DeleteSpace { reply, .. }
             | Command::TransferSpace { reply, .. }
-            | Command::DeleteEvent { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::DeleteEvent { reply, .. }
+            | Command::RevokeInvite { reply, .. }
+            | Command::SetInvitesPaused { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }

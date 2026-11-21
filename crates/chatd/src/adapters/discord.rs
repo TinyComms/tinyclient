@@ -1918,6 +1918,11 @@ impl Discord {
             Command::DeleteEvent { space_id, event_id, reply } => {
                 answer(reply, self.delete_event(&space_id, &event_id))
             }
+            Command::SpaceInvites { space_id, reply } => answer(reply, self.space_invites(&space_id)),
+            Command::RevokeInvite { space_id, code, reply } => answer(reply, self.revoke_invite(&space_id, &code)),
+            Command::SetInvitesPaused { space_id, paused, reply } => {
+                answer(reply, self.set_invites_paused(&space_id, paused))
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
