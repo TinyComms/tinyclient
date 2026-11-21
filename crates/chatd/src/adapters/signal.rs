@@ -2911,7 +2911,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ConversationInfo { conversation_id, reply } => {
             let _ = reply.send(conversation_info(account, &conversation_id));
         }
-        Command::MembersAdd { conversation_id, people, reply } => {
+        Command::MembersAdd { conversation_id, people, reply, .. } => {
             let _ = reply.send(members_add(account, &conversation_id, &people));
         }
         Command::MembersRemove { conversation_id, person, reply } => {

@@ -390,6 +390,134 @@ impl Teams {
         Ok(id)
     }
 
+    /// Computes Teams' `shareHistoryTime` value (milliseconds since epoch, `0` = all history,
+    /// `-1` = no history) from [`protocol::HistoryShare`].
+    pub(super) fn share_history_ms(share: Option<protocol::HistoryShare>, now_ms: i64) -> i64 {
+        match share.unwrap_or(protocol::HistoryShare::None) {
+            protocol::HistoryShare::None => -1,
+            protocol::HistoryShare::All => 0,
+            protocol::HistoryShare::Days { days } => {
+                now_ms.saturating_sub(i64::from(days.max(1)).saturating_mul(86_400_000)).max(1)
+            }
+        }
+    }
+
+    /// Starts a new Teams group chat with multiple people and an optional topic/name.
+    /// Uses `POST /v1/threads` without `uniquerosterthread` or `fixedRoster`.
+    pub(super) fn start_group(&self, people: &[String], title: Option<&str>) -> Result<String, Fault> {
+        let me = self.me();
+        let mut unique: Vec<String> = Vec::new();
+        for person in people {
+            let trimmed = person.trim();
+            if !trimmed.is_empty() && trimmed != me && !unique.iter().any(|p| p == trimmed) {
+                unique.push(trimmed.to_owned());
+            }
+        }
+        if unique.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Pick at least one other person to start a group chat.".to_owned(),
+            });
+        }
+        let mut members = vec![json!({"id": me, "role": "Admin"})];
+        for person in &unique {
+            members.push(json!({"id": person, "role": "Admin"}));
+        }
+        let mut props = serde_json::Map::new();
+        props.insert("threadType".to_owned(), Value::String("chat".to_owned()));
+        let topic = title.map(str::trim).filter(|t| !t.is_empty());
+        if let Some(topic) = topic {
+            props.insert("topic".to_owned(), Value::String(topic.to_owned()));
+        }
+        let wanted = json!({
+            "members": members,
+            "properties": Value::Object(props),
+        });
+        let created = self.chat("POST", "/v1/threads", Body::Json(&wanted), false)?;
+        let named = created.location.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or("");
+        let id = match named {
+            "" => super::id_of(&created.body["id"]),
+            named => named.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"),
+        };
+        if !id.starts_with("19:") {
+            return Err(Fault::Net("Teams created the group chat but did not name it".to_owned()));
+        }
+        self.lookup(&unique);
+        if !self.known(&id)? {
+            return Err(Fault::Net("Teams does not describe the group chat it created".to_owned()));
+        }
+        if let Some(topic) = topic {
+            let _ = self.rename_row(&id, topic);
+        }
+        Ok(id)
+    }
+
+    /// Adds one or more people to a Teams group chat (with optional history sharing) or to a
+    /// team / private channel. Refuses 1:1 chats with a clear message telling the user to start
+    /// a new group chat instead.
+    pub(super) fn members_add(
+        &self,
+        conversation: &str,
+        people: &[String],
+        share_history: Option<protocol::HistoryShare>,
+    ) -> Result<(), Fault> {
+        let thread = super::thread_of(conversation);
+        let row = self.ctx.known(thread)?;
+        let is_one_on_one = thread.ends_with("@unq.gbl.spaces")
+            || row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Direct);
+        if is_one_on_one {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "A 1:1 Teams chat cannot add more people. Start a new group chat instead.".to_owned(),
+            });
+        }
+        let is_channel_or_team = super::tree::is_channel(thread);
+        let role = if is_channel_or_team { "User" } else { "Admin" };
+        let share_ts = Self::share_history_ms(share_history, super::now_ms());
+        for person in people {
+            let mri = person.trim();
+            if mri.is_empty() {
+                continue;
+            }
+            let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(mri));
+            let body = if is_channel_or_team {
+                json!({"role": role})
+            } else {
+                json!({"role": role, "shareHistoryTime": share_ts})
+            };
+            self.chat("PUT", &path, Body::Json(&body), false).map_err(|fault| match fault {
+                Fault::Refused { status: 403, .. } if is_channel_or_team => Fault::Refused {
+                    status: 403,
+                    message: "Only team or channel owners can add members here.".to_owned(),
+                },
+                other => other,
+            })?;
+        }
+        self.ctx.info_stale(thread);
+        Ok(())
+    }
+
+    /// Removes one person from a Teams group chat, team, or private channel.
+    pub(super) fn members_remove(&self, conversation: &str, person: &str) -> Result<(), Fault> {
+        let thread = super::thread_of(conversation);
+        let row = self.ctx.known(thread)?;
+        let is_one_on_one = thread.ends_with("@unq.gbl.spaces")
+            || row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Direct);
+        if is_one_on_one {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "People cannot be removed from a 1:1 Teams chat.".to_owned(),
+            });
+        }
+        let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(person.trim()));
+        self.chat("DELETE", &path, Body::None, false)?;
+        if person.trim() == self.me() {
+            self.ctx.conversation_gone(thread)?;
+        }
+        self.ctx.info_stale(thread);
+        Ok(())
+    }
+
     /// One person's card: what their organization says of them.
     pub(super) fn profile(&self, person: &str) -> Result<About, Fault> {
         let path = "/beta/users/fetchShortProfile?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true\
@@ -549,5 +677,17 @@ mod tests {
         assert!(Teams::listed(&json!({"value": null})).is_empty());
         assert_eq!(Teams::link("ana@contoso.com"), "msteams:/l/chat/0/0?users=ana%40contoso.com");
         assert_eq!(Teams::link(""), "");
+    }
+
+    #[test]
+    fn share_history_maps_none_days_and_all_to_teams_wire_values() {
+        let now = 1_760_000_000_000i64;
+        assert_eq!(Teams::share_history_ms(None, now), -1);
+        assert_eq!(Teams::share_history_ms(Some(protocol::HistoryShare::None), now), -1);
+        assert_eq!(Teams::share_history_ms(Some(protocol::HistoryShare::All), now), 0);
+        assert_eq!(
+            Teams::share_history_ms(Some(protocol::HistoryShare::Days { days: 7 }), now),
+            now - 7 * 86_400_000
+        );
     }
 }

@@ -348,6 +348,12 @@ impl Teams {
             ..ConversationRow::new(id, kind, title)
         };
         row.rights.pin = !notes;
+        if kind == ConversationKind::Group {
+            row.rights.rename = true;
+            row.rights.add_members = true;
+            row.rights.remove_members = true;
+            row.rights.manage_members = true;
+        }
         row
     }
 

@@ -427,6 +427,88 @@ impl Teams {
         Ok(())
     }
 
+    /// Renames a Teams group chat or channel and/or updates its description.
+    pub(super) fn update_conversation(
+        &self,
+        conversation: &str,
+        title: Option<&str>,
+        topic: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        let row = self.ctx.known(thread)?;
+        let is_one_on_one = thread.ends_with("@unq.gbl.spaces")
+            || row.as_ref().is_some_and(|r| r.kind == ConversationKind::Direct);
+        if is_one_on_one {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "One-to-one Teams chats cannot be renamed.".to_owned(),
+            });
+        }
+        let is_channel = super::tree::is_channel(thread);
+        let new_name = title.or(topic).map(str::trim).filter(|s| !s.is_empty());
+        if let Some(name) = new_name {
+            if is_channel && row.as_ref().is_some_and(|r| r.title.eq_ignore_ascii_case("general")) {
+                return Err(Fault::Refused {
+                    status: 400,
+                    message: "The General channel cannot be renamed.".to_owned(),
+                });
+            }
+            let path = format!("/v1/threads/{}/properties?name=topic", escaped(thread));
+            self.chat("PUT", &path, Body::Json(&json!({"topic": name})), false)?;
+            self.rename_row(thread, name)?;
+        }
+        if let Some(desc) = description.map(str::trim) {
+            let path = format!("/v1/threads/{}/properties?name=description", escaped(thread));
+            self.chat("PUT", &path, Body::Json(&json!({"description": desc})), false)?;
+        }
+        self.ctx.info_stale(thread);
+        Ok(())
+    }
+
+    /// Updates a stored conversation's title in place while preserving its metadata and rights.
+    pub(super) fn rename_row(&self, thread: &str, new_title: &str) -> Result<(), Fault> {
+        let trimmed = new_title.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let Some(known) = self.ctx.known(thread)? else {
+            return Ok(());
+        };
+        if known.title == trimmed {
+            return Ok(());
+        }
+        let row = crate::store::ConversationRow {
+            space: known.space,
+            group: known.group,
+            position: known.position,
+            avatar: known.avatar.map(|a| a.id),
+            peer: known.peer,
+            call: known.call,
+            call_video: known.call_video,
+            limit: known.limit,
+            topic: known.topic,
+            parent: known.parent,
+            root: known.root,
+            read_only: known.read_only,
+            read_only_reason: known.read_only_reason,
+            private: known.private,
+            encryption: known.encryption,
+            bot: known.bot,
+            meeting: known.meeting,
+            special: known.special,
+            mark: known.mark,
+            opted_out: known.opted_out,
+            rights: known.rights,
+            can_pin: known.can_pin,
+            moderate: known.moderate,
+            joined: known.joined,
+            ..crate::store::ConversationRow::new(&known.key.id, known.kind, trimmed)
+        };
+        self.ctx.conversation(&row)?;
+        Ok(())
+    }
+
     /// After a chat's newest page: when my message is the newest, whether everyone else has
     /// read up to it, from their read markers. Not for channels, nor for large chats.
     pub(super) fn seen_by(&self, conversation: &str) -> Result<(), Fault> {

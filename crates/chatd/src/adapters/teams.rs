@@ -958,6 +958,7 @@ impl Teams {
             activity_feed: true,
             search: true,
             search_global: true,
+            groups: 250,
             pin_chats: 15,
             close_direct: true,
             clear_history: true,
@@ -1028,6 +1029,26 @@ impl Teams {
             }
             Command::StartDirect { person_id, reply } => {
                 let _ = reply.send(self.start_direct(&person_id).map_err(refuse));
+            }
+            Command::StartGroup { people, title, reply } => {
+                let _ = reply.send(self.start_group(&people, title.as_deref()).map_err(refuse));
+            }
+            Command::MembersAdd { conversation_id, people, share_history, reply } => {
+                let _ = reply.send(self.members_add(&conversation_id, &people, share_history).map_err(refuse));
+            }
+            Command::MembersRemove { conversation_id, person, reply } => {
+                let _ = reply.send(self.members_remove(&conversation_id, &person).map_err(refuse));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                let _ = reply.send(
+                    self.update_conversation(
+                        &conversation_id,
+                        title.as_deref(),
+                        topic.as_deref(),
+                        description.as_deref(),
+                    )
+                    .map_err(refuse),
+                );
             }
             Command::Profile { person_id, reply } => {
                 let _ = reply.send(self.profile(&person_id).map_err(refuse));

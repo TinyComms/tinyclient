@@ -778,6 +778,16 @@ pub fn format_disappearing(seconds: u32) -> String {
     }
 }
 
+/// How much prior chat history a newly added member receives (Teams group chats).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum HistoryShare {
+    #[default]
+    None,
+    Days { days: u32 },
+    All,
+}
+
 /// Content-type filter for network message search (`SearchFilters::has`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1182,5 +1192,21 @@ mod tests {
         assert_eq!(wire, "\"missed_call\"");
         let back: ActivityItemKind = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, ActivityItemKind::MissedCall);
+    }
+
+    #[test]
+    fn history_share_round_trips_and_stays_backward_compatible() {
+        for mode in [HistoryShare::None, HistoryShare::Days { days: 7 }, HistoryShare::All] {
+            let wire = serde_json::to_string(&mode).unwrap();
+            let back: HistoryShare = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, mode);
+        }
+        let legacy = json_members_add_without_share();
+        let req: Request = serde_json::from_str(&legacy).unwrap();
+        assert!(matches!(req, Request::MembersAdd { share_history: None, .. }));
+    }
+
+    fn json_members_add_without_share() -> String {
+        r#"{"op":"members_add","conversation":{"network":"teams","account":"t1","id":"19:g@thread.v2"},"people":["8:orgid:a"]}"#.to_owned()
     }
 }

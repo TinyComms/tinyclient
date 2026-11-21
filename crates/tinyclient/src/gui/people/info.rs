@@ -1132,7 +1132,7 @@ impl InfoPane {
                     cx.notify();
                     return;
                 }
-                Request::MembersAdd { conversation, people }
+                Request::MembersAdd { conversation, people, share_history: None }
             }
             _ => {
                 cx.notify();

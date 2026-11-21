@@ -386,6 +386,7 @@ pub enum Command {
     MembersAdd {
         conversation_id: String,
         people: Vec<String>,
+        share_history: Option<protocol::HistoryShare>,
         reply: Reply<()>,
     },
     /// Remove one person from a group or channel.

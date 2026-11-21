@@ -1063,6 +1063,16 @@ impl Teams {
         if place == super::tree::ACTIVITY {
             return self.heard_activity(raw);
         }
+        if raw["messagetype"].as_str() == Some("ThreadActivity/TopicUpdate") {
+            let content = raw["content"].as_str().unwrap_or("");
+            if let Some(topic) = inside(content, "value")
+                .first()
+                .map(|t| html::parse(t, &Refs { teams: self, mentions: &[] }, "").text)
+                .filter(|t| !t.trim().is_empty())
+            {
+                let _ = self.rename_row(&place, &topic);
+            }
+        }
         match self.read(&place, raw) {
             Read::Typing { person, name, on } => {
                 if person != self.me() && self.ctx.known(&place)?.is_some() {

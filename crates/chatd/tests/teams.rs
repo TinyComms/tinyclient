@@ -194,6 +194,8 @@ struct Fake {
     pinned: Mutex<HashMap<String, Value>>,
     /// Saved messages in 48:saved (for #655).
     saved: Mutex<Vec<Value>>,
+    /// Dynamically created group threads (for #619).
+    threads: Mutex<HashMap<String, Value>>,
 }
 
 impl Fake {
@@ -229,6 +231,7 @@ impl Fake {
                     "sourceMessageId": "1760000500100"
                 }
             })]),
+            threads: Mutex::default(),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -428,8 +431,27 @@ impl Fake {
     /// The chat service. `path` is what follows its address.
     fn chat(&self, call: &Call, path: &str) -> Reply {
         if path == "/v1/threads" && call.method == "POST" {
+            let body = call.json();
+            let unique = body["properties"]["uniquerosterthread"] == true;
+            let thread_id = if unique {
+                CHAT_DEE.to_owned()
+            } else {
+                let mut threads = self.threads.lock().unwrap();
+                let id = format!("19:newgrp{}@thread.v2", threads.len() + 1);
+                let members = body["members"].clone();
+                let properties = body["properties"].clone();
+                threads.insert(
+                    id.clone(),
+                    json!({
+                        "id": id,
+                        "properties": properties,
+                        "members": members,
+                    }),
+                );
+                id
+            };
             let mut created = answer("201 Created", json!({}));
-            created.headers.push(("Location", format!("{}/chat/v1/threads/{CHAT_DEE}", self.base)));
+            created.headers.push(("Location", format!("{}/chat/v1/threads/{thread_id}", self.base)));
             return created;
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/").and_then(|rest| rest.strip_suffix("/consumptionhorizons")) {
@@ -446,9 +468,27 @@ impl Fake {
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/") {
             if call.method == "DELETE" && thread.contains("/members/") {
+                if let Some((tid, mri)) = thread.split_once("/members/") {
+                    if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                        if let Some(arr) = existing["members"].as_array_mut() {
+                            arr.retain(|m| m["id"].as_str() != Some(mri));
+                        }
+                    }
+                }
                 return ok(json!({}));
             }
             if call.method == "PUT" {
+                if let Some((tid, mri)) = thread.split_once("/members/") {
+                    let body = call.json();
+                    if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                        if let Some(arr) = existing["members"].as_array_mut() {
+                            if !arr.iter().any(|m| m["id"].as_str() == Some(mri)) {
+                                arr.push(json!({"id": mri, "role": body["role"].as_str().unwrap_or("Admin")}));
+                            }
+                        }
+                    }
+                    return ok(json!({}));
+                }
                 if let Some(tid) = thread.strip_suffix("/properties") {
                     if call.query.contains("name=pinnedMessages") {
                         let raw = call.json()["pinnedMessages"].as_str().unwrap_or("[]").to_owned();
@@ -456,24 +496,44 @@ impl Fake {
                         self.pinned.lock().unwrap().insert(tid.to_owned(), parsed);
                         return ok(json!({}));
                     }
+                    if call.query.contains("name=topic") {
+                        let new_topic = call.json()["topic"].as_str().unwrap_or("").to_owned();
+                        if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                            existing["properties"]["topic"] = json!(new_topic);
+                        }
+                        return ok(json!({}));
+                    }
+                    if call.query.contains("name=description") {
+                        let new_desc = call.json()["description"].as_str().unwrap_or("").to_owned();
+                        if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                            existing["properties"]["description"] = json!(new_desc);
+                        }
+                        return ok(json!({}));
+                    }
                 }
             }
-            let mut described = match thread {
-                CHAT_DEE => self.fixture("thread.dee"),
-                GENERAL => self.fixture("thread.general"),
-                CHAT_ANA => Some(json!({
-                    "id": thread,
-                    "properties": {"threadType": "chat", "uniquerosterthread": "true"},
-                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
-                })),
-                "19:archive0chat@thread.v2" => Some(json!({
-                    "id": thread,
-                    "properties": {"threadType": "chat", "topic": "Budget Archive"},
-                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
-                })),
-                "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
-                _ => None,
-            };
+            let mut described = self
+                .threads
+                .lock()
+                .unwrap()
+                .get(thread)
+                .cloned()
+                .or_else(|| match thread {
+                    CHAT_DEE => self.fixture("thread.dee"),
+                    GENERAL => self.fixture("thread.general"),
+                    CHAT_ANA => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "chat", "uniquerosterthread": "true"},
+                        "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
+                    })),
+                    "19:archive0chat@thread.v2" => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "chat", "topic": "Budget Archive"},
+                        "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
+                    })),
+                    "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
+                    _ => None,
+                });
             if let Some(desc) = described.as_mut() {
                 if let Some(pins) = self.pinned.lock().unwrap().get(thread) {
                     desc["properties"]["pinnedMessages"] = json!(pins.to_string());
@@ -2935,5 +2995,105 @@ fn server_side_search_across_account_team_conversation_filters_and_jump() {
     let qs = search_call.json()["EntityRequests"][0]["Query"]["QueryString"].as_str().unwrap_or("").to_owned();
     assert!(qs.contains("hasAttachment:true"), "{qs}");
     assert!(qs.contains("from:"), "{qs}");
+}
+
+#[test]
+fn group_chat_create_rename_add_with_history_remove_and_live_topic_update() {
+    let world = World::start();
+    world.ready();
+
+    let account = key(GENERAL).account();
+    assert_eq!(world.account(HOME).can.groups, 250);
+
+    // 1. Create a 3-person group chat (me + Ana + Ben) with a name, without uniquerosterthread.
+    let created = match world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![key(ANA), key(BEN)],
+        title: Some("Incident Bridge".to_owned()),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(created.kind, ConversationKind::Group);
+    assert_eq!(created.title, "Incident Bridge");
+    assert!(created.rights.rename && created.rights.add_members && created.rights.remove_members);
+
+    let post_thread = world.fake.calls("POST", "/chat/v1/threads").pop().expect("POST /v1/threads");
+    let post_body = post_thread.json();
+    assert!(post_body["properties"]["uniquerosterthread"].is_null());
+    assert_eq!(post_body["properties"]["topic"].as_str(), Some("Incident Bridge"));
+    assert_eq!(post_body["members"].as_array().unwrap().len(), 3);
+
+    // 2. Rename the group chat -> PUT /v1/threads/{id}/properties?name=topic and local title updates.
+    let grp_key = created.key.clone();
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: grp_key.clone(),
+            title: Some("Postmortem Crew".to_owned()),
+            topic: None,
+            description: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&grp_key).unwrap().title, "Postmortem Crew");
+    let rename_call = world
+        .fake
+        .calls("PUT", &format!("{}/properties", grp_key.id))
+        .pop()
+        .expect("topic PUT");
+    assert!(rename_call.query.contains("name=topic"));
+    assert_eq!(rename_call.json()["topic"].as_str(), Some("Postmortem Crew"));
+
+    // 3. Add a fourth member (Dee) with 7-day history sharing -> shareHistoryTime > 0.
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: grp_key.clone(),
+            people: vec![DEE.to_owned()],
+            share_history: Some(protocol::HistoryShare::Days { days: 7 }),
+        }),
+        Response::Ok
+    );
+    let add_call = world
+        .fake
+        .calls("PUT", &format!("{}/members/{DEE}", grp_key.id))
+        .pop()
+        .expect("member PUT");
+    let share_ms = add_call.json()["shareHistoryTime"].as_i64().expect("shareHistoryTime");
+    assert!(share_ms > 0, "7-day history share should send positive unix ms, got {share_ms}");
+
+    // 4. Adding a member to a 1:1 chat is refused with a clear message.
+    match world.ask(Request::MembersAdd {
+        conversation: key(CHAT_ANA),
+        people: vec![BEN.to_owned()],
+        share_history: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("group chat"), "{detail}"),
+        other => panic!("expected refusal on 1:1 add, got {other:?}"),
+    }
+
+    // 5. Remove member (Ben) -> DELETE /v1/threads/{id}/members/{BEN}.
+    assert_eq!(
+        world.ask(Request::MembersRemove {
+            conversation: grp_key.clone(),
+            person: BEN.to_owned(),
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", &format!("{}/members/{BEN}", grp_key.id)).is_empty());
+
+    // 6. Live ThreadActivity/TopicUpdate push updates the row's title immediately.
+    let mut rename_evt = message(
+        &grp_key.id,
+        None,
+        1_760_009_500_000,
+        ANA,
+        "Ana Ruiz",
+        "<topicupdate><initiator>8:orgid:00000000-0000-4000-8000-0000000000a1</initiator><value>Resolved Bridge</value></topicupdate>",
+    );
+    rename_evt["messagetype"] = json!("ThreadActivity/TopicUpdate");
+    world.fake.push("NewMessage", rename_evt, false);
+    world.until("live TopicUpdate updates row title", || {
+        world.conversation(&grp_key).filter(|row| row.title == "Resolved Bridge")
+    });
 }
 

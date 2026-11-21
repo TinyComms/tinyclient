@@ -1516,7 +1516,7 @@ impl Slack {
             Command::Members { conversation_id, offset, limit, reply } => {
                 answer(reply, self.members(&conversation_id, offset, limit));
             }
-            Command::MembersAdd { conversation_id, people, reply } => {
+            Command::MembersAdd { conversation_id, people, reply, .. } => {
                 answer(reply, self.members_add(&conversation_id, &people));
             }
             Command::MembersRemove { conversation_id, person, reply } => {
