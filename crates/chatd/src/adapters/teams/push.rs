@@ -278,9 +278,9 @@ impl Teams {
             }
             state.horizon_ms.insert(id.to_owned(), client_ts);
         }
-        let newest = match conversation["lastMessage"]["id"].as_str() {
-            Some(newest) => Some(newest.to_owned()),
-            None => self.ctx.newest(id)?,
+        let newest = match super::id_of(&conversation["lastMessage"]) {
+            newest if !newest.is_empty() => Some(newest),
+            _ => self.ctx.newest(id)?,
         };
         let moved_back = row
             .last_read
@@ -290,7 +290,9 @@ impl Teams {
         if moved_back || (has_unread && row.unread == 0) {
             let marker = if read == "0" { "" } else { read };
             self.ctx.manual_ack(id, marker, None)?;
-            if has_unread && self.ctx.known(id)?.is_some_and(|updated| updated.unread == 0) {
+            if (has_unread || (moved_back && newest.is_none()))
+                && self.ctx.known(id)?.is_some_and(|updated| updated.unread == 0)
+            {
                 self.ctx.mark_unread(id)?;
             }
         } else if has_unread {

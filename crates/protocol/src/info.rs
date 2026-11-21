@@ -358,7 +358,7 @@ impl EmojiScope {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MentionFormat {
-    /// Mentions stay as their plain display label (Telegram, Signal, Messages, Tiny).
+    /// Mentions stay as their plain display label (Telegram, Messages, Tiny).
     #[default]
     Plain,
     /// `<@id>`, `<@&id>`, `<#id>`, `<:name:id>` / `<a:name:id>`.
@@ -367,6 +367,8 @@ pub enum MentionFormat {
     Slack,
     /// `<@id|label>`, `<@&id|label>`, `<#id|label>`; custom emoji stay `:name:`.
     Teams,
+    /// `<@aci>` for person mentions; adapter replaces with U+FFFC and UTF-16 `BodyRange(MentionAci)`.
+    Signal,
 }
 
 impl MentionFormat {
@@ -649,6 +651,9 @@ pub struct Capabilities {
     /// This account supports browsing unjoined public channels, previewing, and joining them (`BrowseChannels`, `PreviewChannel`, `Join`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub browse_channels: bool,
+    /// This account supports an optional subject line on new channel posts (Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channel_subject: bool,
     /// This account supports saving/starring messages for Later and setting network reminders (`StarMessage`, `StarredMessages`, `Remind`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub save_messages: bool,
@@ -1008,6 +1013,9 @@ pub struct Outgoing {
     /// dual-SIM phone). `None` keeps the conversation's default line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_as: Option<String>,
+    /// Optional one-line subject for a new channel post (Teams).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -1027,6 +1035,7 @@ impl Default for Outgoing {
             effect: None,
             contact: None,
             send_as: None,
+            subject: None,
         }
     }
 }

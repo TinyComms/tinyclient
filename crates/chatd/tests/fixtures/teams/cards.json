@@ -1,0 +1,82 @@
+{
+  "connector_alert": {
+    "id": "1760000801001",
+    "sequenceId": 801,
+    "clientmessageid": "1393744801001",
+    "version": "1760000801001",
+    "conversationid": "19:platform0general@thread.tacv2",
+    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000801001",
+    "type": "Message",
+    "messagetype": "RichText/Media_Card",
+    "contenttype": "text",
+    "content": "<URIObject type=\"SWIFT.1\"><Swift b64=\"eyJ0eXBlIjoibWVzc2FnZS9jYXJkIn0=\"></Swift></URIObject>",
+    "amsreferences": [],
+    "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/28:00000000-0000-4000-8000-0000000000f1",
+    "imdisplayname": "Alert Bot",
+    "composetime": "2025-10-09T09:10:01.0000000Z",
+    "originalarrivaltime": "2025-10-09T09:10:01.0000000Z",
+    "properties": {
+      "cards": "[{\"contentType\":\"application/vnd.microsoft.teams.card.o365connector\",\"content\":\"{\\\"@type\\\":\\\"MessageCard\\\",\\\"themeColor\\\":\\\"D93025\\\",\\\"title\\\":\\\"High latency on checkout\\\",\\\"sections\\\":[{\\\"activityTitle\\\":\\\"PagerDuty\\\",\\\"activitySubtitle\\\":\\\"Incident #904\\\",\\\"facts\\\":[{\\\"name\\\":\\\"Service\\\",\\\"value\\\":\\\"checkout-api\\\"},{\\\"name\\\":\\\"P99\\\",\\\"value\\\":\\\"2450 ms\\\"}],\\\"images\\\":[{\\\"image\\\":\\\"https://cdn.pagerduty.example/chart.png\\\",\\\"title\\\":\\\"Latency chart\\\"}]}],\\\"potentialAction\\\":[{\\\"@type\\\":\\\"OpenUri\\\",\\\"name\\\":\\\"View Incident\\\",\\\"targets\\\":[{\\\"os\\\":\\\"default\\\",\\\"uri\\\":\\\"https://pagerduty.example/incidents/904\\\"}]},{\\\"@type\\\":\\\"ActionCard\\\",\\\"name\\\":\\\"Acknowledge\\\"}]}\"}]"
+    }
+  },
+  "adaptive_facts_buttons": {
+    "id": "1760000801002",
+    "sequenceId": 802,
+    "clientmessageid": "1393744801002",
+    "version": "1760000801002",
+    "conversationid": "19:platform0general@thread.tacv2",
+    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000801002",
+    "type": "Message",
+    "messagetype": "RichText/Media_Card",
+    "contenttype": "text",
+    "content": "",
+    "amsreferences": [],
+    "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/28:00000000-0000-4000-8000-0000000000f1",
+    "imdisplayname": "Deploy Bot",
+    "composetime": "2025-10-09T09:10:02.0000000Z",
+    "originalarrivaltime": "2025-10-09T09:10:02.0000000Z",
+    "properties": {
+      "cards": "[{\"contentType\":\"application/vnd.microsoft.card.adaptive\",\"content\":\"{\\\"type\\\":\\\"AdaptiveCard\\\",\\\"version\\\":\\\"1.5\\\",\\\"body\\\":[{\\\"type\\\":\\\"TextBlock\\\",\\\"text\\\":\\\"**Release v2.4.0** approval needed\\\",\\\"weight\\\":\\\"bolder\\\",\\\"size\\\":\\\"large\\\"},{\\\"type\\\":\\\"FactSet\\\",\\\"facts\\\":[{\\\"title\\\":\\\"Environment\\\",\\\"value\\\":\\\"Production\\\"},{\\\"title\\\":\\\"Commit\\\",\\\"value\\\":\\\"a7fa2e22\\\"}]},{\\\"type\\\":\\\"Table\\\",\\\"rows\\\":[{\\\"type\\\":\\\"TableRow\\\",\\\"cells\\\":[{\\\"type\\\":\\\"TableCell\\\",\\\"items\\\":[{\\\"type\\\":\\\"TextBlock\\\",\\\"text\\\":\\\"Check\\\"}]},{\\\"type\\\":\\\"TableCell\\\",\\\"items\\\":[{\\\"type\\\":\\\"TextBlock\\\",\\\"text\\\":\\\"Result\\\"}]}]},{\\\"type\\\":\\\"TableRow\\\",\\\"cells\\\":[{\\\"type\\\":\\\"TableCell\\\",\\\"items\\\":[{\\\"type\\\":\\\"TextBlock\\\",\\\"text\\\":\\\"Tests\\\"}]},{\\\"type\\\":\\\"TableCell\\\",\\\"items\\\":[{\\\"type\\\":\\\"TextBlock\\\",\\\"text\\\":\\\"Pass\\\"}]}]}]},{\\\"type\\\":\\\"Image\\\",\\\"url\\\":\\\"https://eu-api.asm.skype.com/v1/objects/card-img-9/views/imgo\\\",\\\"altText\\\":\\\"Diff\\\"},{\\\"type\\\":\\\"Image\\\",\\\"url\\\":\\\"https://external.example/banner.png\\\",\\\"altText\\\":\\\"External banner\\\"}],\\\"actions\\\":[{\\\"type\\\":\\\"Action.OpenUrl\\\",\\\"title\\\":\\\"Diff\\\",\\\"url\\\":\\\"https://github.com/org/repo/compare/v2.3...v2.4\\\"},{\\\"type\\\":\\\"Action.Submit\\\",\\\"title\\\":\\\"Approve\\\"}]}\"}]"
+    }
+  },
+  "hero_card": {
+    "id": "1760000801003",
+    "sequenceId": 803,
+    "clientmessageid": "1393744801003",
+    "version": "1760000801003",
+    "conversationid": "19:platform0general@thread.tacv2",
+    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000801003",
+    "type": "Message",
+    "messagetype": "RichText/Media_Card",
+    "contenttype": "text",
+    "content": "",
+    "amsreferences": [],
+    "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/28:00000000-0000-4000-8000-0000000000f1",
+    "imdisplayname": "GitHub Bot",
+    "composetime": "2025-10-09T09:10:03.0000000Z",
+    "originalarrivaltime": "2025-10-09T09:10:03.0000000Z",
+    "properties": {
+      "cards": "[{\"contentType\":\"application/vnd.microsoft.card.hero\",\"content\":{\"title\":\"PR #42: Fix timeouts\",\"subtitle\":\"tinyclient / main\",\"text\":\"<p>All checks green.</p>\",\"images\":[{\"url\":\"https://avatars.githubusercontent.com/u/1\",\"alt\":\"Avatar\"}],\"buttons\":[{\"type\":\"openUrl\",\"title\":\"View PR\",\"value\":\"https://github.com/org/repo/pull/42\"},{\"type\":\"postBack\",\"title\":\"Merge\",\"value\":\"merge\"}]}}]"
+    }
+  },
+  "malformed_card": {
+    "id": "1760000801004",
+    "sequenceId": 804,
+    "clientmessageid": "1393744801004",
+    "version": "1760000801004",
+    "conversationid": "19:platform0general@thread.tacv2",
+    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000801004",
+    "type": "Message",
+    "messagetype": "RichText/Media_Card",
+    "contenttype": "text",
+    "content": "<URIObject type=\"SWIFT.1\"></URIObject>",
+    "amsreferences": [],
+    "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/28:00000000-0000-4000-8000-0000000000f1",
+    "imdisplayname": "Broken Bot",
+    "composetime": "2025-10-09T09:10:04.0000000Z",
+    "originalarrivaltime": "2025-10-09T09:10:04.0000000Z",
+    "properties": {
+      "cards": "[{\"contentType\":\"application/vnd.microsoft.card.adaptive\",\"content\":\"{broken json\"}]"
+    }
+  }
+}

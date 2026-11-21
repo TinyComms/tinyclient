@@ -32,6 +32,8 @@ pub struct Controls {
     pub effects: bool,
     /// View-once per-file toggle (`Capabilities::view_once`, Signal/Telegram).
     pub view_once: bool,
+    /// Optional one-line subject on new channel posts (`Capabilities::channel_subject`, Teams).
+    pub subject: bool,
 }
 
 /// `editing`: edit mode is text only on every network.
@@ -61,6 +63,7 @@ pub fn controls(can: &Capabilities, editing: bool) -> Controls {
         broadcast: can.thread_broadcast && !editing,
         effects: can.effects && !editing,
         view_once: can.view_once && !editing,
+        subject: can.channel_subject && !editing,
     }
 }
 
@@ -157,10 +160,10 @@ mod tests {
 
     #[test]
     fn send_option_controls_follow_capabilities_and_hide_when_editing() {
-        let teams = Capabilities { importance: true, ..Capabilities::default() };
+        let teams = Capabilities { importance: true, suppress_embeds: true, channel_subject: true, ..Capabilities::default() };
         let m = controls(&teams, false);
-        assert!(m.importance && !m.broadcast && !m.effects && !m.view_once);
-        assert!(!controls(&teams, true).importance);
+        assert!(m.importance && m.link_chip && m.subject && !m.broadcast && !m.effects && !m.view_once);
+        assert!(!controls(&teams, true).importance && !controls(&teams, true).link_chip && !controls(&teams, true).subject);
 
         let slack = Capabilities { thread_broadcast: true, ..Capabilities::default() };
         let s = controls(&slack, false);

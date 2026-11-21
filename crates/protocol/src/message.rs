@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub const THREAD_FACES: usize = 3;
 /// Most fields a [`Card`] holds.
 pub const CARD_FIELDS: usize = 10;
+/// Most action links a [`Card`] holds.
+pub const CARD_ACTIONS: usize = 10;
 /// Most bytes of a voice message's waveform.
 pub const WAVEFORM_LIMIT: usize = 256;
 /// Most choices one poll lists. Signal allows ten.
@@ -295,6 +297,13 @@ pub struct Forwarded {
     pub text: String,
 }
 
+/// A labelled link or action button at the foot of a [`Card`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardAction {
+    pub label: String,
+    pub url: String,
+}
+
 /// What a bot or app posts instead of plain text: an embed, a block of fields. Drawn as one
 /// framed card under the message's text. Every string is cut to a fixed length on its way in.
 /// A channel's sponsored message is one too, marked `sponsored`.
@@ -311,6 +320,9 @@ pub struct Card {
     /// Label and value, in the network's order, at most [`CARD_FIELDS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, String)>,
+    /// Labelled links or action buttons, in the network's order, at most [`CARD_ACTIONS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<CardAction>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub footer: String,
     /// Full-width image inside the card (when hosted by the network).
@@ -325,6 +337,26 @@ pub struct Card {
     /// A channel's sponsored message: the shell tells chatd when the user follows it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sponsored: bool,
+}
+
+impl Card {
+    pub fn bound(&mut self) {
+        clip(&mut self.author, 256);
+        clip(&mut self.title, 256);
+        clip(&mut self.title_link, 2_000);
+        clip(&mut self.text, 4_000);
+        clip(&mut self.footer, 256);
+        self.fields.truncate(CARD_FIELDS);
+        for (label, value) in &mut self.fields {
+            clip(label, 256);
+            clip(value, 1_000);
+        }
+        self.actions.truncate(CARD_ACTIONS);
+        for action in &mut self.actions {
+            clip(&mut action.label, 120);
+            clip(&mut action.url, 2_000);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +702,9 @@ pub struct Message {
     /// Message importance (Teams: Normal / Important / Urgent).
     #[serde(default, skip_serializing_if = "crate::Importance::is_normal")]
     pub importance: crate::Importance,
+    /// Channel announcement post (Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub announcement: bool,
     /// Optional message effect identifier (Telegram).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<String>,
@@ -786,6 +821,7 @@ impl Message {
             can_edit: None,
             can_delete: None,
             importance: crate::Importance::Normal,
+            announcement: false,
             effect: None,
             contacts: Vec::new(),
             sent_via: None,
@@ -828,14 +864,10 @@ impl Message {
             clip(prior, PRIOR_LIMIT);
         }
         if let Some(card) = &mut self.card {
-            clip(&mut card.title, 256);
-            clip(&mut card.text, 4_000);
-            clip(&mut card.footer, 256);
-            card.fields.truncate(CARD_FIELDS);
-            for (label, value) in &mut card.fields {
-                clip(label, 256);
-                clip(value, 1_000);
-            }
+            card.bound();
+        }
+        for card in &mut self.cards {
+            card.bound();
         }
         if let Some(poll) = &mut self.poll {
             clip(&mut poll.question, 100);
@@ -905,8 +937,12 @@ impl Message {
             Style::Emoji { file } => Some(file),
             _ => None,
         });
+        let cards = self
+            .all_cards()
+            .flat_map(|card| card.image.as_ref().into_iter().chain(card.thumbnail.as_ref()));
         attached
             .chain(self.previews.iter().filter_map(|preview| preview.image.as_ref()))
+            .chain(cards)
             .chain(self.reactions.iter().filter_map(|reaction| reaction.file.as_ref()))
             .chain(emoji)
             .chain(&self.sender.avatar)
@@ -922,8 +958,15 @@ impl Message {
             Style::Emoji { file } => Some(file),
             _ => None,
         });
+        let cards = self
+            .card
+            .as_deref_mut()
+            .into_iter()
+            .chain(self.cards.iter_mut())
+            .flat_map(|card| card.image.as_mut().into_iter().chain(card.thumbnail.as_mut()));
         attached
             .chain(self.previews.iter_mut().filter_map(|preview| preview.image.as_mut()))
+            .chain(cards)
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
             .chain(&mut self.sender.avatar)
@@ -1016,5 +1059,42 @@ mod tests {
         assert!(!rich.is_plain());
         let wire = serde_json::to_string(&rich).unwrap();
         assert_eq!(serde_json::from_str::<crate::Outgoing>(&wire).unwrap(), rich);
+    }
+
+    #[test]
+    fn card_actions_round_trip_and_stay_bounded() {
+        let mut msg = Message::plain("m2", "Bot", "", 1_700_000_000, false);
+        msg.card = Some(Box::new(Card {
+            title: "Build 512".into(),
+            actions: (0..20)
+                .map(|i| CardAction { label: format!("Action {i} {}", "x".repeat(200)), url: format!("https://example.com/{i}") })
+                .collect(),
+            ..Card::default()
+        }));
+        msg.bound();
+        let card = msg.card.as_ref().unwrap();
+        assert_eq!(card.actions.len(), CARD_ACTIONS);
+        assert_eq!(card.actions[0].label.chars().count(), 120);
+        let wire = serde_json::to_string(card).unwrap();
+        assert_eq!(serde_json::from_str::<Card>(&wire).unwrap(), **card);
+        // Older payloads without `actions` still deserialize.
+        let legacy: Card = serde_json::from_str(r#"{"title":"Old"}"#).unwrap();
+        assert!(legacy.actions.is_empty());
+    }
+
+    #[test]
+    fn channel_subject_and_announcement_round_trip() {
+        let plain = crate::Outgoing::default();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("subject"));
+        let with_subject = crate::Outgoing { subject: Some("Q4 kickoff".into()), ..crate::Outgoing::default() };
+        assert!(!with_subject.is_plain());
+        let wire = serde_json::to_string(&with_subject).unwrap();
+        assert_eq!(serde_json::from_str::<crate::Outgoing>(&wire).unwrap(), with_subject);
+
+        let mut msg = Message::plain("m3", "Ana", "Launch day", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("announcement"));
+        msg.announcement = true;
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(serde_json::from_str::<Message>(&wire).unwrap().announcement);
     }
 }

@@ -686,10 +686,7 @@ impl Conversation {
     /// a number only for a mention.
     pub fn badge(&self) -> Badge {
         let quiet = self.bot || self.archived || self.special == Special::Request;
-        // Teams stores a boolean unread as 1. A count is only honest for a mention.
-        let needs_me = if self.key.network == Network::Teams {
-            self.mentions
-        } else if self.kind.is_direct() && !self.muted && !quiet {
+        let needs_me = if self.kind.is_direct() && !self.muted && !quiet {
             self.unread.max(self.mentions)
         } else {
             self.mentions
@@ -3222,12 +3219,15 @@ mod tests {
         assert_eq!(Conversation { mentions: 1, ..app }.badge(), Badge::Count(1));
         let archived = Conversation { archived: true, ..row(Direct, 4, 0, false) };
         assert_eq!(archived.badge(), Badge::Dot);
-        // Teams' unread is a boolean stored as 1: a dot, and a count only for a mention.
-        let mut teams = row(Direct, 1, 0, false);
+        // Teams direct chats show their unread count; channels show a dot unless mentioned.
+        let mut teams = row(Direct, 7, 0, false);
         teams.key.network = Network::Teams;
-        assert_eq!(teams.badge(), Badge::Dot);
-        teams.mentions = 2;
-        assert_eq!(teams.badge(), Badge::Count(2));
+        assert_eq!(teams.badge(), Badge::Count(7));
+        let mut teams_chan = row(Channel, 3, 0, false);
+        teams_chan.key.network = Network::Teams;
+        assert_eq!(teams_chan.badge(), Badge::Dot);
+        teams_chan.mentions = 2;
+        assert_eq!(teams_chan.badge(), Badge::Count(2));
     }
 
     #[test]

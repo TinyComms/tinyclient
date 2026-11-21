@@ -478,6 +478,9 @@ impl Fake {
             limited.headers.push(("Retry-After", "7".to_owned()));
             return limited;
         }
+        if sent["content"].as_str().unwrap_or("").contains("moderated post") {
+            return answer("403 Forbidden", json!({"errorCode": 403, "message": "User is not allowed to post in this channel."}));
+        }
         let arrived = 1_760_001_000_000 + u64::from(self.posted.fetch_add(1, Ordering::Relaxed)) * 1000;
         let (thread, root) = conversation.split_once(";messageid=").map_or((conversation, None), |(thread, root)| (thread, Some(root.to_owned())));
         let root = root.or_else(|| thread.contains("@thread.tacv2").then(|| arrived.to_string()));
@@ -843,8 +846,8 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
         ]
     );
     assert!(rows.iter().all(|row| row.space.is_none()), "a chat is in no Space");
-    // Teams supplies a boolean unread flag; only mentions support a numeric badge.
-    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Dot));
+    // Direct chats show their actual unread count; channels show a dot unless mentioned.
+    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Count(1)));
     assert_eq!(rows[0].avatar.as_ref().map(|avatar| (avatar.kind, avatar.width)), Some((MediaKind::Avatar, 64)));
     assert_eq!((rows[0].preview.as_str(), rows[0].preview_from.as_str(), rows[0].preview_mine), ("Can you look at the deploy?", "Ana Ruiz", false));
     assert!(rows[2].muted && rows[2].unread == 0, "muted by me, and what I said last is not unread");
@@ -991,13 +994,12 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     assert_eq!(std::fs::read(path).unwrap(), SHEET);
     assert_eq!(world.fake.calls("GET", &content).len(), 1);
 
-    // A card is named and linked into the official app, never blank.
-    let card = by("1760000300300");
-    assert_eq!(card.text, "Card: Build 512 passed");
-    let MessageKind::Unsupported { link } = &card.kind else {
-        panic!("{:?}", card.kind);
-    };
-    assert_eq!(link, &format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000300300?tenantId={HOME}"));
+    // An adaptive card renders into Message::card and stays a normal message (reactable, quotable).
+    let card_msg = by("1760000300300");
+    assert_eq!(card_msg.kind, MessageKind::Normal);
+    let card = card_msg.card.as_deref().expect("adaptive card parsed into Message::card");
+    assert_eq!(card.title, "Build 512 passed");
+    assert_eq!(card.actions, vec![protocol::CardAction { label: "Open".into(), url: "https://ci.example/512".into() }]);
 
     // A Loop component is named and linked to its file, not left as a blank card.
     let looped = by("1760000310310");
@@ -2055,3 +2057,287 @@ fn unread_count_from_horizon_and_mark_unread_sync() {
     });
     assert_eq!(rewound.unread, 5);
 }
+
+#[test]
+fn adaptive_connector_and_hero_cards_render_and_malformed_falls_back() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+    let fixtures = world.fake.fixture("cards").expect("cards fixture");
+
+    for name in ["connector_alert", "adaptive_facts_buttons", "hero_card", "malformed_card"] {
+        world.fake.push("NewMessage", fixtures[name].clone(), false);
+    }
+    world.until("all four card messages to arrive", || {
+        let msgs = world.messages(&general);
+        ["1760000801001", "1760000801002", "1760000801003", "1760000801004"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+
+    // 1. Office 365 connector alert
+    let alert = world.message(&general, "1760000801001").unwrap();
+    assert_eq!(alert.kind, MessageKind::Normal);
+    let alert_card = alert.card.as_deref().expect("connector card");
+    assert_eq!(alert_card.title, "High latency on checkout");
+    assert_eq!(alert_card.author, "PagerDuty");
+    assert_eq!(alert_card.color, Some(0xD93025));
+    assert_eq!(alert_card.fields, vec![("Service".into(), "checkout-api".into()), ("P99".into(), "2450 ms".into())]);
+    assert!(alert_card.image.is_none(), "external connector image must not be fetched");
+    assert!(alert_card.actions.iter().any(|a| a.label == "View Incident" && a.url == "https://pagerduty.example/incidents/904"));
+    assert!(alert_card.actions.iter().any(|a| a.label == "Acknowledge · Open in Teams"));
+    assert!(alert_card.actions.iter().any(|a| a.label == "Latency chart" && a.url == "https://cdn.pagerduty.example/chart.png"));
+
+    // 2. Adaptive card with facts, table, hosted + external image, OpenUrl + Submit
+    let adaptive = world.message(&general, "1760000801002").unwrap();
+    assert_eq!(adaptive.kind, MessageKind::Normal);
+    let ac = adaptive.card.as_deref().expect("adaptive card");
+    assert_eq!(ac.title, "Release v2.4.0 approval needed");
+    assert_eq!(ac.fields, vec![("Environment".into(), "Production".into()), ("Commit".into(), "a7fa2e22".into())]);
+    assert!(ac.text.contains("Check | Result") && ac.text.contains("Tests | Pass"), "{}", ac.text);
+    assert!(ac.image.is_some(), "Teams-hosted image should be registered");
+    assert!(ac.actions.iter().any(|a| a.label == "External banner" && a.url == "https://external.example/banner.png"));
+    assert!(ac.actions.iter().any(|a| a.label == "Diff" && a.url == "https://github.com/org/repo/compare/v2.3...v2.4"));
+    assert!(ac.actions.iter().any(|a| a.label == "Approve · Open in Teams"));
+
+    // 3. Hero card
+    let hero = world.message(&general, "1760000801003").unwrap();
+    assert_eq!(hero.kind, MessageKind::Normal);
+    let hc = hero.card.as_deref().expect("hero card");
+    assert_eq!(hc.title, "PR #42: Fix timeouts");
+    assert_eq!(hc.author, "tinyclient / main");
+    assert_eq!(hc.text, "All checks green.");
+    assert!(hc.image.is_none(), "external hero image must not be fetched");
+    assert!(hc.actions.iter().any(|a| a.label == "View PR" && a.url == "https://github.com/org/repo/pull/42"));
+    assert!(hc.actions.iter().any(|a| a.label == "Merge · Open in Teams"));
+
+    // 4. Malformed card falls back cleanly to Unsupported (never a blank row)
+    let broken = world.message(&general, "1760000801004").unwrap();
+    assert!(broken.card.is_none());
+    assert_eq!(broken.text, "Card");
+    assert!(matches!(broken.kind, MessageKind::Unsupported { ref link } if link.contains("1760000801004")));
+}
+
+#[test]
+fn channel_post_subject_announcements_moderation_and_threads_layout() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+
+    // 1. Account advertises channel_subject capability.
+    assert!(world.account(HOME).can.channel_subject);
+
+    // 2. Sending a channel post with a subject emits properties.subject and bolds the first line.
+    let client_id = "1760000999000617";
+    let req = Request::Send {
+        conversation: general.clone(),
+        client_id: client_id.to_owned(),
+        text: "Deployment window is Friday 10:00 UTC.".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            subject: Some("Maintenance window".to_owned()),
+            ..protocol::Outgoing::default()
+        },
+    };
+    assert!(matches!(world.ask(req), Response::Sent { .. }));
+    let sent = world.until("channel post with subject accepted", || {
+        world.messages(&general).into_iter().find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.text, "Maintenance window\nDeployment window is Friday 10:00 UTC.");
+    assert!(ranges(&sent).contains(&("Maintenance window", &Style::Bold)));
+    let posted = world.fake.calls("POST", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages")).pop().unwrap();
+    assert_eq!(posted.json()["properties"]["subject"].as_str(), Some("Maintenance window"));
+
+    // 3. Moderated channel 403 refusal surfaces a clear moderation message.
+    let mod_id = "1760000999000618";
+    world.send(&general, mod_id, "moderated post");
+    let refused = world.until("moderated post refusal", || {
+        world.message(&general, mod_id).filter(|m| m.state != SendState::Pending)
+    });
+    assert_eq!(
+        refused.state,
+        SendState::Failed { reason: "Only channel moderators can start new posts here.".to_owned() }
+    );
+
+    // 4. Announcement post extracts headline + subhead, treats banner as decoration, marks row.
+    let mut ann = message(GENERAL, Some("1760000810001"), 1_760_000_810_001, ANA, "Ana Ruiz", "<p>All hands at 14:00.</p>");
+    ann["properties"] = json!({
+        "cardType": "announcement",
+        "title": "Q4 Town Hall",
+        "subject": "Engineering & Product",
+        "bannerColor": "#5B5FC7",
+        "bannerImage": "https://external.example/banner.jpg"
+    });
+    world.fake.push("NewMessage", ann, false);
+    let stored_ann = world.until("announcement to arrive", || world.message(&general, "1760000810001"));
+    assert!(stored_ann.announcement);
+    assert_eq!(stored_ann.kind, MessageKind::Normal);
+    assert_eq!(stored_ann.text, "Q4 Town Hall\nEngineering & Product\nAll hands at 14:00.");
+    assert!(ranges(&stored_ann).contains(&("Q4 Town Hall", &Style::Bold)));
+    assert!(ranges(&stored_ann).contains(&("Engineering & Product", &Style::Italic)));
+    assert!(stored_ann.attachments.is_empty(), "announcement banner is decoration only");
+
+    // 5. Threads-layout channel reply using rootMessageId (without ;messageid= in conversationLink)
+    // still maps to the post's reply chain.
+    let mut threaded_reply = message(GENERAL, None, 1_760_000_810_050, BEN, "Ben Okafor", "<p>Count me in!</p>");
+    threaded_reply["rootMessageId"] = json!("1760000810001");
+    world.fake.push("NewMessage", threaded_reply, false);
+    let ann_with_reply = world.until("announcement thread summary", || {
+        world.message(&general, "1760000810001").filter(|m| m.thread.as_ref().is_some_and(|t| t.replies == 1))
+    });
+    assert_eq!(ann_with_reply.thread.unwrap().replies, 1);
+    let ann_chain = key(&format!("{GENERAL};messageid=1760000810001"));
+    assert_eq!(world.messages(&ann_chain).last().map(|m| m.text.as_str()), Some("Count me in!"));
+}
+
+#[test]
+fn forwarded_messages_are_read_with_origin_metadata_and_forwarded_to_multiple_chats() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    let ana = key(CHAT_ANA);
+    let grp1 = key("19:grp1@thread.v2");
+    world.open(&general, 6);
+    world.open(&ana, 3);
+
+    // 1. Account advertises native forward capability.
+    assert!(world.account(HOME).can.forward);
+
+    // 2. Receiving a forwarded Teams message maps original sender, conversation, link, note, and body.
+    let orig_link = format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000100100?tenantId={HOME}");
+    let mut inbound = message(
+        CHAT_ANA,
+        None,
+        1_760_000_820_001,
+        ANA,
+        "Ana Ruiz",
+        &format!(
+            "<p>FYI see below</p>\
+             <blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Forward\" itemid=\"1760000100100\">\
+             <strong itemprop=\"mri\" itemid=\"{BEN}\">Ben Okafor</strong>\
+             <span itemprop=\"time\" itemid=\"1760000100100\"></span>\
+             <span itemprop=\"conversation\">General</span>\
+             <a itemprop=\"sourceLink\" href=\"{orig_link}\"></a>\
+             <p itemprop=\"preview\">Deploy is scheduled for 16:00.</p></blockquote>"
+        ),
+    );
+    inbound["properties"] = json!({
+        "forwardedMessage": json!({
+            "originalMessageId": "1760000100100",
+            "originalConversationId": GENERAL,
+            "originalConversationTitle": "General",
+            "originalSenderDisplayName": "Ben Okafor",
+            "originalArrivalTime": 1_760_000_100_100u64,
+            "deepLink": orig_link,
+        }).to_string()
+    });
+    world.fake.push("NewMessage", inbound, false);
+    let received = world.until("forwarded message to arrive", || world.message(&ana, "1760000820001"));
+    assert_eq!(received.text, "FYI see below\nDeploy is scheduled for 16:00.");
+    let fwd = received.forwarded.as_deref().expect("Message::forwarded populated");
+    assert_eq!(fwd.from_title, "Ben Okafor");
+    assert_eq!(fwd.from_space, "General");
+    assert_eq!(fwd.link, orig_link);
+
+    // 3. Forwarding a message with a shared file to two chats sends forward markup, optional note,
+    // and preserves file references without re-uploading to OneDrive.
+    let uploads_before = world.fake.calls("POST", ":/createUploadSession").len();
+    let req = Request::Forward {
+        from: general.clone(),
+        message_ids: vec!["1760000250250".to_owned()],
+        to: vec![ana.clone(), grp1.clone()],
+        note: "Sharing Q4 numbers".to_owned(),
+    };
+    let Response::Forwarded { results } = world.ask(req) else {
+        panic!("expected Response::Forwarded");
+    };
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.ok), "{results:?}");
+    assert_eq!(world.fake.calls("POST", ":/createUploadSession").len(), uploads_before, "forwarded files must not be re-uploaded");
+
+    for target_id in [CHAT_ANA, "19:grp1@thread.v2"] {
+        let sent = world
+            .fake
+            .calls("POST", &format!("/chat/v1/users/ME/conversations/{target_id}/messages"))
+            .pop()
+            .expect("forwarded post reached target");
+        let body = sent.json();
+        let html = body["content"].as_str().unwrap_or("");
+        assert!(html.contains("Sharing Q4 numbers"), "{html}");
+        assert!(html.contains("http://schema.skype.com/Forward"), "{html}");
+        assert!(html.contains("Ana Ruiz"), "{html}");
+        assert!(html.contains("Numbers are in"), "{html}");
+        assert!(body["properties"]["forwardedMessage"].as_str().is_some(), "forwardedMessage property present");
+        let files: Vec<Value> = serde_json::from_str(body["properties"]["files"].as_str().expect("preserved files property")).unwrap();
+        assert_eq!(files[0]["fileName"].as_str(), Some("Q4 plan.xlsx"));
+    }
+}
+
+#[test]
+fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises importance capability.
+    assert!(world.account(HOME).can.importance);
+
+    // 2. Receive Normal, Important (`high`), and Urgent (`urgent`) fixtures.
+    let fixtures = world.fake.fixture("importance").expect("importance fixture");
+    for kind in ["normal", "important", "urgent"] {
+        world.fake.push("NewMessage", fixtures[kind].clone(), false);
+    }
+    world.until("all three importance fixtures", || {
+        let msgs = world.messages(&ana);
+        ["1760000830001", "1760000830002", "1760000830003"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+    assert_eq!(world.message(&ana, "1760000830001").unwrap().importance, protocol::Importance::Normal);
+    assert_eq!(world.message(&ana, "1760000830002").unwrap().importance, protocol::Importance::Important);
+    assert_eq!(world.message(&ana, "1760000830003").unwrap().importance, protocol::Importance::Urgent);
+
+    // 3. Send Important and Urgent messages and verify properties.importance on the wire.
+    let send_with_imp = |client_id: &str, text: &str, importance: protocol::Importance| {
+        let req = Request::Send {
+            conversation: ana.clone(),
+            client_id: client_id.to_owned(),
+            text: text.to_owned(),
+            reply_to: None,
+            with: protocol::Outgoing { importance, ..protocol::Outgoing::default() },
+        };
+        assert!(matches!(world.ask(req), Response::Sent { .. }));
+        world.until("sent message accepted", || {
+            world
+                .messages(&ana)
+                .into_iter()
+                .find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+        })
+    };
+
+    let imp_msg = send_with_imp("1760000999000627", "Review before EOD", protocol::Importance::Important);
+    assert_eq!(imp_msg.importance, protocol::Importance::Important);
+    let imp_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000627")
+        .expect("important POST");
+    assert_eq!(imp_call.json()["properties"]["importance"].as_str(), Some("high"));
+
+    let urg_msg = send_with_imp("1760000999000628", "Site down!", protocol::Importance::Urgent);
+    assert_eq!(urg_msg.importance, protocol::Importance::Urgent);
+    let urg_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000628")
+        .expect("urgent POST");
+    assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
+}
+

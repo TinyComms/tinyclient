@@ -211,6 +211,20 @@ fn placeholder(title: &str, thread: bool) -> String {
     }
 }
 
+fn placeholder_for(target: &Target, thread: bool, replying: bool) -> String {
+    if thread {
+        "Reply in thread".to_owned()
+    } else if target.key.network == Network::Teams && target.kind == ConversationKind::Channel {
+        if replying {
+            "Reply to post".to_owned()
+        } else {
+            format!("Start a new post in {}", target.title)
+        }
+    } else {
+        placeholder(&target.title, false)
+    }
+}
+
 /// Slack has no reply outside a thread, so its composer has no reply mode.
 fn replies_inline(network: Network) -> bool {
     network != Network::Slack
@@ -310,6 +324,7 @@ impl Target {
 #[derive(Clone, Default)]
 struct Draft {
     text: String,
+    subject: String,
     tokens: Vec<Token>,
     files: Vec<Staged>,
     /// A refusal or note that belongs to this conversation, shown again on the way back.
@@ -495,6 +510,7 @@ struct Anchors {
 
 pub struct Composer {
     input: Entity<TextInput>,
+    subject: Entity<TextInput>,
     typing: Entity<TypingRow>,
     shell: WeakEntity<Shell>,
     hub: Hub,
@@ -593,6 +609,14 @@ impl Composer {
             field.set_checking(true);
             field
         });
+        let subject = cx.new(|cx| TextInput::new("Add a subject (optional)", cx));
+        cx.subscribe(&subject, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Submit) {
+                this.focus_next = true;
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Submit => this.send(false, cx),
             InputEvent::Changed => this.typed(cx),
@@ -625,6 +649,7 @@ impl Composer {
         }
         Composer {
             input,
+            subject,
             typing: cx.new(|_| TypingRow::new(hub.clone())),
             shell,
             hub,
@@ -737,7 +762,7 @@ impl Composer {
             }
         }
         if moved || renamed {
-            let hint = placeholder(&target.title, self.thread);
+            let hint = placeholder_for(&target, self.thread, self.reply.is_some());
             self.input.update(cx, |input, cx| {
                 input.set_placeholder(hint);
                 cx.notify();
@@ -767,7 +792,7 @@ impl Composer {
         let Some(old) = self.target.as_ref().map(|old| old.key.clone()) else {
             return;
         };
-        let draft = Draft { text: draft_text(self.input.read(cx).text()), tokens: self.tokens.clone(), files,
+        let draft = Draft { text: draft_text(self.input.read(cx).text()), subject: self.subject.read(cx).text().trim().to_owned(), tokens: self.tokens.clone(), files,
             note: self.caption.clone(), reply: self.reply.take(), };
         self.remember(old, draft);
     }
@@ -795,6 +820,7 @@ impl Composer {
             input.set_text(&draft.text, cx);
             input.set_highlights(highlights, cx);
         });
+        self.subject.update(cx, |input, cx| input.set_text(&draft.subject, cx));
         self.close_list(cx);
         self.dismissed = None;
         self.colon_dismissed = None;
@@ -888,7 +914,9 @@ impl Composer {
             self.schedule_day = None;
         } else if self.editing.is_some() {
             self.end_edit(cx);
-        } else if self.reply.take().is_none() {
+        } else if self.reply.take().is_some() {
+            self.refresh_placeholder(cx);
+        } else {
             // Nothing of the composer's own is up: the next step of the ladder is the window's
             // (a thread, a card), and the composer keeps its focus.
             let shell = self.shell.clone();
@@ -991,6 +1019,10 @@ impl Composer {
             }
         };
         let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
+        let subject = self
+            .show_subject()
+            .then(|| self.subject.read(cx).text().trim().to_owned())
+            .filter(|s| !s.is_empty());
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
@@ -1006,6 +1038,7 @@ impl Composer {
             effect: if controls.effects { self.effect.clone() } else { None },
             contact: None,
             send_as: self.send_as.get(&target.key).cloned(),
+            subject,
         };
         self.importance = protocol::Importance::Normal;
         self.broadcast = false;
@@ -1339,6 +1372,7 @@ impl Composer {
                 draft.files.retain(|chip| !out.chips.contains(&chip.id));
                 if !keep {
                     draft.text.clear();
+                    draft.subject.clear();
                     draft.tokens.clear();
                     draft.note = None;
                 }
@@ -1350,6 +1384,7 @@ impl Composer {
         }
         self.caption = None;
         self.reply = None;
+        self.refresh_placeholder(cx);
         if out.field.is_empty() && out.chips.is_empty() {
             // A GIF or sticker: what was typed is the next message.
             return;
@@ -1394,10 +1429,17 @@ impl Composer {
             return;
         }
         self.follow_text(cx);
-        let mut draft = Draft { text: self.input.read(cx).text().to_owned(), tokens: self.tokens.clone(), reply: self.reply.take(), ..Draft::default() };
+        let mut draft = Draft {
+            text: self.input.read(cx).text().to_owned(),
+            subject: self.subject.read(cx).text().trim().to_owned(),
+            tokens: self.tokens.clone(),
+            reply: self.reply.take(),
+            ..Draft::default()
+        };
         put_back(&mut draft, typed, note);
         self.set_field(&draft, cx);
         self.reply = draft.reply;
+        self.refresh_placeholder(cx);
         self.caption = draft.note;
         self.armed = None;
         self.draft_timer = None;
@@ -2126,6 +2168,16 @@ impl Composer {
         self.target.as_ref().is_some_and(|target| target.locked().is_none())
     }
 
+    fn refresh_placeholder(&mut self, cx: &mut Context<Self>) {
+        if let Some(target) = &self.target {
+            let hint = placeholder_for(target, self.thread, self.reply.is_some());
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder(hint);
+                cx.notify();
+            });
+        }
+    }
+
     // Reply and edit.
 
     fn reply_to(&mut self, message: &Message, cx: &mut Context<Self>) {
@@ -2137,6 +2189,7 @@ impl Composer {
         }
         self.end_edit(cx);
         self.reply = Some(Reply { id: message.id.clone(), name: message.sender.name.clone(), snippet: snippet(message) });
+        self.refresh_placeholder(cx);
         self.focus_next = true;
         cx.notify();
     }
@@ -2154,14 +2207,22 @@ impl Composer {
                 self.draft_timer = None;
                 self.follow_text(cx);
                 let files = std::mem::take(&mut self.tray);
-                (Draft { text: self.input.read(cx).text().to_owned(), tokens: self.tokens.clone(), files,
-                        note: self.caption.clone(), reply: None, }, self.reply.take())
+                (
+                    Draft {
+                        text: self.input.read(cx).text().to_owned(),
+                        subject: self.subject.read(cx).text().trim().to_owned(),
+                        tokens: self.tokens.clone(),
+                        files,
+                        note: self.caption.clone(),
+                        reply: None,
+                    },
+                    self.reply.take(),
+                )
             }
         };
         let (text, tokens) = mention::source(message);
         self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), stash, reply });
-        self.set_field(&Draft { text, tokens, files: Vec::new(),
-                note: None, reply: None, }, cx);
+        self.set_field(&Draft { text, subject: String::new(), tokens, files: Vec::new(), note: None, reply: None }, cx);
         self.close_picker(cx);
         self.caption = None;
         self.armed = None;
@@ -2184,7 +2245,7 @@ impl Composer {
                             if let Some(editing) = this.editing.as_mut() {
                                 editing.original = field.clone();
                             }
-                            this.set_field(&Draft { text: field, tokens, files: Vec::new(), note: None, reply: None }, cx);
+                            this.set_field(&Draft { text: field, subject: String::new(), tokens, files: Vec::new(), note: None, reply: None }, cx);
                             cx.notify();
                         }
                     });
@@ -2202,6 +2263,7 @@ impl Composer {
         self.set_field(&editing.stash, cx);
         self.tray = editing.stash.files;
         self.reply = editing.reply;
+        self.refresh_placeholder(cx);
         self.caption = None;
         cx.notify();
     }
@@ -2457,6 +2519,10 @@ impl Composer {
                     }
                 }
                 rows
+            }
+            (Ok(Response::Members { members, .. }), _) => {
+                self.hub.learn(&members);
+                complete::people(self.known(&target.key), members, &account, &trigger.query)
             }
             (Ok(Response::Conversations { conversations, .. }), Some(space)) => complete::channels(conversations, &account, space, &trigger.query),
             _ => Vec::new(),
@@ -2729,6 +2795,40 @@ impl Composer {
         Some(bar)
     }
 
+    fn show_subject(&self) -> bool {
+        self.controls().subject
+            && !self.thread
+            && self.reply.is_none()
+            && self.target.as_ref().is_some_and(|t| t.kind == ConversationKind::Channel && t.locked().is_none())
+    }
+
+    /// Optional one-line subject input inside the composer card for Teams channel posts.
+    fn subject_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.show_subject() {
+            return None;
+        }
+        let focus = self.subject.focus_handle(cx);
+        Some(
+            div()
+                .h(px(32.))
+                .flex_none()
+                .px(px(12.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .items_center()
+                .type_ui()
+                .font_weight(theme::SEMIBOLD)
+                .text_color(theme::text())
+                .cursor_text()
+                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&focus, cx);
+                })
+                .child(self.subject.clone()),
+        )
+    }
+
     /// The 32 pt bar inside the card that says what Return will do: reply, or save an edit.
     fn mode_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         // A phone's bar is the same line at the phone's run, 40 tall, its close a 36 pt target.
@@ -2768,6 +2868,7 @@ impl Composer {
                     this.end_edit(cx);
                 } else {
                     this.reply = None;
+                    this.refresh_placeholder(cx);
                 }
                 this.focus_next = true;
                 cx.notify();
@@ -3201,6 +3302,7 @@ impl Composer {
             // A click anywhere on the card is a click into the field.
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| window.focus(&focus, cx))
             .children(self.mode_bar(cx))
+            .children(self.subject_bar(cx))
             .children(self.tray(window, cx))
             .children(self.format_bar(cx))
             .child(row)
@@ -3524,8 +3626,14 @@ impl Composer {
     /// The states `--composer` names. Nothing here asks chatd for anything that changes it.
     #[cfg(feature = "gui-shot")]
     fn stage_flag(&mut self, cx: &mut Context<Self>) {
-        let field = |text: &str, tokens: Vec<Token>| Draft { text: text.to_owned(), tokens, files: Vec::new(),
-            note: None, reply: None, };
+        let field = |text: &str, tokens: Vec<Token>| Draft {
+            text: text.to_owned(),
+            subject: String::new(),
+            tokens,
+            files: Vec::new(),
+            note: None,
+            reply: None,
+        };
         let Some(target) = self.target.clone() else {
             return;
         };

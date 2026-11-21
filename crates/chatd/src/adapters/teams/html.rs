@@ -7,6 +7,7 @@ use protocol::{MediaFile, MentionKind, Span, Style};
 
 const MENTION: &str = "http://schema.skype.com/Mention";
 const REPLY: &str = "http://schema.skype.com/Reply";
+const FORWARD: &str = "http://schema.skype.com/Forward";
 const EMOJI: &str = "http://schema.skype.com/Emoji";
 const CUSTOM_EMOJI: &str = "http://schema.skype.com/CustomEmoji";
 const GIPHY: &str = "http://schema.skype.com/Giphy";
@@ -39,6 +40,18 @@ pub(super) struct Quote {
     pub preview: String,
 }
 
+/// A forwarded message block (`http://schema.skype.com/Forward`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ForwardQuote {
+    pub id: String,
+    pub mri: String,
+    pub name: String,
+    pub time: String,
+    pub conversation: String,
+    pub link: String,
+    pub preview: String,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Parsed {
     pub text: String,
@@ -47,6 +60,7 @@ pub(super) struct Parsed {
     /// GIFs from Teams' Giphy button, on Giphy's own host.
     pub gifs: Vec<Image>,
     pub quote: Option<Quote>,
+    pub forward: Option<ForwardQuote>,
     /// It holds a card or another object that is not text.
     pub card: bool,
     /// A mention in it named us.
@@ -183,11 +197,12 @@ fn next(rest: &str) -> Option<(Token<'_>, &str)> {
     Some((Token::Text(&rest[..end]), &rest[end..]))
 }
 
-/// Where text goes while a quoted reply's header is being read.
+/// Where text goes while a quoted reply's or forwarded block's header is being read.
 #[derive(Clone, Copy, PartialEq)]
 enum Field {
     Name,
     Preview,
+    Conversation,
     Nowhere,
 }
 
@@ -199,8 +214,10 @@ struct Element {
     style: Option<Style>,
     mention: bool,
     field: Option<Field>,
-    /// Ends a quoted reply, or something whose inside is not shown.
+    /// Ends a quoted reply, forwarded block, or something whose inside is not shown.
     hides: bool,
+    /// True when this element opened `self.forward`.
+    is_forward: bool,
     block: bool,
 }
 
@@ -215,6 +232,7 @@ struct Builder<'a> {
     /// Inside something not shown.
     hidden: u32,
     quote: Option<Quote>,
+    forward: Option<ForwardQuote>,
 }
 
 const BLOCKS: &[&str] = &[
@@ -284,6 +302,20 @@ impl Builder<'_> {
             }
             return;
         }
+        if let Some(forward) = &mut self.forward {
+            match self.open.iter().rev().find_map(|element| element.field) {
+                Some(Field::Name) => forward.name.push_str(text),
+                Some(Field::Conversation) => forward.conversation.push_str(text),
+                Some(Field::Nowhere) => {}
+                Some(Field::Preview) | None => {
+                    if !forward.preview.is_empty() && !forward.preview.ends_with([' ', '\n']) && text.starts_with(|c: char| !c.is_whitespace()) {
+                        // Preserve spacing between separate blocks inside a forwarded body.
+                    }
+                    forward.preview.push_str(text);
+                }
+            }
+            return;
+        }
         if self.hidden > 0 {
             return;
         }
@@ -334,7 +366,7 @@ impl Builder<'_> {
             }
             return;
         }
-        if self.quote.is_some() || self.hidden > 0 {
+        if self.quote.is_some() || self.forward.is_some() || self.hidden > 0 {
             return;
         }
         if kind == GIPHY && giphy(src) {
@@ -382,9 +414,14 @@ impl Builder<'_> {
         }
         let kind = attr(attrs, "itemtype");
         match name.as_str() {
-            "br" if self.quote.is_none() && self.hidden == 0 => {
+            "br" if self.quote.is_none() && self.forward.is_none() && self.hidden == 0 => {
                 self.due = false;
                 self.out.text.push('\n');
+            }
+            "br" if self.forward.is_some() => {
+                if let Some(forward) = &mut self.forward {
+                    forward.preview.push('\n');
+                }
             }
             "img" => self.image(attrs),
             // A cell after the first on its row.
@@ -401,6 +438,7 @@ impl Builder<'_> {
             mention: false,
             field: None,
             hides: false,
+            is_forward: false,
             block,
             tag: name,
         };
@@ -415,6 +453,49 @@ impl Builder<'_> {
                 "preview" => Some(Field::Preview),
                 "time" => Some(Field::Nowhere),
                 _ => None,
+            };
+            self.open.push(element);
+            return;
+        }
+        if let Some(forward) = &mut self.forward {
+            element.field = match attr(attrs, "itemprop").to_ascii_lowercase().as_str() {
+                "mri" => {
+                    let mri = attr(attrs, "itemid");
+                    if !mri.is_empty() {
+                        forward.mri = mri.to_owned();
+                    }
+                    Some(Field::Name)
+                }
+                "time" => {
+                    let t = attr(attrs, "itemid");
+                    if !t.is_empty() {
+                        forward.time = t.to_owned();
+                    }
+                    Some(Field::Nowhere)
+                }
+                "conversation" | "conversationtitle" => Some(Field::Conversation),
+                "sourcelink" | "link" => {
+                    let href = attr(attrs, "href");
+                    if linkable(href) {
+                        forward.link = href.to_owned();
+                    }
+                    Some(Field::Nowhere)
+                }
+                "preview" => {
+                    if !forward.preview.is_empty() && !forward.preview.ends_with('\n') {
+                        forward.preview.push('\n');
+                    }
+                    Some(Field::Preview)
+                }
+                _ => {
+                    if element.tag == "a" && forward.link.is_empty() {
+                        let href = attr(attrs, "href");
+                        if linkable(href) && href.contains("/l/message/") {
+                            forward.link = href.to_owned();
+                        }
+                    }
+                    None
+                }
             };
             self.open.push(element);
             return;
@@ -441,6 +522,15 @@ impl Builder<'_> {
                     ..Quote::default()
                 });
                 element.hides = true;
+                None
+            }
+            "blockquote" | "div" if kind == FORWARD => {
+                self.forward = Some(ForwardQuote {
+                    id: attr(attrs, "itemid").to_owned(),
+                    ..ForwardQuote::default()
+                });
+                element.hides = true;
+                element.is_forward = true;
                 None
             }
             "blockquote" => Some(Style::Quote),
@@ -477,11 +567,27 @@ impl Builder<'_> {
                 return;
             };
             if element.hides {
-                match self.quote.take() {
-                    Some(quote) if element.tag == "blockquote" => self.out.quote = Some(quote),
-                    quote => {
-                        self.quote = quote;
-                        self.hidden = self.hidden.saturating_sub(1);
+                if element.is_forward {
+                    if let Some(fwd) = self.forward.take() {
+                        match &mut self.out.forward {
+                            Some(existing) => {
+                                if !fwd.preview.trim().is_empty() {
+                                    if !existing.preview.is_empty() {
+                                        existing.preview.push('\n');
+                                    }
+                                    existing.preview.push_str(fwd.preview.trim());
+                                }
+                            }
+                            None => self.out.forward = Some(fwd),
+                        }
+                    }
+                } else {
+                    match self.quote.take() {
+                        Some(quote) if element.tag == "blockquote" => self.out.quote = Some(quote),
+                        quote => {
+                            self.quote = quote;
+                            self.hidden = self.hidden.saturating_sub(1);
+                        }
                     }
                 }
             }
@@ -534,6 +640,11 @@ impl Builder<'_> {
             quote.name = quote.name.trim().to_owned();
             quote.preview = quote.preview.trim().to_owned();
         }
+        if let Some(forward) = &mut self.out.forward {
+            forward.name = forward.name.trim().to_owned();
+            forward.conversation = forward.conversation.trim().to_owned();
+            forward.preview = forward.preview.trim().to_owned();
+        }
         self.out
     }
 }
@@ -572,6 +683,7 @@ pub(super) fn parse(html: &str, lookup: &dyn Lookup, me: &str) -> Parsed {
         verbatim: 0,
         hidden: 0,
         quote: None,
+        forward: None,
     };
     let mut rest = html;
     let mut text = String::new();

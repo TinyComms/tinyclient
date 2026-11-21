@@ -50,11 +50,16 @@ impl World {
     }
 
     fn start(session: Option<&str>) -> World {
+        World::start_with_setup(session, |_| {})
+    }
+
+    fn start_with_setup(session: Option<&str>, setup: impl FnOnce(&std::path::Path)) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // On Windows "/tmp" has no drive; chatd takes only absolute paths.
         let dir = std::path::absolute(format!("/tmp/tinyclient-sg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        setup(&dir);
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
         command
@@ -2183,4 +2188,486 @@ fn call_links_are_redacted_render_join_cards_and_can_be_created_synced_joined_an
     };
     assert_eq!(del, "deleted");
     world.heard("call-link-delete");
+}
+
+#[test]
+fn storage_service_manifest_seeds_contacts_groups_pins_archive_and_mutes_on_first_connect() {
+    let club_hex = CLUB.strip_prefix("g.").unwrap();
+    let far_future: u64 = 4_102_444_800_000;
+    let manifest = format!(
+        r#"{{
+            "contacts": [
+                {{"aci":"{GRACE}","name":"Grace Ombra","nickname":"Gracie","note":"Bridge partner","phone":"+15550100002","username":"grace.42","whitelisted":true}},
+                {{"aci":"{ALAN}","name":"Alan Ferro","archived":true,"muted_until":{far_future},"whitelisted":true}}
+            ],
+            "groups": [
+                {{"id":"{club_hex}","title":"Bridge club","whitelisted":true}}
+            ],
+            "account": {{
+                "pinned": ["{GRACE}"],
+                "keep_muted_archived": true,
+                "link_previews": true,
+                "universal_expire_timer": 3600
+            }}
+        }}"#
+    );
+    let world = World::start_with_setup(Some(SESSION), |dir| {
+        std::fs::write(dir.join("signal.storage.json"), &manifest).unwrap();
+    });
+    world.connected();
+
+    // All 3 conversations (2 contacts + 1 group) are seeded on first connect with NO messages.
+    let grace = world.until("Grace seeded and pinned", || {
+        let row = world.conversation(GRACE)?;
+        (row.title == "Gracie" && row.pin == Some(0)).then_some(row)
+    });
+    assert_eq!(grace.kind, ConversationKind::Direct);
+    assert!(world.messages(GRACE).is_empty());
+
+    let alan = world.until("Alan seeded archived and muted", || {
+        let row = world.conversation(ALAN)?;
+        (row.archived && row.muted).then_some(row)
+    });
+    assert_eq!(alan.title, "Alan Ferro");
+    assert!(world.messages(ALAN).is_empty());
+
+    let club = world.conversation(CLUB).expect("group seeded on first connect");
+    assert_eq!(club.title, "Bridge club");
+    assert!(world.messages(CLUB).is_empty());
+
+    // Re-fetching an updated manifest (simulating SyncMessage.fetchLatest StorageManifest) updates pins and nicknames.
+    let updated = format!(
+        r#"{{"contacts":[{{"aci":"{GRACE}","name":"Grace Ombra","nickname":"G. Ombra","whitelisted":true}}],"groups":[{{"id":"{club_hex}","title":"Bridge club","whitelisted":true}}],"account":{{"pinned":["{CLUB}"]}}}}"#
+    );
+    world.steer(&format!("storage-manifest {updated}"));
+    world.until("updated manifest moved pin to club and updated nickname", || {
+        let g = world.conversation(GRACE)?;
+        let c = world.conversation(CLUB)?;
+        (g.title == "G. Ombra" && g.pin.is_none() && c.pin == Some(0)).then_some(())
+    });
+}
+
+#[test]
+fn safety_number_change_writes_system_rows_and_blocks_verified_send_until_approved() {
+    let world = World::linked();
+    world.connected();
+
+    // Mark Grace verified via the Handoff verify command; returns formatted 60-digit safety number
+    // (12 groups of 5 digits) and applies Mark::Verified to Grace's person row.
+    let before_digits = match world.ask(Request::Handoff {
+        conversation: key(&chatd::adapters::signal::safety_verify_command(GRACE)),
+    }) {
+        Response::Link { url } => url,
+        other => panic!("expected formatted safety number, got {other:?}"),
+    };
+    let groups: Vec<&str> = before_digits.split(' ').collect();
+    assert_eq!(groups.len(), 12, "expected 12 groups of 5 digits, got {before_digits:?}");
+    assert!(groups.iter().all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_digit())));
+
+    world.until("Grace gets Verified mark", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: None,
+            query: Some("Grace".into()),
+            offset: 0,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        let grace = people.iter().find(|p| p.key.id == GRACE)?;
+        (grace.mark == Some(protocol::Mark::Verified)).then_some(())
+    });
+
+    // Simulate Grace's identity key changing: system row appears in DM and shared group,
+    // Verified mark is removed, and sending to Grace is refused until approved.
+    world.steer("identity-change grace");
+    world.until("safety number change system line appears in DM and group", || {
+        let dm = world.messages(GRACE);
+        let grp = world.messages(CLUB);
+        let dm_has = dm.iter().any(|m| {
+            m.kind == MessageKind::System && m.text == "Your safety number with Grace Ombra has changed"
+        });
+        let grp_has = grp.iter().any(|m| {
+            m.kind == MessageKind::System && m.text == "Your safety number with Grace Ombra has changed"
+        });
+        (dm_has && grp_has).then_some(())
+    });
+    world.until("Grace Verified mark cleared after key change", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: None,
+            query: Some("Grace".into()),
+            offset: 0,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        let grace = people.iter().find(|p| p.key.id == GRACE)?;
+        grace.mark.is_none().then_some(())
+    });
+
+    // Sending to Grace while changed & unapproved must be refused.
+    world.send(GRACE, "blocked-id-1", "secret before approval", None);
+    let failed = world.until("send refused while identity change unapproved", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("blocked-id-1") && matches!(m.state, SendState::Failed { .. }))
+    });
+    let SendState::Failed { reason } = failed.state else {
+        unreachable!();
+    };
+    assert!(
+        reason.to_lowercase().contains("safety number"),
+        "expected safety number refusal, got: {reason}"
+    );
+
+    // Approve the new safety number: returns new 60-digit safety number (different from before),
+    // clears the send block, and allows sending again.
+    let after_digits = match world.ask(Request::Handoff {
+        conversation: key(&chatd::adapters::signal::safety_approve_command(GRACE)),
+    }) {
+        Response::Link { url } => url,
+        other => panic!("expected approved safety number, got {other:?}"),
+    };
+    assert_ne!(before_digits, after_digits, "rotated key must produce a different safety number");
+
+    world.send(GRACE, "allowed-id-2", "after approval", None);
+    world.until("send succeeds after approval", || {
+        world
+            .messages(GRACE)
+            .iter()
+            .any(|m| m.text == "after approval" && m.id != "allowed-id-2" && matches!(m.state, SendState::Sent))
+            .then_some(())
+    });
+    assert!(world.calls().contains(&format!("verify {GRACE} verified")));
+    assert!(world.calls().contains(&format!("verify {GRACE} default")));
+}
+
+#[test]
+fn person_profile_returns_about_badges_masked_phone_username_shared_groups_nickname_note_and_safety_number() {
+    const STRANGER: &str = "d4d4d4d4-0000-4000-8000-000000000004";
+    let manifest = format!(
+        r#"{{"contacts":[{{"aci":"{GRACE}","name":"Grace Ombra","nickname":"Bridge Grace","note":"Always opens 1NT","phone":"+15550100002","whitelisted":true}},{{"aci":"{STRANGER}","name":"","whitelisted":false}}],"groups":[{{"id":"{CLUB_HEX}","title":"Bridge club","whitelisted":true}}]}}"#,
+        CLUB_HEX = CLUB.trim_start_matches("g.")
+    );
+    let world = World::start_with_setup(Some(SESSION), |support| {
+        std::fs::write(support.join("signal.storage.json"), &manifest).unwrap();
+    });
+    world.connected();
+
+    // Learn Grace's username via username lookup so it is stored and surfaced in her profile.
+    world.steer(&format!("lookup grace.42 {GRACE}"));
+    let (_, seq) = world.status();
+    let _ = world.ask(Request::People {
+        network: Some(Network::Signal),
+        relation: None,
+        query: Some("grace.42".into()),
+        offset: 0,
+        limit: 10,
+    });
+    world.changed(seq, "grace.42 lookup to finish", |change| match change {
+        Change::Searched { query, .. } if query == "grace.42" => Some(()),
+        _ => None,
+    });
+
+    // Fetch Grace's full profile.
+    let Response::Profile { profile } = world.ask(Request::Profile {
+        person: key(GRACE),
+        space: None,
+    }) else {
+        panic!("expected Response::Profile for Grace");
+    };
+    assert!(profile.bio.contains("Likes bridge"), "expected decrypted about in bio: {:?}", profile.bio);
+    assert!(profile.bio.contains("🃏"), "expected about emoji in bio: {:?}", profile.bio);
+    assert_eq!(profile.nickname, "Bridge Grace");
+    assert_eq!(profile.note, "Always opens 1NT");
+    assert_eq!(profile.person.name, "Bridge Grace", "nickname must be preferred over profile name");
+    assert_eq!(profile.person.handle, "grace.42");
+    assert!(
+        profile.contacts.iter().any(|c| c.kind == ContactKind::Phone && c.value == "+15550100002" && c.masked),
+        "expected masked phone number in profile contacts: {:?}",
+        profile.contacts
+    );
+    assert!(
+        profile.mutual_spaces.iter().any(|s| s == "Bridge club"),
+        "expected shared group Bridge club: {:?}",
+        profile.mutual_spaces
+    );
+    assert!(
+        profile.fields.iter().any(|(k, v)| k == "Badges" && v.contains("Sustainer")),
+        "expected Badges field: {:?}",
+        profile.fields
+    );
+    let safety = profile
+        .fields
+        .iter()
+        .find(|(k, _)| k == "Safety number")
+        .map(|(_, v)| v.as_str())
+        .expect("expected Safety number field");
+    assert_eq!(safety.split(' ').count(), 12);
+
+    // A stranger whose profile key is unknown shows "Name not shared yet" instead of an empty bug state.
+    let Response::Profile { profile: stranger } = world.ask(Request::Profile {
+        person: key(STRANGER),
+        space: None,
+    }) else {
+        panic!("expected Response::Profile for Stranger");
+    };
+    assert_eq!(stranger.bio, "Name not shared yet");
+}
+
+#[test]
+fn link_previews_render_on_receive_ignore_mismatched_urls_and_honor_setting_and_suppress_on_send() {
+    let world = World::linked();
+    world.connected();
+
+    // Receive: a preview whose URL appears in the message body populates Message::previews.
+    world.steer("preview grace 1791892810000 https://example.org/bridge | Bridge Rules | Contract bridge guide | Read https://example.org/bridge tonight");
+    let received = world.until("incoming preview message stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text.contains("https://example.org/bridge"))
+    });
+    assert_eq!(received.previews.len(), 1);
+    assert_eq!(received.previews[0].url, "https://example.org/bridge");
+    assert_eq!(received.previews[0].site, "example.org");
+    assert_eq!(received.previews[0].title, "Bridge Rules");
+    assert_eq!(received.previews[0].description, "Contract bridge guide");
+
+    // Receive: a preview whose URL does NOT appear in the body must be ignored.
+    world.steer("preview grace 1791892820000 https://evil.example.net/phish | Spoofed | Fake card | Check out https://example.org/safe");
+    let spoofed = world.until("mismatched preview message stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text.contains("https://example.org/safe"))
+    });
+    assert!(
+        spoofed.previews.is_empty(),
+        "preview whose URL is not in body must be ignored, got {:?}",
+        spoofed.previews
+    );
+
+    // Send with link previews enabled: fetches via Signal content proxy and attaches preview.
+    world.send(GRACE, "lp-send-1", "Look at https://rust-lang.org/news", None);
+    let sent_with_preview = world.until("outgoing preview echoed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text == "Look at https://rust-lang.org/news" && m.id != "lp-send-1")
+    });
+    assert_eq!(sent_with_preview.previews.len(), 1);
+    assert_eq!(sent_with_preview.previews[0].url, "https://rust-lang.org/news");
+    assert_eq!(sent_with_preview.previews[0].title, "Preview for rust-lang.org");
+    assert!(world.calls().contains(&"preview-fetch https://rust-lang.org/news".to_owned()));
+
+    // Send with composer remove chip (`suppress_embeds: true`): skips preview fetch and sends no preview.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "lp-send-2".into(),
+        text: "No card for https://suppressed.example.org/page".into(),
+        reply_to: None,
+        with: Outgoing {
+            suppress_embeds: true,
+            ..Outgoing::default()
+        },
+    });
+    let sent_suppressed = world.until("suppressed send stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text == "No card for https://suppressed.example.org/page" && m.id != "lp-send-2")
+    });
+    assert!(sent_suppressed.previews.is_empty());
+    assert!(!world.calls().iter().any(|c| c.contains("suppressed.example.org") && c.starts_with("preview-fetch")));
+
+    // Configuration sync disables "Generate link previews": subsequent sends fetch no preview.
+    world.steer("link-previews off");
+    world.until("capabilities drop suppress_embeds when link previews disabled", || {
+        let (accounts, _) = world.status();
+        let acct = accounts.iter().find(|a| a.key.network == Network::Signal)?;
+        (!acct.can.suppress_embeds).then_some(())
+    });
+    world.send(GRACE, "lp-send-3", "Setting off https://disabled.example.org/page", None);
+    let sent_disabled = world.until("disabled send stored", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text == "Setting off https://disabled.example.org/page" && m.id != "lp-send-3")
+    });
+    assert!(sent_disabled.previews.is_empty());
+    assert!(!world.calls().iter().any(|c| c.contains("disabled.example.org") && c.starts_with("preview-fetch")));
+}
+
+#[test]
+fn pinned_messages_serve_pinned_list_expire_and_respect_group_permissions() {
+    let world = World::linked();
+    world.connected();
+
+    // Grace sends two messages in DM.
+    world.steer("incoming grace 1791892810000 Important bridge schedule");
+    world.steer("incoming grace 1791892811000 Short-lived pin");
+    world.until("both incoming messages stored", || {
+        (world.messages(GRACE).len() >= 2).then_some(())
+    });
+
+    // Incoming pin from Grace (forever) emits system line and appears in Request::Pinned.
+    world.steer("pin-msg grace grace grace 1791892810000");
+    world.until("Grace pinned system line appears", || {
+        world
+            .messages(GRACE)
+            .iter()
+            .any(|m| m.kind == MessageKind::System && m.text == "Grace Ombra pinned a message")
+            .then_some(())
+    });
+    let Response::Pinned { messages, .. } = world.ask(Request::Pinned { conversation: key(GRACE) }) else {
+        panic!("expected Response::Pinned");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "Important bridge schedule");
+    assert!(messages[0].pinned);
+    assert_eq!(messages[0].pinned_by.as_deref(), Some("Grace Ombra"));
+
+    // Incoming expiring pin (1 second) appears and then drops once expired.
+    world.steer("pin-msg grace grace grace 1791892811000 1");
+    world.until("expiring pin recorded then expires", || {
+        let Response::Pinned { messages, .. } = world.ask(Request::Pinned { conversation: key(GRACE) }) else {
+            return None;
+        };
+        (messages.len() == 1
+            && messages[0].text == "Important bridge schedule"
+            && world.messages(GRACE).iter().filter(|m| m.text == "Grace Ombra pinned a message").count() >= 2)
+            .then_some(())
+    });
+
+    // Outgoing unpin removes it and logs unpin call on the wire.
+    let target_id = format!("1791892810000-{GRACE}");
+    assert!(matches!(
+        world.ask(Request::Pin {
+            conversation: key(GRACE),
+            message_id: target_id.clone(),
+            pinned: false,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    ));
+    assert!(world.calls().contains(&format!("send {GRACE} unpin {target_id}")));
+    let Response::Pinned { messages, .. } = world.ask(Request::Pinned { conversation: key(GRACE) }) else {
+        panic!("expected Response::Pinned");
+    };
+    assert!(messages.is_empty());
+
+    // Outgoing pin in DM works and logs pin call on the wire.
+    assert!(matches!(
+        world.ask(Request::Pin {
+            conversation: key(GRACE),
+            message_id: target_id.clone(),
+            pinned: true,
+            notify: true,
+            me_only: false,
+        }),
+        Response::Ok
+    ));
+    assert!(world.calls().contains(&format!("send {GRACE} pin {target_id} dur=forever")));
+
+    // Group permission enforcement: non-admin cannot pin when attributes=admin.
+    world.steer("group grace 1791892812000 Group announcement");
+    world.steer("group-role me member");
+    world.steer("group-access attributes=admin");
+    world.until("club updated with admin-only attributes", || {
+        let c = world.conversation(CLUB)?;
+        (!c.rights.pin && world.messages(CLUB).iter().any(|m| m.text == "Group announcement")).then_some(())
+    });
+    let group_msg_id = format!("1791892812000-{GRACE}");
+    let denied = world.ask(Request::Pin {
+        conversation: key(CLUB),
+        message_id: group_msg_id,
+        pinned: true,
+        notify: true,
+        me_only: false,
+    });
+    assert!(
+        matches!(&denied, Response::Error { detail, .. } if detail.to_lowercase().contains("admin")),
+        "expected admin permission refusal, got {denied:?}"
+    );
+}
+
+#[test]
+fn group_at_mentions_send_and_edit_as_ufffc_with_utf16_body_ranges_and_echo_names() {
+    let world = World::linked();
+    world.connected();
+
+    // Send "hi <@GRACE>" in the group: wire gets U+FFFC + Mention(GRACE):3+1, local echo reads "hi @Grace Ombra".
+    world.send(CLUB, "mention-1", &format!("hi <@{GRACE}>"), None);
+    let echoed = world.until("group mention echoed with resolved name", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.text == "hi @Grace Ombra" && m.id != "mention-1")
+    });
+    assert!(
+        echoed.spans.iter().any(|s| {
+            matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == GRACE)
+                && echoed.text.get(s.start as usize..s.end as usize) == Some("@Grace Ombra")
+        }),
+        "expected Style::Mention span on echoed message: {:?}",
+        echoed.spans
+    );
+    assert!(
+        world
+            .calls()
+            .contains(&format!("send {CLUB} text hi \u{FFFC} ranges=Mention({GRACE}):3+1")),
+        "expected wire body with U+FFFC and UTF-16 range, calls: {:?}",
+        world.calls()
+    );
+
+    // Non-ASCII surrogate-pair prefix: 🎉 (2 UTF-16 code units) + " hi " (4) => offset 6.
+    world.send(CLUB, "mention-2", &format!("🎉 hi <@{GRACE}>"), None);
+    world.until("emoji mention echoed", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.text == "🎉 hi @Grace Ombra" && m.id != "mention-2")
+    });
+    assert!(
+        world
+            .calls()
+            .contains(&format!("send {CLUB} text 🎉 hi \u{FFFC} ranges=Mention({GRACE}):6+1")),
+        "expected UTF-16 offset 6 after surrogate pair, calls: {:?}",
+        world.calls()
+    );
+
+    // Editing a message with <@ALAN> also sends U+FFFC + Mention(ALAN):8+1 and updates local echo.
+    let edit_resp = world.ask(Request::Edit {
+        conversation: key(CLUB),
+        message_id: echoed.id.clone(),
+        text: format!("updated <@{ALAN}>"),
+        spans: Vec::new(),
+    });
+    assert!(matches!(edit_resp, Response::Ok), "expected edit Ok, got {edit_resp:?}");
+    let edited = world.until("edited mention updated locally", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.id == echoed.id && m.text == "updated @Alan Ferro")
+    });
+    assert!(edited.edited);
+    assert!(
+        edited.spans.iter().any(|s| {
+            matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == ALAN)
+        }),
+        "expected Style::Mention span on edited message: {:?}",
+        edited.spans
+    );
+    let sent_ts = echoed.id.split('-').next().unwrap();
+    assert!(
+        world
+            .calls()
+            .contains(&format!("send {CLUB} edit {sent_ts} updated \u{FFFC} ranges=Mention({ALAN}):8+1")),
+        "expected edit wire body with U+FFFC and Mention(ALAN):8+1, calls: {:?}",
+        world.calls()
+    );
 }

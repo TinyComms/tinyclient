@@ -697,3 +697,32 @@ fn followed_thread_replies_and_keyword_hits_notify_unless_muted() {
     assert!(!posts(&values, &channel(), &message("Tom", "redeploying soon"), &now));
     assert!(!posts(&values, &Conversation { muted: true, ..channel() }, &message("Tom", "deploy now"), &now));
 }
+
+#[test]
+fn urgent_messages_bypass_conversation_mute_and_prefix_notifications() {
+    let mut values = Values::default();
+    let now = moment();
+    let muted_dm = Conversation { muted: true, ..dm() };
+
+    let normal = message("Ana", "ping");
+    let mut important = message("Ana", "need review");
+    important.importance = protocol::Importance::Important;
+    let mut urgent = message("Ana", "prod outage");
+    urgent.importance = protocol::Importance::Urgent;
+
+    assert!(!posts(&values, &muted_dm, &normal, &now));
+    assert!(!posts(&values, &muted_dm, &important, &now));
+    assert!(posts(&values, &muted_dm, &urgent, &now), "urgent messages bypass conversation mute");
+
+    // Notification body surfaces importance/urgent prefix.
+    set(&mut values, GLOBAL, settings::PREVIEW, "full");
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let verdict = decide(&values, &muted_dm, &urgent, &now).expect("urgent verdict");
+    notes.message(&muted_dm, &urgent, &verdict, Instant::now());
+    assert_eq!(fake.log().posted.last().unwrap().body, "URGENT: prod outage");
+
+    let imp_verdict = decide(&values, &dm(), &important, &now).expect("important verdict");
+    notes.message(&dm(), &important, &imp_verdict, Instant::now());
+    assert_eq!(fake.log().posted.last().unwrap().body, "URGENT: prod outage\nIMPORTANT: need review");
+}

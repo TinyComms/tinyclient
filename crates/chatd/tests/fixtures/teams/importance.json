@@ -1,0 +1,60 @@
+{
+  "normal": {
+    "id": "1760000830001",
+    "sequenceId": 831,
+    "clientmessageid": "1393744830001",
+    "version": "1760000830001",
+    "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+    "type": "Message",
+    "messagetype": "RichText/Html",
+    "contenttype": "text",
+    "content": "<p>Regular check-in</p>",
+    "amsreferences": [],
+    "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+    "imdisplayname": "Ana Ruiz",
+    "composetime": "2025-10-09T09:15:01.0000000Z",
+    "originalarrivaltime": "2025-10-09T09:15:01.0000000Z",
+    "properties": {}
+  },
+  "important": {
+    "id": "1760000830002",
+    "sequenceId": 832,
+    "clientmessageid": "1393744830002",
+    "version": "1760000830002",
+    "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+    "type": "Message",
+    "messagetype": "RichText/Html",
+    "contenttype": "text",
+    "content": "<p>Need sign-off before 5pm</p>",
+    "amsreferences": [],
+    "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+    "imdisplayname": "Ana Ruiz",
+    "composetime": "2025-10-09T09:15:02.0000000Z",
+    "originalarrivaltime": "2025-10-09T09:15:02.0000000Z",
+    "properties": {
+      "importance": "high"
+    }
+  },
+  "urgent": {
+    "id": "1760000830003",
+    "sequenceId": 833,
+    "clientmessageid": "1393744830003",
+    "version": "1760000830003",
+    "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+    "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+    "type": "Message",
+    "messagetype": "RichText/Html",
+    "contenttype": "text",
+    "content": "<p>Prod DB is down</p>",
+    "amsreferences": [],
+    "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+    "imdisplayname": "Ana Ruiz",
+    "composetime": "2025-10-09T09:15:03.0000000Z",
+    "originalarrivaltime": "2025-10-09T09:15:03.0000000Z",
+    "properties": {
+      "importance": "urgent"
+    }
+  }
+}

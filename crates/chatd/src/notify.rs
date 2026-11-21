@@ -137,7 +137,8 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
     if moment.watching.focused && moment.watching.conversation.as_ref() == Some(key) {
         return None;
     }
-    if !values.on(settings::NOTIFY) || conversation.muted || conversation.hidden || conversation.special == Special::Request {
+    let urgent = message.importance == protocol::Importance::Urgent;
+    if !values.on(settings::NOTIFY) || (conversation.muted && !urgent) || conversation.hidden || conversation.special == Special::Request {
         return None;
     }
     let mention = message.mentions_me;
@@ -149,14 +150,14 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
     let keyword_hit = !quiet_row && settings::keyword_matches(&message.text, &values.keywords());
     let wanted = match level {
         "off" => false,
-        "all" => mention || followed_thread || keyword_hit || !quiet_row,
+        "all" => mention || urgent || followed_thread || keyword_hit || !quiet_row,
         // Direct messages and mentions; a conversation set to mentions only means it.
         _ if values.stored(&settings::conversation_scope(key), settings::NOTIFY_ABOUT).is_some() => {
-            mention || followed_thread || keyword_hit
+            mention || urgent || followed_thread || keyword_hit
         }
-        _ => mention || followed_thread || keyword_hit || (conversation.kind.is_direct() && !quiet_row),
+        _ => mention || urgent || followed_thread || keyword_hit || (conversation.kind.is_direct() && !quiet_row),
     };
-    let kind_on = if followed_thread || keyword_hit {
+    let kind_on = if urgent || followed_thread || keyword_hit {
         true
     } else {
         match conversation.kind {
@@ -183,8 +184,8 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
         || moment.watching.focused
         || moment.sounded_here
         || moment.sounded_any;
-    let sound = Some(sound_word(values, key, mention || keyword_hit)).filter(|word| !silent && word != "none");
-    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention: mention || keyword_hit })
+    let sound = Some(sound_word(values, key, mention || urgent || keyword_hit)).filter(|word| !silent && word != "none");
+    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention: mention || urgent || keyword_hit })
 }
 
 /// Whether a reaction to one of my messages notifies. Respects mutes, focus, quiet hours,
@@ -369,7 +370,12 @@ impl Notes {
     pub fn message(&mut self, conversation: &Conversation, message: &Message, verdict: &Verdict, at: Instant) -> Option<String> {
         let key = &conversation.key;
         let group = self.groups.entry(key.clone()).or_insert_with(|| Group { lines: VecDeque::new(), mention: false, sounded: None });
-        let text = crate::store::preview_text(message);
+        let raw_text = crate::store::preview_text(message);
+        let text = match message.importance {
+            protocol::Importance::Urgent => format!("URGENT: {raw_text}"),
+            protocol::Importance::Important => format!("IMPORTANT: {raw_text}"),
+            protocol::Importance::Normal => raw_text,
+        };
         group.lines.push_back((message.sender.name.clone(), text));
         while group.lines.len() > LINES {
             group.lines.pop_front();
@@ -383,7 +389,12 @@ impl Notes {
             .map(|(sender, text)| if several { format!("{sender}: {text}") } else { text.clone() })
             .collect::<Vec<_>>()
             .join("\n");
-        let what = if group.mention { "New mention" } else { "New message" };
+        let what = match message.importance {
+            protocol::Importance::Urgent => "Urgent message",
+            protocol::Importance::Important => "Important message",
+            protocol::Importance::Normal if group.mention => "New mention",
+            protocol::Importance::Normal => "New message",
+        };
         let (title, subtitle, body) = match verdict.preview {
             Preview::Full => (newest.clone(), place(conversation), body),
             Preview::Sender => (newest.clone(), place(conversation), what.to_owned()),

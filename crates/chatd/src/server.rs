@@ -1430,6 +1430,7 @@ impl Chat {
             .collect();
         message.client_id = Some(client_id);
         message.spans = with.spans.clone();
+        message.importance = with.importance;
         let quoted = reply_to.and_then(|id| store.message(conversation, id).ok().flatten());
         message.reply_to = quoted.map(|quoted| protocol::ReplyTo {
             id: quoted.id,

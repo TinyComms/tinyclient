@@ -30,12 +30,20 @@ impl Teams {
             return;
         }
         if with.files.is_empty() {
-            // Text with optional mention spans and link-preview opt-out.
-            self.post_with_options(conversation, client_id, text, reply_to, &with.spans, with.suppress_embeds);
+            self.post_with_outgoing(conversation, client_id, text, reply_to, &with);
             return;
         }
-        let (teams, conversation_id, client, text, reply, spans, suppress) = (self.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned), with.spans, with.suppress_embeds);
-        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &spans, suppress, up));
+        let (teams, conversation_id, client, text, reply, outgoing) = (
+            self.clone(),
+            conversation.to_owned(),
+            client_id.to_owned(),
+            text.to_owned(),
+            reply_to.map(str::to_owned),
+            with.clone(),
+        );
+        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
+            teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &outgoing, up)
+        });
     }
 
     /// Schedules a text message for future delivery in a Teams chat.
@@ -55,7 +63,7 @@ impl Teams {
         let scheduled_iso = super::iso_utc(at);
         let props = json!({"scheduledTime": scheduled_iso});
         let mut message = self
-            .posted_with(conversation, client_id, text, reply_to, &with.spans, with.suppress_embeds, Some(props))
+            .posted_with(conversation, client_id, text, reply_to, with, Some(props))
             .map_err(super::reason)?;
         let raw_id = message.id.clone();
         self.state().scheduled.insert(raw_id.clone(), at);
@@ -68,7 +76,7 @@ impl Teams {
         upload::cancel(&self.ctx.account, client_id);
     }
 
-    fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[protocol::Span], suppress_embeds: bool, up: &mut Upload) -> Result<Message, String> {
+    fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
         let mut named = Vec::new();
         let mut attachments = Vec::new();
         for at in 0..up.files().len() {
@@ -78,7 +86,7 @@ impl Teams {
         }
         up.check()?;
         let properties = json!({"files": Value::Array(named).to_string()});
-        let mut message = self.posted_with(conversation, client_id, text, reply_to, spans, suppress_embeds, Some(properties)).map_err(super::reason)?;
+        let mut message = self.posted_with(conversation, client_id, text, reply_to, with, Some(properties)).map_err(super::reason)?;
         message.attachments = attachments;
         Ok(message)
     }

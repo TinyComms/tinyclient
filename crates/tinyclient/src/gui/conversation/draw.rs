@@ -847,7 +847,13 @@ impl Pane {
         let editing = !self.is_thread() && editing.as_deref() == Some(message.id.as_str());
         let selecting = self.multi_select.active;
         let ticked = selecting && self.multi_select.contains(&message.id);
-        let bar = if editing || ticked { Some(theme::accent()) } else { bar };
+        let bar = if editing || ticked {
+            Some(theme::accent())
+        } else if message.importance != protocol::Importance::Normal {
+            Some(theme::danger())
+        } else {
+            bar
+        };
         let owns = self.owns_overlay(&message.id);
 
         let gutter: Option<AnyElement> = Some(if head {
@@ -954,10 +960,28 @@ impl Pane {
                 None => sent.children(said).children(attached),
             };
             sent = sent
+                .children(message.announcement.then(|| {
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(theme::accent())
+                                .type_micro()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(theme::accent_text())
+                                .child("ANNOUNCEMENT"),
+                        )
+                }))
                 .children((message.importance != protocol::Importance::Normal).then(|| {
                     let (label, color) = match message.importance {
                         protocol::Importance::Urgent => ("URGENT", theme::danger()),
-                        protocol::Importance::Important => ("IMPORTANT", theme::warning()),
+                        protocol::Importance::Important => ("IMPORTANT", theme::danger()),
                         protocol::Importance::Normal => ("", theme::text_faint()),
                     };
                     div()
@@ -2327,6 +2351,31 @@ impl Pane {
                     .into_any_element()
             }
         });
+        let actions_el = (!card.actions.is_empty()).then(|| {
+            let buttons = card.actions.iter().enumerate().map(|(a_ix, action)| {
+                let url = action.url.clone();
+                div()
+                    .id(SharedString::from(format!("card-action-{}-{ix}-{a_ix}", message.id)))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(theme::R_CONTROL))
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .bg(theme::canvas())
+                    .type_small()
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()).underline())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    })
+                    .child(action.label.clone())
+            });
+            div().mt(px(4.)).flex().flex_wrap().gap(px(6.)).children(buttons)
+        });
         let words = div()
             .flex_1()
             .min_w_0()
@@ -2339,6 +2388,7 @@ impl Pane {
             .children(title_el)
             .children((!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone())))
             .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
+            .children(actions_el)
             .children(footer_el);
         let framed = div()
             // The column's width on a phone, so its wrapped words measure against it (`card`).

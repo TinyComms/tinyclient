@@ -1,0 +1,20 @@
+{
+  "id": "1760000840001",
+  "sequenceId": 841,
+  "clientmessageid": "1393744840001",
+  "version": "1760000840001",
+  "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "type": "Message",
+  "messagetype": "RichText/Html",
+  "contenttype": "text",
+  "content": "<p>See <a href=\"https://example.com/guide\">the guide</a> and <a href=\"https://contoso.sharepoint.com/:w:/s/Platform/Doc1\">Q4 Architecture.docx</a></p>",
+  "amsreferences": [],
+  "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+  "imdisplayname": "Ana Ruiz",
+  "composetime": "2025-10-09T09:16:01.0000000Z",
+  "originalarrivaltime": "2025-10-09T09:16:01.0000000Z",
+  "properties": {
+    "links": "[{\"@type\":\"http://schema.skype.com/Link\",\"itemid\":\"0\",\"url\":\"https://example.com/guide\",\"siteName\":\"Example Docs\",\"title\":\"Operations Guide\",\"description\":\"Runbook for weekly releases\",\"previewImage\":{\"url\":\"https://urlp.asm.skype.com/v1/url/content?img=guide\",\"width\":640,\"height\":320}},{\"@type\":\"http://schema.skype.com/Link\",\"itemid\":\"1\",\"url\":\"https://contoso.sharepoint.com/:w:/s/Platform/Doc1\",\"fileName\":\"Q4 Architecture.docx\",\"fileType\":\"docx\",\"siteName\":\"SharePoint\",\"itemType\":\"File\",\"previewImage\":{\"url\":\"https://external.example/track.png\"}}]"
+  }
+}

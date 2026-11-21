@@ -10,15 +10,17 @@ use super::vault::{self, Vault};
 use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
-    CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote, Text, Wire,
+    CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
+    Peer, PersonProfile, Quote, SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::groups_v2::{AccessControl, AccessRequired, Member, Role};
+use presage::libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use presage::libsignal_service::master_key::StorageServiceKey;
-use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, ProfileKey, PushService, ServiceCredentials, ServiceError, Uuid};
+use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, MasterKey, ProfileKey, PushService, ServiceCredentials, ServiceError, Uuid};
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::{AttachmentSpec, AttachmentUploadError, MessageSenderError};
@@ -32,12 +34,15 @@ use presage::model::messages::Received;
 use presage::proto::{
     account_record, addressable_message,
     body_range::{AssociatedValue, Style as RangeStyle},
-    call_message, chat_folder_record, conversation_identifier, data_message, receipt_message, recipient, storage_record, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
+    call_message, chat_folder_record, contact_record, conversation_identifier, data_message, receipt_message, recipient,
+    storage_record, sync_message, typing_message, verified, AddressableMessage, BodyRange, CallMessage,
     ConversationIdentifier, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage,
+    Verified,
 };
 use presage::store::{ContentsStore, StateStore};
 use presage::Manager;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -87,6 +92,9 @@ enum Ask {
     UpdateCallLink { root_key: [u8; 32], name: Option<String>, approve_all: Option<bool>, answer: Sender<Result<CallLink, Fault>> },
     DeleteCallLink { root_key: [u8; 32], answer: Sender<Result<(), Fault>> },
     JoinCallLink { url: String, answer: Sender<Result<CallLinkJoin, Fault>> },
+    SafetyNumber { aci: String, answer: Sender<Result<Option<SafetyNumber>, Fault>> },
+    SetVerified { aci: String, state: IdentityState, answer: Sender<Result<(), Fault>> },
+    PersonProfile { aci: String, answer: Sender<Result<PersonProfile, Fault>> },
 }
 
 pub struct Real {
@@ -272,6 +280,12 @@ fn fault<E: std::error::Error>(err: presage::Error<E>) -> Fault {
             "Signal wants to check this is a person. Send a message from Signal on your phone, then try again.".to_owned(),
         ),
         (_, Some(MessageSenderError::NotFound { .. })) => Fault::Refused("That person is no longer on Signal.".to_owned()),
+        (_, Some(MessageSenderError::UntrustedIdentity { .. }))
+        | (_, Some(MessageSenderError::ProtocolError(presage::libsignal_service::protocol::SignalProtocolError::UntrustedIdentity(_)))) => {
+            Fault::Refused(
+                "Your safety number with this contact has changed. Review and approve their safety number before sending.".to_owned(),
+            )
+        }
         (P::ServiceError(ServiceError::RateLimitExceeded { .. }), _) => Fault::Refused("Signal asked for a pause. Try again in a minute.".to_owned()),
         (P::UnknownGroup, _) => Fault::Refused("This group isn't one Signal still knows for you.".to_owned()),
         _ => Fault::Net(err.to_string()),
@@ -370,6 +384,8 @@ impl Real {
                     };
                     let aci = manager.registration_data().service_ids.aci.to_string();
                     let name = own_name(&mut manager).await.unwrap_or(fallback);
+                    let (id_tx, mut id_rx) = async_mpsc::unbounded_channel();
+                    vault.set_identity_change_sink(id_tx);
                     let mut wire = Session { manager, vault, me: aci.clone(), events, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new() };
                     let _ = ready.send(Ok((aci, name)));
                     wire.first_run().await;
@@ -380,6 +396,11 @@ impl Real {
                                 Some(received) => wire.received(received).await,
                                 None => break wire.why_closed().await,
                             },
+                            Some(changed_aci) = id_rx.recv() => {
+                                if super::wire::is_aci(&changed_aci) {
+                                    wire.tell(Event::IdentityChanged { peer: Peer::Direct(changed_aci) });
+                                }
+                            }
                             Some(ask) = asked.recv() => wire.ask(ask).await,
                             _ = &mut stopped => break Event::Closed("closed".to_owned()),
                         }
@@ -607,6 +628,24 @@ impl Wire for Real {
         self.ask(|answer| Ask::JoinCallLink { url: url.to_owned(), answer })
     }
 
+    fn safety_number(&self, aci: &str) -> Result<Option<SafetyNumber>, Fault> {
+        self.ask(|answer| Ask::SafetyNumber { aci: aci.to_owned(), answer })
+    }
+
+    fn set_verified(&self, aci: &str, state: IdentityState) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetVerified { aci: aci.to_owned(), state, answer })
+    }
+
+    fn person_profile(&self, aci: &str) -> Result<PersonProfile, Fault> {
+        self.ask(|answer| Ask::PersonProfile { aci: aci.to_owned(), answer })
+    }
+
+    /// Fetches link preview metadata and optional thumbnail STRICTLY through Signal's content
+    /// proxy (NEVER directly from chatd, preserving IP privacy parity with Signal Desktop).
+    fn fetch_link_preview(&self, url: &str) -> Result<Option<LinkPreview>, Fault> {
+        Ok(fetch_preview_via_signal_proxy(url))
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -710,17 +749,30 @@ impl Session {
         self.sync_storage().await;
     }
 
-    /// Reads Signal's encrypted Storage Service manifest and items (contact, group, account records)
-    /// to sync mute, archive, pin, mark-unread, blocked, and folder state from the phone.
+    /// Derives the account's read-only Storage Service key from the stored master key or account entropy pool.
+    async fn storage_key(&self) -> Option<StorageServiceKey> {
+        if let Ok(Some(master_key)) = self.vault.fetch_master_key().await {
+            return Some(StorageServiceKey::from_master_key(&master_key));
+        }
+        if let Ok(Some(aep)) = self.vault.fetch_account_entropy_pool().await {
+            if let Ok(master_key) = MasterKey::from_slice(aep.derive_svr_key().as_slice()) {
+                let _ = self.vault.store_master_key(Some(&master_key)).await;
+                return Some(StorageServiceKey::from_master_key(&master_key));
+            }
+        }
+        None
+    }
+
+    /// Reads Signal's encrypted Storage Service manifest and items (contact, group, account, folder records)
+    /// in read-only mode to seed contacts, groups, pins, archive, mutes, nicknames, notes, and settings.
     async fn sync_storage(&mut self) {
-        let Ok(Some(master_key)) = self.vault.fetch_master_key().await else {
+        let Some(storage_key) = self.storage_key().await else {
             return;
         };
         let Ok(credentials) = self.credentials() else {
             return;
         };
         let push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
-        let storage_key = StorageServiceKey::from_master_key(&master_key);
         let Ok(storage) = StorageService::new(push, storage_key).await else {
             return;
         };
@@ -735,9 +787,16 @@ impl Session {
         let Ok(records) = storage.read_items(keys, ikm).await else {
             return;
         };
-        let mut chats = Vec::new();
-        let mut pinned: Option<Vec<Peer>> = None;
-        let mut keep_muted_archived: Option<bool> = None;
+        let join_name = |given: &str, family: &str| -> String {
+            [given.trim(), family.trim()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut contacts = Vec::new();
+        let mut groups = Vec::new();
+        let mut account_record: Option<StorageAccount> = None;
         let mut folders = Vec::new();
         for record in records {
             match record.record {
@@ -755,57 +814,96 @@ impl Session {
                         } else {
                             self.blocked_acis.remove(&aci);
                         }
-                        chats.push(ChatState {
-                            peer: Peer::Direct(aci),
-                            muted_until: contact.muted_until_timestamp,
-                            dont_notify_for_mentions_if_muted: false,
-                            archived: contact.archived,
-                            marked_unread: contact.marked_unread,
+                        if let (Ok(uuid), Ok(pk_bytes)) = (Uuid::parse_str(&aci), <[u8; 32]>::try_from(contact.profile_key.as_slice())) {
+                            let _ = self.vault.upsert_profile_key(&uuid, ProfileKey::create(pk_bytes)).await;
+                        }
+                        let profile_name = join_name(&contact.given_name, &contact.family_name);
+                        let system_name = join_name(&contact.system_given_name, &contact.system_family_name);
+                        let name = if !profile_name.is_empty() { profile_name } else { system_name };
+                        let nickname = contact
+                            .nickname
+                            .as_ref()
+                            .map(|n| join_name(&n.given, &n.family))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| contact.system_nickname.trim().to_owned());
+                        let identity_state = match contact_record::IdentityState::try_from(contact.identity_state) {
+                            Ok(contact_record::IdentityState::Verified) => IdentityState::Verified,
+                            Ok(contact_record::IdentityState::Unverified) => IdentityState::Unverified,
+                            _ => IdentityState::Default,
+                        };
+                        self.vault.sync_storage_identity(&aci, identity_state, &contact.identity_key);
+                        contacts.push(StorageContact {
+                            aci,
+                            name,
+                            nickname,
+                            note: contact.note.trim().to_owned(),
+                            phone: contact.e164.trim().to_owned(),
+                            username: contact.username.trim().to_owned(),
+                            identity_state,
                             blocked: contact.blocked,
                             whitelisted: contact.whitelisted,
+                            archived: contact.archived,
+                            marked_unread: contact.marked_unread,
+                            muted_until: contact.muted_until_timestamp,
+                            hidden: contact.hidden,
                         });
                     }
                 }
                 Some(storage_record::Record::GroupV2(group)) => {
                     if let Ok(key) = <[u8; 32]>::try_from(group.master_key.as_slice()) {
                         let id = group_id(&key);
+                        self.groups.entry(id.clone()).or_insert(key);
                         if group.blocked {
                             self.blocked_groups.insert(id.clone());
                         } else {
                             self.blocked_groups.remove(&id);
                         }
-                        chats.push(ChatState {
-                            peer: Peer::Group(id),
-                            muted_until: group.muted_until_timestamp,
-                            dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
-                            archived: group.archived,
-                            marked_unread: group.marked_unread,
+                        let title = self
+                            .vault
+                            .group(key)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|g| g.title)
+                            .unwrap_or_default();
+                        groups.push(StorageGroup {
+                            id,
+                            title,
                             blocked: group.blocked,
                             whitelisted: group.whitelisted,
+                            archived: group.archived,
+                            marked_unread: group.marked_unread,
+                            muted_until: group.muted_until_timestamp,
+                            dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
                         });
                     }
                 }
                 Some(storage_record::Record::Account(account)) => {
-                    keep_muted_archived = Some(account.keep_muted_chats_archived);
                     let mut pins = Vec::new();
                     for item in account.pinned_conversations {
                         match item.identifier {
                             Some(account_record::pinned_conversation::Identifier::Contact(contact)) => {
                                 if super::wire::is_aci(&contact.service_id) {
-                                    pins.push(Peer::Direct(contact.service_id));
+                                    pins.push(contact.service_id);
                                 } else if let Some(aci) = aci_bytes(&contact.service_id_binary) {
-                                    pins.push(Peer::Direct(aci));
+                                    pins.push(aci);
                                 }
                             }
                             Some(account_record::pinned_conversation::Identifier::GroupMasterKey(raw)) => {
                                 if let Ok(key) = <[u8; 32]>::try_from(raw.as_slice()) {
-                                    pins.push(Peer::Group(group_id(&key)));
+                                    pins.push(Peer::Group(group_id(&key)).conversation());
                                 }
                             }
                             _ => {}
                         }
                     }
-                    pinned = Some(pins);
+                    account_record = Some(StorageAccount {
+                        pinned: pins,
+                        keep_muted_archived: Some(account.keep_muted_chats_archived),
+                        link_previews: Some(account.link_previews),
+                        universal_expire_timer: account.universal_expire_timer,
+                        note_to_self_marked_unread: account.note_to_self_marked_unread,
+                    });
                 }
                 Some(storage_record::Record::ChatFolder(folder)) => {
                     if folder.deleted_at_timestamp_ms != 0
@@ -849,8 +947,12 @@ impl Session {
                 _ => {}
             }
         }
-        if !chats.is_empty() || pinned.is_some() || keep_muted_archived.is_some() {
-            self.tell(Event::ChatStates { chats, pinned, keep_muted_archived });
+        if !contacts.is_empty() || !groups.is_empty() || account_record.is_some() {
+            self.tell(Event::StorageSync(StorageSnapshot {
+                contacts,
+                groups,
+                account: account_record,
+            }));
         }
         if !folders.is_empty() {
             folders.sort_by_key(|f| f.position);
@@ -1077,6 +1179,36 @@ impl Session {
         };
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
         let contacts = message.contact.iter().map(shared_contact_of).collect();
+        let mut previews = Vec::new();
+        for p in &message.preview {
+            let url = p.url.clone().unwrap_or_default();
+            if !super::wire::preview_url_in_body(&body, &url) {
+                continue;
+            }
+            let mut image = None;
+            let mut image_width = 0;
+            let mut image_height = 0;
+            if let Some(ptr) = &p.image {
+                if ptr.size.unwrap_or(0) <= 5 * 1024 * 1024 {
+                    if let Ok(bytes) = self.manager.get_attachment(ptr).await {
+                        if !bytes.is_empty() {
+                            image_width = ptr.width.unwrap_or(0);
+                            image_height = ptr.height.unwrap_or(0);
+                            image = Some(bytes);
+                        }
+                    }
+                }
+            }
+            previews.push(LinkPreview {
+                url,
+                title: p.title.clone().unwrap_or_default(),
+                description: p.description.clone().unwrap_or_default(),
+                date: p.date.unwrap_or(0),
+                image,
+                image_width,
+                image_height,
+            });
+        }
         Text {
             author: author.to_owned(),
             name,
@@ -1089,6 +1221,7 @@ impl Session {
             expire_timer: message.expire_timer.unwrap_or(0),
             expire_timer_version: message.expire_timer_version.unwrap_or(0),
             contacts,
+            previews,
         }
     }
 
@@ -1139,6 +1272,51 @@ impl Session {
         }
         if let Some(delete) = &message.delete {
             self.tell(Event::Deleted { peer, author: author.to_owned(), target: delete.target_sent_timestamp.unwrap_or(0) });
+            return;
+        }
+        if let Some(pin) = &message.pin_message {
+            let Some(target_author) = pin
+                .target_author_aci_binary
+                .as_deref()
+                .and_then(aci_bytes)
+                .filter(|a| !a.is_empty())
+            else {
+                return;
+            };
+            let Some(target) = pin.target_sent_timestamp.filter(|&ts| ts > 0) else {
+                return;
+            };
+            let duration_secs = match pin.pin_duration {
+                Some(data_message::pin_message::PinDuration::PinDurationSeconds(secs)) if secs > 0 => Some(secs),
+                _ => None,
+            };
+            self.tell(Event::Pinned {
+                peer,
+                by: author.to_owned(),
+                author: target_author,
+                target,
+                duration_secs,
+            });
+            return;
+        }
+        if let Some(unpin) = &message.unpin_message {
+            let Some(target_author) = unpin
+                .target_author_aci_binary
+                .as_deref()
+                .and_then(aci_bytes)
+                .filter(|a| !a.is_empty())
+            else {
+                return;
+            };
+            let Some(target) = unpin.target_sent_timestamp.filter(|&ts| ts > 0) else {
+                return;
+            };
+            self.tell(Event::Unpinned {
+                peer,
+                by: author.to_owned(),
+                author: target_author,
+                target,
+            });
             return;
         }
         // DataMessage.Flags.EXPIRATION_TIMER_UPDATE == 2.
@@ -1260,7 +1438,23 @@ impl Session {
             self.tell(Event::Settings {
                 read_receipts: configuration.read_receipts.unwrap_or(false),
                 typing: configuration.typing_indicators.unwrap_or(false),
+                link_previews: configuration.link_previews,
             });
+        }
+        if let Some(verified_sync) = sync.verified {
+            let aci = verified_sync
+                .destination_aci
+                .filter(|s| super::wire::is_aci(s))
+                .or_else(|| verified_sync.destination_aci_binary.as_deref().and_then(aci_bytes));
+            if let Some(aci) = aci {
+                let state = match verified_sync.state.and_then(|v| verified::State::try_from(v).ok()) {
+                    Some(verified::State::Verified) => IdentityState::Verified,
+                    Some(verified::State::Unverified) => IdentityState::Unverified,
+                    _ => IdentityState::Default,
+                };
+                let _ = self.vault.set_identity_state(&aci, state, verified_sync.identity_key.as_deref(), true);
+                self.tell(Event::VerifiedChanged { aci, state });
+            }
         }
         if let Some(delete) = sync.delete_for_me {
             self.deleted_for_me(delete);
@@ -1303,6 +1497,27 @@ impl Session {
             };
             if let (Some(peer), Some(action)) = (peer, action) {
                 self.tell(Event::MessageRequestResponse { peer, action });
+            }
+        }
+        if let Some(keys) = sync.keys {
+            let mut updated_key = false;
+            if let Some(aep_str) = keys.account_entropy_pool.as_deref() {
+                if let Ok(aep) = AccountEntropyPool::from_str(aep_str) {
+                    let _ = self.vault.store_account_entropy_pool(Some(&aep)).await;
+                    if let Ok(master) = MasterKey::from_slice(aep.derive_svr_key().as_slice()) {
+                        let _ = self.vault.store_master_key(Some(&master)).await;
+                    }
+                    updated_key = true;
+                }
+            }
+            if let Some(raw_master) = keys.master.as_deref() {
+                if let Ok(master) = MasterKey::from_slice(raw_master) {
+                    let _ = self.vault.store_master_key(Some(&master)).await;
+                    updated_key = true;
+                }
+            }
+            if updated_key {
+                self.sync_storage().await;
             }
         }
         if let Some(fetch) = sync.fetch_latest {
@@ -1526,7 +1741,65 @@ impl Session {
             Ask::JoinCallLink { url, answer } => {
                 let _ = answer.send(self.join_call_link(&url).await);
             }
+            Ask::SafetyNumber { aci, answer } => {
+                let _ = answer.send(Ok(self.vault.safety_number(&self.me, &aci)));
+            }
+            Ask::SetVerified { aci, state, answer } => {
+                let _ = answer.send(self.set_verified(&aci, state).await);
+            }
+            Ask::PersonProfile { aci, answer } => {
+                let _ = answer.send(self.person_profile(&aci).await);
+            }
         }
+    }
+
+    async fn person_profile(&mut self, aci: &str) -> Result<PersonProfile, Fault> {
+        let uuid = Uuid::parse_str(aci).map_err(|_| Fault::Refused("That person isn't one Signal knows.".to_owned()))?;
+        let id = ServiceId::Aci(Aci::from(uuid));
+        let Some(key) = self.manager.store().profile_key(&id).await.ok().flatten() else {
+            return Ok(PersonProfile { key_known: false, ..PersonProfile::default() });
+        };
+        // Use the manager's existing Signal connection rather than opening a competing Identified
+        // websocket to `/v1/websocket/` (Signal closes the live receiving socket on duplicate
+        // identified connections for the same `(aci, device_id)`).
+        let profile = self.manager.retrieve_profile_by_uuid(Aci::from(uuid), key).await.map_err(fault)?;
+        let name = profile.name.map(|n| n.to_string()).unwrap_or_default();
+        if !name.is_empty() {
+            self.names.insert(aci.to_owned(), name.clone());
+        }
+        Ok(PersonProfile {
+            name,
+            about: profile.about.unwrap_or_default(),
+            emoji: profile.about_emoji.unwrap_or_default(),
+            badges: Vec::new(),
+            key_known: true,
+        })
+    }
+
+    async fn set_verified(&mut self, aci: &str, state: IdentityState) -> Result<(), Fault> {
+        let uuid = Uuid::parse_str(aci).map_err(|_| Fault::Refused("That person isn't one Signal knows.".to_owned()))?;
+        let key = self.vault.peer_identity_key(aci);
+        self.vault
+            .set_identity_state(aci, state, key.as_deref(), true)
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let proto_state = match state {
+            IdentityState::Default => verified::State::Default,
+            IdentityState::Verified => verified::State::Verified,
+            IdentityState::Unverified => verified::State::Unverified,
+        };
+        let sync = SyncMessage {
+            verified: Some(Verified {
+                destination_aci: Some(aci.to_owned()),
+                destination_aci_binary: Some(uuid.as_bytes().to_vec()),
+                identity_key: key,
+                state: Some(proto_state.into()),
+                null_message: None,
+            }),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        let _ = self.sync_to_self(sync).await;
+        self.tell(Event::VerifiedChanged { aci: aci.to_owned(), state });
+        Ok(())
     }
 
     async fn create_group(&mut self, title: &str, members: &[String]) -> Result<GroupInfo, Fault> {
@@ -2345,16 +2618,43 @@ impl Session {
         let at = now_ms();
         let group_v2 = self.group_context(to)?;
         let content = match body {
-            Body::Text { text, quote, ranges, timer } => ContentBody::DataMessage(DataMessage {
-                body: Some(text),
-                body_ranges: proto_ranges(&ranges),
-                quote: quoted(quote),
-                group_v2,
-                expire_timer: (timer.seconds > 0).then_some(timer.seconds),
-                expire_timer_version: (timer.version > 0).then_some(timer.version),
-                ..Default::default()
-            }),
-            Body::Files { text, quote, files, timer } => {
+            Body::Text { text, quote, ranges, timer, previews } => {
+                let mut proto_previews = Vec::with_capacity(previews.len());
+                for p in previews {
+                    let mut image_ptr = None;
+                    if let Some(bytes) = p.image.filter(|b| !b.is_empty()) {
+                        let spec = AttachmentSpec {
+                            content_type: "image/jpeg".to_owned(),
+                            length: bytes.len(),
+                            file_name: Some("preview.jpg".to_owned()),
+                            width: (p.image_width > 0).then_some(p.image_width),
+                            height: (p.image_height > 0).then_some(p.image_height),
+                            ..AttachmentSpec::default()
+                        };
+                        if let Ok(Ok(ptr)) = self.manager.upload_attachment(spec, bytes).await {
+                            image_ptr = Some(ptr);
+                        }
+                    }
+                    proto_previews.push(presage::proto::Preview {
+                        url: Some(p.url),
+                        title: (!p.title.is_empty()).then_some(p.title),
+                        description: (!p.description.is_empty()).then_some(p.description),
+                        date: (p.date > 0).then_some(p.date),
+                        image: image_ptr,
+                    });
+                }
+                ContentBody::DataMessage(DataMessage {
+                    body: Some(text),
+                    body_ranges: proto_ranges(&ranges),
+                    quote: quoted(quote),
+                    preview: proto_previews,
+                    group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
+                    ..Default::default()
+                })
+            }
+            Body::Files { text, quote, ranges, files, timer } => {
                 let mut attachments = Vec::with_capacity(files.len());
                 for file in files {
                     let name = file.name.clone();
@@ -2382,6 +2682,7 @@ impl Session {
                 }
                 ContentBody::DataMessage(DataMessage {
                     body: (!text.is_empty()).then_some(text),
+                    body_ranges: proto_ranges(&ranges),
                     attachments,
                     quote: quoted(quote),
                     timestamp: Some(at),
@@ -2468,6 +2769,37 @@ impl Session {
                 expire_timer_version: (timer.version > 0).then_some(timer.version),
                 ..Default::default()
             }),
+            Body::Pin { author, target, duration_secs } => {
+                let uuid = Uuid::parse_str(&author)
+                    .map_err(|_| Fault::Refused("That message author isn't one Signal knows.".to_owned()))?;
+                let pin_duration = match duration_secs {
+                    Some(secs) if secs > 0 => data_message::pin_message::PinDuration::PinDurationSeconds(secs),
+                    _ => data_message::pin_message::PinDuration::PinDurationForever(true),
+                };
+                ContentBody::DataMessage(DataMessage {
+                    pin_message: Some(data_message::PinMessage {
+                        target_author_aci_binary: Some(uuid.as_bytes().to_vec()),
+                        target_sent_timestamp: Some(target),
+                        pin_duration: Some(pin_duration),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
+            Body::Unpin { author, target } => {
+                let uuid = Uuid::parse_str(&author)
+                    .map_err(|_| Fault::Refused("That message author isn't one Signal knows.".to_owned()))?;
+                ContentBody::DataMessage(DataMessage {
+                    unpin_message: Some(data_message::UnpinMessage {
+                        target_author_aci_binary: Some(uuid.as_bytes().to_vec()),
+                        target_sent_timestamp: Some(target),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
         };
         self.deliver(to, content, at).await?;
         Ok(at)
@@ -2637,6 +2969,107 @@ fn quoted(quote: Option<super::wire::Quote>) -> Option<data_message::Quote> {
         text: Some(quote.text),
         r#type: Some(data_message::quote::Type::Normal.into()),
         ..Default::default()
+    })
+}
+
+/// Fetches a link preview strictly through Signal's content proxy (`contentproxy.signal.org`,
+/// overridable via `TINYCLIENT_SIGNAL_CONTENT_PROXY`). NEVER connects directly to target hosts.
+fn fetch_preview_via_signal_proxy(url: &str) -> Option<LinkPreview> {
+    use crate::adapters::tiny::preview as og;
+    use std::io::Read as _;
+    use std::time::Instant;
+
+    const MAX_REDIRECTS: usize = 3;
+    const MAX_HTML_BYTES: u64 = 512 * 1024;
+    const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024;
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    og::validate_https_url(url).ok()?;
+    let proxy_url = std::env::var("TINYCLIENT_SIGNAL_CONTENT_PROXY")
+        .unwrap_or_else(|_| "https://contentproxy.signal.org:443".to_owned());
+    let proxy = ureq::Proxy::new(proxy_url.trim()).ok()?;
+    let deadline = Instant::now() + DEADLINE;
+
+    let fetch = |start: &str, max_bytes: u64| -> Option<(String, String, Vec<u8>)> {
+        let mut current = start.to_owned();
+        for hop in 0..=MAX_REDIRECTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            og::validate_https_url(&current).ok()?;
+            let config = ureq::Agent::config_builder()
+                .proxy(Some(proxy.clone()))
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(remaining))
+                .user_agent("WhatsApp/2")
+                .build();
+            let agent = ureq::Agent::new_with_config(config);
+            let resp = agent
+                .get(&current)
+                .header("Accept", "text/html,application/xhtml+xml,image/*;q=0.8,*/*;q=0.1")
+                .call()
+                .ok()?;
+            let status = resp.status().as_u16();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if hop == MAX_REDIRECTS {
+                    return None;
+                }
+                let loc = resp.headers().get("location").and_then(|v| v.to_str().ok())?;
+                current = og::resolve_redirect(&current, loc)?;
+                continue;
+            }
+            if !(200..300).contains(&status) {
+                return None;
+            }
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mut buf = Vec::new();
+            resp.into_body().into_reader().take(max_bytes).read_to_end(&mut buf).ok()?;
+            return Some((current, content_type, buf));
+        }
+        None
+    };
+
+    let (final_url, content_type, html_bytes) = fetch(url, MAX_HTML_BYTES)?;
+    if !content_type.is_empty()
+        && !content_type.contains("text/html")
+        && !content_type.contains("application/xhtml")
+    {
+        return None;
+    }
+    let html = String::from_utf8_lossy(&html_bytes);
+    let parsed = og::parse_html_metadata(&html, url)?;
+    let mut image = None;
+    let mut image_width = 0;
+    let mut image_height = 0;
+    if let Some(img_ref) = parsed.image_url {
+        if let Some(resolved) = og::resolve_redirect(&final_url, &img_ref) {
+            if let Some((_, _, img_bytes)) = fetch(&resolved, MAX_IMAGE_BYTES) {
+                if let Some(reencoded) = og::reencode_preview_image(&img_bytes) {
+                    image_width = reencoded.width;
+                    image_height = reencoded.height;
+                    image = Some(reencoded.jpeg);
+                }
+            }
+        }
+    }
+    if parsed.title.is_empty() && parsed.description.is_empty() && image.is_none() {
+        return None;
+    }
+    Some(LinkPreview {
+        url: url.to_owned(),
+        title: parsed.title,
+        description: parsed.description,
+        date: 0,
+        image,
+        image_width,
+        image_height,
     })
 }
 

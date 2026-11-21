@@ -75,6 +75,13 @@ pub fn request(trigger: &Trigger, conversation: &Key, space: Option<&str>) -> Op
     let network = Some(conversation.network);
     match trigger.kind {
         Kind::Emoji => None,
+        Kind::Person if conversation.network == protocol::Network::Signal && conversation.id.starts_with("g.") => {
+            Some(Request::Members {
+                conversation: conversation.clone(),
+                offset: 0,
+                limit: 200,
+            })
+        }
         Kind::Person | Kind::Role => Some(Request::People {
             network,
             relation: None,

@@ -95,6 +95,7 @@
 //! then hands out must be under it), `TINYCLIENT_TEAMS_TROUTER` replaces
 //! `https://go.trouter.teams.microsoft.com`. The session comes from `TINYCLIENT_SESSION_TEAMS`.
 
+mod card;
 mod emoji;
 mod html;
 
@@ -257,7 +258,13 @@ fn reason(fault: Fault) -> String {
         Fault::Limited(seconds) => format!("Teams is rate limiting you. Try again in {seconds} s."),
         Fault::Auth(why) => why,
         Fault::Net(_) => "Teams could not be reached.".to_owned(),
-        Fault::Refused { status: 403, .. } => "Teams does not let you do that here.".to_owned(),
+        Fault::Refused { status: 403, message } => {
+            if message.contains("moderator") || message.contains("Only channel") {
+                message
+            } else {
+                "Teams does not let you do that here.".to_owned()
+            }
+        }
         Fault::Refused { status: 404, .. } => "Teams cannot find that any more.".to_owned(),
         Fault::Refused { status: 413, .. } => "The message is too long for Teams.".to_owned(),
         Fault::Refused { status, message } if message.is_empty() => format!("Teams refused ({status})."),
@@ -282,6 +289,7 @@ struct Place {
     chat: String,
     middle: String,
     presence: String,
+    urlp: Option<String>,
 }
 
 struct Token {
@@ -326,6 +334,9 @@ struct State {
     away: HashMap<String, (String, Option<i64>)>,
     /// Subject and inline image HTML remembered for our own messages so edits keep them.
     own_meta: HashMap<(String, String), message::OwnMeta>,
+    /// Raw `properties.files` JSON remembered for messages with shared files so forwarding
+    /// references them without re-uploading.
+    file_props: HashMap<(String, String), Vec<Value>>,
     /// Chat ids pinned in Teams, in Teams' own order.
     pinned_chats: Vec<String>,
     /// Per-conversation notification level as reported by Teams.
@@ -769,6 +780,7 @@ impl Teams {
                 chat,
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
+                urlp: named("urlp"),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -921,10 +933,12 @@ impl Teams {
             clear_history: true,
             suppress_embeds: true,
             schedule: true,
-            forward: false,
+            forward: true,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
+            importance: true,
+            channel_subject: true,
             ..protocol::Capabilities::default()
         });
         {
@@ -1011,6 +1025,9 @@ impl Teams {
             }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+            }
+            Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+                let _ = reply.send(Ok(self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note)));
             }
             Command::CancelSend { client_id, .. } => self.cancel_send(&client_id),
             // Each row's line comes with the chat list (`lastMessage`); a row still without one
