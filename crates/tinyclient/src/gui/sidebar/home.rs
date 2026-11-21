@@ -406,7 +406,9 @@ pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Co
             let hidden = listed.iter().filter(|c| c.opted_out).count();
             let show_hidden = home.hidden_shown.contains(&team.key.id);
             let shown = listed.iter().filter(|c| {
-                if c.opted_out {
+                if c.pin.is_some() {
+                    false
+                } else if c.opted_out {
                     show_hidden && opened
                 } else {
                     opened || c.badge() != Badge::None || open == Some(&c.key)

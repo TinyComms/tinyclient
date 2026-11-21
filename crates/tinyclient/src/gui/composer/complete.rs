@@ -193,6 +193,7 @@ mod tests {
             status: String::new(),
             link: String::new(),
             emoji: String::new(), activity: None, title: String::new(), utc_offset: None, mark: None,
+            role_color: None, role_icon: None, role_emoji: None,
         }
     }
 

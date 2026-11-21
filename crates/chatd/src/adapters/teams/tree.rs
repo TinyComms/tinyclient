@@ -191,8 +191,13 @@ fn counted(entry: &Value, me: &str) -> Counted {
 /// Classifies a Teams channel by `channelType` (0 = standard, 1 = private, 2 = shared)
 /// and returns `(private, shared, mark)` where cross-tenant shared channels get `Mark::External`.
 pub(super) fn channel_flags(channel: &Value, team_tenant: &str, own_tenant: &str) -> (bool, bool, Option<protocol::Mark>) {
+    channel_flags_with(channel, team_tenant, own_tenant, false)
+}
+
+fn channel_flags_with(channel: &Value, team_tenant: &str, own_tenant: &str, force_shared: bool) -> (bool, bool, Option<protocol::Mark>) {
     let kind = channel["channelType"].as_u64().unwrap_or(0);
-    let shared = kind == 2
+    let shared = force_shared
+        || kind == 2
         || channel["isShared"] == true
         || channel["membershipType"]
             .as_str()
@@ -366,17 +371,20 @@ impl Teams {
                 .iter()
                 .enumerate()
                 .map(|(position, channel)| {
-                    let (private, _shared, mark) = channel_flags(channel, "", &own_tenant);
+                    let chan_id = text(channel, "id");
+                    let (private, shared, mark) = channel_flags_with(channel, "", &own_tenant, true);
+                    let pin = pinned_channels.iter().position(|p| p == chan_id).map(|ix| ix as i32);
                     ConversationRow {
                         space: Some(host_id.clone()),
                         position: position as i32,
                         call: CallSupport::Handoff,
                         private,
-                        shared: true,
+                        shared,
                         mark,
                         read_only: channel["isArchived"] == true,
                         opted_out: channel["isFavorite"] == false && channel["isPinned"] != true,
-                        ..ConversationRow::new(text(channel, "id"), ConversationKind::Channel, text(channel, "displayName"))
+                        filing: Some(Filing { pin, ..Filing::default() }),
+                        ..ConversationRow::new(chan_id, ConversationKind::Channel, text(channel, "displayName"))
                     }
                 })
                 .collect();
