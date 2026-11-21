@@ -142,6 +142,7 @@ pub fn prove_team_info() -> Result<(), String> {
 mod people;
 mod push;
 mod send;
+mod tags;
 mod tree;
 
 /// The lab's teams-chain-paging driver. A build without this returns to the server and stays up.
@@ -347,6 +348,9 @@ struct State {
     endpoint: Option<String>,
     /// Adaptive Card invoke metadata for poll messages: `(conversation, message_id)` -> `PollInvoke`.
     polls: HashMap<(String, String), card::PollInvoke>,
+    /// Team tags per Space id, and tag ids the signed-in user belongs to.
+    tags: HashMap<String, Vec<protocol::TeamTag>>,
+    my_tags: HashSet<String>,
 }
 
 /// What a call presents.
@@ -932,6 +936,7 @@ impl Teams {
             threads: true,
             pins: false,
             pin_chats: 15,
+            groups: 250,
             close_direct: true,
             clear_history: true,
             suppress_embeds: true,
@@ -1015,6 +1020,9 @@ impl Teams {
             Command::StartDirect { person_id, reply } => {
                 let _ = reply.send(self.start_direct(&person_id).map_err(refuse));
             }
+            Command::StartGroup { people, title, reply } => {
+                let _ = reply.send(self.start_group(&people, title.as_deref()).map_err(refuse));
+            }
             Command::Profile { person_id, reply } => {
                 let _ = reply.send(self.profile(&person_id).map_err(refuse));
             }
@@ -1023,6 +1031,9 @@ impl Teams {
             }
             Command::SpaceInfo { space_id, reply } => {
                 let _ = reply.send(self.space_info(&space_id).map_err(refuse));
+            }
+            Command::SpaceTags { space_id, reply } => {
+                let _ = reply.send(self.space_tags(&space_id).map_err(refuse));
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));

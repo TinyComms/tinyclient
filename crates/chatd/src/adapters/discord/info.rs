@@ -241,6 +241,7 @@ impl Discord {
             nickname: info.nick.clone(),
             roles: roles.map(|role| role.name.clone()).take(protocol::PROFILE_ROLES).collect(),
             notify,
+            ..SpaceAbout::default()
         })
     }
 

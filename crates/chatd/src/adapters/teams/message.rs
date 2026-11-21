@@ -834,7 +834,10 @@ impl Teams {
         }
         message.text = parsed.text;
         message.spans = parsed.spans;
-        message.mentions_me = parsed.mentioned && !message.outgoing;
+        let tag_mentions_me = message.spans.iter().any(|span| {
+            matches!(&span.style, Style::Mention { kind: MentionKind::Role, id } if self.is_my_tag(id))
+        });
+        message.mentions_me = (parsed.mentioned || tag_mentions_me) && !message.outgoing;
         message.reply_to = parsed.quote.map(|quote| ReplyTo {
             person: Some(quote.mri).filter(|mri| !mri.is_empty()).map(|mri| self.ctx.key(&mri)),
             id: quote.id,

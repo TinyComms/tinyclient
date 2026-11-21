@@ -211,6 +211,16 @@ struct Earlier {
     ready: bool,
 }
 
+/// Tag members popover opened by clicking a `@Tag` mention in a Teams channel.
+pub(super) struct TagPopover {
+    pub space: Key,
+    pub tag_id: String,
+    pub label: String,
+    pub at: Point<Pixels>,
+    pub tag: Option<protocol::TeamTag>,
+    pub ready: bool,
+}
+
 /// A Block Kit control waiting for user confirmation before firing (`ConfirmDialog`).
 #[derive(Clone)]
 pub(super) struct PendingControlAction {
@@ -387,6 +397,8 @@ pub struct Pane {
     link_ask: Option<links::LinkAsk>,
     /// Earlier wordings of one message, opened from its edited mark.
     revisions: Option<Earlier>,
+    /// Popover listing members of a clicked Teams `@Tag` mention.
+    tag_popover: Option<TagPopover>,
     /// Interactive Block Kit controls currently in flight, keyed by `(message_id, action_id)`.
     pending_actions: HashMap<(String, String), Instant>,
     /// Pending confirmation dialog for a Block Kit control.
@@ -497,6 +509,7 @@ impl Pane {
             multi_select: actions::MultiSelect::default(),
             link_ask: None,
             revisions: None,
+            tag_popover: None,
             pending_actions: HashMap::new(),
             action_confirm: None,
             open_select: None,
@@ -716,6 +729,7 @@ impl Pane {
         self.pending_actions.clear();
         self.forward = None;
         self.link_ask = None;
+        self.tag_popover = None;
         self.hold = None;
         self.land = false;
         self.opening = false;
@@ -1897,6 +1911,7 @@ impl Render for Pane {
             .children(self.history_banner(cx))
             .children(self.away.then(|| self.jump_button(cx)))
             .children(self.selection_bar(cx))
+            .children(self.tag_popover_layer(cx))
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }

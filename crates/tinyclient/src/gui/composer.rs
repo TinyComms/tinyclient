@@ -605,6 +605,9 @@ pub struct Composer {
     /// Cached out-of-office `(note, until)` for 1:1 direct chat peers (Key = person key).
     peer_away: HashMap<Key, Option<(String, Option<i64>)>>,
     peer_away_asked: HashSet<Key>,
+    /// Cached mentionable team tags per Space (Teams `@tag` completion).
+    space_tags: HashMap<Key, Vec<protocol::TeamTag>>,
+    space_tags_asked: HashSet<Key>,
 }
 
 impl Composer {
@@ -711,6 +714,8 @@ impl Composer {
             effect: None,
             peer_away: HashMap::new(),
             peer_away_asked: HashSet::new(),
+            space_tags: HashMap::new(),
+            space_tags_asked: HashSet::new(),
         }
     }
 
@@ -2436,6 +2441,22 @@ impl Composer {
             self.close_list(cx);
             return;
         };
+        if target.key.network == Network::Teams && trigger.kind == mention::Kind::Person && live() {
+            if let Some(space_key) = target.space_key() {
+                if self.space_tags_asked.insert(space_key.clone()) {
+                    let this = cx.weak_entity();
+                    ask_later(cx, Request::SpaceTags { space: space_key.clone() }, move |answer, cx| {
+                        if let Ok(Response::SpaceTags { space, tags }) = answer {
+                            let _ = this.update(cx, |this, cx| {
+                                this.space_tags.insert(space, tags);
+                                this.look_up(cx);
+                                cx.notify();
+                            });
+                        }
+                    });
+                }
+            }
+        }
         let request = complete::request(&trigger, &target.key, target.space.as_deref());
         let (Some(request), false) = (request, self.dismissed == Some(trigger.start)) else {
             self.close_list(cx);
@@ -2541,6 +2562,25 @@ impl Composer {
                                         name: role.name.clone(),
                                         handle: String::new(),
                                         second: "Role".to_owned(),
+                                        person: None,
+                                    });
+                                }
+                            }
+                            rows.truncate(complete::ROWS);
+                        }
+                    }
+                }
+                if target.key.network == protocol::Network::Teams {
+                    if let Some(space_key) = target.space_key() {
+                        if let Some(tags) = self.space_tags.get(&space_key) {
+                            for tag in tags {
+                                if mention::rank(&tag.name, &tag.description, &trigger.query).is_some() {
+                                    rows.push(complete::Row {
+                                        kind: mention::Kind::Role,
+                                        key: Key::new(&account, &tag.id),
+                                        name: tag.name.clone(),
+                                        handle: String::new(),
+                                        second: format!("Tag · {} members", tag.member_count),
                                         person: None,
                                     });
                                 }

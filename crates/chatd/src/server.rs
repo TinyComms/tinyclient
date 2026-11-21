@@ -1991,13 +1991,38 @@ impl Chat {
             nickname: about.nickname,
             roles: about.roles,
             notify: about.notify,
+            tags: about.tags,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
         info.roles.truncate(protocol::PROFILE_ROLES);
         info.roles.iter_mut().for_each(|role| clip(role, 100));
+        info.tags.truncate(200);
+        for tag in &mut info.tags {
+            clip(&mut tag.name, 100);
+            clip(&mut tag.description, 256);
+        }
         self.hub.space_infos.keep(space, info.clone());
         Response::SpaceInfo { info: Box::new(info) }
+    }
+
+    fn space_tags(&self, space: Key) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SpaceTags { space_id, reply }) {
+            Ok(mut tags) => {
+                tags.truncate(200);
+                for tag in &mut tags {
+                    clip(&mut tag.name, 100);
+                    clip(&mut tag.description, 256);
+                }
+                Response::SpaceTags { space, tags }
+            }
+            Err(refused) => *refused,
+        }
     }
 
     /// Something the user did to a conversation on the network: mute, leave, close. The answer
@@ -3290,6 +3315,7 @@ impl Chat {
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::GetOutOfOffice { account } => self.get_out_of_office(account),
             Request::SetOutOfOffice { account, ooo } => self.set_out_of_office(account, ooo),
+            Request::SpaceTags { space } => self.space_tags(space),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),

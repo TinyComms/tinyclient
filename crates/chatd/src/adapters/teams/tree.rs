@@ -200,6 +200,8 @@ impl Teams {
             if let Some(group) = team["teamSiteInformation"]["groupId"].as_str() {
                 self.ctx.set_note(&format!("group:{id}"), group);
             }
+            // Best-effort refresh of team tags so incoming tag mentions can flag `mentions_me`.
+            let _ = self.space_tags(id);
             for channel in channels {
                 let chan_id = text(channel, "id");
                 let level = super::info::parse_notify(channel, true)
@@ -370,7 +372,7 @@ impl Teams {
                     other => other.clone(),
                 };
                 let kind = text(&activity, "activityType").to_ascii_lowercase();
-                if !kind.contains("mention") {
+                if !(kind.contains("mention") || kind.contains("tag")) {
                     continue;
                 }
                 let (thread, message) = (text(&activity, "sourceThreadId"), id_of(&activity["sourceMessageId"]));

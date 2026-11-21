@@ -1668,6 +1668,10 @@ pub enum Request {
         account: AccountKey,
         ooo: OutOfOffice,
     },
+    /// List mentionable tags in a Space (e.g. Teams team tags).
+    SpaceTags {
+        space: Key,
+    },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2929,6 +2933,10 @@ pub enum Response {
     },
     OutOfOffice {
         ooo: OutOfOffice,
+    },
+    SpaceTags {
+        space: Key,
+        tags: Vec<TeamTag>,
     },
     Folders {
         folders: Vec<Folder>,

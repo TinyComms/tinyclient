@@ -46,6 +46,22 @@ pub struct ProfilePerson {
     pub title: String,
 }
 
+/// One mentionable tag in a Space (e.g. a Teams team tag such as `@On-Call`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTag {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ProfilePerson>,
+    /// True when the signed-in user belongs to this tag.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mine: bool,
+}
+
 /// Automatic replies / out-of-office settings for an account (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutOfOffice {
@@ -365,6 +381,9 @@ pub struct SpaceInfo {
     pub roles: Vec<String>,
     #[serde(default)]
     pub notify: Notify,
+    /// Mentionable team tags in this Space (Teams).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<TeamTag>,
 }
 
 /// Which of a custom emoji set this account may send.

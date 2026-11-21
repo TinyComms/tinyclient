@@ -416,8 +416,16 @@ impl Fake {
     /// The chat service. `path` is what follows its address.
     fn chat(&self, call: &Call, path: &str) -> Reply {
         if path == "/v1/threads" && call.method == "POST" {
+            let body = call.json();
+            let target = if body["properties"]["topic"].as_str().is_some_and(|t| !t.is_empty())
+                || body["members"].as_array().is_some_and(|m| m.len() > 2)
+            {
+                "19:tagchat@thread.v2"
+            } else {
+                CHAT_DEE
+            };
             let mut created = answer("201 Created", json!({}));
-            created.headers.push(("Location", format!("{}/chat/v1/threads/{CHAT_DEE}", self.base)));
+            created.headers.push(("Location", format!("{}/chat/v1/threads/{target}", self.base)));
             return created;
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/").and_then(|rest| rest.strip_suffix("/consumptionhorizons")) {
@@ -444,6 +452,11 @@ impl Fake {
                 })),
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
+                "19:tagchat@thread.v2" => Some(json!({
+                    "id": thread,
+                    "properties": {"threadType": "chat", "topic": "On-Call"},
+                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
+                })),
                 "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
                 _ => None,
             };
@@ -639,6 +652,31 @@ impl Fake {
             let query = call.body.to_lowercase();
             let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
+        }
+        if call.path.ends_with("/tags") && call.path.contains("/beta/teams/") {
+            return ok(json!({
+                "tags": [
+                    {
+                        "id": "tag-oncall",
+                        "displayName": "On-Call",
+                        "description": "Incident responders",
+                        "memberCount": 2,
+                        "members": [
+                            {"mri": ME, "displayName": "Me Myself"},
+                            {"mri": ANA, "displayName": "Ana Ruiz"}
+                        ]
+                    },
+                    {
+                        "id": "tag-design",
+                        "displayName": "Design",
+                        "description": "Product design",
+                        "memberCount": 1,
+                        "members": [
+                            {"mri": "8:orgid:00000000-0000-4000-8000-0000000000c3", "displayName": "Cy Tran"}
+                        ]
+                    }
+                ]
+            }));
         }
         if call.path.ends_with("/v1/urlpreview") {
             let asked = call.json();
@@ -2985,5 +3023,92 @@ fn active_presence_heartbeat_privacy_toggle_timed_status_and_reset() {
         !world.fake.calls("DELETE", "/presence/v1/me/forceavailability/").is_empty(),
         "Reset status must DELETE /v1/me/forceavailability/"
     );
+}
+
+#[test]
+fn team_tags_fetch_mentions_me_outgoing_wire_format_and_group_chat() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 2);
+
+    // 1. SpaceTags and SpaceInfo expose the team's tags with member counts and `mine`.
+    let Response::SpaceTags { tags, .. } = world.ask(Request::SpaceTags { space: general.clone() }) else {
+        panic!("expected Response::SpaceTags");
+    };
+    assert_eq!(tags.len(), 2);
+    let design = tags.iter().find(|t| t.id == "tag-design").expect("Design tag");
+    let oncall = tags.iter().find(|t| t.id == "tag-oncall").expect("On-Call tag");
+    assert!(!design.mine && design.member_count == 1);
+    assert!(oncall.mine && oncall.member_count == 2);
+    assert_eq!(oncall.members.len(), 2);
+
+    let Response::SpaceInfo { info } = world.ask(Request::SpaceInfo { space: general.clone() }) else {
+        panic!("expected Response::SpaceInfo");
+    };
+    assert_eq!(info.tags.len(), 2);
+
+    // 2. Incoming message mentioning our tag sets `mentions_me = true`; another tag keeps it false.
+    let mut ping_mine = message(GENERAL, Some("1760000880001"), 1_760_000_880_001, ANA, "Ana Ruiz", "<p><at id=\"0\">On-Call</at> alert!</p>");
+    ping_mine["properties"] = json!({
+        "mentions": json!([{"id": 0, "mri": "tag-oncall", "mentionType": "tag", "displayName": "On-Call"}]).to_string()
+    });
+    let mut ping_other = message(GENERAL, Some("1760000880002"), 1_760_000_880_002, ANA, "Ana Ruiz", "<p><at id=\"0\">Design</at> fyi</p>");
+    ping_other["properties"] = json!({
+        "mentions": json!([{"id": 0, "mri": "tag-design", "mentionType": "tag", "displayName": "Design"}]).to_string()
+    });
+    world.fake.push("NewMessage", ping_mine, false);
+    world.fake.push("NewMessage", ping_other, false);
+    world.until("both tag mention messages stored", || {
+        let msgs = world.messages(&general);
+        ["1760000880001", "1760000880002"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+    let mine_msg = world.message(&general, "1760000880001").unwrap();
+    assert!(mine_msg.mentions_me, "tag we belong to must set mentions_me");
+    let other_msg = world.message(&general, "1760000880002").unwrap();
+    assert!(!other_msg.mentions_me, "tag we do not belong to must not set mentions_me");
+
+    // 3. Outgoing message with `<@&tag-oncall|On-Call>` posts `mentionType: "tag"` on the wire.
+    let sent = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "1760000999000667".to_owned(),
+        text: "Paging <@&tag-oncall|On-Call>".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    world.until("outgoing tag mention accepted", || {
+        world
+            .messages(&general)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000667") && m.state == SendState::Sent)
+    });
+    let post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000667")
+        .expect("tag mention POST");
+    let mentions: Vec<Value> = serde_json::from_str(post.json()["properties"]["mentions"].as_str().unwrap()).unwrap();
+    assert_eq!(mentions[0]["mentionType"].as_str(), Some("tag"));
+    assert_eq!(mentions[0]["mri"].as_str(), Some("tag-oncall"));
+
+    // 4. Starting a group chat from a tag's members creates the chat with the tag's name as topic.
+    assert!(world.account(HOME).can.groups > 0);
+    let Response::Conversation { conversation: group_chat } = world.ask(Request::StartGroup {
+        account: protocol::AccountKey {
+            network: Network::Teams,
+            account: HOME.to_owned(),
+        },
+        people: vec![key(ANA), key(BEN)],
+        title: Some("On-Call".to_owned()),
+    }) else {
+        panic!("expected Response::Conversation from StartGroup");
+    };
+    assert_eq!(group_chat.key.id, "19:tagchat@thread.v2");
+    assert_eq!(group_chat.title, "On-Call");
 }
 
