@@ -1546,7 +1546,7 @@ fn leaving_a_group_chat_removes_myself_and_drops_the_row() {
     let grp1 = key("19:grp1@thread.v2");
     assert!(world.conversation(&grp1).is_some());
 
-    assert_eq!(world.ask(Request::Leave { conversation: grp1.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Leave { conversation: grp1.clone(), silent: false }), Response::Ok);
     let left = world.fake.calls("DELETE", &format!("/v1/threads/19:grp1@thread.v2/members/{ME}"));
     assert_eq!(left.len(), 1);
     assert!(world.conversation(&grp1).is_none());

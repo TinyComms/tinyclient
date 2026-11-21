@@ -3679,12 +3679,12 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
     assert_eq!(direct[0].body["channel_overrides"]["3001"], json!({"muted": false, "message_notifications": 1, "mute_config": {"end_time": null, "selected_time_window": -1}}));
 
     // Leave a group, close a DM: one DELETE each, and the row goes. A server channel is neither.
-    assert_eq!(world.ask(Request::Leave { conversation: world.key("3003") }), Response::Ok);
+    assert_eq!(world.ask(Request::Leave { conversation: world.key("3003"), silent: false }), Response::Ok);
     assert_eq!(world.ask(Request::CloseDirect { conversation: world.key("3002") }), Response::Ok);
     let deleted: Vec<String> = world.discord.requests_to("DELETE", "/channels/").into_iter().map(|seen| seen.path).collect();
     assert_eq!(deleted, ["/channels/3003?silent=false", "/channels/3002"]);
     assert!(matches!(world.ask(Request::Conversation { conversation: world.key("3003") }), Response::Error { .. }));
-    assert!(matches!(world.ask(Request::Leave { conversation: world.key("4101") }), Response::Error { .. }));
+    assert!(matches!(world.ask(Request::Leave { conversation: world.key("4101"), silent: false }), Response::Error { .. }));
     assert_eq!(world.discord.requests_to("DELETE", "/channels/").len(), 2, "refused here, not asked");
 
     // Pins, from the current route.
@@ -5515,4 +5515,181 @@ fn custom_status_emoji_and_clear_after_round_trip_and_sync() {
         let s = own();
         (s.status == "Focusing" && s.status_emoji == "🎯" && s.status_until == Some(future_secs)).then_some(())
     });
+}
+
+#[test]
+fn group_dm_rename_icon_remove_transfer_owner_and_silent_leave() {
+    let world = World::start();
+
+    // 1. Group DM 3003 in READY has owner_id == "1000" (me), so rename, edit_picture, add_members, remove_members are all true.
+    let g = world.conversation("3003");
+    assert!(g.rights.rename);
+    assert!(g.rights.edit_picture);
+    assert!(g.rights.add_members);
+    assert!(g.rights.remove_members);
+
+    // 2. Rename group DM -> PATCH /channels/3003 with {"name": "Road Trip"}.
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "1000",
+            "icon": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: world.key("3003"),
+            title: Some("Road Trip".into()),
+            topic: None,
+            description: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation("3003").title, "Road Trip");
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body, json!({"name": "Road Trip"}));
+
+    // 3. Set group icon from a temp PNG file -> PATCH /channels/3003 with {"icon": "data:image/png;base64,..."}.
+    let tmp_png = std::env::temp_dir().join(format!("tiny-group-icon-{}.png", std::process::id()));
+    std::fs::write(&tmp_png, b"\x89PNG\r\n\x1a\ntest").unwrap();
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "1000",
+            "icon": "newiconhash",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::ConversationPicture {
+            conversation: world.key("3003"),
+            path: tmp_png.to_string_lossy().into_owned(),
+        }),
+        Response::Ok
+    );
+    let _ = std::fs::remove_file(&tmp_png);
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 2);
+    assert!(
+        patches[1].body["icon"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("data:image/png;base64,")),
+        "expected PNG data URI, got {:?}",
+        patches[1].body
+    );
+    assert!(world.conversation("3003").avatar.is_some());
+
+    // 4. Clear group icon (empty path) -> PATCH /channels/3003 with {"icon": null}.
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "1000",
+            "icon": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::ConversationPicture {
+            conversation: world.key("3003"),
+            path: String::new(),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[2].body, json!({"icon": null}));
+    assert!(world.conversation("3003").avatar.is_none());
+
+    // 5. Remove member 2002 as owner -> DELETE /channels/3003/recipients/2002.
+    world.discord.script("/channels/3003/recipients/2002", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::MembersRemove {
+            conversation: world.key("3003"),
+            person: "2002".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/3003/recipients/2002").len(), 1);
+    match world.ask(Request::Members { conversation: world.key("3003"), offset: 0, limit: 50 }) {
+        Response::Members { members, .. } => {
+            assert!(members.iter().all(|m| m.key.id != "2002"), "2002 should be removed");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // 6. Transfer ownership to 2001 -> PATCH /channels/3003 with {"owner": "2001"}, drops remove_members right.
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "2001",
+            "icon": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::TransferOwner {
+            conversation: world.key("3003"),
+            person: "2001".into(),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 4);
+    assert_eq!(patches[3].body, json!({"owner": "2001"}));
+    assert!(!world.conversation("3003").rights.remove_members, "non-owner must lose remove_members right");
+
+    // 7. Attempting to remove 2001 after transferring ownership is refused locally with zero HTTP calls.
+    match world.ask(Request::MembersRemove {
+        conversation: world.key("3003"),
+        person: "2001".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("owner"), "expected owner refusal, got: {detail}");
+        }
+        other => panic!("expected Refused for non-owner remove, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("DELETE", "/channels/3003/recipients/2001").is_empty());
+
+    // 8. Silent leave sends DELETE /channels/3003?silent=true and removes conversation.
+    world.discord.script("/channels/3003", 200, json!({}));
+    assert_eq!(
+        world.ask(Request::Leave { conversation: world.key("3003"), silent: true }),
+        Response::Ok
+    );
+    let deletes = world.discord.requests_to("DELETE", "/channels/3003");
+    assert_eq!(deletes.len(), 1);
+    assert!(
+        deletes[0].path.contains("silent=true"),
+        "expected silent=true query param, got {}",
+        deletes[0].path
+    );
 }

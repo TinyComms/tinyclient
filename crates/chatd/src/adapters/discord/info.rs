@@ -8,9 +8,11 @@ use super::model::{self, number, GuildSettings, Posted};
 use super::rest::Refused;
 use super::{escaped, refusal, Discord};
 use crate::hub::now;
+use base64::Engine;
 use protocol::{ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -271,11 +273,11 @@ impl Discord {
     /// Leaves a group DM (`close` false) or closes a DM as Discord's × does (`close` true). Both
     /// are one `DELETE` of the channel; a server's channel is neither. The row goes, as it does
     /// in Discord; a closed DM comes back with its next message.
-    pub(super) fn leave(&self, channel: &str, close: bool) -> Result<(), Refusal> {
+    pub(super) fn leave(&self, channel: &str, close: bool, silent: bool) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
         let path = match (known.kind, close) {
             (ConversationKind::Direct, true) => format!("/channels/{channel}"),
-            (ConversationKind::Group, false) => format!("/channels/{channel}?silent=false"),
+            (ConversationKind::Group, false) => format!("/channels/{channel}?silent={silent}"),
             (_, true) => return Err(refused("Only a direct message can be closed.")),
             (_, false) => return Err(refused("Leave servers and their channels in Discord.")),
         };
@@ -291,9 +293,162 @@ impl Discord {
         {
             let mut state = crate::hub::lock(&self.state);
             state.privates.remove(channel);
+            state.groups.remove(channel);
             state.directs.retain(|_, id| id != channel);
         }
         self.ctx.conversation_gone(channel).map_err(refused)
+    }
+
+    /// Renames a group DM (`PATCH /channels/{channel}` with `{"name": ...}`).
+    pub(super) fn update_group(&self, channel: &str, title: Option<&str>) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        let Some(raw) = title else {
+            return Err(Refusal::Unsupported);
+        };
+        let name: String = raw.trim().chars().take(100).collect();
+        if name.is_empty() {
+            return Err(refused("A group name cannot be empty."));
+        }
+        let answer = self
+            .call("PATCH", &format!("/channels/{channel}"), Some(json!({ "name": name })))
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<model::Channel>(&answer) {
+            self.direct(&updated, &HashMap::new()).map_err(refused)?;
+        } else {
+            if let Some(group) = crate::hub::lock(&self.state).groups.get_mut(channel) {
+                group.named = true;
+            }
+            self.ctx.conversation(&super::renamed(&known, &name)).map_err(refused)?;
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// Sets or clears a group DM's icon (`PATCH /channels/{channel}` with a `data:image/...;base64,...`
+    /// URI, or `{"icon": null}` when `path` is empty).
+    pub(super) fn set_group_icon(&self, channel: &str, path: &str) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        let icon_val = if path.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            let file_path = std::path::Path::new(path);
+            let ext = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                _ => return Err(refused("Choose a PNG, JPEG, GIF or WebP image.")),
+            };
+            let bytes = std::fs::read(file_path).map_err(|err| refused(format!("Could not read picture: {err}")))?;
+            if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+                return Err(refused("Choose an image under 10 MB."));
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            serde_json::Value::String(format!("data:{mime};base64,{encoded}"))
+        };
+        let answer = self
+            .call("PATCH", &format!("/channels/{channel}"), Some(json!({ "icon": icon_val })))
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<model::Channel>(&answer) {
+            self.direct(&updated, &HashMap::new()).map_err(refused)?;
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// Removes a person from a group DM (`DELETE /channels/{channel}/recipients/{person}`).
+    /// Owner-only on Discord; non-owners are refused locally before calling Discord.
+    pub(super) fn remove_from_group(&self, channel: &str, person: &str) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(group) = state.groups.get(channel) else {
+                return Err(refused("This group is gone."));
+            };
+            if group.owner != state.me {
+                return Err(refused("Only the group owner can remove people."));
+            }
+            if person == state.me {
+                return Err(refused("Use Leave group to leave this conversation."));
+            }
+        }
+        self.call("DELETE", &format!("/channels/{channel}/recipients/{person}"), None)
+            .map_err(refusal)?;
+        let title = {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(group) = state.groups.get_mut(channel) {
+                group.recipients.retain(|id| id != person);
+                let named = group.named;
+                let recs = group.recipients.clone();
+                (!named).then(|| {
+                    recs.iter()
+                        .filter_map(|id| state.users.get(id).map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            if let Ok(Some(current)) = self.ctx.known(channel) {
+                let _ = self.ctx.conversation(&super::renamed(&current, &title));
+            }
+        }
+        self.ctx.info_stale(channel);
+        self.ctx.members_changed(channel);
+        Ok(())
+    }
+
+    /// Transfers group DM ownership to another member (`PATCH /channels/{channel}` with `{"owner": person}`).
+    /// Owner-only on Discord; non-owners and non-members are refused locally.
+    pub(super) fn transfer_group_owner(&self, channel: &str, person: &str) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(group) = state.groups.get(channel) else {
+                return Err(refused("This group is gone."));
+            };
+            if group.owner != state.me {
+                return Err(refused("Only the group owner can transfer ownership."));
+            }
+            if person == state.me || !group.recipients.iter().any(|id| id == person) {
+                return Err(refused("Choose another member of this group to make owner."));
+            }
+        }
+        let answer = self
+            .call("PATCH", &format!("/channels/{channel}"), Some(json!({ "owner": person })))
+            .map_err(refusal)?;
+        if let Some(group) = crate::hub::lock(&self.state).groups.get_mut(channel) {
+            group.owner = person.to_owned();
+        }
+        if let Ok(updated) = serde_json::from_str::<model::Channel>(&answer) {
+            self.direct(&updated, &HashMap::new()).map_err(refused)?;
+        } else {
+            let mut row = super::renamed(&known, &known.title);
+            row.rights.remove_members = false;
+            self.ctx.conversation(&row).map_err(refused)?;
+        }
+        self.ctx.info_stale(channel);
+        self.ctx.members_changed(channel);
+        Ok(())
     }
 
     /// Leaves a Discord server (`DELETE /users/@me/guilds/{guild}` with `{"lurking": false}`).

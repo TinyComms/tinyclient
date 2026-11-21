@@ -754,7 +754,7 @@ impl Demo {
                 let set = demo.ctx.starred(&conversation_id, starred);
                 let _ = reply.send(set.map_err(|err| Refusal::Refused(err.to_string())));
             }
-            Command::Leave { conversation_id, reply } => {
+            Command::Leave { conversation_id, silent: _, reply } => {
                 let left = demo.ctx.conversation_gone(&conversation_id);
                 let _ = reply.send(left.map_err(|err| Refusal::Refused(err.to_string())));
             }
@@ -1032,6 +1032,7 @@ impl Demo {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TransferOwner { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

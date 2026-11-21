@@ -3252,7 +3252,23 @@ impl Chat {
                 }
                 res
             }
-            Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
+            Request::Leave { conversation, silent } => {
+                self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, silent, reply })
+            }
+            Request::TransferOwner { conversation, person } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Choose a member to transfer ownership to.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::TransferOwner {
+                    conversation_id,
+                    person,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
             Request::LeaveSpace { space } => self.leave_space(space),
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })

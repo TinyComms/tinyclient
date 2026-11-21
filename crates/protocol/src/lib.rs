@@ -1571,8 +1571,16 @@ pub enum Request {
         seconds: u32,
     },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
+    /// When `silent` is true on Discord group DMs, leaves without posting a leave system message.
     Leave {
         conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        silent: bool,
+    },
+    /// Transfers ownership of a group conversation (e.g., Discord group DM) to another member.
+    TransferOwner {
+        conversation: Key,
+        person: String,
     },
     /// Closes a direct conversation, as the network's own ×: it leaves the list until a new
     /// message brings it back. Nothing is deleted.

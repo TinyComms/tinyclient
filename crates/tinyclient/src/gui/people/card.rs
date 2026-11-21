@@ -35,8 +35,8 @@ pub enum Float {
     Confirm(Key, RelateAction),
     /// One-line modal to set or clear a friend's private nickname.
     FriendNickname(Key),
-    /// Asked once before leaving a group.
-    Leave(Conversation),
+    /// Asked once before leaving a group (`silent` suppresses Discord's leave notice).
+    Leave { conversation: Conversation, silent: bool },
     /// Asked once before clearing history or deleting a chat on the network.
     ClearHistory { conversation: Conversation, delete_chat: bool, revoke: bool },
     /// Confirm sheet before reporting a message, person, or conversation to the network.
@@ -57,7 +57,7 @@ impl Float {
             | Float::Person { person, .. }
             | Float::Confirm(person, _)
             | Float::FriendNickname(person) => Some(person),
-            Float::Conversation { .. } | Float::Leave(_) | Float::ClearHistory { .. } | Float::Report { .. } => None,
+            Float::Conversation { .. } | Float::Leave { .. } | Float::ClearHistory { .. } | Float::Report { .. } => None,
         }
     }
 }
@@ -639,7 +639,7 @@ impl Floating {
                 let words = if row.as_ref().is_some_and(|row| row.kind == protocol::ConversationKind::Group) { "Leave group" } else { "Leave" };
                 div().child(menu_item_danger("menu-leave", Some("icons/log-out.svg"), words).on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(row) = row.clone() {
-                        this.turn_to(Float::Leave(row), cx);
+                        this.turn_to(Float::Leave { conversation: row, silent: false }, cx);
                     }
                 })))
             }
@@ -707,6 +707,69 @@ impl Floating {
                         this.shell_do(cx, move |shell, cx| then(shell, cx));
                     }))),
             );
+        div()
+            .w(size.width)
+            .h(size.height)
+            .relative()
+            .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+    }
+
+    fn confirm_leave(&self, row: &Conversation, silent: bool, window: &Window, cx: &mut Context<Self>) -> Div {
+        let (title, words, verb) = facts::confirm_words(Act::Leave, &row.title, row.key.network);
+        let size = window.viewport_size();
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let can_silent = row.key.network == protocol::Network::Discord && row.kind == protocol::ConversationKind::Group;
+        let toggle_row = row.clone();
+        let target = row.clone();
+        let mut panel = div()
+            .w(px(wide))
+            .p(px(20.))
+            .rounded(px(theme::R_MODAL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            .flex()
+            .flex_col()
+            .child(div().type_title().child(title))
+            .child(modal_body(words));
+        if can_silent {
+            panel = panel.child(
+                div()
+                    .id("confirm-leave-silent")
+                    .mt(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(theme::text())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.turn_to(
+                            Float::Leave { conversation: toggle_row.clone(), silent: !silent },
+                            cx,
+                        );
+                    }))
+                    .child(crate::gui::components::glyph(
+                        if silent { "icons/square-check.svg" } else { "icons/square.svg" },
+                        16.,
+                        if silent { theme::accent() } else { theme::text_soft() },
+                    ))
+                    .child("Leave without telling the group"),
+            );
+        }
+        panel = panel.child(
+            modal_buttons()
+                .child(button("confirm-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+                .child(button("confirm-do", ButtonKind::Danger, verb).on_click(cx.listener(move |this, _, _, cx| {
+                    let target = target.clone();
+                    this.shell_do(cx, move |shell, cx| shell.leave(&target, silent, cx));
+                }))),
+        );
         div()
             .w(size.width)
             .h(size.height)
@@ -1012,9 +1075,8 @@ impl Render for Floating {
                 (self.confirm(act, &person.name, person.key.network, window, cx, move |shell, cx| shell.relate(&target, action, cx)), true)
             }
             (Float::FriendNickname(_), Some(person)) => (self.confirm_friend_nickname(person, window, cx), true),
-            (Float::Leave(row), _) => {
-                let target = row.clone();
-                (self.confirm(Act::Leave, &row.title, row.key.network, window, cx, move |shell, cx| shell.leave(&target, cx)), true)
+            (Float::Leave { conversation, silent }, _) => {
+                (self.confirm_leave(conversation, *silent, window, cx), true)
             }
             (Float::ClearHistory { conversation, delete_chat, revoke }, _) => {
                 (self.confirm_clear_history(conversation, *delete_chat, *revoke, window, cx), true)

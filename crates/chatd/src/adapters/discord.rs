@@ -2216,9 +2216,12 @@ impl Discord {
                 answer(reply, self.create_invite(conversation_id.as_deref(), space_id.as_deref(), max_age, max_uses, temporary))
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
-            Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
+            Command::Leave { conversation_id, silent, reply } => answer(reply, self.leave(&conversation_id, false, silent)),
+            Command::TransferOwner { conversation_id, person, reply } => {
+                answer(reply, self.transfer_group_owner(&conversation_id, &person))
+            }
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
-            Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
+            Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true, false)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {
                 answer(reply, self.answer_message_request(&conversation_id, accept))
             }
@@ -2253,6 +2256,15 @@ impl Discord {
             Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
             Command::StartGroup { people, title, reply } => answer(reply, self.start_group(&people, title.as_deref())),
             Command::MembersAdd { conversation_id, people, reply } => answer(reply, self.add_to_group(&conversation_id, &people)),
+            Command::MembersRemove { conversation_id, person, reply } => {
+                answer(reply, self.remove_from_group(&conversation_id, &person))
+            }
+            Command::ConversationUpdate { conversation_id, title, topic: _, description: _, reply } => {
+                answer(reply, self.update_group(&conversation_id, title.as_deref()))
+            }
+            Command::ConversationPicture { conversation_id, path, reply } => {
+                answer(reply, self.set_group_icon(&conversation_id, &path))
+            }
             Command::StartThread { conversation_id, message_id, name, reply } => {
                 drop(reply.send(self.start_thread(&conversation_id, &message_id, &name)))
             }

@@ -719,21 +719,47 @@ impl Discord {
             _ => {
                 if let Some(name) = channel.name.as_deref().filter(|name| !name.is_empty()) {
                     row.title = name.to_owned();
+                } else if recipients.is_empty() {
+                    if let Some(group) = state.groups.get(&channel.id) {
+                        let fallback: Vec<&str> = group
+                            .recipients
+                            .iter()
+                            .filter_map(|id| state.users.get(id).map(String::as_str))
+                            .collect();
+                        if !fallback.is_empty() {
+                            row.title = fallback.join(", ");
+                        }
+                    }
                 }
                 if let Some(hash) = &channel.icon {
                     let (file, url) = model::group_icon(&channel.id, hash);
                     row.avatar = Some(file.id.clone());
                     files.push((file, url));
                 }
+                let owner = channel
+                    .owner_id
+                    .clone()
+                    .or_else(|| state.groups.get(&channel.id).map(|g| g.owner.clone()))
+                    .unwrap_or_default();
+                let named = channel.name.as_deref().is_some_and(|name| !name.is_empty());
                 row.rights.add_members = true;
+                row.rights.rename = true;
+                row.rights.edit_picture = true;
+                row.rights.remove_members = !owner.is_empty() && owner == state.me;
                 // A create or update can carry recipient ids and no user objects. Resolving
-                // nobody must not replace the list READY already recorded.
+                // nobody must not replace the list READY already recorded, while still updating
+                // owner and named state.
                 if !recipients.is_empty() {
                     state.groups.insert(channel.id.clone(), super::GroupDm {
-                        owner: channel.owner_id.clone().unwrap_or_default(),
+                        owner,
                         recipients: recipients.iter().map(|user| user.id.clone()).collect(),
-                        named: channel.name.as_deref().is_some_and(|name| !name.is_empty()),
+                        named,
                     });
+                } else if let Some(group) = state.groups.get_mut(&channel.id) {
+                    if !owner.is_empty() {
+                        group.owner = owner;
+                    }
+                    group.named = named;
                 }
             }
         }

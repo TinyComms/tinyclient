@@ -621,7 +621,9 @@ pub enum Command {
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
-    Leave { conversation_id: String, reply: Reply<()> },
+    Leave { conversation_id: String, silent: bool, reply: Reply<()> },
+    /// Transfer group conversation ownership to another member (`person` id).
+    TransferOwner { conversation_id: String, person: String, reply: Reply<()> },
     /// Leave a Space (e.g. Discord server `DELETE /users/@me/guilds/{id}`).
     LeaveSpace { space_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
@@ -859,6 +861,7 @@ impl Command {
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
+            | Command::TransferOwner { reply, .. }
             | Command::LeaveSpace { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }

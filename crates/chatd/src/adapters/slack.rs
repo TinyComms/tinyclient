@@ -1667,7 +1667,7 @@ impl Slack {
             Command::CloseDirect { conversation_id, reply } => {
                 answer(reply, self.close_direct(&conversation_id));
             }
-            Command::Leave { conversation_id, reply } => {
+            Command::Leave { conversation_id, silent: _, reply } => {
                 answer(reply, self.leave(&conversation_id));
             }
             Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {

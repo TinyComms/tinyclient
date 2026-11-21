@@ -268,7 +268,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
     if let Some(timer_row) = disappearing_row(pane, row, info, cx) {
         top = top.child(timer_row.mt(px(8.)));
     }
-    if facts::can_rename(row) || facts::can_edit_topic(row) || facts::can_add_members(row) {
+    if facts::can_rename(row) || facts::can_edit_topic(row) || facts::can_edit_picture(row) || facts::can_add_members(row) {
         let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().gap(px(6.));
         if facts::can_rename(row) {
             let key = row.key.clone();
@@ -282,6 +282,30 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                         pane.start_manage(key.clone(), ManageKind::Rename, &current, "Conversation name", cx);
                     })),
             );
+        }
+        if facts::can_edit_picture(row) {
+            let key = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-picture", ButtonKind::Secondary, "Change picture…")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.pick_conversation_picture(key.clone(), cx);
+                    })),
+            );
+            if row.avatar.is_some() {
+                let clear_key = row.key.clone();
+                manage_bar = manage_bar.child(
+                    button("details-picture-clear", ButtonKind::Ghost, "Remove picture")
+                        .h(px(26.))
+                        .px(px(8.))
+                        .type_small()
+                        .on_click(cx.listener(move |pane, _, _, cx| {
+                            pane.clear_conversation_picture(clear_key.clone(), cx);
+                        })),
+                );
+            }
         }
         if facts::can_edit_topic(row) {
             let key = row.key.clone();
@@ -400,8 +424,13 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
     }
     match facts::members_shown(row, info) {
         MembersShown::Inline => {
-            let (hub, ..) = pane.parts();
-            let (_, _, _, _, _, members) = pane.parts();
+            let (hub, scene, _, _, _, members) = pane.parts();
+            let me_id = scene
+                .accounts
+                .iter()
+                .find(|a| a.key == row.key.account())
+                .map(|a| a.me.as_str())
+                .unwrap_or("");
             if !members.is_empty() {
                 sections = sections.child(draw::label("Members", !any));
                 any = true;
@@ -416,10 +445,14 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     let face = Avatar::new(&person.key, &person.name, 24.).image(avatar.as_ref()).build();
                     let face = face.children(Shape::of(shown).and_then(|shape| presence::dot(shape, 24., &ring)));
                     let key = person.key.clone();
-                    let can_remove = facts::can_remove_members(row);
+                    let is_self = !me_id.is_empty() && person.key.id == me_id;
+                    let can_remove = facts::can_remove_members(row) && !is_self;
+                    let can_transfer = can_remove && row.key.network == Network::Discord && person.title != "Owner";
                     let remove_conv = row.key.clone();
                     let remove_id = person.key.id.clone();
                     let remove_name = person.name.clone();
+                    let owner_conv = row.key.clone();
+                    let owner_id = person.key.id.clone();
                     sections = sections.child(
                         div()
                             .id(("details-member", ix))
@@ -436,6 +469,18 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                             .child(div().flex_1().min_w_0().truncate().type_ui().child(person.name.clone()))
                             .children((person.title == "Owner").then(|| div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
                             .children((!word.is_empty()).then(|| div().flex_none().type_small().text_color(theme::text_faint()).child(format!("· {word}"))))
+                            .when(can_transfer, |item| {
+                                item.child(
+                                    button(("details-member-owner", ix), ButtonKind::Ghost, "Make owner")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_micro()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.transfer_owner(owner_conv.clone(), owner_id.clone(), cx);
+                                        })),
+                                )
+                            })
                             .when(can_remove, |item| {
                                 item.child(
                                     icon_button(("details-member-remove", ix), "icons/x.svg", false)

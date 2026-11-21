@@ -1262,8 +1262,66 @@ impl InfoPane {
         let Some((conversation, person, _)) = self.pending_remove.take() else {
             return;
         };
-        super::ask_later(cx, Request::MembersRemove { conversation, person }, |_, _| {});
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::MembersRemove { conversation, person }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
         cx.notify();
+    }
+
+    pub(in crate::gui) fn pick_conversation_picture(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose group picture".into()),
+        });
+        let shell = self.shell.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = asked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let req = Request::ConversationPicture {
+                conversation,
+                path: path.to_string_lossy().into_owned(),
+            };
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn clear_conversation_picture(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::ConversationPicture { conversation, path: String::new() }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+    }
+
+    pub(in crate::gui) fn transfer_owner(&mut self, conversation: Key, person: String, cx: &mut Context<Self>) {
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::TransferOwner { conversation, person }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
     }
 }
 
@@ -1351,8 +1409,12 @@ impl Shell {
     }
 
     /// Leaves a group, after its one confirm. The row goes when the network agrees.
-    pub(in crate::gui) fn leave(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
-        self.conversation_act(Request::Leave { conversation: conversation.key.clone() }, format!("Can't leave {}", conversation.title), cx);
+    pub(in crate::gui) fn leave(&mut self, conversation: &Conversation, silent: bool, cx: &mut Context<Self>) {
+        self.conversation_act(
+            Request::Leave { conversation: conversation.key.clone(), silent },
+            format!("Can't leave {}", conversation.title),
+            cx,
+        );
     }
 
     /// Where the network's own app opens a row, and whether the user can leave it: what a row's
@@ -1363,7 +1425,7 @@ impl Shell {
 
     /// Asks once, then leaves: the same confirm Details' "…" asks, from a row's sheet.
     pub(in crate::gui) fn confirm_leave(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
-        self.open_float(Float::Leave(conversation), gpui::Point::default(), cx);
+        self.open_float(Float::Leave { conversation, silent: false }, gpui::Point::default(), cx);
     }
 
     /// A row's notifications, from its menu: everything, or nothing. The row changes when the
@@ -1465,7 +1527,7 @@ impl InfoPane {
             Subject::Conversation(_) => {
                 let row = self.row.clone()?;
                 if confirm {
-                    return facts::can_leave(&row).then_some(Float::Leave(row));
+                    return facts::can_leave(&row).then_some(Float::Leave { conversation: row, silent: false });
                 }
                 let link = facts::conversation_link(&row, self.info.got());
                 Some(Float::Conversation { conversation: row, link, alt: false })
