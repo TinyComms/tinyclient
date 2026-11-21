@@ -22,7 +22,7 @@ use crate::session;
 use crate::store::{ConversationRow, Filing, PersonRow};
 use bugle::Chat;
 use protocol::{
-    Attachment, Capabilities, Change, ConversationKind, MediaFile, MediaKind, Message, MessageKind,
+    Attachment, CallOffer, Capabilities, Change, ConversationKind, MediaFile, MediaKind, Message, MessageKind,
     Reaction, ReactionSet, RelateAction, Relation, ReplyTo, SendState, SharedKind, Special,
 };
 use serde::{Deserialize, Serialize};
@@ -721,19 +721,7 @@ fn connect(
         scheduled: scheduled.clone(),
         sims: Mutex::default(),
     });
-    ctx.capabilities(Capabilities {
-        max_file_bytes: bugle::FILE_CAP,
-        max_files: file_limit(),
-        gif_file: true,
-        schedule: true,
-        voice_notes: true,
-        edit: true,
-        edit_window: bugle::EDIT_WINDOW_SECS,
-        close_direct: true,
-        delete: true,
-        reactions: true,
-        ..Capabilities::default()
-    });
+    ctx.capabilities(capability_ceiling());
     let _ = ctx.describe(
         if account.name.is_empty() {
             "Messages"
@@ -835,6 +823,37 @@ fn peer_phone(chat: &Chat) -> Option<String> {
 const NO_REPLY_REASON: &str = "This sender can't receive replies";
 const EMERGENCY_REASON: &str = "Emergency numbers must be contacted directly from your phone.";
 
+/// What this account may send. The phone's file cap, not a plan.
+pub(crate) fn capability_ceiling() -> Capabilities {
+    Capabilities {
+        max_file_bytes: bugle::FILE_CAP,
+        max_files: file_limit(),
+        gif_file: true,
+        schedule: true,
+        voice_notes: true,
+        edit: true,
+        edit_window: bugle::EDIT_WINDOW_SECS,
+        close_direct: true,
+        delete: true,
+        reactions: true,
+        ..Capabilities::default()
+    }
+}
+
+/// What the call button of a Messages chat does. A group has no call button. A 1:1 chat with a
+/// phone number hands off to the OS `tel:` handler.
+pub(crate) fn offered_call(group: bool, emergency: bool, no_reply: bool, phone: bool) -> CallOffer {
+    if group {
+        CallOffer::Absent
+    } else if emergency || no_reply {
+        CallOffer::Missing
+    } else if phone {
+        CallOffer::Handoff
+    } else {
+        CallOffer::Missing
+    }
+}
+
 fn row(chat: &Chat) -> ConversationRow {
     let kind = if chat.group {
         ConversationKind::Group
@@ -849,19 +868,11 @@ fn row(chat: &Chat) -> ConversationRow {
     if emergency {
         row.read_only = true;
         row.read_only_reason = EMERGENCY_REASON.to_owned();
-        row.call = protocol::CallSupport::None;
     } else if no_reply {
         row.read_only = true;
         row.read_only_reason = NO_REPLY_REASON.to_owned();
-        row.call = protocol::CallSupport::None;
-    } else {
-        // A 1:1 chat with a phone number hands off to the OS `tel:` handler; groups have no call button.
-        row.call = if peer_phone(chat).is_some() {
-            protocol::CallSupport::Handoff
-        } else {
-            protocol::CallSupport::None
-        };
     }
+    row.call = offered_call(chat.group, emergency, no_reply, peer_phone(chat).is_some()).support();
     if chat.verified {
         row.mark = Some(protocol::Mark::Verified);
     }

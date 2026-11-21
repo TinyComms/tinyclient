@@ -16,6 +16,7 @@
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
 mod discord;
+pub mod parity;
 
 /// `TINYCLIENT_PROVE=discord-nitro-length`. Nitro's 4,000-character limit, shared by every send path.
 pub fn prove_discord_nitro_length() -> Result<(), String> {

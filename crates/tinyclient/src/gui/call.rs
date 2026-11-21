@@ -1854,7 +1854,7 @@ impl Shell {
             || call.video.iter().any(|v| v.direction == protocol::Direction::Encode && v.content == protocol::Content::Camera);
         let share_on = call.share_view.is_some()
             || call.video.iter().any(|v| v.direction == protocol::Direction::Encode && v.content == protocol::Content::Share);
-        let can_pictures = call.state == CallState::Joined && matches!(call.conversation.network, Network::Tiny | Network::Discord);
+        let can_pictures = call.state == CallState::Joined && protocol::call_pictures(call.conversation.network);
 
         Some(PopoutSnapshot {
             title,

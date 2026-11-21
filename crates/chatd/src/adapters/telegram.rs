@@ -67,6 +67,20 @@ mod secret;
 mod send;
 pub mod signin;
 mod sync;
+
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    sync::capability_ceiling()
+}
+
+/// A normal person's call before the full profile arrives: open it in Telegram.
+pub(crate) fn direct_call_ceiling() -> protocol::CallSupport {
+    sync::user_call(false, false, None).support
+}
+
+/// Groups and channels do not place a call here.
+pub(crate) fn other_call() -> protocol::CallSupport {
+    sync::other_call()
+}
 mod wire;
 
 use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};

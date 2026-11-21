@@ -1315,6 +1315,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
             row.listed = true;
             row.private = true;
             row.rights.pin = true;
+            row.call = call_offer(ConversationKind::Direct).support();
             row
         }
         Peer::Group(_) => {
@@ -1322,6 +1323,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
             let mut row = ConversationRow::new(peer.conversation(), ConversationKind::Group, title);
             row.listed = true;
             row.private = true;
+            row.call = call_offer(ConversationKind::Group).support();
             row
         }
     }
@@ -2655,6 +2657,19 @@ fn offline(ctx: &Context, command: Command) {
 /// emoji per person). No custom emoji, and no cap on how many different ones a message holds.
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules { mine: 1, replaces: true, ..protocol::ReactionRules::default() }
+}
+
+/// The ceiling: link previews on, which is what a linked account is asked for.
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    capabilities(true)
+}
+
+/// Signal calls stay on the phone. Directs and groups exist here; a voice room does not.
+pub(crate) fn call_offer(kind: ConversationKind) -> protocol::CallOffer {
+    match kind {
+        ConversationKind::Direct | ConversationKind::Group => protocol::CallOffer::Missing,
+        _ => protocol::CallOffer::Absent,
+    }
 }
 
 /// What this account may send: text up to the body other clients keep in the message itself,

@@ -38,14 +38,7 @@ DAVE seals the picture as well as the voice. The transport encryption is the sam
 
 ## Hand-off
 
-| Network | What the control does |
-| --- | --- |
-| Slack | Huddles open in Slack. |
-| Teams | Calls and meetings open in Teams. |
-| Telegram | Opens the chat in Telegram so you can start a call there. |
-| Android Messages | In 1:1 chats with a phone number, opens a `tel:` link in the system's phone app. Group chats have no call control. Incoming phone calls are not carried by the relay. |
-| Signal | No call control. An incoming call rings as one notification with "Answer on your phone"; a call nobody answered here leaves a missed-call line in the conversation. |
-| Discord stage | Opens in Discord. |
+Which call control is native, a hand-off, or missing is [the generated table](../parity.md). A control that table does not mark native names the official app and does not start mediad.
 
 A multi-stream video gallery (more than one simultaneous remote video feed), recording, captions, a soundboard, stage channels, activities, a lobby, and breakout rooms are not built on any network.
 

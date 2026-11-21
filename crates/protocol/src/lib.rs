@@ -354,6 +354,43 @@ pub enum CallSupport {
     Restricted,
 }
 
+/// Camera and screen share run in this client on a Tiny or Discord call.
+pub fn call_pictures(network: Network) -> bool {
+    matches!(network, Network::Tiny | Network::Discord)
+}
+
+/// How a conversation kind is called, as the adapter that builds its row decides.
+/// Not sent on the wire. [`CallOffer::Absent`] means that network has no such conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOffer {
+    Native,
+    Handoff,
+    /// The network has this kind of conversation and this client does not call it.
+    Missing,
+    /// The network has no such conversation.
+    Absent,
+}
+
+impl CallOffer {
+    pub fn support(self) -> CallSupport {
+        match self {
+            CallOffer::Native => CallSupport::Native,
+            CallOffer::Handoff => CallSupport::Handoff,
+            CallOffer::Missing | CallOffer::Absent => CallSupport::None,
+        }
+    }
+}
+
+impl From<CallSupport> for CallOffer {
+    fn from(support: CallSupport) -> Self {
+        match support {
+            CallSupport::Native => CallOffer::Native,
+            CallSupport::Handoff => CallOffer::Handoff,
+            CallSupport::None | CallSupport::Restricted => CallOffer::Missing,
+        }
+    }
+}
+
 /// Someone in a voice channel, as its row in the tree shows them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Occupant {

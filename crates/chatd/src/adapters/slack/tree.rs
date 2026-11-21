@@ -3,7 +3,7 @@
 use super::{fnv, seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{BrowsedPage, Command, Failure};
 use crate::store::{ConversationRow, SpaceRow};
-use protocol::{BrowsedChannel, CallSupport, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
+use protocol::{BrowsedChannel, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -78,7 +78,7 @@ impl Slack {
         ConversationRow {
             space: Some(self.ctx.account.account.clone()),
             position: LAST,
-            call: CallSupport::Handoff,
+            call: super::call_support(),
             ..ConversationRow::new(id, kind, title)
         }
     }

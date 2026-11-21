@@ -6,7 +6,7 @@
 use super::{chain_id, escaped, id_of, millis, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, TREE_FRESH};
 use crate::adapters::Command;
 use crate::store::{ConversationRow, Filing, PreviewLine, SpaceRow};
-use protocol::{CallSupport, ConversationKind, Relation, Special};
+use protocol::{ConversationKind, Relation, Special};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -188,7 +188,7 @@ impl Teams {
                 .map(|(position, channel)| ConversationRow {
                     space: Some(id.to_owned()),
                     position: position as i32,
-                    call: CallSupport::Handoff,
+                    call: super::channel_call(),
                     private: channel["channelType"].as_u64().is_some_and(|kind| kind != 0),
                     read_only: team["isArchived"] == true || channel["isArchived"] == true,
                     opted_out: hidden(channel),
@@ -335,7 +335,7 @@ impl Teams {
         ConversationRow {
             avatar: avatar.map(|file| file.id),
             peer: partner.filter(|_| !bot).map(str::to_owned),
-            call: if bot || notes { CallSupport::None } else { CallSupport::Handoff },
+            call: super::chat_call(bot, notes),
             bot,
             special: if notes { Special::Saved } else { Special::None },
             ..ConversationRow::new(id, kind, title)
