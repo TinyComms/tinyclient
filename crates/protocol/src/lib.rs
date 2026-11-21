@@ -2655,6 +2655,14 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// Press an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
+    /// Answers `Response::ButtonAnswer`.
+    PressButton {
+        conversation: Key,
+        message_id: String,
+        /// Hex-encoded callback payload from `InlineButtonKind::Callback::data`.
+        data: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3171,6 +3179,10 @@ pub enum Response {
     /// Members who have read a given message (`Request::ReadBy`).
     ReadBy {
         readers: Vec<ReadBy>,
+    },
+    /// Answer to pressing an inline bot callback button (`Request::PressButton`).
+    ButtonAnswer {
+        answer: ButtonAnswer,
     },
 }
 

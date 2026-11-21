@@ -3961,6 +3961,19 @@ impl Chat {
                 values,
                 reply,
             }),
+            Request::PressButton { conversation, message_id, data } => {
+                let account = conversation.account();
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::PressButton {
+                    conversation_id,
+                    message_id,
+                    data,
+                    reply,
+                }) {
+                    Ok(answer) => Response::ButtonAnswer { answer },
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

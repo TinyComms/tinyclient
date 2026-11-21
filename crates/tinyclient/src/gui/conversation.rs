@@ -1730,6 +1730,42 @@ impl Pane {
         })
         .detach();
     }
+
+    pub(super) fn press_inline_button(
+        &mut self,
+        conversation: Key,
+        message_id: String,
+        pending_key: String,
+        data: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (message_id.clone(), pending_key);
+        self.pending_actions.insert(key.clone(), Instant::now());
+        cx.notify();
+        let request = Request::PressButton { conversation, message_id, data };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.pending_actions.remove(&key);
+                match answer {
+                    Ok(Response::ButtonAnswer { answer }) => {
+                        if let Some(text) = answer.message.filter(|s| !s.is_empty()) {
+                            this.say(text, cx);
+                        }
+                        if let Some(url) = answer.url.filter(|s| !s.is_empty()) {
+                            let _ = crate::host::open_url(&url);
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("press button", &err), cx),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     fn live_call_row(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if self.thread {
             return None;

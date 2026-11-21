@@ -982,6 +982,33 @@ pub(super) fn report(
     }
 }
 
+/// Press an inline callback button under a bot message (`messages.getBotCallbackAnswer`).
+pub(super) fn press_button(
+    account: &Account,
+    conversation_id: &str,
+    message_id: &str,
+    data_hex: &str,
+) -> Result<protocol::ButtonAnswer, Fault> {
+    let (who, _) = Who::parse(conversation_id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let msg_id: i32 = message_id.parse().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+    let bytes = super::content::hex_decode(data_hex).ok_or_else(|| invalid("DATA_INVALID"))?;
+    let peer = account.input(who)?;
+    let tl::enums::messages::BotCallbackAnswer::Answer(ans) = account.ask(
+        &tl::functions::messages::GetBotCallbackAnswer {
+            game: false,
+            peer,
+            msg_id,
+            data: Some(bytes),
+            password: None,
+        },
+    )?;
+    Ok(protocol::ButtonAnswer {
+        message: ans.message,
+        alert: ans.alert,
+        url: ans.url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

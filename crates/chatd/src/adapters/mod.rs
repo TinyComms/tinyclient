@@ -664,6 +664,13 @@ pub enum Command {
         values: Vec<String>,
         reply: Reply<()>,
     },
+    /// Presses an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
+    PressButton {
+        conversation_id: String,
+        message_id: String,
+        data: String,
+        reply: Reply<protocol::ButtonAnswer>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -891,6 +898,7 @@ impl Command {
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

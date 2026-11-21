@@ -3817,3 +3817,67 @@ fn save_and_unsave_gif() {
     };
     assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
 }
+
+#[test]
+fn bot_inline_buttons_render_and_fire_callback() {
+    let world = World::signed_in();
+    world.connected();
+    let bot_chat = key("u7004");
+    world.steer("bot-buttons");
+
+    let msg = world.until("bot message with inline buttons", || {
+        match world.ask(Request::Messages { conversation: bot_chat.clone(), page: Page::Newest, limit: 20 }) {
+            Response::Messages { messages, .. } => messages.into_iter().find(|m| m.id == "90"),
+            _ => None,
+        }
+    });
+    assert_eq!(msg.buttons.len(), 2, "expected 2 rows of inline buttons: {:?}", msg.buttons);
+    assert_eq!(msg.buttons[0].len(), 2);
+    assert_eq!(msg.buttons[0][0].label, "Approve");
+    let callback_data = match &msg.buttons[0][0].kind {
+        protocol::InlineButtonKind::Callback { data, requires_password } => {
+            assert!(!requires_password);
+            data.clone()
+        }
+        other => panic!("expected Callback button, got {other:?}"),
+    };
+    assert_eq!(
+        msg.buttons[0][1],
+        protocol::InlineButton {
+            label: "Docs".into(),
+            kind: protocol::InlineButtonKind::Url { url: "https://example.com/docs".into() },
+        }
+    );
+    assert_eq!(
+        msg.buttons[1][0],
+        protocol::InlineButton {
+            label: "Copy code".into(),
+            kind: protocol::InlineButtonKind::Copy { text: "ABC-123".into() },
+        }
+    );
+    assert_eq!(
+        msg.buttons[1][1],
+        protocol::InlineButton {
+            label: "Search".into(),
+            kind: protocol::InlineButtonKind::SwitchInline { query: "trails ".into(), same_peer: true },
+        }
+    );
+
+    let resp = world.ask(Request::PressButton {
+        conversation: bot_chat,
+        message_id: "90".into(),
+        data: callback_data,
+    });
+    match resp {
+        Response::ButtonAnswer { answer } => {
+            assert_eq!(answer.message.as_deref(), Some("Approved!"));
+            assert!(!answer.alert);
+        }
+        other => panic!("expected ButtonAnswer, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c == "GetBotCallbackAnswer u7004 90 approve:42"),
+        "expected GetBotCallbackAnswer on wire, got: {:#?}",
+        world.calls()
+    );
+}

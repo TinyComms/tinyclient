@@ -1846,6 +1846,51 @@ impl World {
                 self.store(None, message.clone());
                 vec![new(message)]
             }
+            // A bot message with two rows of inline keyboard buttons (callback, URL, copy, switch_inline).
+            "bot-buttons" => {
+                let bot = Who::User(BOT);
+                let mut msg = message(bot, 90, BOT, t0() + 80, "Choose an action:");
+                let row1 = tl::types::KeyboardButtonRow {
+                    buttons: vec![
+                        tl::types::KeyboardButtonCallback {
+                            requires_password: false,
+                            style: None,
+                            text: "Approve".to_owned(),
+                            data: b"approve:42".to_vec(),
+                        }
+                        .into(),
+                        tl::types::KeyboardButtonUrl {
+                            style: None,
+                            text: "Docs".to_owned(),
+                            url: "https://example.com/docs".to_owned(),
+                        }
+                        .into(),
+                    ],
+                }
+                .into();
+                let row2 = tl::types::KeyboardButtonRow {
+                    buttons: vec![
+                        tl::types::KeyboardButtonCopy {
+                            style: None,
+                            text: "Copy code".to_owned(),
+                            copy_text: "ABC-123".to_owned(),
+                        }
+                        .into(),
+                        tl::types::KeyboardButtonSwitchInline {
+                            same_peer: true,
+                            style: None,
+                            text: "Search".to_owned(),
+                            query: "trails ".to_owned(),
+                            peer_types: None,
+                        }
+                        .into(),
+                    ],
+                }
+                .into();
+                msg.reply_markup = Some(tl::types::ReplyInlineMarkup { rows: vec![row1, row2] }.into());
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
             // The channel's post gains a section of comments: the post says its count and the
             // linked group it is answered in, and two comments stand in the thread. A number
             // after the word says how many of them the user has not read.
@@ -2131,6 +2176,23 @@ impl World {
         if asked::<f::account::UpdateStatus>(body).is_some() {
             self.log("UpdateStatus");
             return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::GetBotCallbackAnswer>(body) {
+            let who = input_who(&request.peer);
+            let data_str = request
+                .data
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            self.log(&format!("GetBotCallbackAnswer {} {} {}", who.text(), request.msg_id, data_str));
+            return answer(tl::enums::messages::BotCallbackAnswer::Answer(tl::types::messages::BotCallbackAnswer {
+                alert: false,
+                has_url: false,
+                native_ui: false,
+                message: Some("Approved!".to_owned()),
+                url: None,
+                cache_time: 0,
+            }));
         }
         if let Some(request) = asked::<f::messages::GetDialogs>(body) {
             let after = match &request.offset_peer {
