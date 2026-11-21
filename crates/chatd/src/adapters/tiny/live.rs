@@ -1721,7 +1721,10 @@ fn heard_frame(
         }
         _ if frame.get("seq").is_some() => durable(ctx, saved, seat, kind, frame),
         _ if super::messages::live_kind(kind) => {
-            super::messages::on_live(ctx, saved, &seat.names, kind, frame)
+            super::messages::on_live(ctx, saved, &seat.names, kind, frame);
+            if kind.starts_with("channel.") {
+                ctx.community_changed();
+            }
         }
         // A type this client does not know yet, from a newer server.
         _ => {}
@@ -3177,7 +3180,7 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
     // Anything the page shows: the server, its roles, categories and order, rooms, members
     // and invites. `role.*` and `member.roles` can also change what this account may do; the
     // page's next read learns it.
-    let shown = ["server.", "role.", "roles.", "category.", "layout.", "room.", "member.", "invite."];
+    let shown = ["server.", "role.", "roles.", "category.", "layout.", "room.", "member.", "invite.", "channel."];
     if shown.iter().any(|prefix| kind.starts_with(prefix)) {
         ctx.community_changed();
     }

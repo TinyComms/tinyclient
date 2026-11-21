@@ -711,3 +711,58 @@ fn a_passkey_already_gone_is_said_so_and_not_blamed_on_the_server() {
     });
     assert_eq!(PASSKEY_GONE, "That passkey is gone.");
 }
+
+#[test]
+fn community_loads_channels_with_categories_positions_overrides_and_permissions() {
+    let base = serve(|request| {
+        let first = request.lines().next().unwrap_or("");
+        let route = first.split(' ').take(2).collect::<Vec<_>>().join(" ");
+        match route.as_str() {
+            "GET /v1/capabilities" => http(200, "OK", r#"{"version":"0.4.0","features":["server","roles","categories"]}"#),
+            "GET /v1/me" => http(200, "OK", OWNER),
+            "GET /v1/members" => http(200, "OK", &members()),
+            "GET /v1/invites" => http(200, "OK", "[]"),
+            "GET /v1/rooms" => http(200, "OK", &format!(r#"[{{"id":"{LOBBY}","name":"Lobby"}}]"#)),
+            "GET /v1/categories" => http(200, "OK", r#"[{"id":"cat-text","name":"Text","position":0},{"id":"cat-proj","name":"Projects","position":1}]"#),
+            "GET /v1/channels" => http(200, "OK", &format!(
+                r#"{{"channels":[{{"id":"ch-1","name":"general","topic":"Welcome","category_id":"cat-text","position":0,"e2ee":false,"overrides":[{{"role_id":"{MODS}","allow":512,"deny":0}}],"my_permissions":517}},{{"id":"ch-2","name":"roadmap","topic":"","category_id":"cat-proj","position":2,"e2ee":true,"overrides":[],"my_permissions":1}},{{"id":"ch-3","name":"loose","topic":"","category_id":null,"position":0,"overrides":[]}}]}}"#
+            )),
+            "GET /v1/server" => http(200, "OK", r#"{"name":"Test","description":"","welcome":"","icon":null,"created_at":"t"}"#),
+            "GET /v1/roles" => http(200, "OK", "[]"),
+            "GET /health" => http(200, "OK", r#"{"ok":true,"media":"up"}"#),
+            _ if first.starts_with("GET /v1/audit?") => http(200, "OK", "[]"),
+            _ => http(404, "Not Found", "{}"),
+        }
+    });
+    with_session(&base, "owner", |account| match community(&test_hub(), account) {
+        Response::TinyCommunity { community } => {
+            assert_eq!(community.channels.len(), 3);
+            assert_eq!(community.channels[0].id, "ch-1");
+            assert_eq!(community.channels[0].category_id.as_deref(), Some("cat-text"));
+            assert_eq!(community.channels[0].position, 0);
+            assert_eq!(community.channels[0].overrides.len(), 1);
+            assert_eq!(community.channels[0].overrides[0].allow, 512);
+            assert_eq!(community.channels[0].my_permissions, Some(517));
+            assert_eq!(community.channels[1].category_id.as_deref(), Some("cat-proj"));
+            assert_eq!(community.channels[1].position, 2);
+            assert!(community.channels[1].e2ee);
+            assert_eq!(community.channels[1].my_permissions, Some(1));
+            assert_eq!(community.channels[2].category_id, None);
+            assert_eq!(community.channels[2].my_permissions, None);
+        }
+        other => panic!("expected community, got {other:?}"),
+    });
+}
+
+#[test]
+fn community_loads_rooms_when_channels_route_answers_404() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = newer(OWNER, log);
+    with_session(&base, "owner", |account| match community(&test_hub(), account) {
+        Response::TinyCommunity { community } => {
+            assert_eq!(community.rooms.len(), 1);
+            assert!(community.channels.is_empty());
+        }
+        other => panic!("expected community, got {other:?}"),
+    });
+}

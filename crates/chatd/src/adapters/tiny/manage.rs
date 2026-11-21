@@ -341,6 +341,20 @@ pub(crate) fn categories_of(saved: &Saved) -> Vec<TinyCategory> {
     categories
 }
 
+/// Text channels from `GET /v1/channels`. A 403, 404 or unreadable answer leaves it empty and
+/// does not fail the page: an older server has no such route.
+pub(crate) fn channels_of(saved: &Saved) -> Vec<protocol::TinyChannel> {
+    match asked("GET", saved, "/v1/channels", None) {
+        Ok((200, body)) => {
+            let value = body.get("channels").cloned().unwrap_or(body);
+            let mut read: Vec<protocol::TinyChannel> = rows(value, "channels").unwrap_or_default();
+            read.truncate(LIST_MAX);
+            read
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn bans_of(saved: &Saved) -> Vec<TinyBan> {
     list(saved, "/v1/bans", "bans")
 }

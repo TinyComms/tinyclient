@@ -872,6 +872,7 @@ fn premier() -> protocol::TinyCommunity {
                 ..protocol::TinyRoom::new("r-games", "game night")
             },
         ],
+        channels: Vec::new(),
         online: vec![ME.into(), "halvard".into()],
         media: "up".into(),
         // It speaks end-to-end encrypted text, so Encryption is one of its settings' pages.

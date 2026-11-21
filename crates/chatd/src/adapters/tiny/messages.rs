@@ -100,6 +100,10 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             ..PersonRow::default()
         })
         .collect();
+    let category_map: HashMap<String, (String, i32)> = super::manage::categories_of(saved)
+        .into_iter()
+        .map(|cat| (cat.id, (cat.name, cat.position)))
+        .collect();
     let mut groups = Vec::new();
     let mut rows = Vec::new();
     let mut noted = Vec::new();
@@ -126,17 +130,19 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         {
             row.group = Some(category.to_owned());
             if categories.insert(category.to_owned()) {
-                let position = channels
-                    .iter()
-                    .filter(|other| other.category_id.as_deref() == Some(category))
-                    .map(|other| other.position)
-                    .min()
-                    .unwrap_or(0);
-                let name = channel
-                    .category_name
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(category);
+                let (name, position) = category_map
+                    .get(category)
+                    .filter(|(name, _)| !name.is_empty())
+                    .map(|(name, pos)| (name.as_str(), *pos))
+                    .unwrap_or_else(|| {
+                        let position = channels
+                            .iter()
+                            .filter(|other| other.category_id.as_deref() == Some(category))
+                            .map(|other| other.position)
+                            .min()
+                            .unwrap_or(0);
+                        (category, position)
+                    });
                 groups.push(Group::new(category, name, position));
             }
         }
@@ -259,6 +265,16 @@ pub(crate) fn on_live(
         "channel.deleted" => {
             if let Some(id) = nested_id(frame, "channel", "channel_id") {
                 let _ = ctx.conversation_gone(id);
+            }
+        }
+        "category.updated" => {
+            if let Some(category) = frame.get("category") {
+                let id = field(category, "id");
+                let name = field(category, "name");
+                let position = category.get("position").and_then(Value::as_i64).unwrap_or(0) as i32;
+                if super::safe_id(id) && !name.is_empty() {
+                    let _ = ctx.group(SPACE, &Group::new(id, name, position));
+                }
             }
         }
         "direct.created" => direct_upsert(ctx, saved, names, frame),
@@ -582,8 +598,12 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
         return;
     }
     if let Some(category) = channel.category_id.as_deref().filter(|id| super::safe_id(id)) {
-        let name = channel.category_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(category);
-        let _ = ctx.group(SPACE, &Group::new(category, name, channel.position));
+        let (name, position) = super::manage::categories_of(saved)
+            .into_iter()
+            .find(|cat| cat.id == category && !cat.name.is_empty())
+            .map(|cat| (cat.name, cat.position))
+            .unwrap_or_else(|| (category.to_owned(), channel.position));
+        let _ = ctx.group(SPACE, &Group::new(category, &name, position));
     }
     let mut row = ConversationRow::new(&channel.id, ConversationKind::Channel, title_or(&channel.name, &channel.id));
     row.space = Some(SPACE.to_owned());
@@ -2662,8 +2682,6 @@ struct WireChannel {
     #[serde(default)]
     category_id: Option<String>,
     #[serde(default)]
-    category_name: Option<String>,
-    #[serde(default)]
     position: i32,
     #[serde(default, deserialize_with = "flex_u32")]
     unread: u32,
@@ -3313,8 +3331,11 @@ mod tests {
     fn lists(request: &str) -> Vec<u8> {
         if request.starts_with("GET /v1/channels ") {
             return http(200, "OK", &format!(
-                r#"{{"channels":[{{"id":"channel-1","name":"general","topic":"Hello","category_id":"cat-1","category_name":"Text","position":1,"unread":2,"last_message":{{"id":"c-9","author_id":"{PEER}","body":"hey","created_at":"{WHEN}"}}}}]}}"#
+                r#"{{"channels":[{{"id":"channel-1","name":"general","topic":"Hello","category_id":"cat-1","position":1,"unread":2,"last_message":{{"id":"c-9","author_id":"{PEER}","body":"hey","created_at":"{WHEN}"}}}}]}}"#
             ));
+        }
+        if request.starts_with("GET /v1/categories ") {
+            return http(200, "OK", r#"[{"id":"cat-1","name":"Text","position":0}]"#);
         }
         if request.starts_with("GET /v1/directs ") {
             return http(200, "OK", &format!(
@@ -3639,7 +3660,6 @@ mod tests {
                 "name": "general",
                 "topic": "Moved",
                 "category_id": "cat-1",
-                "category_name": "Text",
                 "position": 1,
                 "unread": 0,
                 "last_message": {
@@ -3655,6 +3675,32 @@ mod tests {
         assert_eq!(channel.unread, 2, "a channel update carries the actor's unread, not ours");
         assert_eq!(channel.topic, "Moved");
         assert_eq!(channel.preview, "later");
+    }
+
+    #[test]
+    fn store_groups_use_category_names_and_positions_and_rename_on_category_updated() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/categories ") {
+                return Some(http(200, "OK", r#"[{"id":"cat-text","name":"Text","position":2},{"id":"cat-proj","name":"Projects","position":5}]"#));
+            }
+            if request.starts_with("GET /v1/channels ") {
+                return Some(http(200, "OK", r#"{"channels":[{"id":"c-1","name":"general","topic":"","category_id":"cat-text","position":10,"unread":0},{"id":"c-2","name":"random","topic":"","category_id":"cat-text","position":11,"unread":0},{"id":"c-3","name":"roadmap","topic":"","category_id":"cat-proj","position":0,"unread":0}]}"#));
+            }
+            None
+        });
+        let space = ctx.key(SPACE);
+        let groups = ctx.hub.store().tree(&space, 0, 50).unwrap().unwrap().groups;
+        let text = groups.iter().find(|g| g.id == "cat-text").expect("Text group");
+        let proj = groups.iter().find(|g| g.id == "cat-proj").expect("Projects group");
+        assert_eq!((text.name.as_str(), text.position), ("Text", 2));
+        assert_eq!((proj.name.as_str(), proj.position), ("Projects", 5));
+
+        on_live(&ctx, &saved, &HashMap::new(), "category.updated", &json!({
+            "category": { "id": "cat-proj", "name": "Roadmap", "position": 1 }
+        }));
+        let groups = ctx.hub.store().tree(&space, 0, 50).unwrap().unwrap().groups;
+        let proj = groups.iter().find(|g| g.id == "cat-proj").expect("renamed group");
+        assert_eq!((proj.name.as_str(), proj.position), ("Roadmap", 1));
     }
 
     /// A 403 on the channel list is a refusal, not an empty server. Treating it as empty makes

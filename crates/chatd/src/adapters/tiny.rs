@@ -1058,6 +1058,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Some(extras) => (extras.server, extras.roles, extras.categories, extras.bans),
         None => (None, Vec::new(), Vec::new(), Vec::new()),
     };
+    let channels = manage::channels_of(&saved);
     // "New device added", from what this device knows: no request.
     let new_devices = e2ee::added(&saved);
     Response::TinyCommunity {
@@ -1068,6 +1069,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             audit,
             origin: saved.base_url,
             rooms,
+            channels,
             online,
             media,
             capabilities: known.capabilities,

@@ -643,6 +643,7 @@ mod tests {
             audit: vec![],
             origin: "https://tiny.example".into(),
             rooms: vec![seated("lounge", &["mem", "me"]), seated("games", &[])],
+            channels: Vec::new(),
             online: vec![],
             media: "up".into(),
             capabilities: TinyCapabilities::default(),

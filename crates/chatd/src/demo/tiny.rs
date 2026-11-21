@@ -17,7 +17,7 @@ use super::{Fallible, Seeder, Who};
 use crate::hub::Hub;
 use protocol::{
     AccountKey, Change, MediaKind, Network, Request, Response, TinyAccess, TinyAudit, TinyBan,
-    TinyCapabilities, TinyCategory, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyOverride,
+    TinyCapabilities, TinyCategory, TinyChannel, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyOverride,
     TinyBot, TinyRole, TinyRoleEdit, TinyRoom, TinySeat, TinyServerInfo, TINY_ALL, TINY_BAN_MEMBERS,
     TINY_CREATE_INVITES, TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS, TINY_EVERYONE_DEFAULT,
     TINY_KICK_MEMBERS, TINY_MOVE_MEMBERS, TINY_MUTE_MEMBERS, TINY_PRIORITY_SPEAKER, TINY_SPEAK,
@@ -537,6 +537,41 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         audit: audit_rows(),
         origin: ORIGIN.to_owned(),
         rooms: vec![lounge, music, raid, squad, afk],
+        channels: vec![
+            TinyChannel {
+                id: "chan-general".into(),
+                name: "general".into(),
+                topic: "Everything Night Shift.".into(),
+                category_id: Some("cat-hangout".into()),
+                position: 0,
+                e2ee: false,
+                overrides: Vec::new(),
+                my_permissions: Some(TINY_ALL),
+            },
+            TinyChannel {
+                id: "chan-music".into(),
+                name: "playlists".into(),
+                topic: "Drop tracks for Friday music night.".into(),
+                category_id: Some("cat-hangout".into()),
+                position: 1,
+                e2ee: false,
+                overrides: Vec::new(),
+                my_permissions: Some(TINY_ALL),
+            },
+            TinyChannel {
+                id: "chan-raid".into(),
+                name: "raid-plans".into(),
+                topic: "Tuesday strat notes.".into(),
+                category_id: Some("cat-games".into()),
+                position: 0,
+                e2ee: true,
+                overrides: vec![
+                    TinyOverride { role_id: EVERYONE.into(), allow: 0, deny: protocol::TINY_VIEW_CHANNEL },
+                    TinyOverride { role_id: RAID.into(), allow: protocol::TINY_VIEW_CHANNEL, deny: 0 },
+                ],
+                my_permissions: Some(TINY_ALL),
+            },
+        ],
         online: vec![OWNER, ME, DEV, LEILA, THEO, SAM, LENA, KOFI].into_iter().map(str::to_owned).collect(),
         media: "up".to_owned(),
         capabilities: TinyCapabilities {

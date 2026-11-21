@@ -197,6 +197,44 @@ impl TinyRoom {
     }
 }
 
+/// One text channel on a Tiny server: its category, order, encryption state, per-role overrides
+/// and what this account may do in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyChannel {
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub name: String,
+    #[serde(default, deserialize_with = "text_or_null", skip_serializing_if = "String::is_empty")]
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "is_zero_i32")]
+    pub position: i32,
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "crate::is_false")]
+    pub e2ee: bool,
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<TinyOverride>,
+    /// What this account may do in this channel. `None` from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_permissions: Option<u64>,
+}
+
+impl TinyChannel {
+    /// A text channel with just an id and name.
+    pub fn new(id: &str, name: &str) -> TinyChannel {
+        TinyChannel {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            topic: String::new(),
+            category_id: None,
+            position: 0,
+            e2ee: false,
+            overrides: Vec::new(),
+            my_permissions: None,
+        }
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -260,6 +298,9 @@ pub struct TinyCommunity {
     /// The server's rooms, in its order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rooms: Vec<TinyRoom>,
+    /// The server's text channels, in its order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<TinyChannel>,
     /// Members online now, as the live socket last said. Empty while it is not connected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub online: Vec<String>,
@@ -661,6 +702,15 @@ impl TinyAccess {
             return true;
         }
         room.my_permissions.unwrap_or(self.permissions) & bits == bits
+    }
+
+    /// Whether this account has all of `bits` in `channel`, by the channel's `my_permissions`
+    /// where the server sent them, else by the server-wide bits.
+    pub fn has_in_channel(&self, channel: &TinyChannel, bits: u64) -> bool {
+        if self.owner {
+            return true;
+        }
+        channel.my_permissions.unwrap_or(self.permissions) & bits == bits
     }
 
     /// Whether this account may act on someone (kick, ban, timeout, roles, server mute or
@@ -2137,5 +2187,20 @@ mod tests {
         assert!(own.contains("http, not https") && own.contains("your network"));
         let open = super::plain_http_words(Open).unwrap();
         assert!(open.contains("http, not https") && open.contains("not on your own network") && open.contains("take over your account"));
+    }
+
+    #[test]
+    fn has_in_channel_checks_owner_my_permissions_and_fallback() {
+        let owner = TinyAccess { owner: true, roles: vec![], permissions: 0, rank: i32::MAX };
+        let member = TinyAccess { owner: false, roles: vec!["r".into()], permissions: TINY_VIEW_CHANNEL | TINY_MANAGE_CHANNELS, rank: 1 };
+        let denied = TinyChannel { my_permissions: Some(TINY_VIEW_CHANNEL), ..TinyChannel::new("c1", "general") };
+        let granted = TinyChannel { my_permissions: Some(TINY_VIEW_CHANNEL | TINY_MANAGE_CHANNELS), ..TinyChannel::new("c2", "ops") };
+        let legacy = TinyChannel::new("c3", "legacy");
+        assert!(owner.has_in_channel(&denied, TINY_MANAGE_CHANNELS));
+        assert!(!member.has_in_channel(&denied, TINY_MANAGE_CHANNELS));
+        assert!(member.has_in_channel(&denied, TINY_VIEW_CHANNEL));
+        assert!(member.has_in_channel(&granted, TINY_MANAGE_CHANNELS));
+        assert!(member.has_in_channel(&legacy, TINY_MANAGE_CHANNELS));
+        assert!(!member.has_in_channel(&legacy, TINY_BAN_MEMBERS));
     }
 }
