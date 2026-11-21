@@ -2785,7 +2785,8 @@ impl Pane {
             let joins = acts && refused.is_none();
             // Right-click names them in a list, where one was sent or the account can fetch them.
             // Left-click keeps its work: joining or taking the reaction back.
-            let list = (!phone && (named || self.caps.reactors)).then(|| {
+            let can_reactors = self.open.as_ref().is_some_and(|open| open.can.reactors);
+            let list = (!phone && (named || can_reactors)).then(|| {
                 let open = message.clone();
                 cx.listener(move |this: &mut Pane, event: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();

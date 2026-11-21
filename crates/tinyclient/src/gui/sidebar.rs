@@ -20,8 +20,9 @@ pub mod tree;
 pub mod walk;
 
 use super::components::{
-    badge_dot, badge_mention, banner, banner_action, empty_state, glyph, icon_button, keycap, list_row, network_icon,
-    pane_title, rollup_badge, row_badge, row_tone, segment, segmented, skeleton, tip, Avatar, Shape, Tone,
+    badge_dot, badge_mention, banner, banner_action, button, empty_state, glyph, icon_button, keycap, list_row,
+    network_icon, pane_title, rollup_badge, row_badge, row_tone, segment, segmented, skeleton, tip, Avatar, ButtonKind,
+    Shape, Tone,
 };
 use super::chrome::{self, End};
 use super::layout::{drags_window, Menu};
@@ -29,8 +30,8 @@ use super::state::{Shell, Snapshot, SpaceTree, TROUBLE_SHOWN};
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Div, FocusHandle, FontWeight, ListAlignment, ListState, MouseButton,
-    ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list, Context, Div, Entity, FocusHandle, FontWeight, ListAlignment, ListState,
+    MouseButton, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
 };
 use history::History;
 use pages::Pages;
@@ -2103,7 +2104,7 @@ impl Shell {
             let _ = shell.update(cx, |this, cx| match answer {
                 Ok(Response::Ok) => {
                     this.sidebar_state.pins.retain(|pin| pin != &space);
-                    this.open_network(network, cx);
+                    this.go(Mode::Network(network), cx);
                     this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Left {name}"), cx);
                     cx.notify();
                 }
@@ -2250,7 +2251,7 @@ impl Shell {
                 Ok(Response::InviteJoined { space, .. }) => {
                     this.sidebar_state.join_server = None;
                     if let Some(space) = space {
-                        this.open_space(space, cx);
+                        this.go(Mode::Space(space), cx);
                     }
                     this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined server", cx);
                     cx.notify();

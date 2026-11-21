@@ -811,7 +811,7 @@ impl Shell {
                 } else if let Some(account) = snapshot
                     .accounts
                     .iter()
-                    .find(|a| a.key.network == network && a.link == Link::Connected && a.capabilities.join_space_by_invite)
+                    .find(|a| a.key.network == network && a.link == Link::Connected && a.can.join_space_by_invite)
                     .map(|a| a.key.clone())
                 {
                     items.push(menu_separator().into_any_element());
@@ -870,7 +870,7 @@ impl Shell {
                         .into_any_element(),
                 );
                 let can_leave = snapshot.accounts.iter().any(|a| {
-                    a.key == space.account() && a.link == Link::Connected && a.capabilities.leave_space
+                    a.key == space.account() && a.link == Link::Connected && a.can.leave_space
                 });
                 if can_leave {
                     let leave_key = space.clone();

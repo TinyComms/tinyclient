@@ -1082,7 +1082,7 @@ impl PeopleList {
         cx.notify();
         let request = Request::AddFriend { account, username };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { crate::gui::ask(&request) }).await;
+            let answer = cx.background_executor().spawn(async move { crate::ask(&request) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.adding_friend = false;
                 match answer {
@@ -1143,8 +1143,8 @@ impl PeopleList {
                         .child(
                             button(
                                 "add-friend-send",
-                                if busy { "Sending…" } else { "Send" },
                                 ButtonKind::Primary,
+                                if busy { "Sending…" } else { "Send" },
                             )
                             .when(!busy, |btn| {
                                 btn.on_click(cx.listener(|this, _, _, cx| this.submit_add_friend(cx)))

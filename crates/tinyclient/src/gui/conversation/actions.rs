@@ -1028,8 +1028,9 @@ impl Pane {
         self.close_picker(cx);
         self.revisions = None;
         self.hover = Some(message.id.clone());
+        let can_reactors = self.open.as_ref().is_some_and(|open| open.can.reactors);
         let needs_fetch = message.reactions.get(reaction).and_then(|r| {
-            if r.who.is_empty() && self.caps.reactors {
+            if r.who.is_empty() && can_reactors {
                 let emoji = r.file.as_ref().map_or_else(|| r.emoji.clone(), |file| file.id.clone());
                 Some((message.id.clone(), emoji))
             } else {

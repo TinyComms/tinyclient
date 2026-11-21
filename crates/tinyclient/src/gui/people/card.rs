@@ -915,7 +915,7 @@ impl Floating {
         let req = Request::SetFriendNickname { person, nickname };
         self.nick_error = None;
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { crate::gui::ask(&req) }).await;
+            let answer = cx.background_executor().spawn(async move { crate::ask(&req) }).await;
             let _ = this.update(cx, |this, cx| match answer {
                 Ok(Response::Ok) => this.close(cx),
                 Ok(Response::Error { detail, .. }) => {
@@ -940,7 +940,20 @@ impl Floating {
         let key = person.key.clone();
         let key_clear = key.clone();
         let focused = self.nick_input.as_ref().is_some_and(|i| i.focus_handle(cx).is_focused(window));
-        let panel = modal_body(CONFIRM_WIDTH)
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let panel = div()
+            .w(px(wide))
+            .p(px(20.))
+            .rounded(px(theme::R_MODAL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            .flex()
+            .flex_col()
             .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Friend nickname"))
             .child(
                 div()
