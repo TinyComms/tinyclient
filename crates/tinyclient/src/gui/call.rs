@@ -1117,6 +1117,24 @@ impl Shell {
             .child(self.call_volume_controls(account, user_id, cx))
     }
 
+    /// Picture path for a call participant: their avatar reference when present (queued once
+    /// through the people hub's media path), falling back to what the people hub already knows
+    /// about that id (for partial voice states on large servers).
+    pub(super) fn call_participant_picture(
+        &self,
+        account: &protocol::AccountKey,
+        who: &protocol::Participant,
+        cx: &mut Context<Self>,
+    ) -> Option<std::path::PathBuf> {
+        if let Some(file) = who.avatar.as_ref() {
+            if let Some(path) = self.people_state.hub().file(account, file, cx).path {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+        let key = Key::new(account, &who.id);
+        self.person_picture(&key, cx)
+    }
+
     pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let account = call.conversation.account();
         let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
@@ -1152,7 +1170,8 @@ impl Shell {
                 None
             };
             let key = Key { network: call.conversation.network, account: call.conversation.account.clone(), id: who.id.clone() };
-            let avatar = super::components::Avatar::new(&key, &who.name, 22.).build();
+            let face = self.call_participant_picture(&account, who, cx);
+            let avatar = super::components::Avatar::new(&key, &who.name, 22.).image_at(face).build();
             let menu_account = account.clone();
             let menu_id = who.id.clone();
             let menu_name = who.name.clone();
@@ -1182,8 +1201,13 @@ impl Shell {
                     .child(ringed(avatar, 22., who.speaking))
                     .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
                     .children(gain_tag.map(|tag| div().flex_none().type_micro().text_color(if muted { theme::warning() } else { theme::text_faint() }).child(tag)))
-                    .when(who.muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::text_faint())))
-                    .when(who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
+                    .when(who.server_muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::danger())))
+                    .when(!who.server_muted && who.suppressed, |r| r.child(glyph("icons/mic-off.svg", 13., theme::warning())))
+                    .when(!who.server_muted && !who.suppressed && who.muted && !who.deafened && !who.server_deafened, |r| {
+                        r.child(glyph("icons/mic-off.svg", 13., theme::text_faint()))
+                    })
+                    .when(who.server_deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::danger())))
+                    .when(!who.server_deafened && who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
                     .into_any_element(),
             );
         }
@@ -2112,6 +2136,7 @@ mod tests {
         let person = |name: &&str| Occupant {
             person: Key { network: Network::Discord, account: "1".into(), id: name.to_lowercase() },
             name: (*name).to_owned(),
+            avatar: None,
             muted: false,
             deafened: false,
             server_muted: false,

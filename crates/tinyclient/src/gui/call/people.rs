@@ -30,18 +30,18 @@ pub(in crate::gui) fn ringed(avatar: Div, size: f32, speaking: bool) -> Div {
     )
 }
 
-fn person(call: &Call, who: &Participant, size: f32) -> Div {
+fn person(call: &Call, who: &Participant, size: f32, picture: Option<std::path::PathBuf>) -> Div {
     let key = Key {
         network: call.conversation.network,
         account: call.conversation.account.clone(),
         id: who.id.clone(),
     };
-    Avatar::new(&key, &who.name, size).build()
+    Avatar::new(&key, &who.name, size).image_at(picture).build()
 }
 
 /// Up to three 20 px avatars overlapping 6, then "+N". A speaker's edge turns `positive`.
 /// The box is sized outright and each avatar placed in it, so the title row measures it right.
-pub(super) fn stack(call: &Call) -> Div {
+pub(super) fn stack(call: &Call, mut picture: impl FnMut(&Participant) -> Option<std::path::PathBuf>) -> Div {
     let shown = call.participants.len().min(3);
     let more = call.participants.len() - shown;
     let chip = if more > 9 { 32. } else { 26. };
@@ -68,7 +68,7 @@ pub(super) fn stack(call: &Call) -> Div {
                 .iter()
                 .take(3)
                 .enumerate()
-                .map(|(ix, who)| slot(ix, who.speaking, 24.).child(person(call, who, 20.))),
+                .map(|(ix, who)| slot(ix, who.speaking, 24.).child(person(call, who, 20., picture(who)))),
         )
         .when(more > 0, |stack| {
             stack.child(
@@ -191,7 +191,7 @@ fn rows(call: &Call, me: Option<&str>, sizes: &Sizes) -> Vec<Div> {
         ),
     );
     let others = roster(call).into_iter().map(|who| {
-        let avatar = person(call, who, sizes.avatar);
+        let avatar = person(call, who, sizes.avatar, who.avatar.as_ref().and_then(|f| f.path.as_deref()).map(std::path::PathBuf::from));
         let speaking = who.speaking && !who.server_muted && !who.suppressed;
         row(
             sizes,

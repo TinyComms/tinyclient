@@ -349,6 +349,7 @@ pub(super) fn running() -> Option<Occupants> {
     let there = |name: &str| Occupant {
         person: key(&name.to_lowercase()),
         name: name.to_owned(),
+        avatar: None,
         muted: false,
         deafened: false,
         server_muted: false,

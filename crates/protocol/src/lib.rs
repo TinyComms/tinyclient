@@ -343,6 +343,8 @@ pub enum CallSupport {
 pub struct Occupant {
     pub person: Key,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
     #[serde(default, skip_serializing_if = "is_false")]

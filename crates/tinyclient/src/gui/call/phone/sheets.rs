@@ -265,7 +265,7 @@ impl Shell {
             .map(|who| Who {
                 key: Key { id: who.id.clone(), ..call.conversation.clone() },
                 name: who.name.clone(),
-                face: self.call_phone_face(call, subject, &who.id),
+                face: self.call_phone_face(call, subject, &who.id, cx),
                 me: false,
                 speaking: who.speaking,
                 muted: who.muted || who.server_muted,

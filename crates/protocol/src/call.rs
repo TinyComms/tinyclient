@@ -111,6 +111,8 @@ pub struct Participant {
     /// The person's id on the call's account.
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<crate::MediaFile>,
     #[serde(default)]
     pub speaking: bool,
     #[serde(default)]

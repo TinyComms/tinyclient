@@ -870,16 +870,19 @@ impl Shell {
                 .filter(|peer| peer.muted)
                 .map(|_| glyph("icons/mic-off.svg", 13., theme::text_faint()).into_any_element()),
             (true, false) if call.participants.is_empty() => None,
-            (true, false) => Some(
-                people::stack(call)
-                    .id("call-stack")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.call_menu_toggle(Menu::People, cx);
-                    }))
-                    .into_any_element(),
-            ),
+            (true, false) => {
+                let account = call.conversation.account();
+                Some(
+                    people::stack(call, |who| self.call_participant_picture(&account, who, cx))
+                        .id("call-stack")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_menu_toggle(Menu::People, cx);
+                        }))
+                        .into_any_element(),
+                )
+            }
         };
         let signal = self.call_signal(call, cx);
         let security = self.call_security(call, Place::Dock, cx);

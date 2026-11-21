@@ -1932,6 +1932,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
         let roster = others.map(|who| Participant {
             id: who.user.clone(),
             name: name(&who.user),
+            avatar: None,
             speaking: false,
             muted: who.muted,
             deafened: who.deafened,
@@ -1972,6 +1973,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
         .map(|who| Occupant {
             person: ctx.key(&who.user),
             name: name(&who.user),
+            avatar: None,
             muted: who.muted,
             deafened: who.deafened,
             server_muted: who.server_muted,
@@ -2651,6 +2653,7 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
         .map(|who| Participant {
             id: who.user.clone(),
             name: person_name(seat, &who.user),
+            avatar: None,
             speaking: false,
             muted: who.muted,
             deafened: who.deafened,

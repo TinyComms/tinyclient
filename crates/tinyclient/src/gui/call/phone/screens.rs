@@ -57,7 +57,7 @@ impl Shell {
     pub(super) fn call_phone_incoming(&self, call: &Call, subject: &Subject, from: &str, cx: &mut Context<Self>) -> Div {
         let network = call.conversation.network;
         let direct = subject.kind == ConversationKind::Direct;
-        let face = self.call_phone_face(call, subject, call.participants.first().map_or("", |peer| peer.id.as_str()));
+        let face = self.call_phone_face(call, subject, call.participants.first().map_or("", |peer| peer.id.as_str()), cx);
         let lead = halo(self.call_phone_lead(&call.conversation, subject, face, 144., false), 144., false);
         let kind = if pictures_network(call) { "Incoming call" } else { "Incoming voice call" };
         let line = if direct { kind.to_owned() } else { format!("{from} is calling") };

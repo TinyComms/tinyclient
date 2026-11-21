@@ -4399,3 +4399,70 @@ fn server_mute_deafen_and_suppress_are_kept_apart_from_self_flags() {
         call().filter(|call| !call.server_muted && !call.suppressed && !call.server_deafened)
     });
 }
+
+#[test]
+fn voice_state_member_avatar_reaches_participant_and_occupant() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    // Member with both a guild server avatar and a user avatar: server avatar wins.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "member": {
+                "avatar": "srv_hash_1",
+                "nick": null,
+                "roles": [],
+                "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "avatar": "usr_hash_1"}
+            }
+        }),
+    );
+    // Member with only a user avatar: user avatar is used.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2007", "session_id": "voice-riley",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "member": {
+                "avatar": null,
+                "nick": null,
+                "roles": [],
+                "user": {"id": "2007", "username": "riley", "global_name": "Riley", "avatar": "usr_hash_2"}
+            }
+        }),
+    );
+
+    let active = wait("participants carry avatars", || {
+        call().filter(|call| {
+            let sam = call.participants.iter().find(|p| p.id == "2006");
+            let riley = call.participants.iter().find(|p| p.id == "2007");
+            sam.and_then(|p| p.avatar.as_ref()).is_some_and(|a| a.id == "mavatar:4000:2006:srv_hash_1")
+                && riley.and_then(|p| p.avatar.as_ref()).is_some_and(|a| a.id == "avatar:2007:usr_hash_2")
+        })
+    });
+    assert_eq!(active.participants.iter().find(|p| p.id == "2006").unwrap().avatar.as_ref().unwrap().id, "mavatar:4000:2006:srv_hash_1");
+    assert_eq!(active.participants.iter().find(|p| p.id == "2007").unwrap().avatar.as_ref().unwrap().id, "avatar:2007:usr_hash_2");
+
+    // Occupants on the voice channel row carry the same avatar references.
+    let occ_avatars = wait("occupants carry avatars", || {
+        match world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) {
+            Response::Tree { conversations, .. } => {
+                let row = conversations.iter().find(|r| r.key.id == "4201")?;
+                let occ = row.occupants.as_ref()?;
+                let sam = occ.people.iter().find(|p| p.person.id == "2006")?.avatar.as_ref()?.id.clone();
+                let riley = occ.people.iter().find(|p| p.person.id == "2007")?.avatar.as_ref()?.id.clone();
+                Some((sam, riley))
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(occ_avatars.0, "mavatar:4000:2006:srv_hash_1");
+    assert_eq!(occ_avatars.1, "avatar:2007:usr_hash_2");
+}

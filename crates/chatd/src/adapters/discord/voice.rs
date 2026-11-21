@@ -7,7 +7,7 @@ use super::model::{self, VoiceState};
 use super::rest::Refused;
 use super::Discord;
 use protocol::{
-    CallFailure, CallSupport, ConversationKind, Dave, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, VoiceQuality, Watching,
+    CallFailure, CallSupport, ConversationKind, Dave, MediaFile, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, VoiceQuality, Watching,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -173,6 +173,7 @@ pub struct Heard {
     pub guild: Option<String>,
     channel: String,
     name: String,
+    avatar: Option<MediaFile>,
     muted: bool,
     deafened: bool,
     server_muted: bool,
@@ -330,6 +331,7 @@ impl Discord {
                 .map(|(id, heard)| Participant {
                     id: id.clone(),
                     name: heard.name.clone(),
+                    avatar: heard.avatar.clone(),
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
@@ -390,6 +392,7 @@ impl Discord {
                 let people = there.into_iter().take(protocol::OCCUPANTS_LIMIT).map(|(id, heard)| Occupant {
                     person: self.ctx.key(id),
                     name: heard.name.clone(),
+                    avatar: heard.avatar.clone(),
                     muted: heard.muted,
                     deafened: heard.deafened,
                     server_muted: heard.server_muted,
@@ -462,6 +465,7 @@ impl Discord {
             .filter(|channel| self.ctx.known(channel).ok().flatten().is_some_and(|row| row.call == CallSupport::Handoff))
             .collect();
         let mut changed = BTreeSet::new();
+        let mut media_files: Vec<(MediaFile, String)> = Vec::new();
         {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
@@ -476,14 +480,25 @@ impl Discord {
                 if state.voice.states.len() >= HEARD && !kept {
                     continue;
                 }
+                let voice_guild = voice.guild_id.clone().or_else(|| guild.map(str::to_owned));
                 let named = voice.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
                 let named = named.or_else(|| state.users.get(&voice.user_id).cloned());
                 let me = (voice.user_id == state.me).then_some("You".to_owned());
+                let avatar = voice
+                    .member
+                    .as_ref()
+                    .and_then(|member| member.avatar(voice_guild.as_deref()))
+                    .map(|(file, url)| {
+                        media_files.push((file.clone(), url));
+                        file
+                    })
+                    .or_else(|| before.as_ref().and_then(|before| before.avatar.clone()));
                 let is_stage = stages.contains(channel.as_str());
                 let heard = Heard {
-                    guild: voice.guild_id.clone().or_else(|| guild.map(str::to_owned)),
+                    guild: voice_guild,
                     channel: channel.clone(),
                     name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
+                    avatar,
                     muted: voice.self_mute,
                     deafened: voice.self_deaf,
                     server_muted: voice.mute,
@@ -496,6 +511,9 @@ impl Discord {
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);
             }
+        }
+        if !media_files.is_empty() {
+            let _ = self.ctx.media(&media_files);
         }
         self.roster();
         self.occupancy(changed);
@@ -1383,6 +1401,7 @@ mod tests {
             guild: Some("g".into()),
             channel: "c".into(),
             name: "Ada".into(),
+            avatar: None,
             muted: false,
             deafened: false,
             server_muted: false,
