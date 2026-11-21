@@ -931,8 +931,14 @@ impl Teams {
     }
 
     /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, properties: Option<Value>) -> Result<Message, Fault> {
-        let mut content = html::compose(text);
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mut properties: Option<Value>) -> Result<Message, Fault> {
+        let (mut content, mentions) = html::compose_rich(text);
+        if !mentions.is_empty() {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("mentions".to_owned(), Value::String(html::mentions_property(&mentions)));
+            }
+        }
         let mut target = conversation.to_owned();
         let quote = match reply_to {
             Some(original) => self.quoted(conversation, original)?,

@@ -475,6 +475,9 @@ impl Fake {
         let root = root.or_else(|| thread.contains("@thread.tacv2").then(|| arrived.to_string()));
         let mut echo = message(thread, root.as_deref(), arrived, ME, sent["imdisplayname"].as_str().unwrap_or(""), sent["content"].as_str().unwrap_or(""));
         echo["clientmessageid"] = sent["clientmessageid"].clone();
+        if sent["properties"].is_object() {
+            echo["properties"] = sent["properties"].clone();
+        }
         let socket = self.socket.lock().unwrap().clone();
         let frame = self.frame(&json!({"time": iso(arrived), "type": "EventMessage", "resourceType": "NewMessage", "resource": echo}), false);
         std::thread::spawn(move || {
@@ -1552,4 +1555,32 @@ fn setting_a_status_message_publishes_the_note_and_availability() {
     assert_eq!(world.ask(clear), Response::Ok);
     let cleared = world.fake.calls("PUT", "/presence/v1/me/publishnote").pop().expect("note cleared");
     assert_eq!(cleared.json()["message"], json!(""));
+}
+
+#[test]
+fn sending_a_mention_writes_the_span_and_properties_mentions() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    let client_id = "1760000999000444";
+    world.send(&ana, client_id, &format!("hi <@{ANA}|Ana Ruiz> check <#{GENERAL}|General>"));
+    let sent = world.until("the mention message to be accepted", || {
+        world.messages(&ana).into_iter().find(|message| message.client_id.as_deref() == Some(client_id) && message.state == SendState::Sent)
+    });
+    let posted = world.fake.calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages")).pop().expect("posted");
+    let body = posted.json();
+    assert_eq!(
+        body["content"].as_str(),
+        Some("<p>hi <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Ana Ruiz</span> check <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"1\">General</span></p>")
+    );
+    let mentions: Vec<Value> = serde_json::from_str(body["properties"]["mentions"].as_str().expect("properties.mentions string")).unwrap();
+    assert_eq!(mentions.len(), 2);
+    assert_eq!((mentions[0]["itemid"].as_u64(), mentions[0]["mri"].as_str(), mentions[0]["mentionType"].as_str(), mentions[0]["displayName"].as_str()), (Some(0), Some(ANA), Some("person"), Some("Ana Ruiz")));
+    assert_eq!((mentions[1]["itemid"].as_u64(), mentions[1]["mri"].as_str(), mentions[1]["mentionType"].as_str(), mentions[1]["displayName"].as_str()), (Some(1), Some(GENERAL), Some("channel"), Some("General")));
+    assert_eq!(sent.text, "hi @Ana Ruiz check @General");
+    let found = ranges(&sent);
+    assert!(found.contains(&("@Ana Ruiz", &Style::Mention { kind: MentionKind::User, id: ANA.into() })));
+    assert!(found.contains(&("@General", &Style::Mention { kind: MentionKind::Everyone, id: GENERAL.into() })));
 }

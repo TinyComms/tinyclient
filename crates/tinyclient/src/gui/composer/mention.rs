@@ -54,8 +54,22 @@ pub fn wire(text: &str, tokens: &[Token], network: Network) -> String {
             }
             // Slack takes the name as typed.
             (Network::Slack, Kind::Emoji) => out.push_str(&token.label),
+            // Teams takes id and display name so the adapter can emit the mention span and properties.mentions.
+            (Network::Teams, Kind::Person) => {
+                let label = token.label.trim_start_matches(['@', '#']);
+                out.push_str(&format!("<@{}|{label}>", token.id));
+            }
+            (Network::Teams, Kind::Role) => {
+                let label = token.label.trim_start_matches(['@', '#']);
+                out.push_str(&format!("<@&{}|{label}>", token.id));
+            }
+            (Network::Teams, Kind::Channel) => {
+                let label = token.label.trim_start_matches(['@', '#']);
+                out.push_str(&format!("<#{}|{label}>", token.id));
+            }
+            (Network::Teams, Kind::Emoji) => out.push_str(&token.label),
             // No adapter yet says what these take, so the name goes as it reads.
-            (Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny, _) => out.push_str(&token.label),
+            (Network::Telegram | Network::Signal | Network::Messages | Network::Tiny, _) => out.push_str(&token.label),
         }
         at = token.range.end;
     }
@@ -214,7 +228,8 @@ mod tests {
         ];
         assert_eq!(wire(text, &tokens, Network::Discord), "ask <@77> in <#5>, cc <@&3>");
         assert_eq!(wire(text, &tokens, Network::Slack), "ask <@77> in <#5>, cc <!subteam^3>");
-        assert_eq!(wire(text, &tokens, Network::Teams), text);
+        assert_eq!(wire(text, &tokens, Network::Teams), "ask <@77|Mara Okafor> in <#5|platform>, cc <@&3|admins>");
+        assert_eq!(wire(text, &tokens, Network::Telegram), text);
         assert_eq!(wire("no tokens <here>", &[], Network::Discord), "no tokens <here>");
         let text = "nice :mossparrot: :party:";
         let emoji = [token(text, ":mossparrot:", Kind::Emoji, "11"), token(text, ":party:", Kind::Emoji, "a:12")];
