@@ -2180,9 +2180,10 @@ fn account_caps(saved: &Saved) -> Capabilities {
         reply: true,
         edit: true,
         delete: true,
-        pins: true,
+        pins: false,
         reactions: true,
         gif_file: true,
+        profile_avatar: true,
         ..Capabilities::default()
     }
 }

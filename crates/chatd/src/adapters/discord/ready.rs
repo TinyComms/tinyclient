@@ -824,17 +824,12 @@ impl Discord {
             direct_threads: false,
             pins: true,
             forward: true,
-            polls: Some(protocol::PollCapabilities {
-                max_options: protocol::POLL_OPTIONS as u8,
-                max_duration_secs: 7 * 86_400,
-                multiple: true,
-                anonymous: false,
-            }),
+            polls: None,
             reactions: true,
             gif_file: false,
             mention_format: protocol::MentionFormat::Discord,
             mention_spans: false,
-            burst_reactions: premium > 0,
+            burst_reactions: false,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;

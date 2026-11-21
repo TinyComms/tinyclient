@@ -1435,8 +1435,8 @@ fn capabilities() -> protocol::Capabilities {
         reply: true,
         edit: true,
         delete: true,
-        pins: true,
-        forward: true,
+        pins: false,
+        forward: false,
         polls: Some(protocol::PollCapabilities {
             max_options: protocol::POLL_OPTIONS as u8,
             max_duration_secs: 0,
@@ -1446,7 +1446,9 @@ fn capabilities() -> protocol::Capabilities {
         reactions: true,
         mention_spans: true,
         disappearing: true,
-        view_once: true,
+        view_once: false,
+        profile_name: true,
+        profile_about: true,
         ..protocol::Capabilities::default()
     }
 }
