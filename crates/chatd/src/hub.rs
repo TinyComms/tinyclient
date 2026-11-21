@@ -541,6 +541,10 @@ impl Hub {
             Change::Call { call, .. } => self.notify(crate::notify::Event::Call(call.clone())),
             _ => {}
         }
+        let landed = match &change {
+            Change::Media { account, file } => Some((account.clone(), file.clone())),
+            _ => None,
+        };
         let mut changes = lock(&self.changes);
         changes.seq += 1;
         let seq = changes.seq;
@@ -552,6 +556,9 @@ impl Hub {
         }
         drop(changes);
         self.moved.notify_all();
+        if let Some((account, file)) = landed {
+            self.player.file_landed(&account, &file);
+        }
     }
 
     /// Everything a shell holds may be stale (the cache was cleared): its next `Wait` answers

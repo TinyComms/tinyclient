@@ -1372,12 +1372,37 @@ impl Chat {
     }
 
     /// When this account connects, hand off the text that was written while it was offline.
+    /// Also wires the player's auto-play hooks (fetching the next voice file and marking it listened).
     fn arm_queue(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         self.hub.on_connected(move |account| {
             let Some(chat) = weak.upgrade() else { return };
             chat.release_queue(account);
         });
+        let weak = Arc::downgrade(self);
+        self.hub.player.on_started(move |conversation, message_id| {
+            let Some(chat) = weak.upgrade() else { return };
+            chat.mark_played(conversation.clone(), message_id.to_owned());
+        });
+        let weak = Arc::downgrade(self);
+        self.hub.player.on_fetch(move |account, file_id| {
+            let Some(chat) = weak.upgrade() else { return };
+            chat.fetch_for_playback(account, file_id);
+        });
+    }
+
+    fn fetch_for_playback(&self, account: &AccountKey, file_id: &str) {
+        let adapter = lock(&self.adapters).get(account).map(Adapter::sender);
+        let ids = [file_id.to_owned()];
+        if let Ok(files) = self.blobs.request(account, &ids, adapter.clone()) {
+            if let Some(found) = files.iter().find(|file| file.id == file_id) {
+                if found.path.is_some() || found.failed.is_some() {
+                    self.hub.player.file_landed(account, found);
+                }
+            } else if let Some(adapter) = adapter {
+                let _ = adapter.send(Command::Wanted(vec![file_id.to_owned()]));
+            }
+        }
     }
 
     /// What the account may send, checked before anything is stored: a file too large or too

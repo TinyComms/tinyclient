@@ -386,6 +386,8 @@ mod tests {
             since: 1_000,
             duration: 6_000,
             rate: 200,
+            has_next: false,
+            has_previous: false,
         }
     }
 
