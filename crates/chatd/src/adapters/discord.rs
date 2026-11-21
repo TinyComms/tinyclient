@@ -210,6 +210,8 @@ struct GuildInfo {
     nick: String,
     /// Server boost tier (0..=3), which can raise the file upload limit for everyone in it.
     premium_tier: u8,
+    /// Unix seconds until our own server timeout ends, if timed out.
+    timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
 }
@@ -301,6 +303,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.opted_out = known.opted_out;
     row.limit = known.limit;
     row.max_file_bytes = known.max_file_bytes;
+    row.read_only_reason = known.read_only_reason.clone();
     row
 }
 

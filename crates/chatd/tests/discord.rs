@@ -4068,3 +4068,64 @@ fn upload_limit_honors_server_boost_tier() {
         (!asked.is_empty()).then_some(asked)
     });
 }
+
+#[test]
+fn server_timeout_marks_rows_read_only_and_lifts_when_cleared() {
+    let world = World::start();
+    assert!(!world.conversation("4101").read_only);
+
+    // Timeout on our own member (with a role change so we can synchronize immediately):
+    world.discord.push(
+        "GUILD_MEMBER_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "user": {"id": "1000", "username": "justin"},
+            "roles": ["4010", "4011"],
+            "nick": null,
+            "communication_disabled_until": "2099-01-01T00:00:00.000000+00:00"
+        }),
+    );
+    wait("the member update to settle", || {
+        world.tree("4000").1.iter().any(|r| r.key.id == "4103").then_some(())
+    });
+    let row = world.conversation("4101");
+    assert!(row.read_only, "a timed-out member's channels must be read-only");
+    assert!(
+        row.read_only_reason.contains("timed out"),
+        "timeout reason should mention being timed out, got {:?}",
+        row.read_only_reason
+    );
+    assert_eq!(world.conversation("4201").call, CallSupport::None, "voice join is disabled while timed out");
+    match world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "c-timed-out".into(),
+        text: "hello?".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    }) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert!(detail.contains("timed out"), "refusal should mention timeout, got {detail}");
+        }
+        other => panic!("expected refused send while timed out, got {other:?}"),
+    }
+
+    // Clearing the timeout (past timestamp / null) lifts read_only.
+    world.discord.push(
+        "GUILD_MEMBER_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "user": {"id": "1000", "username": "justin"},
+            "roles": ["4010"],
+            "nick": null,
+            "communication_disabled_until": null
+        }),
+    );
+    wait("the timeout lift to settle", || {
+        (!world.tree("4000").1.iter().any(|r| r.key.id == "4103")).then_some(())
+    });
+    let lifted = world.conversation("4101");
+    assert!(!lifted.read_only, "clearing timeout must lift read-only");
+    assert!(lifted.read_only_reason.is_empty(), "clearing timeout must clear read_only_reason");
+    assert_eq!(world.conversation("4201").call, CallSupport::Native, "voice join returns when timeout lifts");
+}

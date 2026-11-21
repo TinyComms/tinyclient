@@ -229,6 +229,8 @@ pub struct Member {
     pub roles: Vec<String>,
     #[serde(default)]
     pub presence: Option<PresenceUpdate>,
+    #[serde(default)]
+    pub communication_disabled_until: Option<String>,
 }
 
 impl Member {

@@ -1212,7 +1212,14 @@ impl Chat {
         let stored = {
             let mut store = self.hub.store();
             match store.conversation(&conversation) {
-                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
+                Ok(Some(row)) if row.read_only => {
+                    let why = if row.read_only_reason.is_empty() {
+                        format!("You can read {} but not post in it.", row.title)
+                    } else {
+                        row.read_only_reason
+                    };
+                    return error(ErrorCode::Refused, why);
+                }
                 Ok(Some(_)) => store.ingest(&conversation, &message, true),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),
@@ -1255,7 +1262,14 @@ impl Chat {
         let stored = {
             let mut store = self.hub.store();
             match store.conversation(&conversation) {
-                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
+                Ok(Some(row)) if row.read_only => {
+                    let why = if row.read_only_reason.is_empty() {
+                        format!("You can read {} but not post in it.", row.title)
+                    } else {
+                        row.read_only_reason
+                    };
+                    return error(ErrorCode::Refused, why);
+                }
                 Ok(Some(_)) => store.ingest(&conversation, &message, true),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),

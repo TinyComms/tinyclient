@@ -181,7 +181,33 @@ fn one_line(topic: Option<&str>) -> String {
     topic.unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Human-readable reason for a server timeout.
+pub(super) fn timeout_reason(until: i64, now: i64) -> String {
+    let left = until.saturating_sub(now);
+    if left <= 0 {
+        return String::new();
+    }
+    let phrase = if left >= 86_400 {
+        let days = (left + 43_200) / 86_400;
+        if days == 1 { "1 day".to_owned() } else { format!("{days} days") }
+    } else if left >= 3_600 {
+        let hours = (left + 1_800) / 3_600;
+        if hours == 1 { "1 hour".to_owned() } else { format!("{hours} hours") }
+    } else if left >= 60 {
+        let mins = (left + 30) / 60;
+        if mins == 1 { "1 minute".to_owned() } else { format!("{mins} minutes") }
+    } else {
+        "less than a minute".to_owned()
+    };
+    format!("You are timed out in this server for {phrase}.")
+}
+
 impl GuildInfo {
+    /// Unix seconds when our server timeout ends, if still active.
+    pub(super) fn timed_out(&self, now: i64) -> Option<i64> {
+        self.timeout_until.filter(|until| *until > now)
+    }
+
     /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
     /// overwrites for everyone, for our roles, and for us.
     pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
@@ -229,14 +255,24 @@ impl GuildInfo {
         let category = parent.and_then(|parent| self.categories.get(parent)).map(|(position, _)| *position);
         let name = channel.name.clone().unwrap_or_else(|| "channel".to_owned());
         let written = matches!(kind, ConversationKind::Channel | ConversationKind::Announcement);
+        let clock = now();
+        let timed_out = self.timed_out(clock);
+        let read_only_reason = timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default();
+        let read_only = timed_out.is_some() || (written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0);
+        let call = if timed_out.is_some() {
+            protocol::CallSupport::None
+        } else {
+            super::voice::support(channel.kind)
+        };
         Some(ConversationRow {
             group: parent.filter(|_| category.is_some()).map(str::to_owned),
             position: place(category, channel.is_voice(), channel.position),
-            call: super::voice::support(channel.kind),
+            call,
             // A voice channel's occupant limit, for the tree's `4/12`.
             limit: (channel.kind == model::VOICE).then_some(channel.user_limit).unwrap_or(0),
             topic: one_line(channel.topic.as_deref()),
-            read_only: written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0,
+            read_only,
+            read_only_reason,
             private: self.private(guild, channel),
             opted_out: self.quiet.opted_out(&channel.id, parent),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
@@ -287,6 +323,7 @@ impl Discord {
             quiet,
             nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
             premium_tier: guild.premium_tier().unwrap_or(0),
+            timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
                     id: emoji.id.clone()?,
@@ -370,10 +407,14 @@ impl Discord {
                 continue;
             }
             let name = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
+            let clock = now();
+            let timed_out = info.timed_out(clock);
             let row = ConversationRow {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
                 root: Some(thread.id.clone()),
+                read_only: timed_out.is_some(),
+                read_only_reason: timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default(),
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
                     followed: true,
@@ -550,24 +591,30 @@ impl Discord {
         Ok(())
     }
 
-    /// Our own membership of a server changed: with other roles we may see other channels.
+    /// Our own membership of a server changed: with other roles we may see other channels,
+    /// or a server timeout may have been set or lifted.
     pub(super) fn member_changed(&self, guild: &str, member: &Member) -> Result<(), Failure> {
         if member.id() != self.me() {
             return Ok(());
         }
         let mut roles: Vec<u64> = member.roles.iter().map(|role| number(role)).collect();
         roles.sort_unstable();
-        let moved = {
+        let timeout_until = member.communication_disabled_until.as_deref().and_then(model::iso_seconds);
+        let (moved, timeout_changed) = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(guild) else {
                 return Ok(());
             };
             let mut before = std::mem::replace(&mut info.my_roles, roles.clone());
             before.sort_unstable();
-            before != roles
+            let prev_timeout = std::mem::replace(&mut info.timeout_until, timeout_until);
+            (before != roles, prev_timeout != timeout_until)
         };
-        if moved {
+        if moved || timeout_changed {
             self.replant(guild)?;
+        }
+        if timeout_changed {
+            self.reschedule_unmute();
         }
         Ok(())
     }
@@ -1298,20 +1345,38 @@ impl Discord {
         let now = now();
         let mut state = self.state.lock().unwrap();
         let ends = state.guilds.values().filter_map(|info| info.quiet.next_end(now));
-        let next = ends.chain(state.quiet_directs.next_end(now)).min();
+        let timeouts = state.guilds.values().filter_map(|info| info.timed_out(now));
+        let next = ends.chain(timeouts).chain(state.quiet_directs.next_end(now)).min();
         state.next_unmute = next;
     }
 
-    /// A timed mute ran out: the rows it covered are no longer dimmed.
+    /// A timed mute or server timeout ran out: update the rows it covered.
     pub(super) fn unmute_tick(&self) {
-        let due = self.state.lock().unwrap().next_unmute.is_some_and(|at| at <= now());
+        let clock = now();
+        let due = self.state.lock().unwrap().next_unmute.is_some_and(|at| at <= clock);
         if !due {
             return;
         }
-        let guilds: Vec<String> = self.state.lock().unwrap().guilds.keys().cloned().collect();
+        let (guilds, expired_timeouts): (Vec<String>, Vec<String>) = {
+            let mut state = self.state.lock().unwrap();
+            let guilds = state.guilds.keys().cloned().collect();
+            let mut expired = Vec::new();
+            for (id, info) in state.guilds.iter_mut() {
+                if info.timeout_until.is_some_and(|until| until <= clock) {
+                    info.timeout_until = None;
+                    expired.push(id.clone());
+                }
+            }
+            (guilds, expired)
+        };
         for guild in guilds.iter().map(|guild| Some(guild.as_str())).chain([None]) {
             if let Err(err) = self.apply_quiet(guild) {
                 self.log("mute", err);
+            }
+        }
+        for guild in expired_timeouts {
+            if let Err(err) = self.replant(&guild) {
+                self.log("timeout", err);
             }
         }
         self.reschedule_unmute();

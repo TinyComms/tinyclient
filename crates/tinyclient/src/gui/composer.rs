@@ -259,6 +259,7 @@ struct Target {
     /// The Space it is in, for `#` completion and the Space's own emoji. A thread pane is not told.
     space: Option<String>,
     read_only: bool,
+    read_only_reason: String,
     /// What the account may send.
     can: Capabilities,
 }
@@ -276,7 +277,14 @@ impl Target {
             (Link::SignedOut, _) => Some(Locked::SignedOut),
             (Link::Expired, _) => Some(Locked::Expired),
             (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Posts in a forum are started in the network's app.".to_owned())),
-            _ if self.read_only => Some(Locked::ReadOnly(format!("You can read {} but not post in it.", self.title))),
+            _ if self.read_only => {
+                let why = if self.read_only_reason.is_empty() {
+                    format!("You can read {} but not post in it.", self.title)
+                } else {
+                    self.read_only_reason.clone()
+                };
+                Some(Locked::ReadOnly(why))
+            }
             _ => None,
         }
     }
@@ -3296,6 +3304,7 @@ impl Shell {
             link,
             space: open.space.clone(),
             read_only: open.read_only,
+            read_only_reason: open.read_only_reason.clone(),
             can,
         };
         let composer = self.composer_in(false, cx);
@@ -3322,6 +3331,7 @@ impl Shell {
             link,
             space: None,
             read_only: false,
+            read_only_reason: String::new(),
             can: self.can_of(thread),
         };
         let composer = self.composer_in(true, cx);
@@ -3921,7 +3931,16 @@ mod tests {
 
     fn target(link: Link, kind: ConversationKind, read_only: bool) -> Target {
         let key = Key { network: Network::Slack, account: "T1".into(), id: "C1".into() };
-        Target { key, title: "#announcements".into(), kind, link, space: None, read_only, can: Capabilities::default() }
+        Target {
+            key,
+            title: "#announcements".into(),
+            kind,
+            link,
+            space: None,
+            read_only,
+            read_only_reason: String::new(),
+            can: Capabilities::default(),
+        }
     }
 
     #[test]

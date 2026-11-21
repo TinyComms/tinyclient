@@ -519,6 +519,9 @@ pub struct Conversation {
     /// Per-conversation upload limit override, in bytes (e.g. a boosted Discord server). 0: use account's `Capabilities::max_file_bytes`.
     #[serde(default, skip_serializing_if = "is_zero64")]
     pub max_file_bytes: u64,
+    /// Why this conversation is read-only, in words (e.g. a Discord server timeout). Empty uses the default sentence.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub read_only_reason: String,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -580,6 +583,7 @@ impl Conversation {
             delivered: false,
             sending: false,
             max_file_bytes: 0,
+            read_only_reason: String::new(),
         }
     }
 

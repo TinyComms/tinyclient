@@ -785,7 +785,7 @@ mod tests {
             private: false,
             encryption: protocol::Encryption::Unknown,
             draft: String::new(),
-            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0,
+            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(),
         }
     }
 
