@@ -6,10 +6,11 @@
 //! is answered with an address per file; each file is `PUT` there straight from its path; the
 //! message then names the uploaded files. A cancelled send deletes what it already uploaded.
 
-use super::model::Posted;
+use super::model::{self, Posted};
 use super::Discord;
+use crate::adapters::Refusal;
 use crate::blobs::upload::{Target, Upload};
-use protocol::{CatalogKind, Message, Outgoing};
+use protocol::{CatalogKind, ConversationKind, Message, Outgoing};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -171,6 +172,154 @@ impl Discord {
             attachments.push(json!({"id": at.to_string(), "filename": name, "uploaded_filename": slot.upload_filename}));
         }
         Ok(attachments)
+    }
+
+    /// A new post in a forum or media channel. One request, and only when the user asked:
+    /// Discord watches thread creation. The body is the web client's nested shape
+    /// (`use_nested_fields`). A 429 is not retried, and a captcha does not lock the session.
+    pub(super) fn forum_post(&self, forum: &str, title: &str, text: &str, tags: &[String], with: &Outgoing) -> Result<String, Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        if title.trim().is_empty() {
+            return Err(refuse("A post needs a title.".to_owned()));
+        }
+        let name = super::thread_name(title);
+        let parent = self.ctx.known(forum).map_err(|err| refuse(err.to_string()))?.ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
+        if parent.kind != ConversationKind::Forum {
+            return Err(refuse("This is not a forum.".to_owned()));
+        }
+        if parent.read_only {
+            let why = if parent.read_only_reason.is_empty() {
+                format!("You can read {} but not post in it.", parent.title)
+            } else {
+                parent.read_only_reason.clone()
+            };
+            return Err(refuse(why));
+        }
+        let guild = self.guild_of(&parent);
+        let kept = guild.as_ref().and_then(|guild| self.ctx.note(&format!("kept:{guild}")));
+        let kept: Vec<model::Kept> = kept.and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
+        let kept = kept.into_iter().find(|kept| kept.id == forum).ok_or_else(|| refuse("This forum is not here.".to_owned()))?;
+        if kept.flags & model::REQUIRE_TAG != 0 && tags.is_empty() {
+            return Err(refuse("This forum requires a tag.".to_owned()));
+        }
+        if kept.kind == model::MEDIA_FORUM && with.files.is_empty() {
+            return Err(refuse("A media channel needs a file.".to_owned()));
+        }
+        if !tags.is_empty() {
+            let known = !kept.available_tags.is_empty();
+            let allowed = |id: &str| kept.available_tags.iter().any(|tag| tag.id == id);
+            if !known || tags.iter().any(|id| !allowed(id)) {
+                return Err(refuse("That tag is not on this forum.".to_owned()));
+            }
+        }
+        let text = text.trim();
+        if text.is_empty() && with.files.is_empty() {
+            return Err(refuse("Write a message or attach a file.".to_owned()));
+        }
+        if with.schedule.is_some() {
+            return Err(refuse("Discord cannot schedule a message.".to_owned()));
+        }
+        let premium = self.state.lock().unwrap().premium;
+        if let Some(why) = super::too_long(premium, text) {
+            return Err(refuse(why));
+        }
+        let tier = guild
+            .as_deref()
+            .and_then(|guild| self.state.lock().unwrap().guilds.get(guild).map(|info| info.premium_tier))
+            .unwrap_or(0);
+        let most = upload_limit(premium, tier);
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let mut upload = if with.files.is_empty() {
+            None
+        } else {
+            let up = Upload::new(&self.ctx, forum, &format!("post-{forum}-{stamp}"), &with.files).map_err(refuse)?;
+            if up.files().len() > FILES {
+                return Err(refuse(format!("Discord takes {FILES} files in one message.")));
+            }
+            if let Some(big) = up.files().iter().find(|file| file.bytes > most) {
+                return Err(refuse(format!("{} is too big for Discord (limit {} MB).", big.name, most >> 20)));
+            }
+            Some(up)
+        };
+        let attachments = match upload.as_mut() {
+            Some(up) => self.upload(forum, up).map_err(refuse)?,
+            None => Vec::new(),
+        };
+        if let Some(up) = upload.as_ref() {
+            up.check().map_err(refuse)?;
+        }
+
+        let mut content = text.to_owned();
+        let mut stickers = Vec::new();
+        match &with.pick {
+            Some(pick) if pick.kind == CatalogKind::Gifs => {
+                content = if content.is_empty() { pick.id.clone() } else { format!("{content}\n{}", pick.id) };
+            }
+            Some(pick) if pick.kind == CatalogKind::Stickers => stickers.push(pick.id.clone()),
+            _ => {}
+        }
+        let mut flags = 0u64;
+        if with.silent {
+            flags |= SUPPRESS_NOTIFICATIONS;
+        }
+        if with.suppress_embeds {
+            flags |= SUPPRESS_EMBEDS;
+        }
+        let mut message = json!({"content": content, "flags": flags});
+        if !attachments.is_empty() {
+            message["attachments"] = json!(attachments.clone());
+        }
+        if !stickers.is_empty() {
+            message["sticker_ids"] = json!(stickers);
+        }
+        let mut body = json!({"name": name, "auto_archive_duration": 4320, "message": message});
+        if !tags.is_empty() {
+            body["applied_tags"] = json!(tags);
+        }
+        let path = format!("/channels/{forum}/threads?use_nested_fields=true");
+        let posted = self.rest.call_once_with("POST", &path, Some(body), &[]);
+        if matches!(&posted, Err(super::rest::Refused::Expired)) {
+            self.wake();
+        }
+        let accepted = match posted {
+            Ok(text) => text,
+            Err(refused) => {
+                self.forget_uploaded(&attachments);
+                return Err(super::refusal(refused));
+            }
+        };
+        let value: Value = serde_json::from_str(&accepted).map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+        let thread: model::Channel = serde_json::from_value(value.clone()).map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+        if thread.id.is_empty() {
+            self.forget_uploaded(&attachments);
+            return Err(refuse("Discord did not name the post.".to_owned()));
+        }
+        let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or(name);
+        self.record_thread(&parent, &thread.id, &thread.id, &title)?;
+        if let Some(posted) = value.get("message").cloned() {
+            if let Ok(mut posted) = serde_json::from_value::<Posted>(posted) {
+                if !posted.id.is_empty() {
+                    if posted.channel_id.is_empty() {
+                        posted.channel_id = thread.id.clone();
+                    }
+                    let (message, files) = self.convert(&posted, guild.as_deref(), ConversationKind::Thread);
+                    let _ = files.register(&self.ctx);
+                    self.ctx.history(&thread.id, &[message]).map_err(|err| refuse(err.to_string()))?;
+                }
+            }
+        }
+        if let Some(up) = upload {
+            up.done();
+        }
+        Ok(thread.id)
+    }
+
+    /// Takes back files already uploaded when the post itself did not go.
+    fn forget_uploaded(&self, attachments: &[Value]) {
+        for file in attachments {
+            let Some(name) = file["uploaded_filename"].as_str() else { continue };
+            let _ = self.call("DELETE", &format!("/attachments/{name}"), None);
+        }
     }
 }
 

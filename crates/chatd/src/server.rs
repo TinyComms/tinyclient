@@ -2740,6 +2740,45 @@ impl Chat {
                 }
             }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
+            Request::ForumInfo { forum } => {
+                if !self.shows(&forum.account()) {
+                    return error(ErrorCode::NotFound, "no such conversation");
+                }
+                match self.ask(&forum.account(), |reply| Command::ForumInfo {
+                    conversation_id: forum.id.clone(),
+                    reply,
+                }) {
+                    Ok(info) => Response::ForumInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ForumPost { forum, title, text, tags, with } => {
+                let account = forum.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                if !self.shows(&account) {
+                    return error(ErrorCode::NotFound, "no such conversation");
+                }
+                match self.ask(&account, |reply| Command::ForumPost {
+                    conversation_id: forum.id.clone(),
+                    title,
+                    text,
+                    tags,
+                    with: Box::new(with),
+                    reply,
+                }) {
+                    Ok(thread_id) => {
+                        let key = Key::new(&account, &thread_id);
+                        match self.hub.store().conversation(&key) {
+                            Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                            Ok(None) => error(ErrorCode::Internal, "post created, but not recorded"),
+                            Err(err) => internal(err),
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),

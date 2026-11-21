@@ -463,6 +463,20 @@ pub enum Command {
         name: String,
         reply: Reply<String>,
     },
+    /// Guidelines, tags, and posting rules of a forum or media channel, from what is already kept.
+    ForumInfo {
+        conversation_id: String,
+        reply: Reply<protocol::ForumInfo>,
+    },
+    /// The id of a new post in a forum or media channel. One create, then the thread is recorded.
+    ForumPost {
+        conversation_id: String,
+        title: String,
+        text: String,
+        tags: Vec<String>,
+        with: Box<Outgoing>,
+        reply: Reply<String>,
+    },
     /// One person's card. One request to the network, and only because the user opened it.
     Profile { person_id: String, reply: Reply<About> },
     /// The same, opened from inside a Space: add the nickname, roles and join date there. An
@@ -862,6 +876,7 @@ impl Command {
             | Command::CreateChannel { reply, .. }
             | Command::CreateGroup { reply, .. }
             | Command::StartThread { reply, .. }
+            | Command::ForumPost { reply, .. }
             | Command::Handoff { reply, .. }
             | Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
@@ -872,6 +887,7 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ForumInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

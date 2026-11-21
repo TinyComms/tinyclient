@@ -302,7 +302,6 @@ impl Target {
             _ if !self.joined => Some(Locked::NotJoined),
             _ if self.special == protocol::Special::Request => Some(Locked::MessageRequest),
             _ if self.blocked_peer.is_some() => Some(Locked::Blocked(self.blocked_peer.clone().unwrap())),
-            (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Posts in a forum are started in the network's app.".to_owned())),
             _ if self.read_only => {
                 let why = if self.read_only_reason.is_empty() {
                     format!("You can read {} but not post in it.", self.title)
@@ -311,6 +310,7 @@ impl Target {
                 };
                 Some(Locked::ReadOnly(why))
             }
+            (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Start a post with New post.".to_owned())),
             _ => None,
         }
     }
@@ -4647,7 +4647,14 @@ mod tests {
             panic!("a read-only channel takes no message");
         };
         assert_eq!(sentence, "You can read #announcements but not post in it.");
-        assert!(matches!(target(Link::Offline, ConversationKind::Forum, false).locked(), Some(Locked::ReadOnly(_))));
+        let Some(Locked::ReadOnly(forum)) = target(Link::Offline, ConversationKind::Forum, false).locked() else {
+            panic!("a forum takes no message in the composer");
+        };
+        assert_eq!(forum, "Start a post with New post.");
+        let Some(Locked::ReadOnly(quiet)) = target(Link::Connected, ConversationKind::Forum, true).locked() else {
+            panic!("a read-only forum says why");
+        };
+        assert_eq!(quiet, "You can read #announcements but not post in it.");
     }
 
     #[test]

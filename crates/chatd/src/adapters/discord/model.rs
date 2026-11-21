@@ -36,6 +36,10 @@ pub const STAGE: u8 = 13;
 pub const FORUM: u8 = 15;
 pub const MEDIA_FORUM: u8 = 16;
 
+/// Channel flags: bit 1 = pinned thread in a forum, bit 4 = tag required to post in a forum.
+pub const THREAD_PINNED: u32 = 1 << 1;
+pub const REQUIRE_TAG: u32 = 1 << 4;
+
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
@@ -311,6 +315,19 @@ pub struct ThreadMetadata {
     pub archived: bool,
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+pub struct ForumTag {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moderated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_name: Option<String>,
+}
+
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct Channel {
     pub id: String,
@@ -339,7 +356,7 @@ pub struct Channel {
     pub recipients: Vec<User>,
     #[serde(default)]
     pub recipient_ids: Vec<String>,
-    /// Who owns a group DM.
+    /// Who owns a group DM or forum post thread.
     #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
@@ -350,6 +367,20 @@ pub struct Channel {
     pub thread_metadata: Option<ThreadMetadata>,
     #[serde(default)]
     pub message_count: Option<u32>,
+    #[serde(default)]
+    pub total_message_sent: Option<u32>,
+    /// Channel flags (e.g. `THREAD_PINNED`, `REQUIRE_TAG`).
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u32,
+    /// Tags defined on a forum or media channel.
+    #[serde(default, deserialize_with = "nullable")]
+    pub available_tags: Vec<ForumTag>,
+    /// Tag ids applied to a forum post thread.
+    #[serde(default, deserialize_with = "nullable")]
+    pub applied_tags: Vec<String>,
+    /// Default slowmode per newly created thread in a forum channel (seconds).
+    #[serde(default, deserialize_with = "nullable")]
+    pub default_thread_rate_limit_per_user: u32,
     /// Our own membership of a thread, present when we are in it.
     #[serde(default)]
     pub member: Option<IgnoredAny>,
@@ -386,6 +417,12 @@ pub struct Kept {
     pub topic: Option<String>,
     #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
     pub overwrites: Vec<(String, bool, u64, u64)>,
+    #[serde(rename = "f", default, skip_serializing_if = "no_limit")]
+    pub flags: u32,
+    #[serde(rename = "g", default, skip_serializing_if = "Vec::is_empty")]
+    pub available_tags: Vec<ForumTag>,
+    #[serde(rename = "r", default, skip_serializing_if = "no_limit")]
+    pub default_thread_rate_limit_per_user: u32,
 }
 
 /// A count that means "none" stays off a note.
@@ -406,6 +443,9 @@ impl Kept {
             parent: channel.parent_id.clone(),
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
+            flags: channel.flags,
+            available_tags: channel.available_tags.clone(),
+            default_thread_rate_limit_per_user: channel.default_thread_rate_limit_per_user,
         }
     }
 
@@ -421,6 +461,9 @@ impl Kept {
             parent_id: self.parent,
             topic: self.topic,
             permission_overwrites: overwrites.collect(),
+            flags: self.flags,
+            available_tags: self.available_tags,
+            default_thread_rate_limit_per_user: self.default_thread_rate_limit_per_user,
             ..Channel::default()
         }
     }

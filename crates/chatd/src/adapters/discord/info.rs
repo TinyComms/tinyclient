@@ -301,6 +301,35 @@ impl Discord {
         })
     }
 
+    /// A forum's posting rules, from the channel note READY kept. Nothing is asked of Discord.
+    pub(super) fn forum_info(&self, channel: &str) -> Result<protocol::ForumInfo, Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Forum {
+            return Err(refused("This is not a forum."));
+        }
+        let guild = self.guild_of(&known).ok_or_else(|| refused("This forum is not here."))?;
+        let note = self.ctx.note(&format!("kept:{guild}"));
+        let kept: Vec<model::Kept> = note.and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
+        let kept = kept.into_iter().find(|kept| kept.id == channel).ok_or_else(|| refused("This forum is not here."))?;
+        let tags = kept.available_tags.iter().map(|tag| {
+            let emoji = tag
+                .emoji_name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .or_else(|| tag.emoji_id.clone().filter(|id| !id.is_empty()))
+                .unwrap_or_default();
+            protocol::ForumTag { id: tag.id.clone(), name: tag.name.clone(), emoji, moderated: tag.moderated }
+        });
+        Ok(protocol::ForumInfo {
+            forum: known.key,
+            guidelines: kept.topic.unwrap_or_default(),
+            tags: tags.collect(),
+            require_tag: kept.flags & model::REQUIRE_TAG != 0,
+            media: kept.kind == model::MEDIA_FORUM,
+            default_slowmode: kept.default_thread_rate_limit_per_user,
+        })
+    }
+
     /// A server's info: its description and counts in one request, our nickname, roles and the
     /// notification setting from what READY said.
     ///

@@ -429,6 +429,53 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 }),
             )
         }
+        // A forum or media post: the channel is the new thread, and the starter is nested.
+        ("POST", ["channels", channel, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            let starter = &seen.body["message"];
+            let sent = starter["attachments"].as_array().cloned().unwrap_or_default();
+            let attached: Vec<Value> = sent
+                .iter()
+                .enumerate()
+                .map(|(at, file)| {
+                    json!({"id": format!("880{at}"), "filename": file["filename"], "size": 4, "url": format!("https://cdn.discordapp.com/attachments/{id}/880{at}/f"),
+                           "content_type": "text/plain"})
+                })
+                .collect();
+            let message = json!({
+                "id": shared.snowflake(),
+                "channel_id": id,
+                "type": 0,
+                "author": me(),
+                "content": starter["content"],
+                "timestamp": "2026-10-13T08:15:00.000000+00:00",
+                "edited_timestamp": null,
+                "mentions": [],
+                "mention_roles": [],
+                "mention_everyone": false,
+                "attachments": attached,
+                "embeds": [],
+                "pinned": false,
+                "flags": starter["flags"],
+            });
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 1,
+                    "member_count": 1,
+                    "thread_metadata": {"archived": false, "locked": false},
+                    "newly_created": true,
+                    "message": message,
+                }),
+            )
+        }
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["read-states", "ack-bulk"]) => (200, json!({})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
@@ -1098,6 +1145,118 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     // something that needs me (`polish/01` §2): read up to 600, its posts have gone past it.
     let forum = rows.iter().find(|row| row.key.id == "4106").unwrap();
     assert_eq!((forum.unread, forum.mentions), (1, 0), "{forum:?}");
+}
+
+#[test]
+fn a_forum_post_is_created_with_a_tag_and_a_file_and_a_media_channel_needs_one() {
+    let world = World::start();
+    let info = world.ask(Request::ForumInfo { forum: world.key("4106") });
+    let Response::ForumInfo { info } = info else { panic!("{info:?}") };
+    assert_eq!(info.guidelines, "Say what you tried.");
+    assert!(info.require_tag && !info.media);
+    assert_eq!(info.default_slowmode, 30);
+    assert_eq!(info.tags.len(), 2);
+    assert_eq!((info.tags[0].id.as_str(), info.tags[0].name.as_str(), info.tags[0].emoji.as_str(), info.tags[0].moderated), ("9001", "question", "❓", false));
+    assert_eq!((info.tags[1].id.as_str(), info.tags[1].emoji.as_str(), info.tags[1].moderated), ("9002", "ferris", true));
+
+    let post = |title: &str, text: &str, tags: &[&str], with: protocol::Outgoing| {
+        world.ask(Request::ForumPost {
+            forum: world.key("4106"),
+            title: title.into(),
+            text: text.into(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            with,
+        })
+    };
+    match post("", "hello", &["9001"], Default::default()) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "A post needs a title.");
+        }
+        other => panic!("{other:?}"),
+    }
+    match post("Need a tag", "hello", &[], Default::default()) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "This forum requires a tag.");
+        }
+        other => panic!("{other:?}"),
+    }
+    match post("Bad tag", "hello", &["nope"], Default::default()) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "That tag is not on this forum.");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4106/threads").is_empty());
+
+    let notes = staged(&world, "tried.txt", 4);
+    let with = protocol::Outgoing { files: vec![file(&notes, false)], ..Default::default() };
+    let created = post("  Cargo  won't  build  ", "I tried clean.", &["9001"], with);
+    let Response::Conversation { conversation } = created else { panic!("{created:?}") };
+    assert_eq!(conversation.title, "Cargo won't build");
+    assert_eq!(conversation.kind, ConversationKind::Thread);
+    assert_eq!(conversation.parent.as_deref(), Some("4106"));
+    assert_eq!(conversation.root.as_deref(), Some(conversation.key.id.as_str()));
+    assert!(conversation.space.is_none() && conversation.group.is_none());
+    let (_, rows) = world.tree("4000");
+    assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201", "4202"]);
+    assert!(!ids(&rows).contains(&conversation.key.id.as_str()));
+    let Response::Conversations { conversations: posts, .. } = world.ask(Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 10,
+        landing: false,
+    }) else {
+        panic!("no posts");
+    };
+    assert!(posts.iter().any(|row| row.key.id == conversation.key.id), "{posts:?}");
+    let stored = world.messages(&conversation.key.id);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0].text, "I tried clean.");
+    assert_eq!(stored[0].attachments.len(), 1);
+    assert_eq!(stored[0].attachments[0].name, "tried.txt");
+
+    let created_at = world.discord.requests_to("POST", "/channels/4106/threads");
+    assert_eq!(created_at.len(), 1);
+    assert!(created_at[0].path.contains("use_nested_fields=true"), "{}", created_at[0].path);
+    assert_eq!(created_at[0].body["name"], "Cargo won't build");
+    assert_eq!(created_at[0].body["auto_archive_duration"], 4320);
+    assert_eq!(created_at[0].body["applied_tags"], json!(["9001"]));
+    assert_eq!(created_at[0].body["message"]["content"], "I tried clean.");
+    assert_eq!(
+        created_at[0].body["message"]["attachments"],
+        json!([{"id": "0", "filename": "tried.txt", "uploaded_filename": "up/tried.txt"}])
+    );
+    assert_eq!(world.discord.requests_to("POST", "/channels/4106/attachments").len(), 1);
+
+    // A media channel (type 16) that also requires a tag. The tag is present and the file is
+    // not, so the refusal is the missing file and nothing is uploaded.
+    world.discord.push("CHANNEL_CREATE", json!({
+        "id": "4108", "type": 16, "guild_id": "4000", "name": "clips", "position": 5, "parent_id": "4100",
+        "flags": 16, "available_tags": [{"id": "9100", "name": "clip"}], "permission_overwrites": []
+    }));
+    wait("the media channel", || match world.ask(Request::Conversation { conversation: world.key("4108") }) {
+        Response::Conversation { conversation } if conversation.kind == ConversationKind::Forum => Some(()),
+        _ => None,
+    });
+    let media = world.ask(Request::ForumPost {
+        forum: world.key("4108"),
+        title: "A clip".into(),
+        text: "look".into(),
+        tags: vec!["9100".into()],
+        with: Default::default(),
+    });
+    match media {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "A media channel needs a file.");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4108/threads").is_empty());
+    assert!(world.discord.requests_to("POST", "/channels/4108/attachments").is_empty());
 }
 
 #[test]

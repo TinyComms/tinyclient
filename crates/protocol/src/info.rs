@@ -255,6 +255,37 @@ pub enum Warning {
     Spam,
 }
 
+/// One tag defined on a forum or media channel (`ForumInfo::tags`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForumTag {
+    pub id: String,
+    pub name: String,
+    /// Unicode emoji or custom emoji name/id when the tag carries one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub moderated: bool,
+}
+
+/// Guidelines, available tags, and posting rules of a forum or media channel (`Request::ForumInfo`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForumInfo {
+    pub forum: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guidelines: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<ForumTag>,
+    /// True when every new post must carry at least one tag (Discord channel flags bit 4).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_tag: bool,
+    /// True for a media channel (Discord channel type 16), where posts require an attachment.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub media: bool,
+    /// Default per-post slowmode in seconds, when set on the forum.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub default_slowmode: u32,
+}
+
 /// A conversation's info pane: what the row does not carry, asked of the network once when the
 /// pane opens and kept five minutes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

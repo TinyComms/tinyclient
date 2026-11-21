@@ -482,6 +482,18 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                     sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
                 });
             }
+            // A post with files uploads before Discord will name the thread. That waits on its
+            // own thread, so the commands behind it (a cancel among them) are not held up.
+            Command::ForumPost { conversation_id, title, text, tags, with, reply } if !with.files.is_empty() => {
+                discord.asked();
+                let sending = discord.clone();
+                let started = std::thread::Builder::new().name("forum-post".into()).spawn(move || {
+                    answer(reply, sending.forum_post(&conversation_id, &title, &text, &tags, &with));
+                });
+                if let Err(err) = started {
+                    discord.log("forum post", err);
+                }
+            }
             // A search can wait on Discord's tight search limits: it runs on a thread of its
             // own, so the sends and reactions behind it are not held up, and one queued past
             // the shell's patience does not ask at all.
@@ -2064,6 +2076,10 @@ impl Discord {
             Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
             Command::StartThread { conversation_id, message_id, name, reply } => {
                 drop(reply.send(self.start_thread(&conversation_id, &message_id, &name)))
+            }
+            Command::ForumInfo { conversation_id, reply } => answer(reply, self.forum_info(&conversation_id)),
+            Command::ForumPost { conversation_id, title, text, tags, with, reply } => {
+                answer(reply, self.forum_post(&conversation_id, &title, &text, &tags, &with))
             }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),

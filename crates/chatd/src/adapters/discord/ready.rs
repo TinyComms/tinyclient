@@ -255,7 +255,7 @@ impl GuildInfo {
         let parent = channel.parent_id.as_deref();
         let category = parent.and_then(|parent| self.categories.get(parent)).map(|(position, _)| *position);
         let name = channel.name.clone().unwrap_or_else(|| "channel".to_owned());
-        let written = matches!(kind, ConversationKind::Channel | ConversationKind::Announcement);
+        let written = matches!(kind, ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Forum);
         let clock = now();
         let timed_out = self.timed_out(clock);
         let perms = self.permissions(guild, me, channel);

@@ -1433,6 +1433,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         landing: bool,
     },
+    /// Reads a forum or media channel's posting rules: guidelines, available tags, whether a
+    /// tag or attachment is required, and default post slowmode.
+    ForumInfo {
+        forum: Key,
+    },
+    /// Creates a new post in a forum or media channel.
+    ForumPost {
+        forum: Key,
+        title: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Outgoing::is_plain")]
+        with: Outgoing,
+    },
     /// Voice channels and calls with a friend in them now, across Spaces: the Discord home's
     /// "In voice". From what chatd holds live; at most 50.
     InVoice {
@@ -3126,6 +3141,10 @@ pub enum Response {
     ScheduledMessage {
         message: ScheduledMessage,
     },
+    /// Posting rules, guidelines, and available tags of a forum or media channel (`Request::ForumInfo`).
+    ForumInfo {
+        info: ForumInfo,
+    },
 }
 
 /// The phone's app-private data directory, set once by the mobile entry (`set_support_dir`).
@@ -3714,5 +3733,28 @@ mod sock_path_tests {
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert!(!old.follow_threads);
         assert!(!old.dnd_snooze);
+    }
+
+    #[test]
+    fn forum_post_request_and_info_round_trip() {
+        let forum = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4106");
+        let req = Request::ForumPost {
+            forum: forum.clone(),
+            title: "Cargo won't build".into(),
+            text: "I tried clean.".into(),
+            tags: vec!["9001".into()],
+            with: Outgoing::default(),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&req).unwrap()).unwrap(), req);
+        let info = ForumInfo {
+            forum,
+            guidelines: "Say what you tried.".into(),
+            tags: vec![ForumTag { id: "9001".into(), name: "question".into(), emoji: "❓".into(), moderated: false }],
+            require_tag: true,
+            media: false,
+            default_slowmode: 30,
+        };
+        let response = Response::ForumInfo { info };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(), response);
     }
 }
