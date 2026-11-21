@@ -1877,6 +1877,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spans: Vec<Span>,
     },
+    /// Replaces the photo or file on one of our own sent messages, with an optional updated
+    /// caption and formatting spans (Telegram `messages.editMessage` with `media`).
+    EditMedia {
+        conversation: Key,
+        message_id: String,
+        file: OutgoingFile,
+        #[serde(default)]
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<Span>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        invert_media: bool,
+    },
     /// Deletes a message. `scope` defaults to `Everyone` (so older shells keep working);
     /// `Me` removes it on this user's side only (Telegram, Signal, Google Messages).
     Delete {

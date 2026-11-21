@@ -707,7 +707,7 @@ fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Telegram is offline.".to_owned());
     match command {
         Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
-        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::EditMedia { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
@@ -776,6 +776,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
+        }
+        Command::EditMedia { conversation_id, message_id, file, text, spans, invert_media, reply } => {
+            let _ = reply.send(edit_media(account, &conversation_id, &message_id, &file, &text, &spans, invert_media).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, scope, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id, scope).map_err(refused));
@@ -1148,6 +1151,54 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans:
     };
     let answer = account.ask(&request)?;
     // Reported before the answer, as the contract asks: nothing was changed locally.
+    live::answered(account, &answer);
+    Ok(())
+}
+
+fn edit_media(
+    account: &Account,
+    conversation: &str,
+    message: &str,
+    file: &protocol::OutgoingFile,
+    text: &str,
+    spans: &[protocol::Span],
+    invert_media: bool,
+) -> Result<(), Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    let media = send::upload_single(account, conversation, &format!("edit-{message}"), file).map_err(Fault::Net)?;
+    let (plain, mut entities) = content::outgoing(text);
+    if !plain.is_empty() && entities.is_none() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) {
+            entities = content::with_stored(&plain, &stored.spans);
+        }
+    }
+    let (plain, entities) = if plain.is_empty() {
+        (String::new(), None)
+    } else if spans.is_empty() {
+        dress(account, conversation, plain, entities)
+    } else {
+        let dir = account.dir();
+        let next = content::apply_mention_spans(&plain, entities.unwrap_or_default(), spans, |uid| {
+            dir.get(Who::User(uid)).and_then(|known| known.hash)
+        });
+        (plain, (!next.is_empty()).then_some(next))
+    };
+    let request = tl::functions::messages::EditMessage {
+        no_webpage: false,
+        invert_media,
+        peer: account.input(who)?,
+        id,
+        message: Some(plain),
+        media: Some(media),
+        reply_markup: None,
+        entities,
+        schedule_date: None,
+        schedule_repeat_period: None,
+        quick_reply_shortcut_id: None,
+        rich_message: None,
+    };
+    let answer = account.ask(&request)?;
     live::answered(account, &answer);
     Ok(())
 }

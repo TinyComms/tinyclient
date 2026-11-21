@@ -348,6 +348,17 @@ pub enum Command {
         spans: Vec<protocol::Span>,
         reply: Reply<()>,
     },
+    /// Replace the media (photo/file) on one of our messages, optionally updating its caption.
+    /// Report the edited message through [`Context::message`] before answering.
+    EditMedia {
+        conversation_id: String,
+        message_id: String,
+        file: protocol::OutgoingFile,
+        text: String,
+        spans: Vec<protocol::Span>,
+        invert_media: bool,
+        reply: Reply<()>,
+    },
     /// Fetch the raw source text of a message for lossless editing.
     Source {
         conversation_id: String,
@@ -896,6 +907,7 @@ impl Command {
             }
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
+            | Command::EditMedia { reply, .. }
             | Command::Delete { reply, .. }
             | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }

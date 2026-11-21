@@ -2490,18 +2490,31 @@ impl World {
         if let Some(request) = asked::<f::messages::EditMessage>(body) {
             let peer = input_who(&request.peer);
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
-            self.log(&format!("EditMessage {} {}{noted}", peer.text(), request.id));
+            let replaced = request.media.as_ref().map(|m| held_media(m, self.next + 4_000));
+            let media_note = replaced.as_ref().map(|(kind, _)| format!(" media={kind}")).unwrap_or_default();
+            let invert_note = if request.invert_media { " [invert]" } else { "" };
+            self.log(&format!("EditMessage {} {}{noted}{media_note}{invert_note}", peer.text(), request.id));
             let Some(tl::enums::Message::Message(mut edited)) = self.messages.get(&peer.text()).and_then(|held| held.get(&request.id)).cloned() else {
                 return Err(rpc(400, "MESSAGE_ID_INVALID", None));
             };
-            if !edited.out {
+            if !edited.out && !edited.post {
                 return Err(rpc(403, "MESSAGE_AUTHOR_REQUIRED", None));
             }
-            edited.message = request.message.clone().unwrap_or_default();
+            if let Some(text) = request.message.clone() {
+                edited.message = text;
+            }
             edited.entities = request.entities.clone();
+            if let Some((_, media)) = replaced {
+                edited.media = Some(media);
+            }
+            edited.invert_media = request.invert_media;
             edited.edit_date = Some(crate::hub::now() as i32);
             self.store(None, edited.clone());
-            return answer(updates(vec![tl::types::UpdateEditMessage { message: edited.into(), pts: 0, pts_count: 0 }.into()]));
+            let upd: tl::enums::Update = match peer {
+                Who::Channel(_) => tl::types::UpdateEditChannelMessage { message: edited.into(), pts: 0, pts_count: 0 }.into(),
+                _ => tl::types::UpdateEditMessage { message: edited.into(), pts: 0, pts_count: 0 }.into(),
+            };
+            return answer(updates(vec![upd]));
         }
         if let Some(request) = asked::<f::messages::DeleteMessages>(body) {
             self.log(&format!("DeleteMessages {:?} revoke {}", request.id, request.revoke));

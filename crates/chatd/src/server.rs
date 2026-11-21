@@ -1613,7 +1613,9 @@ impl Chat {
         let conversation_id = conversation.id;
         let asked = match text {
             Some(_) if !message.outgoing => return error(ErrorCode::Refused, "Only your own messages can be edited."),
-            Some(text) if text.trim().is_empty() => return error(ErrorCode::Refused, "A message cannot be edited to nothing. Delete it instead."),
+            Some(text) if text.trim().is_empty() && message.attachments.is_empty() => {
+                return error(ErrorCode::Refused, "A message cannot be edited to nothing. Delete it instead.");
+            }
             Some(text) => self.ask(&account, |reply| Command::Edit {
                 conversation_id,
                 message_id,
@@ -1629,6 +1631,48 @@ impl Chat {
             }),
         };
         match asked {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn edit_media(
+        &self,
+        conversation: Key,
+        message_id: String,
+        file: protocol::OutgoingFile,
+        text: String,
+        spans: Vec<protocol::Span>,
+        invert_media: bool,
+    ) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let message = match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) => message,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        if message.state != SendState::Sent {
+            return error(ErrorCode::Refused, "This message was never sent. Discard it instead.");
+        }
+        if !message.outgoing {
+            return error(ErrorCode::Refused, "Only your own messages can be edited.");
+        }
+        if file.path.trim().is_empty() {
+            return error(ErrorCode::Refused, "Choose a file to replace the attachment with.");
+        }
+        let conversation_id = conversation.id;
+        match self.ask(&account, |reply| Command::EditMedia {
+            conversation_id,
+            message_id,
+            file,
+            text,
+            spans,
+            invert_media,
+            reply,
+        }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
@@ -3382,6 +3426,9 @@ impl Chat {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
             }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
+            Request::EditMedia { conversation, message_id, file, text, spans, invert_media } => {
+                self.edit_media(conversation, message_id, file, text, spans, invert_media)
+            }
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
 

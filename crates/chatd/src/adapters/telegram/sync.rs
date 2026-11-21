@@ -389,6 +389,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         clear_history: true,
         reply: true,
         edit: true,
+        edit_media: true,
         delete: true,
         threads: false,
         direct_threads: false,

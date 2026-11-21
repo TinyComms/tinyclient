@@ -393,6 +393,20 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     first.ok_or_else(|| "Nothing was sent.".to_owned())
 }
 
+/// Uploads one replacement file for `messages.editMessage` (`media`), reusing the same
+/// part-streaming, photo/document detection, spoiler, and video/audio probing as sends.
+pub(super) fn upload_single(
+    account: &Account,
+    conversation: &str,
+    key_seed: &str,
+    source: &protocol::OutgoingFile,
+) -> Result<tl::enums::InputMedia, String> {
+    let mut up = Upload::with_progress(&account.ctx.account, key_seed, std::slice::from_ref(source), |_, _| {})?;
+    let uploaded = file(account, conversation, key_seed, 0, None, &mut up);
+    up.done();
+    uploaded.map(|u| u.media)
+}
+
 /// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
 /// `voice` and is sent as a voice note, as Telegram's apps send one.
 fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {

@@ -446,6 +446,9 @@ struct Editing {
     id: String,
     /// The message as it was put in the field: saving this unchanged is a cancel.
     original: String,
+    /// The message being edited carries media (photo/file), so an empty caption is allowed
+    /// and networks with `Capabilities::edit_media` may replace the attachment.
+    has_media: bool,
     /// What was in the field before, and the reply it was for. Back on save or cancel.
     stash: Draft,
     reply: Option<Reply>,
@@ -718,7 +721,13 @@ impl Composer {
 
     fn controls(&self) -> Controls {
         match &self.target {
-            Some(target) => controls(&target.can, self.editing.is_some()),
+            Some(target) => {
+                let mut c = controls(&target.can, self.editing.is_some());
+                if target.can.edit_media && target.can.max_file_bytes > 0 && self.editing.as_ref().is_some_and(|e| e.has_media) {
+                    c.attach = true;
+                }
+                c
+            }
             None => Controls::default(),
         }
     }
@@ -1523,9 +1532,19 @@ impl Composer {
                 chip
             })
             .collect();
+        let editing_media = here && self.editing.as_ref().is_some_and(|e| e.has_media) && can.edit_media;
+        let incoming: Vec<Staged> = if editing_media {
+            incoming.into_iter().take(1).collect()
+        } else {
+            incoming
+        };
         let converting: Vec<(u64, PathBuf)> = incoming.iter().filter(|chip| chip.converting).map(|chip| (chip.id, chip.path.clone())).collect();
         let kept: Vec<u64> = incoming.iter().map(|chip| chip.id).collect();
         let turned_away: Vec<PathBuf> = incoming.iter().skip(attach::most(&can).saturating_sub(room)).filter(|chip| chip.owned).map(|chip| chip.path.clone()).collect();
+        if editing_media && !incoming.is_empty() {
+            let replaced: Vec<PathBuf> = self.tray.drain(..).filter(|chip| chip.owned).map(|chip| chip.path).collect();
+            delete_later(replaced);
+        }
         let destination = if here {
             &mut self.tray
         } else {
@@ -2223,7 +2242,8 @@ impl Composer {
             }
         };
         let (text, tokens) = mention::source(message);
-        self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), stash, reply });
+        let has_media = !message.attachments.is_empty();
+        self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), has_media, stash, reply });
         self.set_field(&Draft { text, subject: String::new(), tokens, files: Vec::new(), note: None, reply: None }, cx);
         self.close_picker(cx);
         self.caption = None;
@@ -2263,7 +2283,8 @@ impl Composer {
             return;
         };
         self.set_field(&editing.stash, cx);
-        self.tray = editing.stash.files;
+        let replaced = std::mem::replace(&mut self.tray, editing.stash.files);
+        delete_later(replaced.into_iter().filter(|chip| chip.owned).map(|chip| chip.path).collect());
         self.reply = editing.reply;
         self.refresh_placeholder(cx);
         self.caption = None;
@@ -2299,16 +2320,19 @@ impl Composer {
     }
 
     fn save_edit(&mut self, target: &Target, cx: &mut Context<Self>) {
-        let Some((id, original)) = self.editing.as_ref().map(|editing| (editing.id.clone(), editing.original.clone())) else {
+        let Some((id, original, has_media)) =
+            self.editing.as_ref().map(|editing| (editing.id.clone(), editing.original.clone(), editing.has_media))
+        else {
             return;
         };
         self.follow_text(cx);
         let field = self.input.read(cx).text().to_owned();
-        if field.trim() == original.trim() {
+        let replacement = self.tray.iter().filter_map(Staged::outgoing).next();
+        if replacement.is_none() && field.trim() == original.trim() {
             self.end_edit(cx);
             return;
         }
-        if field.trim().is_empty() {
+        if replacement.is_none() && !has_media && field.trim().is_empty() {
             self.caption = Some(("A message can't be saved empty. Delete it from its menu instead.".to_owned(), Tone::Note));
             cx.notify();
             return;
@@ -2318,16 +2342,27 @@ impl Composer {
         }
         let key = target.key.clone();
         let (wire, spans) = length::wire_with_spans(&field, &self.tokens, &target.can, false);
-        if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
+        let limit = if has_media || replacement.is_some() { target.can.caption_limit } else { target.can.text_limit };
+        if let Some(words) = length::edit_refusal(wire.chars().count(), limit) {
             self.caption = Some((words, Tone::Refused));
             cx.notify();
             return;
         }
-        let request = Request::Edit {
-            conversation: key.clone(),
-            message_id: id.clone(),
-            text: wire,
-            spans,
+        let request = match replacement {
+            Some(file) => Request::EditMedia {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                file,
+                text: wire,
+                spans,
+                invert_media: false,
+            },
+            None => Request::Edit {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                text: wire,
+                spans,
+            },
         };
         self.sending = true;
         cx.notify();
@@ -2876,10 +2911,30 @@ impl Composer {
                 cx.notify();
             }))
             .child(glyph("icons/x.svg", 14., theme::text_soft()));
-        if self.editing.is_some() {
+        if let Some(editing) = &self.editing {
+            let can_replace = editing.has_media && self.target.as_ref().is_some_and(|t| t.can.edit_media && t.can.max_file_bytes > 0);
+            let replace_btn = can_replace.then(|| {
+                div()
+                    .id("edit-replace-file")
+                    .flex_none()
+                    .h(px(if phone { 32. } else { 22. }))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent_text())
+                    .child("Replace file")
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
+            });
             return Some(
                 bar.child(glyph("icons/pencil.svg", 14., theme::accent_text()))
                     .child(strong("Editing message".to_owned()))
+                    .children(replace_btn)
                     .child(div().flex_1())
                     // A phone's keyboard has no Esc, and its Return is the send button.
                     .when(!phone, |bar| bar.child(div().flex_none().text_color(theme::text_faint()).child("Return to save · Esc to cancel")))
@@ -3109,7 +3164,8 @@ impl Composer {
 
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
-        let ready = !self.sending && !self.scan_blocks_current() && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
+        let editing_media = self.editing.as_ref().is_some_and(|e| e.has_media);
+        let ready = !self.sending && !self.scan_blocks_current() && (editing_media || !self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
@@ -3653,7 +3709,7 @@ impl Composer {
             }
         } else if staged("edit") {
             let original = "Sounds good. I'll keep the consumers paused until it finishes.";
-            self.editing = Some(Editing { id: "1".into(), original: original.into(), stash: Draft::default(), reply: None });
+            self.editing = Some(Editing { id: "1".into(), original: original.into(), has_media: false, stash: Draft::default(), reply: None });
             self.set_field(&field(original, Vec::new()), cx);
         } else if staged("complete") {
             let person = |name: &str, handle: &str, presence| Person {

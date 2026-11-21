@@ -158,6 +158,8 @@ struct Open {
     call: protocol::CallSupport,
     /// Conversation topic (e.g. "RCS message" / "Text message" for Google Messages).
     topic: String,
+    /// Special conversation role (e.g. Telegram Saved Messages, exempt from the 48h edit window).
+    special: protocol::Special,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -587,6 +589,7 @@ impl Pane {
                 || open.can_pin != conversation.can_pin
                 || open.call != conversation.call
                 || open.topic != conversation.topic
+                || open.special != conversation.special
             {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
@@ -597,6 +600,7 @@ impl Pane {
                 open.can_pin = conversation.can_pin;
             open.call = conversation.call;
                 open.topic.clone_from(&conversation.topic);
+                open.special = conversation.special;
                 cx.notify();
             }
             return;
@@ -617,6 +621,7 @@ impl Pane {
             open.can_pin = conversation.can_pin;
             open.call = conversation.call;
             open.topic.clone_from(&conversation.topic);
+            open.special = conversation.special;
         }
     }
 
@@ -672,6 +677,7 @@ impl Pane {
             can_pin: false,
             call: protocol::CallSupport::None,
             topic: String::new(),
+            special: protocol::Special::None,
             started: Instant::now(),
         });
         self.window = pages::Window::default();

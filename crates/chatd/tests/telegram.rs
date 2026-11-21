@@ -3857,3 +3857,109 @@ fn clicking_a_telegram_username_resolves_once_and_caches_result() {
     assert_eq!(missing_again, None);
     assert_eq!(world.called("ResolveUsername nobody_here_495"), 1);
 }
+
+#[test]
+fn replace_media_and_edit_caption_formatting() {
+    let world = World::signed_in();
+    world.connected();
+
+    let dir = std::env::temp_dir().join(format!("tinyclient-tg-edit-media-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let photo_a = dir.join("first.jpg");
+    let photo_b = dir.join("second.jpg");
+    std::fs::write(&photo_a, vec![3u8; 4_096]).unwrap();
+    std::fs::write(&photo_b, vec![9u8; 8_192]).unwrap();
+
+    // Send a photo with a plain caption first.
+    let file_a = protocol::OutgoingFile {
+        path: photo_a.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "edit-media-1".into(),
+            text: "initial caption".into(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file_a], ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("photo sent", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("edit-media-1") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.attachments.len(), 1);
+    let old_file_id = sent.attachments[0].file.id.clone();
+
+    // Edit only the caption's formatting (bold, italic, spoiler) via Request::Edit.
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            text: "**bold** _italic_ ||secret||".into(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let formatted = world.until("caption formatted", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == sent.id && m.text == "bold italic secret")
+    });
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Bold), "{:?}", formatted.spans);
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Italic), "{:?}", formatted.spans);
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Spoiler), "{:?}", formatted.spans);
+
+    // Clearing the caption on a media message is allowed.
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            text: String::new(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let cleared = world.until("caption cleared", || {
+        world.messages("u7002").into_iter().find(|m| m.id == sent.id && m.text.is_empty())
+    });
+    assert_eq!(cleared.attachments.len(), 1);
+
+    // Replace the photo with a new file + spoiler and a formatted caption via Request::EditMedia.
+    let file_b = protocol::OutgoingFile {
+        path: photo_b.to_string_lossy().into_owned(),
+        spoiler: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        world.ask(Request::EditMedia {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            file: file_b,
+            text: "**new** photo".into(),
+            spans: Vec::new(),
+            invert_media: true,
+        }),
+        Response::Ok
+    );
+    let replaced = world.until("media replaced", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == sent.id && m.text == "new photo")
+    });
+    assert_eq!(replaced.attachments.len(), 1);
+    assert_ne!(replaced.attachments[0].file.id, old_file_id);
+    assert!(replaced.attachments[0].spoiler);
+    assert!(replaced.spans.iter().any(|s| s.style == protocol::Style::Bold));
+    assert!(
+        world.calls().iter().any(|c| c.contains("EditMessage u7002") && c.contains("media=photo+spoiler") && c.contains("[invert]")),
+        "expected EditMessage with replacement media and invert_media on wire: {:#?}",
+        world.calls()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

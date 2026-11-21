@@ -560,6 +560,9 @@ pub struct Capabilities {
     /// This account supports editing own messages.
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit: bool,
+    /// This account supports replacing the photo or file of an already-sent message (`Request::EditMedia`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_media: bool,
     /// This account supports deleting messages.
     #[serde(default, skip_serializing_if = "is_false")]
     pub delete: bool,
