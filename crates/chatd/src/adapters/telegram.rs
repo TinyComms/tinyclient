@@ -715,6 +715,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::CallHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
@@ -857,6 +858,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::DeleteCallEntries { message_ids, revoke, reply } => {
             let _ = reply.send(info::delete_call_entries(account, &message_ids, revoke).map_err(refused));
+        }
+        Command::GetPrivacy { key, reply } => {
+            let _ = reply.send(info::get_privacy(account, key).map_err(refused));
+        }
+        Command::SetPrivacy { key, policy, reply } => {
+            let _ = reply.send(info::set_privacy(account, key, &policy).map_err(refused));
         }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));

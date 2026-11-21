@@ -1583,6 +1583,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         revoke: bool,
     },
+    /// Read an account's network privacy policy for `key` (e.g. Telegram Calls, P2P, VoiceMessages).
+    GetPrivacy {
+        account: AccountKey,
+        key: PrivacyKey,
+    },
+    /// Write an account's network privacy policy for `key`. Callers must read the current policy
+    /// first and send the full updated policy so existing exceptions are never wiped.
+    SetPrivacy {
+        account: AccountKey,
+        key: PrivacyKey,
+        policy: PrivacyPolicy,
+    },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2680,6 +2692,10 @@ pub enum Response {
         next: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
+    },
+    Privacy {
+        key: PrivacyKey,
+        policy: PrivacyPolicy,
     },
     Folders {
         folders: Vec<Folder>,

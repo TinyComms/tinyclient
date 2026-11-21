@@ -994,6 +994,8 @@ impl Demo {
             // Nothing is behind these: what is stored is all there is.
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

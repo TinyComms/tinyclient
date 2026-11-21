@@ -3475,3 +3475,68 @@ fn call_history_pages_filters_missed_and_deletes_entries() {
     };
     assert!(after_del.is_empty());
 }
+
+#[test]
+fn privacy_settings_read_and_write_rules_with_user_and_chat_exceptions() {
+    use protocol::{PrivacyAudience, PrivacyException, PrivacyKey, PrivacyPolicy};
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Read default PhoneCall, PhoneP2p, and VoiceMessages rules.
+    let Response::Privacy { policy: call_pol, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneCall,
+    }) else {
+        panic!("expected Privacy for PhoneCall");
+    };
+    assert_eq!(call_pol.audience, PrivacyAudience::Everybody);
+    assert!(!call_pol.premium_only);
+
+    let Response::Privacy { policy: p2p_pol, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneP2p,
+    }) else {
+        panic!("expected Privacy for PhoneP2p");
+    };
+    assert_eq!(p2p_pol.audience, PrivacyAudience::Contacts);
+
+    let Response::Privacy { policy: voice_pol, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::VoiceMessages,
+    }) else {
+        panic!("expected Privacy for VoiceMessages");
+    };
+    assert!(voice_pol.premium_only, "free account should mark VoiceMessages as premium_only");
+
+    // 2. Write PhoneCall = Contacts with one always-allow user (u7002), one never-allow user (u7003),
+    //    and one always-allow chat (g8001).
+    let updated = PrivacyPolicy {
+        audience: PrivacyAudience::Contacts,
+        always_allow: vec![
+            PrivacyException { id: "u7002".into(), name: String::new(), chat: false },
+            PrivacyException { id: "g8001".into(), name: String::new(), chat: true },
+        ],
+        never_allow: vec![PrivacyException { id: "u7003".into(), name: String::new(), chat: false }],
+        premium_only: false,
+    };
+    let Response::Privacy { policy: saved, .. } = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneCall,
+        policy: updated,
+    }) else {
+        panic!("expected Privacy after SetPrivacy");
+    };
+    assert_eq!(saved.audience, PrivacyAudience::Contacts);
+    assert!(saved.always_allow.iter().any(|e| e.id == "u7002" && !e.chat));
+    assert!(saved.always_allow.iter().any(|e| e.id == "g8001" && e.chat));
+    assert!(saved.never_allow.iter().any(|e| e.id == "u7003" && !e.chat));
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy phone_call")
+            && c.contains("allow_users:[7002]")
+            && c.contains("allow_chats:[8001]")
+            && c.contains("disallow_users:[7003]")
+            && c.contains("allow_contacts")),
+        "expected exact setPrivacy rules on wire, got: {:#?}",
+        world.calls()
+    );
+}

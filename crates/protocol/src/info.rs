@@ -37,6 +37,51 @@ fn yes() -> bool {
     true
 }
 
+/// Which account privacy setting to read or update (`Request::GetPrivacy`, `Request::SetPrivacy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyKey {
+    PhoneCall,
+    PhoneP2p,
+    VoiceMessages,
+}
+
+/// Base audience for a network privacy rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyAudience {
+    #[default]
+    Everybody,
+    Contacts,
+    Nobody,
+}
+
+/// One person or chat exception in a privacy rule list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivacyException {
+    /// Peer id as the adapter spells it (`u<id>`, `g<id>`, `c<id>`).
+    pub id: String,
+    /// Human-readable display name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// True for a group/channel chat exception; false for a user exception.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chat: bool,
+}
+
+/// Current privacy policy for one [`PrivacyKey`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivacyPolicy {
+    pub audience: PrivacyAudience,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub always_allow: Vec<PrivacyException>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub never_allow: Vec<PrivacyException>,
+    /// True when changing this key requires a paid tier (e.g. Telegram Premium for VoiceMessages).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub premium_only: bool,
+}
+
 /// Which list of a network's home `Home` reads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -505,6 +505,17 @@ pub enum Command {
         revoke: bool,
         reply: Reply<()>,
     },
+    /// Read an account's network privacy policy for `key`.
+    GetPrivacy {
+        key: protocol::PrivacyKey,
+        reply: Reply<protocol::PrivacyPolicy>,
+    },
+    /// Write an account's network privacy policy for `key`.
+    SetPrivacy {
+        key: protocol::PrivacyKey,
+        policy: protocol::PrivacyPolicy,
+        reply: Reply<protocol::PrivacyPolicy>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -654,6 +665,8 @@ impl Command {
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {

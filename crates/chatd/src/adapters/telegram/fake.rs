@@ -542,6 +542,8 @@ struct World {
     blocked: HashSet<i64>,
     /// Per-user `(phone_calls_available, phone_calls_private, video_calls_available)` for `GetFullUser`.
     call_flags: HashMap<i64, (bool, bool, bool)>,
+    /// Stored privacy rules by key name (`phone_call`, `phone_p2p`, `voice_messages`).
+    privacy: HashMap<&'static str, Vec<tl::enums::PrivacyRule>>,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -610,6 +612,11 @@ impl World {
             topic_reads: HashMap::new(),
             blocked: HashSet::new(),
             call_flags: HashMap::new(),
+            privacy: HashMap::from([
+                ("phone_call", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("phone_p2p", vec![tl::enums::PrivacyRule::PrivacyValueAllowContacts]),
+                ("voice_messages", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+            ]),
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -2703,6 +2710,73 @@ impl World {
         if asked::<f::help::GetAppConfig>(body).is_some() {
             self.log("GetAppConfig");
             return answer(app_config());
+        }
+        if let Some(request) = asked::<f::account::GetPrivacy>(body) {
+            let name = match request.key {
+                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
+                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
+                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
+                _ => "other",
+            };
+            self.log(&format!("account.getPrivacy {name}"));
+            let rules = self.privacy.get(name).cloned().unwrap_or_else(|| vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]);
+            let found = tl::types::account::PrivacyRules { rules, chats: chats(), users: users() };
+            return answer(tl::enums::account::PrivacyRules::Rules(found));
+        }
+        if let Some(request) = asked::<f::account::SetPrivacy>(body) {
+            let name = match request.key {
+                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
+                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
+                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
+                _ => "other",
+            };
+            let mut mapped: Vec<tl::enums::PrivacyRule> = Vec::new();
+            let mut tags: Vec<String> = Vec::new();
+            for rule in request.rules {
+                match rule {
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowAll => {
+                        tags.push("allow_all".into());
+                        mapped.push(tl::enums::PrivacyRule::PrivacyValueAllowAll);
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowContacts => {
+                        tags.push("allow_contacts".into());
+                        mapped.push(tl::enums::PrivacyRule::PrivacyValueAllowContacts);
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueDisallowAll => {
+                        tags.push("disallow_all".into());
+                        mapped.push(tl::enums::PrivacyRule::PrivacyValueDisallowAll);
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowUsers(u) => {
+                        let ids: Vec<i64> = u.users.iter().filter_map(|u| match u {
+                            tl::enums::InputUser::User(u) => Some(u.user_id),
+                            _ => None,
+                        }).collect();
+                        tags.push(format!("allow_users:{ids:?}"));
+                        mapped.push(tl::types::PrivacyValueAllowUsers { users: ids }.into());
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueDisallowUsers(u) => {
+                        let ids: Vec<i64> = u.users.iter().filter_map(|u| match u {
+                            tl::enums::InputUser::User(u) => Some(u.user_id),
+                            _ => None,
+                        }).collect();
+                        tags.push(format!("disallow_users:{ids:?}"));
+                        mapped.push(tl::types::PrivacyValueDisallowUsers { users: ids }.into());
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueAllowChatParticipants(c) => {
+                        tags.push(format!("allow_chats:{:?}", c.chats));
+                        mapped.push(tl::types::PrivacyValueAllowChatParticipants { chats: c.chats }.into());
+                    }
+                    tl::enums::InputPrivacyRule::InputPrivacyValueDisallowChatParticipants(c) => {
+                        tags.push(format!("disallow_chats:{:?}", c.chats));
+                        mapped.push(tl::types::PrivacyValueDisallowChatParticipants { chats: c.chats }.into());
+                    }
+                    _ => {}
+                }
+            }
+            self.log(&format!("account.setPrivacy {name} {}", tags.join(",")));
+            self.privacy.insert(name, mapped.clone());
+            let found = tl::types::account::PrivacyRules { rules: mapped, chats: chats(), users: users() };
+            return answer(tl::enums::account::PrivacyRules::Rules(found));
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;

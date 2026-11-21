@@ -161,6 +161,9 @@ impl SettingsWindow {
                 if network == Network::Tiny && account.link == Link::Connected {
                     group = group.child(self.tiny_rows(account, ix, window, cx));
                 }
+                if network == Network::Telegram && account.link == Link::Connected {
+                    group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
+                }
             }
             if network == Network::Tiny {
                 tiny_line = self.tiny_line();
@@ -183,6 +186,184 @@ impl SettingsWindow {
     fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
         cx.notify();
+    }
+
+    fn load_telegram_privacy(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_privacy_requested.insert(account.clone()) {
+            return;
+        }
+        let keys = [
+            protocol::PrivacyKey::PhoneCall,
+            protocol::PrivacyKey::PhoneP2p,
+            protocol::PrivacyKey::VoiceMessages,
+        ];
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::new();
+                    for key in keys {
+                        if let Ok(protocol::Response::Privacy { policy, .. }) =
+                            crate::client::ask(&protocol::Request::GetPrivacy { account: acc.clone(), key })
+                        {
+                            out.push((key, policy));
+                        }
+                    }
+                    out
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for (key, policy) in loaded {
+                    this.tg_privacy.insert((account.clone(), key), policy);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_telegram_privacy_audience(
+        &mut self,
+        account: protocol::AccountKey,
+        key: protocol::PrivacyKey,
+        audience: protocol::PrivacyAudience,
+        cx: &mut Context<Self>,
+    ) {
+        // Never write a rule list that was not fully read first.
+        let Some(mut policy) = self.tg_privacy.get(&(account.clone(), key)).cloned() else {
+            return;
+        };
+        if policy.premium_only || policy.audience == audience {
+            return;
+        }
+        policy.audience = audience;
+        self.tg_privacy.insert((account.clone(), key), policy.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let sent = policy.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&protocol::Request::SetPrivacy { account: acc, key, policy: sent })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::Privacy { policy, .. }) = answer {
+                    this.tg_privacy.insert((account, key), policy);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn telegram_call_privacy_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_telegram_privacy(account.key.clone(), cx);
+        let scope = protocol::settings::account_scope(&account.key);
+        let always_relay = crate::gui::app::prefs::values()
+            .stored(&scope, protocol::settings::TELEGRAM_ALWAYS_RELAY)
+            == Some("on");
+        let mut box_div = div().flex().flex_col();
+        let rows: [(&str, &str, protocol::PrivacyKey); 3] = [
+            ("Who can call me", "Controls who can place voice or video calls to you on Telegram.", protocol::PrivacyKey::PhoneCall),
+            ("Peer-to-Peer", "Controls when Telegram may share your IP address directly during a call.", protocol::PrivacyKey::PhoneP2p),
+            ("Voice & video messages", "Controls who may send you voice and round video messages.", protocol::PrivacyKey::VoiceMessages),
+        ];
+        for (row_ix, (title, sub, pkey)) in rows.into_iter().enumerate() {
+            let policy = self.tg_privacy.get(&(account.key.clone(), pkey)).cloned();
+            let premium_locked = policy.as_ref().is_some_and(|p| p.premium_only);
+            let exceptions_note = policy.as_ref().and_then(|p| {
+                let mut parts = Vec::new();
+                if !p.always_allow.is_empty() {
+                    parts.push(format!("Always allow: {}", p.always_allow.len()));
+                }
+                if !p.never_allow.is_empty() {
+                    parts.push(format!("Never allow: {}", p.never_allow.len()));
+                }
+                (!parts.is_empty()).then(|| parts.join(" · "))
+            });
+            let choices: [(&str, protocol::PrivacyAudience); 3] = [
+                ("Everybody", protocol::PrivacyAudience::Everybody),
+                ("Contacts", protocol::PrivacyAudience::Contacts),
+                ("Nobody", protocol::PrivacyAudience::Nobody),
+            ];
+            let control = if let Some(ref pol) = policy {
+                if premium_locked {
+                    div().type_small().text_color(theme::text_faint()).child("Telegram Premium").into_any_element()
+                } else {
+                    let mut seg = div().flex().items_center().gap(px(4.));
+                    for (c_ix, (label, aud)) in choices.into_iter().enumerate() {
+                        let active = pol.audience == aud;
+                        let acc_key = account.key.clone();
+                        seg = seg.child(
+                            button(
+                                ("tg-priv", ix * 100 + row_ix * 10 + c_ix),
+                                if active { ButtonKind::Primary } else { ButtonKind::Secondary },
+                                label,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_telegram_privacy_audience(acc_key.clone(), pkey, aud, cx);
+                            })),
+                        );
+                    }
+                    seg.into_any_element()
+                }
+            } else {
+                div().type_small().text_color(theme::text_faint()).child("Loading…").into_any_element()
+            };
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().type_ui().text_color(theme::text()).child(title))
+                            .child(div().type_small().text_color(theme::text_soft()).child(sub))
+                            .children(exceptions_note.map(|note| div().type_small().text_color(theme::text_faint()).child(note))),
+                    )
+                    .child(control),
+            );
+        }
+        // Local "Always relay my Telegram calls" switch (independent of Telegram account P2P setting).
+        let relay_scope = scope.clone();
+        box_div = box_div.child(rule()).child(
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_ui().text_color(theme::text()).child("Always relay my Telegram calls"))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Never offer a direct peer-to-peer path on this device, regardless of your Telegram setting.")),
+                )
+                .child(
+                    super::controls::switch(("tg-always-relay", ix), "Always relay my Telegram calls", always_relay).on_click(cx.listener(move |this, _, _, cx| {
+                        let next = !always_relay;
+                        let stored = next.then(|| "on".to_owned());
+                        this.set("tg-always-relay", relay_scope.clone(), protocol::settings::TELEGRAM_ALWAYS_RELAY, stored, cx);
+                    })),
+                ),
+        );
+        box_div
     }
 
     pub(super) fn sign_out(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {

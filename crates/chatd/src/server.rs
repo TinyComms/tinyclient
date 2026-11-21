@@ -2162,6 +2162,26 @@ impl Chat {
         }
     }
 
+    fn get_privacy(&self, account: AccountKey, key: protocol::PrivacyKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetPrivacy { key, reply }) {
+            Ok(policy) => Response::Privacy { key, policy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_privacy(&self, account: AccountKey, key: protocol::PrivacyKey, policy: protocol::PrivacyPolicy) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetPrivacy { key, policy, reply }) {
+            Ok(policy) => Response::Privacy { key, policy },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Drops an unsent row locally. A queued send is cancelled this way: the adapter never had it.
     fn drop_unsent(&self, conversation: Key, client_id: &str, message: &Message) -> Response {
         match self.hub.store().delete_message(&conversation, client_id) {
@@ -3040,6 +3060,8 @@ impl Chat {
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::CallHistory { account, missed, before, limit } => self.call_history(account, missed, before, limit),
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
+            Request::GetPrivacy { account, key } => self.get_privacy(account, key),
+            Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::Relate { person, action } => self.relate(person, action),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
