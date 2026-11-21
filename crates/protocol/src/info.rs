@@ -333,6 +333,9 @@ pub struct SpaceInfo {
     pub roles: Vec<String>,
     #[serde(default)]
     pub notify: Notify,
+    /// Optional `https://` hand-off link to open or manage this Space in the network's app.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
 }
 
 /// Which of a custom emoji set this account may send.
@@ -1208,5 +1211,38 @@ mod tests {
 
     fn json_members_add_without_share() -> String {
         r#"{"op":"members_add","conversation":{"network":"teams","account":"t1","id":"19:g@thread.v2"},"people":["8:orgid:a"]}"#.to_owned()
+    }
+
+    #[test]
+    fn space_info_link_round_trips_and_defaults_empty() {
+        let space = Space {
+            key: Key { network: Network::Teams, account: "t1".into(), id: "19:g@thread.tacv2".into() },
+            name: "Platform".into(),
+            icon: None,
+            position: 0,
+            attention: 0,
+            unread: false,
+            folder: None,
+            muted: false,
+            hide_muted: false,
+            can_create_channels: true,
+        };
+        let info = SpaceInfo {
+            space,
+            description: "Core".into(),
+            members: Some(4),
+            online: None,
+            nickname: String::new(),
+            roles: vec!["Owner".into()],
+            notify: Notify::All,
+            link: "https://teams.microsoft.com/l/team/19%3Ag/conversations?groupId=g1&tenantId=t1".into(),
+        };
+        let wire = serde_json::to_string(&info).unwrap();
+        let back: SpaceInfo = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, info);
+
+        let without_link = wire.replace(&format!(r#","link":"{}""#, info.link), "");
+        let legacy: SpaceInfo = serde_json::from_str(&without_link).unwrap();
+        assert!(legacy.link.is_empty());
     }
 }

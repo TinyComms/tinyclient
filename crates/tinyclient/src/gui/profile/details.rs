@@ -709,11 +709,31 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
     } else if waiting && late {
         body = body.child(draw::rule().mt(px(16.))).child(div().px(px(theme::PANE_PAD)).pt(px(16.)).child(draw::skeleton()));
     }
-    let link = facts::space_link(key);
+    let link = info
+        .as_ref()
+        .map(|i| i.link.as_str())
+        .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+        .map(str::to_owned)
+        .or_else(|| facts::space_link(key));
+    let shell = pane.shell_weak();
+    let label = if key.network == Network::Teams {
+        "Manage in Teams".to_owned()
+    } else {
+        format!("Open in {}", key.network.label())
+    };
     body.child(
-        div()
-            .px(px(theme::PANE_PAD))
-            .pt(px(16.))
-            .children(link.map(|url| draw::open_in("space-open", key.network).on_click(move |_, _, cx| cx.open_url(&url)))),
+        div().px(px(theme::PANE_PAD)).pt(px(16.)).children(link.map(move |url| {
+            let shell = shell.clone();
+            draw::open_in_labeled("space-open", key.network, label.clone()).on_click(move |_, window, cx| {
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    let _ = shell.update(cx, |shell, cx| {
+                        let pane = shell.pane(cx);
+                        pane.update(cx, |pane, cx| pane.open_external_link(&url, window, cx));
+                    });
+                } else {
+                    cx.open_url(&url);
+                }
+            })
+        })),
     )
 }

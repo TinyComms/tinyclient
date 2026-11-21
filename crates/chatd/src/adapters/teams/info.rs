@@ -309,12 +309,68 @@ impl Teams {
         let role = described["members"].as_array().into_iter().flatten().find(|member| member["id"].as_str() == Some(me.as_str()));
         let role = role.and_then(|member| member["role"].as_str()).and_then(super::people::role_label);
         let members = described["members"].as_array().map(|members| members.len() as u32);
+        let group = self
+            .ctx
+            .note(&format!("group:{space}"))
+            .or_else(|| properties["groupId"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let link = links::team_share(space, &group, &self.session.tenant);
+        let mut description = text("description");
+        let archived = properties["isArchived"] == true
+            || properties["isArchived"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if archived {
+            if !description.is_empty() {
+                description.push_str("\n\n");
+            }
+            description.push_str("This team is archived (read-only). Manage archive, templates, and moderation settings in Teams.");
+        }
         Ok(SpaceAbout {
-            description: text("description"),
+            description,
             members,
             roles: role.map(str::to_owned).into_iter().collect(),
+            link,
             ..SpaceAbout::default()
         })
+    }
+
+    /// Deletes a non-General Teams channel where allowed and removes it from the local store.
+    pub(super) fn delete_channel(&self, conversation: &str) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        let Some(row) = self.ctx.known(thread)? else {
+            return Err(Fault::Refused {
+                status: 404,
+                message: "This channel is gone.".to_owned(),
+            });
+        };
+        if row.kind != ConversationKind::Channel {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Only team channels can be deleted here.".to_owned(),
+            });
+        }
+        if row.title.eq_ignore_ascii_case("general") || row.space.as_deref() == Some(thread) {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "The General channel cannot be deleted.".to_owned(),
+            });
+        }
+        let team_id = row.space.as_deref().unwrap_or(thread);
+        let url = format!(
+            "{}/beta/teams/{}/channels/{}",
+            self.place()?.middle,
+            escaped(team_id),
+            escaped(thread)
+        );
+        self.call("DELETE", &url, super::Auth::Both(super::SPACES), Body::None, false)
+            .map_err(|fault| match fault {
+                Fault::Refused { status: 403, .. } => Fault::Refused {
+                    status: 403,
+                    message: "Only team owners or members permitted by your organization's policy can delete this channel.".to_owned(),
+                },
+                other => other,
+            })?;
+        self.ctx.conversation_gone(thread)?;
+        Ok(())
     }
 
     /// Updates Teams per-conversation notification level (`All`, `Mentions`, `Nothing`).

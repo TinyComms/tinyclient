@@ -209,6 +209,7 @@ pub struct SpaceAbout {
     pub nickname: String,
     pub roles: Vec<String>,
     pub notify: Notify,
+    pub link: String,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -968,6 +969,15 @@ impl Context {
     pub fn spaces(&self, spaces: &[SpaceRow]) -> Stores {
         self.hub.store().replace_spaces(&self.account, spaces)?;
         self.hub.changed(Change::Spaces { account: self.account.clone() });
+        Ok(())
+    }
+
+    /// Marks whether the user may create channels inside a Space.
+    pub fn space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
         Ok(())
     }
 

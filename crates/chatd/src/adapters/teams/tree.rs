@@ -3,10 +3,10 @@
 //! state Teams keeps for all of it. Everything comes from one call, and the Activity stream is
 //! read once at connect for the mentions that came while tinyclient was closed.
 
-use super::{chain_id, escaped, id_of, millis, now_ms, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, TREE_FRESH};
-use crate::adapters::{ActivityPage, Command};
+use super::{chain_id, escaped, id_of, millis, now_ms, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, SPACES, TREE_FRESH};
+use crate::adapters::{ActivityPage, BrowsedPage, Command};
 use crate::store::{ConversationRow, Filing, PreviewLine, SpaceRow};
-use protocol::{ActivityItem, ActivityItemKind, CallSupport, ConversationKind, Mark, Relation, Special};
+use protocol::{ActivityItem, ActivityItemKind, BrowsedChannel, CallSupport, ConversationKind, Mark, Relation, Special};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -172,10 +172,14 @@ impl Teams {
             })
             .filter(|space| space.id != OLD_CHATS)
             .collect();
+        self.state().spaces = spaces.clone();
         self.ctx.spaces(&spaces)?;
 
         for team in teams {
             let id = text(team, "id");
+            let can_create_channels = team["isArchived"] != true
+                && team["memberSettings"]["allowCreateUpdateChannels"] != false;
+            self.ctx.space_can_create_channels(id, can_create_channels)?;
             // General first, then the order Teams lists them in. A channel the user hid is kept
             // apart (`opted_out`), behind the tree's "Show hidden". Unverified: that
             // `isFavorite: false` is what hiding a channel writes.
@@ -187,17 +191,30 @@ impl Teams {
                 .enumerate()
                 .map(|(position, channel)| {
                     let read_only = team["isArchived"] == true || channel["isArchived"] == true;
+                    let is_general = channel["isGeneral"] == true;
+                    let private = channel["channelType"].as_u64().is_some_and(|kind| kind != 0);
                     let mut row = ConversationRow {
                         space: Some(id.to_owned()),
                         position: position as i32,
                         call: CallSupport::Handoff,
-                        private: channel["channelType"].as_u64().is_some_and(|kind| kind != 0),
+                        private,
                         read_only,
                         opted_out: hidden(channel),
                         can_pin: !read_only,
                         ..ConversationRow::new(text(channel, "id"), ConversationKind::Channel, text(channel, "displayName"))
                     };
                     row.rights.pin = !read_only;
+                    if !read_only {
+                        if !is_general {
+                            row.rights.rename = true;
+                            row.rights.edit_topic = true;
+                        }
+                        if private || is_general {
+                            row.rights.add_members = true;
+                            row.rights.remove_members = true;
+                            row.rights.manage_members = true;
+                        }
+                    }
                     row
                 })
                 .collect();
@@ -850,6 +867,405 @@ impl Teams {
             _ => chat(),
         }
     }
+
+    /// Leaves a Teams team (`DELETE /v1/threads/{space_id}/members/{me}`) and drops it and its
+    /// channels from the Spaces list.
+    pub(super) fn leave_team(&self, space_id: &str) -> Result<(), Fault> {
+        let path = format!("/v1/threads/{}/members/{}", escaped(space_id), escaped(&self.me()));
+        self.chat("DELETE", &path, Body::None, false).map_err(|fault| match fault {
+            Fault::Refused { status: 403 | 400, .. } => Fault::Refused {
+                status: 403,
+                message: "You cannot leave this team (you may be its last owner — manage ownership in Teams first).".to_owned(),
+            },
+            other => other,
+        })?;
+        let remaining = {
+            let mut state = self.state();
+            state.spaces.retain(|space| space.id != space_id);
+            state.spaces.clone()
+        };
+        self.ctx.spaces(&remaining)?;
+        Ok(())
+    }
+
+    /// Browses channels of a team (`space_id` non-empty, including hidden channels so they can
+    /// be shown) or public teams in the organization (`space_id` empty), filtered by `query` and
+    /// paged with a numeric offset cursor.
+    pub(super) fn browse_channels(
+        &self,
+        space_id: &str,
+        query: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<BrowsedPage, Fault> {
+        let needle = query.trim().to_ascii_lowercase();
+        let offset = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        let count = limit.clamp(1, 100) as usize;
+
+        let mut all = Vec::new();
+        if space_id.trim().is_empty() {
+            let joined_spaces: HashSet<String> = self.state().spaces.iter().map(|s| s.id.clone()).collect();
+            let url = format!("{}/beta/teams/public", self.place()?.middle);
+            let answer = self.call("GET", &url, Auth::Both(SPACES), Body::None, true)?.body;
+            let entries = [
+                answer["teams"].as_array(),
+                answer["value"].as_array(),
+                answer.as_array(),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+            for team in entries {
+                if team["isDeleted"] == true {
+                    continue;
+                }
+                let id = text(team, "id");
+                let name = text(team, "displayName").trim();
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let topic = team["description"].as_str().unwrap_or("").trim().to_owned();
+                if !needle.is_empty()
+                    && !name.to_ascii_lowercase().contains(&needle)
+                    && !topic.to_ascii_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                let members = team["memberCount"]
+                    .as_u64()
+                    .or_else(|| team["membershipSummary"]["totalMemberCount"].as_u64())
+                    .unwrap_or(0) as u32;
+                all.push(BrowsedChannel {
+                    key: self.ctx.key(id),
+                    name: name.to_owned(),
+                    topic,
+                    members,
+                    joined: joined_spaces.contains(id) || team["isMember"] == true,
+                    private: false,
+                    archived: team["isArchived"] == true,
+                });
+            }
+        } else {
+            let url = format!("{}/api/csa/api/v1/teams/{}/channels", self.api, escaped(space_id));
+            let answer = self.call("GET", &url, Auth::Both(AGGREGATOR), Body::None, true)?.body;
+            let entries = [
+                answer["channels"].as_array(),
+                answer["value"].as_array(),
+                answer.as_array(),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+            for ch in entries {
+                if ch["isDeleted"] == true {
+                    continue;
+                }
+                let id = text(ch, "id");
+                let name = text(ch, "displayName").trim();
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let topic = ch["description"].as_str().unwrap_or("").trim().to_owned();
+                if !needle.is_empty()
+                    && !name.to_ascii_lowercase().contains(&needle)
+                    && !topic.to_ascii_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                let is_general = ch["isGeneral"] == true;
+                let shown_in_sidebar = ch["isMember"] != false
+                    && (is_general || ch["isFavorite"] != false || ch["isPinned"] == true);
+                all.push(BrowsedChannel {
+                    key: self.ctx.key(id),
+                    name: name.to_owned(),
+                    topic,
+                    members: ch["memberCount"].as_u64().unwrap_or(0) as u32,
+                    joined: shown_in_sidebar,
+                    private: ch["channelType"].as_u64().is_some_and(|k| k != 0),
+                    archived: ch["isArchived"] == true,
+                });
+            }
+        }
+
+        let total = all.len();
+        let page: Vec<BrowsedChannel> = all.into_iter().skip(offset).take(count).collect();
+        let next = (offset + page.len() < total).then(|| (offset + page.len()).to_string());
+        Ok(BrowsedPage { channels: page, cursor: next })
+    }
+
+    /// Previews a hidden or unjoined Teams channel: stores it as read-only (`joined: false`) and
+    /// fetches one page of history so the user can inspect it before showing or joining.
+    pub(super) fn preview_channel(&self, conversation_id: &str) -> Result<(), Fault> {
+        let thread = thread_of(conversation_id);
+        let existing = self.ctx.known(thread)?;
+        let described = self
+            .chat("GET", &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)), Body::None, true)
+            .map(|a| a.body)
+            .unwrap_or(Value::Null);
+        let title = described["properties"]["topic"]
+            .as_str()
+            .or_else(|| described["properties"]["displayName"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| existing.as_ref().map(|r| r.title.clone()))
+            .unwrap_or_else(|| "Channel".to_owned());
+        let mut row = ConversationRow {
+            space: existing.as_ref().and_then(|r| r.space.clone()),
+            position: existing.as_ref().map_or(LAST, |r| r.position),
+            call: CallSupport::Handoff,
+            private: existing.as_ref().is_some_and(|r| r.private),
+            read_only: true,
+            read_only_reason: "Show or join this channel to post messages.".to_owned(),
+            opted_out: existing.as_ref().is_some_and(|r| r.opted_out),
+            joined: false,
+            ..ConversationRow::new(thread, ConversationKind::Channel, title)
+        };
+        if let Some(prev) = existing {
+            row.topic = prev.topic;
+        }
+        self.ctx.conversation(&row)?;
+        if let Ok((raws, _)) = self.page(thread, 30, "startTime=1") {
+            let messages: Vec<protocol::Message> = raws.iter().filter_map(|raw| self.read_message(thread, raw)).collect();
+            if !messages.is_empty() {
+                self.ctx.history(thread, &messages)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shows a hidden channel of a team we are in (`isFavorite = true`), or joins an unjoined
+    /// channel / public team (`PUT /v1/threads/{id}/members/{me}`).
+    pub(super) fn join_channel_or_team(&self, conversation_id: &str) -> Result<(), Fault> {
+        let thread = thread_of(conversation_id);
+        let existing = self.ctx.known(thread)?;
+        let is_hidden_channel = existing
+            .as_ref()
+            .is_some_and(|r| r.space.is_some() && (r.opted_out || !r.joined));
+        if is_hidden_channel {
+            let path = format!("/v1/users/ME/conversations/{}/properties?name=isFavorite", escaped(thread));
+            self.chat("PUT", &path, Body::Json(&json!({"isFavorite": "true"})), false)?;
+            if let Some(known) = existing {
+                let row = ConversationRow {
+                    space: known.space,
+                    group: known.group,
+                    position: known.position,
+                    avatar: known.avatar.map(|a| a.id),
+                    peer: known.peer,
+                    call: known.call,
+                    call_video: known.call_video,
+                    limit: known.limit,
+                    topic: known.topic,
+                    parent: known.parent,
+                    root: known.root,
+                    read_only: false,
+                    read_only_reason: String::new(),
+                    private: known.private,
+                    encryption: known.encryption,
+                    bot: known.bot,
+                    meeting: known.meeting,
+                    special: known.special,
+                    mark: known.mark,
+                    opted_out: false,
+                    rights: known.rights,
+                    can_pin: true,
+                    moderate: known.moderate,
+                    joined: true,
+                    ..ConversationRow::new(&known.key.id, known.kind, &known.title)
+                };
+                self.ctx.conversation(&row)?;
+            }
+            return Ok(());
+        }
+        let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(&self.me()));
+        self.chat("PUT", &path, Body::Json(&json!({"role": "User"})), false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } => Fault::Refused {
+                status: 403,
+                message: "Your organization's policy or team settings do not allow joining this team or channel.".to_owned(),
+            },
+            other => other,
+        })?;
+        // Refresh teams/channels so a newly joined public team and its channels appear immediately.
+        self.list(false)?;
+        Ok(())
+    }
+
+    /// Creates a standard or private channel inside a team where members are allowed to.
+    pub(super) fn create_channel(&self, space_id: &str, name: &str, private: bool) -> Result<String, Fault> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Channel name cannot be empty.".to_owned(),
+            });
+        }
+        let url = format!("{}/beta/teams/{}/channels", self.place()?.middle, escaped(space_id));
+        let body = json!({
+            "displayName": trimmed,
+            "membershipType": if private { "private" } else { "standard" },
+        });
+        let answer = self
+            .call("POST", &url, Auth::Both(SPACES), Body::Json(&body), false)
+            .map_err(|fault| match fault {
+                Fault::Refused { status: 403, .. } => Fault::Refused {
+                    status: 403,
+                    message: "Your organization's policy or team settings do not allow creating channels here.".to_owned(),
+                },
+                other => other,
+            })?;
+        let id = [
+            answer.body["id"].as_str(),
+            answer.body["channelId"].as_str(),
+            answer.body["threadId"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .or_else(|| answer.location.rsplit('/').next().filter(|s| !s.is_empty()))
+        .ok_or_else(|| Fault::Net("Teams created the channel without returning its id.".to_owned()))?
+        .to_owned();
+        let display = answer.body["displayName"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(trimmed);
+        let mut row = ConversationRow {
+            space: Some(space_id.to_owned()),
+            position: LAST,
+            call: CallSupport::Handoff,
+            private,
+            can_pin: true,
+            ..ConversationRow::new(&id, ConversationKind::Channel, display)
+        };
+        row.rights.pin = true;
+        row.rights.rename = true;
+        row.rights.edit_topic = true;
+        if private {
+            row.rights.add_members = true;
+            row.rights.remove_members = true;
+            row.rights.manage_members = true;
+        }
+        self.ctx.conversation(&row)?;
+        Ok(id)
+    }
+
+    /// Previews a Teams join code (`GET {middle}/beta/teams/joinCode/{code}`).
+    pub(super) fn invite_preview(&self, raw: &str) -> Result<protocol::InvitePreview, Fault> {
+        let code = parse_teams_join_code(raw).map_err(|message| Fault::Refused { status: 400, message })?;
+        let url = format!("{}/beta/teams/joinCode/{}", self.place()?.middle, escaped(&code));
+        let body = self
+            .call("GET", &url, Auth::Both(SPACES), Body::None, true)
+            .map_err(|fault| match fault {
+                Fault::Refused { status: 404, .. } => Fault::Refused {
+                    status: 400,
+                    message: "That Teams join code was not found or has expired.".to_owned(),
+                },
+                Fault::Refused { status: 403, .. } => Fault::Refused {
+                    status: 403,
+                    message: "Your organization's policy does not allow joining this team by code.".to_owned(),
+                },
+                other => other,
+            })?
+            .body;
+        let team = if body["team"].is_object() { &body["team"] } else { &body };
+        let space_id = team["id"]
+            .as_str()
+            .or_else(|| team["teamId"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let name = team["displayName"]
+            .as_str()
+            .or_else(|| team["name"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&code)
+            .to_owned();
+        let description = team["description"].as_str().unwrap_or("").trim().to_owned();
+        let members = team["memberCount"]
+            .as_u64()
+            .or_else(|| team["membershipSummary"]["totalMemberCount"].as_u64())
+            .map(|n| n as u32);
+        Ok(protocol::InvitePreview {
+            code,
+            name,
+            description,
+            icon: None,
+            members,
+            online: None,
+            space_id: space_id.clone(),
+            channel_id: space_id,
+        })
+    }
+
+    /// Joins a Teams team by join code (`POST {middle}/beta/teams/joinByCode`), never retrying
+    /// automatically, then refreshes the Spaces list.
+    pub(super) fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>), Fault> {
+        let code = parse_teams_join_code(raw).map_err(|message| Fault::Refused { status: 400, message })?;
+        let url = format!("{}/beta/teams/joinByCode", self.place()?.middle);
+        let body = self
+            .call("POST", &url, Auth::Both(SPACES), Body::Json(&json!({"joinCode": code})), false)
+            .map_err(|fault| match fault {
+                Fault::Refused { status: 404, .. } => Fault::Refused {
+                    status: 400,
+                    message: "That Teams join code was not found or has expired.".to_owned(),
+                },
+                Fault::Refused { status: 403, .. } => Fault::Refused {
+                    status: 403,
+                    message: "Your organization's policy does not allow joining this team by code.".to_owned(),
+                },
+                other => other,
+            })?
+            .body;
+        let team = if body["team"].is_object() { &body["team"] } else { &body };
+        let space_id = team["id"]
+            .as_str()
+            .or_else(|| team["teamId"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let channel_id = team["generalChannelId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| space_id.clone());
+        self.list(false)?;
+        Ok((space_id, channel_id))
+    }
+}
+
+/// Extracts a Teams join code from either a bare code (e.g. `ab12cd3`) or a Teams URL containing
+/// a `code=` / `joinCode=` query parameter.
+pub(super) fn parse_teams_join_code(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a Teams join code.".to_owned());
+    }
+    let candidate = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        let query = trimmed.split_once('?').map(|(_, q)| q).unwrap_or("");
+        query
+            .split('&')
+            .find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                if k.eq_ignore_ascii_case("code") || k.eq_ignore_ascii_case("joincode") {
+                    Some(v.split('#').next().unwrap_or(v).trim())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("")
+    } else {
+        trimmed
+    };
+    if candidate.len() < 4
+        || candidate.len() > 64
+        || !candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Enter a valid Teams join code (letters and digits).".to_owned());
+    }
+    Ok(candidate.to_owned())
 }
 
 /// A chat's own title: its topic, or a meeting's subject.
@@ -1050,5 +1466,22 @@ mod tests {
         assert_eq!(classify_activity("missedCall", &json!({})), (ActivityItemKind::MissedCall, String::new()));
         assert_eq!(classify_activity("addedToTeam", &json!({})), (ActivityItemKind::Invite, String::new()));
         assert_eq!(classify_activity("appNotification", &json!({})), (ActivityItemKind::App, String::new()));
+    }
+
+    #[test]
+    fn parse_teams_join_code_accepts_bare_code_and_url_and_rejects_garbage() {
+        assert_eq!(parse_teams_join_code("TEAM42").unwrap(), "TEAM42");
+        assert_eq!(
+            parse_teams_join_code("https://teams.microsoft.com/l/team/join?code=ab12cd3").unwrap(),
+            "ab12cd3"
+        );
+        assert_eq!(
+            parse_teams_join_code("https://teams.microsoft.com/?joinCode=xy_99-z#frag").unwrap(),
+            "xy_99-z"
+        );
+        assert!(parse_teams_join_code("").is_err());
+        assert!(parse_teams_join_code("ab").is_err());
+        assert!(parse_teams_join_code("bad code!").is_err());
+        assert!(parse_teams_join_code("https://teams.microsoft.com/l/team/nocode").is_err());
     }
 }

@@ -393,6 +393,7 @@ impl Demo {
             nickname: if self.ctx.account.network == Network::Discord { "Robin 🍄".to_owned() } else { String::new() },
             roles: if self.ctx.account.network == Network::Discord { vec!["Member".to_owned(), "Trail lead".to_owned()] } else { Vec::new() },
             notify: Notify::Mentions,
+            ..SpaceAbout::default()
         })
     }
 

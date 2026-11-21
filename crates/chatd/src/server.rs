@@ -1982,6 +1982,11 @@ impl Chat {
             Ok(about) => about,
             Err(refused) => return *refused,
         };
+        let mut link = about.link.trim().to_owned();
+        if !link.starts_with("https://") && !link.starts_with("http://") {
+            link.clear();
+        }
+        clip(&mut link, 2_000);
         let mut info = SpaceInfo {
             space: known,
             description: about.description,
@@ -1990,6 +1995,7 @@ impl Chat {
             nickname: about.nickname,
             roles: about.roles,
             notify: about.notify,
+            link,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);

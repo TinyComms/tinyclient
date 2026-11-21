@@ -269,7 +269,12 @@ fn reason(fault: Fault) -> String {
         Fault::Auth(why) => why,
         Fault::Net(_) => "Teams could not be reached.".to_owned(),
         Fault::Refused { status: 403, message } => {
-            if message.contains("moderator") || message.contains("Only channel") {
+            if message.contains("moderator")
+                || message.contains("Only channel")
+                || message.contains("Only team")
+                || message.contains("organization's policy")
+                || message.contains("last owner")
+            {
                 message
             } else {
                 "Teams does not let you do that here.".to_owned()
@@ -370,6 +375,8 @@ struct State {
     search_at: Option<Instant>,
     /// Blocked user MRIs on Teams.
     blocked: HashSet<String>,
+    /// Last listed teams (Spaces), kept so leaving one updates the Spaces list cleanly.
+    spaces: Vec<crate::store::SpaceRow>,
 }
 
 /// What a call presents.
@@ -962,6 +969,9 @@ impl Teams {
             search_global: true,
             groups: 250,
             blocks: true,
+            browse_channels: true,
+            join_space_by_invite: true,
+            leave_space: true,
             pin_chats: 15,
             close_direct: true,
             clear_history: true,
@@ -1068,8 +1078,34 @@ impl Teams {
             Command::Leave { conversation_id, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
             }
-            Command::File { conversation_id, pinned, archived: _, folder_add: _, folder_remove: _, reply } => {
-                let _ = reply.send(self.file_chat(&conversation_id, pinned).map_err(refuse));
+            Command::LeaveSpace { space_id, reply } => {
+                let _ = reply.send(self.leave_team(&space_id).map_err(refuse));
+            }
+            Command::BrowseChannels { space_id, query, cursor, limit, reply } => {
+                let _ = reply.send(self.browse_channels(&space_id, &query, cursor.as_deref(), limit).map_err(refuse));
+            }
+            Command::PreviewChannel { conversation_id, reply } => {
+                let _ = reply.send(self.preview_channel(&conversation_id).map_err(refuse));
+            }
+            Command::Join { conversation_id, reply } => {
+                let _ = reply.send(self.join_channel_or_team(&conversation_id).map_err(refuse));
+            }
+            Command::CreateChannel { space_id, name, kind: _, private, group: _, reply } => {
+                let _ = reply.send(self.create_channel(&space_id, &name, private).map_err(refuse));
+            }
+            Command::InvitePreview { code, reply } => {
+                let _ = reply.send(self.invite_preview(&code).map_err(refuse));
+            }
+            Command::InviteJoin { code, reply } => {
+                let _ = reply.send(self.invite_join(&code).map_err(refuse));
+            }
+            Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {
+                let result = if archived == Some(true) && tree::is_channel(thread_of(&conversation_id)) {
+                    self.delete_channel(&conversation_id)
+                } else {
+                    self.file_chat(&conversation_id, pinned)
+                };
+                let _ = reply.send(result.map_err(refuse));
             }
             Command::Pinned { conversation_id, reply } => {
                 let _ = reply.send(self.pinned_messages(&conversation_id).map_err(refuse));

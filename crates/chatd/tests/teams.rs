@@ -198,6 +198,12 @@ struct Fake {
     threads: Mutex<HashMap<String, Value>>,
     /// Blocked user MRIs (for #621).
     blocked: Mutex<Vec<String>>,
+    /// Teams joined via public browse or join code (for #629).
+    extra_teams: Mutex<Vec<Value>>,
+    /// Channels created inside teams (for #629).
+    extra_channels: Mutex<HashMap<String, Vec<Value>>>,
+    /// Team ids left by the user (for #629).
+    left_teams: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -235,6 +241,9 @@ impl Fake {
             })]),
             threads: Mutex::default(),
             blocked: Mutex::new(vec!["8:orgid:00000000-0000-4000-8000-0000000000bb".to_owned()]),
+            extra_teams: Mutex::default(),
+            extra_channels: Mutex::default(),
+            left_teams: Mutex::default(),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -349,7 +358,44 @@ impl Fake {
                 authz["tokens"]["skypeToken"] = skype.into();
                 ok(authz)
             }
-            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => ok(self.fixture("teams.users.me").unwrap()),
+            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => {
+                let mut body = self.fixture("teams.users.me").unwrap();
+                let left = self.left_teams.lock().unwrap().clone();
+                let extra_teams = self.extra_teams.lock().unwrap().clone();
+                let extra_channels = self.extra_channels.lock().unwrap().clone();
+                if let Some(teams) = body["teams"].as_array_mut() {
+                    teams.retain(|t| t["id"].as_str().is_none_or(|id| !left.iter().any(|l| l == id)));
+                    for t in teams.iter_mut() {
+                        if let Some(tid) = t["id"].as_str().map(str::to_owned) {
+                            if let Some(added) = extra_channels.get(&tid) {
+                                if let Some(chans) = t["channels"].as_array_mut() {
+                                    chans.extend(added.iter().cloned());
+                                }
+                            }
+                        }
+                    }
+                    teams.extend(extra_teams);
+                }
+                ok(body)
+            }
+            _ if path.starts_with("/api/csa/api/v1/teams/") && path.ends_with("/channels") && bearer("csa") && header("x-skypetoken") == skype => {
+                let tid = path
+                    .trim_start_matches("/api/csa/api/v1/teams/")
+                    .trim_end_matches("/channels");
+                let body = self.fixture("teams.users.me").unwrap();
+                let mut chans: Vec<Value> = body["teams"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| t["id"].as_str() == Some(tid))
+                    .and_then(|t| t["channels"].as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(added) = self.extra_channels.lock().unwrap().get(tid) {
+                    chans.extend(added.iter().cloned());
+                }
+                ok(json!({"channels": chans}))
+            }
             "/v4/a" if header("x-skypetoken") == skype => ok(json!({
                 "socketio": format!("{}/", self.base), "surl": format!("{}/v4/f/abc123/", self.base),
                 "url": format!("{}/v4/f/abc123/", self.base), "ttl": 587_000, "ccid": "cc-1",
@@ -472,6 +518,15 @@ impl Fake {
         if let Some(thread) = path.strip_prefix("/v1/threads/") {
             if call.method == "DELETE" && thread.contains("/members/") {
                 if let Some((tid, mri)) = thread.split_once("/members/") {
+                    if tid == "19:lastowner@thread.tacv2" {
+                        return answer("403 Forbidden", json!({"errorCode": 403, "message": "last owner cannot leave"}));
+                    }
+                    if mri == ME && (tid.contains("@thread.tacv2") || tid.contains("@thread.skype")) {
+                        let mut left = self.left_teams.lock().unwrap();
+                        if !left.iter().any(|l| l == tid) {
+                            left.push(tid.to_owned());
+                        }
+                    }
                     if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
                         if let Some(arr) = existing["members"].as_array_mut() {
                             arr.retain(|m| m["id"].as_str() != Some(mri));
@@ -483,6 +538,31 @@ impl Fake {
             if call.method == "PUT" {
                 if let Some((tid, mri)) = thread.split_once("/members/") {
                     let body = call.json();
+                    if tid == "19:eng0general@thread.tacv2" && mri == ME {
+                        let mut extra = self.extra_teams.lock().unwrap();
+                        if !extra.iter().any(|t| t["id"].as_str() == Some(tid)) {
+                            extra.push(json!({
+                                "id": tid,
+                                "displayName": "Engineering",
+                                "isFavorite": true,
+                                "isDeleted": false,
+                                "isArchived": false,
+                                "tenantId": HOME,
+                                "teamSiteInformation": {"groupId": "e0873025-0000-4000-8000-00000000e199"},
+                                "channels": [{
+                                    "id": tid,
+                                    "displayName": "General",
+                                    "parentTeamId": tid,
+                                    "isGeneral": true,
+                                    "isFavorite": true,
+                                    "isMember": true,
+                                    "isDeleted": false,
+                                    "isArchived": false,
+                                    "channelType": 0
+                                }]
+                            }));
+                        }
+                    }
                     if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
                         if let Some(arr) = existing["members"].as_array_mut() {
                             if !arr.iter().any(|m| m["id"].as_str() == Some(mri)) {
@@ -561,6 +641,11 @@ impl Fake {
                         ]
                     })),
                     "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
+                    "19:platform0hidden@thread.tacv2" => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "topic", "topic": "Hidden one"},
+                        "members": [{"id": ME, "role": "User"}]
+                    })),
                     _ => None,
                 });
             if let Some(desc) = described.as_mut() {
@@ -848,6 +933,113 @@ impl Fake {
             if call.method == "DELETE" {
                 self.blocked.lock().unwrap().retain(|b| b != mri);
                 return ok(json!({}));
+            }
+        }
+        if call.path.ends_with("/beta/teams/public") && call.method == "GET" {
+            return ok(json!({
+                "teams": [
+                    {
+                        "id": "19:eng0general@thread.tacv2",
+                        "displayName": "Engineering",
+                        "description": "Public engineering hub",
+                        "memberCount": 18,
+                        "isArchived": false,
+                        "isDeleted": false
+                    },
+                    {
+                        "id": GENERAL,
+                        "displayName": "Platform",
+                        "description": "Platform team",
+                        "memberCount": 4,
+                        "isArchived": false,
+                        "isDeleted": false
+                    }
+                ]
+            }));
+        }
+        if let Some(code) = call.path.split("/beta/teams/joinCode/").nth(1) {
+            if call.method == "GET" {
+                if code == "TEAM42" {
+                    return ok(json!({
+                        "id": "19:code0general@thread.tacv2",
+                        "displayName": "Release Guild",
+                        "description": "Coordinating weekly releases",
+                        "memberCount": 12
+                    }));
+                }
+                return answer("404 Not Found", json!({"errorCode": 404, "message": "not found"}));
+            }
+        }
+        if call.path.ends_with("/beta/teams/joinByCode") && call.method == "POST" {
+            let code = call.json()["joinCode"].as_str().unwrap_or("").to_owned();
+            if code == "BLOCKED42" {
+                return answer("403 Forbidden", json!({"errorCode": 403, "message": "policy forbids join"}));
+            }
+            if code == "TEAM42" {
+                let tid = "19:code0general@thread.tacv2";
+                let mut extra = self.extra_teams.lock().unwrap();
+                if !extra.iter().any(|t| t["id"].as_str() == Some(tid)) {
+                    extra.push(json!({
+                        "id": tid,
+                        "displayName": "Release Guild",
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "isArchived": false,
+                        "tenantId": HOME,
+                        "teamSiteInformation": {"groupId": "e0873025-0000-4000-8000-00000000c0de"},
+                        "channels": [{
+                            "id": tid,
+                            "displayName": "General",
+                            "parentTeamId": tid,
+                            "isGeneral": true,
+                            "isFavorite": true,
+                            "isMember": true,
+                            "isDeleted": false,
+                            "isArchived": false,
+                            "channelType": 0
+                        }]
+                    }));
+                }
+                return ok(json!({
+                    "id": tid,
+                    "displayName": "Release Guild",
+                    "generalChannelId": tid
+                }));
+            }
+            return answer("404 Not Found", json!({"errorCode": 404, "message": "invalid code"}));
+        }
+        if let Some(rest) = call.path.split("/beta/teams/").nth(1) {
+            if call.method == "POST" && rest.ends_with("/channels") {
+                let tid = rest.trim_end_matches("/channels").to_owned();
+                let body = call.json();
+                let name = body["displayName"].as_str().unwrap_or("").to_owned();
+                if name.to_ascii_lowercase().contains("forbidden") {
+                    return answer("403 Forbidden", json!({"errorCode": 403, "message": "policy blocks channel creation"}));
+                }
+                let private = body["membershipType"].as_str() == Some("private");
+                let mut map = self.extra_channels.lock().unwrap();
+                let list = map.entry(tid.clone()).or_default();
+                let cid = format!("19:newchan{}@thread.tacv2", list.len() + 1);
+                list.push(json!({
+                    "id": cid,
+                    "displayName": name,
+                    "parentTeamId": tid,
+                    "isGeneral": false,
+                    "isFavorite": true,
+                    "isMember": true,
+                    "isDeleted": false,
+                    "isArchived": false,
+                    "channelType": if private { 1 } else { 0 }
+                }));
+                return answer("201 Created", json!({"id": cid, "displayName": name}));
+            }
+            if call.method == "DELETE" && rest.contains("/channels/") {
+                if let Some((tid, cid)) = rest.split_once("/channels/") {
+                    if let Some(list) = self.extra_channels.lock().unwrap().get_mut(tid) {
+                        list.retain(|c| c["id"].as_str() != Some(cid));
+                    }
+                    return ok(json!({}));
+                }
             }
         }
         if call.path.ends_with("/v1/urlpreview") {
@@ -3326,5 +3518,209 @@ fn external_federated_badge_request_accept_block_and_email_lookup() {
         Response::Ok
     );
     assert!(!world.fake.calls("DELETE", "/beta/users/blocklist/8:live:personal_spammer").is_empty());
+}
+
+#[test]
+fn team_and_channel_browse_join_create_rename_delete_members_leave_and_manage_link() {
+    let world = World::start();
+    world.ready();
+
+    let account = world.account(HOME);
+    assert!(account.can.browse_channels);
+    assert!(account.can.join_space_by_invite);
+    assert!(account.can.leave_space);
+
+    let spaces = || match world.ask(Request::Spaces { network: Some(Network::Teams) }) {
+        Response::Spaces { spaces, .. } => spaces,
+        other => panic!("unexpected spaces: {other:?}"),
+    };
+    let platform = spaces().into_iter().find(|s| s.key == key(GENERAL)).expect("Platform space");
+    assert!(platform.can_create_channels);
+
+    // 1. SpaceInfo returns a working "Manage in Teams" deep link carrying groupId & tenantId.
+    let info = match world.ask(Request::SpaceInfo { space: key(GENERAL) }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("unexpected space info: {other:?}"),
+    };
+    assert!(
+        info.link.starts_with("https://teams.microsoft.com/l/team/")
+            && info.link.contains("groupId=e0873025-0000-4000-8000-00000000beef")
+            && info.link.contains(&format!("tenantId={HOME}")),
+        "unexpected team manage link: {}",
+        info.link
+    );
+
+    // 2. Browse hidden channels in Platform, preview, then show (Join -> isFavorite=true).
+    let browsed = match world.ask(Request::BrowseChannels {
+        space: key(GENERAL),
+        query: "Hidden".into(),
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::BrowsedChannels { channels, .. } => channels,
+        other => panic!("unexpected browse: {other:?}"),
+    };
+    assert_eq!(browsed.len(), 1);
+    assert_eq!(browsed[0].key, key("19:platform0hidden@thread.tacv2"));
+    assert!(!browsed[0].joined);
+
+    let previewed = match world.ask(Request::PreviewChannel {
+        conversation: key("19:platform0hidden@thread.tacv2"),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected preview: {other:?}"),
+    };
+    assert!(!previewed.joined && previewed.read_only);
+
+    let shown = match world.ask(Request::Join {
+        conversation: key("19:platform0hidden@thread.tacv2"),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected join hidden channel: {other:?}"),
+    };
+    assert!(shown.joined && !shown.opted_out && !shown.read_only);
+    assert!(!world.fake.calls("PUT", "/v1/users/ME/conversations/19:platform0hidden@thread.tacv2/properties").is_empty());
+
+    // 3. Browse public teams (empty space id) and join Engineering.
+    let public_teams = match world.ask(Request::BrowseChannels {
+        space: key(""),
+        query: String::new(),
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::BrowsedChannels { channels, .. } => channels,
+        other => panic!("unexpected public browse: {other:?}"),
+    };
+    let eng = public_teams
+        .iter()
+        .find(|c| c.key == key("19:eng0general@thread.tacv2"))
+        .expect("Engineering public team");
+    assert!(!eng.joined && eng.members == 18);
+    let plat_pub = public_teams.iter().find(|c| c.key == key(GENERAL)).expect("Platform in public list");
+    assert!(plat_pub.joined);
+
+    let _ = world.ask(Request::Join {
+        conversation: key("19:eng0general@thread.tacv2"),
+    });
+    assert!(
+        spaces().iter().any(|s| s.key == key("19:eng0general@thread.tacv2")),
+        "Engineering should appear in Spaces after joining"
+    );
+
+    // 4. Join team by code: preview, policy refusal, and successful join.
+    let acc_key = protocol::AccountKey { network: Network::Teams, account: HOME.to_owned() };
+    let preview = match world.ask(Request::InvitePreview {
+        account: acc_key.clone(),
+        code: "https://teams.microsoft.com/l/team/join?code=TEAM42".into(),
+    }) {
+        Response::InvitePreview { preview } => preview,
+        other => panic!("unexpected invite preview: {other:?}"),
+    };
+    assert_eq!(preview.code, "TEAM42");
+    assert_eq!(preview.name, "Release Guild");
+    assert_eq!(preview.members, Some(12));
+
+    match world.ask(Request::InviteJoin {
+        account: acc_key.clone(),
+        code: "BLOCKED42".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("organization's policy"), "detail: {detail}"),
+        other => panic!("expected policy refusal, got {other:?}"),
+    }
+
+    match world.ask(Request::InviteJoin {
+        account: acc_key,
+        code: "TEAM42".into(),
+    }) {
+        Response::InviteJoined { space, .. } => assert_eq!(space, Some(key("19:code0general@thread.tacv2"))),
+        other => panic!("unexpected invite join: {other:?}"),
+    }
+    assert!(spaces().iter().any(|s| s.key == key("19:code0general@thread.tacv2")));
+
+    // 5. Create channel (standard + policy refusal), rename, add member to private channel, delete channel.
+    match world.ask(Request::CreateChannel {
+        space: key(GENERAL),
+        name: "Forbidden Channel".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("organization's policy"), "detail: {detail}"),
+        other => panic!("expected channel create policy refusal, got {other:?}"),
+    }
+
+    let created = match world.ask(Request::CreateChannel {
+        space: key(GENERAL),
+        name: "Incident War Room".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected create channel: {other:?}"),
+    };
+    assert_eq!(created.title, "Incident War Room");
+    assert!(created.rights.rename && created.rights.edit_topic);
+
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: created.key.clone(),
+            title: Some("Incident Response".into()),
+            topic: None,
+            description: Some("Active sev-1 coordination".into()),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&created.key).unwrap().title, "Incident Response");
+
+    // Add member to private channel Leads.
+    let leads = world.conversation(&key("19:platform0leads@thread.tacv2")).expect("Leads channel");
+    assert!(leads.private && leads.rights.add_members);
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: leads.key.clone(),
+            people: vec![DEE.to_owned()],
+            share_history: None,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("PUT", &format!("/v1/threads/19:platform0leads@thread.tacv2/members/{DEE}")).is_empty());
+
+    // General channel cannot be deleted, created channel can be deleted.
+    match world.ask(Request::File {
+        conversation: key(GENERAL),
+        pinned: None,
+        archived: Some(true),
+        folder_add: None,
+        folder_remove: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("General"), "detail: {detail}"),
+        other => panic!("expected General delete refusal, got {other:?}"),
+    }
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: created.key.clone(),
+            pinned: None,
+            archived: Some(true),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(world.conversation(&created.key).is_none());
+
+    // 6. Leave Design team and verify last-owner refusal.
+    assert!(spaces().iter().any(|s| s.key == key("19:design0general@thread.tacv2")));
+    assert_eq!(
+        world.ask(Request::LeaveSpace { space: key("19:design0general@thread.tacv2") }),
+        Response::Ok
+    );
+    assert!(!spaces().iter().any(|s| s.key == key("19:design0general@thread.tacv2")));
+    assert!(!world.fake.calls("DELETE", &format!("/v1/threads/19:design0general@thread.tacv2/members/{ME}")).is_empty());
+
+    match world.ask(Request::LeaveSpace { space: key("19:lastowner@thread.tacv2") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("last owner"), "detail: {detail}"),
+        other => panic!("expected last owner refusal, got {other:?}"),
+    }
 }
 

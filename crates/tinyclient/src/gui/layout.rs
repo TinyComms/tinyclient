@@ -814,9 +814,10 @@ impl Shell {
                     .find(|a| a.key.network == network && a.link == Link::Connected && a.can.join_space_by_invite)
                     .map(|a| a.key.clone())
                 {
+                    let join_label = if network == Network::Teams { "Join a team…" } else { "Join a server…" };
                     items.push(menu_separator().into_any_element());
                     items.push(
-                        menu_item("join-server-invite", Some("icons/log-in.svg"), "Join a server…", None)
+                        menu_item("join-server-invite", Some("icons/log-in.svg"), join_label, None)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
                                 this.open_join_server(account.clone(), cx);
@@ -874,15 +875,17 @@ impl Shell {
                 });
                 if can_leave {
                     let leave_key = space.clone();
+                    let default_noun = if space.network == Network::Teams { "this team" } else { "this server" };
+                    let leave_label = if space.network == Network::Teams { "Leave team…" } else { "Leave server…" };
                     let leave_name = self
                         .spaces
                         .iter()
                         .find(|s| &s.key == space)
                         .map(|s| s.name.clone())
-                        .unwrap_or_else(|| "this server".to_owned());
+                        .unwrap_or_else(|| default_noun.to_owned());
                     items.push(menu_separator().into_any_element());
                     items.push(
-                        menu_item_danger("space-leave", Some("icons/log-out.svg"), "Leave server…")
+                        menu_item_danger("space-leave", Some("icons/log-out.svg"), leave_label)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
                                 this.open_leave_space(leave_key.clone(), leave_name.clone(), cx);
