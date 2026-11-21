@@ -42,6 +42,14 @@ struct GuildCounts {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
+    banner: Option<String>,
+    #[serde(default)]
+    premium_tier: Option<u8>,
+    #[serde(default)]
+    premium_subscription_count: Option<u32>,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
     approximate_member_count: Option<u32>,
     #[serde(default)]
     approximate_presence_count: Option<u32>,
@@ -225,22 +233,53 @@ impl Discord {
         }
         let answer = self.call("GET", &format!("/guilds/{guild}?with_counts=true"), None).map_err(refusal)?;
         let counts: GuildCounts = serde_json::from_str(&answer).map_err(refused)?;
-        let state = crate::hub::lock(&self.state);
-        let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
-        let roles = info.my_roles.iter().filter(|role| **role != number(guild)).filter_map(|role| info.roles.get(role));
-        let notify = match () {
-            _ if info.quiet.server_muted(now()) => Notify::Nothing,
-            _ if info.quiet.level == 1 => Notify::Mentions,
-            _ if info.quiet.level == 2 => Notify::Nothing,
-            _ => Notify::All,
+        let (description, banner_hash, boost_level, boosts, mark, nickname, roles, notify) = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            let roles = info
+                .my_roles
+                .iter()
+                .filter(|role| **role != number(guild))
+                .filter_map(|role| info.roles.get(role))
+                .map(|role| role.name.clone())
+                .take(protocol::PROFILE_ROLES)
+                .collect();
+            let notify = match () {
+                _ if info.quiet.server_muted(now()) => Notify::Nothing,
+                _ if info.quiet.level == 1 => Notify::Mentions,
+                _ if info.quiet.level == 2 => Notify::Nothing,
+                _ => Notify::All,
+            };
+            let description = counts
+                .description
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| info.description.clone());
+            let banner_hash = counts.banner.or_else(|| info.banner.clone());
+            let boost_level = counts.premium_tier.unwrap_or(info.premium_tier);
+            let boosts = counts.premium_subscription_count.unwrap_or(info.premium_subscription_count);
+            let features = if counts.features.is_empty() { &info.features } else { &counts.features };
+            let mark = model::guild_mark(features);
+            (description, banner_hash, boost_level, boosts, mark, info.nick.clone(), roles, notify)
+        };
+        let banner = match banner_hash.as_deref() {
+            Some(hash) => {
+                let (file, url) = model::guild_banner(guild, hash);
+                let _ = self.ctx.media(&[(file.clone(), url)]);
+                Some(file)
+            }
+            None => None,
         };
         Ok(SpaceAbout {
-            description: counts.description.unwrap_or_default(),
+            description,
             members: counts.approximate_member_count,
             online: counts.approximate_presence_count,
-            nickname: info.nick.clone(),
-            roles: roles.map(|role| role.name.clone()).take(protocol::PROFILE_ROLES).collect(),
+            nickname,
+            roles,
             notify,
+            banner,
+            boost_level,
+            boosts,
+            mark,
         })
     }
 

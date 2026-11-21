@@ -209,6 +209,10 @@ pub struct SpaceAbout {
     pub nickname: String,
     pub roles: Vec<String>,
     pub notify: Notify,
+    pub banner: Option<MediaFile>,
+    pub boost_level: u8,
+    pub boosts: u32,
+    pub mark: Option<protocol::Mark>,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -1609,6 +1613,11 @@ impl Context {
     /// The info pane's cached count is no longer true.
     pub fn info_stale(&self, conversation_id: &str) {
         self.hub.infos.forget(&self.key(conversation_id));
+    }
+
+    /// A Space's cached info is no longer current (e.g. `GUILD_UPDATE` or overview edit).
+    pub fn space_info_stale(&self, space_id: &str) {
+        self.hub.space_infos.forget(&self.key(space_id));
     }
 
     /// What is held about a person's presence now, for a member row built here.

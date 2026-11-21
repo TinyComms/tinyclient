@@ -210,6 +210,16 @@ struct GuildInfo {
     nick: String,
     /// Server boost tier (0..=3), which can raise the file upload limit for everyone in it.
     premium_tier: u8,
+    /// Number of active server boosts.
+    premium_subscription_count: u32,
+    /// Banner hash from Discord (`banners/{guild}/{hash}.webp`).
+    banner: Option<String>,
+    /// Server description shown in Details.
+    description: String,
+    /// Discord feature flags (e.g. `VERIFIED`, `PARTNERED`, `INVITES_DISABLED`).
+    features: Vec<String>,
+    /// Server vanity invite code, if any.
+    vanity_url_code: Option<String>,
     /// Unix seconds until our own server timeout ends, if timed out.
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,

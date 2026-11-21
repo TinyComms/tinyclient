@@ -219,6 +219,26 @@ pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
     )
 }
 
+/// A server's banner image, served from Discord's CDN at 512px wide.
+pub fn guild_banner(guild: &str, hash: &str) -> (MediaFile, String) {
+    (
+        MediaFile {
+            width: 512,
+            height: 288,
+            ..MediaFile::new(format!("banner:{guild}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/banners/{guild}/{hash}.webp?size=512{}", cdn(), moving(hash)),
+    )
+}
+
+/// Whether a server's `features` list marks it as verified or partnered.
+pub fn guild_mark(features: &[String]) -> Option<protocol::Mark> {
+    features
+        .iter()
+        .any(|f| f == "VERIFIED" || f == "PARTNERED")
+        .then_some(protocol::Mark::Verified)
+}
+
 /// A group direct message's own picture. The address is from the community documentation and
 /// unconfirmed against a real account.
 pub fn group_icon(channel: &str, hash: &str) -> (MediaFile, String) {
@@ -442,9 +462,19 @@ pub struct GuildProperties {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
     pub premium_tier: Option<u8>,
+    #[serde(default)]
+    pub premium_subscription_count: Option<u32>,
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    #[serde(default)]
+    pub vanity_url_code: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -457,9 +487,19 @@ pub struct Guild {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
     pub premium_tier: Option<u8>,
+    #[serde(default)]
+    pub premium_subscription_count: Option<u32>,
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    #[serde(default)]
+    pub vanity_url_code: Option<String>,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -556,6 +596,31 @@ impl Guild {
     pub fn premium_tier(&self) -> Option<u8> {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.premium_tier);
         wrapped.or(self.premium_tier)
+    }
+
+    pub fn banner(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.banner.as_deref());
+        wrapped.or(self.banner.as_deref()).filter(|h| !h.is_empty())
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.description.as_deref());
+        wrapped.or(self.description.as_deref())
+    }
+
+    pub fn premium_subscription_count(&self) -> Option<u32> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.premium_subscription_count);
+        wrapped.or(self.premium_subscription_count)
+    }
+
+    pub fn features(&self) -> Option<&[String]> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.features.as_deref());
+        wrapped.or(self.features.as_deref())
+    }
+
+    pub fn vanity_url_code(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.vanity_url_code.as_deref());
+        wrapped.or(self.vanity_url_code.as_deref()).filter(|c| !c.is_empty())
     }
 }
 
@@ -1136,5 +1201,36 @@ mod tests {
         let index = (175_928_847_299_117_063u64 >> 22) % 6;
         assert_eq!(url, format!("{}/embed/avatars/{index}.png", cdn()));
         assert_eq!(file.id, format!("avatar:default:{index}"));
+    }
+
+    #[test]
+    fn guild_banner_boosts_description_and_verified_mark_parse() {
+        let guild: Guild = serde_json::from_str(
+            r#"{
+                "id": "4000",
+                "properties": {
+                    "name": "Rustaceans",
+                    "banner": "a_banhash",
+                    "description": "Friendly crabs",
+                    "premium_tier": 2,
+                    "premium_subscription_count": 9,
+                    "features": ["COMMUNITY", "VERIFIED"],
+                    "vanity_url_code": "rust"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(guild.banner(), Some("a_banhash"));
+        assert_eq!(guild.description(), Some("Friendly crabs"));
+        assert_eq!(guild.premium_tier(), Some(2));
+        assert_eq!(guild.premium_subscription_count(), Some(9));
+        assert_eq!(guild.vanity_url_code(), Some("rust"));
+        assert_eq!(guild_mark(guild.features()), Some(protocol::Mark::Verified));
+
+        let (file, url) = guild_banner("4000", "a_banhash");
+        assert_eq!(file.id, "banner:4000:a_banhash");
+        assert_eq!(url, format!("{}/banners/4000/a_banhash.webp?size=600", cdn()));
+        assert_eq!(guild_mark(&["PARTNERED".to_owned()]), Some(protocol::Mark::Verified));
+        assert_eq!(guild_mark(&["COMMUNITY".to_owned()]), None);
     }
 }

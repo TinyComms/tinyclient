@@ -5045,3 +5045,79 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
 }
+
+#[test]
+fn space_info_shows_banner_boosts_verified_mark_description_and_updates_on_guild_update() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["properties"]["banner"] = json!("ban123");
+    ready["guilds"][0]["properties"]["description"] = json!("Crabs from READY");
+    ready["guilds"][0]["properties"]["premium_tier"] = json!(2);
+    ready["guilds"][0]["properties"]["premium_subscription_count"] = json!(11);
+    ready["guilds"][0]["properties"]["features"] = json!(["COMMUNITY", "VERIFIED"]);
+
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Per-server upload limit on channels reflects boost tier 2 (50 MiB).
+    let rows = world.tree("4000");
+    let general = rows.iter().find(|c| c.key.id == "4101").expect("general channel");
+    assert_eq!(general.max_file_bytes, Some(50 << 20));
+
+    // SpaceInfo merges READY banner, boost tier/count, verified mark, and REST description/counts.
+    match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => {
+            assert_eq!(info.description, "Crabs and their friends");
+            assert_eq!(info.members, Some(1204));
+            assert_eq!(info.online, Some(230));
+            assert_eq!(info.boost_level, 2);
+            assert_eq!(info.boosts, 11);
+            assert_eq!(info.mark, Some(protocol::Mark::Verified));
+            assert_eq!(info.banner.as_ref().map(|b| b.id.as_str()), Some("banner:4000:ban123"));
+        }
+        other => panic!("expected Response::SpaceInfo, got {other:?}"),
+    }
+
+    // GUILD_UPDATE with a new banner and tier 3 invalidates cached SpaceInfo and lifts channel upload limit to 100 MiB.
+    world.discord.push(
+        "GUILD_UPDATE",
+        json!({
+            "id": "4000",
+            "name": "Rustaceans",
+            "banner": "ban456",
+            "description": "Updated description",
+            "premium_tier": 3,
+            "premium_subscription_count": 20,
+            "features": ["COMMUNITY", "PARTNERED"]
+        }),
+    );
+    wait("channel upload limit to reflect tier 3", || {
+        world.tree("4000").into_iter().find(|c| c.key.id == "4101" && c.max_file_bytes == Some(100 << 20))
+    });
+    world.discord.script(
+        "/guilds/4000",
+        200,
+        json!({
+            "id": "4000",
+            "name": "Rustaceans",
+            "banner": "ban456",
+            "description": "Updated description",
+            "premium_tier": 3,
+            "premium_subscription_count": 20,
+            "features": ["COMMUNITY", "PARTNERED"],
+            "approximate_member_count": 1250,
+            "approximate_presence_count": 260
+        }),
+    );
+    match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => {
+            assert_eq!(info.description, "Updated description");
+            assert_eq!(info.boost_level, 3);
+            assert_eq!(info.boosts, 20);
+            assert_eq!(info.mark, Some(protocol::Mark::Verified));
+            assert_eq!(info.banner.as_ref().map(|b| b.id.as_str()), Some("banner:4000:ban456"));
+        }
+        other => panic!("expected updated Response::SpaceInfo, got {other:?}"),
+    }
+}

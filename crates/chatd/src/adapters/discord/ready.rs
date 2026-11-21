@@ -333,6 +333,11 @@ impl Discord {
             quiet,
             nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
             premium_tier: guild.premium_tier().unwrap_or(0),
+            premium_subscription_count: guild.premium_subscription_count().unwrap_or(0),
+            banner: guild.banner().map(str::to_owned),
+            description: guild.description().unwrap_or_default().to_owned(),
+            features: guild.features().to_vec(),
+            vanity_url_code: guild.vanity_url_code().map(str::to_owned),
             timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
@@ -636,18 +641,24 @@ impl Discord {
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
             flags.extend(state.guilds.iter().map(|(id, info)| (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted)));
-            let listed = state.guilds.iter().map(|(id, info)| {
+            let mut rows = Vec::with_capacity(state.guilds.len());
+            let mut files = Vec::new();
+            for (id, info) in &state.guilds {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
-                let row = SpaceRow {
+                rows.push(SpaceRow {
                     id: id.clone(),
                     name: info.name.clone(),
                     icon: icon.as_ref().map(|(file, _)| file.id.clone()),
                     position: info.position,
-                };
-                (row, icon)
-            });
-            let (rows, icons): (Vec<_>, Vec<_>) = listed.unzip();
-            (rows, icons.into_iter().flatten().collect())
+                });
+                if let Some(icon) = icon {
+                    files.push(icon);
+                }
+                if let Some(hash) = info.banner.as_deref() {
+                    files.push(model::guild_banner(id, hash));
+                }
+            }
+            (rows, files)
         };
         self.ctx.media(&files)?;
         self.ctx.spaces(&rows)?;
@@ -1137,6 +1148,19 @@ impl Discord {
                 info.name = guild.name().to_owned();
             }
             info.icon = guild.icon().map(str::to_owned);
+            info.banner = guild.banner().map(str::to_owned);
+            if let Some(description) = guild.description() {
+                info.description = description.to_owned();
+            }
+            if let Some(count) = guild.premium_subscription_count() {
+                info.premium_subscription_count = count;
+            }
+            if !guild.features().is_empty() {
+                info.features = guild.features().to_vec();
+            }
+            if let Some(code) = guild.vanity_url_code() {
+                info.vanity_url_code = Some(code.to_owned());
+            }
             match guild.premium_tier() {
                 Some(tier) if tier != info.premium_tier => {
                     info.premium_tier = tier;
@@ -1148,6 +1172,7 @@ impl Discord {
         if tier_changed {
             self.replant(&guild.id)?;
         }
+        self.ctx.space_info_stale(&guild.id);
         Ok(self.spaces()?)
     }
 

@@ -333,6 +333,18 @@ pub struct SpaceInfo {
     pub roles: Vec<String>,
     #[serde(default)]
     pub notify: Notify,
+    /// Server banner image, where the Space has one (e.g. boosted Discord server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<MediaFile>,
+    /// Boost level / tier (0..=3 on Discord).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub boost_level: u8,
+    /// Number of active server boosts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub boosts: u32,
+    /// Verified or partnered server mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<Mark>,
 }
 
 /// Which of a custom emoji set this account may send.
@@ -1206,5 +1218,44 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn space_info_banner_boosts_and_mark_round_trip_and_default_cleanly() {
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let space = Space {
+            key: Key::new(&account, "4000"),
+            name: "Rustaceans".into(),
+            icon: None,
+            position: 0,
+            attention: 0,
+            unread: false,
+            folder: None,
+            muted: false,
+            hide_muted: false,
+            can_create_channels: false,
+        };
+        let legacy = serde_json::json!({
+            "space": space,
+            "description": "Crabs",
+            "members": 42,
+            "online": 7
+        });
+        let parsed: SpaceInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.banner, None);
+        assert_eq!(parsed.boost_level, 0);
+        assert_eq!(parsed.boosts, 0);
+        assert_eq!(parsed.mark, None);
+
+        let full = SpaceInfo {
+            banner: Some(MediaFile::new("banner:4000:abc", crate::MediaKind::Image)),
+            boost_level: 2,
+            boosts: 14,
+            mark: Some(Mark::Verified),
+            ..parsed
+        };
+        let wire = serde_json::to_string(&full).unwrap();
+        let back: SpaceInfo = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, full);
     }
 }

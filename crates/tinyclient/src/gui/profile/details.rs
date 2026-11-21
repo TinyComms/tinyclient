@@ -639,6 +639,22 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
     let info = info.filter(|info| info.space.key == *key).cloned();
     let name = known.map(|space| space.name.clone()).or_else(|| info.as_ref().map(|info| info.space.name.clone())).unwrap_or_default();
     let icon = known.and_then(|space| space.icon.clone()).map(|icon| hub.file(&key.account(), &icon, cx));
+    let banner = info
+        .as_ref()
+        .and_then(|info| info.banner.as_ref())
+        .map(|file| hub.file(&key.account(), file, cx))
+        .and_then(|file| file.path);
+    let mark = (info.as_ref().and_then(|info| info.mark) == Some(protocol::Mark::Verified)).then(|| {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .child(glyph("icons/badge-check.svg", 14., theme::text_soft()))
+    });
+    let boost_line = info
+        .as_ref()
+        .filter(|_| key.network == Network::Discord)
+        .and_then(|info| facts::space_boost_line(info.boost_level, info.boosts));
     let (waiting, failed, late) = pane.waiting();
     let line = match (key.network, info.as_ref()) {
         (Network::Discord, Some(info)) => match (info.members, info.online) {
@@ -662,8 +678,9 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
         .flex()
         .flex_col()
         .child(div().pt(px(16.)).child(Avatar::new(key, &name, draw::AVATAR).shape(Plate::Place).image(icon.as_ref()).build()))
-        .child(div().mt(px(12.)).min_w_0().truncate().type_title().child(name.clone()))
-        .children(line.map(|line| line.type_ui().text_color(theme::text_soft())));
+        .child(draw::name_line(name.clone(), mark).mt(px(12.)))
+        .children(line.map(|line| line.type_ui().text_color(theme::text_soft())))
+        .children(boost_line.map(|words| div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(words)));
     // CONTRACT: no request sets a Space's notifications, so the setting `SpaceInfo` gives is
     // shown as it is, read-only, and changed in the network's app.
     let notify = info.as_ref().filter(|_| key.network == Network::Discord).map(|info| info.notify);
@@ -680,7 +697,19 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
                     .child(shown(2, "Nothing", Notify::Nothing)),
             ))
     }));
-    let mut body = div().flex().flex_col().pb(px(theme::PANE_PAD)).child(top);
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .pb(px(theme::PANE_PAD))
+        .children(banner.map(|path| {
+            div()
+                .w_full()
+                .h(px(96.))
+                .overflow_hidden()
+                .bg(theme::raised())
+                .child(gpui::img(std::path::PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover))
+        }))
+        .child(top);
     let mut sections = div().px(px(theme::PANE_PAD)).flex().flex_col();
     let mut any = false;
     if let Some(info) = &info {

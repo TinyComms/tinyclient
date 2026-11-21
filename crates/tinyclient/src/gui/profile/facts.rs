@@ -786,6 +786,20 @@ pub fn space_link(space: &protocol::Key) -> Option<String> {
     }
 }
 
+/// A server's boost tier and count as one quiet line ("Level 2 · 14 boosts"), omitted when
+/// unboosted so ordinary servers keep a calm header.
+pub fn space_boost_line(boost_level: u8, boosts: u32) -> Option<String> {
+    if boost_level == 0 && boosts == 0 {
+        return None;
+    }
+    let noun = if boosts == 1 { "boost" } else { "boosts" };
+    match (boost_level, boosts) {
+        (0, count) => Some(format!("{} {noun}", thousands(count))),
+        (level, 0) => Some(format!("Level {level}")),
+        (level, count) => Some(format!("Level {level} · {} {noun}", thousands(count))),
+    }
+}
+
 /// What the one confirm asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
@@ -1397,5 +1411,14 @@ mod tests {
         p.relation = Relation::None;
         p.bot = true;
         assert!(!person_menu(&p, &with_blocks, false, false).contains(&Item::Block));
+    }
+
+    #[test]
+    fn space_boost_line_formats_levels_and_counts() {
+        assert_eq!(space_boost_line(0, 0), None);
+        assert_eq!(space_boost_line(0, 1), Some("1 boost".into()));
+        assert_eq!(space_boost_line(1, 0), Some("Level 1".into()));
+        assert_eq!(space_boost_line(2, 14), Some("Level 2 · 14 boosts".into()));
+        assert_eq!(space_boost_line(3, 1_250), Some("Level 3 · 1,250 boosts".into()));
     }
 }

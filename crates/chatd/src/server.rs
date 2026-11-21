@@ -1990,6 +1990,10 @@ impl Chat {
             nickname: about.nickname,
             roles: about.roles,
             notify: about.notify,
+            banner: about.banner,
+            boost_level: about.boost_level,
+            boosts: about.boosts,
+            mark: about.mark,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
