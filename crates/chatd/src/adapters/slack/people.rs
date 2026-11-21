@@ -590,6 +590,19 @@ impl Slack {
         self.ctx.relation(person, Relation::Contact)
     }
 
+    /// Drops a closed direct conversation's partner so presence is no longer watched for them.
+    pub(super) fn forget_partner(&self, channel: &str) {
+        let removed = {
+            let mut state = self.state();
+            let before = state.partners.len();
+            state.partners.retain(|_, id| id != channel);
+            state.partners.len() != before
+        };
+        if removed {
+            self.keep_partners();
+        }
+    }
+
     /// The row of a direct conversation. The partner is looked up first, which registers
     /// their picture and records them before the row that names both.
     pub(super) fn direct_row(&self, channel: &str, person: &str) -> ConversationRow {

@@ -1060,8 +1060,8 @@ impl Shell {
             ));
             items.push(act("row-open-in", "icons/external-link.svg", format!("Open in {}", network.label()).into(), Box::new(move |_, cx| cx.open_url(&link))));
         }
-        // CONTRACT: closing a DM has a request on Discord only; leaving, where `can_leave` says.
-        let close = row.kind == protocol::ConversationKind::Direct && network == Network::Discord;
+        // Closing a DM is offered only on networks whose adapter serves `CloseDirect`; leaving, where `can_leave` says.
+        let close = row.kind == protocol::ConversationKind::Direct && super::profile::facts::can_close_direct(network);
         if close || leave {
             items.push(menu_separator().into_any_element());
         }

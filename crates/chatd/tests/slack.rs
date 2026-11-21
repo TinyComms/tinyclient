@@ -430,6 +430,12 @@ impl Fake {
                 "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
                             "user": param("users"), "is_open": true, "priority": 0},
             })),
+            "conversations.close" => {
+                if channel.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
             // A conversation star is the channel alone. A timestamp would star a message.
             "stars.add" | "stars.remove" => {
                 if channel.is_empty() || !param("timestamp").is_empty() {
@@ -2620,4 +2626,25 @@ fn a_call_block_is_a_meeting_card_with_a_join_link_and_an_old_call_names_itself(
         "room": { "date_start": started, "date_end": started + 25 * 60, "has_ended": true, "call_family": "huddle" },
     }));
     assert_eq!(huddle.text, "A huddle happened · 25 min");
+}
+
+#[test]
+fn closing_a_direct_or_leaving_a_group_dm_calls_conversations_close_and_drops_the_row() {
+    let world = World::start();
+    world.ready();
+    let dm = alpha("D0ANA");
+    let group = alpha("G0GRP");
+    assert!(world.conversation(&dm).is_some(), "DM starts in the tree");
+    assert!(world.conversation(&group).is_some(), "group DM starts in the tree");
+
+    let closed = world.ask(Request::CloseDirect { conversation: dm.clone() });
+    assert!(matches!(closed, Response::Ok), "CloseDirect should succeed, got {closed:?}");
+    let left = world.ask(Request::Leave { conversation: group.clone() });
+    assert!(matches!(left, Response::Ok), "Leave on group DM should succeed, got {left:?}");
+
+    let calls = world.fake.calls(ALPHA, "conversations.close");
+    let closed_ids: Vec<&str> = calls.iter().filter_map(|call| call.params.get("channel").map(String::as_str)).collect();
+    assert_eq!(closed_ids, ["D0ANA", "G0GRP"]);
+    world.until("closed DM to leave the tree", || world.conversation(&dm).is_none().then_some(()));
+    world.until("left group DM to leave the tree", || world.conversation(&group).is_none().then_some(()));
 }

@@ -590,6 +590,7 @@ impl Slack {
     pub(super) fn left(&self, event: &Value) -> Result<(), Failure> {
         let channel = &event["channel"];
         if let Some(id) = channel.as_str().or(channel["id"].as_str()) {
+            self.forget_partner(id);
             self.ctx.conversation_gone(id)?;
         }
         Ok(())

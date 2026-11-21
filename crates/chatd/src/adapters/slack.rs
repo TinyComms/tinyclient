@@ -1374,6 +1374,9 @@ impl Slack {
                 answer(reply, self.members(&conversation_id, offset, limit));
             }
             Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
+            Command::CloseDirect { conversation_id, reply } | Command::Leave { conversation_id, reply } => {
+                answer(reply, self.close_direct(&conversation_id));
+            }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(Ok(self.download(url)));
             }
@@ -1571,6 +1574,17 @@ impl Slack {
             }
         }
         self.ctx.starred(conversation_id, starred).map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    /// Closes a direct conversation or group DM (`conversations.close`), removes its partner
+    /// from `partners`, and removes the row from the tree.
+    fn close_direct(&self, conversation_id: &str) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        self.api("conversations.close", &[("channel", conversation_id)])?;
+        self.forget_partner(conversation_id);
+        self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
     }
 
     /// A `star_added` or `star_removed` for a conversation. A message star changes nothing here.
