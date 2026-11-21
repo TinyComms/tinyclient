@@ -1411,6 +1411,15 @@ impl Slack {
             Command::BookmarkRemove { conversation_id, bookmark_id, reply } => {
                 answer(reply, self.bookmark_remove(&conversation_id, &bookmark_id))
             }
+            Command::BrowseChannels { query, cursor, limit, reply, .. } => {
+                answer(reply, self.browse_channels(&query, cursor.as_deref(), limit))
+            }
+            Command::PreviewChannel { conversation_id, reply } => {
+                answer(reply, self.preview_channel(&conversation_id))
+            }
+            Command::Join { conversation_id, reply } => {
+                answer(reply, self.join_channel(&conversation_id))
+            }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
@@ -2068,6 +2077,7 @@ fn capabilities() -> protocol::Capabilities {
         mention_spans: false,
         activity_feed: true,
         bookmarks: true,
+        browse_channels: true,
         ..protocol::Capabilities::default()
     }
 }

@@ -227,6 +227,13 @@ pub struct ActivityPage {
     pub cursor: Option<String>,
 }
 
+/// A page of public channels from `BrowseChannels`.
+#[derive(Debug, Clone, Default)]
+pub struct BrowsedPage {
+    pub channels: Vec<protocol::BrowsedChannel>,
+    pub cursor: Option<String>,
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -449,6 +456,24 @@ pub enum Command {
     BookmarkRemove {
         conversation_id: String,
         bookmark_id: String,
+        reply: Reply<()>,
+    },
+    /// Browse public channels in a Space (paged, never fetched whole).
+    BrowseChannels {
+        space_id: String,
+        query: String,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<BrowsedPage>,
+    },
+    /// Preview an unjoined public channel (stores as `joined: false`, `read_only: true`, outside the sidebar).
+    PreviewChannel {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Join a public channel (`conversations.join`).
+    Join {
+        conversation_id: String,
         reply: Reply<()>,
     },
     /// A Space's info, opened from its name.
@@ -680,6 +705,9 @@ impl Command {
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PreviewChannel { reply, .. }
+            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());

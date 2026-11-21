@@ -3498,6 +3498,62 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::BrowseChannels { space, query, cursor, limit } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 50 } else { limit.min(100) };
+                match self.ask(&account, |reply| Command::BrowseChannels {
+                    space_id: space.id,
+                    query,
+                    cursor,
+                    limit,
+                    reply,
+                }) {
+                    Ok(mut page) => {
+                        for ch in &mut page.channels {
+                            clip(&mut ch.name, 120);
+                            clip(&mut ch.topic, 300);
+                        }
+                        Response::BrowsedChannels { channels: page.channels, cursor: page.cursor }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::PreviewChannel { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::PreviewChannel { conversation_id, reply }) {
+                    Ok(()) => match self.hub.store().conversation(&conversation) {
+                        Ok(Some(row)) => Response::Conversation { conversation: self.row(row) },
+                        Ok(None) => error(ErrorCode::NotFound, "no such conversation"),
+                        Err(err) => internal(err),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Join { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::Join { conversation_id, reply }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        match self.hub.store().conversation(&conversation) {
+                            Ok(Some(row)) => Response::Conversation { conversation: self.row(row) },
+                            Ok(None) => Response::Ok,
+                            Err(err) => internal(err),
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

@@ -483,6 +483,22 @@ impl Fake {
                 Some(json!({"ok": true, "team": {"id": id, "name": name, "domain": domain}}))
             }
             "conversations.info" => {
+                if channel == "C0PUB" {
+                    return ok(json!({
+                        "ok": true,
+                        "channel": {
+                            "id": "C0PUB",
+                            "name": "watercooler",
+                            "is_channel": true,
+                            "is_private": false,
+                            "is_member": false,
+                            "num_members": 42,
+                            "topic": {"value": "Casual chat"},
+                            "purpose": {"value": "Watercooler talk"},
+                            "created": 1700000000
+                        }
+                    }));
+                }
                 let listed = self.fixture(token, "users.conversations").unwrap();
                 let known = listed["channels"].as_array().unwrap().iter().find(|known| known["id"] == channel).cloned();
                 known.map(|mut known| {
@@ -507,6 +523,15 @@ impl Fake {
                 })
             }
             "conversations.history" => {
+                if channel == "C0PUB" {
+                    return ok(json!({
+                        "ok": true,
+                        "messages": [
+                            {"type": "message", "user": "U0ANA", "text": "welcome to watercooler", "ts": "1760000950.000100"}
+                        ],
+                        "has_more": false
+                    }));
+                }
                 let page = match (param("oldest"), param("inclusive"), param("latest")) {
                     ("", "true", _) => ".around",
                     ("", _, "") => "",
@@ -618,6 +643,44 @@ impl Fake {
                     list.retain(|b| b["id"] != bid);
                 }
                 Some(json!({"ok": true}))
+            }
+            "conversations.list" => {
+                let cursor = param("cursor");
+                if cursor.is_empty() {
+                    Some(json!({
+                        "ok": true,
+                        "channels": [
+                            {"id": "C0GEN", "name": "general", "is_channel": true, "is_private": false, "is_member": true, "num_members": 12, "purpose": {"value": "Company wide"}},
+                            {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false, "is_member": false, "num_members": 42, "purpose": {"value": "Watercooler talk"}}
+                        ],
+                        "response_metadata": {"next_cursor": "page2"}
+                    }))
+                } else {
+                    Some(json!({
+                        "ok": true,
+                        "channels": [
+                            {"id": "C0DESIGN", "name": "design-crit", "is_channel": true, "is_private": false, "is_member": false, "num_members": 19, "purpose": {"value": "Design critiques"}}
+                        ],
+                        "response_metadata": {"next_cursor": ""}
+                    }))
+                }
+            }
+            "conversations.join" => {
+                if channel.is_empty() {
+                    return refused("channel_not_found");
+                }
+                Some(json!({
+                    "ok": true,
+                    "channel": {
+                        "id": channel,
+                        "name": "watercooler",
+                        "is_channel": true,
+                        "is_private": false,
+                        "is_member": true,
+                        "num_members": 43,
+                        "purpose": {"value": "Watercooler talk"}
+                    }
+                }))
             }
             method => self.fixture(token, method),
         };
@@ -3078,4 +3141,66 @@ fn slack_bookmarks_list_add_edit_remove_and_socket_invalidation() {
     };
     assert_eq!(refreshed.bookmarks.len(), 1);
     assert_eq!(refreshed.bookmarks[0].id, "Bk1");
+}
+
+#[test]
+fn slack_browse_preview_and_join_public_channel() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.browse_channels, "Slack should advertise browse_channels");
+    let space = alpha("T01ALPHA");
+
+    // Page 1 of public channels filtered by query "water".
+    let Response::BrowsedChannels { channels, cursor } = world.ask(Request::BrowseChannels {
+        space: space.clone(),
+        query: "water".into(),
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected BrowsedChannels");
+    };
+    assert_eq!(cursor.as_deref(), Some("page2"));
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].key, alpha("C0PUB"));
+    assert_eq!(channels[0].name, "#watercooler");
+    assert_eq!(channels[0].members, 42);
+    assert!(!channels[0].joined);
+
+    // Page 2 using cursor returns #design-crit.
+    let Response::BrowsedChannels { channels: page2, cursor: cursor2 } = world.ask(Request::BrowseChannels {
+        space: space.clone(),
+        query: String::new(),
+        cursor,
+        limit: 50,
+    }) else {
+        panic!("expected BrowsedChannels");
+    };
+    assert!(cursor2.is_none());
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].name, "#design-crit");
+
+    // Preview #watercooler: recorded as joined=false, read_only=true, outside the sidebar, with history loaded.
+    let pub_key = alpha("C0PUB");
+    let Response::Conversation { conversation: preview } = world.ask(Request::PreviewChannel {
+        conversation: pub_key.clone(),
+    }) else {
+        panic!("expected Conversation");
+    };
+    assert!(!preview.joined);
+    assert!(preview.read_only);
+    assert!(preview.space.is_none(), "previewed channel must stay outside the sidebar");
+    let msgs = world.messages(&pub_key);
+    assert!(msgs.iter().any(|m| m.text == "welcome to watercooler"), "preview must load history");
+
+    // Join #watercooler: calls conversations.join, marks joined=true, and places it in the sidebar tree.
+    let Response::Conversation { conversation: joined } = world.ask(Request::Join {
+        conversation: pub_key.clone(),
+    }) else {
+        panic!("expected Conversation after Join");
+    };
+    assert!(joined.joined);
+    assert!(!joined.read_only);
+    assert_eq!(joined.space.as_deref(), Some("T01ALPHA"));
+    assert_eq!(world.fake.calls(ALPHA, "conversations.join").len(), 1);
 }

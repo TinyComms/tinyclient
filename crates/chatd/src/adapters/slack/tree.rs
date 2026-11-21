@@ -1,9 +1,9 @@
 //! A workspace as a Space: its sidebar as the tree, and the unread state Slack keeps for it.
 
 use super::{fnv, seconds, thread_id, thread_of, Fault, Slack};
-use crate::adapters::{Command, Failure};
+use crate::adapters::{BrowsedPage, Command, Failure};
 use crate::store::{ConversationRow, SpaceRow};
-use protocol::{CallSupport, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
+use protocol::{BrowsedChannel, CallSupport, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -116,6 +116,97 @@ impl Slack {
         row.read_only = ["is_read_only", "is_archived", "is_frozen"].iter().any(|flag| channel[*flag] == true);
         row.rights.pin = !row.read_only;
         Some(row)
+    }
+
+    /// Paged public channel browser (`conversations.list` with `types=public_channel`), never
+    /// fetched whole. Filters the returned page by `query` when non-empty.
+    pub(super) fn browse_channels(&self, query: &str, cursor: Option<&str>, limit: u32) -> Result<BrowsedPage, Fault> {
+        let count = limit.clamp(1, 100).to_string();
+        let mut params = vec![
+            ("types", "public_channel"),
+            ("exclude_archived", "true"),
+            ("limit", count.as_str()),
+        ];
+        if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
+            params.push(("cursor", cursor));
+        }
+        let page = self.api("conversations.list", &params)?;
+        let needle = query.trim().to_lowercase();
+        let mut channels = Vec::new();
+        for ch in page["channels"].as_array().into_iter().flatten() {
+            let Some(id) = ch["id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let raw_name = ch["name"].as_str().or(ch["name_normalized"].as_str()).unwrap_or("");
+            if raw_name.is_empty() {
+                continue;
+            }
+            let name = format!("#{raw_name}");
+            let topic = ch["purpose"]["value"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| ch["topic"]["value"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("")
+                .to_owned();
+            if !needle.is_empty() && !name.to_lowercase().contains(&needle) && !topic.to_lowercase().contains(&needle) {
+                continue;
+            }
+            channels.push(BrowsedChannel {
+                key: self.ctx.key(id),
+                name,
+                topic,
+                members: ch["num_members"].as_u64().unwrap_or(0) as u32,
+                joined: ch["is_member"] == true,
+                private: ch["is_private"] == true,
+            });
+        }
+        let next = page["response_metadata"]["next_cursor"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
+        Ok(BrowsedPage { channels, cursor: next })
+    }
+
+    /// Previews an unjoined public channel: records it as `joined: false`, `read_only: true`,
+    /// outside the sidebar (`space: None`, `group: None`), and fetches one page of history.
+    pub(super) fn preview_channel(&self, channel_id: &str) -> Result<(), Fault> {
+        let info = self.api("conversations.info", &[("channel", channel_id), ("include_num_members", "true")])?;
+        let ch = &info["channel"];
+        let mut row = self.row(ch).ok_or_else(|| Fault::Slack("channel_not_found".to_owned()))?;
+        let is_member = ch["is_member"] == true;
+        if !is_member {
+            row.joined = false;
+            row.read_only = true;
+            row.read_only_reason = "Join this channel to post messages.".to_owned();
+            row.space = None;
+            row.group = None;
+            row.listed = false;
+        }
+        self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+        if let Ok(history) = self.api("conversations.history", &[("channel", channel_id), ("limit", "30")]) {
+            let entries = history["messages"].as_array().map_or(&[][..], Vec::as_slice);
+            self.authors(entries);
+            let messages: Vec<protocol::Message> = entries.iter().filter_map(|e| self.message(channel_id, e)).collect();
+            let _ = self.ctx.history(channel_id, &messages);
+        }
+        Ok(())
+    }
+
+    /// Joins a public channel (`conversations.join`) and places it in the workspace sidebar tree.
+    pub(super) fn join_channel(&self, channel_id: &str) -> Result<(), Fault> {
+        let joined = self.api("conversations.join", &[("channel", channel_id)])?;
+        let ch = &joined["channel"];
+        if let Some(mut row) = self.row(ch) {
+            row.joined = true;
+            self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+        } else {
+            let info = self.api("conversations.info", &[("channel", channel_id)])?;
+            if let Some(mut row) = self.row(&info["channel"]) {
+                row.joined = true;
+                self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     /// A stored row as the row to write again, with nothing lost.

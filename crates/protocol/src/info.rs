@@ -592,6 +592,24 @@ pub struct Capabilities {
     /// This account supports channel bookmarks (`bookmarks.list` / `add` / `edit` / `remove`, Slack).
     #[serde(default, skip_serializing_if = "is_false")]
     pub bookmarks: bool,
+    /// This account supports browsing unjoined public channels, previewing, and joining them (`BrowseChannels`, `PreviewChannel`, `Join`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub browse_channels: bool,
+}
+
+/// One public channel returned by [`crate::Request::BrowseChannels`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowsedChannel {
+    pub key: Key,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub members: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub joined: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub private: bool,
 }
 
 /// What kind of event an [`ActivityItem`] represents.
