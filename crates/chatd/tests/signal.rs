@@ -1262,3 +1262,61 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
         message.poll.as_ref().filter(|poll| poll.closed).map(|_| ())
     });
 }
+
+#[test]
+fn disappearing_messages_carry_timer_and_expire_after_read() {
+    let world = World::linked();
+    world.connected();
+
+    let sent = T0 + 10_000;
+    world.steer(&format!("expiring grace {sent} 2 Secret note"));
+    let arrived = world.arrived(GRACE, &id(sent, GRACE));
+    assert_eq!(arrived.text, "Secret note");
+    // Not read yet, so it has no expiry timestamp yet.
+    assert!(arrived.expires_at.is_none());
+
+    // Sending a reply in this conversation carries the conversation's active expire_timer = 2.
+    let _ = world.send(GRACE, "exp-1", "Got it", None);
+    let reply = world.until("settled outgoing disappearing message", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("exp-1") && m.id != "exp-1")
+    });
+    assert!(reply.expires_at.is_some(), "outgoing disappearing message must have expires_at");
+    world.heard(&format!("send {GRACE} text Got it expire=2"));
+
+    // Reading Grace's message starts its 2-second countdown and removes it from the store.
+    assert_eq!(
+        world.ask(Request::MarkRead {
+            conversation: key(GRACE),
+            message_id: arrived.id.clone(),
+        }),
+        Response::Ok
+    );
+    world.until("expired message to be deleted from store", || {
+        let still_there = world.messages(GRACE).into_iter().any(|m| m.id == arrived.id);
+        (!still_there).then_some(())
+    });
+
+    // Timer updates produce a system row and clear or update the outgoing timer.
+    world.steer("timer grace 60");
+    world.until("timer set system row", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.kind == MessageKind::System && m.text == "Disappearing messages are set to 1 minute")
+    });
+    let _ = world.send(GRACE, "exp-2", "Still disappearing", None);
+    world.heard(&format!("send {GRACE} text Still disappearing expire=60"));
+
+    world.steer("timer grace 0");
+    world.until("timer off system row", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.kind == MessageKind::System && m.text == "Disappearing messages are off")
+    });
+    let _ = world.send(GRACE, "exp-3", "Permanent now", None);
+    world.heard(&format!("send {GRACE} text Permanent now"));
+}

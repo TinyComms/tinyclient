@@ -80,6 +80,15 @@ pub struct GroupInfo {
     pub member: bool,
     /// Account ids of the members, including us. Empty when the wire has not said who.
     pub member_ids: Vec<String>,
+    /// Disappearing-message timer in seconds. 0 means off.
+    pub timer_secs: u32,
+}
+
+/// Disappearing-message timer carried on a conversation or outgoing message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timer {
+    pub seconds: u32,
+    pub version: u32,
 }
 
 /// The earlier message a message answers.
@@ -108,6 +117,10 @@ pub struct Text {
     pub spans: Vec<Span>,
     /// What it carries that is not text and is not drawn here ("Photo", "Sticker"), in words.
     pub unsupported: Option<String>,
+    /// Disappearing-message timer in seconds carried on this message. 0 means off.
+    pub expire_timer: u32,
+    /// Timer version carried on this message. 0 when unset.
+    pub expire_timer_version: u32,
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -214,6 +227,8 @@ pub enum Event {
     CallEnded { id: u64, answered: bool },
     /// The user's own settings, as the phone shares them.
     Settings { read_receipts: bool, typing: bool },
+    /// A conversation's disappearing-messages timer changed (0 turns it off).
+    TimerChanged { peer: Peer, seconds: u32, version: u32 },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -239,17 +254,17 @@ pub struct File {
 /// What is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    Text { text: String, quote: Option<Quote>, ranges: Vec<Range> },
+    Text { text: String, quote: Option<Quote>, ranges: Vec<Range>, timer: Timer },
     /// Files, with the caption in `text` (empty when there is none).
-    Files { text: String, quote: Option<Quote>, files: Vec<File> },
+    Files { text: String, quote: Option<Quote>, files: Vec<File>, timer: Timer },
     React { author: String, target: u64, emoji: String, remove: bool },
-    Edit { target: u64, text: String, ranges: Vec<Range> },
+    Edit { target: u64, text: String, ranges: Vec<Range>, timer: Timer },
     /// Delete for everyone.
     Delete { target: u64 },
     /// Delete for me: the user's other devices drop this message, and nobody else is told.
     DeleteForMe { author: String, target: u64 },
     /// Start a poll. `options` has 2 to 10 choices.
-    Poll { question: String, options: Vec<String>, multiple: bool },
+    Poll { question: String, options: Vec<String>, multiple: bool, timer: Timer },
     /// Vote, or take a vote back when `indexes` is empty. `serial` increments each time we vote.
     PollVote { author: String, target: u64, indexes: Vec<u32>, serial: u32 },
     /// End our own poll.

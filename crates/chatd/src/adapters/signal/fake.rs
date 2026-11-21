@@ -114,6 +114,7 @@ impl Fake {
             members: 3,
             member: true,
             member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+            timer_secs: 0,
         };
         let _ = events.send(Event::Groups(vec![club]));
         let _ = events.send(Event::Settings { read_receipts: true, typing: true });
@@ -188,6 +189,34 @@ fn steer(line: &str) -> Vec<Event> {
     let club = || Peer::Group(CLUB.to_owned());
     let rest = |line: &str, skip: usize| line.split_whitespace().skip(skip).collect::<Vec<_>>().join(" ");
     match command {
+        "timer" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let seconds = next().parse().unwrap_or(0);
+            vec![Event::TimerChanged {
+                peer: direct(author),
+                seconds,
+                version: u32::from(seconds > 0),
+            }]
+        }
+        "expiring" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let secs = next().parse().unwrap_or(0);
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                text: rest(line, 4),
+                expire_timer: secs,
+                expire_timer_version: u32::from(secs > 0),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
         "incoming" | "group" | "mention" | "photo" | "quote" | "payment" | "giftbadge" | "viewonce" | "viewonce-video" | "longtext" => {
             let Some((author, name)) = who(next()) else {
                 return Vec::new();
@@ -408,20 +437,23 @@ impl Wire for Fake {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Fault::Net("closed".into()));
         }
+        let exp = |timer: super::wire::Timer| {
+            if timer.seconds > 0 { format!(" expire={}", timer.seconds) } else { String::new() }
+        };
         let line = match &body {
-            Body::Text { text, quote: Some(quote), ranges } => {
-                format!("send {} text {text}{} (answering {}-{})", describe(to), noted(ranges), quote.sent, quote.author)
+            Body::Text { text, quote: Some(quote), ranges, timer } => {
+                format!("send {} text {text}{}{} (answering {}-{})", describe(to), noted(ranges), exp(*timer), quote.sent, quote.author)
             }
-            Body::Text { text, quote: None, ranges } => format!("send {} text {text}{}", describe(to), noted(ranges)),
-            Body::Files { text, quote, files } => {
+            Body::Text { text, quote: None, ranges, timer } => format!("send {} text {text}{}{}", describe(to), noted(ranges), exp(*timer)),
+            Body::Files { text, quote, files, timer } => {
                 let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
-                super::files::call_line(&describe(to), &names, text, quote.as_ref())
+                format!("{}{}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), exp(*timer))
             }
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
-            Body::Edit { target, text, ranges } => format!("send {} edit {target} {text}{}", describe(to), noted(ranges)),
+            Body::Edit { target, text, ranges, timer } => format!("send {} edit {target} {text}{}{}", describe(to), noted(ranges), exp(*timer)),
             Body::Delete { target } => format!("send {} delete {target}", describe(to)),
             Body::DeleteForMe { target, .. } => format!("send {} delete-for-me {target}", describe(to)),
-            Body::Poll { question, options, multiple } => format!("send {} poll {question} | {} multi={multiple}", describe(to), options.join(" | ")),
+            Body::Poll { question, options, multiple, timer } => format!("send {} poll {question} | {} multi={multiple}{}", describe(to), options.join(" | "), exp(*timer)),
             Body::PollVote { author, target, indexes, serial } => {
                 let picked = if indexes.is_empty() { "-".to_owned() } else { indexes.iter().map(|index| index.to_string()).collect::<Vec<_>>().join(",") };
                 format!("send {} vote {target}-{author} {picked} serial={serial}", describe(to))
