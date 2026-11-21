@@ -2252,6 +2252,9 @@ impl Shell {
         for pane in state.pane.get().into_iter().chain(state.thread.borrow().as_ref()) {
             pane.update(cx, |pane, cx| pane.changed(change, cx));
         }
+        if let Some(board) = state.forum.get() {
+            board.update(cx, |board, cx| board.media_changed(change, cx));
+        }
     }
 
     /// chatd no longer knows what changed: everything held is read again.
