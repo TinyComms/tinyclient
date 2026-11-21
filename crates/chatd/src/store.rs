@@ -2364,6 +2364,16 @@ impl Store {
             if filters.mentions_me && !msg.mentions_me {
                 continue;
             }
+            if let Some(in_ch) = &filters.in_channel {
+                if hit.conversation.id != in_ch.id {
+                    continue;
+                }
+            }
+            if let Some(pinned) = filters.pinned {
+                if msg.pinned != pinned {
+                    continue;
+                }
+            }
             if let Some(has) = filters.has {
                 let ok = match has {
                     protocol::SearchHas::Files => !msg.attachments.is_empty(),
@@ -2371,6 +2381,17 @@ impl Store {
                         .attachments
                         .iter()
                         .any(|a| matches!(a.file.kind, protocol::MediaKind::Image | protocol::MediaKind::Gif)),
+                    protocol::SearchHas::Videos => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Video)),
+                    protocol::SearchHas::Sounds => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Audio)),
+                    protocol::SearchHas::Stickers => msg.attachments.iter().any(|a| a.sticker),
+                    protocol::SearchHas::Embeds => !msg.previews.is_empty(),
+                    protocol::SearchHas::Polls => msg.poll.is_some(),
                     protocol::SearchHas::Links => {
                         !msg.previews.is_empty()
                             || msg.text.contains("http://")

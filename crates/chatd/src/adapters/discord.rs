@@ -402,6 +402,8 @@ struct Discord {
     /// This account's message searches: one in flight at a time, paced from when the last
     /// finished, with recent answers kept in memory.
     message_search: Mutex<info::MessageSearch>,
+    /// Serialises queued message searches per account so rapid Enters wait their turn.
+    search_turn: Mutex<()>,
     /// One Go Live request at a time, so a stop cannot land before the start it was meant to end.
     stream_gate: Mutex<()>,
 }
@@ -448,6 +450,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         refused_sessions: Mutex::new((0, String::new())),
         held: AtomicBool::new(false),
         message_search: Mutex::new(info::MessageSearch::default()),
+        search_turn: Mutex::new(()),
         stream_gate: Mutex::new(()),
     });
     let socket = discord.clone();
@@ -482,10 +485,10 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             // A search can wait on Discord's tight search limits: it runs on a thread of its
             // own, so the sends and reactions behind it are not held up, and one queued past
             // the shell's patience does not ask at all.
-            Command::Search { query, scope, at, reply, .. } => {
+            Command::Search { query, scope, filters, cursor, at, reply } => {
                 discord.asked();
                 if at.elapsed() < SEARCH_PATIENCE {
-                    Discord::search_queued(&discord, query, scope, at, reply);
+                    Discord::search_queued(&discord, query, scope, filters, cursor, at, reply);
                 } else {
                     drop(reply);
                 }

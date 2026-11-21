@@ -257,6 +257,20 @@ pub struct ReactorsPage {
     pub more: bool,
 }
 
+/// One page of network message search results (`Command::Search`).
+#[derive(Debug, Clone, Default)]
+pub struct SearchPage {
+    pub hits: Vec<MessageHit>,
+    pub cursor: Option<String>,
+    pub total: Option<u32>,
+}
+
+impl From<Vec<MessageHit>> for SearchPage {
+    fn from(hits: Vec<MessageHit>) -> Self {
+        Self { hits, cursor: None, total: None }
+    }
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -795,7 +809,7 @@ pub enum Command {
         filters: protocol::SearchFilters,
         cursor: Option<String>,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<SearchPage>,
     },
     /// The shell asked for these files and the media cache knows none of them, or knows them
     /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches

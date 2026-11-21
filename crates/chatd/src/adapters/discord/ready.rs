@@ -803,6 +803,7 @@ impl Discord {
             gifs: true,
             stickers: true,
             search: true,
+            search_global: true,
             custom_emoji: emoji,
             silent: true,
             schedule: false,

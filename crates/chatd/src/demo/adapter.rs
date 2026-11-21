@@ -832,6 +832,7 @@ impl Demo {
                     .hub
                     .store()
                     .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
+                    .map(crate::adapters::SearchPage::from)
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }

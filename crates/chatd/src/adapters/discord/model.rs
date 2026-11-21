@@ -65,6 +65,17 @@ pub fn seconds(id: &str) -> i64 {
     (((id >> 22) + 1_420_070_400_000) / 1000) as i64
 }
 
+/// Lowest Discord snowflake for a Unix timestamp in seconds, clamped to Discord's 2015 epoch.
+pub fn snowflake_from_unix(unix_secs: i64) -> u64 {
+    const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
+    let ms = unix_secs.saturating_mul(1000).saturating_sub(DISCORD_EPOCH_MS);
+    if ms <= 0 {
+        0
+    } else {
+        (ms as u64) << 22
+    }
+}
+
 pub fn number(id: &str) -> u64 {
     id.parse().unwrap_or(0)
 }

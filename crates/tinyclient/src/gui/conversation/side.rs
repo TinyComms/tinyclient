@@ -85,6 +85,8 @@ pub struct SearchPage {
     pub filters: protocol::SearchFilters,
     /// Cursor for "Load more" network results.
     pub network_cursor: Option<String>,
+    /// Total hits reported by the network for the current search, when known.
+    pub network_total: Option<u32>,
     /// Connected networks that could not be asked during an everywhere search.
     pub not_searched: Vec<Network>,
 }
@@ -95,20 +97,21 @@ pub struct NetworkFound {
     pub result: Result<Vec<MessageHit>, String>,
 }
 
-/// How far a search asks: the conversation open now, its Space, or the whole cache.
+/// How far a search asks: the conversation open now, its Space, all DMs (Discord), or everywhere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
     #[default]
     Everywhere,
     Conversation,
     Space,
+    AllDms,
 }
 
 /// Whether the pane's Enter asks this account's network itself: the account's capabilities say
 /// it searches, and the scope is one the network takes. Slack and Discord search a Space or
-/// one conversation, Telegram only one conversation. Everywhere is the cache alone.
+/// one conversation, Discord also searches all DMs, Telegram searches one conversation or global.
 fn network_searches(can: &Capabilities, network: Network, scope: Scope) -> bool {
-    if scope == Scope::Everywhere {
+    if scope == Scope::Everywhere || scope == Scope::AllDms {
         return can.search_global;
     }
     if !can.search {
@@ -128,6 +131,7 @@ impl Scope {
             (Scope::Conversation, _) => "This conversation",
             (Scope::Space, Some(Network::Discord)) => "This server",
             (Scope::Space, _) => "This space",
+            (Scope::AllDms, _) => "All DMs",
             (Scope::Everywhere, _) => "Everywhere",
         }
     }
@@ -178,6 +182,23 @@ impl SearchPage {
     /// said it.
     fn listed(&self) -> Vec<(&MessageHit, bool)> {
         let cache = self.hits.as_deref().unwrap_or_default();
+        if self.filters.sort == protocol::SearchSort::Relevant {
+            let mut listed: Vec<(&MessageHit, bool)> = Vec::new();
+            let mut seen: std::collections::HashSet<(&Key, &str)> = std::collections::HashSet::new();
+            if let Some(Ok(found)) = self.network.as_ref().map(|found| &found.result) {
+                for hit in found {
+                    if seen.insert((&hit.conversation, hit.message_id.as_str())) {
+                        listed.push((hit, false));
+                    }
+                }
+            }
+            for hit in cache {
+                if seen.insert((&hit.conversation, hit.message_id.as_str())) {
+                    listed.push((hit, true));
+                }
+            }
+            return listed;
+        }
         let mut listed: Vec<(&MessageHit, bool)> = cache.iter().map(|hit| (hit, true)).collect();
         if let Some(Ok(found)) = self.network.as_ref().map(|found| &found.result) {
             let seen: std::collections::HashSet<(&Key, &str)> =
@@ -189,7 +210,12 @@ impl SearchPage {
                     .map(|hit| (hit, false)),
             );
         }
-        listed.sort_by_key(|(hit, _)| std::cmp::Reverse(hit.sent));
+        match self.filters.sort {
+            protocol::SearchSort::Oldest => listed.sort_by_key(|(hit, _)| hit.sent),
+            protocol::SearchSort::Newest | protocol::SearchSort::Relevant => {
+                listed.sort_by_key(|(hit, _)| std::cmp::Reverse(hit.sent));
+            }
+        }
         listed
     }
 
@@ -199,6 +225,7 @@ impl SearchPage {
         self.network_asked_for = None;
         self.network_asked = 0;
         self.network_cursor = None;
+        self.network_total = None;
         self.not_searched.clear();
     }
 
@@ -879,6 +906,65 @@ impl Shell {
         cx.notify();
     }
 
+    fn toggle_search_pinned(&mut self, cx: &mut Context<Self>) {
+        if let Some(page) = self.conversation_state.side.search.as_mut() {
+            page.filters.pinned = if page.filters.pinned == Some(true) { None } else { Some(true) };
+            page.reset_network();
+        }
+        cx.notify();
+    }
+
+    fn set_search_sort(&mut self, sort: protocol::SearchSort, cx: &mut Context<Self>) {
+        let was_searched = if let Some(page) = self.conversation_state.side.search.as_mut() {
+            if page.filters.sort == sort {
+                return;
+            }
+            let had = page.network.is_some();
+            page.filters.sort = sort;
+            page.reset_network();
+            had
+        } else {
+            return;
+        };
+        if was_searched {
+            self.ask_network(None, cx);
+        }
+        cx.notify();
+    }
+
+    /// Channels and people visible for the active account, used for search token completion and parsing.
+    fn search_lookup_lists(&self, account: Option<&protocol::AccountKey>) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        let mut channels: Vec<(String, String)> = Vec::new();
+        let mut seen_ch = std::collections::HashSet::new();
+        let all_rows = self
+            .held_rows()
+            .chain(self.trees.values().flat_map(|tree| tree.conversations.iter()));
+        for row in all_rows {
+            if account.is_some_and(|a| row.key.account() != *a) {
+                continue;
+            }
+            if matches!(row.kind, ConversationKind::Channel | ConversationKind::Forum | ConversationKind::Thread)
+                && seen_ch.insert(row.key.id.clone())
+            {
+                channels.push((row.title.clone(), row.key.id.clone()));
+            }
+        }
+        let mut people: Vec<(String, String)> = Vec::new();
+        let mut seen_p = std::collections::HashSet::new();
+        for row in self.held_rows() {
+            if account.is_some_and(|a| row.key.account() != *a) {
+                continue;
+            }
+            if row.kind == ConversationKind::Direct {
+                let id = row.peer.clone().unwrap_or_default();
+                if !id.is_empty() && seen_p.insert(id.clone()) {
+                    people.push((row.title.clone(), id));
+                }
+            }
+        }
+        (channels, people)
+    }
+
     fn apply_search_suggestion(&mut self, insert: &str, cx: &mut Context<Self>) {
         let next = {
             let Some(page) = self.conversation_state.side.search.as_mut() else {
@@ -896,22 +982,15 @@ impl Shell {
         cx.notify();
     }
 
-    /// Asks the network itself for the page's words: a Space's own search, one conversation's, or
-    /// everywhere across connected accounts that support global search.
+    /// Asks the network itself for the page's words: a Space's own search, one conversation's,
+    /// all Discord DMs, or everywhere across connected accounts that support global search.
     fn ask_network(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
         let Some(page) = self.conversation_state.side.search.as_ref() else {
             return;
         };
-        let (words, scope, filters) = (page.words.clone(), page.scope, page.filters.clone());
-        let trimmed: String = words.trim().chars().take(1024).collect();
-        if trimmed.is_empty() && filters.is_empty() {
-            return;
-        }
-        let load_more = cursor.is_some();
-        if !load_more && page.network_asked_for.as_deref() == Some(trimmed.as_str()) {
-            return;
-        }
-        let (conversation, space, where_at) = match scope {
+        let (words, scope, base_filters) = (page.words.clone(), page.scope, page.filters.clone());
+        let raw: String = words.trim().chars().take(1024).collect();
+        let (conversation, space, account_scope, where_at) = match scope {
             Scope::Conversation => {
                 let Some(open) = self.snapshot.as_ref().and_then(|s| s.open.as_ref()) else {
                     return;
@@ -919,7 +998,7 @@ impl Shell {
                 let key = open.key.clone();
                 let name = if open.title.is_empty() { key.id.clone() } else { open.title.clone() };
                 let where_at = format!("{} · {}", key.network.label(), name);
-                (Some(key), None, where_at)
+                (Some(key), None, None, where_at)
             }
             Scope::Space => {
                 let Some((key, Some(space))) = self.open_with_space() else {
@@ -932,16 +1011,42 @@ impl Shell {
                     .map_or_else(String::new, |known| known.name.clone());
                 let where_at = format!("{} · {}", key.network.label(), if known.is_empty() { space.clone() } else { known });
                 let space = Key { network: key.network, account: key.account.clone(), id: space };
-                (None, Some(space), where_at)
+                (None, Some(space), None, where_at)
             }
-            Scope::Everywhere => (None, None, "connected networks".to_owned()),
+            Scope::AllDms => {
+                let Some(key) = self.open_key().cloned() else {
+                    return;
+                };
+                let where_at = format!("{} · All DMs", key.network.label());
+                (None, None, Some(key.account()), where_at)
+            }
+            Scope::Everywhere => (None, None, None, "connected networks".to_owned()),
         };
+        let target_account = conversation
+            .as_ref()
+            .map(Key::account)
+            .or_else(|| space.as_ref().map(Key::account))
+            .or_else(|| account_scope.clone());
+        let (channels, people) = self.search_lookup_lists(target_account.as_ref());
+        let parse_tokens = target_account.as_ref().is_none_or(|a| a.network != Network::Slack);
+        let (trimmed, filters) = if parse_tokens {
+            parse_search_query(&raw, &base_filters, target_account.as_ref(), &channels, &people, now())
+        } else {
+            (raw.clone(), base_filters)
+        };
+        if trimmed.is_empty() && filters.is_empty() {
+            return;
+        }
+        let load_more = cursor.is_some();
+        if !load_more && page.network_asked_for.as_deref() == Some(raw.as_str()) {
+            return;
+        }
         let asked = {
             let side = &mut self.conversation_state.side;
             side.search_asks += 1;
             if let Some(page) = side.search.as_mut() {
                 page.network_asked = side.search_asks;
-                page.network_asked_for = Some(trimmed.clone());
+                page.network_asked_for = Some(raw.clone());
                 page.network_asking = Some(where_at.clone());
             }
             side.search_asks
@@ -950,7 +1055,7 @@ impl Shell {
         let request = Request::SearchNetwork {
             conversation,
             space,
-            account: None,
+            account: account_scope,
             network: None,
             query: trimmed,
             filters,
@@ -965,8 +1070,11 @@ impl Shell {
                 };
                 page.network_asking = None;
                 match answer {
-                    Ok(Response::MessageHits { hits, cursor, not_searched }) => {
+                    Ok(Response::MessageHits { hits, cursor, not_searched, total }) => {
                         page.network_cursor = cursor;
+                        if total.is_some() || !load_more {
+                            page.network_total = total;
+                        }
                         if !not_searched.is_empty() || !load_more {
                             page.not_searched = not_searched;
                         }
@@ -1381,10 +1489,11 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
     let network = open.as_ref().map(|(key, _)| key.network);
     let in_space = open.as_ref().and_then(|(_, space)| space.as_deref()).is_some();
     let mut chips = div().flex_none().px(px(8.)).pt(px(8.)).pb(px(2.)).flex().flex_wrap().gap(px(6.));
-    for candidate in [Scope::Conversation, Scope::Space, Scope::Everywhere] {
+    for candidate in [Scope::Conversation, Scope::Space, Scope::AllDms, Scope::Everywhere] {
         let available = match candidate {
             Scope::Conversation => open.is_some(),
             Scope::Space => in_space,
+            Scope::AllDms => network == Some(Network::Discord),
             Scope::Everywhere => true,
         };
         if !available {
@@ -1409,26 +1518,34 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         );
     }
     // What the network said on Enter: a line that names what is being searched, what was
-    // searched, or its word for why nothing came.
+    // searched (with total count when the network gives one), or its word for why nothing came.
     let said = if let Some(where_at) = &page.network_asking {
-        Some(format!("Asking {where_at}…"))
+        Some(format!("Searching {where_at}…"))
     } else {
         page.network.as_ref().map(|found| match &found.result {
-            Ok(_) => format!("Searched {}.", found.where_at),
+            Ok(_) => match page.network_total {
+                Some(total) => format!(
+                    "Searched {} · {} result{}",
+                    found.where_at,
+                    total,
+                    if total == 1 { "" } else { "s" }
+                ),
+                None => format!("Searched {}.", found.where_at),
+            },
             Err(why) => why.clone(),
         })
     };
     let listed = page.listed();
-    let body = if page.words.trim().is_empty() {
+    let body = if page.words.trim().is_empty() && page.filters.is_empty() {
         empty_state("icons/search.svg", "Search the cache.", "What was said in what tinyclient has read.").into_any_element()
     } else if page.failed {
         empty_state("icons/search.svg", "tinyclient isn't answering.", "The cache could not be asked. Try again in a moment.")
             .into_any_element()
-    } else if page.hits.is_none() {
+    } else if page.hits.is_none() && page.network.is_none() && page.network_asking.is_none() {
         empty_state("icons/search.svg", "Asking the cache…", "The hits land here as they are read.").into_any_element()
     } else if listed.is_empty() {
         let why = if page.network_asking.is_some() {
-            "Waiting for the network's answer."
+            "Searching…"
         } else {
             match page.network.as_ref().map(|found| &found.result) {
                 Some(Ok(_)) => "The network found nothing here.",
@@ -1501,6 +1618,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
     for (id, label, has) in [
         ("sf-files", "Has file", protocol::SearchHas::Files),
         ("sf-images", "Has image", protocol::SearchHas::Images),
+        ("sf-videos", "Has video", protocol::SearchHas::Videos),
         ("sf-links", "Has link", protocol::SearchHas::Links),
     ] {
         let on = page.filters.has == Some(has);
@@ -1538,32 +1656,71 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
             .on_click(cx.listener(|this, _, _, cx| this.toggle_search_mentions_me(cx)))
             .child("Mentions me"),
     );
+    let pinned_on = page.filters.pinned == Some(true);
+    filter_chips = filter_chips.child(
+        div()
+            .id("sf-pinned")
+            .px(px(8.))
+            .h(px(22.))
+            .rounded(px(theme::R_CONTROL))
+            .flex()
+            .items_center()
+            .type_micro()
+            .cursor_pointer()
+            .text_color(if pinned_on { theme::on_accent() } else { theme::text_faint() })
+            .bg(if pinned_on { theme::accent() } else { theme::raised() })
+            .hover(|s| if pinned_on { s } else { s.bg(theme::hover()) })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_search_pinned(cx)))
+            .child("Pinned"),
+    );
 
-    let is_slack_search = shell.open_key().is_some_and(|k| k.network == Network::Slack);
-    let slack_suggestions = if is_slack_search {
+    let mut sort_row = div().flex_none().px(px(8.)).pb(px(4.)).flex().items_center().gap(px(4.));
+    sort_row = sort_row.child(div().type_micro().text_color(theme::text_faint()).child("Sort:"));
+    for (id, label, sort) in [
+        ("sf-sort-newest", "Newest", protocol::SearchSort::Newest),
+        ("sf-sort-oldest", "Oldest", protocol::SearchSort::Oldest),
+        ("sf-sort-relevant", "Relevant", protocol::SearchSort::Relevant),
+    ] {
+        let on = page.filters.sort == sort;
+        sort_row = sort_row.child(
+            div()
+                .id(id)
+                .px(px(7.))
+                .h(px(20.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .type_micro()
+                .cursor_pointer()
+                .text_color(if on { theme::text() } else { theme::text_faint() })
+                .when(on, |chip| chip.bg(theme::selected()))
+                .hover(|s| if on { s } else { s.bg(theme::hover()) })
+                .on_click(cx.listener(move |this, _, _, cx| this.set_search_sort(sort, cx)))
+                .child(label),
+        );
+    }
+
+    let open_network = shell.open_key().map(|k| k.network);
+    let modifier_suggestions = if matches!(open_network, Some(Network::Slack | Network::Discord)) {
         let account = shell.open_key().map(|k| k.account());
-        let channels: Vec<String> = shell
-            .held_rows()
-            .filter(|r| account.as_ref().is_none_or(|a| r.key.account() == *a))
-            .filter(|r| r.title.starts_with('#'))
-            .map(|r| r.title.clone())
-            .take(30)
-            .collect();
-        let people: Vec<(String, String)> = shell
-            .held_rows()
-            .filter(|r| account.as_ref().is_none_or(|a| r.key.account() == *a))
-            .filter(|r| r.kind == ConversationKind::Direct)
-            .map(|r| (r.title.clone(), r.peer.clone().unwrap_or_default()))
-            .take(30)
-            .collect();
-        let items = slack_search_completions(&page.words, &channels, &people);
+        let (channels_pairs, people) = shell.search_lookup_lists(account.as_ref());
+        let items = if open_network == Some(Network::Discord) {
+            discord_search_completions(&page.words, &channels_pairs, &people)
+        } else {
+            let channels: Vec<String> = channels_pairs
+                .into_iter()
+                .map(|(name, _)| if name.starts_with('#') { name } else { format!("#{name}") })
+                .take(30)
+                .collect();
+            slack_search_completions(&page.words, &channels, &people)
+        };
         (!items.is_empty()).then(|| {
             let mut row = div().flex_none().px(px(8.)).pb(px(4.)).flex().flex_wrap().gap(px(4.));
             for (six, item) in items.into_iter().take(6).enumerate() {
                 let insert = item.insert.clone();
                 row = row.child(
                     div()
-                        .id(("sf-slack-comp", six))
+                        .id(("sf-mod-comp", six))
                         .px(px(7.))
                         .h(px(20.))
                         .rounded(px(theme::R_CHIP))
@@ -1636,7 +1793,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                 key.network == Network::Tiny
                     && shell.held_rows().any(|r| r.key.account() == key.account() && is_e2ee(r.encryption))
             }),
-            Scope::Everywhere => false,
+            Scope::Everywhere | Scope::AllDms => false,
         };
     div()
         .size_full()
@@ -1646,7 +1803,8 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         .child(head)
         .child(chips)
         .child(filter_chips)
-        .children(slack_suggestions)
+        .child(sort_row)
+        .children(modifier_suggestions)
         .children(said.map(|line| div().flex_none().px(px(12.)).pb(px(4.)).type_small().text_color(theme::text_soft()).child(line)))
         .child(body)
         .children(load_more)
@@ -1899,6 +2057,276 @@ pub fn apply_search_completion(query: &str, insert: &str) -> String {
     }
 }
 
+/// Computes Discord search modifier completion suggestions (`from:`, `mentions:`, `in:`, `has:`,
+/// `before:`, `after:`, `during:`, `pinned:`, `authorType:`) for the active trailing token.
+pub fn discord_search_completions(
+    query: &str,
+    channels: &[(String, String)],
+    people: &[(String, String)],
+) -> Vec<SearchSuggestion> {
+    let trailing_space = query.ends_with(char::is_whitespace);
+    let active = if trailing_space {
+        ""
+    } else {
+        query.split_whitespace().last().unwrap_or("")
+    };
+    let lower = active.to_ascii_lowercase();
+    let mut out = Vec::new();
+    if let Some(rest) = lower.strip_prefix("in:") {
+        let needle = rest.trim_start_matches('#');
+        for (name, _) in channels {
+            let bare = name.trim_start_matches('#');
+            if needle.is_empty() || bare.to_ascii_lowercase().contains(needle) {
+                let value = format!("in:#{bare}");
+                out.push(SearchSuggestion { label: value.clone(), insert: value });
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = lower.strip_prefix("from:").or_else(|| lower.strip_prefix("mentions:")) {
+        let prefix = if lower.starts_with("from:") { "from:" } else { "mentions:" };
+        let needle = rest.trim_start_matches('@');
+        for (name, id) in people {
+            let handle = name.trim().trim_start_matches('@');
+            if needle.is_empty()
+                || handle.to_ascii_lowercase().contains(needle)
+                || id.to_ascii_lowercase().starts_with(needle)
+            {
+                let value = format!("{prefix}{}", if id.is_empty() { handle } else { id });
+                out.push(SearchSuggestion {
+                    label: format!("{prefix}@{handle}"),
+                    insert: value,
+                });
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = lower.strip_prefix("has:") {
+        for kind in ["link", "embed", "file", "image", "video", "sound", "sticker", "poll"] {
+            if rest.is_empty() || kind.starts_with(rest) {
+                let value = format!("has:{kind}");
+                out.push(SearchSuggestion { label: value.clone(), insert: value });
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = lower.strip_prefix("pinned:") {
+        for val in ["true", "false"] {
+            if rest.is_empty() || val.starts_with(rest) {
+                let value = format!("pinned:{val}");
+                out.push(SearchSuggestion { label: value.clone(), insert: value });
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = lower.strip_prefix("authortype:") {
+        for val in ["user", "bot", "webhook"] {
+            if rest.is_empty() || val.starts_with(rest) {
+                let value = format!("authorType:{val}");
+                out.push(SearchSuggestion { label: value.clone(), insert: value });
+            }
+        }
+        return out;
+    }
+    for date_prefix in ["before:", "after:", "during:"] {
+        if let Some(rest) = lower.strip_prefix(date_prefix) {
+            for preset in ["today", "yesterday", "this-week", "this-month"] {
+                if rest.is_empty() || preset.starts_with(rest) {
+                    let value = format!("{date_prefix}{preset}");
+                    out.push(SearchSuggestion { label: value.clone(), insert: value });
+                }
+            }
+            return out;
+        }
+    }
+    for (label, insert) in [
+        ("from:", "from:"),
+        ("mentions:", "mentions:"),
+        ("in:", "in:"),
+        ("has:", "has:"),
+        ("before:", "before:"),
+        ("after:", "after:"),
+        ("during:", "during:"),
+        ("pinned:true", "pinned:true"),
+        ("authorType:", "authorType:"),
+    ] {
+        if lower.is_empty() || label.to_ascii_lowercase().starts_with(&lower) {
+            out.push(SearchSuggestion { label: label.to_owned(), insert: insert.to_owned() });
+        }
+    }
+    out
+}
+
+/// Converts a civil UTC date `(year, month 1..=12, day 1..=31)` to Unix seconds at 00:00:00 UTC.
+fn ymd_to_unix(y: i64, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || !(1970..=2999).contains(&y) {
+        return None;
+    }
+    let (y_adj, m_adj) = if m <= 2 { (y - 1, m as i64 + 9) } else { (y, m as i64 - 3) };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj.rem_euclid(400);
+    let doy = (153 * m_adj + 2) / 5 + (d as i64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400)
+}
+
+/// Parses a search date value (`YYYY-MM-DD`, `today`, `yesterday`, `this-week`, `this-month`) into
+/// a `(start_unix, end_unix)` UTC range.
+fn parse_date_range(value: &str, now_unix: i64) -> Option<(i64, i64)> {
+    const DAY: i64 = 86_400;
+    let day_start = now_unix.div_euclid(DAY) * DAY;
+    match value.to_ascii_lowercase().as_str() {
+        "today" => Some((day_start, day_start + DAY)),
+        "yesterday" => Some((day_start - DAY, day_start)),
+        "this-week" => Some((day_start - 6 * DAY, day_start + DAY)),
+        "this-month" => Some((day_start - 29 * DAY, day_start + DAY)),
+        other => {
+            let mut parts = other.split('-');
+            let y: i64 = parts.next()?.parse().ok()?;
+            let m: u32 = parts.next()?.parse().ok()?;
+            let d: u32 = parts.next()?.parse().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            let start = ymd_to_unix(y, m, d)?;
+            Some((start, start + DAY))
+        }
+    }
+}
+
+/// Parses inline `key:value` filter tokens (`from:`, `mentions:`, `in:`, `has:`, `before:`,
+/// `after:`, `during:`, `pinned:`, `authorType:`) out of a search string into structured
+/// [`protocol::SearchFilters`], returning the remaining free-text query and merged filters.
+pub fn parse_search_query(
+    raw: &str,
+    base: &protocol::SearchFilters,
+    account: Option<&protocol::AccountKey>,
+    channels: &[(String, String)],
+    people: &[(String, String)],
+    now_unix: i64,
+) -> (String, protocol::SearchFilters) {
+    let mut filters = base.clone();
+    let mut words: Vec<&str> = Vec::new();
+    let resolve_person = |val: &str| -> Option<Key> {
+        let acct = account?;
+        let cleaned = val.trim_start_matches("<@").trim_end_matches('>').trim_start_matches('@');
+        if cleaned.is_empty() {
+            return None;
+        }
+        if cleaned.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(Key::new(acct, cleaned));
+        }
+        let needle = cleaned.to_ascii_lowercase();
+        people
+            .iter()
+            .find(|(name, id)| {
+                name.trim().trim_start_matches('@').eq_ignore_ascii_case(&needle)
+                    || id.eq_ignore_ascii_case(&needle)
+            })
+            .filter(|(_, id)| !id.is_empty())
+            .map(|(_, id)| Key::new(acct, id))
+    };
+    let resolve_channel = |val: &str| -> Option<Key> {
+        let acct = account?;
+        let cleaned = val.trim_start_matches("<#").trim_end_matches('>').trim_start_matches('#');
+        if cleaned.is_empty() {
+            return None;
+        }
+        if cleaned.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(Key::new(acct, cleaned));
+        }
+        let needle = cleaned.to_ascii_lowercase();
+        channels
+            .iter()
+            .find(|(name, id)| {
+                name.trim().trim_start_matches('#').eq_ignore_ascii_case(&needle)
+                    || id.eq_ignore_ascii_case(&needle)
+            })
+            .map(|(_, id)| Key::new(acct, id))
+    };
+
+    for token in raw.split_whitespace() {
+        let Some((k, v)) = token.split_once(':') else {
+            words.push(token);
+            continue;
+        };
+        if v.is_empty() {
+            words.push(token);
+            continue;
+        }
+        match k.to_ascii_lowercase().as_str() {
+            "from" => {
+                if let Some(key) = resolve_person(v) {
+                    filters.from = Some(key);
+                } else {
+                    words.push(token);
+                }
+            }
+            "mentions" => {
+                if v.eq_ignore_ascii_case("me") {
+                    filters.mentions_me = true;
+                } else if let Some(key) = resolve_person(v) {
+                    filters.mentions = Some(key);
+                } else {
+                    words.push(token);
+                }
+            }
+            "in" => {
+                if let Some(key) = resolve_channel(v) {
+                    filters.in_channel = Some(key);
+                } else {
+                    words.push(token);
+                }
+            }
+            "has" => match v.to_ascii_lowercase().as_str() {
+                "file" | "files" => filters.has = Some(protocol::SearchHas::Files),
+                "link" | "links" => filters.has = Some(protocol::SearchHas::Links),
+                "image" | "images" => filters.has = Some(protocol::SearchHas::Images),
+                "video" | "videos" => filters.has = Some(protocol::SearchHas::Videos),
+                "embed" | "embeds" => filters.has = Some(protocol::SearchHas::Embeds),
+                "sound" | "sounds" | "audio" => filters.has = Some(protocol::SearchHas::Sounds),
+                "sticker" | "stickers" => filters.has = Some(protocol::SearchHas::Stickers),
+                "poll" | "polls" => filters.has = Some(protocol::SearchHas::Polls),
+                _ => words.push(token),
+            },
+            "before" => {
+                if let Some((start, _)) = parse_date_range(v, now_unix) {
+                    filters.before = Some(start);
+                } else {
+                    words.push(token);
+                }
+            }
+            "after" => {
+                if let Some((_, end)) = parse_date_range(v, now_unix) {
+                    filters.after = Some(end);
+                } else {
+                    words.push(token);
+                }
+            }
+            "during" => {
+                if let Some((start, end)) = parse_date_range(v, now_unix) {
+                    filters.after = Some(start);
+                    filters.before = Some(end);
+                } else {
+                    words.push(token);
+                }
+            }
+            "pinned" => match v.to_ascii_lowercase().as_str() {
+                "true" | "yes" => filters.pinned = Some(true),
+                "false" | "no" => filters.pinned = Some(false),
+                _ => words.push(token),
+            },
+            "authortype" => match v.to_ascii_lowercase().as_str() {
+                "user" | "bot" | "webhook" => filters.author_type = Some(v.to_ascii_lowercase()),
+                _ => words.push(token),
+            },
+            _ => words.push(token),
+        }
+    }
+    (words.join(" "), filters)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2068,5 +2496,38 @@ mod tests {
 
         // Prefix-only insertion does not add a trailing space so completion continues immediately.
         assert_eq!(apply_search_completion("deploy ", "from:"), "deploy from:");
+    }
+
+    #[test]
+    fn discord_search_tokens_parse_into_structured_filters_and_completions() {
+        let acct = AccountKey { network: Network::Discord, account: "1000".into() };
+        let channels = vec![("general".into(), "4101".into()), ("design".into(), "4102".into())];
+        let people = vec![("Ines".into(), "2001".into()), ("Sam".into(), "2002".into())];
+
+        let (text, filters) = parse_search_query(
+            "from:Ines mentions:Sam in:#general has:video during:2026-01-15 pinned:true authorType:bot hello world",
+            &protocol::SearchFilters::default(),
+            Some(&acct),
+            &channels,
+            &people,
+            1_768_500_000,
+        );
+        assert_eq!(text, "hello world");
+        assert_eq!(filters.from, Some(Key::new(&acct, "2001")));
+        assert_eq!(filters.mentions, Some(Key::new(&acct, "2002")));
+        assert_eq!(filters.in_channel, Some(Key::new(&acct, "4101")));
+        assert_eq!(filters.has, Some(protocol::SearchHas::Videos));
+        assert_eq!(filters.pinned, Some(true));
+        assert_eq!(filters.author_type.as_deref(), Some("bot"));
+        let expected_start = ymd_to_unix(2026, 1, 15).unwrap();
+        assert_eq!(filters.after, Some(expected_start));
+        assert_eq!(filters.before, Some(expected_start + 86_400));
+
+        let has_sugg = discord_search_completions("has:v", &channels, &people);
+        assert_eq!(has_sugg.iter().map(|s| s.insert.as_str()).collect::<Vec<_>>(), vec!["has:video"]);
+        let from_sugg = discord_search_completions("from:in", &channels, &people);
+        assert_eq!(from_sugg[0].insert, "from:2001");
+        let in_sugg = discord_search_completions("in:des", &channels, &people);
+        assert_eq!(in_sugg[0].insert, "in:#design");
     }
 }

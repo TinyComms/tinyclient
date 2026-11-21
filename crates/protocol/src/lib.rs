@@ -2873,6 +2873,8 @@ pub enum Response {
         cursor: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_searched: Vec<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u32>,
     },
     /// Answers `Reminders`: what is still waiting in the conversation, due first.
     Reminders {
@@ -3382,9 +3384,39 @@ mod tests {
             outgoing: false,
         };
         assert_eq!(
-            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),
+            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new(), total: None }).unwrap(),
             r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
         );
+        // Structured search filters, sort, offset and total round-trip and omit defaults.
+        let filtered = Request::SearchNetwork {
+            conversation: None,
+            space: Some(Key { network: Network::Discord, account: "1".into(), id: "G1".into() }),
+            account: None,
+            network: None,
+            query: "release".into(),
+            filters: SearchFilters {
+                from: Some(Key { network: Network::Discord, account: "1".into(), id: "U1".into() }),
+                mentions: Some(Key { network: Network::Discord, account: "1".into(), id: "U2".into() }),
+                in_channel: Some(Key { network: Network::Discord, account: "1".into(), id: "C2".into() }),
+                has: Some(SearchHas::Videos),
+                before: Some(1_767_225_600),
+                after: Some(1_735_689_600),
+                mentions_me: false,
+                pinned: Some(true),
+                author_type: Some("bot".into()),
+                sort: SearchSort::Oldest,
+                offset: 25,
+            },
+            cursor: Some("25".into()),
+        };
+        let encoded = serde_json::to_string(&filtered).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, filtered);
+        let hits_total = Response::MessageHits { hits: Vec::new(), cursor: Some("25".into()), not_searched: Vec::new(), total: Some(142) };
+        let encoded_hits = serde_json::to_string(&hits_total).unwrap();
+        assert!(encoded_hits.contains(r#""total":142"#), "{encoded_hits}");
+        let decoded_hits: Response = serde_json::from_str(&encoded_hits).unwrap();
+        assert_eq!(decoded_hits, hits_total);
         // The network's own ask: the scope is a conversation, Space, account, network, or everywhere.
         let ask: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen"}"#).unwrap();
         let Request::SearchNetwork { conversation, space, query, filters, cursor, .. } = &ask else {

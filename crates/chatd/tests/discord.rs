@@ -294,22 +294,16 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             });
             (200, json!({"items": [{"pinned_at": "2026-10-13T09:00:00.000000+00:00", "message": pinned}], "has_more": false}))
         }
-        ("GET", ["guilds", _, "messages", "search"]) | ("GET", ["channels", _, "messages", "search"]) => {
-            let channel = if parts[0] == "channels" { parts[1].to_owned() } else { "4101".to_owned() };
-            // The pane's words: text hits, and a 202 while the words ask for one being indexed.
-            if seen.path.contains("content=") {
-                if seen.path.contains("index") {
-                    return (202, json!({"code": 110000, "message": "Index not yet available"}));
-                }
-                let hit = json!({
-                    "id": "1300000000000000600", "channel_id": channel, "type": 0,
-                    "author": {"id": "200000000000000001", "username": "Ines Marchetti", "global_name": "Ines Marchetti", "discriminator": "0", "avatar": null},
-                    "content": "read the rules, they are short",
-                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
-                    "mention_everyone": false, "embeds": [], "pinned": false, "attachments": [],
-                });
-                (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 1, "messages": [[hit]]}))
-            } else {
+        ("GET", ["guilds", _, "messages", "search"])
+        | ("GET", ["channels", _, "messages", "search"])
+        | ("GET", ["users", "@me", "messages", "search"]) => {
+            let channel = match parts[0] {
+                "channels" => parts[1].to_owned(),
+                "users" => "3001".to_owned(),
+                _ => "4101".to_owned(),
+            };
+            // Shared-pane queries always pass `limit=`; message searches use `sort_by=`.
+            if seen.path.contains("limit=") && !seen.path.contains("content=") {
                 let hit = json!({
                     "id": "1300000000000000600", "channel_id": channel, "type": 0, "author": me(), "content": "the map",
                     "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
@@ -318,6 +312,24 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                                      "proxy_url": "https://media.discordapp.net/attachments/1/9001/map.png", "width": 640, "height": 480, "content_type": "image/png"}],
                 });
                 (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 37, "messages": [[hit]]}))
+            } else if seen.path.contains("content=index") {
+                (202, json!({"code": 110000, "message": "Index not yet available"}))
+            } else {
+                let (id, text, total) = if seen.path.contains("offset=25") {
+                    ("1300000000000000601", "second page hit", 40)
+                } else if seen.path.contains("content=paged") {
+                    ("1300000000000000600", "first page hit", 40)
+                } else {
+                    ("1300000000000000600", "read the rules, they are short", 1)
+                };
+                let hit = json!({
+                    "id": id, "channel_id": channel, "type": 0,
+                    "author": {"id": "200000000000000001", "username": "Ines Marchetti", "global_name": "Ines Marchetti", "discriminator": "0", "avatar": null},
+                    "content": text,
+                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                    "mention_everyone": false, "embeds": [], "pinned": false, "attachments": [],
+                });
+                (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": total, "messages": [[hit]]}))
             }
         }
         ("GET", ["guilds", guild]) => (
@@ -3770,9 +3782,101 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
     let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(&not_ready, Response::Error { detail, .. } if detail.contains("isn't ready")), "{not_ready:?}");
 
-    // Paced: Enter again at once is refused in words, so no client can turn it into a burst.
-    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
-    assert!(matches!(&paced, Response::Error { detail, .. } if detail.contains("paced")), "{paced:?}");
+    // Paced: Enter again at once queues and waits out the gap instead of refusing.
+    let started = Instant::now();
+    let queued = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None });
+    assert!(matches!(&queued, Response::MessageHits { hits, total: Some(1), .. } if hits.len() == 1), "{queued:?}");
+    assert!(started.elapsed() >= Duration::from_millis(350), "rapid search must wait its pacing gap");
+}
+
+#[test]
+fn search_maps_all_filters_sort_paging_and_all_dms_route() {
+    let world = polished();
+    let filters = protocol::SearchFilters {
+        from: Some(world.key("200000000000000001")),
+        mentions: Some(world.key("200000000000000002")),
+        in_channel: Some(world.key("4101")),
+        has: Some(protocol::SearchHas::Videos),
+        before: Some(1_767_225_600),
+        after: Some(1_735_689_600),
+        mentions_me: false,
+        pinned: Some(true),
+        author_type: Some("bot".into()),
+        sort: protocol::SearchSort::Oldest,
+        offset: 0,
+    };
+    let page1 = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        network: None,
+        query: "paged".into(),
+        filters: filters.clone(),
+        cursor: None,
+    });
+    let Response::MessageHits { hits, cursor, total, .. } = page1 else {
+        panic!("expected MessageHits, got {page1:?}");
+    };
+    assert_eq!(hits.len(), 1);
+    assert_eq!(total, Some(40));
+    assert_eq!(cursor.as_deref(), Some("25"));
+    let req1 = world.discord.requests_to("GET", "/guilds/4000/messages/search").pop().unwrap();
+    for expected in [
+        "channel_id=4101",
+        "content=paged",
+        "author_id=200000000000000001",
+        "mentions=200000000000000002",
+        "has=video",
+        "min_id=",
+        "max_id=",
+        "pinned=true",
+        "author_type=bot",
+        "sort_by=timestamp&sort_order=asc",
+    ] {
+        assert!(req1.path.contains(expected), "missing {expected} in {}", req1.path);
+    }
+
+    // Second page passes offset=25 via cursor and exhausts cursor once offset+25 >= total (40).
+    let page2 = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        network: None,
+        query: "paged".into(),
+        filters,
+        cursor,
+    });
+    let Response::MessageHits { hits: hits2, cursor: cursor2, total: total2, .. } = page2 else {
+        panic!("expected MessageHits page 2, got {page2:?}");
+    };
+    assert_eq!(hits2[0].message_id, "1300000000000000601");
+    assert_eq!(total2, Some(40));
+    assert_eq!(cursor2, None);
+    let req2 = world.discord.requests_to("GET", "/guilds/4000/messages/search").pop().unwrap();
+    assert!(req2.path.contains("offset=25"), "{}", req2.path);
+
+    // All-DMs scope hits /users/@me/messages/search and supports Relevance sort + mentions_me.
+    let all_dms = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(world.account()),
+        network: None,
+        query: "hello".into(),
+        filters: protocol::SearchFilters {
+            mentions_me: true,
+            sort: protocol::SearchSort::Relevant,
+            ..Default::default()
+        },
+        cursor: None,
+    });
+    let Response::MessageHits { hits: dm_hits, .. } = all_dms else {
+        panic!("expected MessageHits for all-DMs, got {all_dms:?}");
+    };
+    assert_eq!(dm_hits.len(), 1);
+    assert_eq!(dm_hits[0].conversation, world.key("3001"));
+    let req3 = world.discord.requests_to("GET", "/users/@me/messages/search").pop().unwrap();
+    assert!(req3.path.contains("mentions=1000"), "{}", req3.path);
+    assert!(req3.path.contains("sort_by=relevance&sort_order=desc"), "{}", req3.path);
 }
 
 /// A file of `size` bytes beside the world's directory: chatd never sends from its own.

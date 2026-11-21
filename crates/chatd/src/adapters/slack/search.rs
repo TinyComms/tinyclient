@@ -191,9 +191,12 @@ pub(super) fn format_slack_query(
     if let Some(has) = filters.has {
         if !has_modifier(trimmed, "has:") {
             let word = match has {
-                protocol::SearchHas::Links => "link",
+                protocol::SearchHas::Links | protocol::SearchHas::Embeds => "link",
                 protocol::SearchHas::Files => "file",
-                protocol::SearchHas::Images => "image",
+                protocol::SearchHas::Images | protocol::SearchHas::Stickers => "image",
+                protocol::SearchHas::Videos => "video",
+                protocol::SearchHas::Sounds => "audio",
+                protocol::SearchHas::Polls => "poll",
             };
             parts.push(format!("has:{word}"));
         }
@@ -232,6 +235,7 @@ mod tests {
             before: Some(1_767_225_600), // 2026-01-01
             after: Some(1_735_689_600),  // 2025-01-01
             mentions_me: true,
+            ..SearchFilters::default()
         };
         let formatted = format_slack_query("deploy", &filters, Some("#general"), Some("U0ME"));
         assert_eq!(

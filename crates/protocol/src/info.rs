@@ -812,19 +812,44 @@ pub fn format_disappearing(seconds: u32) -> String {
 }
 
 /// Content-type filter for network message search (`SearchFilters::has`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchHas {
     Files,
     Links,
     Images,
+    Videos,
+    Embeds,
+    Sounds,
+    Stickers,
+    Polls,
+}
+
+/// Sort order for network message search (`SearchFilters::sort`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    #[default]
+    Newest,
+    Oldest,
+    Relevant,
+}
+
+impl SearchSort {
+    pub fn is_newest(&self) -> bool {
+        *self == SearchSort::Newest
+    }
 }
 
 /// Optional filters on `Request::SearchNetwork`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SearchFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_channel: Option<Key>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has: Option<SearchHas>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -833,6 +858,14 @@ pub struct SearchFilters {
     pub after: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_type: Option<String>,
+    #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+    pub sort: SearchSort,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: u32,
 }
 
 impl SearchFilters {
