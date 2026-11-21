@@ -402,7 +402,7 @@ impl Shell {
     }
 
     /// The rows the shell holds now, wherever they are drawn.
-    fn held_rows(&self) -> impl Iterator<Item = &Conversation> {
+    pub(in crate::gui) fn held_rows(&self) -> impl Iterator<Item = &Conversation> {
         let open = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref());
         let lists = self.sidebar_state.held();
         let trees = self.trees.values().flat_map(|tree| &tree.conversations);

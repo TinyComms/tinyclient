@@ -1097,6 +1097,91 @@ impl Shell {
         }
     }
 
+    /// Server origin (`https://host[:port]`) for a signed-in Tiny account, for building message links.
+    pub(in crate::gui) fn tiny_origin(&self, account: &AccountKey) -> Option<String> {
+        if self.tiny_state.account.as_ref() == Some(account) {
+            if let Some(origin) = self.tiny_state.community.as_ref().map(|c| c.origin.trim()).filter(|o| !o.is_empty()) {
+                return Some(origin.to_owned());
+            }
+        }
+        let host = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| a.key == *account))
+            .map(|a| a.name.trim())
+            .filter(|n| !n.is_empty())?;
+        if host.starts_with("https://") || host.starts_with("http://") {
+            Some(host.to_owned())
+        } else {
+            Some(format!("https://{host}"))
+        }
+    }
+
+    /// Open a `tinyclient://message#<origin>/<conversation_id>/<message_id>` link:
+    /// find the signed-in account for `origin`, open the conversation, and jump to the message.
+    pub(in crate::gui) fn tiny_open_message_link(
+        &mut self,
+        origin: &str,
+        conversation_id: &str,
+        message_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let server = protocol::join_host(origin);
+        let matched = self
+            .tiny_state
+            .community
+            .as_ref()
+            .filter(|c| protocol::join_host(&c.origin).eq_ignore_ascii_case(&server))
+            .and_then(|_| self.tiny_state.account.clone())
+            .or_else(|| {
+                self.spaces
+                    .iter()
+                    .find(|s| s.key.network == Network::Tiny && s.name.eq_ignore_ascii_case(&server))
+                    .map(|s| s.key.account())
+            })
+            .or_else(|| {
+                self.snapshot.as_ref()?.accounts.iter().find_map(|a| {
+                    (a.key.network == Network::Tiny
+                        && (a.name.eq_ignore_ascii_case(&server)
+                            || protocol::join_host(&a.name).eq_ignore_ascii_case(&server)))
+                    .then(|| a.key.clone())
+                })
+            });
+        let Some(account) = matched else {
+            self.toast(None, "That message is on a server you're not signed in to.", cx);
+            return;
+        };
+        let key = Key::new(&account, conversation_id);
+        let msg_id = message_id.to_owned();
+        if self.open.as_ref() == Some(&key) {
+            let pane = self.pane(cx);
+            pane.update(cx, |pane, cx| pane.jump_to(&msg_id, cx));
+            return;
+        }
+        let held = self.held_rows().find(|r| r.key == key).cloned();
+        if let Some(row) = held {
+            let pane = self.pane(cx);
+            pane.update(cx, |pane, _| pane.land_next(msg_id));
+            self.select(row.key, &row.title, cx);
+            return;
+        }
+        let asked = key.clone();
+        self.off_thread(
+            cx,
+            move || ask(&Request::Conversation { conversation: asked }),
+            move |this, answer, cx| match answer {
+                Ok(Response::Conversation { conversation }) => {
+                    let pane = this.pane(cx);
+                    pane.update(cx, |pane, _| pane.land_next(msg_id));
+                    this.select(conversation.key, &conversation.title, cx);
+                }
+                _ => {
+                    this.toast(None, "That message isn't available.", cx);
+                }
+            },
+        );
+    }
+
     pub(super) fn tiny_fold(&mut self, key: String, cx: &mut Context<Self>) {
         if !self.tiny_state.folded.remove(&key) {
             self.tiny_state.folded.insert(key);

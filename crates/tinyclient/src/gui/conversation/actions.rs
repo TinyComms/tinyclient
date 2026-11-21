@@ -189,7 +189,8 @@ pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: 
             Some(format!("https://discord.com/channels/{place}/{channel}/{id}"))
         }
         Network::Slack => space.map(|team| format!("slack://channel?team={team}&id={channel}&message={id}")),
-        Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => None,
+        Network::Tiny => space.and_then(|origin| protocol::message_link(origin, channel, id)),
+        Network::Telegram | Network::Teams | Network::Signal | Network::Messages => None,
     }
 }
 
@@ -253,6 +254,7 @@ fn menu_acts(
     adds: bool,
     has_text: bool,
     has_link: bool,
+    can_open_link: bool,
     can_save: bool,
 ) -> Vec<MenuAct> {
     if can.unsent {
@@ -285,7 +287,9 @@ fn menu_acts(
     }
     if has_link {
         acts.push(MenuAct::Link);
-        acts.push(MenuAct::Open);
+        if can_open_link {
+            acts.push(MenuAct::Open);
+        }
     }
     if can_save {
         acts.push(MenuAct::SaveAs);
@@ -733,13 +737,15 @@ impl Pane {
         } else {
             emoji::quick(self.rules(), &message.reactions, 6).len()
         };
+        let has_link = self.link_of(message, cx).is_some();
         let acts = menu_acts(
             can,
             matches!(message.state, SendState::Failed { .. }),
             quick,
             self.adds(message),
             !message.text.is_empty(),
-            self.link_of(message, cx).is_some(),
+            has_link,
+            has_link && self.network() != Network::Tiny,
             self.saveable_file(message).is_some(),
         );
         let cursor = if acts.is_empty() {
@@ -831,7 +837,7 @@ impl Pane {
         })
     }
 
-    /// Where a message leads in the network's own app.
+    /// Where a message leads in the network's own app (or in tinyclient for Tiny).
     fn link_of(&self, message: &Message, cx: &Context<Self>) -> Option<String> {
         let shell = self.shell.upgrade()?;
         let shell = shell.read(cx);
@@ -841,6 +847,10 @@ impl Pane {
             (Some(mine), protocol::Network::Discord) => &mine.key,
             _ => &open.key,
         };
+        if key.network == Network::Tiny {
+            let origin = shell.tiny_origin(&key.account());
+            return message_link(key, origin.as_deref(), message);
+        }
         message_link(key, open.space.as_deref(), message)
     }
 
@@ -954,14 +964,16 @@ impl Pane {
                         }))
                         .into_any_element(),
                 );
-                rows.push(
-                    row("sheet-open-in", "icons/external-link.svg", format!("Open in {network}").into(), false)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            cx.open_url(&open);
-                        }))
-                        .into_any_element(),
-                );
+                if self.network() != Network::Tiny {
+                    rows.push(
+                        row("sheet-open-in", "icons/external-link.svg", format!("Open in {network}").into(), false)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                cx.open_url(&open);
+                            }))
+                            .into_any_element(),
+                    );
+                }
             }
             if let Some((path, name)) = self.saveable_file(message) {
                 rows.push(
@@ -1154,11 +1166,13 @@ impl Pane {
             if self.link_of(&message, cx).is_some() {
                 items = items
                     .child(menu_item("link", Some("icons/link.svg"), "Copy link", None).when(lit(MenuAct::Link), |row| row.bg(theme::selected()))
-                            .on_click(go(MenuAct::Link)))
-                    .child(menu_separator())
-                    .child(menu_item("open-in", Some("icons/external-link.svg"), format!("Open in {network}"), None).when(lit(MenuAct::Open), |row| row.bg(theme::selected()))
-                        .on_click(go(MenuAct::Open
-                    )));
+                            .on_click(go(MenuAct::Link)));
+                if self.network() != Network::Tiny {
+                    items = items
+                        .child(menu_separator())
+                        .child(menu_item("open-in", Some("icons/external-link.svg"), format!("Open in {network}"), None).when(lit(MenuAct::Open), |row| row.bg(theme::selected()))
+                            .on_click(go(MenuAct::Open)));
+                }
             }
             if self.saveable_file(&message).is_some() {
                 items = items.child(
@@ -1579,7 +1593,7 @@ mod tests {
         let said = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&said, Network::Discord, channel, false);
         assert_eq!(
-            menu_acts(on, false, 2, true, true, true, false),
+            menu_acts(on, false, 2, true, true, true, true, false),
             vec![
                 MenuAct::Quick(0),
                 MenuAct::Quick(1),
@@ -1592,16 +1606,19 @@ mod tests {
                 MenuAct::Unread,
             ]
         );
+        // Tiny has Copy link without Open in Tiny.
+        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false);
+        assert!(tiny_acts.contains(&MenuAct::Link) && !tiny_acts.contains(&MenuAct::Open));
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         mine.state = SendState::Failed {
             reason: "Slow mode".into(),
         };
         let failed = can(&mine, Network::Discord, channel, false);
         assert_eq!(
-            menu_acts(failed, true, 3, true, true, false, true),
+            menu_acts(failed, true, 3, true, true, false, false, true),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
-            menu_acts(on, false, 0, false, false, false, true),
+            menu_acts(on, false, 0, false, false, false, false, true),
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs, MenuAct::Unread],
         );
     }
@@ -1626,6 +1643,15 @@ mod tests {
         assert_eq!(message_link(&key, Some("T1"), &said).as_deref(), Some("slack://channel?team=T1&id=C9&message=M3"));
         key.network = Network::Telegram;
         assert_eq!(message_link(&key, Some("x"), &said), None);
+        key.network = Network::Tiny;
+        key.id = "11111111-2222-3333-4444-555555555555".into();
+        let tiny_said = Message::plain("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "Mara", "hello", 1, false);
+        assert_eq!(
+            message_link(&key, Some("https://tiny.example"), &tiny_said).as_deref(),
+            Some("tinyclient://message#https://tiny.example/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert_eq!(message_link(&key, None, &tiny_said), None);
+        key.id = "C9".into();
         // One that never left has no place on the network; an unsupported one names its own.
         key.network = Network::Discord;
         let mut pending = said.clone();

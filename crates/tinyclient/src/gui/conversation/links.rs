@@ -46,8 +46,15 @@ pub(super) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) ->
 }
 
 impl Pane {
-    /// A click on a link in a message. Anything that is not a web address does nothing.
+    /// A click on a link in a message. Anything that is not a web address does nothing,
+    /// except `mailto:` and Tiny message links (which open in place without asking).
     pub(super) fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((origin, conversation_id, message_id)) = protocol::parse_message_link(url) {
+            let _ = self.shell.update(cx, |shell, cx| {
+                shell.tiny_open_message_link(&origin, &conversation_id, &message_id, cx);
+            });
+            return;
+        }
         // An e-mail address Telegram or Slack made a link of: the mail app's, not a site.
         if is_mailto(url) {
             cx.open_url(url);

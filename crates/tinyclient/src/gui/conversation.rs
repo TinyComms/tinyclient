@@ -1629,7 +1629,7 @@ impl Render for Pane {
 }
 
 impl Shell {
-    fn pane(&self, cx: &mut Context<Self>) -> Entity<Pane> {
+    pub(in crate::gui) fn pane(&self, cx: &mut Context<Self>) -> Entity<Pane> {
         let pane = self
             .conversation_state
             .pane

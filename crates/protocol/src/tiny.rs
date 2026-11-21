@@ -1401,6 +1401,50 @@ pub fn parse_room_link(input: &str) -> Option<(String, String)> {
     (!host.is_empty()).then_some((host, id))
 }
 
+const MESSAGE_APP_PREFIX: &str = "tinyclient://message#";
+
+fn is_uuid(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() == 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && b.iter().enumerate().all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
+/// Build an app deep link for a Tiny message:
+/// `tinyclient://message#<https server origin>/<conversation uuid>/<message uuid>`.
+/// The parts live in the fragment so nothing is sent to a web server if pasted in a browser.
+pub fn message_link(origin: &str, conversation_id: &str, message_id: &str) -> Option<String> {
+    let origin = invite_origin(origin)?;
+    if !origin.starts_with("https://") || !is_uuid(conversation_id) || !is_uuid(message_id) {
+        return None;
+    }
+    Some(format!("{MESSAGE_APP_PREFIX}{origin}/{conversation_id}/{message_id}"))
+}
+
+/// Parse a Tiny message deep link (`tinyclient://message#<origin>/<conversation_id>/<message_id>`),
+/// returning `(normalized_origin, conversation_id, message_id)`.
+pub fn parse_message_link(input: &str) -> Option<(String, String, String)> {
+    if input.len() > INVITE_ORIGIN_MAX + 128
+        || input.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return None;
+    }
+    let rest = input.strip_prefix(MESSAGE_APP_PREFIX)?;
+    let (prefix, message_id) = rest.rsplit_once('/')?;
+    let (origin, conversation_id) = prefix.rsplit_once('/')?;
+    if !is_uuid(conversation_id) || !is_uuid(message_id) {
+        return None;
+    }
+    let normalized = invite_origin(origin)?;
+    if !normalized.starts_with("https://") {
+        return None;
+    }
+    Some((normalized, conversation_id.to_owned(), message_id.to_owned()))
+}
+
 /// The host, and a port when it is not the usual one. `https://private.tinyclient.io` is
 /// `private.tinyclient.io`. `http://127.0.0.1:8080` keeps the port.
 pub fn join_host(origin: &str) -> String {
@@ -1645,6 +1689,42 @@ mod tests {
         }
         assert!(room_link("https://tiny.example", "../etc").is_none());
         assert!(room_link("ftp://tiny.example", "lounge").is_none());
+    }
+
+    #[test]
+    fn message_links_round_trip_and_reject_malformed_inputs() {
+        let conv = "11111111-2222-3333-4444-555555555555";
+        let msg = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let link = message_link("https://Chat.Example:8443", conv, msg).unwrap();
+        assert_eq!(link, format!("tinyclient://message#https://chat.example:8443/{conv}/{msg}"));
+        assert_eq!(
+            parse_message_link(&link),
+            Some(("https://chat.example:8443".into(), conv.into(), msg.into()))
+        );
+
+        let plain = message_link("https://tiny.example", conv, msg).unwrap();
+        assert_eq!(plain, format!("tinyclient://message#https://tiny.example/{conv}/{msg}"));
+        assert_eq!(
+            parse_message_link(&plain),
+            Some(("https://tiny.example".into(), conv.into(), msg.into()))
+        );
+
+        assert!(message_link("http://tiny.example", conv, msg).is_none());
+        assert!(message_link("https://tiny.example", "not-a-uuid", msg).is_none());
+        assert!(message_link("https://tiny.example", conv, "not-a-uuid").is_none());
+
+        for bad in [
+            "tinyclient://message#",
+            "tinyclient://message#http://tiny.example/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://message#https://tiny.example/11111111-2222-3333-4444-555555555555",
+            "tinyclient://message#https://tiny.example/bad/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://message#https://tiny.example/11111111-2222-3333-4444-555555555555/bad",
+            "tinyclient://message#https://user@tiny.example/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://message#https://tiny.example/extra/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://join#abc",
+        ] {
+            assert_eq!(parse_message_link(bad), None, "{bad}");
+        }
     }
 
     #[test]
