@@ -109,7 +109,8 @@ pub(super) fn canned() -> Option<Canned> {
             password(None)
         }
         "password-wrong" => password(Some(SignInProblem::PasswordInvalid)),
-        "password-recovery" => SignInStep::PasswordRecovery { email_pattern: "m***@example.com".to_owned(), problem: None },
+        // The same handoff as `password`: a recovery email does not open a code that removes the password.
+        "password-recovery" => password(None),
         "passkey" => SignInStep::Passkey {
             options: String::new(),
             problem: Some(SignInProblem::Other {

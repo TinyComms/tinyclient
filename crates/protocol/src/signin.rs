@@ -116,13 +116,15 @@ pub enum SignInStep {
     Password {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         hint: String,
-        /// True when a recovery email is set on the account (`auth.requestPasswordRecovery`).
+        /// True when Telegram reports a recovery email. This client does not start recovery (#542):
+        /// `auth.recoverPassword` with no new settings deletes the cloud password.
         #[serde(default, skip_serializing_if = "is_false")]
         has_recovery: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
-    /// Recover a forgotten two-step verification password using the code sent to `email_pattern`.
+    /// Kept so an older step still parses. This client does not collect a recovery code (#542):
+    /// `auth.recoverPassword` with no new settings deletes the cloud password.
     PasswordRecovery {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         email_pattern: String,
@@ -196,9 +198,9 @@ pub enum SignInInput {
     /// Submit the verification code emailed to the login email (`account.verifyEmail`).
     EmailCode { code: String },
     Password { password: String },
-    /// Ask Telegram to email a password recovery code (`auth.requestPasswordRecovery`).
+    /// Does not recover the password and does not remove it (#542). See `SignInStep::PasswordRecovery`.
     RecoverPassword,
-    /// Submit the emailed password recovery code (`auth.recoverPassword`).
+    /// Does not submit a recovery code and does not remove the password. See `RecoverPassword`.
     RecoveryCode { code: String },
     /// Finish passkey sign-in with a WebAuthn assertion (`auth.finishPasskeyLogin`).
     Passkey {

@@ -800,7 +800,7 @@ impl Picker {
             }
             for (at, _) in &line.items {
                 if let Some(item) = self.stickers.items.get(*at) {
-                    if !item.set.is_empty() {
+                    if !item.locked && !item.set.is_empty() {
                         return Some(item.set.clone());
                     }
                 }
@@ -814,6 +814,10 @@ impl Picker {
         let Some(account) = self.setup.account.clone() else {
             return;
         };
+        // A locked pack has an empty set, and Add is not drawn for it. Refuse here too.
+        if set.is_empty() || !self.stickers.items.iter().any(|item| !item.locked && item.set == set) {
+            return;
+        }
         let request = Request::StickerSet { account, set, install: Some(true), order: Vec::new() };
         let this = cx.weak_entity();
         ask_later(cx, request, move |answer, cx| {

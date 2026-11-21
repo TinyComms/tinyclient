@@ -2528,10 +2528,29 @@ fn an_uninstalled_sticker_can_be_added_and_recent_favourite_and_searched_sticker
     world.steer("featured-premium");
     let (page, next) = stickers(&world, "", None);
     assert!(!page.is_empty());
-    assert!(page.iter().all(|sticker| sticker.locked), "{page:?}");
+    assert!(page.iter().all(|sticker| sticker.locked && sticker.set.is_empty()), "{page:?}");
     assert_eq!(page[0].pack, "Gold");
-    assert_eq!(page[0].set, "930:931");
     assert_eq!(next.as_deref(), Some("1"));
+    let refused = world.ask(Request::StickerSet { account: account(), set: "930:931".into(), install: Some(true), order: Vec::new() });
+    assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "This needs Telegram Premium.".into() });
+    assert!(!exact(&world, "InstallStickerSet 930"), "{:?}", world.calls());
+    let (found, _) = stickers(&world, "✨", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].locked && found[0].set.is_empty(), "{found:?}");
+    assert_eq!(found[0].pack, "Gold");
+
+    world.steer("gold-installed");
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Hiking");
+    assert!(page.iter().all(|sticker| sticker.set.is_empty() && !sticker.locked), "{page:?}");
+    assert_eq!(next.as_deref(), Some("1"));
+    let (page, next) = stickers(&world, "", Some("1"));
+    assert_eq!(page[0].pack, "Gold");
+    assert!(page.iter().all(|sticker| sticker.locked && sticker.set.is_empty()), "{page:?}");
+    assert!(next.is_none());
+    let (found, _) = stickers(&world, "✨", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].locked && found[0].set.is_empty(), "{found:?}");
 
     let world = World::signed_in();
     world.connected();
@@ -2804,7 +2823,7 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
 }
 
 #[test]
-fn a_login_email_a_new_account_and_a_recovery_code_sign_in_and_a_passkey_is_refused() {
+fn a_login_email_a_new_account_and_password_recovery_does_not_sign_in_and_a_passkey_is_refused() {
     let world = World::start(None, "30");
     world.sign_in(None);
     assert_eq!(world.sign_in(Some(SignInInput::UsePhone)), SignInStep::Phone { problem: None });
@@ -2844,11 +2863,13 @@ fn a_login_email_a_new_account_and_a_recovery_code_sign_in_and_a_passkey_is_refu
     world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0166".into() }));
     let password = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
     assert!(matches!(password, SignInStep::Password { has_recovery: true, problem: None, .. }), "{password:?}");
-    let recovery = world.sign_in(Some(SignInInput::RecoverPassword));
-    assert!(matches!(recovery, SignInStep::PasswordRecovery { ref email_pattern, problem: None } if email_pattern == "m***@example.com"), "{recovery:?}");
-    let wrong = world.sign_in(Some(SignInInput::RecoveryCode { code: "000000".into() }));
-    assert!(matches!(wrong, SignInStep::PasswordRecovery { problem: Some(SignInProblem::CodeInvalid), .. }), "{wrong:?}");
-    assert_eq!(world.sign_in(Some(SignInInput::RecoveryCode { code: "135790".into() })), SignInStep::Done { account: Some(account()) });
+    let stayed = world.sign_in(Some(SignInInput::RecoverPassword));
+    assert!(matches!(stayed, SignInStep::Password { has_recovery: true, problem: None, .. }), "{stayed:?}");
+    let still = world.sign_in(Some(SignInInput::RecoveryCode { code: "135790".into() }));
+    assert!(matches!(still, SignInStep::Password { has_recovery: true, problem: None, .. }), "{still:?}");
+    assert_eq!(world.called("RequestPasswordRecovery"), 0);
+    assert_eq!(world.called("RecoverPassword"), 0);
+    assert!(world.status().0.is_empty());
     let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
     assert!(!said.contains("135790"), "{said}");
 

@@ -585,6 +585,8 @@ struct World {
     signup_required: bool,
     /// The Camp pack (id 920) was installed with `messages.installStickerSet`.
     camp_installed: bool,
+    /// The Gold pack (id 930) is installed as well as featured. Paired with `featured_premium`.
+    gold_installed: bool,
     /// Installed pack ids, first shown first (`messages.reorderStickerSets`). Empty keeps Hiking, then Camp.
     sticker_order: Vec<i64>,
     /// Starred sticker document ids (`messages.faveSticker`).
@@ -669,6 +671,7 @@ impl World {
             pending_login_email: None,
             signup_required: false,
             camp_installed: false,
+            gold_installed: false,
             sticker_order: Vec::new(),
             faved: Vec::new(),
             show_recent: false,
@@ -1572,6 +1575,12 @@ impl World {
                 self.featured_premium = true;
                 Vec::new()
             }
+            // Installed, and still on the Premium featured list, so a non-Premium account keeps it locked.
+            "gold-installed" => {
+                self.featured_premium = true;
+                self.gold_installed = true;
+                Vec::new()
+            }
             "call-flags" => {
                 let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
                 let avail = words.next().is_some_and(|v| v == "1" || v == "true");
@@ -2220,21 +2229,15 @@ impl World {
             self.signup_required = false;
             return answer(self.me());
         }
+        // Neither call reads the code or signs anyone in. `auth.recoverPassword` with no new
+        // settings deletes the cloud password, and that recovery stays unimplemented (#542).
         if asked::<f::auth::RequestPasswordRecovery>(body).is_some() {
             self.log("RequestPasswordRecovery");
-            if !self.has_recovery {
-                return Err(rpc(400, "PASSWORD_RECOVERY_NA", None));
-            }
-            return answer(tl::enums::auth::PasswordRecovery::Recovery(tl::types::auth::PasswordRecovery { email_pattern: "m***@example.com".to_owned() }));
+            return Err(rpc(400, "PASSWORD_RECOVERY_NA", None));
         }
-        if let Some(request) = asked::<f::auth::RecoverPassword>(body) {
+        if asked::<f::auth::RecoverPassword>(body).is_some() {
             self.log("RecoverPassword");
-            if request.code != "135790" {
-                return Err(rpc(400, "CODE_INVALID", None));
-            }
-            self.signed_in = true;
-            self.password_owed = false;
-            return answer(self.me());
+            return Err(rpc(400, "PASSWORD_RECOVERY_NA", None));
         }
         if asked::<f::account::GetPassword>(body).is_some() {
             self.log("GetPassword");
@@ -3493,6 +3496,9 @@ impl World {
             if self.camp_installed {
                 sets.push(installed_pack(920, 921, "Camp", "camp", 1));
             }
+            if self.gold_installed {
+                sets.push(installed_pack(930, 931, "Gold", "gold", 1));
+            }
             if !self.sticker_order.is_empty() {
                 let order = self.sticker_order.clone();
                 sets.sort_by_key(|set| order.iter().position(|id| *id == set.id).unwrap_or(usize::MAX));
@@ -3539,6 +3545,8 @@ impl World {
                 vec![sticker_in(6_420, "⛺", 920, 921).into()]
             } else if request.emoticon == "🥾" {
                 vec![sticker(6_400).into()]
+            } else if request.emoticon == "✨" {
+                vec![sticker_in(6_430, "✨", 930, 931).into()]
             } else {
                 Vec::new()
             };

@@ -1097,7 +1097,8 @@ pub struct CatalogItem {
     #[serde(default, skip_serializing_if = "is_false")]
     pub animated: bool,
     /// `id:access_hash` or a short name when this sticker's pack is not installed yet.
-    /// Empty for an installed pack, a GIF, or an emoji.
+    /// Empty for an installed pack, a locked Premium pack, a GIF, or an emoji. A locked pack
+    /// leaves this empty so the picker does not install it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub set: String,
     /// A Premium sticker this account cannot send.

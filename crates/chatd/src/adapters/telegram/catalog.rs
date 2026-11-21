@@ -79,8 +79,9 @@ pub(super) enum StickerPage {
 }
 
 /// A document as a picker item: its still, queued to be fetched, and remembered for sending.
-/// `set` is the install key when the pack is not on the account yet. `locked` is a Premium
-/// sticker this account cannot send.
+/// `set` is the install key when the pack is not on the account yet. It stays empty when the
+/// pack is installed, and when it is locked, so the picker does not offer Add. `locked` is a
+/// Premium sticker this account cannot send.
 fn item(account: &Account, document: &tl::enums::Document, pack: &str, locked: bool, set: &str) -> Option<CatalogItem> {
     let tl::enums::Document::Document(document) = document else {
         return None;
@@ -412,15 +413,19 @@ fn stickers(account: &Account, query: &str, at: usize) -> Result<CatalogPage, Fa
         .iter()
         .take(protocol::CATALOG_LIMIT)
         .filter_map(|document| {
-            let install = installable(&pages, document, &set);
+            let install = installable(&pages, document, &set, locked);
             item(account, document, &title, locked, &install)
         })
         .collect();
     Ok(CatalogPage { items, cursor })
 }
 
-/// The set key to offer an Add for: the page's own, or the document's when that pack is not installed.
-fn installable(pages: &[StickerPage], document: &tl::enums::Document, page_set: &str) -> String {
+/// The set key to offer an Add for. A locked pack never has one. Otherwise the page's own key,
+/// or the document's when that pack is not installed.
+fn installable(pages: &[StickerPage], document: &tl::enums::Document, page_set: &str, locked: bool) -> String {
+    if locked {
+        return String::new();
+    }
     if !page_set.is_empty() {
         return page_set.to_owned();
     }
@@ -430,6 +435,28 @@ fn installable(pages: &[StickerPage], document: &tl::enums::Document, page_set: 
     let key = content::sticker_set_key(&raw.attributes);
     let installed = pages.iter().any(|page| matches!(page, StickerPage::Pack { id, access, set, .. } if set.is_empty() && key == format!("{id}:{access}")));
     if key.is_empty() || installed { String::new() } else { key }
+}
+
+fn account_premium(account: &Account) -> bool {
+    account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium)
+}
+
+/// Ids of Premium featured packs this account cannot add. Empty when the account is Premium
+/// or the featured list is not a Premium list. Fetched each time: a steer can change the list.
+fn premium_pack_ids(account: &Account) -> Result<Vec<i64>, Fault> {
+    if account_premium(account) {
+        return Ok(Vec::new());
+    }
+    let tl::enums::messages::FeaturedStickers::Stickers(found) = account.ask(&tl::functions::messages::GetFeaturedStickers { hash: 0 })? else {
+        return Ok(Vec::new());
+    };
+    if !found.premium {
+        return Ok(Vec::new());
+    }
+    Ok(found.sets.into_iter().map(|covered| {
+        let tl::enums::StickerSet::Set(set) = covered.set();
+        set.id
+    }).collect())
 }
 
 fn sticker_pages(account: &Account) -> Result<Vec<StickerPage>, Fault> {
@@ -444,11 +471,14 @@ fn sticker_pages(account: &Account) -> Result<Vec<StickerPage>, Fault> {
     if !faved_documents(account)?.is_empty() {
         pages.push(StickerPage::Faved);
     }
-    let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
+    let mut premium_ids = Vec::new();
     if let tl::enums::messages::FeaturedStickers::Stickers(found) = account.ask(&tl::functions::messages::GetFeaturedStickers { hash: 0 })? {
-        let locked = found.premium && !premium;
+        let locked = found.premium && !account_premium(account);
         for covered in found.sets {
             let tl::enums::StickerSet::Set(set) = covered.set();
+            if locked {
+                premium_ids.push(set.id);
+            }
             let already = installed.iter().any(|one| matches!(one, tl::enums::StickerSet::Set(held) if held.id == set.id));
             if already {
                 continue;
@@ -458,13 +488,14 @@ fn sticker_pages(account: &Account) -> Result<Vec<StickerPage>, Fault> {
                 access: set.access_hash,
                 title: set.title,
                 locked,
-                set: format!("{}:{}", set.id, set.access_hash),
+                set: if locked { String::new() } else { format!("{}:{}", set.id, set.access_hash) },
             });
         }
     }
     for set in installed {
         let tl::enums::StickerSet::Set(set) = set;
-        pages.push(StickerPage::Pack { id: set.id, access: set.access_hash, title: set.title, locked: false, set: String::new() });
+        let locked = premium_ids.contains(&set.id);
+        pages.push(StickerPage::Pack { id: set.id, access: set.access_hash, title: set.title, locked, set: String::new() });
     }
     Ok(pages)
 }
@@ -505,6 +536,7 @@ fn searched(account: &Account, query: &str) -> Result<CatalogPage, Fault> {
             tl::enums::messages::Stickers::NotModified => Vec::new(),
         }
     };
+    let locked_ids = premium_pack_ids(account)?;
     let mut titles: Vec<(String, String)> = Vec::new();
     let mut items = Vec::new();
     for document in documents.iter().take(protocol::CATALOG_LIMIT) {
@@ -512,8 +544,10 @@ fn searched(account: &Account, query: &str) -> Result<CatalogPage, Fault> {
             tl::enums::Document::Document(raw) => content::sticker_set_key(&raw.attributes),
             tl::enums::Document::Empty(_) => String::new(),
         };
+        let locked = key.split_once(':').and_then(|(id, _)| id.parse::<i64>().ok()).is_some_and(|id| locked_ids.contains(&id));
         let title = titled(account, &key, &mut titles);
-        if let Some(shown) = item(account, document, &title, false, &key) {
+        let install = if locked { "" } else { key.as_str() };
+        if let Some(shown) = item(account, document, &title, locked, install) {
             items.push(shown);
         }
     }
@@ -551,7 +585,8 @@ fn input_set(set: &str) -> Result<tl::enums::InputStickerSet, Fault> {
     Ok(tl::types::InputStickerSetShortName { short_name: set.to_owned() }.into())
 }
 
-/// Installs or removes a pack, or restacks the installed packs. Clears the page list either way.
+/// Installs or removes a pack, or restacks the installed packs. Clears the page list when it changes.
+/// A Premium featured pack is not installed for an account that is not Premium.
 pub(super) fn sticker_set(account: &Account, set: &str, install: Option<bool>, order: &[i64]) -> Result<(), Fault> {
     if !order.is_empty() {
         account.ask(&tl::functions::messages::ReorderStickerSets { masks: false, emojis: false, order: order.to_vec() })?;
@@ -561,6 +596,11 @@ pub(super) fn sticker_set(account: &Account, set: &str, install: Option<bool>, o
     let stickerset = input_set(set)?;
     match install {
         Some(true) => {
+            if let tl::enums::InputStickerSet::Id(chosen) = &stickerset {
+                if premium_pack_ids(account)?.contains(&chosen.id) {
+                    return Err(Fault::Rpc { code: 403, name: "PREMIUM_ACCOUNT_REQUIRED".to_owned(), value: None });
+                }
+            }
             account.ask(&tl::functions::messages::InstallStickerSet { stickerset, archived: false })?;
         }
         Some(false) => {

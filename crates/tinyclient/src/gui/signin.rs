@@ -829,11 +829,10 @@ impl Sheet {
 
     /// The field behind the boxes changed. It keeps digits only; the last one sends the code.
     fn code_typed(&mut self, cx: &mut Context<Sheet>) {
-        // 0 phone code, 1 login-email code, 2 password-recovery code. Recovery codes are six digits.
-        let (length, which) = match &self.face {
-            Some(Face::Step(SignInStep::Code { length, .. })) => (*length, 0),
-            Some(Face::Step(SignInStep::EmailVerify { length, .. })) => (*length, 1),
-            Some(Face::Step(SignInStep::PasswordRecovery { .. })) => (6, 2),
+        // A phone code, or a login-email code. A password recovery code is not collected (#542).
+        let (length, email) = match &self.face {
+            Some(Face::Step(SignInStep::Code { length, .. })) => (*length, false),
+            Some(Face::Step(SignInStep::EmailVerify { length, .. })) => (*length, true),
             _ => return,
         };
         let length = usize::from(length).max(1);
@@ -844,11 +843,7 @@ impl Sheet {
             self.digits.update(cx, |input, cx| input.set_text("", cx));
         } else if code.len() == length {
             self.digits.update(cx, |input, cx| input.set_text("", cx));
-            let input = match which {
-                1 => SignInInput::EmailCode { code },
-                2 => SignInInput::RecoveryCode { code },
-                _ => SignInInput::Code { code },
-            };
+            let input = if email { SignInInput::EmailCode { code } } else { SignInInput::Code { code } };
             self.answer(input, cx);
         } else if code != typed {
             self.digits.update(cx, |input, cx| input.set_text(&code, cx));
@@ -970,8 +965,8 @@ impl Sheet {
     fn target(&self, cx: &App) -> FocusHandle {
         match &self.face {
             Some(Face::Step(SignInStep::Phone { .. })) => self.number.focus_handle(cx),
-            Some(Face::Step(SignInStep::Code { .. } | SignInStep::EmailVerify { .. } | SignInStep::PasswordRecovery { .. })) => self.digits.focus_handle(cx),
-            Some(Face::Step(SignInStep::Password { .. })) => self.password.focus_handle(cx),
+            Some(Face::Step(SignInStep::Code { .. } | SignInStep::EmailVerify { .. })) => self.digits.focus_handle(cx),
+            Some(Face::Step(SignInStep::Password { .. } | SignInStep::PasswordRecovery { .. })) => self.password.focus_handle(cx),
             Some(Face::Step(SignInStep::EmailSetup { .. } | SignInStep::SignUp { .. })) => self.url.focus_handle(cx),
             Some(Face::Step(SignInStep::Server { .. })) => self.url.focus_handle(cx),
             Some(Face::Step(SignInStep::Invite { .. })) => self.invite.focus_handle(cx),
@@ -1202,7 +1197,7 @@ impl Sheet {
             .child(footer(26.).child(resend).child(self.cancel("Cancel", cx)))
     }
 
-    fn password_step(&self, hint: &str, has_recovery: bool, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+    fn password_step(&self, hint: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
         let handle = self.password.focus_handle(cx);
         let focused = handle.is_focused(window);
         let count = self.password.read(cx).text().chars().count();
@@ -1238,12 +1233,9 @@ impl Sheet {
             )
             .child(hidden(&self.password, 12., 10., 64.))
             .child(bullets);
-        // Without a recovery email the reset happens in Telegram's own app, so the words are not a link.
-        let aside = if has_recovery {
-            self.answer_link("signin-recover", "Email me a recovery code", || SignInInput::RecoverPassword, cx).into_any_element()
-        } else {
-            div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.").into_any_element()
-        };
+        // Recovery stays in Telegram's own app. Emailing a code would be `auth.recoverPassword`,
+        // which with no new settings deletes the cloud password (#542).
+        let aside = div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.");
         div()
             .flex()
             .flex_col()
@@ -1283,11 +1275,6 @@ impl Sheet {
             window,
             cx,
         )
-    }
-
-    fn recovery_step(&self, pattern: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
-        let where_to = if pattern.is_empty() { "your recovery email".to_owned() } else { pattern.to_owned() };
-        self.digit_step("Recovery code", &format!("Telegram sent a 6-digit code to {where_to}."), 6, problem, window, cx)
     }
 
     /// The same boxes as a phone code, with a sentence of our own. The last digit sends it.
@@ -1786,8 +1773,9 @@ impl Render for Sheet {
                     }
                     SignInStep::EmailSetup { phone, .. } => self.email_setup_step(phone, problem, window, cx),
                     SignInStep::EmailVerify { email_pattern, length, .. } => self.email_verify_step(email_pattern, *length, problem, window, cx),
-                    SignInStep::Password { hint, has_recovery, .. } => self.password_step(hint, *has_recovery, problem, window, cx),
-                    SignInStep::PasswordRecovery { email_pattern, .. } => self.recovery_step(email_pattern, problem, window, cx),
+                    SignInStep::Password { hint, .. } => self.password_step(hint, problem, window, cx),
+                    // An older chatd may still name this step. It is the same handoff, not a code that removes the password.
+                    SignInStep::PasswordRecovery { .. } => self.password_step("", problem, window, cx),
                     SignInStep::Passkey { .. } => self.passkey_step(problem, cx),
                     SignInStep::SignUp { phone, terms, .. } => self.signup_step(phone, terms, problem, window, cx),
                     SignInStep::Server { .. } => self.server_step(problem, window, cx),

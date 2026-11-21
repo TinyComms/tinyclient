@@ -1,7 +1,9 @@
 //! Signing in to Telegram, one step at a time, as the shell's sheet draws it: a QR code scanned
 //! from the phone first; a phone number and the code sent to it otherwise; a login email when
 //! Telegram asks for one before the code; a name when the number has no account yet; the second
-//! password where the account has one, and a recovery code when a recovery email is set.
+//! password where the account has one. A recovery email is not used: resetting that password
+//! happens in Telegram's own app. `auth.recoverPassword` with no new settings deletes the cloud
+//! password, so that recovery stays unimplemented (#542).
 //! Passkey sign-in is refused here: a third-party client cannot assert Telegram's passkey domain.
 //! Telegram has no web page for this and wants none used.
 //!
@@ -41,8 +43,6 @@ enum Way {
     Passkey,
     /// The second password, and the way that led to it.
     Password { from_qr: bool },
-    /// Recovering a forgotten second password by email.
-    PasswordRecovery { from_qr: bool },
     Ended,
 }
 
@@ -60,7 +60,7 @@ struct State {
     sent: Option<Sent>,
     /// What Telegram says of the account's second password, for the proof.
     password: Option<tl::types::account::Password>,
-    /// Masked email address shown on `EmailVerify` and `PasswordRecovery`.
+    /// Masked email address shown on `EmailVerify`.
     email_pattern: String,
     /// Digit length of the email verification code on `EmailVerify`.
     email_code_len: u8,
@@ -412,12 +412,8 @@ impl Flow {
                 self.show(SignInStep::Phone { problem: None }, false)
             }
             (SignInInput::Password { password }, Way::Password { from_qr }) => self.check_password(password, from_qr),
-            (SignInInput::RecoverPassword, Way::Password { from_qr }) => self.ask_recovery(from_qr),
-            (SignInInput::RecoveryCode { code }, Way::PasswordRecovery { from_qr }) => self.take_recovery(code, from_qr),
-            (SignInInput::Back, Way::PasswordRecovery { from_qr }) => {
-                let step = self.password_step(from_qr, None);
-                self.show(step, false)
-            }
+            // `RecoverPassword` and `RecoveryCode` fall through. They are not sent on:
+            // `auth.recoverPassword` with no new settings deletes the cloud password (#542).
             // Never `auth.initPasskeyLogin` or `auth.finishPasskeyLogin`: those assert Telegram's domain.
             (SignInInput::UsePasskey | SignInInput::Passkey { .. }, _) => self.refuse_passkey(),
             (SignInInput::Back, Way::Passkey) => {
@@ -735,34 +731,6 @@ impl Flow {
         match wire::call(self.wire.as_ref(), &request) {
             Ok(authorization) => self.finish(authorization, false),
             Err(fault) => self.signup_again(problem(&fault)),
-        }
-    }
-
-    fn ask_recovery(&self, from_qr: bool) -> SignInStep {
-        match wire::call(self.wire.as_ref(), &tl::functions::auth::RequestPasswordRecovery {}) {
-            Ok(tl::enums::auth::PasswordRecovery::Recovery(recovery)) => {
-                let mut state = self.state();
-                state.way = Way::PasswordRecovery { from_qr };
-                state.email_pattern = recovery.email_pattern.clone();
-                let step = SignInStep::PasswordRecovery { email_pattern: recovery.email_pattern, problem: None };
-                drop(state);
-                self.show(step, false)
-            }
-            Err(fault) => {
-                let step = self.password_step(from_qr, Some(problem(&fault)));
-                self.show(step, false)
-            }
-        }
-    }
-
-    fn take_recovery(&self, code: String, _from_qr: bool) -> SignInStep {
-        let request = tl::functions::auth::RecoverPassword { code, new_settings: None };
-        match wire::call(self.wire.as_ref(), &request) {
-            Ok(authorization) => self.finish(authorization, false),
-            Err(fault) => {
-                let email_pattern = self.state().email_pattern.clone();
-                self.show(SignInStep::PasswordRecovery { email_pattern, problem: Some(problem(&fault)) }, false)
-            }
         }
     }
 
