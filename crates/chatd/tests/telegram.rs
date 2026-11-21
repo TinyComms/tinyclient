@@ -3295,3 +3295,50 @@ fn sent_video_carries_dimensions_duration_streaming_flag_and_thumb() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn shared_contact_send_and_receive() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.share_contact, "Telegram must advertise share_contact capability");
+
+    let shared = protocol::SharedContact {
+        name: "Odalys Brandt".into(),
+        phones: vec!["+15550100777".into()],
+        emails: vec!["odalys@example.org".into()],
+        organization: "Trail Crew".into(),
+        avatar: None,
+        person_id: None,
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7003"),
+            client_id: "contact-tg-1".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { contact: Some(shared), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("contact sent", || {
+        world
+            .messages("u7003")
+            .into_iter()
+            .find(|m| !m.contacts.is_empty() && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
+    assert_eq!(sent.kind, MessageKind::Normal);
+    assert_eq!(sent.contacts.len(), 1);
+    let card = &sent.contacts[0];
+    assert_eq!(card.name, "Odalys Brandt");
+    assert_eq!(card.phones, vec!["+15550100777"]);
+    assert_eq!(card.emails, vec!["odalys@example.org"]);
+    assert_eq!(card.organization, "Trail Crew");
+    assert_eq!(card.person_id.as_deref(), Some("u7002"));
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMedia u7003 contact:Odalys:Brandt:+15550100777")),
+        "expected InputMediaContact on wire, got: {:#?}",
+        world.calls()
+    );
+}

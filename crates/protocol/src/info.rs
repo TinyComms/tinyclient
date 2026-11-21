@@ -595,6 +595,9 @@ pub struct Capabilities {
     /// This account supports browsing unjoined public channels, previewing, and joining them (`BrowseChannels`, `PreviewChannel`, `Join`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub browse_channels: bool,
+    /// This account supports sharing contact cards (`Outgoing::contact`, Telegram/Signal).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub share_contact: bool,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].

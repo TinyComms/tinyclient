@@ -3218,6 +3218,17 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
             tl::enums::InputDocument::Document(kept) if kept.id >= 6_400 && kept.id < 6_500 => ("sticker".to_owned(), document_media(sticker(kept.id))),
             _ => ("kept-document".to_owned(), file("file", "application/octet-stream")),
         },
+        tl::enums::InputMedia::Contact(one) => (
+            format!("contact:{}:{}:{}", one.first_name, one.last_name, one.phone_number),
+            tl::types::MessageMediaContact {
+                phone_number: one.phone_number.clone(),
+                first_name: one.first_name.clone(),
+                last_name: one.last_name.clone(),
+                vcard: one.vcard.clone(),
+                user_id: if one.phone_number.contains("15550100777") { ODALYS } else { 0 },
+            }
+            .into(),
+        ),
         _ => ("other".to_owned(), tl::enums::MessageMedia::Empty),
     }
 }

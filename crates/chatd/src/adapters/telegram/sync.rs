@@ -361,6 +361,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         effects: false,
         view_once: false,
         blocks: true,
+        share_contact: true,
         ..Capabilities::default()
     }
 }
