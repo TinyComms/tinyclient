@@ -1247,10 +1247,14 @@ impl Shell {
             }
         };
         let emoji_text = open.role_emoji.read(cx).text().trim().to_owned();
-        let unicode_emoji = if open.role_clear_emoji {
-            Some(String::new())
-        } else if !emoji_text.is_empty() {
+        // A typed emoji replaces Clear. The flag only applies while the field stays empty.
+        if !emoji_text.is_empty() {
+            open.role_clear_emoji = false;
+        }
+        let unicode_emoji = if !emoji_text.is_empty() {
             Some(emoji_text)
+        } else if open.role_clear_emoji {
+            Some(String::new())
         } else {
             None
         };
