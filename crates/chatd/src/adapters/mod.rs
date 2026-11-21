@@ -182,6 +182,9 @@ pub struct About {
     pub away_until: Option<i64>,
     pub note: String,
     pub warning: Option<Warning>,
+    pub badges: Vec<protocol::ProfileBadge>,
+    pub connections: Vec<protocol::ProfileConnection>,
+    pub server_tag: String,
 }
 
 /// What a conversation's info pane says beyond its row, as the network tells it.

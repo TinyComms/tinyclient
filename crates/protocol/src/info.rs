@@ -20,6 +20,9 @@ pub const ROWS_WATCHED: usize = 100;
 /// Most roles, or contact lines, a profile carries.
 pub const PROFILE_ROLES: usize = 12;
 pub const PROFILE_CONTACTS: usize = 6;
+/// Most badges or connected accounts a profile carries.
+pub const PROFILE_BADGES: usize = 24;
+pub const PROFILE_CONNECTIONS: usize = 16;
 /// Most files one `Send` carries. A network that takes fewer says so in `Capabilities`.
 pub const ATTACHMENTS_LIMIT: usize = 10;
 /// Most items one catalog answer carries.
@@ -243,6 +246,25 @@ pub struct Contact {
     /// Drawn masked ("+44 •••• ••42 · Show") until clicked, each time. Phone numbers always.
     #[serde(default, skip_serializing_if = "is_false")]
     pub masked: bool,
+}
+
+/// One badge on a person's profile (Nitro, HypeSquad, Server Booster, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileBadge {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<MediaFile>,
+}
+
+/// One external account linked on a person's profile (GitHub, X, Spotify, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileConnection {
+    pub service: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verified: bool,
 }
 
 /// The one heads-up line on a profile.

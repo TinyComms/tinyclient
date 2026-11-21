@@ -3,7 +3,7 @@
 
 use palette::IntoColor;
 use super::facts::{self, HeadsUpWords, PresenceLine, Role, Tone};
-use crate::gui::components::{glyph, Avatar, Shape as Plate};
+use crate::gui::components::{glyph, tip, Avatar, Shape as Plate};
 use crate::gui::people::presence::{self, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, rgb, Div, ElementId, Rgba, SharedString, Stateful};
@@ -18,6 +18,103 @@ pub fn band(color: u32, surface: Rgba) -> Rgba {
     let mut tinted = rgb(color);
     tinted.alpha = 0.4;
     theme::over(tinted, surface)
+}
+
+/// The banner band behind the avatar: the user's banner image when fetched, else their accent tint.
+pub fn banner_band(banner_path: Option<String>, accent: Option<u32>, surface: Rgba) -> Option<Div> {
+    if let Some(path) = banner_path {
+        let mut frame = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(BAND))
+            .overflow_hidden();
+        if let Some(color) = accent {
+            frame = frame.bg(band(color, surface));
+        }
+        return Some(
+            frame.child(
+                gpui::img(std::path::PathBuf::from(path))
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Cover),
+            ),
+        );
+    }
+    accent.map(|color| div().absolute().top_0().left_0().right_0().h(px(BAND)).bg(band(color, surface)))
+}
+
+/// A compact horizontal strip of profile badges (16px icons with tooltips, or subtle pills).
+pub fn badge_strip(prefix: &'static str, badges: &[(String, Option<String>)]) -> Option<Div> {
+    if badges.is_empty() {
+        return None;
+    }
+    let mut row = div().mt(px(6.)).flex().flex_wrap().items_center().gap(px(4.));
+    for (ix, (name, icon_path)) in badges.iter().enumerate() {
+        let label = name.clone();
+        if let Some(path) = icon_path {
+            row = row.child(
+                div()
+                    .id((prefix, ix))
+                    .size(px(18.))
+                    .rounded(px(4.))
+                    .bg(theme::hover())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(tip(label, None))
+                    .child(
+                        gpui::img(std::path::PathBuf::from(path))
+                            .size(px(14.))
+                            .object_fit(gpui::ObjectFit::Contain),
+                    ),
+            );
+        } else {
+            row = row.child(
+                div()
+                    .id((prefix, ix))
+                    .h(px(18.))
+                    .px(px(5.))
+                    .rounded(px(4.))
+                    .bg(theme::hover())
+                    .flex()
+                    .items_center()
+                    .type_micro()
+                    .text_color(theme::text_soft())
+                    .tooltip(tip(label, None))
+                    .child(name.clone()),
+            );
+        }
+    }
+    Some(row)
+}
+
+/// One external connected account row (service, handle, verified check, optional link icon).
+pub fn connection_row(id: impl Into<ElementId>, conn: &protocol::ProfileConnection) -> Stateful<Div> {
+    let clickable = !conn.url.is_empty();
+    div()
+        .id(id)
+        .h(px(theme::ROW_ONE))
+        .mx(px(-8.))
+        .px(px(8.))
+        .rounded(px(theme::R_CONTROL))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .when(clickable, |row| row.cursor_pointer().hover(|s| s.bg(theme::hover())))
+        .child(glyph("icons/link.svg", 14., theme::text_soft()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(div().type_ui().truncate().child(conn.name.clone()))
+                .when(conn.verified, |inner| inner.child(glyph("icons/check.svg", 12., theme::accent_text())))
+                .child(div().flex_none().type_small().text_color(theme::text_faint()).child(conn.service.clone())),
+        )
+        .when(clickable, |row| row.child(glyph("icons/external-link.svg", 13., theme::text_faint())))
 }
 
 /// A tag after a name: Bot, App, Guest, External, Private; Scam and Fake in danger.

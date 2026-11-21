@@ -486,19 +486,40 @@ impl InfoPane {
         let line = draw::presence_line_for(person, profile, presence, &status, calling);
         let place = space.map(|(_, name)| name.as_str());
         let accent = profile.and_then(|profile| profile.accent);
+        let banner_path = profile
+            .and_then(|p| p.banner.as_ref())
+            .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+        let badges: Vec<(String, Option<String>)> = profile
+            .map(|p| {
+                p.badges
+                    .iter()
+                    .map(|b| {
+                        let path = b.icon.as_ref().and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                        (b.name.clone(), path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mark = draw::mark_of(person).or_else(|| {
+            profile
+                .map(|p| p.server_tag.as_str())
+                .filter(|t| !t.is_empty())
+                .map(|t| draw::tag(t.to_owned(), false))
+        });
         let actions = facts::actions(person, &seen, Surface::Pane);
 
         // "…" alone never opens a row of its own at the left: it sits at the head's right.
         let lone = actions.more && !actions.message && !actions.request && actions.call.is_none();
         let more = actions.more.then(|| self.more_button(person, &seen));
         let (more_in_head, more_in_row) = if lone { (more, None) } else { (None, more) };
-        let head = self.head(person, accent, calling, more_in_head, cx);
+        let head = self.head(person, banner_path, accent, calling, more_in_head, cx);
         let mut top = div()
             .px(px(theme::PANE_PAD))
             .flex()
             .flex_col()
-            .child(draw::name_line(person.name.clone(), draw::mark_of(person)).mt(px(12.)))
+            .child(draw::name_line(person.name.clone(), mark).mt(px(12.)))
             .children(draw::soft_line(facts::handle_line(person, profile)))
+            .children(draw::badge_strip("info-badge", &badges))
             .children(draw::presence_row(&line, theme::sidebar(), 2));
         if !lone && (actions.more || actions.message || actions.request || actions.call.is_some()) {
             top = top.child(self.person_actions(person, &actions, &seen, more_in_row, cx).mt(px(16.)));
@@ -668,6 +689,17 @@ impl InfoPane {
                 any = true;
                 sections = sections.child(self.in_common(person, &common, cx));
             }
+            if !profile.connections.is_empty() {
+                sections = sections.child(draw::label("Connections", !any));
+                any = true;
+                for (ix, conn) in profile.connections.iter().enumerate() {
+                    let url = conn.url.clone();
+                    let row = draw::connection_row(("info-conn", ix), conn).when(!url.is_empty(), |row| {
+                        row.on_click(move |_, _, cx| cx.open_url(&url))
+                    });
+                    sections = sections.child(row);
+                }
+            }
             let safety_digits = profile
                 .fields
                 .iter()
@@ -733,13 +765,13 @@ impl InfoPane {
         body
     }
 
-    fn head(&self, person: &Person, accent: Option<u32>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
+    fn head(&self, person: &Person, banner_path: Option<String>, accent: Option<u32>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
         let ring = Ring::on(theme::sidebar());
         // The band's slot is kept with or without a colour, so nothing below moves.
         div()
             .relative()
             .h(px(16. + draw::AVATAR))
-            .children(accent.map(|color| div().absolute().top_0().left_0().right_0().h(px(draw::BAND)).bg(draw::band(color, theme::sidebar()))))
+            .children(draw::banner_band(banner_path, accent, theme::sidebar()))
             .child(
                 div()
                     .absolute()

@@ -39,6 +39,13 @@ fn refused(why: impl std::fmt::Display) -> Refusal {
     Refusal::Refused(why.to_string())
 }
 
+/// Extracts `YYYY-MM-DD` from an ISO 8601 timestamp like `2022-05-10T12:00:00+00:00`.
+fn iso_date(raw: &str) -> Option<String> {
+    let prefix = raw.get(0..10)?;
+    model::iso_seconds(raw)?;
+    Some(prefix.to_owned())
+}
+
 #[derive(Deserialize)]
 struct GuildCounts {
     #[serde(default)]
@@ -159,15 +166,97 @@ impl Discord {
                 let _ = self.ctx.media_variants(&id, &sizes);
             }
         }
+        let mut media: Vec<(protocol::MediaFile, String)> = Vec::new();
+        let text = profile.user_profile.as_ref();
+        let member_text = profile.guild_member_profile.as_ref();
+        let banner = space
+            .and_then(|guild| {
+                member_text
+                    .and_then(|p| p.banner.as_deref())
+                    .filter(|h| !h.is_empty())
+                    .map(|hash| model::member_banner(guild, person, hash))
+            })
+            .or_else(|| {
+                text.and_then(|p| p.banner.as_deref())
+                    .filter(|h| !h.is_empty())
+                    .or_else(|| profile.user.as_ref().and_then(|u| u.banner.as_deref()).filter(|h| !h.is_empty()))
+                    .map(|hash| model::user_banner(person, hash))
+            });
+        let banner_file = banner.map(|(file, url)| {
+            media.push((file.clone(), url));
+            file
+        });
+        let accent = member_text
+            .and_then(|p| p.accent_color)
+            .or_else(|| text.and_then(|p| p.accent_color))
+            .or_else(|| profile.user.as_ref().and_then(|u| u.accent_color))
+            .or_else(|| member_text.and_then(|p| p.theme_colors.as_ref()).and_then(|c| c.first().copied()))
+            .or_else(|| text.and_then(|p| p.theme_colors.as_ref()).and_then(|c| c.first().copied()));
+
+        let mut seen_badges = std::collections::HashSet::new();
+        let mut badges = Vec::new();
+        for badge in profile.badges.iter().chain(profile.guild_badges.iter()) {
+            if !badge.id.is_empty() && !seen_badges.insert(badge.id.clone()) {
+                continue;
+            }
+            let name = if !badge.description.is_empty() {
+                badge.description.clone()
+            } else {
+                badge.id.clone()
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let icon = badge.icon.as_deref().filter(|h| !h.is_empty()).map(|hash| {
+                let (file, url) = model::badge_icon(hash);
+                media.push((file.clone(), url));
+                file
+            });
+            badges.push(protocol::ProfileBadge { name, icon });
+        }
+        if !media.is_empty() {
+            let _ = self.ctx.media(&media);
+        }
+
+        let connections: Vec<protocol::ProfileConnection> = profile
+            .connected_accounts
+            .iter()
+            .filter(|c| !c.kind.is_empty() && !c.name.is_empty())
+            .map(|c| protocol::ProfileConnection {
+                service: model::connection_label(&c.kind),
+                name: c.name.clone(),
+                url: model::connection_url(&c.kind, &c.id, &c.name),
+                verified: c.verified,
+            })
+            .collect();
+        let server_tag = profile
+            .user
+            .as_ref()
+            .and_then(|u| u.primary_guild.as_ref())
+            .filter(|pg| pg.identity_enabled != Some(false))
+            .and_then(|pg| pg.tag.clone())
+            .unwrap_or_default();
+        let mut fields = Vec::new();
+        if let Some(date) = profile.premium_since.as_deref().and_then(iso_date) {
+            fields.push(("Nitro since".to_owned(), date));
+        }
+        if let Some(date) = profile.premium_guild_since.as_deref().and_then(iso_date) {
+            fields.push(("Boosting since".to_owned(), date));
+        }
+
         let state = crate::hub::lock(&self.state);
         let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
-        let text = profile.user_profile.as_ref();
         let mut about = About {
             bio: profile.bio(),
             mutual_spaces: shared.map(|guild| guild.name.clone()).take(protocol::MUTUAL_SPACES).collect(),
             mutual_total: profile.mutual_guilds.len() as u32,
             pronouns: text.map(|text| text.pronouns.clone()).unwrap_or_default(),
-            accent: text.and_then(|text| text.accent_color),
+            accent,
+            banner: banner_file,
+            badges,
+            connections,
+            server_tag,
+            fields,
             // An id carries the moment it was made: the day they joined Discord.
             since: Some(model::seconds(person)).filter(|since| *since > 1_420_070_400),
             ..About::default()

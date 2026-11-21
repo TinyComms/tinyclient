@@ -880,6 +880,15 @@ pub struct Profile {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<Warning>,
+    /// Badges shown on their profile (Nitro, HypeSquad, Booster, etc.), at most [`PROFILE_BADGES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub badges: Vec<ProfileBadge>,
+    /// External accounts linked on their profile, at most [`PROFILE_CONNECTIONS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<ProfileConnection>,
+    /// Short guild/clan tag beside their name (e.g. Discord's primary guild tag).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_tag: String,
 }
 
 impl Profile {
@@ -911,6 +920,9 @@ impl Profile {
             away_until: None,
             note: String::new(),
             warning: None,
+            badges: Vec::new(),
+            connections: Vec::new(),
+            server_tag: String::new(),
         }
     }
 }

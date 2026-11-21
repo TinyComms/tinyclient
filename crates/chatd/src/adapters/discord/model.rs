@@ -105,6 +105,14 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(de: D) -> 
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
+pub struct PrimaryGuild {
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub identity_enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct User {
     pub id: String,
     #[serde(default, deserialize_with = "nullable")]
@@ -113,6 +121,12 @@ pub struct User {
     pub global_name: Option<String>,
     #[serde(default)]
     pub avatar: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub accent_color: Option<u32>,
+    #[serde(default)]
+    pub primary_guild: Option<PrimaryGuild>,
     #[serde(default, deserialize_with = "nullable")]
     pub discriminator: String,
     #[serde(default, deserialize_with = "nullable")]
@@ -211,6 +225,93 @@ pub fn member_avatar(guild: &str, user: &str, hash: &str) -> (MediaFile, String)
         sized(format!("mavatar:{guild}:{user}:{hash}"), MediaKind::Avatar, 80),
         format!("{}/guilds/{guild}/users/{user}/avatars/{hash}.webp?size=80{}", cdn(), moving(hash)),
     )
+}
+
+pub fn user_banner(user: &str, hash: &str) -> (MediaFile, String) {
+    (
+        MediaFile {
+            width: 600,
+            height: 240,
+            ..MediaFile::new(format!("banner:{user}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/banners/{user}/{hash}.webp?size=600{}", cdn(), moving(hash)),
+    )
+}
+
+pub fn member_banner(guild: &str, user: &str, hash: &str) -> (MediaFile, String) {
+    (
+        MediaFile {
+            width: 600,
+            height: 240,
+            ..MediaFile::new(format!("mbanner:{guild}:{user}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/guilds/{guild}/users/{user}/banners/{hash}.webp?size=600{}", cdn(), moving(hash)),
+    )
+}
+
+pub fn badge_icon(hash: &str) -> (MediaFile, String) {
+    (
+        sized(format!("badge:{hash}"), MediaKind::Image, 24),
+        format!("{}/badge-icons/{hash}.png", cdn()),
+    )
+}
+
+pub fn connection_label(kind: &str) -> String {
+    match kind {
+        "github" => "GitHub".to_owned(),
+        "twitter" | "x" => "X".to_owned(),
+        "twitch" => "Twitch".to_owned(),
+        "youtube" => "YouTube".to_owned(),
+        "spotify" => "Spotify".to_owned(),
+        "steam" => "Steam".to_owned(),
+        "reddit" => "Reddit".to_owned(),
+        "bluesky" => "Bluesky".to_owned(),
+        "tiktok" => "TikTok".to_owned(),
+        "instagram" => "Instagram".to_owned(),
+        "facebook" => "Facebook".to_owned(),
+        "domain" => "Website".to_owned(),
+        "xbox" => "Xbox".to_owned(),
+        "playstation" => "PlayStation".to_owned(),
+        "ebay" => "eBay".to_owned(),
+        "paypal" => "PayPal".to_owned(),
+        "epicgames" => "Epic Games".to_owned(),
+        "battlenet" => "Battle.net".to_owned(),
+        "riotgames" => "Riot Games".to_owned(),
+        "leagueoflegends" => "League of Legends".to_owned(),
+        "crunchyroll" => "Crunchyroll".to_owned(),
+        "roblox" => "Roblox".to_owned(),
+        "bungie" => "Bungie".to_owned(),
+        "skype" => "Skype".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+pub fn connection_url(kind: &str, id: &str, name: &str) -> String {
+    let clean = name.trim();
+    let handle = clean.trim_start_matches('@');
+    match kind {
+        "github" if !clean.is_empty() => format!("https://github.com/{clean}"),
+        "twitter" | "x" if !handle.is_empty() => format!("https://x.com/{handle}"),
+        "twitch" if !clean.is_empty() => format!("https://twitch.tv/{clean}"),
+        "youtube" if !id.is_empty() => format!("https://www.youtube.com/channel/{id}"),
+        "spotify" if !id.is_empty() => format!("https://open.spotify.com/user/{id}"),
+        "steam" if !id.is_empty() => format!("https://steamcommunity.com/profiles/{id}"),
+        "reddit" if !clean.is_empty() => format!("https://www.reddit.com/u/{clean}"),
+        "bluesky" if !handle.is_empty() => format!("https://bsky.app/profile/{handle}"),
+        "tiktok" if !handle.is_empty() => format!("https://www.tiktok.com/@{handle}"),
+        "instagram" if !handle.is_empty() => format!("https://www.instagram.com/{handle}"),
+        "facebook" if !id.is_empty() => format!("https://www.facebook.com/{id}"),
+        "domain" if !clean.is_empty() => format!("https://{clean}"),
+        "ebay" if !clean.is_empty() => format!("https://www.ebay.com/usr/{clean}"),
+        "roblox" if !id.is_empty() => format!("https://www.roblox.com/users/{id}/profile"),
+        _ => String::new(),
+    }
 }
 
 pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
@@ -1053,6 +1154,32 @@ pub struct ProfileText {
     pub pronouns: String,
     #[serde(default)]
     pub accent_color: Option<u32>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub theme_colors: Option<Vec<u32>>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ProfileBadge {
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub description: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ConnectedAccount {
+    #[serde(rename = "type", default, deserialize_with = "nullable")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub verified: bool,
 }
 
 /// Their membership of the server asked about (`guild_id` on the profile request).
@@ -1078,10 +1205,22 @@ pub struct Profile {
     pub user: Option<User>,
     #[serde(default)]
     pub user_profile: Option<ProfileText>,
+    #[serde(default)]
+    pub guild_member_profile: Option<ProfileText>,
     #[serde(default, deserialize_with = "nullable")]
     pub mutual_guilds: Vec<MutualGuild>,
     #[serde(default)]
     pub guild_member: Option<ProfileMember>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub badges: Vec<ProfileBadge>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub guild_badges: Vec<ProfileBadge>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub connected_accounts: Vec<ConnectedAccount>,
+    #[serde(default)]
+    pub premium_since: Option<String>,
+    #[serde(default)]
+    pub premium_guild_since: Option<String>,
 }
 
 impl Profile {

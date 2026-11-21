@@ -4192,6 +4192,19 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
         // Phone numbers are never drawn in full until clicked, whoever the network is.
         contact.masked |= contact.kind == protocol::ContactKind::Phone;
     }
+    about.badges.retain(|badge| !badge.name.trim().is_empty());
+    about.badges.truncate(protocol::PROFILE_BADGES);
+    for badge in &mut about.badges {
+        clip(&mut badge.name, 64);
+    }
+    about.connections.retain(|c| !c.service.trim().is_empty() && !c.name.trim().is_empty());
+    about.connections.truncate(protocol::PROFILE_CONNECTIONS);
+    for conn in &mut about.connections {
+        clip(&mut conn.service, 32);
+        clip(&mut conn.name, 128);
+        clip(&mut conn.url, 256);
+    }
+    clip(&mut about.server_tag, 16);
     let mut profile = Profile::of(person);
     profile.bio = about.bio;
     profile.mutual_spaces = about.mutual_spaces;
@@ -4217,6 +4230,9 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.away_until = about.away_until;
     profile.note = about.note;
     profile.warning = about.warning;
+    profile.badges = about.badges;
+    profile.connections = about.connections;
+    profile.server_tag = about.server_tag;
     profile
 }
 

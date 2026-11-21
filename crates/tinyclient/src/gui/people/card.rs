@@ -297,19 +297,38 @@ impl Floating {
         let actions = facts::actions(person, &seen, Surface::Card);
         let place = self.place.as_ref().map(|(_, name)| name.as_str());
         let ring = Ring::on(theme::overlay());
+        let banner_path = profile
+            .and_then(|p| p.banner.as_ref())
+            .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
         let head = div()
             .relative()
             .h(px(16. + draw::AVATAR))
-            .children(profile.and_then(|profile| profile.accent).map(|color| {
-                div().absolute().top_0().left_0().right_0().h(px(draw::BAND)).bg(draw::band(color, theme::overlay()))
-            }))
+            .children(draw::banner_band(banner_path, profile.and_then(|p| p.accent), theme::overlay()))
             .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, person, draw::AVATAR, &ring, calling, cx)));
+        let badges: Vec<(String, Option<String>)> = profile
+            .map(|p| {
+                p.badges
+                    .iter()
+                    .map(|b| {
+                        let path = b.icon.as_ref().and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                        (b.name.clone(), path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mark = draw::mark_of(person).or_else(|| {
+            profile
+                .map(|p| p.server_tag.as_str())
+                .filter(|t| !t.is_empty())
+                .map(|t| draw::tag(t.to_owned(), false))
+        });
         let mut top = div()
             .px(px(16.))
             .flex()
             .flex_col()
-            .child(draw::name_line(person.name.clone(), draw::mark_of(person)).mt(px(12.)))
+            .child(draw::name_line(person.name.clone(), mark).mt(px(12.)))
             .children(draw::soft_line(facts::handle_line(person, profile)))
+            .children(draw::badge_strip("card-badge", &badges))
             .children(draw::presence_row(&line, theme::overlay(), 2))
             .when(actions.message || actions.request || actions.call.is_some(), |top| {
                 top.child(self.card_actions(person, &actions, cx).mt(px(16.)))
@@ -375,6 +394,18 @@ impl Floating {
                         .children(icons)
                         .child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(common.words)),
                 );
+            }
+            if !profile.connections.is_empty() {
+                any = true;
+                let mut conns = div().flex().flex_col();
+                for (ix, conn) in profile.connections.iter().take(4).enumerate() {
+                    let url = conn.url.clone();
+                    let row = draw::connection_row(("card-conn", ix), conn).when(!url.is_empty(), |row| {
+                        row.on_click(move |_, _, cx| cx.open_url(&url))
+                    });
+                    conns = conns.child(row);
+                }
+                body = body.child(conns);
             }
         }
         let max = f32::from(window.viewport_size().height) - 16.;

@@ -5693,3 +5693,93 @@ fn group_dm_rename_icon_remove_transfer_owner_and_silent_leave() {
         deletes[0].path
     );
 }
+
+#[test]
+fn profile_parses_banner_badges_connections_nitro_and_server_tag() {
+    let world = World::start();
+
+    // Script GET /users/2001/profile with banner, guild_member_profile banner, 3 badges, 2 connected accounts, Nitro/boost dates, and primary_guild server tag.
+    world.discord.script(
+        "/users/2001/profile",
+        200,
+        json!({
+            "user": {
+                "id": "2001",
+                "username": "mara",
+                "global_name": "Mara Okafor",
+                "avatar": "av2001",
+                "banner": "userban1",
+                "accent_color": 3447003,
+                "primary_guild": {"tag": "RUST", "identity_enabled": true}
+            },
+            "user_profile": {
+                "bio": "Systems programmer",
+                "pronouns": "she/her",
+                "banner": "userban1",
+                "accent_color": 5793266,
+                "theme_colors": [1118481, 2236962]
+            },
+            "guild_member_profile": {
+                "banner": "guildban4000",
+                "accent_color": 15105570
+            },
+            "guild_member": {
+                "nick": "Mara (Mod)",
+                "roles": ["4010"],
+                "joined_at": "2023-03-01T12:00:00+00:00"
+            },
+            "mutual_guilds": [{"id": "4000"}],
+            "badges": [
+                {"id": "premium", "description": "Subscriber since May 2022", "icon": "2ba85e8026a8614b640c2837bcdfe21b"},
+                {"id": "hypesquad_house_1", "description": "HypeSquad Bravery", "icon": "8a88d63823d8a71cd5e390baa45efa02"}
+            ],
+            "guild_badges": [
+                {"id": "guild_booster_lvl3", "description": "Server boosting since Jun 2023", "icon": "ec92202290b48d0879b7413d2dde3bab"}
+            ],
+            "connected_accounts": [
+                {"type": "github", "id": "42", "name": "mara-dev", "verified": true},
+                {"type": "spotify", "id": "sp99", "name": "Mara Beats", "verified": false}
+            ],
+            "premium_since": "2022-05-10T12:00:00+00:00",
+            "premium_guild_since": "2023-06-01T00:00:00+00:00"
+        }),
+    );
+
+    let profile = match world.ask(Request::Profile {
+        person: world.key("2001"),
+        space: Some(world.key("4000")),
+    }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected Response::Profile, got {other:?}"),
+    };
+
+    // Per-server banner wins over global user banner, and per-server accent wins too.
+    assert_eq!(profile.banner.as_ref().map(|b| b.id.as_str()), Some("mbanner:4000:2001:guildban4000"));
+    assert_eq!(profile.accent, Some(15105570));
+    assert_eq!(profile.server_tag, "RUST");
+
+    // 3 badges (2 user + 1 guild), each with registered icon.
+    assert_eq!(profile.badges.len(), 3);
+    assert_eq!(profile.badges[0].name, "Subscriber since May 2022");
+    assert_eq!(profile.badges[0].icon.as_ref().map(|i| i.id.as_str()), Some("badge:2ba85e8026a8614b640c2837bcdfe21b"));
+    assert_eq!(profile.badges[1].name, "HypeSquad Bravery");
+    assert_eq!(profile.badges[2].name, "Server boosting since Jun 2023");
+
+    // 2 connected accounts with proper service labels, URLs, and verified flags.
+    assert_eq!(profile.connections.len(), 2);
+    assert_eq!(profile.connections[0].service, "GitHub");
+    assert_eq!(profile.connections[0].name, "mara-dev");
+    assert_eq!(profile.connections[0].url, "https://github.com/mara-dev");
+    assert!(profile.connections[0].verified);
+    assert_eq!(profile.connections[1].service, "Spotify");
+    assert_eq!(profile.connections[1].name, "Mara Beats");
+    assert_eq!(profile.connections[1].url, "https://open.spotify.com/user/sp99");
+    assert!(!profile.connections[1].verified);
+
+    // Nitro and boosting dates surfaced in profile fields.
+    assert!(profile.fields.iter().any(|(k, v)| k == "Nitro since" && v == "2022-05-10"));
+    assert!(profile.fields.iter().any(|(k, v)| k == "Boosting since" && v == "2023-06-01"));
+
+    // All parsed from the single existing GET /users/2001/profile request — zero extra HTTP calls.
+    assert_eq!(world.discord.requests_to("GET", "/users/2001/profile").len(), 1);
+}
