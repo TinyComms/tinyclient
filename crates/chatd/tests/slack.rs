@@ -3204,3 +3204,109 @@ fn slack_browse_preview_and_join_public_channel() {
     assert_eq!(joined.space.as_deref(), Some("T01ALPHA"));
     assert_eq!(world.fake.calls(ALPHA, "conversations.join").len(), 1);
 }
+
+#[test]
+fn slack_block_kit_images_video_stacked_cards_and_layout() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let ts = "1760000990.000100";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "ts": ts,
+        "text": "Deploy summary",
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "Release v4"}},
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "All green"},
+                "accessory": {
+                    "type": "image",
+                    "image_url": "https://a.slack-edge.com/thumb.png",
+                    "alt_text": "status badge"
+                }
+            },
+            {
+                "type": "image",
+                "title": {"type": "plain_text", "text": "Hosted chart"},
+                "image_url": "https://i0.wp.com/slack-imgs.com/chart.png",
+                "alt_text": "chart"
+            },
+            {
+                "type": "image",
+                "title": {"type": "plain_text", "text": "External img"},
+                "image_url": "https://untrusted.example.org/pic.png",
+                "alt_text": "external"
+            },
+            {
+                "type": "video",
+                "title": {"type": "plain_text", "text": "Demo clip"},
+                "title_url": "https://example.com/demo",
+                "video_url": "https://example.com/demo/embed",
+                "thumbnail_url": "https://a.slack-edge.com/video-thumb.jpg",
+                "provider_name": "Vimeo",
+                "description": {"type": "plain_text", "text": "Walkthrough"}
+            },
+            {
+                "type": "markdown",
+                "text": "*Bold note*"
+            }
+        ],
+        "attachments": [
+            {
+                "color": "#36a64f",
+                "author_name": "BuildBot",
+                "title": "Build #101",
+                "title_link": "https://ci.example.com/101",
+                "text": "Passed in 2m",
+                "fields": [
+                    {"title": "Branch", "value": "main", "short": true},
+                    {"title": "Commit", "value": "abc1234", "short": true}
+                ],
+                "image_url": "https://files.slack.com/files-pri/T01ALPHA-F1/build.png",
+                "footer": "CI"
+            },
+            {
+                "color": "#ff9900",
+                "author_name": "AlertBot",
+                "title": "Staging warning",
+                "text": "Disk at 80%",
+                "fields": [
+                    {"title": "Host", "value": "stage-1", "short": true}
+                ],
+                "footer": "Monitor"
+            }
+        ]
+    }));
+
+    let msg = world.until("block kit message stored", || world.message(&general, ts));
+    // Divider and external image fallback preserved in text; markdown rendered; hosted images attached inline.
+    assert!(msg.text.contains("───"), "divider should render as separator line: {}", msg.text);
+    assert!(msg.text.contains("[image: External img]"), "unhosted external image must stay named, not fetched");
+    assert!(!msg.text.contains("Open in Slack"), "supported video/markdown/divider blocks must not trigger undrawn fallback");
+
+    // Hosted section accessory image attached inline (slack-edge.com).
+    assert!(msg.attachments.iter().any(|a| a.name == "status badge" && a.file.kind == MediaKind::Image));
+
+    // Video block mapped to Preview with link and hosted thumbnail.
+    let vid = msg.previews.iter().find(|p| p.url == "https://example.com/demo").expect("video block preview");
+    assert_eq!(vid.title, "Demo clip");
+    assert_eq!(vid.site, "Vimeo");
+    assert!(vid.image.is_some(), "hosted video thumbnail should be preserved");
+
+    // Two separate stacked cards with author, title_link, fields, and hosted card image.
+    let cards: Vec<_> = msg.all_cards().collect();
+    assert_eq!(cards.len(), 2, "both attachments should become separate cards");
+    assert_eq!(cards[0].author, "BuildBot");
+    assert_eq!(cards[0].title, "Build #101");
+    assert_eq!(cards[0].title_link, "https://ci.example.com/101");
+    assert_eq!(cards[0].fields.len(), 2);
+    assert!(cards[0].image.is_some(), "hosted card image_url should be preserved");
+    assert_eq!(cards[1].author, "AlertBot");
+    assert_eq!(cards[1].title, "Staging warning");
+    assert_eq!(cards[1].fields.len(), 1);
+}

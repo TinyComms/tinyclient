@@ -636,6 +636,7 @@ fn card(embed: &Embed, names: &dyn Names) -> Card {
         footer: embed.footer.as_ref().map_or_else(String::new, |footer| footer.text.clone()),
         color: embed.color,
         sponsored: false,
+        ..Card::default()
     }
 }
 
@@ -870,6 +871,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_subsec_millis: 0,
         seal: protocol::Seal::Plain,
         card,
+        cards: Vec::new(),
         deleted: false,
         moderated: false,
         forwarded: forwarded_from,

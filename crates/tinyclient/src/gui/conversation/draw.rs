@@ -922,7 +922,7 @@ impl Pane {
                                 .child(format!("✨ {effect}")),
                         )
                 }))
-                .children(message.card.as_deref().map(|card| self.app_card(card)))
+                .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(ix, card)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(self.cards(message, window, cx));
         }
@@ -2129,7 +2129,7 @@ impl Pane {
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
-    fn app_card(&self, card: &Card) -> AnyElement {
+    fn app_card(&self, ix: usize, card: &Card) -> AnyElement {
         let bar = match media::card_tone(card.color) {
             media::Tone::Positive => theme::positive(),
             media::Tone::Danger => theme::danger(),
@@ -2142,9 +2142,26 @@ impl Pane {
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().truncate().type_small().text_color(theme::text_faint()).child(label.clone()))
+                .children((!label.is_empty()).then(|| div().truncate().type_small().text_color(theme::text_faint()).child(label.clone())))
                 .child(div().type_ui().child(value.clone()))
         };
+        let title_el = (!card.title.is_empty()).then(|| {
+            if card.title_link.is_empty() {
+                div().type_body().font_weight(theme::SEMIBOLD).child(card.title.clone()).into_any_element()
+            } else {
+                let url = card.title_link.clone();
+                div()
+                    .id(("card-title-link", ix))
+                    .type_body()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(card.title.clone())
+                    .into_any_element()
+            }
+        });
         let words = div()
             .flex_1()
             .min_w_0()
@@ -2153,7 +2170,8 @@ impl Pane {
             .flex()
             .flex_col()
             .gap(px(4.))
-            .children((!card.title.is_empty()).then(|| div().type_body().font_weight(theme::SEMIBOLD).child(card.title.clone())))
+            .children((!card.author.is_empty()).then(|| div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(card.author.clone())))
+            .children(title_el)
             .children((!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone())))
             .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
             .children((!card.footer.is_empty()).then(|| div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone())));

@@ -285,7 +285,11 @@ pub struct Forwarded {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title_link: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
     /// Label and value, in the network's order, at most [`CARD_FIELDS`].
@@ -293,6 +297,12 @@ pub struct Card {
     pub fields: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub footer: String,
+    /// Full-width image inside the card (when hosted by the network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<MediaFile>,
+    /// Small thumbnail image beside the card's text (when hosted by the network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<MediaFile>,
     /// The accent the network gave it, `0xRRGGBB`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<u32>,
@@ -552,6 +562,9 @@ pub struct Message {
     pub forwarded: Option<Box<Forwarded>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<Box<Card>>,
+    /// Additional stacked cards beyond the first `card` (e.g. multiple Slack attachments).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<Card>,
     /// Boxed, like `card`: few messages are a poll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<Box<Poll>>,
@@ -696,6 +709,7 @@ impl Message {
             thread: None,
             forwarded: None,
             card: None,
+            cards: Vec::new(),
             poll: None,
             deleted: false,
             moderated: false,
@@ -789,6 +803,11 @@ impl Message {
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
+    /// Iterates over every card on this message (`card` first, then `cards`).
+    pub fn all_cards(&self) -> impl Iterator<Item = &Card> {
+        self.card.as_deref().into_iter().chain(self.cards.iter())
+    }
+
     pub fn tombstone(&mut self) {
         self.text.clear();
         self.spans.clear();
@@ -798,6 +817,7 @@ impl Message {
         self.reply_to = None;
         self.forwarded = None;
         self.card = None;
+        self.cards.clear();
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();
