@@ -221,6 +221,14 @@ pub struct SharedPage {
     pub total: Option<u32>,
 }
 
+/// One page of workspace/account-wide files (`Command::AccountFiles`).
+#[derive(Debug, Clone, Default)]
+pub struct AccountFilesPage {
+    pub items: Vec<SharedItem>,
+    pub cursor: Option<String>,
+    pub more: bool,
+}
+
 /// A page of a picker's catalog, and where the next one starts.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogPage {
@@ -277,6 +285,8 @@ pub enum Command {
     HistoryAround { conversation_id: String, around: String },
     /// The user opened a Space: bring its tree up to date if the network needs asking.
     OpenSpace(String),
+    /// The user collapsed or expanded a Space group (Discord category sync).
+    Collapse { space_id: String, group_id: String, collapsed: bool },
     /// Tell the network the conversation has been read up to this message.
     MarkRead { conversation_id: String, message_id: String },
     /// Tell the network the marker moved back. `message_id` is the last message that still
@@ -462,6 +472,12 @@ pub enum Command {
         item_id: Option<String>,
         reply: Reply<()>,
     },
+    /// Members who have read a given message (`Request::ReadBy`).
+    ReadBy {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<Vec<protocol::ReadBy>>,
+    },
     /// Add a bookmark to a channel.
     BookmarkAdd {
         conversation_id: String,
@@ -503,6 +519,19 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<()>,
     },
+    /// Paged workspace/account-wide file list (Slack `files.list` without a channel).
+    AccountFiles {
+        query: String,
+        kind: Option<String>,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<AccountFilesPage>,
+    },
+    /// Delete a file on the network (Slack `files.delete`).
+    DeleteFile {
+        file_id: String,
+        reply: Reply<()>,
+    },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
     /// Preview a Space invite link or code.
@@ -514,6 +543,21 @@ pub enum Command {
     InviteJoin {
         code: String,
         reply: Reply<(Option<String>, Option<String>)>,
+    },
+    /// Moderate a member in a Space (kick, ban, timeout, untimeout, nickname).
+    Moderate {
+        space_id: String,
+        person_id: String,
+        action: protocol::ModerateAction,
+        reason: String,
+        reply: Reply<()>,
+    },
+    /// Lift a member ban in a Space.
+    Unban {
+        space_id: String,
+        person_id: String,
+        reason: String,
+        reply: Reply<()>,
     },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
@@ -565,6 +609,31 @@ pub enum Command {
         remind_at: Option<i64>,
         reply: Reply<()>,
     },
+    /// Lists pending scheduled messages for one conversation (Slack `chat.scheduledMessages.list`).
+    ScheduledList {
+        conversation_id: String,
+        reply: Reply<Vec<protocol::ScheduledMessage>>,
+    },
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    CancelScheduled {
+        conversation_id: String,
+        scheduled_id: String,
+        reply: Reply<()>,
+    },
+    /// Edits/reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
+    Reschedule {
+        conversation_id: String,
+        scheduled_id: String,
+        text: Option<String>,
+        post_at: i64,
+        reply: Reply<protocol::ScheduledMessage>,
+    },
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`).
+    FollowThread {
+        conversation_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -586,6 +655,17 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
+    /// Executes an interactive Block Kit control on a message (Slack `blocks.actions`).
+    MessageAction {
+        conversation_id: String,
+        message_id: String,
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        value: String,
+        values: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -594,6 +674,12 @@ pub enum Command {
         to_conversation_ids: Vec<String>,
         note: String,
         reply: Reply<Vec<(String, Result<(), String>)>>,
+    },
+    /// Save or remove a GIF in the user's saved GIFs collection (`messages.saveGif`).
+    SaveGif {
+        id: String,
+        unsave: bool,
+        reply: Reply<()>,
     },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
@@ -786,6 +872,8 @@ impl Command {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::Moderate { reply, .. }
+            | Command::Unban { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
@@ -794,13 +882,19 @@ impl Command {
             | Command::Star { reply, .. }
             | Command::File { reply, .. }
             | Command::StarMessage { reply, .. }
-            | Command::Remind { reply, .. } => {
+            | Command::Remind { reply, .. }
+            | Command::CancelScheduled { reply, .. }
+            | Command::FollowThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -809,12 +903,15 @@ impl Command {
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
-            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::Join { reply, .. }
+            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
@@ -972,6 +1069,15 @@ impl Context {
         Ok(())
     }
 
+    /// Sets whether the user can create channels in `space_id`.
+    pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
     /// One Space's whole tree: only what the user may see, in the network's order. Rows go
     /// straight to the store; keep none of them.
     pub fn tree(&self, space_id: &str, groups: &[Group], conversations: &[ConversationRow]) -> Stores {
@@ -986,6 +1092,15 @@ impl Context {
         let space = self.key(space_id);
         self.hub.store().upsert_group(&space, group)?;
         self.hub.changed(Change::Tree { space });
+        Ok(())
+    }
+
+    /// Updates a group's collapsed state from the network (e.g. Discord category settings).
+    pub fn set_collapsed(&self, space_id: &str, group_id: &str, collapsed: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_collapsed(&space, group_id, collapsed)? {
+            self.hub.changed(Change::Tree { space });
+        }
         Ok(())
     }
 

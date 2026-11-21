@@ -217,10 +217,10 @@ fn me_on(account: &AccountKey) -> Person {
 
 fn sender(id: &str) -> Sender {
     if id == ME {
-        return Sender { id: ME.into(), name: ME_NAME.into(), avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")), bot: false };
+        return Sender { id: ME.into(), name: ME_NAME.into(), avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")), bot: false, ..Sender::default() };
     }
     let who = who(id).expect("a person of the fixture");
-    Sender { id: id.into(), name: who.name.into(), avatar: who.photo.map(|name| face(who.id, name)), bot: false }
+    Sender { id: id.into(), name: who.name.into(), avatar: who.photo.map(|name| face(who.id, name)), bot: false, ..Sender::default() }
 }
 
 // Conversations.
@@ -1134,6 +1134,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             rules: serde_json::from_value(serde_json::json!({})).expect("the default rules"),
         },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
+        Request::SaveGif { .. } => Response::Ok,
         Request::Watch(watching) => {
             let people = watching
                 .people

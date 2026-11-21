@@ -712,12 +712,15 @@ fn offline(ctx: &Context, command: Command) {
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Report { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ReportReasons { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::CallHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -843,10 +846,17 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
             let _ = reply.send(info::forward(account, &from_conversation_id, &message_ids, &to_conversation_ids, &note).map_err(refused));
         }
-        Command::Search { query, scope, reply, .. } => {
+        Command::Report { target, reason, note, block, reply } => {
+            let _ = reply.send(info::report(account, &target, reason, &note, block).map_err(refused));
+        }
+        Command::ReportReasons { reply, .. } => {
+            let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
+        }
+        Command::Search { query, scope, cursor, reply, .. } => {
             let result = match scope {
                 super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
-                super::SearchScope::Space(_) | super::SearchScope::Account => Err(Refusal::Unsupported),
+                super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
+                super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result);
         }
@@ -867,6 +877,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
+        }
+        Command::SaveGif { id, unsave, reply } => {
+            let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {

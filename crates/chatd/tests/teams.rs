@@ -190,6 +190,8 @@ struct Fake {
     heard: Mutex<Vec<String>>,
     pushed: AtomicU32,
     posted: AtomicU32,
+    /// Optional replacement payload for `/api/csa/api/v1/teams/users/me`.
+    teams_override: Mutex<Option<Value>>,
 }
 
 impl Fake {
@@ -206,6 +208,7 @@ impl Fake {
             heard: Mutex::default(),
             pushed: AtomicU32::new(0),
             posted: AtomicU32::new(0),
+            teams_override: Mutex::default(),
         });
         let serving = fake.clone();
         std::thread::spawn(move || {
@@ -319,7 +322,15 @@ impl Fake {
                 authz["tokens"]["skypeToken"] = skype.into();
                 ok(authz)
             }
-            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => ok(self.fixture("teams.users.me").unwrap()),
+            "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => {
+                let body = self
+                    .teams_override
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| self.fixture("teams.users.me").unwrap());
+                ok(body)
+            }
             "/v4/a" if header("x-skypetoken") == skype => ok(json!({
                 "socketio": format!("{}/", self.base), "surl": format!("{}/v4/f/abc123/", self.base),
                 "url": format!("{}/v4/f/abc123/", self.base), "ttl": 587_000, "ccid": "cc-1",
@@ -357,6 +368,19 @@ impl Fake {
             },
             _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
             _ if path.starts_with("/upload/") => self.upload(call),
+            _ if path.starts_with("/ams/v1/objects") && (call.method == "POST" || call.method == "PUT") => {
+                if header("authorization") != format!("skype_token {skype}") {
+                    return unauthorized();
+                }
+                if call.method == "POST" && path == "/ams/v1/objects" {
+                    let n = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
+                    return answer("201 Created", json!({"id": format!("0-neu-d1-img{n}")}));
+                }
+                if call.method == "PUT" && path.ends_with("/content/imgpsh") {
+                    return answer("201 Created", json!({}));
+                }
+                answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
+            }
             _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") => Reply {
                 status: "200 OK",
                 headers: Vec::new(),
@@ -2341,3 +2365,471 @@ fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance(
     assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
 }
 
+#[test]
+fn activity_feed_lists_mentions_replies_reactions_missed_calls_and_marks_read() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Account advertises activity_feed capability.
+    assert!(world.account(HOME).can.activity_feed);
+
+    // 2. Fetch full activity feed from 48:notifications.
+    let account = protocol::AccountKey { network: Network::Teams, account: HOME.to_owned() };
+    let Response::ActivityFeed { items, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected Response::ActivityFeed");
+    };
+    assert_eq!(items.len(), 6, "expected all 6 activity items: {items:?}");
+
+    let mention = items.iter().find(|i| i.id == "1760000900001").expect("mention item");
+    assert_eq!(mention.kind, protocol::ActivityItemKind::Mention);
+    assert_eq!(mention.conversation, key("19:grp1@thread.v2"));
+    assert_eq!(mention.message_id, "1759600000000");
+    assert!(mention.unread);
+
+    let reaction = items.iter().find(|i| i.id == "1760000900003").expect("reaction item");
+    assert_eq!(reaction.kind, protocol::ActivityItemKind::Reaction);
+    assert_eq!(reaction.emoji, "👍");
+    assert_eq!(reaction.text, "Shipped the fix");
+
+    let reply = items.iter().find(|i| i.id == "1760000900004").expect("reply item");
+    assert_eq!(reply.kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(reply.conversation, key(GENERAL));
+    assert_eq!(reply.thread_id.as_deref(), Some("19:platform0general@thread.tacv2;messageid=1760000200200"));
+    assert_eq!(reply.message_id, "1760000210210");
+    assert_eq!(reply.actor, "Ana Ruiz");
+
+    let missed = items.iter().find(|i| i.id == "1760000900005").expect("missed call item");
+    assert_eq!(missed.kind, protocol::ActivityItemKind::Other);
+    assert_eq!(missed.text, "Missed call");
+
+    let added = items.iter().find(|i| i.id == "1760000900006").expect("added-to-team item");
+    assert_eq!(added.kind, protocol::ActivityItemKind::Invite);
+    assert_eq!(added.text, "Added you to Design");
+
+    // 3. Kind filter narrows the returned items.
+    let Response::ActivityFeed { items: reactions_only, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: Some(protocol::ActivityItemKind::Reaction),
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected filtered Response::ActivityFeed");
+    };
+    assert_eq!(reactions_only.len(), 1);
+    assert_eq!(reactions_only[0].id, "1760000900003");
+
+    // 4. Marking a single item read sends PUT isRead and clears unread on refetch.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead {
+            account: account.clone(),
+            item_id: Some("1760000900001".to_owned()),
+        }),
+        Response::Ok
+    );
+    let mark_call = world
+        .fake
+        .calls("PUT", "/48:notifications/messages/1760000900001/properties")
+        .pop()
+        .expect("PUT isRead for activity item");
+    assert_eq!(mark_call.query, "name=isRead");
+
+    let Response::ActivityFeed { items: after_one, .. } = world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected Response::ActivityFeed after mark-one");
+    };
+    assert!(!after_one.iter().find(|i| i.id == "1760000900001").unwrap().unread);
+    assert!(after_one.iter().find(|i| i.id == "1760000900004").unwrap().unread);
+
+    // 5. Marking all read advances 48:notifications consumptionhorizon and clears remaining unread.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead { account: account.clone(), item_id: None }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", "/48:notifications/properties")
+            .iter()
+            .any(|c| c.query == "name=consumptionhorizon"),
+        "expected PUT consumptionhorizon on 48:notifications"
+    );
+    let Response::ActivityFeed { items: after_all, .. } = world.ask(Request::ActivityFeed {
+        account,
+        kind: None,
+        cursor: None,
+        limit: 50,
+    }) else {
+        panic!("expected Response::ActivityFeed after mark-all");
+    };
+    assert!(after_all.iter().all(|i| !i.unread), "all activity items should be read");
+}
+
+#[test]
+fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises image-only attachment capability.
+    let can = world.account(HOME).can;
+    assert!(can.max_file_bytes > 0, "Teams should allow image attachments");
+    assert!(can.max_files > 0);
+    assert!(can.images_only, "Teams should advertise images_only while OneDrive docs stay off");
+
+    // 2. Stage a valid PNG screenshot (with a real IHDR header for 320x200) and a non-image file.
+    let staged = std::path::absolute(format!("/tmp/tinyclient-teams-ams-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&staged).unwrap();
+    let img_path = staged.join("screenshot.png");
+    let mut png_bytes = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
+    png_bytes.extend_from_slice(&320u32.to_be_bytes());
+    png_bytes.extend_from_slice(&200u32.to_be_bytes());
+    png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    std::fs::write(&img_path, &png_bytes).unwrap();
+
+    let doc_path = staged.join("spec.txt");
+    std::fs::write(&doc_path, b"not an image").unwrap();
+
+    // Non-image files are still refused.
+    let doc_send = world.ask(Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000646".into(),
+        text: "doc".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: doc_path.to_string_lossy().into_owned(),
+                name: "spec.txt".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            ..Default::default()
+        },
+    });
+    assert!(!matches!(doc_send, Response::Sent { .. }), "non-image must be refused: {doc_send:?}");
+
+    // 3. Send the pasted PNG screenshot with caption text.
+    let client_id = "1760000999000647";
+    let sent_resp = world.ask(Request::Send {
+        conversation: ana.clone(),
+        client_id: client_id.into(),
+        text: "See attached screenshot".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: img_path.to_string_lossy().into_owned(),
+                name: "screenshot.png".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            ..Default::default()
+        },
+    });
+    assert!(matches!(sent_resp, Response::Sent { .. }), "image send should be accepted: {sent_resp:?}");
+
+    let sent_msg = world.until("image message sent", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some(client_id) && m.state == SendState::Sent)
+    });
+    assert!(sent_msg.text.contains("See attached screenshot"));
+    assert_eq!(sent_msg.attachments.len(), 1);
+    assert_eq!(sent_msg.attachments[0].file.kind, MediaKind::Image);
+
+    // 4. Verify AMS object creation (POST /ams/v1/objects) and image upload (PUT .../content/imgpsh).
+    let create_call = world
+        .fake
+        .calls("POST", "/ams/v1/objects")
+        .pop()
+        .expect("POST /ams/v1/objects");
+    let create_json = create_call.json();
+    assert_eq!(create_json["type"].as_str(), Some("pish/image"));
+    assert_eq!(create_json["filename"].as_str(), Some("screenshot.png"));
+    assert!(create_json["permissions"][CHAT_ANA].is_array());
+
+    let put_call = world
+        .fake
+        .calls("PUT", "/content/imgpsh")
+        .pop()
+        .expect("PUT /ams/v1/objects/{id}/content/imgpsh");
+    assert!(
+        put_call.headers.get("authorization").is_some_and(|v| v.starts_with("skype_token ")),
+        "AMS PUT must carry Authorization: skype_token ..."
+    );
+
+    // 5. Verify posted RichText/Html carries the inline AMS <img> tag with dimensions.
+    let post_call = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == client_id)
+        .expect("chat POST with inline image");
+    let post_body = post_call.json();
+    let html = post_body["content"].as_str().unwrap_or("");
+    assert!(html.contains("See attached screenshot"), "{html}");
+    assert!(html.contains("http://schema.skype.com/AMSImage"), "{html}");
+    assert!(html.contains("/ams/v1/objects/"), "{html}");
+    assert!(html.contains("/views/imgo"), "{html}");
+    assert!(html.contains("width=\"320\"") && html.contains("height=\"200\""), "{html}");
+
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn read_by_lists_readers_and_live_seen_updates_on_horizon_push() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Account advertises read_by capability.
+    assert!(world.account(HOME).can.read_by);
+
+    // 2. Request::ReadBy on Launch crew (19:grp2@thread.v2) returns members who read past message id.
+    let grp2 = key("19:grp2@thread.v2");
+    let Response::ReadBy { readers } = world.ask(Request::ReadBy {
+        conversation: grp2.clone(),
+        message_id: "1759000000000".into(),
+    }) else {
+        panic!("expected Response::ReadBy");
+    };
+    let reader_ids: Vec<&str> = readers.iter().map(|r| r.person.id.as_str()).collect();
+    assert!(reader_ids.contains(&BEN), "Ben read 1759000000000: {readers:?}");
+    assert!(
+        reader_ids.contains(&"8:orgid:00000000-0000-4000-8000-0000000000c3"),
+        "third member read past 1759000000000: {readers:?}"
+    );
+    assert!(!reader_ids.contains(&ME), "self should not be listed in ReadBy");
+
+    // For a newer message (1759000000250), only member c3 (horizon 1759000000500) has read it.
+    let Response::ReadBy { readers: partial } = world.ask(Request::ReadBy {
+        conversation: grp2,
+        message_id: "1759000000250".into(),
+    }) else {
+        panic!("expected Response::ReadBy for newer message");
+    };
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].person.id, "8:orgid:00000000-0000-4000-8000-0000000000c3");
+
+    // 3. Live Seen update: send a message in Ana's 1:1 chat; initially not seen, then push a
+    //    ThreadActivity/MemberConsumptionHorizonUpdate from Ana and verify `seen` flips to true live.
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+    let cid = "1760000999000654";
+    world.send(&ana, cid, "Did you see the PR?");
+    let sent = world.until("message sent to Ana", || {
+        world.messages(&ana).into_iter().find(|m| m.client_id.as_deref() == Some(cid) && m.state == SendState::Sent)
+    });
+    assert!(!world.conversation(&ana).unwrap().seen, "not seen before peer reads it");
+
+    let horizon_push = json!({
+        "id": "1760001999999",
+        "conversationid": CHAT_ANA,
+        "conversationLink": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/{CHAT_ANA}"),
+        "type": "Message",
+        "messagetype": "ThreadActivity/MemberConsumptionHorizonUpdate",
+        "contenttype": "text",
+        "content": json!({
+            "id": ANA,
+            "consumptionhorizon": format!("{};1760001999999;{}", sent.id, sent.id)
+        }).to_string(),
+        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+        "properties": {}
+    });
+    world.fake.push("NewMessage", horizon_push, false);
+    let seen_row = world.until("Ana chat becomes seen live", || {
+        world.conversation(&ana).filter(|row| row.seen)
+    });
+    assert!(seen_row.seen);
+}
+
+#[test]
+fn shared_channels_are_distinguished_from_private_and_external_orgs_marked() {
+    let world = World::start();
+    world.ready();
+
+    // Replace the teams/users/me payload with a team having standard (0), private (1),
+    // same-org shared (2), and an external-org shared channel whose host team we are not a member of.
+    let ext_tenant = "99999999-9999-4999-8999-999999999999";
+    let custom = json!({
+        "teams": [
+            {
+                "id": GENERAL,
+                "displayName": "Platform",
+                "isDeleted": false,
+                "isArchived": false,
+                "tenantId": HOME,
+                "channels": [
+                    {
+                        "id": GENERAL,
+                        "displayName": "General",
+                        "isGeneral": true,
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "channelType": 0,
+                        "tenantId": HOME
+                    },
+                    {
+                        "id": "19:platform0leads@thread.tacv2",
+                        "displayName": "Leads",
+                        "isGeneral": false,
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "channelType": 1,
+                        "tenantId": HOME
+                    },
+                    {
+                        "id": "19:platform0shared@thread.tacv2",
+                        "displayName": "Cross-Team Sync",
+                        "isGeneral": false,
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "channelType": 2,
+                        "tenantId": HOME
+                    }
+                ]
+            }
+        ],
+        "sharedChannels": [
+            {
+                "id": "19:partner0extshared@thread.tacv2",
+                "displayName": "Vendor Launch",
+                "parentTeamId": "19:partner0general@thread.tacv2",
+                "parentTeamName": "Partner Engineering",
+                "isGeneral": false,
+                "isFavorite": true,
+                "isDeleted": false,
+                "channelType": 2,
+                "tenantId": ext_tenant
+            }
+        ],
+        "chats": []
+    });
+    *world.fake.teams_override.lock().unwrap() = Some(custom);
+    // Trigger a fresh teams/users/me listing via trouter.message_loss.
+    world.fake.socket.lock().unwrap().as_ref().unwrap().send("5:99+::{\"name\":\"trouter.message_loss\"}".to_owned()).unwrap();
+
+    // Wait for the external shared channel to appear under its host team.
+    let ext_row = world.until("external shared channel listed", || {
+        world.conversation(&key("19:partner0extshared@thread.tacv2"))
+    });
+    assert!(ext_row.shared, "channelType 2 must set shared=true");
+    assert!(!ext_row.private, "shared channel must not be marked private (lock)");
+    assert_eq!(ext_row.mark, Some(protocol::Mark::External), "cross-tenant shared channel must be marked External");
+    assert_eq!(ext_row.space.as_deref(), Some("19:partner0general@thread.tacv2"));
+
+    // Standard, private, and same-org shared channels in Platform.
+    let std_row = world.conversation(&key(GENERAL)).unwrap();
+    assert!(!std_row.private && !std_row.shared && std_row.mark.is_none());
+
+    let priv_row = world.conversation(&key("19:platform0leads@thread.tacv2")).unwrap();
+    assert!(priv_row.private && !priv_row.shared && priv_row.mark.is_none());
+
+    let same_org_shared = world.conversation(&key("19:platform0shared@thread.tacv2")).unwrap();
+    assert!(same_org_shared.shared, "same-org channelType 2 must set shared=true");
+    assert!(!same_org_shared.private, "same-org shared channel must not set private=true");
+    assert_eq!(same_org_shared.mark, None, "same-org shared channel should not be marked External");
+}
+
+#[test]
+fn channels_can_be_shown_hidden_and_pinned_with_filing_updates() {
+    let world = World::start();
+    world.ready();
+
+    // 1. All channels of Platform (including hidden `Hidden one`) are listed, with hidden flagged opted_out.
+    let deploys = key(DEPLOYS);
+    let hidden = key("19:platform0hidden@thread.tacv2");
+    assert!(!world.conversation(&deploys).unwrap().opted_out);
+    assert!(world.conversation(&hidden).unwrap().opted_out);
+    assert_eq!(world.conversation(&deploys).unwrap().pin, None);
+
+    // 2. Pin Deploys channel -> PUT properties?name=pinned and Filing::pin updated.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: deploys.clone(),
+            pinned: Some(true),
+            archived: None,
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", &format!("/{DEPLOYS}/properties"))
+            .iter()
+            .any(|c| c.query == "name=pinned" && c.json()["pinned"] == "true"),
+        "expected PUT pinned=true for Deploys channel"
+    );
+    assert_eq!(world.conversation(&deploys).unwrap().pin, Some(0));
+
+    // 3. Unpin Deploys channel -> PUT properties?name=pinned=false and Filing::pin cleared.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: deploys.clone(),
+            pinned: Some(false),
+            archived: None,
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&deploys).unwrap().pin, None);
+
+    // 4. Hide Deploys channel (`archived: Some(true)`) -> PUT channelSettings isFavorite=false, opted_out=true.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: deploys.clone(),
+            pinned: None,
+            archived: Some(true),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", &format!("/{DEPLOYS}/properties"))
+            .iter()
+            .any(|c| c.query == "name=channelSettings" && c.json()["channelSettings"]["isFavorite"] == false),
+        "expected PUT channelSettings isFavorite=false when hiding channel"
+    );
+    assert!(world.conversation(&deploys).unwrap().opted_out, "hidden channel should have opted_out=true");
+
+    // 5. Show Hidden one (`archived: Some(false)`) -> PUT channelSettings isFavorite=true, opted_out=false.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: hidden.clone(),
+            pinned: None,
+            archived: Some(false),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", &format!("/19:platform0hidden@thread.tacv2/properties"))
+            .iter()
+            .any(|c| c.query == "name=channelSettings" && c.json()["channelSettings"]["isFavorite"] == true),
+        "expected PUT channelSettings isFavorite=true when showing channel"
+    );
+    assert!(!world.conversation(&hidden).unwrap().opted_out, "shown channel should have opted_out=false");
+}

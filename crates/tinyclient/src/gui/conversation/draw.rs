@@ -435,6 +435,21 @@ pub(super) fn play_disc() -> Div {
     )
 }
 
+/// Formats Unix seconds as UTC `YYYY-MM-DD` (Howard Hinnant's civil-from-days algorithm).
+fn format_ymd(secs: i64) -> String {
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
 /// A small square button inside a row or a bar.
 fn tool(id: impl Into<ElementId>, which: Icon, size: f32) -> Stateful<Div> {
     div()
@@ -1034,6 +1049,7 @@ impl Pane {
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
+                .children(self.message_controls(message, cx))
                 .children(self.cards(message, window, cx));
         }
         if pending {
@@ -1281,11 +1297,23 @@ impl Pane {
                             .type_body()
                             .when(phone, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
                             .font_weight(theme::SEMIBOLD)
+                            .when_some(message.sender.role_color, |name, color| name.text_color(theme::role_color(color)))
                             .child(name),
                         "author-name",
                         message,
                         cx,
                     ))
+                    .children(message.sender.role_icon.as_ref().and_then(|f| f.path.as_deref()).filter(|p| !p.is_empty()).map(|path| {
+                        gpui::img(std::path::PathBuf::from(path))
+                            .size(px(14.))
+                            .rounded(px(3.))
+                            .flex_none()
+                    }))
+                    .children(message.sender.role_icon.is_none().then(|| {
+                        message.sender.role_emoji.as_deref().filter(|e| !e.is_empty()).map(|emoji| {
+                            div().flex_none().text_size(px(13.)).line_height(px(14.)).child(emoji.to_owned())
+                        })
+                    }).flatten())
                     .child(
                         div()
                             .flex_none()
@@ -2329,6 +2357,28 @@ impl Pane {
                 row = row.child(div().type_small().text_color(theme::text_faint()).child(card.footer.clone()));
             }
             Some(row.into_any_element())
+        } else if !card.footer.is_empty() && !card.title_link.is_empty() && card.footer.starts_with("Open in ") {
+            let url = card.title_link.clone();
+            Some(
+                div()
+                    .mt(px(4.))
+                    .flex()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("card-open-{}-{ix}", message.id)))
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(theme::accent())
+                            .hover(|s| s.underline())
+                            .child(card.footer.clone())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_external_link(&url, window, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            )
         } else if !card.footer.is_empty() {
             Some(div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone()).into_any_element())
         } else {
@@ -2346,7 +2396,10 @@ impl Pane {
                     .text_color(theme::accent_text())
                     .cursor_pointer()
                     .hover(|s| s.underline())
-                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_external_link(&url, window, cx);
+                    }))
                     .child(card.title.clone())
                     .into_any_element()
             }
@@ -2403,6 +2456,342 @@ impl Pane {
             .child(div().w(px(3.)).flex_none().bg(bar))
             .child(words);
         div().pt(px(5.)).flex().child(framed).into_any_element()
+    }
+
+    /// Interactive Block Kit controls attached to a message (buttons, menus, pickers, radios, checkboxes).
+    fn message_controls(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if message.controls.is_empty() {
+            return None;
+        }
+        let conversation = self.key()?.clone();
+        let mut row = div().pt(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
+        for (idx, control) in message.controls.iter().enumerate() {
+            let pending = self
+                .pending_actions
+                .get(&(message.id.clone(), control.action_id.clone()))
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(10));
+            let el_id = SharedString::from(format!("ctrl-{}-{idx}", message.id));
+            match &control.kind {
+                protocol::ControlKind::Button { url, style } => {
+                    let label = if pending {
+                        format!("{}…", control.label)
+                    } else if !url.is_empty() {
+                        format!("{} ↗", control.label)
+                    } else {
+                        control.label.clone()
+                    };
+                    let (bg, fg, border, hover_bg) = match style {
+                        protocol::ControlStyle::Primary => (theme::accent(), theme::on_accent(), theme::accent(), theme::accent()),
+                        protocol::ControlStyle::Danger => (theme::danger(), theme::on_accent(), theme::danger(), theme::danger()),
+                        protocol::ControlStyle::Default => (tokens::card(), theme::text(), tokens::border_strong(), theme::hover()),
+                    };
+                    let mut btn = div()
+                        .id(el_id)
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(bg)
+                        .border_1()
+                        .border_color(border)
+                        .flex()
+                        .items_center()
+                        .type_small()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(fg)
+                        .cursor_pointer()
+                        .when(pending, |d| d.opacity(0.6))
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(label);
+                    if !url.is_empty() {
+                        let conv = conversation.clone();
+                        let msg_id = message.id.clone();
+                        let target = url.clone();
+                        let confirm = control.confirm.clone();
+                        btn = btn.on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.trigger_link_control(conv.clone(), msg_id.clone(), target.clone(), confirm.clone(), window, cx);
+                        }));
+                    } else if !pending {
+                        let conv = conversation.clone();
+                        let msg_id = message.id.clone();
+                        let block_id = control.block_id.clone();
+                        let action_id = control.action_id.clone();
+                        let element_type = control.element_type.clone();
+                        let value = control.value.clone();
+                        let confirm = control.confirm.clone();
+                        btn = btn.on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.trigger_control(
+                                conv.clone(),
+                                msg_id.clone(),
+                                block_id.clone(),
+                                action_id.clone(),
+                                element_type.clone(),
+                                value.clone(),
+                                Vec::new(),
+                                confirm.clone(),
+                                cx,
+                            );
+                        }));
+                    }
+                    row = row.child(btn);
+                }
+                protocol::ControlKind::Select { placeholder, options, selected, external } => {
+                    let current_label = selected
+                        .as_deref()
+                        .and_then(|val| options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
+                        .unwrap_or_else(|| if placeholder.is_empty() { "Select…" } else { placeholder.as_str() });
+                    let shown = if pending {
+                        format!("{current_label}…")
+                    } else {
+                        format!("{current_label} ▾")
+                    };
+                    let mut chip = div()
+                        .id(el_id)
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(tokens::card())
+                        .border_1()
+                        .border_color(tokens::border_strong())
+                        .flex()
+                        .items_center()
+                        .type_small()
+                        .text_color(theme::text())
+                        .cursor_pointer()
+                        .when(pending, |d| d.opacity(0.6))
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(shown);
+                    if !options.is_empty() && !pending {
+                        let open = super::OpenSelect {
+                            conversation: conversation.clone(),
+                            message_id: message.id.clone(),
+                            block_id: control.block_id.clone(),
+                            action_id: control.action_id.clone(),
+                            element_type: control.element_type.clone(),
+                            options: options.clone(),
+                            selected: selected.clone(),
+                            confirm: control.confirm.clone(),
+                            at: gpui::Point::default(),
+                        };
+                        chip = chip.on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            let mut next = open.clone();
+                            next.at = event.position();
+                            this.open_select = Some(next);
+                            cx.notify();
+                        }));
+                    } else if *external && !message.permalink.is_empty() {
+                        let link = message.permalink.clone();
+                        chip = chip.on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_external_link(&link, window, cx);
+                        }));
+                    }
+                    row = row.child(chip);
+                }
+                protocol::ControlKind::DatePicker { placeholder, initial } => {
+                    let label = initial
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if placeholder.is_empty() { "Pick a date" } else { placeholder.as_str() });
+                    let shown = if pending { format!("📅 {label}…") } else { format!("📅 {label} ▾") };
+                    let now = crate::view::now();
+                    let mut opts = Vec::new();
+                    if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
+                        opts.push(protocol::ControlOption { label: format!("Keep ({init})"), value: init.clone() });
+                    }
+                    for (name, days) in [("Today", 0i64), ("Tomorrow", 1), ("In 3 days", 3), ("In 7 days", 7)] {
+                        let ymd = format_ymd(now + days * 86_400);
+                        if !opts.iter().any(|o| o.value == ymd) {
+                            opts.push(protocol::ControlOption { label: format!("{name} ({ymd})"), value: ymd });
+                        }
+                    }
+                    let open = super::OpenSelect {
+                        conversation: conversation.clone(),
+                        message_id: message.id.clone(),
+                        block_id: control.block_id.clone(),
+                        action_id: control.action_id.clone(),
+                        element_type: control.element_type.clone(),
+                        options: opts,
+                        selected: initial.clone(),
+                        confirm: control.confirm.clone(),
+                        at: gpui::Point::default(),
+                    };
+                    row = row.child(
+                        div()
+                            .id(el_id)
+                            .h(px(28.))
+                            .px(px(10.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(tokens::card())
+                            .border_1()
+                            .border_color(tokens::border_strong())
+                            .flex()
+                            .items_center()
+                            .type_small()
+                            .text_color(theme::text())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                let mut next = open.clone();
+                                next.at = event.position();
+                                this.open_select = Some(next);
+                                cx.notify();
+                            }))
+                            .child(shown),
+                    );
+                }
+                protocol::ControlKind::TimePicker { placeholder, initial } => {
+                    let label = initial
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if placeholder.is_empty() { "Pick a time" } else { placeholder.as_str() });
+                    let shown = if pending { format!("🕒 {label}…") } else { format!("🕒 {label} ▾") };
+                    let mut opts = Vec::new();
+                    if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
+                        opts.push(protocol::ControlOption { label: init.clone(), value: init.clone() });
+                    }
+                    for slot in ["09:00", "12:00", "14:00", "17:00"] {
+                        if !opts.iter().any(|o| o.value == slot) {
+                            opts.push(protocol::ControlOption { label: slot.to_owned(), value: slot.to_owned() });
+                        }
+                    }
+                    let open = super::OpenSelect {
+                        conversation: conversation.clone(),
+                        message_id: message.id.clone(),
+                        block_id: control.block_id.clone(),
+                        action_id: control.action_id.clone(),
+                        element_type: control.element_type.clone(),
+                        options: opts,
+                        selected: initial.clone(),
+                        confirm: control.confirm.clone(),
+                        at: gpui::Point::default(),
+                    };
+                    row = row.child(
+                        div()
+                            .id(el_id)
+                            .h(px(28.))
+                            .px(px(10.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(tokens::card())
+                            .border_1()
+                            .border_color(tokens::border_strong())
+                            .flex()
+                            .items_center()
+                            .type_small()
+                            .text_color(theme::text())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                let mut next = open.clone();
+                                next.at = event.position();
+                                this.open_select = Some(next);
+                                cx.notify();
+                            }))
+                            .child(shown),
+                    );
+                }
+                protocol::ControlKind::Checkboxes { options, selected } => {
+                    for (opt_ix, opt) in options.iter().enumerate() {
+                        let checked = selected.iter().any(|v| v == &opt.value);
+                        let mut next = selected.clone();
+                        if checked {
+                            next.retain(|v| v != &opt.value);
+                        } else {
+                            next.push(opt.value.clone());
+                        }
+                        let conv = conversation.clone();
+                        let msg_id = message.id.clone();
+                        let block_id = control.block_id.clone();
+                        let action_id = control.action_id.clone();
+                        let element_type = control.element_type.clone();
+                        let confirm = control.confirm.clone();
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("ctrl-chk-{}-{idx}-{opt_ix}", message.id)))
+                                .h(px(26.))
+                                .px(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(if checked { theme::accent_soft() } else { tokens::card() })
+                                .border_1()
+                                .border_color(if checked { theme::accent() } else { tokens::border_strong() })
+                                .flex()
+                                .items_center()
+                                .type_small()
+                                .text_color(theme::text())
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.trigger_control(
+                                        conv.clone(),
+                                        msg_id.clone(),
+                                        block_id.clone(),
+                                        action_id.clone(),
+                                        element_type.clone(),
+                                        String::new(),
+                                        next.clone(),
+                                        confirm.clone(),
+                                        cx,
+                                    );
+                                }))
+                                .child(format!("{} {}", if checked { "☑" } else { "☐" }, opt.label)),
+                        );
+                    }
+                }
+                protocol::ControlKind::RadioButtons { options, selected } => {
+                    for (opt_ix, opt) in options.iter().enumerate() {
+                        let chosen = selected.as_deref() == Some(opt.value.as_str());
+                        let conv = conversation.clone();
+                        let msg_id = message.id.clone();
+                        let block_id = control.block_id.clone();
+                        let action_id = control.action_id.clone();
+                        let element_type = control.element_type.clone();
+                        let val = opt.value.clone();
+                        let confirm = control.confirm.clone();
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("ctrl-rad-{}-{idx}-{opt_ix}", message.id)))
+                                .h(px(26.))
+                                .px(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(if chosen { theme::accent_soft() } else { tokens::card() })
+                                .border_1()
+                                .border_color(if chosen { theme::accent() } else { tokens::border_strong() })
+                                .flex()
+                                .items_center()
+                                .type_small()
+                                .text_color(theme::text())
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.trigger_control(
+                                        conv.clone(),
+                                        msg_id.clone(),
+                                        block_id.clone(),
+                                        action_id.clone(),
+                                        element_type.clone(),
+                                        val.clone(),
+                                        Vec::new(),
+                                        confirm.clone(),
+                                        cx,
+                                    );
+                                }))
+                                .child(format!("{} {}", if chosen { "◉" } else { "○" }, opt.label)),
+                        );
+                    }
+                }
+            }
+        }
+        Some(row.into_any_element())
     }
 
     /// Shared contact card: name, organization, masked phone numbers (click to reveal), emails, and copy actions.
@@ -2470,6 +2859,33 @@ impl Pane {
                     .into_any_element(),
             );
         }
+        let message_btn = contact.person_id.as_ref().and_then(|pid| {
+            let open = self.open.as_ref()?;
+            let person = protocol::Person::new(
+                protocol::Key {
+                    network: open.key.network,
+                    account: open.key.account.clone(),
+                    id: pid.clone(),
+                },
+                title.to_owned(),
+            );
+            Some(
+                div()
+                    .pt(px(4.))
+                    .child(
+                        div()
+                            .id(name_id(&format!("contact-message-{}-{idx}", message.id), ""))
+                            .cursor_pointer()
+                            .type_micro()
+                            .text_color(theme::accent())
+                            .hover(|s| s.underline())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let _ = this.shell.update(cx, |shell, cx| shell.start_direct(&person, cx));
+                            }))
+                            .child("Message"),
+                    ),
+            )
+        });
         div()
             .mt(px(4.))
             .max_w(px(340.))
@@ -2485,6 +2901,7 @@ impl Pane {
             .child(div().type_body().font_weight(theme::SEMIBOLD).child(title.to_owned()))
             .children((!contact.organization.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(contact.organization.clone())))
             .children(rows)
+            .children(message_btn)
             .into_any_element()
     }
 

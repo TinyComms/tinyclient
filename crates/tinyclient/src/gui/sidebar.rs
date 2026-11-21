@@ -451,12 +451,18 @@ impl Shell {
             drafts.clear();
         }
         if drafts.insert(conversation.clone(), text.trim().to_owned()).as_deref() != Some(text.trim()) {
-            cx.notify();
+            if self.sidebar_state.mode == Mode::Network(Network::Slack)
+                || matches!(self.sidebar_state.drill, Some(home::Drill::Drafts(_)))
+            {
+                self.rebuild_rows(cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 
     /// The draft a row shows: what the composer last said, else what chatd stored.
-    fn draft_of<'a>(&'a self, c: &'a Conversation) -> &'a str {
+    pub(super) fn draft_of<'a>(&'a self, c: &'a Conversation) -> &'a str {
         self.sidebar_state.drafts.get(&c.key).map_or(c.draft.as_str(), String::as_str)
     }
 
@@ -668,7 +674,8 @@ impl Shell {
             Mode::Network(Network::Slack) => match self.slack_space() {
                 Some(space) => {
                     let threads = self.threads_row(&space);
-                    threads.into_iter().chain(flat(&space, 0)).collect()
+                    let drafts = self.drafts_row(&space);
+                    threads.into_iter().chain(drafts).chain(flat(&space, 0)).collect()
                 }
                 None => Vec::new(),
             },
@@ -737,7 +744,7 @@ impl Shell {
     }
 
     pub(super) fn mark_all_read(&mut self, cx: &mut Context<Self>) {
-        let request = Request::MarkAllRead { network: None, space: None };
+        let request = Request::MarkAllRead { network: None, space: None, folder: None };
         self.off_thread(cx, move || ask(&request), |this, answer, cx| {
             match answer {
                 Ok(Response::Ok) => {
@@ -759,7 +766,26 @@ impl Shell {
     /// Everything with a badge in one Space is read, here and where the network keeps a read
     /// state. Direct messages and other Spaces are left alone.
     pub(super) fn mark_space_read(&mut self, space: Key, cx: &mut Context<Self>) {
-        let request = Request::MarkAllRead { network: Some(space.network), space: Some(space) };
+        let request = Request::MarkAllRead { network: Some(space.network), space: Some(space), folder: None };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            match answer {
+                Ok(Response::Ok) => {
+                    this.sidebar_state.muted_news.clear();
+                    this.sidebar_state.muted_open = false;
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Marked as read", cx);
+                }
+                Ok(Response::Error { detail, .. }) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx),
+                Err(err) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words("inbox", &err), cx),
+                _ => {}
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+        });
+    }
+
+    /// Everything with a badge in one folder (e.g. a Discord server folder) is read.
+    pub(super) fn mark_folder_read(&mut self, folder: Key, cx: &mut Context<Self>) {
+        let request = Request::MarkAllRead { network: Some(folder.network), space: None, folder: Some(folder) };
         self.off_thread(cx, move || ask(&request), |this, answer, cx| {
             match answer {
                 Ok(Response::Ok) => {
@@ -988,6 +1014,7 @@ impl Shell {
             Row::Conversation { conversation, .. } => self.pick_row(&conversation, cx),
             Row::Group { space, id, collapsed, .. } => self.collapse(space, id, !collapsed, cx),
             Row::Threads { space, .. } => self.drill(home::Drill::Threads(space), cx),
+            Row::Drafts { space, .. } => self.drill(home::Drill::Drafts(space), cx),
             Row::Fold { reveal, .. } => {
                 let space = match &self.sidebar_state.mode {
                     Mode::Space(space) => Some(space.clone()),
@@ -1393,6 +1420,11 @@ impl Shell {
                 self.action_row(("threads", ix), Some("icons/messages-square.svg"), "Threads".into(), *count > 0, trailing, focused)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
+            Row::Drafts { count, .. } => {
+                let trailing = (*count > 0).then(|| super::components::badge_count_unread(*count));
+                self.action_row(("drafts", ix), Some("icons/pencil.svg"), "Drafts & sent".into(), false, trailing, focused)
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+            }
             Row::Fold { words, depth, .. } => {
                 let content = div()
                     .children(indent(*depth, 8.))
@@ -1727,13 +1759,14 @@ impl Shell {
         if let Some(drill) = &self.sidebar_state.drill {
             let title = match drill {
                 home::Drill::Threads(_) => "Threads".to_owned(),
+                home::Drill::Drafts(_) => "Drafts & sent".to_owned(),
                 home::Drill::Archive => "Archive".to_owned(),
                 home::Drill::Calls => "Calls".to_owned(),
                 home::Drill::Requests => "Message requests".to_owned(),
                 home::Drill::Topics(forum) => forum.title.clone(),
             };
             let place = match drill {
-                home::Drill::Threads(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
+                home::Drill::Threads(space) | home::Drill::Drafts(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
                 _ => None,
             };
             return strip
@@ -2453,25 +2486,27 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .id("create-chan-kind")
-                            .type_small()
-                            .text_color(theme::accent_text())
-                            .cursor_pointer()
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(m) = this.sidebar_state.create_channel.as_mut() {
-                                    m.kind = if m.kind == ConversationKind::Voice {
-                                        ConversationKind::Channel
-                                    } else {
-                                        ConversationKind::Voice
-                                    };
-                                    cx.notify();
-                                }
-                            }))
-                            .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
-                    )
+                    .when(modal.space.network != Network::Slack, |row| {
+                        row.child(
+                            div()
+                                .id("create-chan-kind")
+                                .type_small()
+                                .text_color(theme::accent_text())
+                                .cursor_pointer()
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(m) = this.sidebar_state.create_channel.as_mut() {
+                                        m.kind = if m.kind == ConversationKind::Voice {
+                                            ConversationKind::Channel
+                                        } else {
+                                            ConversationKind::Voice
+                                        };
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
+                        )
+                    })
                     .child(
                         div()
                             .id("create-chan-private")

@@ -39,6 +39,32 @@ pub(super) fn find(account: &Account, id: &str) -> Option<Pick> {
     account.live().picks.iter().rev().find(|(held, _)| held == id).map(|(_, pick)| pick.clone())
 }
 
+/// Remembers a document from a message so `save_gif` can address it by `d<id>` without re-fetching.
+pub(super) fn remember_document(account: &Account, loc: &tl::types::InputDocumentFileLocation) {
+    let id = format!("d{}", loc.id);
+    if find(account, &id).is_some() {
+        return;
+    }
+    remember(
+        account,
+        &id,
+        Pick::Document(tl::types::InputDocument {
+            id: loc.id,
+            access_hash: loc.access_hash,
+            file_reference: loc.file_reference.clone(),
+        }),
+    );
+}
+
+/// Saves or removes a GIF in Telegram's saved GIFs list (`messages.saveGif`).
+pub(super) fn save_gif(account: &Account, id: &str, unsave: bool) -> Result<(), Fault> {
+    let Some(Pick::Document(doc)) = find(account, id) else {
+        return Err(Fault::Rpc { code: 400, name: "DOCUMENT_INVALID".to_owned(), value: None });
+    };
+    account.ask(&tl::functions::messages::SaveGif { id: doc.into(), unsave })?;
+    Ok(())
+}
+
 /// A document as a picker item: its still, queued to be fetched, and remembered for sending.
 fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option<CatalogItem> {
     let tl::enums::Document::Document(document) = document else {

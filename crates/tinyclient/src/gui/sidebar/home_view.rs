@@ -65,6 +65,7 @@ impl Shell {
         // Keys only: the read runs off this thread.
         let drill = self.sidebar_state.drill.as_ref().map(|drill| match drill {
             Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false),
+            Drill::Drafts(_) => (Shelf::Main, None, None, false),
             Drill::Archive => (Shelf::Archive, None, None, false),
             Drill::Calls => (Shelf::Main, None, None, true),
             Drill::Requests => (Shelf::Requests, None, None, false),
@@ -181,6 +182,13 @@ impl Shell {
         Some(super::tree::Row::Threads { space: space.clone(), count: news.len() as u32, mention: news.iter().any(|c| c.mentions > 0) })
     }
 
+    /// The Slack workspace's Drafts row: shown when any conversation in the workspace has a draft.
+    pub(super) fn drafts_row(&self, space: &Key) -> Option<super::tree::Row> {
+        let tree = self.trees.get(space)?;
+        let count = tree.conversations.iter().filter(|c| !c.draft.trim().is_empty()).count() as u32;
+        (count > 0).then(|| super::tree::Row::Drafts { space: space.clone(), count })
+    }
+
     /// The home's items again, from what is held.
     pub(super) fn rebuild_home(&mut self, cx: &mut Context<Self>) {
         let state = &self.sidebar_state;
@@ -216,6 +224,18 @@ impl Shell {
                 }
                 out
             }
+            (Mode::Network(_), Some(Drill::Drafts(space))) => self
+                .trees
+                .get(space)
+                .map(|tree| {
+                    tree.conversations
+                        .iter()
+                        .filter(|c| !c.draft.trim().is_empty())
+                        .cloned()
+                        .map(Item::Chat)
+                        .collect()
+                })
+                .unwrap_or_default(),
             (Mode::Network(_), Some(_)) => state.home.drilled.iter().cloned().map(Item::Chat).collect(),
             (Mode::Network(Network::Discord), None) | (Mode::Space(Key { network: Network::Discord, .. }), None) => {
                 let spaces: Vec<protocol::Space> = self.spaces.iter().filter(|s| s.key.network == Network::Discord).cloned().collect();
@@ -497,9 +517,16 @@ impl Shell {
                 click(self.action_row(("home-action", ix), Some(icon), words.into(), lit, trailing, focused), cx).into_any_element()
             }
             Item::Space { index, child, open } => click(self.space_row(ix, index, child, open, focused), cx).into_any_element(),
-            Item::Folder { name, color, open, lit, mention, .. } => {
+            Item::Folder { id, name, color, open, lit, mention } => {
                 let color = color.map_or(theme::text_faint(), gpui::rgb);
                 let chevron = if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
+                let folder_key = self
+                    .sidebar_state
+                    .home
+                    .folders
+                    .iter()
+                    .find(|f| f.key.id == id && (f.unread > 0 || f.mentions > 0))
+                    .map(|f| f.key.clone());
                 let content = div()
                     .gap(px(8.))
                     .child(div().size(px(20.)).flex_none().flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded(px(1.5)).bg(color)))
@@ -507,7 +534,17 @@ impl Shell {
                     .child(glyph(chevron, 12., theme::text_faint()))
                     .child(div().flex_1())
                     .children(lit.then(|| badge_dot(8., if mention { theme::mention() } else { theme::unread() })));
-                click(list_row(("folder", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx).into_any_element()
+                let mut row = click(list_row(("folder", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx);
+                if let Some(folder_key) = folder_key {
+                    row = row.on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_menu(super::Menu::Folder(folder_key.clone(), event.position), cx);
+                        }),
+                    );
+                }
+                row.into_any_element()
             }
             Item::Channel(c) => self.place_row(&c, 1, focused, cx).into_any_element(),
         }
@@ -752,6 +789,7 @@ impl Shell {
         let state = &self.sidebar_state;
         let (icon, title, detail): (&'static str, String, String) = match (&state.home.network, &state.drill) {
             (_, Some(Drill::Threads(_))) => ("icons/messages-square.svg", "No new replies".into(), "Threads you follow show here when someone replies.".into()),
+            (_, Some(Drill::Drafts(_))) => ("icons/pencil.svg", "No drafts".into(), "Messages you start typing in this workspace appear here.".into()),
             (_, Some(Drill::Archive)) => ("icons/inbox.svg", "Nothing archived".into(), "Chats you archive in Telegram show up here.".into()),
             (_, Some(Drill::Calls)) => ("icons/phone.svg", "No recent calls".into(), "Your Telegram calls show up here.".into()),
             (_, Some(Drill::Requests)) => ("icons/mail.svg", "No message requests".into(), "Messages from people you don't know wait here.".into()),

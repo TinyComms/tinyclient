@@ -484,6 +484,9 @@ pub struct Capabilities {
     /// Most files in one message.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_files: u32,
+    /// Only image files (e.g. pasted screenshots) may be attached; other documents are refused.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub images_only: bool,
     /// Longest caption under files, in characters. 0: the text limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub caption_limit: u32,
@@ -645,6 +648,9 @@ pub struct Capabilities {
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,
+    /// This account supports per-message read-receipt lookup (`Request::ReadBy`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_by: bool,
     /// This account supports channel bookmarks (`bookmarks.list` / `add` / `edit` / `remove`, Slack).
     #[serde(default, skip_serializing_if = "is_false")]
     pub bookmarks: bool,
@@ -660,12 +666,30 @@ pub struct Capabilities {
     /// This account supports setting a status with an emoji and a clear-after expiration (`SetPresence` with `status_emoji` and `clear_at`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub rich_status: bool,
+    /// This account supports workspace-wide file listing and deleting own files (`AccountFiles`, `DeleteFile`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_files: bool,
     /// This account supports previewing and joining a Space from an invite link (`InvitePreview`, `InviteJoin`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub join_space_by_invite: bool,
     /// This account supports leaving a Space (`Request::LeaveSpace`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub leave_space: bool,
+    /// This account supports sharing contact cards (`Outgoing::contact`, Telegram/Signal).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub share_contact: bool,
+    /// This account supports saving and removing GIFs in the saved GIFs collection (`Request::SaveGif`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub save_gif: bool,
+    /// This account supports pausing notifications for a duration (`SetPresence { presence: Dnd, clear_at: Some(..) }` -> `dnd.setSnooze` / `dnd.endSnooze`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dnd_snooze: bool,
+    /// This account supports following and unfollowing threads (`Request::FollowThread`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follow_threads: bool,
+    /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_mute: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
@@ -702,6 +726,19 @@ pub struct BrowsedChannel {
     pub private: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
+}
+
+/// One pending scheduled message returned by [`crate::Request::ScheduledMessages`] or
+/// [`crate::Request::RescheduleMessage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledMessage {
+    pub id: String,
+    pub conversation: Key,
+    #[serde(default)]
+    pub text: String,
+    pub post_at: i64,
+    #[serde(default)]
+    pub created: i64,
 }
 
 /// What kind of event an [`ActivityItem`] represents.
@@ -748,6 +785,19 @@ pub struct ActivityItem {
     /// Whether the network considers this item unread.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread: bool,
+}
+
+/// One member who has read up to a given message (`Request::ReadBy`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadBy {
+    pub person: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+    /// Unix seconds when they read it, if reported by the network.
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.
@@ -1013,6 +1063,10 @@ pub struct Outgoing {
     /// dual-SIM phone). `None` keeps the conversation's default line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_as: Option<String>,
+    /// Optional Slack snippet syntax type (e.g. `"rust"`, `"python"`, `"text"`) passed to
+    /// `files.getUploadURLExternal` when uploading a code/text snippet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_type: Option<String>,
     /// Optional one-line subject for a new channel post (Teams).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
@@ -1035,6 +1089,7 @@ impl Default for Outgoing {
             effect: None,
             contact: None,
             send_as: None,
+            snippet_type: None,
             subject: None,
         }
     }

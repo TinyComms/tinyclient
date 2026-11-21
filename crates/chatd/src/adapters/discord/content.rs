@@ -910,6 +910,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             name: who,
             avatar: Some(avatar),
             bot: author.bot || posted.webhook_id.is_some(),
+            ..Sender::default()
         },
         sent,
         seq: 0,
@@ -947,6 +948,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         contacts: Vec::new(),
         sent_via: None,
         permalink: String::new(),
+        controls: Vec::new(),
     };
     (message, rich.files)
 }

@@ -1132,8 +1132,8 @@ impl Chat {
     /// Every badge goes. Discord hears one bulk ack per account; the other networks hear the
     /// read they already know. A message request is read here and not announced. `network`
     /// limits it to one network; `space` to one Space's conversations.
-    fn mark_all_read(&self, network: Option<Network>, space: Option<Key>) -> Response {
-        let marks = match self.hub.store().unread_marks(network, space.as_ref()) {
+    fn mark_all_read(&self, network: Option<Network>, space: Option<Key>, folder: Option<Key>) -> Response {
+        let marks = match self.hub.store().unread_marks(network, space.as_ref(), folder.as_ref()) {
             Ok(marks) => marks,
             Err(err) => return internal(err),
         };
@@ -1387,6 +1387,9 @@ impl Chat {
         }
         for file in &with.files {
             let named = file_name(file);
+            if can.images_only && !crate::blobs::upload::mime_of(&named).starts_with("image/") {
+                return refuse(format!("{name} only supports sending images from tinyclient right now."));
+            }
             // The same rule the upload reads by: never chatd's own files, a device, a secret, or
             // a link in `outbox/`.
             let real = match crate::blobs::upload::allowed(&file.path) {
@@ -2695,10 +2698,32 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::FollowThread { conversation, on } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::FollowThread {
+                    conversation_id: conversation.id.clone(),
+                    on,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
+            Request::SaveGif { account, id, unsave } => {
+                match self.ask(&account, |reply| Command::SaveGif { id, unsave, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Gifs);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {
@@ -2874,7 +2899,19 @@ impl Chat {
             }
             Request::Collapse { space, group, collapsed } => {
                 match self.hub.store().set_collapsed(&space, &group, collapsed) {
-                    Ok(true) => Response::Ok,
+                    Ok(true) => {
+                        if space.network == Network::Discord && self.hub.link(&space.account()) == Link::Connected {
+                            self.command(
+                                &space.account(),
+                                Command::Collapse {
+                                    space_id: space.id,
+                                    group_id: group,
+                                    collapsed,
+                                },
+                            );
+                        }
+                        Response::Ok
+                    }
                     Ok(false) => error(ErrorCode::NotFound, "no such group"),
                     Err(err) => internal(err),
                 }
@@ -2954,6 +2991,46 @@ impl Chat {
                 match self.hub.store().reminders(&conversation) {
                     Ok(reminders) => Response::Reminders { conversation, reminders },
                     Err(err) => internal(err),
+                }
+            }
+            Request::ScheduledMessages { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::ScheduledList {
+                    conversation_id: conversation.id.clone(),
+                    reply,
+                }) {
+                    Ok(messages) => Response::ScheduledMessages { messages },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CancelScheduled { conversation, scheduled_id } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::CancelScheduled {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RescheduleMessage { conversation, scheduled_id, text, post_at } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::Reschedule {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    text,
+                    post_at,
+                    reply,
+                }) {
+                    Ok(message) => Response::ScheduledMessage { message },
+                    Err(refused) => *refused,
                 }
             }
 
@@ -3209,6 +3286,37 @@ impl Chat {
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
+            Request::Moderate { space, person, action, reason } => {
+                if let Err(refused) = self.online(&space.account()) {
+                    return *refused;
+                }
+                let (space_id, person_id) = (space.id.clone(), person.id.clone());
+                match self.ask(&space.account(), |reply| Command::Moderate {
+                    space_id,
+                    person_id,
+                    action,
+                    reason,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Unban { space, person, reason } => {
+                if let Err(refused) = self.online(&space.account()) {
+                    return *refused;
+                }
+                let (space_id, person_id) = (space.id.clone(), person.id.clone());
+                match self.ask(&space.account(), |reply| Command::Unban {
+                    space_id,
+                    person_id,
+                    reason,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
@@ -3228,7 +3336,7 @@ impl Chat {
             Request::Resolve { url } => self.resolve_link(&url),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
-            Request::MarkAllRead { network, space } => self.mark_all_read(network, space),
+            Request::MarkAllRead { network, space, folder } => self.mark_all_read(network, space, folder),
             Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {
                 let began = std::time::Instant::now();
@@ -3828,6 +3936,49 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::AccountFiles { account, query, kind, cursor, limit } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 25 } else { limit.min(100) };
+                match self.ask(&account, |reply| Command::AccountFiles { query, kind, cursor, limit, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.title, 256);
+                            clip(&mut item.url, 2_000);
+                        }
+                        Response::AccountFiles { items: page.items, cursor: page.cursor, more: page.more }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteFile { account, file_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteFile { file_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::MessageAction {
+                conversation,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+            } => self.act(&conversation, |conversation_id, reply| Command::MessageAction {
+                conversation_id,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                reply,
+            }),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
@@ -3838,6 +3989,17 @@ impl Chat {
                 }
                 self.hub.notify(crate::notify::Event::Play(sound));
                 Response::Ok
+            }
+            Request::ReadBy { conversation, message_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::ReadBy { conversation_id, message_id, reply }) {
+                    Ok(readers) => Response::ReadBy { readers },
+                    Err(refused) => *refused,
+                }
             }
         }
     }
@@ -4431,7 +4593,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
 /// reads the whole Inbox.
 pub fn prove_space_mark_all_read() -> Result<(), String> {
     match serde_json::from_value::<Request>(serde_json::json!({"op": "mark_all_read"})) {
-        Ok(Request::MarkAllRead { network: None, space: None }) => {}
+        Ok(Request::MarkAllRead { network: None, space: None, folder: None }) => {}
         _ => return Err("an older frame without a Space did not read".into()),
     }
     let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
@@ -4447,7 +4609,7 @@ pub fn prove_space_mark_all_read() -> Result<(), String> {
     store.ingest(&general, &Message::plain("8", "mara", "for this space", 10, false), true).map_err(|err| err.to_string())?;
     store.ingest(&elsewhere, &Message::plain("9", "mara", "for another", 20, false), true).map_err(|err| err.to_string())?;
     let chat = Arc::new(Chat::new(store));
-    let read = chat.handle(Request::MarkAllRead { network: Some(Network::Discord), space: Some(Key::new(&account, "4000")) });
+    let read = chat.handle(Request::MarkAllRead { network: Some(Network::Discord), space: Some(Key::new(&account, "4000")), folder: None });
     if !matches!(read, Response::Ok) {
         return Err(format!("the space-scoped read was refused: {read:?}"));
     }
@@ -4489,7 +4651,7 @@ fn pending_self_sender(store: &Store, conversation: &Key) -> Sender {
         .and_then(|sender| sender.avatar)
         .or_else(|| person.and_then(|person| person.avatar))
         .or(row.avatar);
-    Sender { id: me, name, avatar, bot: false }
+    Sender { id: me, name, avatar, bot: false, ..Sender::default() }
 }
 
 /// Seeds one account's self person with a picture already on the media row.

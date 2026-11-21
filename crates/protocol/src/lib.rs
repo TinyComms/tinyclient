@@ -479,6 +479,9 @@ pub struct Conversation {
     /// Only invited people see it: drawn with a lock.
     #[serde(default, skip_serializing_if = "is_false")]
     pub private: bool,
+    /// Shared channel across teams or organizations (Teams `channelType == 2`): drawn with a link icon.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
     /// End-to-end encrypted or not, where the network says (a Tiny server). A plaintext
     /// conversation can be upgraded once; messages from before that stay readable by the server.
     #[serde(default, skip_serializing_if = "Encryption::is_unknown")]
@@ -615,6 +618,7 @@ impl Conversation {
             limit: 0,
             read_only: false,
             private: false,
+            shared: false,
             encryption: Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(),
@@ -775,6 +779,15 @@ pub struct Person {
     pub utc_offset: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<Mark>,
+    /// Highest coloured role's RGB (`0xRRGGBB`) in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_color: Option<u32>,
+    /// Highest role icon image in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_icon: Option<MediaFile>,
+    /// Highest role unicode emoji badge in the current Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_emoji: Option<String>,
 }
 
 impl Person {
@@ -795,6 +808,9 @@ impl Person {
             title: String::new(),
             utc_offset: None,
             mark: None,
+            role_color: None,
+            role_icon: None,
+            role_emoji: None,
         }
     }
 }
@@ -932,6 +948,27 @@ pub struct SharedItem {
     pub url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+}
+
+/// Member moderation actions in a Space (`Request::Moderate`, Discord).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModerateAction {
+    Kick,
+    Ban {
+        #[serde(default, skip_serializing_if = "is_zero")]
+        delete_seconds: u32,
+    },
+    Timeout {
+        /// Unix seconds until the timeout expires.
+        until: i64,
+    },
+    Untimeout,
+    Nick {
+        /// New nickname; empty clears it.
+        #[serde(default)]
+        nick: String,
+    },
 }
 
 /// What the user does about a person. Never automated: only on a shell request.
@@ -1322,6 +1359,23 @@ pub enum Request {
     Reminders {
         conversation: Key,
     },
+    /// Lists pending scheduled messages for one conversation (Slack `chat.scheduledMessages.list`).
+    ScheduledMessages {
+        conversation: Key,
+    },
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    CancelScheduled {
+        conversation: Key,
+        scheduled_id: String,
+    },
+    /// Edits and/or reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
+    RescheduleMessage {
+        conversation: Key,
+        scheduled_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        post_at: i64,
+    },
     /// Conversations whose title contains `query`, across every Space, most recent first. From
     /// the cache alone: a channel of a Space never opened is not in it.
     Find {
@@ -1397,6 +1451,12 @@ pub enum Request {
         space: Key,
         offset: u32,
         limit: u32,
+    },
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread for reply notifications
+    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`).
+    FollowThread {
+        conversation: Key,
+        on: bool,
     },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.
@@ -1632,6 +1692,22 @@ pub enum Request {
         account: AccountKey,
         username: String,
     },
+    /// Moderate a member inside a Space (kick, ban, timeout, untimeout, or change nickname).
+    /// Gated by computed permissions and role hierarchy; never sent without confirmation.
+    Moderate {
+        space: Key,
+        person: Key,
+        action: ModerateAction,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Lift a ban on a person in a Space.
+    Unban {
+        space: Key,
+        person: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
     /// Report a message, person, or conversation to the network. Never sent without a confirm sheet.
     Report {
         target: ReportTarget,
@@ -1751,8 +1827,8 @@ pub enum Request {
         message_id: String,
     },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
-    /// one; `space` to one Space's conversations; both `None` is the whole Inbox. Message
-    /// requests are read here only.
+    /// one; `space` to one Space's conversations; `folder` to one folder's conversations/Spaces;
+    /// all `None` is the whole Inbox. Message requests are read here only.
     MarkAllRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
@@ -1760,6 +1836,9 @@ pub enum Request {
         /// peer that does not know the field ignores it and hears the wider request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<Key>,
+        /// The folder to read out (e.g. a Discord server folder or Telegram chat folder).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<Key>,
     },
     /// Drops this conversation's cached messages and its badge. A direct or group conversation
     /// leaves the Inbox until a newer message arrives. The network is not asked to delete
@@ -1893,6 +1972,14 @@ pub enum Request {
         query: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+    },
+
+    /// Saves a GIF to the account's saved GIFs, or removes it when `unsave` is true (Telegram).
+    SaveGif {
+        account: AccountKey,
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        unsave: bool,
     },
 
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
@@ -2531,6 +2618,43 @@ pub enum Request {
     Join {
         conversation: Key,
     },
+    /// Paged workspace/account-wide file list (Slack `files.list` without a channel).
+    /// Answers `Response::AccountFiles`.
+    AccountFiles {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Delete a file on the network (Slack `files.delete`, own files).
+    DeleteFile {
+        account: AccountKey,
+        file_id: String,
+    },
+    /// Execute an interactive control on a message (Slack Block Kit `blocks.actions`).
+    /// Answers `Response::Ok` when accepted; message updates arrive asynchronously.
+    MessageAction {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        value: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        values: Vec<String>,
+    },
+    /// Who has read a given message in a chat (`Capabilities::read_by`).
+    ReadBy {
+        conversation: Key,
+        message_id: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3027,6 +3151,26 @@ pub enum Response {
         channels: Vec<BrowsedChannel>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+    },
+    /// One page of workspace/account-wide files (`Request::AccountFiles`).
+    AccountFiles {
+        items: Vec<SharedItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
+    },
+    /// Pending scheduled messages for a conversation (`Request::ScheduledMessages`).
+    ScheduledMessages {
+        messages: Vec<ScheduledMessage>,
+    },
+    /// One updated/rescheduled message (`Request::RescheduleMessage`).
+    ScheduledMessage {
+        message: ScheduledMessage,
+    },
+    /// Members who have read a given message (`Request::ReadBy`).
+    ReadBy {
+        readers: Vec<ReadBy>,
     },
 }
 
@@ -3540,5 +3684,51 @@ mod sock_path_tests {
         let err = ChatStream::connect(&long).err().expect("a path past sun_path cannot connect");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn scheduled_message_requests_and_responses_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, "C1");
+        let reqs = [
+            Request::ScheduledMessages { conversation: conv.clone() },
+            Request::CancelScheduled { conversation: conv.clone(), scheduled_id: "Q1".into() },
+            Request::RescheduleMessage {
+                conversation: conv.clone(),
+                scheduled_id: "Q1".into(),
+                text: Some("Later".into()),
+                post_at: 1_900_000_000,
+            },
+        ];
+        for req in reqs {
+            let encoded = serde_json::to_string(&req).unwrap();
+            let decoded: Request = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, req);
+        }
+        let msg = ScheduledMessage {
+            id: "Q2".into(),
+            conversation: conv,
+            text: "Later".into(),
+            post_at: 1_900_000_000,
+            created: 1_899_999_000,
+        };
+        let resp = Response::ScheduledMessages { messages: vec![msg.clone()] };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+        let one = Response::ScheduledMessage { message: msg };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&one).unwrap()).unwrap(), one);
+    }
+
+    #[test]
+    fn follow_thread_request_and_capability_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, "C1:1760000200.000200");
+        let req = Request::FollowThread { conversation: conv, on: true };
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), req);
+
+        let can = Capabilities { follow_threads: true, dnd_snooze: true, ..Capabilities::default() };
+        let cjson = serde_json::to_string(&can).unwrap();
+        assert_eq!(serde_json::from_str::<Capabilities>(&cjson).unwrap(), can);
+        let old: Capabilities = serde_json::from_str("{}").unwrap();
+        assert!(!old.follow_threads);
+        assert!(!old.dnd_snooze);
     }
 }

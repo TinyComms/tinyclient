@@ -884,6 +884,7 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
                 emails: if email.is_empty() { Vec::new() } else { vec![email] },
                 organization: org,
                 avatar: None,
+                person_id: None,
             };
             let text = Text {
                 author: author.into(),
