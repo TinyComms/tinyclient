@@ -249,6 +249,9 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (204, Value::Null)
         }
         ("PATCH", ["users", "@me", "settings-proto", "1"]) => (200, json!({"settings": seen.body["settings"]})),
+        ("GET", ["users", "@me", "settings-proto", "2"]) => (200, json!({"settings": ""})),
+        ("PATCH", ["users", "@me", "settings-proto", "2"]) => (200, json!({"settings": seen.body["settings"]})),
+        ("GET", ["sticker-packs"]) => (200, json!({"sticker_packs": []})),
         ("GET", ["users", person, "profile"]) => {
             let mut profile = json!({
                 "user": {"id": person, "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m", "bio": ""},
@@ -3901,7 +3904,10 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     let stickers = catalog(protocol::CatalogKind::Stickers, "", Some("4000"));
     assert_eq!(stickers.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["5201", "5202"]);
     assert_eq!(stickers[1].file.as_ref().unwrap().kind, protocol::MediaKind::File, "Lottie JSON is offered to the native renderer");
-    assert_eq!(world.discord.asked().len(), before);
+    // The first emoji or sticker catalog reads settings-proto/2 once. No Nitro, so no sticker packs.
+    let grown: Vec<String> = world.discord.asked().into_iter().skip(before).collect();
+    assert_eq!(grown, vec!["GET /users/@me/settings-proto/2".to_owned()]);
+    assert!(world.discord.requests_to("GET", "/sticker-packs").is_empty());
     let pick = protocol::Pick { kind: protocol::CatalogKind::Stickers, id: "5201".into() };
     send_with(&world, "4101", "77005", "", None, protocol::Outgoing { pick: Some(pick), ..Default::default() });
     world.outcome("4101", "77005");
@@ -5356,4 +5362,214 @@ fn privacy_safety_decode_write_and_per_server_dm_switches() {
         other => panic!("{other:?}"),
     };
     assert_eq!(s4000_after.privacy, Some(protocol::SpacePrivacy { allow_dms: true, allow_requests: false }));
+}
+
+fn proto_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn proto_bytes(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+    proto_varint(out, field << 3 | 2);
+    proto_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn proto_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    proto_varint(out, field << 3);
+    proto_varint(out, value);
+}
+
+/// A `FrecencyUserSettings` blob: unknown field 7 is the bytes `keep-me`.
+fn frecency_settings(emojis: &[&str], sticker_ids: &[u64], emoji_score: Option<(&str, u64)>, sticker_score: Option<(u64, u64)>) -> String {
+    let mut emojis_msg = Vec::new();
+    for emoji in emojis {
+        proto_bytes(&mut emojis_msg, 1, emoji.as_bytes());
+    }
+    let mut stickers_msg = Vec::new();
+    if !sticker_ids.is_empty() {
+        let mut packed = Vec::new();
+        for id in sticker_ids {
+            packed.extend_from_slice(&id.to_le_bytes());
+        }
+        proto_bytes(&mut stickers_msg, 1, &packed);
+    }
+    let mut whole = Vec::new();
+    proto_bytes(&mut whole, 7, b"keep-me");
+    if !stickers_msg.is_empty() {
+        proto_bytes(&mut whole, 3, &stickers_msg);
+    }
+    if let Some((id, score)) = sticker_score {
+        let mut item = Vec::new();
+        proto_varint_field(&mut item, 4, score);
+        let mut entry = Vec::new();
+        entry.push(0x09);
+        entry.extend_from_slice(&id.to_le_bytes());
+        proto_bytes(&mut entry, 2, &item);
+        let mut map = Vec::new();
+        proto_bytes(&mut map, 1, &entry);
+        proto_bytes(&mut whole, 4, &map);
+    }
+    proto_bytes(&mut whole, 5, &emojis_msg);
+    if let Some((glyph, score)) = emoji_score {
+        let mut item = Vec::new();
+        proto_varint_field(&mut item, 4, score);
+        let mut entry = Vec::new();
+        proto_bytes(&mut entry, 1, glyph.as_bytes());
+        proto_bytes(&mut entry, 2, &item);
+        let mut map = Vec::new();
+        proto_bytes(&mut map, 1, &entry);
+        proto_bytes(&mut whole, 6, &map);
+    }
+    base64::engine::general_purpose::STANDARD.encode(whole)
+}
+
+fn polished_premium(premium: u8) -> World {
+    let world = World::launch(&[], |shared| {
+        let mut ready: Value = serde_json::from_str(&polished_ready()).unwrap();
+        ready["user"]["premium_type"] = json!(premium);
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    world
+}
+
+fn catalog_of(world: &World, kind: protocol::CatalogKind, query: &str, space: Option<&str>) -> Vec<protocol::CatalogItem> {
+    match world.ask(Request::Catalog {
+        account: world.account(),
+        kind,
+        space: space.map(|space| world.key(space)),
+        query: query.into(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn account_favourites_lead_the_picker_and_a_locked_emoji_is_a_public_link() {
+    let world = polished();
+    let settings = frecency_settings(&["😀", "ferris:5101"], &[5201], Some(("🎉", 40)), Some((5202, 9)));
+    world.discord.script("/users/@me/settings-proto/2", 200, json!({"settings": settings}));
+
+    let emoji = catalog_of(&world, protocol::CatalogKind::Emoji, "", Some("4000"));
+    let shown: Vec<(&str, &str, &str)> = emoji.iter().map(|item| (item.id.as_str(), item.name.as_str(), item.pack.as_str())).collect();
+    assert_eq!(
+        shown,
+        [
+            ("😀", "😀", "Favorites"),
+            ("emoji:5101", ":ferris:", "Favorites"),
+            ("🎉", "🎉", "Frequently used"),
+        ]
+    );
+    assert!(emoji[0].file.is_none(), "a Unicode favourite draws as the glyph");
+
+    let stickers = catalog_of(&world, protocol::CatalogKind::Stickers, "", Some("4000"));
+    let sticker_rows: Vec<(&str, &str)> = stickers.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect();
+    assert_eq!(sticker_rows, [("5201", "Favorites"), ("5202", "Frequently used")]);
+    assert!(world.discord.requests_to("GET", "/sticker-packs").is_empty(), "no Nitro, so no standard packs");
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1);
+
+    assert_eq!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Emoji,
+            id: "emoji:5101".into(),
+            on: false,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/2");
+    assert_eq!(patches.len(), 1);
+    let sent = base64::engine::general_purpose::STANDARD.decode(patches[0].body["settings"].as_str().unwrap()).unwrap();
+    let sent = String::from_utf8_lossy(&sent);
+    assert!(sent.contains("keep-me"), "unknown fields survive a favourite write");
+    assert!(!sent.contains("ferris:5101"), "the unfavourited emoji leaves the list");
+    assert!(sent.contains("🎉"), "frecency scores are not rewritten");
+
+    assert!(matches!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Gifs,
+            id: "https://tenor.com/view/cat".into(),
+            on: true,
+        }),
+        Response::Error { code: ErrorCode::Unsupported, .. }
+    ));
+
+    let next = frecency_settings(&["🎉"], &[], None, None);
+    world.discord.push("USER_SETTINGS_PROTO_UPDATE", json!({"settings": {"type": 2, "proto": next}, "partial": false}));
+    // Each try uses a new cursor so chatd's catalog cache cannot keep a page from before the
+    // gateway event landed. The adapter treats a non-numeric cursor as the first page.
+    let burst = std::cell::Cell::new(1usize);
+    let again = wait("the gateway frecency update to lead the picker", || {
+        let cursor = "x".repeat(burst.get());
+        burst.set(burst.get() + 1);
+        let items = match world.ask(Request::Catalog {
+            account: world.account(),
+            kind: protocol::CatalogKind::Emoji,
+            space: Some(world.key("4000")),
+            query: "🎉".into(),
+            cursor: Some(cursor),
+        }) {
+            Response::Catalog { items, .. } => items,
+            _ => return None,
+        };
+        items.first().is_some_and(|item| item.id == "🎉" && item.pack == "Favorites").then_some(items)
+    });
+    assert_eq!(again.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect::<Vec<_>>(), [("🎉", "Favorites")]);
+
+    send_with(
+        &world,
+        "4101",
+        "77101",
+        "hi <:ferris:5101> <a:party_blob:5103> <:core_only:5104> <:other:9999>",
+        None,
+        protocol::Outgoing::default(),
+    );
+    world.outcome("4101", "77101");
+    let posted = world.discord.requests_to("POST", "/channels/4101/messages");
+    assert_eq!(
+        posted.last().unwrap().body["content"],
+        "hi <:ferris:5101> https://cdn.discordapp.com/emojis/5103.gif https://cdn.discordapp.com/emojis/5104.webp https://cdn.discordapp.com/emojis/9999.webp"
+    );
+    let pick = protocol::Pick { kind: protocol::CatalogKind::Stickers, id: "9999".into() };
+    send_with(&world, "4101", "77102", "", None, protocol::Outgoing { pick: Some(pick), ..Default::default() });
+    world.outcome("4101", "77102");
+    let posted = world.discord.requests_to("POST", "/channels/4101/messages");
+    let body = &posted.last().unwrap().body;
+    assert_eq!(body["content"], "https://media.discordapp.net/stickers/9999.png");
+    assert!(body.get("sticker_ids").is_none());
+}
+
+#[test]
+fn nitro_offers_standard_sticker_packs_once_and_animated_emoji() {
+    let world = polished_premium(2);
+    world.discord.script(
+        "/sticker-packs",
+        200,
+        json!({"sticker_packs": [{"id": "pack1", "name": "Wumpus", "stickers": [
+            {"id": "9001", "name": "wumpus", "format_type": 1, "available": true},
+            {"id": "9002", "name": "gone", "format_type": 1, "available": false},
+            {"id": "9003", "name": "bad", "format_type": 0, "available": true}
+        ]}]}),
+    );
+    let emoji = catalog_of(&world, protocol::CatalogKind::Emoji, "", Some("4000"));
+    let ids: Vec<&str> = emoji.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids, ["emoji:5101", "emoji:5103"]);
+    let stickers = catalog_of(&world, protocol::CatalogKind::Stickers, "", Some("4000"));
+    let rows: Vec<(&str, &str)> = stickers.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect();
+    assert_eq!(rows, [("5201", "Rustaceans"), ("5202", "Rustaceans"), ("9001", "Wumpus")]);
+    assert_eq!(world.discord.requests_to("GET", "/sticker-packs").len(), 1);
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1);
+    let _ = catalog_of(&world, protocol::CatalogKind::Stickers, "", Some("4000"));
+    assert_eq!(world.discord.requests_to("GET", "/sticker-packs").len(), 1, "a pack list is asked once a session");
 }

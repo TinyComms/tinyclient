@@ -517,6 +517,16 @@ impl Discord {
     /// update carries only what changed, so the status is read from either kind and the order
     /// only from a whole one.
     fn settings_proto(&self, update: SettingsUpdate) -> Result<(), Failure> {
+        // Type 2 is `FrecencyUserSettings`: favourites and frecency for the picker. A partial
+        // update still carries the whole proto Discord sent, so the blob is replaced whole.
+        if update.settings.kind == 2 {
+            if let Some(bytes) = proto::decode_settings(&update.settings.proto) {
+                let mut state = self.state.lock().unwrap();
+                state.frecency = bytes;
+                state.frecency_loaded = true;
+            }
+            return Ok(());
+        }
         if update.settings.kind != 1 {
             return Ok(());
         }

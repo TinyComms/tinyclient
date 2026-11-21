@@ -1,5 +1,7 @@
-//! The two things read from Discord's protobuf settings: the order of the server list, and our
-//! own status. The status is also the one thing written.
+//! What is read from Discord's protobuf settings: the order of the server list, our own status,
+//! privacy, and the picker's frecency (`settings-proto/2`). Status, privacy, and favourite
+//! emoji and sticker lists are written back. Frecency scores are read and never written: a
+//! wrong score would replace the account's frecency on every device.
 //!
 //! Sessions that identify as the current web client get their settings as base64 protobuf
 //! (`user_settings_proto`) instead of JSON. The field numbers are from the community's
@@ -374,6 +376,146 @@ pub fn privacy_update_settings(privacy: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(whole)
 }
 
+/// Base64 protobuf as Discord puts it in `settings` or a gateway `proto` field.
+pub fn decode_settings(text: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD.decode(text.trim()).ok()
+}
+
+/// `FrecencyUserSettings` as the body of `PATCH /users/@me/settings-proto/2`.
+pub fn encode_settings(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Favourite lists and frecency scores from `FrecencyUserSettings` (settings-proto/2).
+/// Field numbers follow the community `discord-protos`:
+/// - 3 `favorite_stickers.sticker_ids` (repeated fixed64)
+/// - 4 `sticker_frecency` (map of fixed64 to `FrecencyItem`)
+/// - 5 `favorite_emojis.emojis` (repeated string)
+/// - 6 `emoji_frecency` (map of string to `FrecencyItem`)
+/// `FrecencyItem.score` is field 4; `frecency` (field 3) is used when score is absent.
+/// Scores are only read. [`with_favorite_emojis`] and [`with_favorite_stickers`] never rewrite them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrecencyLists {
+    pub favorite_emojis: Vec<String>,
+    pub favorite_stickers: Vec<String>,
+    /// `(key, score)`, wire order. The picker sorts.
+    pub emoji_frecency: Vec<(String, i32)>,
+    pub sticker_frecency: Vec<(String, i32)>,
+}
+
+/// Decodes a `FrecencyUserSettings` message. Unknown fields are ignored here; the raw bytes
+/// are what a later write copies.
+pub fn decode_frecency(bytes: &[u8]) -> FrecencyLists {
+    let mut lists = FrecencyLists::default();
+    for (number, field, _) in fields(bytes) {
+        let Field::Bytes(inner) = field else {
+            continue;
+        };
+        match number {
+            3 => ids(inner, 1, &mut lists.favorite_stickers),
+            4 => lists.sticker_frecency = frecency_map(inner, true),
+            5 => lists.favorite_emojis = strings(inner, 1),
+            6 => lists.emoji_frecency = frecency_map(inner, false),
+            _ => {}
+        }
+    }
+    lists
+}
+
+/// Replaces favourite emoji (field 5) and copies every other field, including frecency scores
+/// and anything this client does not know.
+pub fn with_favorite_emojis(bytes: &[u8], emojis: &[String]) -> Vec<u8> {
+    replace_message(bytes, 5, &strings_message(emojis))
+}
+
+/// Replaces favourite stickers (field 3) and copies every other field, including frecency scores.
+pub fn with_favorite_stickers(bytes: &[u8], ids: &[String]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    write_packed_ids(&mut inner, 1, ids);
+    replace_message(bytes, 3, &inner)
+}
+
+fn replace_message(bytes: &[u8], number: u64, inner: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + inner.len() + 8);
+    for (found, _, raw) in fields(bytes) {
+        if found != number {
+            out.extend_from_slice(raw);
+        }
+    }
+    write(&mut out, number, inner);
+    out
+}
+
+fn strings_message(list: &[String]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    for text in list {
+        write(&mut inner, 1, text.as_bytes());
+    }
+    inner
+}
+
+fn strings(message: &[u8], wanted: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = Reader(message);
+    while let Some((number, field)) = reader.field() {
+        if number == wanted {
+            if let Field::Bytes(bytes) = field {
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    if !text.is_empty() {
+                        out.push(text.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Map field 1 of an `EmojiFrecency` or `StickerFrecency` message. `fixed_key` is a sticker id.
+fn frecency_map(message: &[u8], fixed_key: bool) -> Vec<(String, i32)> {
+    let mut out = Vec::new();
+    let mut reader = Reader(message);
+    while let Some((number, field)) = reader.field() {
+        let Field::Bytes(entry) = field else {
+            continue;
+        };
+        if number != 1 {
+            continue;
+        }
+        let mut key = String::new();
+        let mut score = 0i32;
+        let mut inner = Reader(entry);
+        while let Some((number, field)) = inner.field() {
+            match (number, field) {
+                (1, Field::Bytes(bytes)) if !fixed_key => key = String::from_utf8_lossy(bytes).into_owned(),
+                (1, Field::Fixed64(id)) if fixed_key => key = id.to_string(),
+                (2, Field::Bytes(item)) => score = frecency_score(item),
+                _ => {}
+            }
+        }
+        if !key.is_empty() {
+            out.push((key, score));
+        }
+    }
+    out
+}
+
+/// `FrecencyItem.score` (field 4), else `frecency` (field 3).
+fn frecency_score(item: &[u8]) -> i32 {
+    let mut score = None;
+    let mut frecency = 0i32;
+    for (number, field, _) in fields(item) {
+        if let Field::Varint(value) = field {
+            if number == 4 {
+                score = Some(value as i32);
+            } else if number == 3 {
+                frecency = value as i32;
+            }
+        }
+    }
+    score.unwrap_or(frecency)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +626,69 @@ mod tests {
         let cleared = with_status(&idle, "online", Some(""));
         assert_eq!((own_status(&cleared).1.as_str(), bytes_of(&cleared, 2)), ("", None));
         assert_eq!(status_settings("AAAA"), None);
+    }
+
+    #[test]
+    fn frecency_favourites_round_trip_and_leave_scores_and_unknown_fields() {
+        // Favourite emoji, favourite stickers, both frecency maps, a stand-in for favorite_gifs
+        // (field 2), and an unknown varint (field 99).
+        let mut emojis = Vec::new();
+        write(&mut emojis, 1, "😀".as_bytes());
+        write(&mut emojis, 1, b"ferris:5101");
+        let mut stickers = Vec::new();
+        write_packed_ids(&mut stickers, 1, &["111".into(), "222".into()]);
+        let mut item = Vec::new();
+        write_varint_field(&mut item, 1, 3);
+        write_varint_field(&mut item, 4, 40);
+        let mut entry = Vec::new();
+        write(&mut entry, 1, "🎉".as_bytes());
+        write(&mut entry, 2, &item);
+        let mut emoji_frecency = Vec::new();
+        write(&mut emoji_frecency, 1, &entry);
+        let mut scored = Vec::new();
+        write_varint_field(&mut scored, 3, 9);
+        let mut sticker_entry = Vec::new();
+        sticker_entry.push(0x09);
+        sticker_entry.extend_from_slice(&333u64.to_le_bytes());
+        write(&mut sticker_entry, 2, &scored);
+        let mut sticker_frecency = Vec::new();
+        write(&mut sticker_frecency, 1, &sticker_entry);
+        let mut whole = Vec::new();
+        write(&mut whole, 2, b"gif-unknown");
+        write(&mut whole, 3, &stickers);
+        write(&mut whole, 4, &sticker_frecency);
+        write(&mut whole, 5, &emojis);
+        write(&mut whole, 6, &emoji_frecency);
+        write_varint_field(&mut whole, 99, 77);
+
+        let lists = decode_frecency(&whole);
+        assert_eq!(lists.favorite_emojis, ["😀", "ferris:5101"]);
+        assert_eq!(lists.favorite_stickers, ["111", "222"]);
+        assert_eq!(lists.emoji_frecency, vec![("🎉".to_owned(), 40)]);
+        assert_eq!(lists.sticker_frecency, vec![("333".to_owned(), 9)]);
+
+        let next = with_favorite_emojis(&whole, &["ferris:5101".into(), "wave:1".into()]);
+        let again = decode_frecency(&next);
+        assert_eq!(again.favorite_emojis, ["ferris:5101", "wave:1"]);
+        assert_eq!(again.favorite_stickers, lists.favorite_stickers);
+        assert_eq!(again.emoji_frecency, lists.emoji_frecency);
+        assert_eq!(again.sticker_frecency, lists.sticker_frecency);
+        assert!(
+            fields(&next).iter().any(|(n, field, _)| *n == 2 && matches!(field, Field::Bytes(bytes) if bytes == b"gif-unknown")),
+            "favorite_gifs must survive an emoji favourite write"
+        );
+        assert!(
+            fields(&next).iter().any(|(n, field, _)| *n == 99 && matches!(field, Field::Varint(77))),
+            "unknown field 99 must survive"
+        );
+
+        let stick = with_favorite_stickers(&next, &["222".into()]);
+        let stick_lists = decode_frecency(&stick);
+        assert_eq!(stick_lists.favorite_stickers, ["222"]);
+        assert_eq!(stick_lists.favorite_emojis, again.favorite_emojis);
+        assert_eq!(stick_lists.emoji_frecency, lists.emoji_frecency, "frecency scores are not rewritten");
+        assert_eq!(stick_lists.sticker_frecency, lists.sticker_frecency, "frecency scores are not rewritten");
+        let encoded = encode_settings(&stick);
+        assert_eq!(decode_frecency(&decode_settings(&encoded).unwrap()).favorite_stickers, ["222"]);
     }
 }

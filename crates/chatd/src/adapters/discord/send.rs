@@ -13,6 +13,7 @@ use base64::Engine;
 use protocol::{CatalogKind, Message, Outgoing, VoiceNote};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 /// Discord's own message flags.
 const SUPPRESS_EMBEDS: u64 = 1 << 2;
@@ -41,6 +42,63 @@ struct Slot {
 struct Slots {
     #[serde(default)]
     attachments: Vec<Slot>,
+}
+
+/// A custom emoji this account cannot send, rewritten to Discord's public CDN. The address is
+/// the public one, not `TINYCLIENT_DISCORD_CDN`, so a lab fake cannot change what a real
+/// message would carry. Animated emoji are always a GIF. A plain emoji the account may use
+/// stays as `<name:id>`.
+pub(super) fn rewrite_locked_emoji(content: &str, allowed: &HashSet<String>) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let token = &rest[start..];
+        let animated = token.starts_with("<a:");
+        let plain = token.starts_with("<:");
+        let Some(end) = token.find('>') else {
+            out.push_str(token);
+            break;
+        };
+        if !animated && !plain {
+            out.push('<');
+            rest = &token[1..];
+            continue;
+        }
+        let inner = &token[if animated { 3 } else { 2 }..end];
+        let Some((name, id)) = inner.rsplit_once(':') else {
+            out.push_str(&token[..=end]);
+            rest = &token[end + 1..];
+            continue;
+        };
+        let snowflake = !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) && !name.is_empty();
+        if !snowflake {
+            out.push_str(&token[..=end]);
+        } else if animated {
+            out.push_str("https://cdn.discordapp.com/emojis/");
+            out.push_str(id);
+            out.push_str(".gif");
+        } else if allowed.contains(id) {
+            out.push_str(&token[..=end]);
+        } else {
+            out.push_str("https://cdn.discordapp.com/emojis/");
+            out.push_str(id);
+            out.push_str(".webp");
+        }
+        rest = &token[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A sticker's public picture. Format 4 is a GIF, 3 is Lottie JSON, and the rest are PNG.
+pub(super) fn sticker_link(id: &str, format: u8) -> String {
+    let ext = match format {
+        4 => "gif",
+        3 => "json",
+        _ => "png",
+    };
+    format!("https://media.discordapp.net/stickers/{id}.{ext}")
 }
 
 /// The name Discord shows: a spoiler is a file whose name says so.
@@ -100,6 +158,51 @@ impl Discord {
         info.permissions(guild, &me, &found.channel()) & model::SEND_VOICE_MESSAGES != 0
     }
 
+    /// Custom emoji this channel's server may send without Nitro: its own, not animated, and
+    /// not locked to a role we lack.
+    fn sendable_emoji(&self, guild: Option<&str>) -> HashSet<String> {
+        let mut allowed = HashSet::new();
+        let Some(guild) = guild else {
+            return allowed;
+        };
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(guild) else {
+            return allowed;
+        };
+        for emoji in &info.emojis {
+            if emoji.animated {
+                continue;
+            }
+            let roles_ok = emoji.roles.is_empty() || emoji.roles.iter().any(|role| info.my_roles.contains(role));
+            if roles_ok {
+                allowed.insert(emoji.id.clone());
+            }
+        }
+        allowed
+    }
+
+    /// Nitro may send any sticker id and Discord decides. Without it, only a sticker of the
+    /// server the message is said in.
+    fn sticker_sendable(&self, id: &str, nitro: bool, guild: Option<&str>) -> bool {
+        if nitro {
+            return true;
+        }
+        let state = crate::hub::lock(&self.state);
+        guild.is_some_and(|guild| {
+            state.guilds.get(guild).is_some_and(|info| info.stickers.iter().any(|sticker| sticker.id == id))
+        })
+    }
+
+    fn sticker_format(&self, id: &str) -> u8 {
+        let state = crate::hub::lock(&self.state);
+        for info in state.guilds.values() {
+            if let Some(sticker) = info.stickers.iter().find(|sticker| sticker.id == id) {
+                return sticker.format;
+            }
+        }
+        state.standard_stickers.iter().find(|sticker| sticker.id == id).map(|sticker| sticker.format).unwrap_or(1)
+    }
+
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
     /// the files and ends the send through `Context::sent`.
     pub(super) fn send_with(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
@@ -134,14 +237,25 @@ impl Discord {
             }
         }
 
+        let nitro = matches!(premium, 1..=3);
         let mut content = if with.voice.is_some() { String::new() } else { text.to_owned() };
+        if with.voice.is_none() && !nitro {
+            content = rewrite_locked_emoji(&content, &self.sendable_emoji(guild.as_deref()));
+        }
         let mut stickers = Vec::new();
         if with.voice.is_none() {
             match &with.pick {
                 Some(pick) if pick.kind == CatalogKind::Gifs => {
                     content = if content.is_empty() { pick.id.clone() } else { format!("{content}\n{}", pick.id) };
                 }
-                Some(pick) if pick.kind == CatalogKind::Stickers => stickers.push(pick.id.clone()),
+                Some(pick) if pick.kind == CatalogKind::Stickers => {
+                    if self.sticker_sendable(&pick.id, nitro, guild.as_deref()) {
+                        stickers.push(pick.id.clone());
+                    } else {
+                        let link = sticker_link(&pick.id, self.sticker_format(&pick.id));
+                        content = if content.is_empty() { link } else { format!("{content}\n{link}") };
+                    }
+                }
                 _ => {}
             }
         }
@@ -265,5 +379,18 @@ mod tests {
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(&capped).unwrap().len(), protocol::WAVEFORM_LIMIT);
         let empty = encode_waveform(&[]);
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(&empty).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn a_locked_emoji_becomes_its_cdn_link() {
+        let allowed = HashSet::from(["5101".to_owned()]);
+        let rewritten = rewrite_locked_emoji("hi <:ferris:5101> <a:party:5103> <:other:9999>", &allowed);
+        assert_eq!(
+            rewritten,
+            "hi <:ferris:5101> https://cdn.discordapp.com/emojis/5103.gif https://cdn.discordapp.com/emojis/9999.webp"
+        );
+        assert_eq!(sticker_link("5202", 3), "https://media.discordapp.net/stickers/5202.json");
+        assert_eq!(sticker_link("5201", 1), "https://media.discordapp.net/stickers/5201.png");
+        assert_eq!(sticker_link("5204", 4), "https://media.discordapp.net/stickers/5204.gif");
     }
 }

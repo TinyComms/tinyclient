@@ -1961,6 +1961,16 @@ pub enum Request {
         unsave: bool,
     },
 
+    /// Marks or unmarks an emoji or sticker as a favourite on the account (Discord
+    /// `settings-proto/2`). `on` adds it. Frecency scores are not written.
+    Favourite {
+        account: AccountKey,
+        kind: CatalogKind,
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        on: bool,
+    },
+
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
     /// later is a `Media` change. Ask only for what is on screen.
     Fetch {

@@ -194,6 +194,14 @@ impl Default for Quiet {
     }
 }
 
+/// One sticker from a standard pack (`GET /sticker-packs`).
+struct PackedSticker {
+    id: String,
+    name: String,
+    format: u8,
+    pack: String,
+}
+
 /// One of a server's custom emoji or stickers, kept for the picker: about 40 bytes each.
 struct Pickable {
     id: String,
@@ -366,6 +374,15 @@ struct State {
     status_settings: Vec<u8>,
     /// Raw `PreloadedUserSettings.privacy` bytes (field 6), preserved across updates.
     privacy_settings: Vec<u8>,
+    /// Raw `FrecencyUserSettings` (`settings-proto/2`). Empty until the picker first opens.
+    /// Favourite lists are the only part written back. Frecency scores are read for the
+    /// "Frequently used" section and never written: a wrong score would replace the account's
+    /// frecency on every device.
+    frecency: Vec<u8>,
+    frecency_loaded: bool,
+    /// Standard sticker packs from `GET /sticker-packs`, once a session, Nitro only.
+    standard_stickers: Vec<PackedSticker>,
+    standard_stickers_loaded: bool,
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
     covered: HashMap<String, Vec<(u64, u64)>>,
@@ -1932,6 +1949,7 @@ impl Discord {
             Command::Catalog { kind, space_id, query, cursor, reply } => {
                 answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))
             }
+            Command::Favourite { kind, id, on, reply } => answer(reply, self.favourite(kind, &id, on)),
             Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(self.reaction_rules(&conversation_id)))),
             Command::CancelSend { client_id, .. } => upload::cancel(&self.ctx.account, &client_id),
             // Never: a fetch per DM is the burst that flags accounts. chatd does not send it,

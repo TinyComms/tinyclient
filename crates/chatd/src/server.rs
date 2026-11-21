@@ -2797,6 +2797,15 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Favourite { account, kind, id, on } => {
+                match self.ask(&account, |reply| Command::Favourite { kind, id, on, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, cached, ..)| acct == &account && *cached == kind);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {
