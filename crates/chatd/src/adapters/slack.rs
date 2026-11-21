@@ -331,6 +331,7 @@ fn per_minute(method: &str) -> f64 {
         | "emoji.list"
         | "usergroups.list"
         | "dnd.setSnooze"
+        | "dnd.endSnooze"
         | "stars.add"
         | "stars.remove"
         | "stars.list"
@@ -2098,7 +2099,7 @@ impl Slack {
         Ok(results)
     }
 
-    /// Our own presence, and the status text/emoji/expiration when given.
+    /// Our own presence, DND snooze (`dnd.setSnooze` / `dnd.endSnooze`), and status text/emoji/expiration.
     fn set_presence(
         &self,
         presence: Presence,
@@ -2106,20 +2107,38 @@ impl Slack {
         status_emoji: Option<String>,
         clear_at: Option<i64>,
     ) -> Result<(), Fault> {
+        let me = self.me.get().cloned().unwrap_or_default();
+        let now = crate::hub::now();
+        if matches!(presence, Presence::Dnd | Presence::Busy) {
+            let Some(minutes) = dnd_snooze_minutes(now, clear_at) else {
+                return Err(Fault::Slack("no_dnd_end".to_owned()));
+            };
+            let mins_str = minutes.to_string();
+            let snoozed = self.api("dnd.setSnooze", &[("num_minutes", mins_str.as_str())])?;
+            let endtime = snoozed["snooze_endtime"].as_i64().filter(|ts| *ts > now).unwrap_or(now + minutes * 60);
+            let mut dnd = self.state().dnd.get(&me).cloned().unwrap_or_default();
+            dnd.snooze_enabled = true;
+            dnd.snooze_endtime = endtime;
+            self.apply_dnd(&me, dnd, now);
+            return Ok(());
+        }
         let word = match presence {
             Presence::Online => Some("auto"),
             // Slack knows two words. Away is all it has for not being here.
             Presence::Idle | Presence::Offline => Some("away"),
-            // Not built: Slack's Do Not Disturb is a snooze that must be given its length
-            // (`dnd.setSnooze`, `num_minutes`), and the request carries none. Refused in words
-            // rather than shown as set when it is not.
-            Presence::Dnd | Presence::Busy => return Err(Fault::Slack("no_dnd_end".to_owned())),
+            Presence::Dnd | Presence::Busy => unreachable!(),
             Presence::Unknown => None,
         };
+        if word.is_some() {
+            let snooze_active = self.state().dnd.get(&me).is_some_and(|d| d.snooze_enabled && d.snooze_endtime > now);
+            if snooze_active {
+                let ended = self.api("dnd.endSnooze", &[])?;
+                self.apply_dnd(&me, people::DndState::from_value(&ended), now);
+            }
+        }
         if let Some(word) = word {
             self.api("users.setPresence", &[("presence", word)])?;
         }
-        let me = self.me.get().cloned().unwrap_or_default();
         if status.is_some() || status_emoji.is_some() {
             let clearing = status.as_deref() == Some("") && status_emoji.as_deref().unwrap_or("").is_empty();
             let cached_me = self.cached(&me);
@@ -2714,6 +2733,7 @@ fn capabilities() -> protocol::Capabilities {
         archive: true,
         save_messages: true,
         rich_status: true,
+        dnd_snooze: true,
         ..protocol::Capabilities::default()
     }
 }
@@ -2740,6 +2760,17 @@ fn download_headers(agent: &str, token: &str, cookie: &str, private: bool) -> Ve
 /// `stars.add` when starring, `stars.remove` when not. Tier 2, the same as the pacer holds them to.
 fn star_method(starred: bool) -> &'static str {
     if starred { "stars.add" } else { "stars.remove" }
+}
+
+/// Converts a `clear_at` unix timestamp into Slack's `dnd.setSnooze` `num_minutes` (1..=1440).
+/// Returns `None` when `clear_at` is absent or not in the future.
+fn dnd_snooze_minutes(now: i64, clear_at: Option<i64>) -> Option<i64> {
+    let until = clear_at?;
+    let secs = until - now;
+    if secs <= 0 {
+        return None;
+    }
+    Some(((secs + 59) / 60).clamp(1, 1440))
 }
 
 /// Converts a Unicode emoji or `:name:` shortcode into Slack's `:name:` status_emoji wire format.
@@ -3024,5 +3055,17 @@ mod tests {
         assert!(should_apply_remote_draft("local", Some(100), 120));
         assert!(!should_apply_remote_draft("local", None, 0));
         assert!(should_apply_remote_draft("local", None, 120));
+    }
+
+    #[test]
+    fn dnd_snooze_minutes_clamps_and_rejects_missing_or_past_end() {
+        let now = 1_800_000_000_i64;
+        assert_eq!(dnd_snooze_minutes(now, None), None);
+        assert_eq!(dnd_snooze_minutes(now, Some(now)), None);
+        assert_eq!(dnd_snooze_minutes(now, Some(now - 60)), None);
+        assert_eq!(dnd_snooze_minutes(now, Some(now + 1)), Some(1));
+        assert_eq!(dnd_snooze_minutes(now, Some(now + 1800)), Some(30));
+        assert_eq!(dnd_snooze_minutes(now, Some(now + 7200)), Some(120));
+        assert_eq!(dnd_snooze_minutes(now, Some(now + 10 * 86_400)), Some(1440));
     }
 }

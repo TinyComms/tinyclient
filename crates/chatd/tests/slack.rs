@@ -479,6 +479,27 @@ impl Fake {
                 "snooze_endtime": 0,
             }))),
             "dnd.teamInfo" => Some(json!({"ok": true, "users": {}})),
+            "dnd.setSnooze" => {
+                let mins = param("num_minutes").parse::<i64>().unwrap_or(0);
+                if mins <= 0 {
+                    return refused("missing_duration");
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+                Some(json!({
+                    "ok": true,
+                    "snooze_enabled": true,
+                    "snooze_endtime": now + mins * 60,
+                    "snooze_remaining": mins * 60,
+                }))
+            }
+            "dnd.endSnooze" => Some(json!({
+                "ok": true,
+                "dnd_enabled": false,
+                "next_dnd_start_ts": 0,
+                "next_dnd_end_ts": 0,
+                "snooze_enabled": false,
+                "snooze_endtime": 0,
+            })),
             "stars.add" | "stars.remove" => {
                 if channel.is_empty() {
                     return refused("invalid_arguments");
@@ -4497,5 +4518,80 @@ fn slack_drafts_sync_create_update_delete_and_live_events() {
     world.until("live draft_deleted cleared", || {
         let row = world.conversation(&general)?;
         row.draft.is_empty().then_some(())
+    });
+}
+
+#[test]
+fn slack_dnd_snooze_resume_and_live_dnd_updated() {
+    let world = World::start();
+    world.ready();
+
+    let account = alpha("C0GEN").account();
+    assert!(world.account("T01ALPHA").can.dnd_snooze, "Slack should advertise dnd_snooze capability");
+
+    // 1. Pausing notifications with a clear_at calls dnd.setSnooze and switches presence to Dnd.
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Dnd,
+            status: None,
+            status_emoji: None,
+            clear_at: Some(now + 1800),
+        }),
+        Response::Ok
+    );
+    let snooze = world.fake.calls(ALPHA, "dnd.setSnooze").pop().expect("dnd.setSnooze called");
+    let mins: i64 = snooze.params["num_minutes"].parse().unwrap();
+    assert!((29..=31).contains(&mins), "expected ~30 minutes, got {mins}");
+    world.until("account presence becomes Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Dnd).then_some(())
+    });
+
+    // 2. Resuming notifications (setting Online) calls dnd.endSnooze and clears Dnd.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: None,
+            status_emoji: None,
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "dnd.endSnooze").len(), 1);
+    world.until("account presence returns to Online", || {
+        (world.account("T01ALPHA").presence == Presence::Online).then_some(())
+    });
+
+    // 3. Live dnd_updated socket event sets and clears Dnd.
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated",
+        "user": "U0ME",
+        "dnd_status": {
+            "dnd_enabled": false,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": true,
+            "snooze_endtime": now + 3600,
+        }
+    }));
+    world.until("live dnd_updated sets Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Dnd).then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated",
+        "user": "U0ME",
+        "dnd_status": {
+            "dnd_enabled": false,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": false,
+            "snooze_endtime": 0,
+        }
+    }));
+    world.until("live dnd_updated clears Dnd", || {
+        (world.account("T01ALPHA").presence == Presence::Online).then_some(())
     });
 }

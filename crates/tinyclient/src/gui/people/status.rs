@@ -151,6 +151,48 @@ impl ClearAfter {
     }
 }
 
+/// Preset durations for Slack's "Pause notifications" (`dnd.setSnooze`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DndPreset {
+    Minutes30,
+    Hour1,
+    Hours2,
+    UntilTomorrow,
+}
+
+impl DndPreset {
+    const ALL: [DndPreset; 4] = [
+        DndPreset::Minutes30,
+        DndPreset::Hour1,
+        DndPreset::Hours2,
+        DndPreset::UntilTomorrow,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DndPreset::Minutes30 => "30m",
+            DndPreset::Hour1 => "1h",
+            DndPreset::Hours2 => "2h",
+            DndPreset::UntilTomorrow => "Until tomorrow",
+        }
+    }
+
+    pub fn until(self, now: i64) -> i64 {
+        match self {
+            DndPreset::Minutes30 => now + 30 * 60,
+            DndPreset::Hour1 => now + 3600,
+            DndPreset::Hours2 => now + 2 * 3600,
+            // Next day at 09:00 UTC (at least 1 hour ahead, capped at 24h).
+            DndPreset::UntilTomorrow => {
+                let day = 86_400;
+                let midnight = now - now.rem_euclid(day);
+                let nine_am = midnight + day + 9 * 3600;
+                (nine_am - now).clamp(3600, day) + now
+            }
+        }
+    }
+}
+
 pub struct StatusMenu {
     shell: WeakEntity<Shell>,
     hub: Hub,
@@ -454,6 +496,60 @@ impl StatusMenu {
                     .when(own.presence == state, |row| row.child(glyph("icons/check.svg", 14., theme::text_soft())))
                     .on_click(cx.listener(move |this, _, _, cx| this.send(account.clone(), state, None, None, None, cx))),
             );
+        }
+        if own.can.dnd_snooze {
+            if own.presence == Presence::Dnd {
+                let account = own.key.clone();
+                choices = choices.child(
+                    div()
+                        .id(("own-dnd-resume", ix))
+                        .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::selected()))
+                        .child(glyph("icons/bell.svg", 14., theme::text_soft()))
+                        .child(div().flex_1().min_w_0().truncate().child("Resume notifications"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.send(account.clone(), Presence::Online, None, None, None, cx);
+                        })),
+                );
+            }
+            let dnd_row = div()
+                .mt(px(2.))
+                .px(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Pause notifications"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(4.))
+                        .children(DndPreset::ALL.iter().enumerate().map(|(pix, &preset)| {
+                            let account = own.key.clone();
+                            div()
+                                .id(("own-dnd-preset", ix * 8 + pix))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(theme::R_CHIP))
+                                .type_micro()
+                                .text_color(theme::text_soft())
+                                .cursor_pointer()
+                                .hover(|el| el.bg(theme::hover()))
+                                .child(preset.label())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let until = preset.until(crate::view::now());
+                                    this.send(account.clone(), Presence::Dnd, None, None, Some(until), cx);
+                                }))
+                        })),
+                );
+            choices = choices.child(dnd_row);
         }
         if !has_status_text(network, &own.can) {
             return choices;
@@ -822,5 +918,15 @@ mod tests {
         assert_eq!(account_label(&accounts, &accounts[0]), "Discord");
         assert_eq!(account_label(&accounts, &accounts[1]), "Northwind");
         assert_eq!(account_label(&accounts[..2], &accounts[1]), "Slack");
+    }
+
+    #[test]
+    fn dnd_presets_compute_future_snooze_end_times() {
+        let now = 1_800_000_000_i64;
+        assert_eq!(DndPreset::Minutes30.until(now), now + 1800);
+        assert_eq!(DndPreset::Hour1.until(now), now + 3600);
+        assert_eq!(DndPreset::Hours2.until(now), now + 7200);
+        let tomorrow = DndPreset::UntilTomorrow.until(now);
+        assert!(tomorrow >= now + 3600 && tomorrow <= now + 86_400);
     }
 }
