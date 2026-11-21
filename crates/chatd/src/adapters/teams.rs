@@ -345,6 +345,8 @@ struct State {
     scheduled: HashMap<String, i64>,
     /// Active trouter registration endpoint id, removed on sign-out.
     endpoint: Option<String>,
+    /// Adaptive Card invoke metadata for poll messages: `(conversation, message_id)` -> `PollInvoke`.
+    polls: HashMap<(String, String), card::PollInvoke>,
 }
 
 /// What a call presents.
@@ -941,6 +943,12 @@ impl Teams {
             importance: true,
             channel_subject: true,
             out_of_office: true,
+            polls: Some(protocol::PollCapabilities {
+                max_options: 10,
+                max_duration_secs: 0,
+                multiple: true,
+                anonymous: true,
+            }),
             ..protocol::Capabilities::default()
         });
         {
@@ -977,6 +985,12 @@ impl Teams {
             }
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
+            }
+            Command::Vote { conversation_id, message_id, votes, reply } => {
+                let _ = reply.send(self.vote(&conversation_id, &message_id, votes.as_deref()).map_err(refuse));
+            }
+            Command::MessageAction { conversation_id, message_id, block_id, action_id, element_type: _, value, values: _, reply } => {
+                let _ = reply.send(self.invoke_card_action(&conversation_id, &message_id, &block_id, &action_id, &value).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
             Command::Edit { conversation_id, message_id, text, spans, reply } => {

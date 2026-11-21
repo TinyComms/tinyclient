@@ -25,6 +25,11 @@ impl Teams {
             self.ctx.sent(conversation, client_id, outcome);
             return;
         }
+        if let Some(ref draft) = with.poll {
+            let outcome = self.send_poll(conversation, client_id, draft, reply_to, &with);
+            self.ctx.sent(conversation, client_id, outcome);
+            return;
+        }
         if with.files.is_empty() {
             self.post_with_outgoing(conversation, client_id, text, reply_to, &with);
             return;
@@ -65,6 +70,42 @@ impl Teams {
         self.state().scheduled.insert(raw_id.clone(), at);
         message.id = format!("scheduled:{raw_id}");
         message.sent = at;
+        Ok(message)
+    }
+
+    /// Creates and posts a Teams Polls Adaptive Card in `conversation`.
+    fn send_poll(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        draft: &protocol::PollDraft,
+        reply_to: Option<&str>,
+        with: &Outgoing,
+    ) -> Result<Message, String> {
+        let question = draft.question.trim();
+        let options: Vec<String> = draft.options.iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+        if question.is_empty() {
+            return Err("Poll question cannot be empty.".to_owned());
+        }
+        if options.len() < 2 || options.len() > 10 {
+            return Err("Teams polls require between 2 and 10 options.".to_owned());
+        }
+        let cleaned = protocol::PollDraft {
+            question: question.to_owned(),
+            options: options.clone(),
+            multiple: draft.multiple,
+            duration_secs: draft.duration_secs,
+            anonymous: draft.anonymous,
+        };
+        let (card_attachment, invoke) = super::card::build_poll_card(&cleaned, client_id);
+        let props = json!({"cards": Value::Array(vec![card_attachment]).to_string()});
+        let mut message = self
+            .posted_with(conversation, client_id, question, reply_to, with, Some(props))
+            .map_err(super::reason)?;
+        self.state().polls.insert((conversation.to_owned(), message.id.clone()), invoke);
+        let mut poll = protocol::Poll::open(question, options, draft.multiple);
+        poll.anonymous = draft.anonymous;
+        message.poll = Some(Box::new(poll));
         Ok(message)
     }
 

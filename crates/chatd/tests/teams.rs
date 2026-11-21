@@ -478,6 +478,9 @@ impl Fake {
                 ok(self.fixture(name).unwrap())
             }
             ("POST", "messages") => self.post(call, conversation),
+            ("POST", _) if tail.starts_with("messages/") && tail.ends_with("/invoke") => {
+                ok(json!({"statusCode": 200, "type": "application/vnd.microsoft.activity.message", "value": "OK"}))
+            }
             ("PUT", "properties") => ok(json!({})),
             ("DELETE", "") => ok(json!({})),
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
@@ -2687,5 +2690,180 @@ fn rich_org_card_populates_phones_office_local_time_org_chart_and_refreshes_avat
     assert_eq!(dee.title, "Product Manager");
     assert_eq!(dee.office, "Lisbon");
     assert!(dee.manager.is_none());
+}
+
+#[test]
+fn polls_praise_and_approvals_cards_render_vote_create_and_act() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises poll capability.
+    let poll_can = world.account(HOME).can.polls.expect("Teams advertises polls");
+    assert!(poll_can.max_options >= 10 && poll_can.multiple && poll_can.anonymous);
+
+    // 2. Push incoming Poll, Praise, and Approval Adaptive Cards.
+    let mut poll_msg = message(CHAT_ANA, None, 1_760_000_860_001, ANA, "Ana Ruiz", "");
+    poll_msg["messagetype"] = "RichText/Html".into();
+    poll_msg["properties"] = json!({
+        "cards": json!([{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "appId": "ef56c0de-36fc-4ef8-b417-3d82ba9d073c",
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Lunch today?", "weight": "bolder", "size": "medium"},
+                    {
+                        "type": "Input.ChoiceSet",
+                        "id": "pollChoice",
+                        "isMultiSelect": false,
+                        "choices": [
+                            {"title": "Ramen", "value": "opt_ramen"},
+                            {"title": "Tacos", "value": "opt_tacos"}
+                        ]
+                    }
+                ],
+                "actions": [{"type": "Action.Submit", "title": "Submit vote", "data": {"pollId": "p-99", "action": "vote"}}]
+            }).to_string()
+        }]).to_string()
+    });
+
+    let mut praise_msg = message(CHAT_ANA, None, 1_760_000_860_002, ANA, "Ana Ruiz", "");
+    praise_msg["messagetype"] = "RichText/Html".into();
+    praise_msg["properties"] = json!({
+        "cards": json!([{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "appId": "a6b63365-31a4-4f43-92ec-710b71557af9",
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Ana sent praise to Ben Okafor"},
+                    {"type": "TextBlock", "text": "Awesome", "weight": "bolder", "size": "large"},
+                    {"type": "TextBlock", "text": "Great launch!"}
+                ]
+            }).to_string()
+        }]).to_string()
+    });
+
+    let mut approval_msg = message(CHAT_ANA, None, 1_760_000_860_003, ANA, "Ana Ruiz", "");
+    approval_msg["messagetype"] = "RichText/Html".into();
+    approval_msg["properties"] = json!({
+        "cards": json!([{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "appId": "7c316234-ded0-4f95-8a83-8453d0876592",
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Deploy hotfix #12", "weight": "bolder", "size": "medium"},
+                    {"type": "FactSet", "facts": [
+                        {"title": "Requester", "value": "Ana Ruiz"},
+                        {"title": "Status", "value": "Requested"}
+                    ]}
+                ],
+                "actions": [
+                    {"type": "Action.Submit", "id": "approve", "title": "Approve", "data": {"approvalId": "a-12", "decision": "Approve"}},
+                    {"type": "Action.Submit", "id": "reject", "title": "Reject", "data": {"approvalId": "a-12", "decision": "Reject"}}
+                ]
+            }).to_string()
+        }]).to_string()
+    });
+
+    for m in [poll_msg, praise_msg, approval_msg] {
+        world.fake.push("NewMessage", m, false);
+    }
+    world.until("poll, praise, and approval messages stored", || {
+        let msgs = world.messages(&ana);
+        ["1760000860001", "1760000860002", "1760000860003"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+
+    let p = world.message(&ana, "1760000860001").unwrap();
+    let poll = p.poll.as_ref().expect("native poll on message");
+    assert_eq!(poll.question, "Lunch today?");
+    assert_eq!(poll.choices.len(), 2);
+
+    let pr = world.message(&ana, "1760000860002").unwrap();
+    let pr_card = pr.card.as_ref().expect("praise card");
+    assert_eq!(pr_card.author, "Praise");
+    assert_eq!(pr_card.title, "Awesome");
+    assert_eq!(pr_card.fields, vec![("To".into(), "Ben Okafor".into())]);
+
+    let ap = world.message(&ana, "1760000860003").unwrap();
+    let ap_card = ap.card.as_ref().expect("approval card");
+    assert_eq!(ap_card.author, "Approval");
+    assert_eq!(ap_card.title, "Deploy hotfix #12");
+    assert_eq!(ap.controls.len(), 2);
+    assert_eq!(ap.controls[0].label, "Approve");
+    assert_eq!(ap.controls[1].label, "Reject");
+
+    // 3. Vote on the poll via Request::Poll -> hits /invoke and updates local mine.
+    let vote_res = world.ask(Request::Poll {
+        conversation: ana.clone(),
+        message_id: "1760000860001".to_owned(),
+        votes: Some(vec![1]),
+    });
+    assert!(matches!(vote_res, Response::Ok), "{vote_res:?}");
+    let vote_call = world
+        .fake
+        .calls("POST", "/messages/1760000860001/invoke")
+        .pop()
+        .expect("poll vote invoke reached Teams");
+    assert_eq!(vote_call.json()["value"]["action"]["data"]["pollChoice"].as_str(), Some("opt_tacos"));
+    let updated_poll = world.message(&ana, "1760000860001").unwrap().poll.unwrap();
+    assert_eq!(updated_poll.mine, vec![1]);
+    assert_eq!(updated_poll.choices[1].count, 1);
+
+    // 4. Approve via Request::MessageAction -> hits /invoke with approval data.
+    let act_res = world.ask(Request::MessageAction {
+        conversation: ana.clone(),
+        message_id: "1760000860003".to_owned(),
+        block_id: ap.controls[0].block_id.clone(),
+        action_id: ap.controls[0].action_id.clone(),
+        element_type: ap.controls[0].element_type.clone(),
+        value: ap.controls[0].value.clone(),
+        values: Vec::new(),
+    });
+    assert!(matches!(act_res, Response::Ok), "{act_res:?}");
+    let apr_call = world
+        .fake
+        .calls("POST", "/messages/1760000860003/invoke")
+        .pop()
+        .expect("approval invoke reached Teams");
+    assert_eq!(apr_call.json()["value"]["action"]["data"]["decision"].as_str(), Some("Approve"));
+
+    // 5. Create a new poll via Request::Send with Outgoing::poll.
+    let created = world.ask(Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000650".to_owned(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            poll: Some(protocol::PollDraft {
+                question: "Release day?".to_owned(),
+                options: vec!["Tuesday".to_owned(), "Wednesday".to_owned()],
+                multiple: false,
+                duration_secs: None,
+                anonymous: true,
+            }),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(created, Response::Sent { .. }), "{created:?}");
+    let sent_poll = world.until("created poll stored", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000650") && m.state == SendState::Sent)
+    });
+    let sp = sent_poll.poll.as_ref().expect("created message carries native poll");
+    assert_eq!(sp.question, "Release day?");
+    assert_eq!(sp.choices.len(), 2);
+    assert!(sp.anonymous);
 }
 

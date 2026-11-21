@@ -9,8 +9,10 @@
 //! returns nothing so the caller falls back to the one-line unsupported form, never a blank row.
 
 use base64::Engine;
-use protocol::{Card, CardAction, MediaFile, MediaKind, CARD_ACTIONS, CARD_FIELDS};
-use serde_json::Value;
+use protocol::{
+    Card, CardAction, ControlKind, ControlStyle, MediaFile, MediaKind, MessageControl, Poll, PollChoice, PollDraft, CARD_ACTIONS, CARD_FIELDS,
+};
+use serde_json::{json, Value};
 
 /// Teams card content types we parse into [`Card`].
 const ADAPTIVE: &str = "application/vnd.microsoft.card.adaptive";
@@ -18,15 +20,34 @@ const HERO: &str = "application/vnd.microsoft.card.hero";
 const THUMBNAIL: &str = "application/vnd.microsoft.card.thumbnail";
 const O365_CONNECTOR: &str = "application/vnd.microsoft.teams.card.o365connector";
 
-/// Parsed cards and any Teams-hosted media registered for them.
+/// Known Microsoft Teams first-party app IDs for Polls/Forms, Praise, and Approvals.
+const APP_FORMS: &str = "2049e460-c544-4209-9e6c-694733088c8b";
+const APP_POLLS: &str = "ef56c0de-36fc-4ef8-b417-3d82ba9d073c";
+const APP_PRAISE: &str = "a6b63365-31a4-4f43-92ec-710b71557af9";
+const APP_APPROVALS: &str = "7c316234-ded0-4f95-8a83-8453d0876592";
+
+/// Metadata kept per poll message so `Command::Vote` can invoke Teams' Adaptive Card action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PollInvoke {
+    pub app_id: String,
+    pub poll_id: String,
+    pub input_id: String,
+    pub option_values: Vec<String>,
+    pub submit_data: Value,
+}
+
+/// Parsed cards, optional native poll, interactive controls, and Teams-hosted media.
 #[derive(Debug, Default)]
 pub(super) struct ParsedCards {
     pub cards: Vec<Card>,
     pub media: Vec<(MediaFile, String)>,
+    pub poll: Option<(Poll, PollInvoke)>,
+    pub controls: Vec<MessageControl>,
 }
 
 /// Parses `properties.cards` (or an embedded `<Swift b64="...">` payload when `cards` is empty)
-/// into structured [`Card`] entries. Returns an empty list if nothing meaningful could be read.
+/// into structured [`Card`] entries, native [`Poll`]s (Teams Polls / Forms), Praise cards, and
+/// Approval cards with interactive Approve/Reject [`MessageControl`]s.
 pub(super) fn parse_cards(
     cards: &[Value],
     content_html: &str,
@@ -44,11 +65,566 @@ pub(super) fn parse_cards(
     };
     let mut media_index = 0usize;
     for entry in source {
+        let Some(content) = extract_content(entry) else {
+            continue;
+        };
+        let content_type = entry["contentType"].as_str().unwrap_or("").to_ascii_lowercase();
+        let is_adaptive = content_type == ADAPTIVE
+            || content["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("AdaptiveCard"));
+        if is_adaptive {
+            if out.poll.is_none() {
+                if let Some(poll) = try_parse_poll(entry, &content, message_id) {
+                    out.poll = Some(poll);
+                    continue;
+                }
+            }
+            if let Some(praise) = try_parse_praise(entry, &content, message_id, message_link, &hosted, &mut out.media, &mut media_index) {
+                out.cards.push(praise);
+                continue;
+            }
+            if let Some((approval, controls)) = try_parse_approval(entry, &content, message_id, message_link, &hosted, &mut out.media, &mut media_index) {
+                out.cards.push(approval);
+                out.controls.extend(controls);
+                continue;
+            }
+        }
         if let Some(card) = parse_one(entry, message_id, message_link, &hosted, &mut out.media, &mut media_index) {
             out.cards.push(card);
         }
     }
     out
+}
+
+fn extract_content(entry: &Value) -> Option<Value> {
+    let content = match entry.get("content") {
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok()?,
+        Some(Value::Object(_)) => entry["content"].clone(),
+        _ if entry.is_object() && (entry["type"] == "AdaptiveCard" || entry["@type"] == "MessageCard") => entry.clone(),
+        _ => return None,
+    };
+    content.is_object().then_some(content)
+}
+
+fn app_id_of(entry: &Value, content: &Value) -> String {
+    [
+        entry["appId"].as_str(),
+        entry["teamsAppId"].as_str(),
+        content["msTeams"]["appId"].as_str(),
+        content["msteams"]["appId"].as_str(),
+        content["appId"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|s| !s.is_empty())
+    .unwrap_or("")
+    .to_ascii_lowercase()
+}
+
+/// Recursively collects all elements matching `pred` inside an Adaptive Card body tree.
+fn walk_body<'a>(items: &'a [Value], out: &mut Vec<&'a Value>) {
+    for item in items {
+        out.push(item);
+        if let Some(sub) = item["items"].as_array() {
+            walk_body(sub, out);
+        }
+        if let Some(cols) = item["columns"].as_array() {
+            for col in cols {
+                if let Some(sub) = col["items"].as_array() {
+                    walk_body(sub, out);
+                }
+            }
+        }
+        if let Some(rows) = item["rows"].as_array() {
+            for row in rows {
+                if let Some(cells) = row["cells"].as_array() {
+                    for cell in cells {
+                        if let Some(sub) = cell["items"].as_array() {
+                            walk_body(sub, out);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(actions) = item["actions"].as_array() {
+            for act in actions {
+                if let Some(sub) = act["card"]["body"].as_array() {
+                    walk_body(sub, out);
+                }
+            }
+        }
+    }
+}
+
+/// Collects all actions across top-level `actions` and any `ActionSet` elements inside `body`.
+fn collect_actions<'a>(root: &'a Value, body_nodes: &[&'a Value]) -> Vec<&'a Value> {
+    let mut actions = Vec::new();
+    for node in body_nodes {
+        if node["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("ActionSet")) {
+            if let Some(arr) = node["actions"].as_array() {
+                actions.extend(arr.iter());
+            }
+        }
+    }
+    if let Some(arr) = root["actions"].as_array() {
+        actions.extend(arr.iter());
+    }
+    actions
+}
+
+/// Extracts an integer count from strings like `"3 votes"`, `"3 responses (60%)"`, `"Total responses: 5"`.
+fn extract_vote_count(text: &str) -> Option<u32> {
+    let lower = text.to_ascii_lowercase();
+    if !(lower.contains("vote") || lower.contains("response")) {
+        return None;
+    }
+    for token in lower.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(n) = token.parse::<u32>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Detects and parses a Teams Polls / Microsoft Forms Adaptive Card into `(Poll, PollInvoke)`.
+fn try_parse_poll(entry: &Value, content: &Value, message_id: &str) -> Option<(Poll, PollInvoke)> {
+    let app_id = app_id_of(entry, content);
+    let body = content["body"].as_array()?;
+    let mut nodes = Vec::new();
+    walk_body(body, &mut nodes);
+    let actions = collect_actions(content, &nodes);
+
+    let choice_set = nodes
+        .iter()
+        .copied()
+        .find(|n| n["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("Input.ChoiceSet")));
+    let submit_action = actions.iter().copied().find(|a| {
+        let kind = a["type"].as_str().unwrap_or("");
+        if !(kind.eq_ignore_ascii_case("Action.Submit") || kind.eq_ignore_ascii_case("Action.Execute")) {
+            return false;
+        }
+        let title = a["title"].as_str().unwrap_or("").to_ascii_lowercase();
+        title.contains("vote") || title.contains("submit") || a["data"]["pollId"].is_string() || a["data"]["action"] == "vote"
+    });
+    let is_poll_app = app_id == APP_FORMS || app_id == APP_POLLS;
+    let has_poll_shape = choice_set.is_some() && (is_poll_app || submit_action.is_some());
+    if !has_poll_shape && !is_poll_app {
+        return None;
+    }
+
+    let mut links = Vec::new();
+    let texts: Vec<String> = nodes
+        .iter()
+        .filter(|n| n["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("TextBlock")))
+        .filter_map(|n| n["text"].as_str())
+        .map(|s| clean_ac_markdown(s, &mut links).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let question = nodes
+        .iter()
+        .filter(|n| n["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("TextBlock")))
+        .find_map(|n| {
+            let raw = n["text"].as_str()?.trim();
+            let cleaned = clean_ac_markdown(raw, &mut links).trim().to_owned();
+            let lower = cleaned.to_ascii_lowercase();
+            if cleaned.is_empty() || lower == "polls" || lower == "forms" || lower == "microsoft forms" || lower.starts_with("responses are") {
+                return None;
+            }
+            let prominent = n["weight"].as_str().is_some_and(|w| w.eq_ignore_ascii_case("bolder"))
+                || n["size"].as_str().is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "medium" | "large" | "extralarge"));
+            prominent.then_some(cleaned)
+        })
+        .or_else(|| {
+            texts
+                .iter()
+                .find(|t| {
+                    let l = t.to_ascii_lowercase();
+                    l != "polls" && l != "forms" && !l.starts_with("responses are") && !l.starts_with("total ")
+                })
+                .cloned()
+        })
+        .unwrap_or_default();
+
+    let mut choices: Vec<PollChoice> = Vec::new();
+    let mut option_values: Vec<String> = Vec::new();
+    let mut multiple = false;
+    let mut input_id = "pollChoice".to_owned();
+
+    if let Some(cs) = choice_set {
+        multiple = cs["isMultiSelect"] == true;
+        if let Some(id) = cs["id"].as_str().filter(|s| !s.is_empty()) {
+            input_id = id.to_owned();
+        }
+        for (ix, ch) in cs["choices"].as_array().into_iter().flatten().enumerate() {
+            let title = ch["title"].as_str().unwrap_or("").trim().to_owned();
+            if title.is_empty() {
+                continue;
+            }
+            let value = ch["value"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| ix.to_string());
+            let count = ch["voteCount"].as_u64().or_else(|| ch["count"].as_u64()).unwrap_or(0) as u32;
+            choices.push(PollChoice { text: title, count, voters: Vec::new() });
+            option_values.push(value);
+        }
+    }
+
+    // Also inspect result lines in `ColumnSet` / `FactSet` rows to populate per-choice vote counts
+    // (or choices themselves on a closed results-only poll card with no Input.ChoiceSet).
+    for node in &nodes {
+        if node["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("ColumnSet")) {
+            let cols = node["columns"].as_array().map_or(&[][..], Vec::as_slice);
+            if cols.len() >= 2 {
+                let left = cols[0]["items"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|i| i["text"].as_str())
+                    .map(|s| clean_ac_markdown(s, &mut links).trim().to_owned())
+                    .unwrap_or_default();
+                let right = cols[1]["items"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|i| i["text"].as_str())
+                    .map(|s| clean_ac_markdown(s, &mut links).trim().to_owned())
+                    .unwrap_or_default();
+                if let Some(count) = extract_vote_count(&right) {
+                    if let Some(existing) = choices.iter_mut().find(|c| c.text.eq_ignore_ascii_case(&left)) {
+                        existing.count = existing.count.max(count);
+                    } else if choice_set.is_none() && !left.is_empty() {
+                        option_values.push(choices.len().to_string());
+                        choices.push(PollChoice { text: left, count, voters: Vec::new() });
+                    }
+                }
+            }
+        }
+    }
+
+    if question.is_empty() || choices.len() < 2 {
+        return None;
+    }
+
+    let joined_lower = texts.join("\n").to_ascii_lowercase();
+    let anonymous = joined_lower.contains("anonymous");
+    let closed = joined_lower.contains("poll closed")
+        || joined_lower.contains("status: closed")
+        || joined_lower.contains("voting closed")
+        || (choice_set.is_none() && submit_action.is_none());
+    let total = texts
+        .iter()
+        .find(|t| {
+            let l = t.to_ascii_lowercase();
+            l.contains("total") || l.ends_with("responses") || l.ends_with("votes")
+        })
+        .and_then(|t| extract_vote_count(t));
+
+    let submit_data = submit_action.map(|a| a["data"].clone()).unwrap_or(Value::Null);
+    let poll_id = submit_data["pollId"]
+        .as_str()
+        .or_else(|| submit_data["id"].as_str())
+        .or_else(|| content["msTeams"]["pollId"].as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(message_id)
+        .to_owned();
+
+    let poll = Poll {
+        question,
+        choices,
+        multiple,
+        closed,
+        closes_at: None,
+        anonymous,
+        total,
+        mine: Vec::new(),
+        ballots: Vec::new(),
+    };
+    let invoke = PollInvoke {
+        app_id: if app_id.is_empty() { APP_POLLS.to_owned() } else { app_id },
+        poll_id,
+        input_id,
+        option_values,
+        submit_data,
+    };
+    Some((poll, invoke))
+}
+
+/// Builds a Teams Polls Adaptive Card JSON + [`PollInvoke`] metadata for creating a poll.
+pub(super) fn build_poll_card(draft: &PollDraft, poll_id: &str) -> (Value, PollInvoke) {
+    let mut choices_json = Vec::new();
+    let mut option_values = Vec::new();
+    for (ix, opt) in draft.options.iter().enumerate() {
+        let val = format!("opt_{ix}");
+        option_values.push(val.clone());
+        choices_json.push(json!({"title": opt, "value": val}));
+    }
+    let mut body = vec![
+        json!({"type": "TextBlock", "text": "Polls", "size": "small", "isSubtle": true}),
+        json!({"type": "TextBlock", "text": draft.question, "weight": "bolder", "size": "medium", "wrap": true}),
+    ];
+    if draft.anonymous {
+        body.push(json!({"type": "TextBlock", "text": "Responses are anonymous", "size": "small", "isSubtle": true}));
+    }
+    body.push(json!({
+        "type": "Input.ChoiceSet",
+        "id": "pollChoice",
+        "style": "expanded",
+        "isMultiSelect": draft.multiple,
+        "choices": choices_json,
+    }));
+    let submit_data = json!({"action": "vote", "pollId": poll_id});
+    let card_content = json!({
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.5",
+        "msTeams": {"appId": APP_POLLS, "pollId": poll_id},
+        "body": body,
+        "actions": [{
+            "type": "Action.Submit",
+            "id": "submitVote",
+            "title": "Submit vote",
+            "data": submit_data,
+        }],
+    });
+    let attachment = json!({
+        "contentType": ADAPTIVE,
+        "appId": APP_POLLS,
+        "content": card_content.to_string(),
+    });
+    let invoke = PollInvoke {
+        app_id: APP_POLLS.to_owned(),
+        poll_id: poll_id.to_owned(),
+        input_id: "pollChoice".to_owned(),
+        option_values,
+        submit_data,
+    };
+    (attachment, invoke)
+}
+
+/// Detects and parses a Teams Praise Adaptive Card (badge, recipients, note).
+fn try_parse_praise(
+    entry: &Value,
+    content: &Value,
+    message_id: &str,
+    message_link: &str,
+    hosted: &dyn Fn(&str) -> bool,
+    media: &mut Vec<(MediaFile, String)>,
+    media_index: &mut usize,
+) -> Option<Card> {
+    let app_id = app_id_of(entry, content);
+    let body = content["body"].as_array()?;
+    let mut nodes = Vec::new();
+    walk_body(body, &mut nodes);
+
+    let mut links = Vec::new();
+    let texts: Vec<String> = nodes
+        .iter()
+        .filter(|n| n["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("TextBlock")))
+        .filter_map(|n| n["text"].as_str())
+        .map(|s| clean_ac_markdown(s, &mut links).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mentions_praise = texts.iter().any(|t| {
+        let l = t.to_ascii_lowercase();
+        l.contains("sent praise") || l == "praise" || l.starts_with("praise:")
+    });
+    if app_id != APP_PRAISE && !mentions_praise {
+        return None;
+    }
+
+    let mut card = Card {
+        author: "Praise".to_owned(),
+        color: Some(0x7B5EA7),
+        ..Card::default()
+    };
+
+    // Extract badge title, recipients, and note from prominent TextBlocks & FactSets.
+    for node in &nodes {
+        match node["type"].as_str().unwrap_or("") {
+            t if t.eq_ignore_ascii_case("TextBlock") => {
+                let raw = node["text"].as_str().unwrap_or("");
+                let cleaned = clean_ac_markdown(raw, &mut links).trim().to_owned();
+                let lower = cleaned.to_ascii_lowercase();
+                if cleaned.is_empty() || lower == "praise" {
+                    continue;
+                }
+                if let Some(rest) = cleaned.strip_prefix("To:").or_else(|| cleaned.strip_prefix("Sent to ")) {
+                    push_fact(&mut card, "To", rest.trim());
+                } else if lower.contains("sent praise to ") {
+                    if let Some(pos) = lower.find("sent praise to ") {
+                        let who = cleaned[pos + "sent praise to ".len()..].trim();
+                        if !who.is_empty() {
+                            push_fact(&mut card, "To", who);
+                        }
+                    }
+                } else if card.title.is_empty()
+                    && (node["weight"].as_str().is_some_and(|w| w.eq_ignore_ascii_case("bolder"))
+                        || node["size"].as_str().is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "medium" | "large" | "extralarge")))
+                {
+                    card.title = cleaned;
+                } else {
+                    push_line(&mut card.text, &cleaned);
+                }
+            }
+            t if t.eq_ignore_ascii_case("FactSet") => {
+                for fact in node["facts"].as_array().into_iter().flatten() {
+                    let k = fact["title"].as_str().unwrap_or("");
+                    let v = clean_ac_markdown(fact["value"].as_str().unwrap_or(""), &mut links);
+                    push_fact(&mut card, k, &v);
+                }
+            }
+            t if t.eq_ignore_ascii_case("Image") => {
+                let url = node["url"].as_str().unwrap_or("");
+                let alt = node["altText"].as_str().unwrap_or("Praise badge");
+                add_image(&mut card, url, alt, true, message_id, hosted, media, media_index);
+            }
+            _ => {}
+        }
+    }
+    if card.title.is_empty() {
+        card.title = "Praise".to_owned();
+    }
+    for (label, url) in links {
+        push_action(&mut card, &label, &url);
+    }
+    if !message_link.is_empty() && card.actions.is_empty() {
+        push_open_in_teams(&mut card, "View praise", message_link);
+    }
+    card.bound();
+    Some(card)
+}
+
+/// Detects and parses a Teams Approvals Adaptive Card (requester, title, status, and Approve/Reject controls).
+fn try_parse_approval(
+    entry: &Value,
+    content: &Value,
+    message_id: &str,
+    message_link: &str,
+    hosted: &dyn Fn(&str) -> bool,
+    media: &mut Vec<(MediaFile, String)>,
+    media_index: &mut usize,
+) -> Option<(Card, Vec<MessageControl>)> {
+    let app_id = app_id_of(entry, content);
+    let body = content["body"].as_array()?;
+    let mut nodes = Vec::new();
+    walk_body(body, &mut nodes);
+    let actions = collect_actions(content, &nodes);
+
+    let has_approve_reject = actions.iter().any(|a| {
+        let t = a["title"].as_str().unwrap_or("").to_ascii_lowercase();
+        t == "approve" || t == "reject"
+    });
+    if app_id != APP_APPROVALS && !has_approve_reject {
+        return None;
+    }
+
+    let mut card = Card {
+        author: "Approval".to_owned(),
+        ..Card::default()
+    };
+    let mut links = Vec::new();
+    let mut status_word = String::new();
+
+    for node in &nodes {
+        match node["type"].as_str().unwrap_or("") {
+            t if t.eq_ignore_ascii_case("TextBlock") => {
+                let raw = node["text"].as_str().unwrap_or("");
+                let cleaned = clean_ac_markdown(raw, &mut links).trim().to_owned();
+                let lower = cleaned.to_ascii_lowercase();
+                if cleaned.is_empty() || lower == "approvals" || lower == "approval" {
+                    continue;
+                }
+                if card.title.is_empty()
+                    && (node["weight"].as_str().is_some_and(|w| w.eq_ignore_ascii_case("bolder"))
+                        || node["size"].as_str().is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "medium" | "large" | "extralarge")))
+                {
+                    card.title = cleaned;
+                } else {
+                    if lower.contains("approved") {
+                        status_word = "Approved".to_owned();
+                    } else if lower.contains("rejected") {
+                        status_word = "Rejected".to_owned();
+                    } else if lower.contains("requested") || lower.contains("pending") {
+                        status_word = "Requested".to_owned();
+                    }
+                    push_line(&mut card.text, &cleaned);
+                }
+            }
+            t if t.eq_ignore_ascii_case("FactSet") => {
+                for fact in node["facts"].as_array().into_iter().flatten() {
+                    let k = fact["title"].as_str().unwrap_or("");
+                    let v = clean_ac_markdown(fact["value"].as_str().unwrap_or(""), &mut links);
+                    if k.eq_ignore_ascii_case("status") && !v.is_empty() {
+                        status_word = v.clone();
+                    }
+                    push_fact(&mut card, k, &v);
+                }
+            }
+            t if t.eq_ignore_ascii_case("Image") => {
+                let url = node["url"].as_str().unwrap_or("");
+                let alt = node["altText"].as_str().unwrap_or("Approval");
+                add_image(&mut card, url, alt, true, message_id, hosted, media, media_index);
+            }
+            _ => {}
+        }
+    }
+
+    card.color = Some(match status_word.to_ascii_lowercase().as_str() {
+        s if s.contains("approved") => 0x16A34A,
+        s if s.contains("rejected") || s.contains("cancel") => 0xDC2626,
+        s if s.contains("request") || s.contains("pending") => 0xD97706,
+        _ => 0x2563EB,
+    });
+
+    let block = if app_id.is_empty() { APP_APPROVALS.to_owned() } else { app_id };
+    let mut controls = Vec::new();
+    for action in &actions {
+        let kind = action["type"].as_str().unwrap_or("");
+        let title = action["title"].as_str().unwrap_or("").trim();
+        if title.is_empty() {
+            continue;
+        }
+        if kind.eq_ignore_ascii_case("Action.OpenUrl") {
+            if let Some(url) = action["url"].as_str() {
+                push_action(&mut card, title, url);
+            }
+        } else if kind.eq_ignore_ascii_case("Action.Submit") || kind.eq_ignore_ascii_case("Action.Execute") {
+            let lower = title.to_ascii_lowercase();
+            let style = if lower.contains("approve") {
+                ControlStyle::Primary
+            } else if lower.contains("reject") || lower.contains("decline") {
+                ControlStyle::Danger
+            } else {
+                ControlStyle::Default
+            };
+            let action_id = action["id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| lower.replace(' ', "_"));
+            let data = if !action["data"].is_null() {
+                action["data"].to_string()
+            } else {
+                json!({"action": action_id}).to_string()
+            };
+            controls.push(MessageControl {
+                block_id: block.clone(),
+                action_id,
+                element_type: "adaptive_invoke".to_owned(),
+                label: title.to_owned(),
+                value: data,
+                confirm: None,
+                kind: ControlKind::Button { url: String::new(), style },
+            });
+        }
+    }
+    for (label, url) in links {
+        push_action(&mut card, &label, &url);
+    }
+    push_open_in_teams(&mut card, "View details", message_link);
+    card.bound();
+    Some((card, controls))
 }
 
 /// Extracts card attachments from `<Swift b64="...">` in legacy Teams `RichText/Media_Card` HTML.
@@ -864,5 +1440,108 @@ mod tests {
         assert!(parse_cards(bad.as_array().unwrap(), "", "1", MSG_LINK, hosted_teams).cards.is_empty());
         let empty = json!([{"contentType": ADAPTIVE, "content": "{\"type\":\"AdaptiveCard\",\"body\":[]}"}]);
         assert!(parse_cards(empty.as_array().unwrap(), "", "1", MSG_LINK, hosted_teams).cards.is_empty());
+    }
+
+    #[test]
+    fn poll_praise_and_approval_adaptive_cards_parse_natively() {
+        // 1. Teams Polls card with choices, counts, and anonymous notice.
+        let poll_card = json!([{
+            "contentType": ADAPTIVE,
+            "appId": APP_POLLS,
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Polls", "size": "small"},
+                    {"type": "TextBlock", "text": "Where should we hold offsite?", "weight": "bolder", "size": "medium"},
+                    {"type": "TextBlock", "text": "Responses are anonymous", "size": "small"},
+                    {
+                        "type": "Input.ChoiceSet",
+                        "id": "pollChoice",
+                        "isMultiSelect": true,
+                        "choices": [
+                            {"title": "Lisbon", "value": "opt_0"},
+                            {"title": "Berlin", "value": "opt_1"}
+                        ]
+                    },
+                    {"type": "ColumnSet", "columns": [
+                        {"type": "Column", "items": [{"type": "TextBlock", "text": "Lisbon"}]},
+                        {"type": "Column", "items": [{"type": "TextBlock", "text": "4 votes (67%)"}]}
+                    ]},
+                    {"type": "ColumnSet", "columns": [
+                        {"type": "Column", "items": [{"type": "TextBlock", "text": "Berlin"}]},
+                        {"type": "Column", "items": [{"type": "TextBlock", "text": "2 votes (33%)"}]}
+                    ]},
+                    {"type": "TextBlock", "text": "Total responses: 6"}
+                ],
+                "actions": [
+                    {"type": "Action.Submit", "title": "Submit vote", "data": {"pollId": "poll-42", "action": "vote"}}
+                ]
+            }).to_string()
+        }]);
+        let parsed = parse_cards(poll_card.as_array().unwrap(), "", "100", MSG_LINK, hosted_teams);
+        assert!(parsed.cards.is_empty(), "poll renders as native Poll, not duplicate raw card");
+        let (poll, invoke) = parsed.poll.expect("native poll parsed");
+        assert_eq!(poll.question, "Where should we hold offsite?");
+        assert!(poll.multiple && poll.anonymous && !poll.closed);
+        assert_eq!(poll.total, Some(6));
+        assert_eq!(poll.choices[0].text, "Lisbon");
+        assert_eq!(poll.choices[0].count, 4);
+        assert_eq!(poll.choices[1].count, 2);
+        assert_eq!(invoke.poll_id, "poll-42");
+        assert_eq!(invoke.option_values, vec!["opt_0", "opt_1"]);
+
+        // 2. Praise card.
+        let praise_card = json!([{
+            "contentType": ADAPTIVE,
+            "appId": APP_PRAISE,
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Ana sent praise to Ben Okafor"},
+                    {"type": "TextBlock", "text": "Team Player", "weight": "bolder", "size": "large"},
+                    {"type": "TextBlock", "text": "Thanks for covering the incident handoff!"}
+                ]
+            }).to_string()
+        }]);
+        let parsed = parse_cards(praise_card.as_array().unwrap(), "", "101", MSG_LINK, hosted_teams);
+        assert_eq!(parsed.cards.len(), 1);
+        assert_eq!(parsed.cards[0].author, "Praise");
+        assert_eq!(parsed.cards[0].title, "Team Player");
+        assert_eq!(parsed.cards[0].fields, vec![("To".into(), "Ben Okafor".into())]);
+        assert!(parsed.cards[0].text.contains("incident handoff"));
+
+        // 3. Approval card with interactive Approve/Reject buttons.
+        let approval_card = json!([{
+            "contentType": ADAPTIVE,
+            "appId": APP_APPROVALS,
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Production DB Access", "weight": "bolder", "size": "medium"},
+                    {"type": "FactSet", "facts": [
+                        {"title": "Requester", "value": "Ana Ruiz"},
+                        {"title": "Status", "value": "Requested"}
+                    ]},
+                    {"type": "TextBlock", "text": "Temporary read-only access for incident #91."}
+                ],
+                "actions": [
+                    {"type": "Action.Submit", "id": "approve", "title": "Approve", "data": {"approvalId": "apr-7", "decision": "Approve"}},
+                    {"type": "Action.Submit", "id": "reject", "title": "Reject", "data": {"approvalId": "apr-7", "decision": "Reject"}}
+                ]
+            }).to_string()
+        }]);
+        let parsed = parse_cards(approval_card.as_array().unwrap(), "", "102", MSG_LINK, hosted_teams);
+        assert_eq!(parsed.cards.len(), 1);
+        assert_eq!(parsed.cards[0].author, "Approval");
+        assert_eq!(parsed.cards[0].title, "Production DB Access");
+        assert_eq!(parsed.cards[0].color, Some(0xD97706));
+        assert_eq!(parsed.controls.len(), 2);
+        assert_eq!(parsed.controls[0].label, "Approve");
+        assert!(matches!(parsed.controls[0].kind, ControlKind::Button { style: ControlStyle::Primary, .. }));
+        assert_eq!(parsed.controls[1].label, "Reject");
+        assert!(matches!(parsed.controls[1].kind, ControlKind::Button { style: ControlStyle::Danger, .. }));
     }
 }

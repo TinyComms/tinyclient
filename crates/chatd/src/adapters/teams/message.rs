@@ -955,28 +955,120 @@ impl Teams {
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
             let link = self.message_link(conversation, &id, raw);
             let mut rendered = super::card::parse_cards(&cards, content, &id, &link, |url| self.pictures(url));
-            if !rendered.cards.is_empty() {
-                if !rendered.media.is_empty() {
-                    if let Err(err) = self.ctx.media(&rendered.media) {
-                        tracing::warn!("chatd: Teams: {err}");
-                    }
+            if !rendered.media.is_empty() {
+                if let Err(err) = self.ctx.media(&rendered.media) {
+                    tracing::warn!("chatd: Teams: {err}");
                 }
+            }
+            let has_rich = rendered.poll.is_some() || !rendered.cards.is_empty();
+            if let Some((poll, invoke)) = rendered.poll {
+                self.state().polls.insert((conversation.to_owned(), id.clone()), invoke);
+                message.poll = Some(Box::new(poll));
+            }
+            if !rendered.cards.is_empty() {
                 message.card = Some(Box::new(rendered.cards.remove(0)));
                 message.cards = rendered.cards;
-                // Keep the message normal (reactable, quotable) when the card rendered.
-            } else {
+            }
+            if !rendered.controls.is_empty() {
+                message.controls = rendered.controls;
+            }
+            if !has_rich {
                 let title = cards.iter().find_map(|card| card_title(card, 6));
                 if message.text.is_empty() {
                     message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
                 }
                 message.kind = MessageKind::Unsupported { link };
             }
-        } else if message.text.is_empty() && message.attachments.is_empty() && message.card.is_none() && message.previews.is_empty() {
+        } else if message.text.is_empty() && message.attachments.is_empty() && message.card.is_none() && message.poll.is_none() && message.previews.is_empty() {
             message.text = "Unsupported message".to_owned();
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
         Read::Message(Box::new(message))
+    }
+
+    /// Submits a vote on a Teams Polls Adaptive Card via the chat service's `/invoke` endpoint,
+    /// and optimistically updates the stored poll until the `MessageUpdate` push arrives.
+    pub(super) fn vote(&self, conversation: &str, message_id: &str, votes: Option<&[u32]>) -> Result<(), Fault> {
+        let choices: Vec<u32> = votes.map(|v| v.to_vec()).unwrap_or_default();
+        let invoke = self
+            .state()
+            .polls
+            .get(&(conversation.to_owned(), message_id.to_owned()))
+            .cloned();
+        let selected_values: Vec<String> = if let Some(ref meta) = invoke {
+            choices
+                .iter()
+                .filter_map(|&idx| meta.option_values.get(idx as usize).cloned())
+                .collect()
+        } else {
+            choices.iter().map(u32::to_string).collect()
+        };
+        let mut data = invoke
+            .as_ref()
+            .map(|m| m.submit_data.clone())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({"action": "vote", "pollId": message_id}));
+        let input_id = invoke.as_ref().map_or("pollChoice", |m| m.input_id.as_str());
+        data[input_id] = Value::String(selected_values.join(","));
+        let app_id = invoke.as_ref().map_or("", |m| m.app_id.as_str());
+        let body = json!({
+            "type": "invoke",
+            "name": "adaptiveCard/action",
+            "value": {
+                "appId": app_id,
+                "action": {
+                    "type": "Action.Submit",
+                    "id": "submitVote",
+                    "data": data,
+                }
+            }
+        });
+        let path = format!(
+            "/v1/users/ME/conversations/{}/messages/{}/invoke",
+            escaped(conversation),
+            escaped(message_id)
+        );
+        self.chat("POST", &path, Body::Json(&body), false)?;
+        if let Some(mut msg) = self.ctx.stored_message(conversation, message_id)? {
+            if let Some(poll) = msg.poll.as_deref_mut() {
+                let me = self.me();
+                poll.apply_vote(&me, choices, &me);
+                self.ctx.history(conversation, &[msg])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Invokes an interactive Adaptive Card action button (e.g. Approval Approve / Reject).
+    pub(super) fn invoke_card_action(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        block_id: &str,
+        action_id: &str,
+        value: &str,
+    ) -> Result<(), Fault> {
+        let data: Value = serde_json::from_str(value).unwrap_or_else(|_| json!({"value": value}));
+        let body = json!({
+            "type": "invoke",
+            "name": "adaptiveCard/action",
+            "value": {
+                "appId": block_id,
+                "action": {
+                    "type": "Action.Submit",
+                    "id": action_id,
+                    "data": data,
+                }
+            }
+        });
+        let path = format!(
+            "/v1/users/ME/conversations/{}/messages/{}/invoke",
+            escaped(conversation),
+            escaped(message_id)
+        );
+        self.chat("POST", &path, Body::Json(&body), false)?;
+        Ok(())
     }
 
     /// `properties.emotions`: one entry per reaction, each with everyone who gave it. Teams
