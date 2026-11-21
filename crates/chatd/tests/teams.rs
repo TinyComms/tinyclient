@@ -478,6 +478,9 @@ impl Fake {
             limited.headers.push(("Retry-After", "7".to_owned()));
             return limited;
         }
+        if sent["content"].as_str().unwrap_or("").contains("moderated post") {
+            return answer("403 Forbidden", json!({"errorCode": 403, "message": "User is not allowed to post in this channel."}));
+        }
         let arrived = 1_760_001_000_000 + u64::from(self.posted.fetch_add(1, Ordering::Relaxed)) * 1000;
         let (thread, root) = conversation.split_once(";messageid=").map_or((conversation, None), |(thread, root)| (thread, Some(root.to_owned())));
         let root = root.or_else(|| thread.contains("@thread.tacv2").then(|| arrived.to_string()));
@@ -843,8 +846,8 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
         ]
     );
     assert!(rows.iter().all(|row| row.space.is_none()), "a chat is in no Space");
-    // Teams supplies a boolean unread flag; only mentions support a numeric badge.
-    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Dot));
+    // Direct chats show their actual unread count; channels show a dot unless mentioned.
+    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Count(1)));
     assert_eq!(rows[0].avatar.as_ref().map(|avatar| (avatar.kind, avatar.width)), Some((MediaKind::Avatar, 64)));
     assert_eq!((rows[0].preview.as_str(), rows[0].preview_from.as_str(), rows[0].preview_mine), ("Can you look at the deploy?", "Ana Ruiz", false));
     assert!(rows[2].muted && rows[2].unread == 0, "muted by me, and what I said last is not unread");
@@ -991,13 +994,12 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     assert_eq!(std::fs::read(path).unwrap(), SHEET);
     assert_eq!(world.fake.calls("GET", &content).len(), 1);
 
-    // A card is named and linked into the official app, never blank.
-    let card = by("1760000300300");
-    assert_eq!(card.text, "Card: Build 512 passed");
-    let MessageKind::Unsupported { link } = &card.kind else {
-        panic!("{:?}", card.kind);
-    };
-    assert_eq!(link, &format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000300300?tenantId={HOME}"));
+    // An adaptive card renders into Message::card and stays a normal message (reactable, quotable).
+    let card_msg = by("1760000300300");
+    assert_eq!(card_msg.kind, MessageKind::Normal);
+    let card = card_msg.card.as_deref().expect("adaptive card parsed into Message::card");
+    assert_eq!(card.title, "Build 512 passed");
+    assert_eq!(card.actions, vec![protocol::CardAction { label: "Open".into(), url: "https://ci.example/512".into() }]);
 
     // A Loop component is named and linked to its file, not left as a blank card.
     let looped = by("1760000310310");
