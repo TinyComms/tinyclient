@@ -216,7 +216,8 @@ impl Discord {
             let _ = self.ctx.media(&friend_files);
         }
         let state = crate::hub::lock(&self.state);
-        let mutual_space_items: Vec<protocol::MutualSpace> = profile
+        // Count known servers before the list is capped. An id we have never seen stays out.
+        let known_spaces: Vec<protocol::MutualSpace> = profile
             .mutual_guilds
             .iter()
             .filter_map(|mg| {
@@ -227,8 +228,9 @@ impl Discord {
                     nickname: mg.nick.clone().unwrap_or_default(),
                 })
             })
-            .take(protocol::MUTUAL_SPACES)
             .collect();
+        let mutual_total = known_spaces.len() as u32;
+        let mutual_space_items: Vec<protocol::MutualSpace> = known_spaces.into_iter().take(protocol::MUTUAL_SPACES).collect();
         let mutual_spaces: Vec<String> = mutual_space_items.iter().map(|s| s.name.clone()).collect();
         // An unknown id is not a friend. Inventing Friend here lets the card's learn
         // replace a blocked or ignored person. Anyone who is not already Friend is left out.
@@ -259,7 +261,6 @@ impl Discord {
             .mutual_friends_count
             .unwrap_or(profile.mutual_friends.len() as u32)
             .max(mutual_people.len() as u32);
-        let mutual_total = mutual_space_items.len() as u32;
         let text = profile.user_profile.as_ref();
         let bio = match member_profile.map(|p| p.bio.as_str()).filter(|b| !b.is_empty()) {
             Some(server_bio) => {
@@ -785,7 +786,7 @@ impl Discord {
         roles: bool,
         space: Option<&str>,
         limit: u32,
-    ) -> Result<(Vec<protocol::MentionHit>, bool), Refusal> {
+    ) -> Result<(Vec<protocol::MentionHit>, bool, Option<String>), Refusal> {
         let cap = limit.clamp(1, 25);
         let mut path = format!("/users/@me/mentions?limit={cap}&roles={roles}&everyone={everyone}");
         if let Some(before) = before.filter(|b| !b.is_empty()) {
@@ -797,6 +798,9 @@ impl Discord {
         let answer = self.call("GET", &path, None).map_err(refusal)?;
         let raw: Vec<Posted> = serde_json::from_str(&answer).map_err(refused)?;
         let more = raw.len() >= cap as usize;
+        // The next page starts before the last raw id, even when every hit on this page was
+        // filtered out. One call returns one page.
+        let cursor = more.then(|| raw.last().map(|posted| posted.id.clone())).flatten();
         let nsfw = crate::hub::lock(&self.state).nsfw_channels.clone();
         let mut hits = Vec::new();
         for posted in &raw {
@@ -838,7 +842,7 @@ impl Discord {
                 mentions_role: !posted.mention_roles.is_empty(),
             });
         }
-        Ok((hits, more))
+        Ok((hits, more, cursor))
     }
 
     /// Dismisses a recent mention (`DELETE /users/@me/mentions/{message_id}`).

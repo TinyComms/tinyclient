@@ -71,6 +71,17 @@ pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A present JSON value for `Option<Option<T>>`. An absent field stays the `Default` (`None`:
+/// leave it). `null` is `Some(None)` (clear). A value is `Some(Some(value))`. Serde's own
+/// `Option` turns a present `null` into the outer `None`, which cannot be told from absent.
+fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
 fn default_mentions_true() -> bool {
     true
 }
@@ -778,6 +789,10 @@ pub struct Person {
     /// people in a list are doing anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Box<Activity>>,
+    /// A server nickname, shown on that server's member list. People keeps `name`, the global
+    /// display name. Empty when this row has no server nickname.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nickname: String,
     /// Their job title (Slack, Teams). Stored.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
@@ -807,6 +822,7 @@ impl Person {
             title: String::new(),
             utc_offset: None,
             mark: None,
+            nickname: String::new(),
         }
     }
 }
@@ -2592,8 +2608,9 @@ pub enum Request {
         /// New name. Absent leaves it. Empty clears it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        /// New colour (`0xRRGGBB`). Absent leaves it. `Some(None)` clears it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// New colour (`0xRRGGBB`). Absent leaves it. `Some(None)` clears it. A present JSON
+        /// `null` is the clear; serde's `Option` would read that as "leave it".
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_or_null")]
         color: Option<Option<u32>>,
     },
     /// Add a link bookmark to a channel (Slack `bookmarks.add`).
@@ -3162,6 +3179,10 @@ pub enum Response {
         items: Vec<MentionHit>,
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
+        /// Ask before this id next. The last id of the raw page, so a page that was filtered
+        /// down to nothing still moves on. Absent when `more` is false.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
     },
     /// A created or edited channel bookmark (`BookmarkAdd` / `BookmarkEdit`).
     Bookmark {
@@ -3499,6 +3520,31 @@ mod tests {
         assert!(!typing("a", &[]).same_scope(&Change::Messages { conversation: key("a") }));
         assert!(!Change::Messages { conversation: key("a") }
             .same_scope(&Change::Conversation { conversation: key("a") }));
+    }
+
+    #[test]
+    fn clearing_a_folder_colour_round_trips_through_a_frame() {
+        use std::io::Cursor;
+        let folder = Key::new(&AccountKey { network: Network::Discord, account: "1".into() }, "77");
+        let clear = Request::SetFolder { folder: folder.clone(), name: None, color: Some(None) };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &clear).unwrap();
+        let back: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: Some(None), name: None, .. }));
+
+        let paint = Request::SetFolder { folder: folder.clone(), name: Some("Games".into()), color: Some(Some(0x34_A8_53)) };
+        buf.clear();
+        write_frame(&mut buf, &paint).unwrap();
+        let back: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: Some(Some(0x34_A8_53)), .. }));
+
+        let rename = Request::SetFolder { folder, name: Some("Games".into()), color: None };
+        buf.clear();
+        write_frame(&mut buf, &rename).unwrap();
+        let body = std::str::from_utf8(&buf[4..]).unwrap();
+        assert!(!body.contains("\"color\""));
+        let back: Request = read_frame(Cursor::new(buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: None, .. }));
     }
 
     #[test]

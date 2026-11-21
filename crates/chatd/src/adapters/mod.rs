@@ -484,7 +484,7 @@ pub enum Command {
         roles: bool,
         space_id: Option<String>,
         limit: u32,
-        reply: Reply<(Vec<protocol::MentionHit>, bool)>,
+        reply: Reply<(Vec<protocol::MentionHit>, bool, Option<String>)>,
     },
     /// Dismiss a recent mention on the network (`DELETE /users/@me/mentions/{id}`).
     DismissMention {

@@ -770,10 +770,9 @@ pub struct Activity {
     pub assets: Option<ActivityAssets>,
 }
 
-fn valid_http_url(url: &str) -> Option<String> {
+fn valid_https_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
-    let ok = trimmed.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
-        || trimmed.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"));
+    let ok = trimmed.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"));
     if ok && trimmed.len() <= 512 && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
         Some(trimmed.to_owned())
     } else {
@@ -885,7 +884,7 @@ impl PresenceUpdate {
                 .filter(|&s| s > 0)
                 .map(|s| if s > 10_000_000_000 { s / 1000 } else { s });
             let url = if kind == Streaming {
-                activity.url.as_deref().and_then(valid_http_url).unwrap_or_default()
+                activity.url.as_deref().and_then(valid_https_url).unwrap_or_default()
             } else {
                 String::new()
             };
@@ -1374,5 +1373,13 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(bad_stream.doing().unwrap().url, "");
+
+        let plain_http: PresenceUpdate = serde_json::from_value(serde_json::json!({
+            "user": {"id": "2004"},
+            "status": "online",
+            "activities": [{"type": 1, "name": "Hades", "url": "http://twitch.tv/abc"}]
+        }))
+        .unwrap();
+        assert_eq!(plain_http.doing().unwrap().url, "");
     }
 }

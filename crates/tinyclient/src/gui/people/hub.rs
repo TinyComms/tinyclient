@@ -504,9 +504,9 @@ impl Hub {
             let mut inner = self.0.borrow_mut();
             let scoped_avatar = person.avatar.as_ref().is_some_and(|a| a.id.starts_with("mavatar:"));
             if scoped_avatar {
-                // A server avatar and nickname stay on that server. People, DMs, and the
-                // quick switcher keep the global picture and name, including when this
-                // person was not in the hub yet.
+                // A server picture and server nickname stay on that server. People, DMs, and
+                // the quick switcher keep the global picture and the global display name.
+                // A row already here keeps the picture and name it has.
                 if let Some(existing) = inner.people.get_mut(&person.key) {
                     if person.presence != Presence::Unknown {
                         existing.presence = person.presence;
@@ -527,7 +527,7 @@ impl Hub {
                 }
                 let mut row = person.clone();
                 row.avatar = None;
-                row.name.clear();
+                row.nickname.clear();
                 if inner.people.insert(person.key.clone(), row).is_none() {
                     inner.people_order.push_back(person.key.clone());
                     if inner.people_order.len() > PEOPLE_LIMIT {
@@ -538,7 +538,10 @@ impl Hub {
                 }
                 continue;
             }
-            if inner.people.insert(person.key.clone(), person.clone()).is_none() {
+            // A server nickname belongs on that server's member list, not on the hub row.
+            let mut row = person.clone();
+            row.nickname.clear();
+            if inner.people.insert(person.key.clone(), row).is_none() {
                 inner.people_order.push_back(person.key.clone());
                 if inner.people_order.len() > PEOPLE_LIMIT {
                     if let Some(old) = inner.people_order.pop_front() {
@@ -899,6 +902,31 @@ mod tests {
         assert_eq!(names(105), ["tomasz"]);
         assert_eq!(names(111), ["tomasz"]);
         assert!(names(112).is_empty());
+    }
+
+    #[test]
+    fn a_new_server_picture_keeps_the_global_name_and_not_the_server_nickname() {
+        let hub = Hub::default();
+        let who = key("2001");
+        let mut person = Person::new(who.clone(), "Mara Okafor");
+        person.nickname = "mara-srv".into();
+        person.avatar = Some(MediaFile::new("mavatar:4000:2001:srv", protocol::MediaKind::Avatar));
+        hub.learn(std::slice::from_ref(&person));
+        let stored = hub.person(&who).expect("learned");
+        assert_eq!(stored.name, "Mara Okafor");
+        assert!(stored.nickname.is_empty());
+        assert!(stored.avatar.is_none());
+
+        let mut known = Person::new(who.clone(), "Mara Okafor");
+        known.avatar = Some(MediaFile::new("avatar:2001:global", protocol::MediaKind::Avatar));
+        hub.learn(std::slice::from_ref(&known));
+        let mut again = person.clone();
+        again.name = "mara-srv".into();
+        again.avatar = Some(MediaFile::new("mavatar:4000:2001:other", protocol::MediaKind::Avatar));
+        hub.learn(std::slice::from_ref(&again));
+        let stored = hub.person(&who).expect("still there");
+        assert_eq!(stored.name, "Mara Okafor");
+        assert_eq!(stored.avatar.as_ref().map(|file| file.id.as_str()), Some("avatar:2001:global"));
     }
 
     #[test]

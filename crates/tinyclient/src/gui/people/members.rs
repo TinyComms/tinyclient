@@ -486,7 +486,8 @@ impl MemberList {
             .unwrap_or_else(|| (false, person.key.clone()));
         let remove_shell = self.shell.clone();
         let remove_id = person.key.id.clone();
-        let remove_name = person.name.clone();
+        let label = if person.nickname.is_empty() { person.name.clone() } else { person.nickname.clone() };
+        let remove_name = label.clone();
         let tapped = (profile.clone(), shell.clone());
         div()
             .id(("member", ix))
@@ -538,7 +539,7 @@ impl MemberList {
                                 // profile, the sidebar): 16, not the desktop's interface size scaled.
                                 .map(|name| if phone { name.type_body() } else { name.type_ui() })
                                 .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
-                                .child(person.name.clone()),
+                                .child(label),
                         )
                         .when(show_second, |col| {
                             col.child(

@@ -795,6 +795,7 @@ fn person_from(row: &Row) -> rusqlite::Result<Person> {
         emoji: String::new(),
         emoji_file: None,
         activity: None,
+        nickname: String::new(),
     })
 }
 

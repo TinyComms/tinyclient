@@ -3672,6 +3672,7 @@ impl Composer {
                 title: String::new(),
                 utc_offset: None,
                 mark: None,
+                nickname: String::new(),
             };
             let found = vec![
                 person("Dev Patel", "devp", protocol::Presence::Online),

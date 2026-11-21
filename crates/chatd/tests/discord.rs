@@ -1943,7 +1943,9 @@ fn the_space_on_screen_is_the_only_one_subscribed() {
             let sections: Vec<(&str, u32)> = sections.iter().map(|section| (section.name.as_str(), section.count)).collect();
             assert_eq!(sections, [("mods", 1), ("Online", 1), ("Offline", 1)]);
             let names: Vec<&str> = members.iter().map(|person| person.name.as_str()).collect();
-            assert_eq!(names, ["mara-mod", "Sam Whitlock", "Dev Patel"]);
+            assert_eq!(names, ["Mara Okafor", "Sam Whitlock", "Dev Patel"]);
+            assert_eq!(members[0].nickname, "mara-mod");
+            assert!(members[1].nickname.is_empty());
             assert_eq!((members[0].relation, members[0].presence), (Relation::Friend, Presence::Dnd));
             assert_eq!((members[1].relation, members[2].presence), (Relation::None, Presence::Offline));
             assert_eq!(offset, 0);
@@ -5492,7 +5494,7 @@ fn recent_mentions_fetch_filter_and_dismiss() {
         space: None,
         limit: 25,
     }) {
-        Response::Mentions { items, more } => {
+        Response::Mentions { items, more, .. } => {
             assert!(!more);
             assert_eq!(items.len(), 1, "request DM and NSFW channel must be filtered out: {items:?}");
             assert_eq!(items[0].message_id, "1300000000000090001");
@@ -5519,7 +5521,7 @@ fn recent_mentions_fetch_filter_and_dismiss() {
             space: Some(world.key("4000")),
             limit: 10,
         }),
-        Response::Mentions { items, more: false } if items.is_empty()
+        Response::Mentions { items, more: false, .. } if items.is_empty()
     ));
     let reqs = world.discord.requests_to("GET", "/users/@me/mentions");
     assert_eq!(reqs.len(), 2);

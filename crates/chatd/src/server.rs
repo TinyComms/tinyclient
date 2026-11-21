@@ -3791,14 +3791,14 @@ impl Chat {
                 let limit = if limit == 0 { 25 } else { limit.min(50) };
                 let space_id = space.filter(|s| s.account() == account).map(|s| s.id);
                 match self.ask(&account, |reply| Command::Mentions { before, everyone, roles, space_id, limit, reply }) {
-                    Ok((mut items, more)) => {
+                    Ok((mut items, more, cursor)) => {
                         for item in &mut items {
                             clip(&mut item.sender, 120);
                             clip(&mut item.text, 500);
                             clip(&mut item.title, 120);
                             clip(&mut item.space_title, 120);
                         }
-                        Response::Mentions { items, more }
+                        Response::Mentions { items, more, cursor }
                     }
                     Err(refused) => *refused,
                 }

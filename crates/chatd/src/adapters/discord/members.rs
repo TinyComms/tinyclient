@@ -481,10 +481,12 @@ impl Discord {
         });
         // In voice wins over playing/listening, matching Friends.
         let activity = voice.get(&user.id).cloned().or(presence_doing);
+        // `name` is the global display name. The server nickname stays on `nickname` so the
+        // member list can show it without People taking it as who they are everywhere.
         let person = Person {
             link: super::model::user_link(&user.id),
             key: self.ctx.key(&user.id),
-            name: member.name().to_owned(),
+            name: user.name().to_owned(),
             handle: user.username.clone(),
             avatar: Some(avatar),
             bot: user.bot,
@@ -494,6 +496,7 @@ impl Discord {
             emoji: emoji.clone(),
             emoji_file,
             activity: activity.clone().map(Box::new),
+            nickname: member.nick.clone().filter(|nick| !nick.is_empty()).unwrap_or_default(),
             ..Person::new(self.ctx.key(&user.id), "")
         };
         Some((person, shown, status.to_owned(), emoji, activity))

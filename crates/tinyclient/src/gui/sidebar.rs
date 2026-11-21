@@ -50,6 +50,15 @@ const WATCH: &str = "sidebar";
 /// Drafts remembered ahead of their rows being read again.
 const DRAFTS_HELD: usize = 256;
 
+/// The id to ask before on the next mention page. `None` when this page is the last.
+/// A page that was filtered down to nothing still moves on, using the raw page's last id.
+fn mention_cursor(items: &[protocol::MentionHit], more: bool, cursor: Option<String>) -> Option<String> {
+    if !more {
+        return None;
+    }
+    cursor.filter(|id| !id.is_empty()).or_else(|| items.last().map(|item| item.message_id.clone()))
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     Inbox,
@@ -1086,11 +1095,9 @@ impl Shell {
                             space: None,
                             limit: 25,
                         };
-                        if let Ok(Response::Mentions { items, more: has_more }) = ask(&req) {
-                            if has_more {
-                                if let Some(last) = items.last() {
-                                    more.push((account, last.message_id.clone()));
-                                }
+                        if let Ok(Response::Mentions { items, more: has_more, cursor }) = ask(&req) {
+                            if let Some(before) = mention_cursor(&items, has_more, cursor) {
+                                more.push((account, before));
                             }
                             merged.extend(items);
                         }
@@ -1137,13 +1144,9 @@ impl Shell {
                             limit: 25,
                         };
                         match ask(&req) {
-                            Ok(Response::Mentions { items, more }) => {
-                                if more {
-                                    if let Some(last) = items.last() {
-                                        next.push((account, last.message_id.clone()));
-                                    } else {
-                                        next.push((account, before));
-                                    }
+                            Ok(Response::Mentions { items, more, cursor }) => {
+                                if let Some(before) = mention_cursor(&items, more, cursor) {
+                                    next.push((account, before));
                                 }
                                 extra.extend(items);
                             }
