@@ -48,7 +48,7 @@ use protocol::{
     PAGE_LIMIT,
 };
 use rows::Item;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::rc::Rc;
@@ -64,6 +64,18 @@ pub struct State {
     listening: OnceCell<Subscription>,
     following: OnceCell<Subscription>,
     side: side::Side,
+}
+
+impl State {
+    /// The message menu reads commands the shell just stored.
+    pub(in crate::gui) fn wake_panes(&self, cx: &mut gpui::App) {
+        if let Some(pane) = self.pane.get() {
+            pane.update(cx, |_, cx| cx.notify());
+        }
+        if let Some(thread) = self.thread.borrow().clone() {
+            thread.update(cx, |_, cx| cx.notify());
+        }
+    }
 }
 
 /// How often the network is told how far the user has read, at most.
@@ -388,6 +400,9 @@ pub struct Pane {
     /// if it holds still (`actions::LONG_PRESS`). Dropping the task cancels it.
     press: Option<(gpui::Task<()>, (f32, f32))>,
     menu: Option<actions::Menu>,
+    /// Where the Apps row and its submenu were painted, so a click on the submenu is not outside.
+    apps_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    apps_menu: Rc<Cell<Option<Bounds<Pixels>>>>,
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
@@ -505,6 +520,8 @@ impl Pane {
             hover: None,
             press: None,
             menu: None,
+            apps_anchor: Rc::default(),
+            apps_menu: Rc::default(),
             picker: None,
             confirm: None,
             forward: None,

@@ -5541,3 +5541,66 @@ fn slash_commands_fetch_the_index_and_post_type_2() {
     );
     assert_eq!(world.discord.requests_to("POST", "/channels/4101/threads").last().unwrap().body["name"], "release plan");
 }
+
+/// A message command and a user command name the message or the person (`data.target_id`).
+fn context_commands_post_the_target() {
+    let world = World::start();
+    let channel = world.key("4101");
+    assert_eq!(
+        world.ask(Request::RunCommand {
+            conversation: channel.clone(),
+            command_id: "9002".into(),
+            application_id: "555".into(),
+            version: "1".into(),
+            kind: protocol::CommandKind::Message,
+            name: "Pin".into(),
+            arguments: Vec::new(),
+            target_id: Some("msg-9".into()),
+            files: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let pin = &world.discord.requests_to("POST", "/interactions").last().unwrap().body;
+    assert_eq!(pin["type"], 2);
+    assert_eq!(pin["channel_id"], "4101");
+    assert_eq!(pin["guild_id"], "4000");
+    assert_eq!(pin["session_id"], "session-one");
+    assert_eq!(pin["data"]["type"], 3);
+    assert_eq!(pin["data"]["id"], "9002");
+    assert_eq!(pin["data"]["name"], "Pin");
+    assert_eq!(pin["data"]["target_id"], "msg-9");
+
+    assert_eq!(
+        world.ask(Request::RunCommand {
+            conversation: channel,
+            command_id: "9005".into(),
+            application_id: "777".into(),
+            version: "2".into(),
+            kind: protocol::CommandKind::User,
+            name: "Hug".into(),
+            arguments: Vec::new(),
+            target_id: Some("user-4".into()),
+            files: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let hug = &world.discord.requests_to("POST", "/interactions").last().unwrap().body;
+    assert_eq!(hug["data"]["type"], 2);
+    assert_eq!(hug["data"]["target_id"], "user-4");
+    assert_eq!(hug["application_id"], "777");
+
+    let posted = world.discord.requests_to("POST", "/interactions").len();
+    let missing = world.ask(Request::RunCommand {
+        conversation: world.key("4101"),
+        command_id: "9002".into(),
+        application_id: "555".into(),
+        version: "1".into(),
+        kind: protocol::CommandKind::Message,
+        name: "Pin".into(),
+        arguments: Vec::new(),
+        target_id: None,
+        files: Vec::new(),
+    });
+    assert!(matches!(missing, Response::Error { code: ErrorCode::Refused, .. }), "{missing:?}");
+    assert_eq!(world.discord.requests_to("POST", "/interactions").len(), posted);
+}

@@ -1239,6 +1239,9 @@ impl Shell {
 
     /// Opens a floating menu or confirm of the People views at `anchor`.
     pub(in crate::gui) fn open_float(&mut self, float: Float, anchor: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        if let Float::Menu(person) | Float::Person { person, .. } = &float {
+            self.ask_person_apps(person, cx);
+        }
         self.people_state.attach(cx);
         let floating = self.floating_entity(cx);
         floating.update(cx, |floating, cx| floating.open(float, anchor, cx));

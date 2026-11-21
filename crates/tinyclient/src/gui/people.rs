@@ -79,6 +79,15 @@ pub struct State {
     status: OnceCell<Entity<StatusMenu>>,
 }
 
+impl State {
+    /// The person menu reads commands the shell just stored.
+    pub(in crate::gui) fn wake_floating(&self, cx: &mut gpui::App) {
+        if let Some(float) = self.floating.get() {
+            float.update(cx, |_, cx| cx.notify());
+        }
+    }
+}
+
 /// One signed-in account, and how others see us on it.
 #[derive(Clone, PartialEq)]
 pub(in crate::gui) struct Own {
@@ -554,6 +563,7 @@ impl Shell {
     }
 
     fn open_row_menu(&mut self, person: Key, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        self.ask_person_apps(&person, cx);
         let floating = self.floating_entity(cx);
         floating.update(cx, |floating, cx| floating.open(Float::Menu(person), anchor, cx));
         cx.notify();
